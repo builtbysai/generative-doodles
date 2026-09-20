@@ -53,6 +53,51 @@ Line fields bent around attractors/orbits; crack-like fracture patterns.
 - Monochrome discipline: let density carry the image
 - Pen-plotter thinking: every mark must be drawable (great constraint for plotter/)
 
+## Visual study pass (2026-09-20, deep)
+
+Inspected inconvergent.net gallery pages live (differential-line,
+sand-creatures), screenshots read in full.
+
+### Differential Line, the 40-hour circle
+
+- The signature render is a huge disc of fine concentric wavy lines, moire
+  dense at the center, opening up toward the edge. Zoomed out it reads as a
+  stippled grey ball; up close it is thousands of non-touching hairlines.
+- The page documents the two knobs that matter: how often new nodes are
+  introduced, and the avoidance radius. The third knob, where to insert
+  (uniform vs curvature-prioritized), is "the most interesting one" and the
+  40-hour image uses curvature-based insertion.
+- Painting the curve's position at every timestep (a time-lapse trace) gives
+  a dramatically different texture from the same system. Same rules, second
+  piece for free.
+
+### Sand Creatures, procedure read in full
+
+The whole recipe is three lines:
+1. Random control points from a uniform distribution, confined in a sphere.
+2. Put them in an arbitrary order.
+3. Draw a B-spline through them in that order.
+
+That yields cursive, almost-legible glyphs. The texture pass: clone the
+control points, offset them slightly at random, build a second spline, then
+draw the "sandstroke" lines between equally spaced points on the two
+splines. Result: dusty, grainy blobs that look hand-shaded.
+
+- Two grids on the page: thin-line cursive creatures, and the grainy
+  blob variant. The grainy ones are the stronger images.
+- Hoff notes the texture only really lands at large print sizes. Honest
+  craft note: density rendering needs physical scale.
+- The arbitrariness is the point: uniform randomness plus one spline is
+  enough to get "writing-like" marks. No linguistics, no gesture data.
+
+### Confirmed aesthetic
+
+- Black ink on white, everything else carried by mark density. The
+  sand-creatures color version exists on the generative index page
+  (sand-creatures-color.jpg) but the galleries stay monochrome.
+- His site itself is the anti-portfolio: plain text, big images, github
+  links. The work carries everything.
+
 ## What NOT to do
 - Differential growth is heavily imitated, use it as a *component*, not the whole piece.
 - Don't fake the plotter aesthetic with blur/filters; earn it with real line counts.

@@ -42,7 +42,63 @@ non-overlapping curves.
 - **QQL insight:** Letting collectors tune parameters ("parametric artist"), interactivity
   as a compositional tool, not just a viewer toy.
 
+## Visual study pass (2026-09-20, deep)
+
+Inspected full-resolution images on tylerxhobbs.com: 4 Fidenza outputs
+(cool blues, dark plum, near-white, teal), 2 QQL outputs, 2 Incomplete Control
+outputs, plus the works index thumbnails.
+
+### Fidenza, seen up close
+
+- **Strokes layer.** Thick curves are drawn OVER thinner ones in places, no
+  pure non-overlap. The cream ground separates them, so it reads clean anyway.
+- **Dry-brush ends.** Stroke caps are frayed and ragged, never round. Some
+  strokes taper, thin out, and break mid-curve into dash segments.
+- **Palette discipline.** Each output commits to 5-8 colors plus the ground.
+  Pastel accents (lavender, mint, coral) appear in tiny doses, like spice.
+- **Density gradient.** The field is not uniform: dense clusters of curves in
+  one region, open breathing room elsewhere. That contrast is what makes an
+  output feel composed rather than wallpapered.
+- **Monochrome proof.** The near-white output works with almost no color at
+  all. The composition is flow and density first; color is a second voice.
+
+### QQL, two distinct modes
+
+- **The mark is a bullseye.** Every dot is a concentric-ring target, not a
+  flat circle. That ring structure is the whole identity, it reads as
+  embroidery or woven texture at scale.
+- **Stipple-wave mode:** thousands of solid dots in tonal bands build a
+  Hokusai-style great wave. Contour lines emerge from dot color bands, not
+  from drawn lines. Scattered bright dots read as spray or sparks.
+- **Ring-field mode:** bullseyes on a jittered grid, positions and color
+  following a flow field (blue diagonal sweep, warm edges). The grid
+  distortion carries the motion.
+- QQL feels more graphic and structured than Fidenza. The parametric angle
+  (collector-tuned parameters) makes sense here: the system is legible
+  enough to tune.
+
+### Incomplete Control
+
+- **Shaky rectangles.** Loose rows of hand-drawn rectangles, each edge
+  retraced several times with wobble, like a nervous hand tracing a ruler
+  line. Jitter amplitude varies per rectangle.
+- **Three fill treatments:** dense scribble hatching, flat pastel color blocks
+  (pink, yellow, blue, black) with visible brush grain, or bare outlines.
+- Cream paper ground throughout. The color blocks are painted, not flat fills.
+- The name fits: it is a study of control versus looseness. The wobble is the
+  content, not a defect.
+
+### New works on the index (thumbnails only)
+
+- **Please Respond, 2026:** tall piece of stratified horizontal color bands
+  with jittered edges, reads like geological strata or stacked flow segments.
+- **From Noise, 2025:** thousands of colored speckles in a falling density
+  gradient, a pointillist noise field.
+- **Translated Gestures, 2025:** physical painted panels, blob gestures in
+  flat color. He keeps a foot in physical media.
+
 ## Techniques to steal (not copy)
+
 - Flow-field curve walking with margin-extended grids
 - Layered passes with independent palettes/scales
 - Angle quantization for structural contrast
