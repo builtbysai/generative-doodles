@@ -1,6 +1,6 @@
-# Doodle №003: Grain Study (2026-09-20)
+# Doodle №003: Mai Menochot (2026-09-20)
 
-**File:** `003-grain-study/index.html` (self-contained, vanilla canvas, no dependencies)
+**File:** `003-mai-menochot/index.html` (self-contained, vanilla canvas, no dependencies)
 
 ## Concept
 A letterpress misprint of a rising sun. Two passes of ink build a sun over a
