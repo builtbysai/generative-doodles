@@ -157,9 +157,60 @@ fields and proximity falloff are exactly the tools that turn random
 dots into something with direction and intent.
 
 The Behance side shows the plugin in use: Generista Posters I and II
-(June 2024), posters generated with the plugin, plus a 3D exploration
-series (Generatik) that suggests he extends the same thinking into 3D.
-Not yet visually inspected.
+(July and August 2024), plus a 3D exploration series (Generatik) that
+suggests he extends the same thinking into 3D.
+
+**Generista Posters I and II, visually inspected 2026-09-20.**
+
+Series I (behance.net/gallery/201576795, published July 3 2024, posters
+dated 18/06/24): 12 posters in 4 rows of 3, each row one algorithm, each
+poster rendered in one of 3 strict palettes (light gray with black marks,
+near-black with light marks, red-orange gradient with dark marks). Row
+#0001 NOISE: a dense grid of short dashes, each rotated by a noise flow
+field, producing flocking-like bands of texture. Row #0002 NOISE: small
+arrow marks on a grid rotated by a noise field into swirling directional
+currents. Row #0003 SEQUENCE: a patchwork of large semicircles, each rotated
+to a few orientations so the half-discs interlock into organic negative-space
+shapes. Row #0004 SEQUENCE: a dense angular maze of thin lines with a
+horizontal mid-poster info band. Every poster carries a fixed typographic
+system: vertical "GENERISTA FIGMA PLUGIN" plus the algorithm name on the left
+edge, and "18/06/24 LONDON, UK" with the series number (#0001 to #0004) in
+the footer. The description text is only "Generative posters made with
+Generista. Get the Figma Plugin."
+
+Series II (behance.net/gallery/206169353, published August 22 2024, posters
+dated 27/07/24): 4 posters, #0005 to #0008, all in dark monochrome grayscale,
+continuing the numbering and the same footer system ("GENERISTA FIGMA
+PLUGIN", algorithm name, "27/07/24 LONDON, UK"). #0005 SEQUENCE: rotated
+semicircle patchwork like #0003, refined grayscale tonal range on dark
+charcoal with occasional quarter-circle tiles. #0006 NOISE: a grid of
+rounded-square tiles shaded through a vertical gray gradient, some cells
+omitted so the pattern dissolves into negative space. #0007 SEQUENCE: circles
+in graduated gray tones on near-black, cells selectively skipped into a loose
+composition. #0008 SEQUENCE: coarse large geometric block shapes in flat gray,
+a Tetris-like pixel mosaic.
+
+The in-use technique is consistent across both series. Start with one simple
+vector layer in Figma (dash, arrow, semicircle, square, circle), duplicate it
+across a grid, then apply either NOISE (per-cell rotation, scale, shade, or
+displacement driven by a noise field) or SEQUENCE (deterministic row-by-row
+progression of rotation and tone). The output locks into a rigid poster
+system: duotone or monochrome palette, Swiss-minimal footer with date,
+location, algorithm name, and series number. The strongest results come when
+the noise field has enough coherence to read as flow (the dash field, #0001)
+or when tonal range does the work (the grayscale of series II); the weakest
+come when the marks are too uniform in energy (the arrows, the plain circle
+grid). The monochrome versions consistently outperform the red-orange
+gradient, which reads garish by comparison, and the mid-poster info band on
+the maze row (#0004) disrupts an otherwise hypnotic field. No parameters,
+layer counts, or Figma workflow details are given in either project
+description; the algorithm names appear only as labels printed on the posters.
+
+Visual identity: maximal generative fields inside minimal poster framing,
+with the algorithm name printed on the poster like a process label. NOISE vs
+SEQUENCE is a clean two-mode taxonomy worth remembering: stochastic
+field-driven variation vs deterministic row-by-row progression, both applied
+to the same repeated primitive.
 
 ## What is overdone (avoid-list)
 
