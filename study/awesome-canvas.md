@@ -89,6 +89,43 @@ Each is a well-documented family with tiny core algorithms. The generative
 doodles project can work through them one family at a time; several (particles,
 trig curves, recursive trees) are already covered in other study notes.
 
+## Visual follow-up, 2026-09-20
+
+Retried the shortlisted surviving examples and visually inspected the ones
+that load. Depth: deep on the three that render.
+
+- **Trigonoparty (ramesaliyev.com/trigonoparty): ALIVE.** Interactive unit
+  circle at 60 FPS, click and drag the angle. Every trig function drawn as a
+  labeled color-coded segment: sine, cosine, tangent, cotangent, secant,
+  cosecant. Side panel with live values, degree/radian, step-by-frame option.
+  Technique: direct trig-as-geometry drawing, one radius line, the six function
+  segments derived from it each frame. What makes it sing: the unit circle is
+  the whole composition, nothing decorative, yet dragging the angle feels
+  tactile and the values ticking over make the math visceral. For doodles: the
+  unit circle is an underused generative substrate, and "draw the construction
+  lines" can BE the piece.
+- **Star Time Lapse (fralonra.github.io/star-time-lapse/demo/): ALIVE.**
+  Concentric star-trail arcs on a deep indigo sky, gold and blue trails with
+  glowing star heads, arcs of varying length and radius. The classic
+  long-exposure look built from arc() calls with per-star phase. Same fade/trail
+  idea as other notes but radial instead of linear. Quiet, confident, no UI
+  clutter except a Stop button. Avoid-list echo: even a good demo does not need
+  much interface.
+- **Canvas Colour Cycling (effectgames.com/demos/canvascycle/): ALIVE.**
+  Mark Ferrari style living pixel scenes, palette-animated in canvas. The demo
+  shows "Jungle Waterfall - Morning" with prev/next scene switching. The image
+  is fixed, the 8-bit palette rotates, and water/fire/sparkle regions come
+  alive. A whole aesthetic from a lookup-table trick. For doodles: palette
+  animation is almost untouched territory in p5.js pieces and could be a
+  distinctive No.002 ingredient (animate the palette, not the pixels).
+- **raphamorim.io/canvas-experiments/particles: DEAD.** GitHub Pages 404.
+  The linked GitHub repo still exists but the Pages deploy path changed. This
+  is the link-rot avoid-list in action: when a technique matters, reconstruct
+  it locally instead of linking to it.
+
+Overall: the list's value as a map holds, but roughly half its destinations
+are gone or moved. The follow-up stands: reconstruct, do not link.
+
 Avoid-list: link rot. Half the examples are on dead domains (cssdeck.com is
 gone), which is a general warning about depending on hosted demos: when a
 technique matters, reconstruct it locally instead of linking to it. Also,
