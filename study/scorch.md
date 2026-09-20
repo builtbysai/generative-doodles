@@ -1,10 +1,9 @@
-# scorch: Study Notes (11 pens deep, more to come)
+# scorch: Study Notes (17 pens deep, more to come)
 
 **Profile:** codepen.io/scorch | Prolific generative sketch artist, many genuary entries
-**Status:** 11 pens visually inspected live with JS read (2026-09-20, two passes).
-Technique summaries below. Remaining plan-list pens for a later pass: PeLmpY,
-deaZxz, JLNOvr, NYoNJq, ZxLajX, WzojLb, jZeVGN, KQGwOL, jZvqrO, yPaaoG, YrgWYQ,
-JrzKEG, MExeWZ, mBoPpV, NpogGr.
+**Status:** 17 pens visually inspected live with JS read (2026-09-20, three passes).
+Technique summaries below. Remaining plan-list pens for a later pass: jZeVGN,
+KQGwOL, jZvqrO, yPaaoG, YrgWYQ, JrzKEG, MExeWZ, mBoPpV, NpogGr.
 
 ## Style profile
 
@@ -130,6 +129,81 @@ generator places rectangles with randomized cell spans. No animation.
 **Takeaway:** the simplest possible generator (nested loops, randomized spans)
 can produce a composed look if the palette and stroke discipline hold. Random
 rectangles only look random when the taste is missing.
+
+## Batch 3 (2026-09-20, third live pass)
+
+Two standalone studies plus a four-pen "polygon slicing" series that reads as a
+single idea iterated in public, from minimal prototype to smoothed and tuned
+instrument.
+
+### 12. "Untitled" (PeLmpY): rotating hatch grid
+
+A grid of jittered square cells on cream; each cell holds fine dark hatch lines
+at a slightly different angle, forming an evolving angular moire texture like
+plotter line work. Vanilla 2D canvas: a grid of random quads with jittered
+corners, each quad picking a random hatch angle; parallel lines are swept across
+the quad's rotated bounding box and clipped to the quad via a segment-segment
+intersection routine, so only interior segments draw. Each frame increments every
+quad's angle by pi/360, so the whole hatch field rotates continuously. Palette:
+cream ground rgb(242,235,222), semi-transparent navy hatch #00227766; dense
+full-bleed grid.
+
+**Takeaway:** clipping line sweeps to arbitrary quads is a general motif-maker.
+One hatch rule times a jittered grid gives a texture that reads as woven. The
+slow uniform rotation turns a static pattern into ambient motion without any
+compositional risk.
+
+### 13. "Untitled" (deaZxz): counter-rotating petal mandala
+
+A white layered petal/flower mandala with gray outlines on pale pink, soft and
+organic, like a blooming flower seen from above. p5.js: a Shape class stores
+points in Cartesian coordinates but caches their polar transform so rotation and
+scale apply cheaply; shapes drawn with beginShape/curveVertex. Four concentric
+layers (center blob, then 6, 9, 15 petal copies at even angular steps, scaled
+1.1/1.4/1.8). The translucent pale-pink background [242,225,222,150] is drawn
+with alpha each frame, so motion leaves trails. The three petal layers rotate at
+different speeds (0.0035/0.0051/0.0064 rad/frame), counter-rotating. White-filled
+petals, gray/black 1.4px outlines, centered 520px canvas, no interaction.
+
+**Takeaway:** counter-rotation at irrational-ish speed ratios is what keeps a
+mandala from locking into a periodic flipbook. Alpha background redraw is the
+same trail trick as Abstract Vegetation, here serving smoothness rather than
+history.
+
+### 14-17. The "polygon slicing" series (WzojLb, ZxLajX, NYoNJq, JLNOvr)
+
+An interactive instrument built in public, four iterations. The engine is
+constant: a seeded polygon, a click-drag defining a line, segment-segment
+intersection tests against every polygon edge, and bisection of each polygon hit
+by exactly two intersections. Rendering is what evolves:
+
+- **WzojLb "polygon slicing":** the minimal prototype. Plain white square with
+  thin black border on crimson (190,50,70); default p5 white fill/black stroke,
+  raw vertex() rendering, no smoothing, no coloring. A dark-red drag line shows
+  while the mouse is pressed.
+- **ZxLajX "polygon slicing (2)":** adds craft. Each piece's vertices inset
+  slightly toward the polygon centroid (0.98/0.02 blend); pieces filled with a
+  near-white rose tint varying subtly per piece (220,200,200 plus a sin wobble).
+  Crimson ground, pale-rose square, "Click + Drag..." hint on canvas.
+- **NYoNJq "Polygon Slicing 6 (circle)":** seeds a 120-vertex circle instead of
+  a quad, renders as an open unfilled stroke with double Chaikin smoothing.
+  Adds a dat.GUI S1 slider (0.51-0.99, default 0.95) controlling the smoothing
+  factor live. Gray background, dark desaturated-green stroke; the most minimal
+  composition of the four.
+- **JLNOvr "polygon slicing (5) cell division":** the richest. Vertices pulled
+  slightly toward centroid, then smoothed with two passes of Chaikin-style corner
+  cutting and drawn with curveVertex into blobby forms; two passes draw outer
+  salmon layer (240,120,120 with sin wobble) over an inner rose layer
+  (180,40,70,180). Burnt-sienna background [122,44,28]; cells read as
+  microscopic cell-division slides. Subtle sine "breathing" wobble each frame,
+  so cuts accumulate on a living form.
+
+**Takeaway:** publish the series, not just the best version. Four pens trace one
+engine from raw prototype to polished instrument, and the trail teaches more
+than any single piece. For our own work: Chaikin corner-cutting plus centroid
+pull is the fastest route from angular generated geometry to organic blobby
+forms, and exposing one tuning parameter (the smoothing slider) turns a demo
+into an instrument.
 
 ## Cross-cutting observations
 
