@@ -1,6 +1,54 @@
 # Matt DesLauriers: Study Notes
 
-**Site:** mattdesl.com / x.com/mattdesl | **Key works:** Meridian (2021, 1000 outputs), FOLIO (2022), color-wander, canvas-sketch toolkit
+**Site:** mattdesl.com | **Key works:** Meridian (2021, 1000 outputs), FOLIO (2022),
+color-wander, canvas-sketch toolkit, tiny-artblocks scaffold
+
+**2026-09-20 visual pass (deep):** 3 Meridian outputs inspected at full res
+(tokens 53000414, 53000100, 53000160 via artblocks media), 1 FOLIO output
+(token 8000034 via artblocks media), mattdesl.com works index read in full,
+tiny-artblocks repo README read in full (incl. PRNG discussion).
+
+## What the work actually looks like (visual findings)
+
+### Meridian — three distinct registers across outputs
+1. **Sparse sketch register:** thin jittered strokes, lots of white, landform
+   reads as faint embroidery; strokes follow terrain flow lines and simply stop
+   at region edges, leaving ragged, frayed boundaries. White voids inside the
+   landform where the stroke field thins — the void is part of the composition.
+2. **Dense quilt register:** saturated strata bands (teal/pink/ochre/rust),
+   strokes packed tight, edges crisp where a color band meets the next; reads
+   almost like woven textile.
+3. **Prismatic register:** explosive near-primary color blocks (blue, orange,
+   magenta, green) with heavy ink weight, strokes nearly black in overlap
+   zones; the overlap darkening is load-bearing for the depth illusion.
+
+**Construction details that matter:**
+- Strokes are short, straight-ish dashes, each with slightly varied color and
+  alpha; neighboring strokes in one band share a base hue that drifts slowly —
+  the banding is the macro-shape, the jitter is the micro-life.
+- Overlap zones go dark. No explicit shading; density IS shading.
+- Background is paper-white, never tinted; the piece sits inside generous
+  margins, like a print on a sheet.
+- The landform is a tilted plane (isometric-ish) with a thin baseline slab;
+  the composition floats, never bleeds to the edge.
+
+### FOLIO (token 8000034)
+- Exactly as described: ONLY typographic glyphs — parentheses, colons, dashes,
+  percent signs, brackets — packed into clean rectangular bins. Black glyphs
+  on white, no color at all in this output.
+- Bins vary in mark density: dashed-line bins, solid-dot bins, parenthesis bins;
+  composition reads as a concrete-poetry page. The bin edges are razor sharp —
+  glyphs are clipped at boundaries, not allowed to leak.
+- This is the strongest "constraint as engine" example in his body of work:
+  no strokes, no curves, no color, yet unmistakably composed.
+
+### Workflow (tiny-artblocks)
+- canvas-sketch-descended scaffold: seeded PRNG as first-class citizen
+  (MurmurHash → PCG; notes that xorshift128 is probably enough for most art),
+  live reload, byte-size reporting on every build, code-golf tips as docs.
+- The practice treats the toolchain as part of the artwork: reproducibility
+  (hash → output) is a design feature, not an engineering afterthought.
+  Meridian itself is only ~15kb of JS.
 
 ## Core techniques
 
