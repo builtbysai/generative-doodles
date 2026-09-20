@@ -1,9 +1,8 @@
-# scorch: Study Notes (17 pens deep, more to come)
+# scorch: Study Notes (26 pens deep, complete)
 
 **Profile:** codepen.io/scorch | Prolific generative sketch artist, many genuary entries
-**Status:** 17 pens visually inspected live with JS read (2026-09-20, three passes).
-Technique summaries below. Remaining plan-list pens for a later pass: jZeVGN,
-KQGwOL, jZvqrO, yPaaoG, YrgWYQ, JrzKEG, MExeWZ, mBoPpV, NpogGr.
+**Status:** all 26 plan-list pens visually inspected live with JS read (2026-09-20,
+four passes). Technique summaries below.
 
 ## Style profile
 
@@ -205,6 +204,97 @@ pull is the fastest route from angular generated geometry to organic blobby
 forms, and exposing one tuning parameter (the smoothing slider) turns a demo
 into an instrument.
 
+## Batch 4 (2026-09-20, fourth live pass): the last 9 pens
+
+### 18. "Untitled" (jZeVGN): Twig radial sea-urchin
+
+p5.js. 47 "Twig" strands radiate from canvas center; each strand is a chain of
+points walking outward along Perlin noise angles, with random jitter and an
+inverse-square mouse repulsion (800000/(dx^2+dy^2)) that bends strands away from
+the cursor. Each strand renders as a filled ribbon: two offset polylines stitched
+with curveVertex in dark fill (47) on warm beige (220,210,200), plus a small
+circle at each tip. A central blob is built by joining all strand base points
+with curveVertex and filling it. Strands slowly rotate (angle drift 0.003/frame)
+with jitter and live mouse bending. Sings: organic hand-drawn feel, smooth
+ribbon rendering, strong beige/black contrast. Weak: one composition repeated
+frame to frame, uniform tips, and the blob can read as a blob rather than a
+flower head.
+
+### 19. "Untitled" (KQGwOL): the same Twig engine, breathing
+
+Visually near-identical to #18 in a still frame. Code differences: a conf object
+(NUM_PARTICLES 8, NUM_STRANDS 12, FRAME_RATE 120), frameRate(120), and a global
+sine cycle (c/cS) added to the mouse force so the strands slowly breathe in and
+out over roughly 200-second cycles. Strength: smoother 120fps motion. Weakness:
+a duplicate study of #18, and the config object looks vestigial (fields like
+NUM_PARTICLES and NUM_STRANDS appear unused in the visible code).
+
+### 20. "Untitled" (jZvqrO): Twig spears
+
+Same engine, but strand width 2.4, no tip dots, and the final segment of each
+strand swells (w=(w+1)*1.4), so each strand tapers into a spear or leaf tip. Reads
+as a dandelion or pincushion starburst. Keeps the 120fps and sine breathing from
+#19. Sharper silhouette and confident botanical linework. Weak: thick strands
+pile into visual noise near the center, and the central blob is less elegant
+without the tip dots.
+
+### 21. "#Codevember 6: Storm" (yPaaoG): lightning via midpoint displacement
+
+Raw Canvas 2D, three layered canvases composited with 'screen' blend. The bolt is
+classic midpoint displacement: 8 subdivision iterations between two endpoints,
+each new midpoint offset perpendicular by a random amount with decreasing range
+200/(i*i+1). The bolt strokes in flickering blue-violet hsla (hue around 238)
+with width modulated by sin/cos of the frame step; every frame applies a
+full-canvas blur plus a translucent background fill, giving phosphor-like fading
+trails. Soft dark cloud blobs drift on a second layer. Interaction: mousemove
+moves one endpoint, mousedown moves the other, and endpoints auto re-seed at
+random. Palette: near-black teal (13,27,34) with a blue-violet bolt. Strengths:
+genuinely stochastic bolt geometry, atmospheric glow, good layered compositing.
+Weaknesses: the bolt sometimes exits the frame awkwardly, the clouds are crude
+blobs, and heavy trailing can smear into murk.
+
+### 22-25. The "experiment 992" DOM-grid series (no canvas at all)
+
+Four pens share one trick: 400 DOM divs in a 20x20 grid, animated purely with
+CSS. Each cell is a dark rounded square whose half-fill is a linear-gradient
+rotated by the atan2 angle from a pointer point, plus a global cosine wave over
+120 frames that animates fill heights and slight rotation. The result is a vortex
+of half-filled squares rippling in concentric waves around the cursor,
+near-black cells on off-white (#f4f4f4). Crisp, mesmerizing moire motion that is
+cheap and smooth to render; but DOM-heavy, and at rest it is just a static grid,
+so the effect only lives under mouse movement.
+
+- **YrgWYQ "experiment 992-Br":** the half-fill squares described above.
+- **JrzKEG "experiment 992-Fp":** same engine in blue (#28a); the gradient fill
+  is vertical with the blue band positioned by cos(distance/170) plus the global
+  wave, so columns of blue bars rise and fall in concentric waves radiating from
+  the pointer, like an equalizer or waterfall. Clean and hypnotic, but the bars
+  vary in only one dimension, so less dynamic range than its sibling.
+- **MExeWZ "experiment 992-Pk":** each cell shows a diagonal stripe via a rotated
+  linear-gradient (transparent 30%, #333 from 30.5% to 70%), producing
+  parallelogram blades that all point at the cursor, like a school of fish or
+  compass needles. Strong directional field, elegant vortex, minimal and graphic.
+  Weakness: stripe clipping at cell edges can look choppy at some angles.
+- **mBoPpV "experiment 992-[Beethoven]":** 600 divs at 60px cells; each cell a
+  hard diagonal split (linear-gradient at the pointer angle, #333 50%, #f4f4f4
+  50.5%) making two-tone triangle cells, a bold Op-Art pinwheel vortex radiating
+  from the pointer (default focus at 150,150). High-contrast and very hypnotic
+  under motion. Weaknesses: 600-node DOM is heavy, visible aliasing on the
+  diagonal edges, strictly monochrome which limits depth.
+
+### 26. "Zap zap" (NpogGr): plasma ribbons
+
+Single canvas on setInterval(animate, 60ms). Each tick draws one
+midpoint-displacement arc (8 iterations, the same 200/(i*i+1) falloff as the
+Storm pen) between pt1, which follows the mousemove, and pt2, set on mousedown.
+Stroke hue cycles with sin(step/30)*120+50 at 90% saturation, 70% lightness.
+Each frame starts with a blur and a 0.17 fade, so past arcs linger as ghost
+filaments; the live view shows a stream of neon yellow-green electric ribbons
+sweeping across the dark teal field. Lovely plasma-ribbon motion, the trails
+make arc history visible, and the code is simple and effective. Weaknesses: one
+arc per tick can feel sparse, the hue cycle passes through muddy greens, and
+nothing on the page hints that it is interactive.
+
 ## Cross-cutting observations
 
 - Seeded random is a habit across the stronger pens. Reproducibility lets a good
@@ -214,3 +304,14 @@ into an instrument.
 - Scorch reuses scaffolds with one parameter changed (the two "lines" pens, the
   two "cpc-generative-blocks" pens). A small series from one scaffold is a
   legitimate format, not a shortcut.
+- The final 9 pens add two more series to that point: three Twig radial pens
+  and four "experiment 992" DOM-grid pens. Across the whole body of work, the
+  series itself is the signature device: vary one parameter, publish the
+  family.
+- Pointer-driven CSS gradient fields (the experiment 992 trick: atan2-rotated
+  linear-gradients on divs, global cosine wave) are a legitimate generative
+  technique with zero canvas code. GPU-cheap, smooth, and sharp; the tradeoff
+  is DOM weight and no idle-state composition.
+- Midpoint-displacement lightning recipe worth stealing: 8 iterations,
+  200/(i*i+1) offset falloff, each frame a blur plus a translucent fade for
+  phosphor trails, composited 'screen' over drifting background layers.
