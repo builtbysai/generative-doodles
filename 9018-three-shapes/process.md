@@ -1,6 +1,6 @@
-# Doodle №9017: Three Shapes (2026-09-19)
+# Doodle №9018: Three Shapes (2026-09-19)
 
-**File:** `9017-three-shapes/index.html` (self-contained, vanilla canvas, no dependencies)
+**File:** `9018-three-shapes/index.html` (self-contained, vanilla canvas, no dependencies)
 
 ## Concept
 A tangent chain: each new shape sits tangent to the last, the chain wandering
@@ -17,7 +17,7 @@ part of the piece. Two muted inks on paper, one translucent accent fill.
   shapes, warm taupe construction lines, paper-white ground
 - **Overlap-transparency accent**, Zitzmann's rosette trick: one shape gets a
   translucent terracotta fill, layering doing the color work
-- **Grain pass + vignette**, the print finish from №9016's lessons, kept subtle
+- **Grain pass + vignette**, the print finish from №9017's lessons, kept subtle
 
 ## Parameters
 - 7-10 shapes, seeded PRNG (mulberry32), `?seed=` in URL or click for new variation

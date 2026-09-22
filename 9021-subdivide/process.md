@@ -1,4 +1,4 @@
-# Doodle №9020: Subdivide (2026-09-22)
+# Doodle №9021: Subdivide (2026-09-22)
 
 **File:** `005-subdivide/index.html` (self-contained, vanilla canvas, no dependencies)
 
@@ -8,7 +8,7 @@ Recursive subdivision with jittered split ratios, occasional terminal diagonal
 cuts, and nine fill treatments: paper, hatch, crosshatch, stipple, dot grid,
 solid ink, solid accent, rings, waves. One dominant accent plus a rare second
 per piece, drawn from an earthy set (rust, ochre, indigo, teal, plum); accent
-solids get a slight misregistration slip past the ink line, a nod to №9018's
+solids get a slight misregistration slip past the ink line, a nod to №9019's
 print voice. Mondrian-adjacent in method only: the voice here is texture,
 hand-wobbled ink lines, and the odd diagonal.
 

@@ -1,6 +1,6 @@
-# Doodle №9015: Interference (2026-09-17)
+# Doodle №9016: Interference (2026-09-17)
 
-**File:** `9015-interference/index.html` (self-contained, vanilla canvas, no dependencies)
+**File:** `9016-interference/index.html` (self-contained, vanilla canvas, no dependencies)
 
 ## Concept
 Two or three wheels of fine lines turn at different speeds on paper, and where

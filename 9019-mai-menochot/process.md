@@ -1,6 +1,6 @@
-# Doodle №9018: Mai Menochot (2026-09-20)
+# Doodle №9019: Mai Menochot (2026-09-20)
 
-**File:** `9018-mai-menochot/index.html` (self-contained, vanilla canvas, no dependencies)
+**File:** `9019-mai-menochot/index.html` (self-contained, vanilla canvas, no dependencies)
 
 ## Concept
 A letterpress misprint of a rising sun. Two passes of ink build a sun over a
@@ -20,7 +20,7 @@ as a found print, not a digital render.
   ink+accent pairings (black+rust, indigo+ochre, green+brick) on one cream paper.
 - **Print-object framing**: print area floats on the sheet with plate mark,
   wobbly edge bleed, generous margins.
-- **Grain pass + vignette**, carried over from №9016's print logic.
+- **Grain pass + vignette**, carried over from №9017's print logic.
 
 ## Parameters
 - Seeded PRNG (mulberry32), `?seed=` in URL or click for new variation

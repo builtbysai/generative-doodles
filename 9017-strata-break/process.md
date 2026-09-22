@@ -1,4 +1,4 @@
-# Doodle №9016: Strata Break (2026-09-18)
+# Doodle №9017: Strata Break (2026-09-18)
 
 **File:** `doodles/001-strata-break.html` (self-contained, vanilla canvas, no dependencies)
 

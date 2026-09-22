@@ -1,6 +1,6 @@
-# Doodle №9019: Contour Fields (2026-09-21)
+# Doodle №9020: Contour Fields (2026-09-21)
 
-**File:** `9019-contour-fields/index.html` (self-contained, vanilla canvas, no dependencies)
+**File:** `9020-contour-fields/index.html` (self-contained, vanilla canvas, no dependencies)
 
 ## Concept
 Imaginary terrain traced one contour at a time. A domain-warped noise field
@@ -17,7 +17,7 @@ slightly darker, like a real topo sheet.
   three alpha buckets per level for fast canvas draws.
 - **Monochrome ink discipline** (Hoff): one ink on one paper, density as tone.
 - **Hand-drawn perturbation**: positional noise wobble plus random ink skips,
-  the same print-object grain/vignette finish carried over from №9018.
+  the same print-object grain/vignette finish carried over from №9019.
 - **Quiet framing**: a single wobbly hairline frame, generous margins.
 
 ## Parameters
