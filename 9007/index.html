@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Old Courses — Generative Doodles №9007</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; overflow:hidden; background:#d9c9a3; }
+  canvas { display:block; width:100vw; height:100vh; cursor:pointer; }
+</style>
+</head>
+<body>
+<canvas id="map"></canvas>
+<script>
+"use strict";
+/* Doodle №9007 — "Old Courses" (2026-09-08)
+   A fictional antique survey plate of a river that never existed.
+   A guide line becomes a river; each point migrates by a blend of its
+   tangent and a curvature-weighted outward bitangent (after Robert Hodgin's
+   Meander engine, re-derived in a local study); near self-collisions pinch
+   off oxbow lakes; past channel positions accumulate as numbered historical
+   stages, Fisk-plate style. Click for another survey. */
+
+const q = new URLSearchParams(location.search);
+let SEED = parseInt(q.get('seed') || '867530', 10) >>> 0;
+
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296};}
+const TAU = Math.PI*2;
+
+/* ---------------- river simulation (virtual 1200x900 space) ---------------- */
+const VW=1200, VH=900, NPTS=320;
+const SIM_YEARS=585, EPOCH_EVERY=45;
+
+function resampleFixed(pts,n){
+  const cum=[0];
+  for(let i=1;i<pts.length;i++) cum.push(cum[i-1]+Math.hypot(pts[i].x-pts[i-1].x,pts[i].y-pts[i-1].y));
+  const total=cum[cum.length-1], out=[{x:pts[0].x,y:pts[0].y}];
+  let j=1;
+  for(let k=1;k<n-1;k++){
+    const s=total*k/(n-1);
+    while(j<cum.length-1 && cum[j]<s) j++;
+    const s0=cum[j-1], s1=cum[j], t=s1>s0?(s-s0)/(s1-s0):0;
+    out.push({x:pts[j-1].x+(pts[j].x-pts[j-1].x)*t, y:pts[j-1].y+(pts[j].y-pts[j-1].y)*t});
+  }
+  out.push({x:pts[pts.length-1].x, y:pts[pts.length-1].y});
+  return out;
+}
+function laplacian(pts,f){
+  const n=pts.length, out=new Array(n);
+  out[0]={x:pts[0].x,y:pts[0].y}; out[n-1]={x:pts[n-1].x,y:pts[n-1].y};
+  for(let i=1;i<n-1;i++){
+    const a=pts[i-1], b=pts[i+1], p=pts[i];
+    out[i]={x:p.x+((a.x+b.x)/2-p.x)*f, y:p.y+((a.y+b.y)/2-p.y)*f};
+  }
+  return out;
+}
+function lakeExtent(L){
+  let x0=1e9,x1=-1e9,y0=1e9,y1=-1e9;
+  for(const p of L.pts){x0=Math.min(x0,p.x);x1=Math.max(x1,p.x);y0=Math.min(y0,p.y);y1=Math.max(y1,p.y);}
+  return Math.max(x1-x0,y1-y0);
+}
+
+class River{
+  constructor(seed){
+    this.seed=seed; this.rand=mulberry32(seed);
+    this.width=17;
+    this.guide=this.makeGuide();
+    this.pts=this.guide.map(p=>({x:p.x,y:p.y}));
+    this.year=0; this.epochs=[]; this.lakes=[];
+    this.wT=0.3; this.wB=0.7; this.stepScale=3.2;
+    this.kRef=1/(7*this.width);
+  }
+  makeGuide(){
+    const r=this.rand, pts=[];
+    const p1=r()*TAU, a1=0.11+r()*0.07;
+    for(let i=0;i<NPTS;i++){
+      const t=i/(NPTS-1);
+      pts.push({
+        x: VW*(0.06+0.88*t),
+        y: VH*(0.52 + a1*Math.sin(t*TAU+p1) + 0.008*Math.sin(t*TAU*3+p1*2))
+      });
+    }
+    for(let i=2;i<NPTS-2;i++) pts[i].y += (r()-0.5)*6;
+    return pts;
+  }
+  guideY(x){
+    const g=this.guide;
+    if(x<=g[0].x) return g[0].y;
+    if(x>=g[g.length-1].x) return g[g.length-1].y;
+    let lo=0, hi=g.length-1;
+    while(hi-lo>1){ const m=(lo+hi)>>1; if(g[m].x<x) lo=m; else hi=m; }
+    const t=(x-g[lo].x)/(g[hi].x-g[lo].x);
+    return g[lo].y+(g[hi].y-g[lo].y)*t;
+  }
+  step(){
+    const pts=this.pts, n=pts.length, r=this.rand;
+    // curvature field, neighborhood-smoothed so long wavelengths win
+    const kraw=new Array(n), crossArr=new Array(n);
+    for(let i=0;i<n;i++){
+      const p0=pts[Math.max(0,i-1)], p2=pts[Math.min(n-1,i+1)], p=pts[i];
+      const v1x=p.x-p0.x, v1y=p.y-p0.y, v2x=p2.x-p.x, v2y=p2.y-p.y;
+      const l1=Math.hypot(v1x,v1y)||1, l2=Math.hypot(v2x,v2y)||1;
+      const cross=(v1x*v2y-v1y*v2x)/(l1*l2);
+      crossArr[i]=cross;
+      kraw[i]=Math.abs(cross)/((l1+l2)/2);
+    }
+    const ksm=new Array(n);
+    for(let i=0;i<n;i++){
+      let a=0,c=0;
+      for(let j=-9;j<=9;j++){ const jj=Math.min(n-1,Math.max(0,i+j)); a+=kraw[jj]; c++; }
+      ksm[i]=a/c;
+    }
+    const sp=Math.hypot(pts[n-1].x-pts[0].x,pts[n-1].y-pts[0].y)/(n-1);
+    const maxD=sp*0.5;
+    for(let i=1;i<n-1;i++){
+      const p0=pts[i-1], p2=pts[Math.min(n-1,i+1)], p=pts[i];
+      let tx=p2.x-p0.x, ty=p2.y-p0.y;
+      const tl=Math.hypot(tx,ty)||1; tx/=tl; ty/=tl;
+      const cross=crossArr[i];
+      const kk=(ksm[i]/this.kRef)/(1+ksm[i]/this.kRef); // saturated outward push
+      const nx=-ty, ny=tx, side=cross>0?-1:1;          // outside of the bend
+      let vx=(tx*this.wT + nx*side*kk*this.wB)*this.stepScale;
+      let vy=(ty*this.wT + ny*side*kk*this.wB)*this.stepScale;
+      const dl=Math.hypot(vx,vy);
+      if(dl>maxD){ vx*=maxD/dl; vy*=maxD/dl; }
+      p.x+=vx+(r()-0.5)*0.4;
+      p.y+=vy+(r()-0.5)*0.4;
+      p.y+=(this.guideY(p.x)-p.y)*0.006;               // the valley holds it
+    }
+    this.pts=laplacian(this.pts,0.3);
+    this.pts=resampleFixed(this.pts,NPTS);
+    this.tryCutoff();
+    for(const L of this.lakes){
+      L.age++;
+      const c=L.centroid;
+      for(const p of L.pts){ p.x=c.x+(p.x-c.x)*0.9975; p.y=c.y+(p.y-c.y)*0.9975; }
+    }
+    this.lakes=this.lakes.filter(L=>L.age<520 && lakeExtent(L)>this.width*1.4);
+    this.year++;
+    if(this.year%EPOCH_EVERY===0) this.epochs.push(this.pts.map(p=>({x:p.x,y:p.y})));
+  }
+  tryCutoff(){
+    const pts=this.pts, n=pts.length, w=this.width;
+    const minSep=80, thresh=w*0.55;
+    let bi=-1,bj=-1,bd=1e9;
+    for(let i=2;i<n-minSep;i+=2){
+      for(let j=i+minSep;j<n-2;j+=2){
+        const dx=pts[i].x-pts[j].x, dy=pts[i].y-pts[j].y, d=dx*dx+dy*dy;
+        if(d<bd){ bd=d; bi=i; bj=j; }
+      }
+    }
+    if(bi>0 && bd<thresh*thresh){
+      const lakePts=pts.slice(bi,bj+1).map(p=>({x:p.x,y:p.y}));
+      let cx=0,cy=0;
+      for(const p of lakePts){ cx+=p.x; cy+=p.y; }
+      cx/=lakePts.length; cy/=lakePts.length;
+      this.lakes.push({pts:lakePts, age:0, centroid:{x:cx,y:cy}, bornEpoch:this.epochs.length});
+      this.pts=resampleFixed(pts.slice(0,bi+1).concat(pts.slice(bj)),NPTS);
+    }
+  }
+  run(){
+    for(let y=0;y<SIM_YEARS;y++) this.step();
+  }
+  bounds(){
+    let x0=1e9,x1=-1e9,y0=1e9,y1=-1e9;
+    const eat=p=>{x0=Math.min(x0,p.x);x1=Math.max(x1,p.x);y0=Math.min(y0,p.y);y1=Math.max(y1,p.y);};
+    for(const e of this.epochs) for(const p of e) eat(p);
+    for(const L of this.lakes) for(const p of L.pts) eat(p);
+    for(const p of this.pts) eat(p);
+    return {x0,x1,y0,y1};
+  }
+}
+
+/* ---------------- names ---------------- */
+const PRE=['Ash','Briar','Cinder','Dun','Elder','Fen','Gale','Har','Kestrel','Lark','Moss','Nettle','Osier','Pike','Quill','Rook','Sedge','Thorn','Wren','Alder','Birch','Ember','Flint','Grouse','Heath','Juniper','Loon','Marrow','Newt','Otter','Reed','Sorrel','Yarrow'];
+const MID=['ford','wick','moor','dale','brook','holt','shaw','mere','combe','fell','thorpe','stead','ham','ley','den'];
+const TYPES=['Marsh','Summit','Overlook','Coulee','Hill','Mountain','Lake','Bend','Bluff','Fen','Ford','Ridge'];
+function placename(r){
+  return (PRE[(r()*PRE.length)|0] + MID[(r()*MID.length)|0]).toUpperCase();
+}
+
+/* ---------------- palette ---------------- */
+const PAPER='#e9dcbb', INK='#3a2f22', FAINT='#6b5a3e';
+const EPOCH=['#7d8fa3','#8ba888','#c9a227','#b5651d','#5e8b7e','#a26769','#d4a373',
+             '#6a994e','#bc6c25','#6e8fa8','#c1666b','#94a187','#8a7f9e'];
+const CHANNEL='#f4ecda';
+
+/* ---------------- map ---------------- */
+const canvas=document.getElementById('map');
+const ctx=canvas.getContext('2d');
+let river=null, terrain=null, riverName='', labels=[], surveyed='';
+let VW_PX=0, VH_PX=0, DPR=1;
+
+function spacedText(c,text,x,y,ls,align){
+  c.save();
+  c.textAlign='left'; c.textBaseline='alphabetic';
+  const widths=[...text].map(ch=>c.measureText(ch).width);
+  const total=widths.reduce((a,b)=>a+b,0)+ls*(text.length-1);
+  let sx = align==='center' ? x-total/2 : (align==='right' ? x-total : x);
+  [...text].forEach((ch,i)=>{ c.fillText(ch,sx,y); sx+=widths[i]+ls; });
+  c.restore();
+}
+
+function buildTerrain(seed, w, h){
+  const r=mulberry32(seed^0x9e3779b9);
+  const dots=[];
+  for(let i=0;i<2600;i++) dots.push({x:r()*w, y:r()*h, a:0.04+r()*0.05, s:0.8+r()*1.2});
+  const contours=[];
+  for(let c=0;c<16;c++){
+    const cx=r()*w, cy=r()*h, base=30+r()*70, pts=[];
+    const wob1=r()*TAU, wob2=r()*TAU, f1=2+((r()*3)|0), f2=3+((r()*4)|0);
+    for(let i=0;i<=64;i++){
+      const t=i/64*TAU;
+      const rad=base*(1+0.28*Math.sin(t*f1+wob1)+0.14*Math.sin(t*f2+wob2));
+      pts.push({x:cx+Math.cos(t)*rad*1.4, y:cy+Math.sin(t)*rad*0.9});
+    }
+    contours.push({pts, a:0.05+r()*0.05});
+  }
+  const parcels=[];
+  for(let i=0;i<7;i++){
+    const x0=r()*w, y0=r()*h, ang=r()*TAU, len=200+r()*500, pts=[];
+    for(let s=0;s<=20;s++){
+      const d=s/20*len;
+      pts.push({x:x0+Math.cos(ang)*d+(r()-0.5)*8, y:y0+Math.sin(ang)*d+(r()-0.5)*8});
+    }
+    parcels.push({pts, a:0.06+r()*0.05});
+  }
+  return {dots, contours, parcels};
+}
+
+function ribbonPath(c,pts,w){
+  const n=pts.length, L=[], R=[];
+  for(let i=0;i<n;i++){
+    const a=pts[Math.max(0,i-1)], b=pts[Math.min(n-1,i+1)];
+    let tx=b.x-a.x, ty=b.y-a.y;
+    const l=Math.hypot(tx,ty)||1; tx/=l; ty/=l;
+    L.push({x:pts[i].x-ty*w/2, y:pts[i].y+tx*w/2});
+    R.push({x:pts[i].x+ty*w/2, y:pts[i].y-tx*w/2});
+  }
+  c.beginPath();
+  c.moveTo(L[0].x,L[0].y);
+  for(const p of L) c.lineTo(p.x,p.y);
+  for(let i=R.length-1;i>=0;i--) c.lineTo(R[i].x,R[i].y);
+  c.closePath();
+}
+
+function survey(){
+  river=new River(SEED);
+  river.run();
+  const r=mulberry32(SEED^0x77aa);
+  riverName=placename(r)+' RIVER';
+  surveyed='SURVEYED '+(1800+((SEED>>3)%120))+'  ·  PLATE № '+(((SEED>>7)%86)+10);
+  labels=[];
+  for(let i=0;i<10;i++) labels.push(placename(r)+' '+TYPES[(r()*TYPES.length)|0]);
+  terrain=buildTerrain(SEED, VW, VH);
+}
+
+function draw(){
+  const w=VW_PX, h=VH_PX;
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+  // paper
+  ctx.fillStyle=PAPER; ctx.fillRect(0,0,w,h);
+  const pr=mulberry32(SEED^0x1234);
+  for(let i=0;i<3;i++){ // stains
+    const gx=pr()*w, gy=pr()*h, gr=(0.25+pr()*0.3)*Math.max(w,h);
+    const g=ctx.createRadialGradient(gx,gy,0,gx,gy,gr);
+    g.addColorStop(0,'rgba(150,110,60,0.05)'); g.addColorStop(1,'rgba(150,110,60,0)');
+    ctx.fillStyle=g; ctx.fillRect(0,0,w,h);
+  }
+  ctx.strokeStyle='rgba(120,95,55,0.05)'; ctx.lineWidth=1;
+  for(let i=0;i<900;i++){ // fibers
+    const x=pr()*w, y=pr()*h, a=pr()*TAU, l=2+pr()*5;
+    ctx.beginPath(); ctx.moveTo(x,y); ctx.lineTo(x+Math.cos(a)*l,y+Math.sin(a)*l); ctx.stroke();
+  }
+  const m=Math.max(14, Math.min(w,h)*0.038);
+  const small=Math.min(w,h)<520;
+  const pad=small?10:18;
+  const frame={x:m, y:m, w:w-2*m, h:h-2*m};
+  // map area: frame minus title band, legend, paddings
+  let titleH, mapR, legend;
+  if(!small){
+    titleH=96;
+    const legW=112;
+    mapR={x:frame.x+pad, y:frame.y+titleH, w:frame.w-2*pad-legW-8, h:frame.h-titleH-pad-66};
+    legend={kind:'side', x:frame.x+frame.w-pad-legW+8, y:mapR.y, w:legW-8, h:mapR.h};
+  } else {
+    titleH=78;
+    const legH=52, bottomBand=92;
+    mapR={x:frame.x+pad, y:frame.y+titleH, w:frame.w-2*pad, h:frame.h-titleH-bottomBand-legH};
+    legend={kind:'strip', x:frame.x+pad, y:frame.y+frame.h-bottomBand-legH, w:frame.w-2*pad, h:legH};
+  }
+
+  // terrain (faint, under everything, clipped to frame)
+  ctx.save();
+  ctx.beginPath(); ctx.rect(frame.x+8,frame.y+8,frame.w-16,frame.h-16); ctx.clip();
+  const tS=Math.min(mapR.w/VW, mapR.h/VH);
+  const tX=mapR.x+(mapR.w-VW*tS)/2, tY=mapR.y+(mapR.h-VH*tS)/2;
+  ctx.save();
+  ctx.translate(tX,tY); ctx.scale(tS,tS);
+  ctx.fillStyle=FAINT;
+  for(const d of terrain.dots){ ctx.globalAlpha=d.a; ctx.fillRect(d.x,d.y,d.s,d.s); }
+  ctx.globalAlpha=1; ctx.strokeStyle=FAINT; ctx.lineWidth=1.2/tS;
+  for(const c of terrain.contours){
+    ctx.globalAlpha=c.a; ctx.beginPath();
+    c.pts.forEach((p,i)=> i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y));
+    ctx.closePath(); ctx.stroke();
+  }
+  for(const p of terrain.parcels){
+    ctx.globalAlpha=p.a; ctx.beginPath();
+    p.pts.forEach((pt,i)=> i?ctx.lineTo(pt.x,pt.y):ctx.moveTo(pt.x,pt.y));
+    ctx.stroke();
+  }
+  ctx.globalAlpha=1;
+  ctx.restore();
+
+  // river: fit bounds into mapR
+  const b=river.bounds();
+  const bw=Math.max(1,b.x1-b.x0), bh=Math.max(1,b.y1-b.y0);
+  const s=Math.min(mapR.w/bw, mapR.h/bh)*0.88;
+  const ox=mapR.x+(mapR.w-bw*s)/2-b.x0*s, oy=mapR.y+(mapR.h-bh*s)/2-b.y0*s;
+  ctx.save();
+  ctx.translate(ox,oy); ctx.scale(s,s);
+  river.epochs.forEach((e,k)=>{
+    ctx.fillStyle=EPOCH[k%EPOCH.length];
+    ctx.globalAlpha=0.88;
+    ribbonPath(ctx,e,river.width*0.94); ctx.fill();
+  });
+  ctx.globalAlpha=1;
+  for(const L of river.lakes){
+    ctx.fillStyle=EPOCH[L.bornEpoch%EPOCH.length];
+    ribbonPath(ctx,L.pts,river.width*0.66); ctx.fill();
+    ctx.strokeStyle='rgba(58,47,34,0.55)'; ctx.lineWidth=1; ctx.stroke();
+  }
+  ribbonPath(ctx,river.pts,river.width);
+  ctx.fillStyle=CHANNEL; ctx.fill();
+  ctx.strokeStyle=INK; ctx.lineWidth=1.8; ctx.stroke();
+  ctx.restore();
+
+  // place names: screen-space, seeded, clear of the river on every viewport
+  {
+    const samp=[];
+    const push=(p)=>samp.push({x:ox+p.x*s, y:oy+p.y*s});
+    for(const e of river.epochs) for(let i=0;i<e.length;i+=6) push(e[i]);
+    for(const L of river.lakes) for(let i=0;i<L.pts.length;i+=4) push(L.pts[i]);
+    for(let i=0;i<river.pts.length;i+=6) push(river.pts[i]);
+    const lr=mulberry32(SEED^0x51ab3);
+    const fs=small?10:12.5, placed=[];
+    for(const nm of labels){
+      if(placed.length>=8) break;
+      const hw=nm.length*fs*0.32;
+      let bx=0,by=0,ok=false;
+      for(let a=0;a<120 && !ok;a++){
+        const x=mapR.x+8+hw+lr()*Math.max(1,(mapR.w-16-2*hw)), y=mapR.y+14+lr()*(mapR.h-28);
+        ok=true;
+        for(const sx of [x-hw,x,x+hw]){
+          for(let i=0;i<samp.length;i+=4){
+            const p=samp[i];
+            if(Math.hypot(p.x-sx,p.y-y)<30){ ok=false; break; }
+          }
+          if(!ok) break;
+        }
+        if(ok) for(const o of placed){ if(Math.hypot(o.x-x,o.y-y)<46){ ok=false; break; } }
+        if(ok){ bx=x; by=y; }
+      }
+      if(ok) placed.push({x:bx,y:by,name:nm});
+    }
+    ctx.fillStyle=INK; ctx.globalAlpha=0.72;
+    ctx.font=`600 ${fs}px Georgia, "Times New Roman", serif`;
+    for(const L of placed) spacedText(ctx,L.name,L.x,L.y,2,'center');
+    ctx.globalAlpha=1;
+  }
+  ctx.restore(); // unclip
+
+  // frame: double rule
+  ctx.strokeStyle=INK; ctx.lineWidth=small?1.6:2.4;
+  ctx.strokeRect(frame.x,frame.y,frame.w,frame.h);
+  ctx.lineWidth=1;
+  ctx.strokeRect(frame.x+7,frame.y+7,frame.w-14,frame.h-14);
+  // graticule ticks
+  ctx.fillStyle=INK; ctx.globalAlpha=0.7;
+  const tick=(x,y,wt,ht)=>ctx.fillRect(x,y,wt,ht);
+  for(let gx=frame.x+60; gx<frame.x+frame.w-40; gx+=Math.max(60,frame.w/9)){
+    tick(gx,frame.y,1.5,7); tick(gx,frame.y+frame.h-7,1.5,7);
+  }
+  for(let gy=frame.y+60; gy<frame.y+frame.h-40; gy+=Math.max(60,frame.h/8)){
+    tick(frame.x,gy,7,1.5); tick(frame.x+frame.w-7,gy,7,1.5);
+  }
+  ctx.globalAlpha=1;
+
+  // title cartouche
+  ctx.fillStyle=INK; ctx.textBaseline='alphabetic';
+  const cx=frame.x+frame.w/2;
+  ctx.font=`${small?10:13}px Georgia, serif`;
+  spacedText(ctx,'ANCIENT COURSES',cx,frame.y+(small?26:44),small?4:8,'center');
+  ctx.font=`italic ${small?9:12}px Georgia, serif`;
+  spacedText(ctx,'of the',cx,frame.y+(small?40:64),3,'center');
+  ctx.font=`600 ${small?17:30}px Georgia, serif`;
+  spacedText(ctx,riverName,cx,frame.y+(small?62:96),small?2.5:5,'center');
+  ctx.font=`${small?8:10}px Georgia, serif`; ctx.globalAlpha=0.75;
+  spacedText(ctx,surveyed,cx,frame.y+frame.h-(small?34:40),2,'center');
+  ctx.globalAlpha=1;
+
+  // legend: stages of the channel
+  const n=river.epochs.length;
+  if(legend.kind==='side'){
+    const lx=legend.x, ly=legend.y;
+    ctx.font='11px Georgia, serif';
+    spacedText(ctx,'STAGES OF',lx+legend.w/2,ly+14,2,'center');
+    spacedText(ctx,'THE CHANNEL',lx+legend.w/2,ly+28,2,'center');
+    const rowH=(legend.h-64)/Math.max(1,n);
+    river.epochs.forEach((e,k)=>{
+      const yy=ly+50+k*rowH;
+      ctx.fillStyle=EPOCH[k%EPOCH.length];
+      ctx.fillRect(lx+6,yy-9,28,9);
+      ctx.strokeStyle=INK; ctx.lineWidth=0.75; ctx.strokeRect(lx+6,yy-9,28,9);
+      ctx.fillStyle=INK; ctx.font='11px Georgia, serif';
+      ctx.textAlign='left'; ctx.textBaseline='alphabetic';
+      ctx.fillText(String(k+1), lx+40, yy);
+    });
+  } else {
+    const lx=legend.x, ly=legend.y;
+    ctx.fillStyle=INK; ctx.font='9px Georgia, serif';
+    spacedText(ctx,'STAGES OF THE CHANNEL',lx,ly+11,1.5,'left');
+    const cellW=legend.w/Math.max(1,n);
+    river.epochs.forEach((e,k)=>{
+      const ccx=lx+cellW*k+cellW/2;
+      ctx.fillStyle=EPOCH[k%EPOCH.length];
+      ctx.fillRect(ccx-11,ly+18,22,9);
+      ctx.strokeStyle=INK; ctx.lineWidth=0.75; ctx.strokeRect(ccx-11,ly+18,22,9);
+      ctx.fillStyle=INK; ctx.font='8px Georgia, serif';
+      ctx.textAlign='center'; ctx.textBaseline='alphabetic';
+      ctx.fillText(String(k+1), ccx, ly+40);
+    });
+  }
+
+  // scale bar
+  const sbW=Math.min(220,frame.w*0.32), sbX=cx-sbW/2, sbY=frame.y+frame.h-(small?22:26);
+  const seg=sbW/5;
+  for(let i=0;i<5;i++){
+    ctx.fillStyle=i%2?PAPER:INK;
+    ctx.fillRect(sbX+i*seg,sbY,seg,5);
+    ctx.strokeStyle=INK; ctx.lineWidth=0.75; ctx.strokeRect(sbX+i*seg,sbY,seg,5);
+  }
+  ctx.fillStyle=INK; ctx.font=`${small?8:10}px Georgia, serif`;
+  spacedText(ctx,'0',sbX,sbY+16,0,'center');
+  spacedText(ctx,'5',cx,sbY+16,0,'center');
+  spacedText(ctx,'10 MILES',sbX+sbW,sbY+16,1,'center');
+
+  // hint
+  ctx.globalAlpha=0.55; ctx.font=`italic ${small?9:11}px Georgia, serif`;
+  if(!small) spacedText(ctx,'click for another survey',frame.x+frame.w-12,frame.y+22,1,'right');
+  else spacedText(ctx,'click for another survey',frame.x+10,frame.y+frame.h-8,1,'left');
+  ctx.globalAlpha=1;
+
+  // vignette
+  const vg=ctx.createRadialGradient(w/2,h/2,Math.min(w,h)*0.35,w/2,h/2,Math.max(w,h)*0.75);
+  vg.addColorStop(0,'rgba(60,40,15,0)'); vg.addColorStop(1,'rgba(60,40,15,0.14)');
+  ctx.fillStyle=vg; ctx.fillRect(0,0,w,h);
+}
+
+function resize(){
+  DPR=Math.min(2, window.devicePixelRatio||1);
+  VW_PX=window.innerWidth; VH_PX=window.innerHeight;
+  canvas.width=Math.round(VW_PX*DPR); canvas.height=Math.round(VH_PX*DPR);
+  draw();
+}
+
+canvas.addEventListener('click',()=>{
+  SEED=(Math.random()*0xffffffff)>>>0;
+  history.replaceState(null,'','?seed='+SEED);
+  survey();
+  draw();
+});
+let rzT=null;
+window.addEventListener('resize',()=>{ clearTimeout(rzT); rzT=setTimeout(resize,150); });
+
+survey();
+resize();
+</script>
+</body>
+</html>
