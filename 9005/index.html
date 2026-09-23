@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Nine Hundred Years · №9005</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#04070c; overflow:hidden; }
+  body { display:flex; align-items:center; justify-content:center; }
+  canvas {
+    display:block; cursor:pointer; touch-action:manipulation;
+    -webkit-tap-highlight-color:transparent; user-select:none; -webkit-user-select:none;
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<script>
+"use strict";
+/*
+ * №9005 — NINE HUNDRED YEARS
+ * A time-lapse of a river that never existed. The meander engine is a port of
+ * Robert Hodgin's "Meander" system (May 2020): each point on the channel is
+ * pushed each year by a blend of its tangent and a modified bitangent that
+ * points to the outside of the bend, scaled by the local curvature. Bends
+ * grow on their own, so the river is never drawn, only simulated.
+ * Stabilizers (saturated curvature response, long-wavelength smoothing,
+ * valley spring, displacement clamp, fixed-count resampling) keep the
+ * feedback from exploding. When the channel touches itself, the loop is cut
+ * off and becomes an oxbow lake that shrinks and cools over the years.
+ *
+ * Dev hooks (invisible in normal use):
+ *   ?seed=N    fixed seed
+ *   ?instant=1 run all 900 years at once, show the finished frame
+ *   ?toy=N     run N years at once, then hold (for mid-animation inspection)
+ *   ?square=1  square 900x900 layout (thumbnail renders)
+ */
+
+const Q = new URLSearchParams(location.search);
+const SQUARE = Q.get("square") === "1";
+const LW = SQUARE ? 900 : 1200;
+const LH = 900;
+const YEARS = 900;
+const NPTS = 320;
+const RUN_MS = 11500;              // full time-lapse duration, refresh-rate independent
+const EPOCH_EVERY = 90;            // snapshot cadence for the final strata pass
+const TRAIL_FADE = 0.0016;         // per-year phosphor decay on the accumulation layer
+
+/* ---------------- seeded rng ---------------- */
+function mulberry32(a){
+  return function(){
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+/* ---------------- meander engine (after Hodgin) ---------------- */
+function makeGuide(w, h, rand){
+  const pts = [];
+  const p1 = rand() * 6.28, a1 = 0.11 + rand() * 0.07;
+  for (let i = 0; i < NPTS; i++){
+    const t = i / (NPTS - 1);
+    const x = w * (0.06 + 0.88 * t);
+    const y = h * (0.52 + a1 * Math.sin(t * 6.28 + p1) + 0.008 * Math.sin(t * 6.28 * 3.0 + p1 * 2.0));
+    pts.push({x, y});
+  }
+  for (let i = 2; i < NPTS - 2; i++) pts[i].y += (rand() - 0.5) * 6;
+  return pts;
+}
+
+function resampleFixed(pts, n){
+  const cum = [0];
+  for (let i = 1; i < pts.length; i++)
+    cum.push(cum[i-1] + Math.hypot(pts[i].x - pts[i-1].x, pts[i].y - pts[i-1].y));
+  const total = cum[cum.length-1], out = [{...pts[0]}];
+  let j = 1;
+  for (let k = 1; k < n - 1; k++){
+    const s = total * k / (n - 1);
+    while (j < cum.length - 1 && cum[j] < s) j++;
+    const s0 = cum[j-1], s1 = cum[j], t = s1 > s0 ? (s - s0) / (s1 - s0) : 0;
+    out.push({x: pts[j-1].x + (pts[j].x - pts[j-1].x) * t,
+              y: pts[j-1].y + (pts[j].y - pts[j-1].y) * t});
+  }
+  out.push({...pts[pts.length-1]});
+  return out;
+}
+
+function laplacian(pts, f){
+  const n = pts.length, out = new Array(n);
+  out[0] = {...pts[0]}; out[n-1] = {...pts[n-1]};
+  for (let i = 1; i < n - 1; i++){
+    const a = pts[i-1], b = pts[i+1], p = pts[i];
+    out[i] = {x: p.x + ((a.x + b.x) / 2 - p.x) * f,
+              y: p.y + ((a.y + b.y) / 2 - p.y) * f};
+  }
+  return out;
+}
+
+function lakeExtent(L){
+  let x0 = 1e9, x1 = -1e9, y0 = 1e9, y1 = -1e9;
+  for (const p of L.pts){
+    x0 = Math.min(x0, p.x); x1 = Math.max(x1, p.x);
+    y0 = Math.min(y0, p.y); y1 = Math.max(y1, p.y);
+  }
+  return Math.max(x1 - x0, y1 - y0);
+}
+
+class River {
+  constructor(seed, w, h){
+    this.w = w; this.h = h;
+    this.rand = mulberry32(seed);
+    this.guide = makeGuide(w, h, this.rand);
+    this.pts = this.guide.map(p => ({...p}));
+    this.width = w / 46;                 // channel width in logical px (~26 at 1200)
+    this.year = 0;
+    this.epochs = [];                    // snapshots every EPOCH_EVERY years
+    this.lakes = [];
+    this.events = [];                    // cutoff events {x, y, year}
+    this.cutoffs = 0;
+    this.wT = 0.35; this.wB = 0.7;       // locked study parameters
+    this.stepScale = 3.2;
+    this.spring = 0.006;
+    this.kRef = 1 / (7 * this.width);
+    this.minSep = 84;                    // minimum loop length, in points
+    this.thresh = this.width * 0.55;     // self-collision distance
+  }
+  guideY(x){
+    const g = this.guide;
+    if (x <= g[0].x) return g[0].y;
+    if (x >= g[g.length-1].x) return g[g.length-1].y;
+    let lo = 0, hi = g.length - 1;
+    while (hi - lo > 1){ const m = (lo + hi) >> 1; if (g[m].x < x) lo = m; else hi = m; }
+    const t = (x - g[lo].x) / (g[hi].x - g[lo].x);
+    return g[lo].y + (g[hi].y - g[lo].y) * t;
+  }
+  spacing(){
+    const p = this.pts, n = p.length;
+    return Math.hypot(p[n-1].x - p[0].x, p[n-1].y - p[0].y) / (n - 1);
+  }
+  step(){
+    const pts = this.pts, n = pts.length, rand = this.rand;
+    const sp = this.spacing(), maxD = sp * 0.5;
+    const disp = new Array(n);
+    const kraw = new Array(n), crossArr = new Array(n);
+    for (let i = 0; i < n; i++){
+      const p0 = pts[Math.max(0, i-1)], p2 = pts[Math.min(n-1, i+1)], p = pts[i];
+      const v1x = p.x - p0.x, v1y = p.y - p0.y, v2x = p2.x - p.x, v2y = p2.y - p.y;
+      const l1 = Math.hypot(v1x, v1y) || 1, l2 = Math.hypot(v2x, v2y) || 1;
+      const cross = (v1x * v2y - v1y * v2x) / (l1 * l2);
+      crossArr[i] = cross;
+      kraw[i] = Math.abs(cross) / ((l1 + l2) / 2);
+    }
+    // box-blur curvature over +-9 pts: long wavelengths win
+    const ksm = new Array(n);
+    for (let i = 0; i < n; i++){
+      let a = 0, c = 0;
+      for (let j = -9; j <= 9; j++){ const jj = Math.min(n-1, Math.max(0, i+j)); a += kraw[jj]; c++; }
+      ksm[i] = a / c;
+    }
+    for (let i = 0; i < n; i++){
+      const p0 = pts[Math.max(0, i-1)], p2 = pts[Math.min(n-1, i+1)];
+      let tx = p2.x - p0.x, ty = p2.y - p0.y;
+      const tl = Math.hypot(tx, ty) || 1; tx /= tl; ty /= tl;
+      const cross = crossArr[i];
+      const k = (ksm[i] / this.kRef) / (1 + ksm[i] / this.kRef);  // saturated 0..1
+      const nx = -ty, ny = tx;
+      const side = cross > 0 ? -1 : 1;                            // outer bank
+      const bx = nx * side * k, by = ny * side * k;
+      let vx = (tx * this.wT + bx * this.wB) * this.stepScale;
+      let vy = (ty * this.wT + by * this.wB) * this.stepScale;
+      const dl = Math.hypot(vx, vy);
+      if (dl > maxD){ vx *= maxD / dl; vy *= maxD / dl; }
+      disp[i] = {x: vx, y: vy};
+    }
+    for (let i = 1; i < n - 1; i++){
+      const p = pts[i], d = disp[i];
+      p.x += d.x + (rand() - 0.5) * 0.4;
+      p.y += d.y + (rand() - 0.5) * 0.4;
+      p.y += (this.guideY(p.x) - p.y) * this.spring;               // valley spring
+    }
+    this.pts = laplacian(this.pts, 0.3);
+    this.pts = resampleFixed(this.pts, NPTS);
+    this.tryCutoff();
+    for (const L of this.lakes){
+      L.age++;
+      const c = L.centroid;
+      for (const p of L.pts){ p.x = c.x + (p.x - c.x) * 0.9975; p.y = c.y + (p.y - c.y) * 0.9975; }
+    }
+    this.lakes = this.lakes.filter(L => L.age < 520 && lakeExtent(L) > this.width * 1.4);
+    this.year++;
+    if (this.year % EPOCH_EVERY === 0)
+      this.epochs.push(this.pts.map(p => ({...p})));
+  }
+  tryCutoff(){
+    const pts = this.pts, n = pts.length, w = this.width;
+    const minSep = this.minSep, thresh = this.thresh;
+    let bi = -1, bj = -1, bd = 1e9;
+    for (let i = 2; i < n - minSep; i += 2){
+      for (let j = i + minSep; j < n - 2; j += 2){
+        const dx = pts[i].x - pts[j].x, dy = pts[i].y - pts[j].y, d = dx * dx + dy * dy;
+        if (d < bd){ bd = d; bi = i; bj = j; }
+      }
+    }
+    if (bi > 0 && bd < thresh * thresh){
+      const lakePts = pts.slice(bi, bj + 1).map(p => ({...p}));
+      let cx = 0, cy = 0;
+      for (const p of lakePts){ cx += p.x; cy += p.y; }
+      cx /= lakePts.length; cy /= lakePts.length;
+      this.lakes.push({pts: lakePts, age: 0, centroid: {x: cx, y: cy}});
+      this.events.push({x: (pts[bi].x + pts[bj].x) / 2, y: (pts[bi].y + pts[bj].y) / 2, year: this.year});
+      this.pts = resampleFixed(pts.slice(0, bi + 1).concat(pts.slice(bj)), NPTS);
+      this.cutoffs++;
+    }
+  }
+}
+
+/* ---------------- drawing helpers ---------------- */
+function ribbonPath(ctx, pts, w){
+  const n = pts.length, L = [], R = [];
+  for (let i = 0; i < n; i++){
+    const a = pts[Math.max(0, i-1)], b = pts[Math.min(n-1, i+1)];
+    let tx = b.x - a.x, ty = b.y - a.y;
+    const l = Math.hypot(tx, ty) || 1; tx /= l; ty /= l;
+    L.push({x: pts[i].x - ty * w / 2, y: pts[i].y + tx * w / 2});
+    R.push({x: pts[i].x + ty * w / 2, y: pts[i].y - tx * w / 2});
+  }
+  ctx.beginPath();
+  ctx.moveTo(L[0].x, L[0].y);
+  for (const p of L) ctx.lineTo(p.x, p.y);
+  for (let i = R.length - 1; i >= 0; i--) ctx.lineTo(R[i].x, R[i].y);
+  ctx.closePath();
+}
+
+function centerline(ctx, pts){
+  ctx.beginPath();
+  ctx.moveTo(pts[0].x, pts[0].y);
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+}
+
+function hexLerp(a, b, t){
+  const pa = [1,3,5].map(i => parseInt(a.substr(i, 2), 16));
+  const pb = [1,3,5].map(i => parseInt(b.substr(i, 2), 16));
+  const c = pa.map((v, i) => Math.round(v + (pb[i] - v) * t));
+  return "#" + c.map(v => v.toString(16).padStart(2, "0")).join("");
+}
+
+/* oxbow cooling: amber at birth, cold blue in old age */
+const LAKE_STOPS = [[0, "#ffc06a"], [60, "#e09a52"], [150, "#7fa8c4"], [400, "#3c6084"]];
+function lakeColor(age){
+  let a = LAKE_STOPS[0], b = LAKE_STOPS[LAKE_STOPS.length-1];
+  for (let i = 0; i < LAKE_STOPS.length - 1; i++){
+    if (age >= LAKE_STOPS[i][0] && age <= LAKE_STOPS[i+1][0]){ a = LAKE_STOPS[i]; b = LAKE_STOPS[i+1]; break; }
+  }
+  const t = Math.min(1, Math.max(0, (age - a[0]) / Math.max(1, b[0] - a[0])));
+  return hexLerp(a[1], b[1], t);
+}
+
+/* epoch strata: oldest deep blue, newest near-white */
+const EPOCH_PAL = ["#14334c","#173f5f","#1c4e75","#23638d","#2c7ba3",
+                   "#3798b8","#4fb3c9","#7ccbd6","#aadde2","#dcf2f4"];
+
+/* ---------------- canvases ---------------- */
+const BG_COL = "#05090f";
+const stage = document.getElementById("stage");
+const vctx = stage.getContext("2d");
+stage.width = LW; stage.height = LH;
+
+const bgC = document.createElement("canvas");  bgC.width = LW; bgC.height = LH;
+const trailC = document.createElement("canvas"); trailC.width = LW; trailC.height = LH;
+const bgx = bgC.getContext("2d"), trx = trailC.getContext("2d");
+
+function fitCanvas(){
+  const s = Math.min(innerWidth / LW, innerHeight / LH);
+  stage.style.width = Math.floor(LW * s) + "px";
+  stage.style.height = Math.floor(LH * s) + "px";
+}
+addEventListener("resize", fitCanvas);
+fitCanvas();
+
+/* night-drafting ground: near-black ink, stippled grain, soft vignette */
+function buildBackground(seed){
+  const r = mulberry32(seed ^ 0x9e3779b9);
+  const g = bgx.createRadialGradient(LW/2, LH/2, LH*0.2, LW/2, LH/2, LH*0.75);
+  g.addColorStop(0, "#0a1220"); g.addColorStop(1, BG_COL);
+  bgx.fillStyle = g; bgx.fillRect(0, 0, LW, LH);
+  for (let i = 0; i < 2600; i++){
+    const a = 0.02 + r() * 0.05;
+    bgx.fillStyle = "rgba(150,180,205," + a.toFixed(3) + ")";
+    const s = r() < 0.85 ? 1 : 2;
+    bgx.fillRect(r() * LW, r() * LH, s, s);
+  }
+}
+
+/* ---------------- simulation state ---------------- */
+let seedParam = parseInt(Q.get("seed") || "", 10);
+let seed = (Number.isFinite(seedParam) && seedParam !== 0) ? seedParam : 33; // strong default
+let river, startT, done = false, endT = 0, flashT = 0;
+let toyHold = false;
+
+function initSim(s){
+  seed = s;
+  river = new River(seed, LW, LH);
+  trx.save();
+  trx.setTransform(1, 0, 0, 1, 0, 0);
+  trx.clearRect(0, 0, LW, LH);
+  trx.restore();
+  buildBackground(seed);
+  done = false; endT = 0; flashT = 0;
+  startT = performance.now();
+}
+
+function drawYearOnTrail(){
+  // phosphor decay of everything already drawn
+  trx.save();
+  trx.globalCompositeOperation = "destination-out";
+  trx.fillStyle = "rgba(0,0,0," + TRAIL_FADE + ")";
+  trx.fillRect(0, 0, LW, LH);
+  trx.restore();
+  // the new course, bright
+  trx.strokeStyle = "rgba(207,232,247,0.5)";
+  trx.lineWidth = 2;
+  centerline(trx, river.pts);
+  trx.stroke();
+}
+
+function finishEpochPass(){
+  // redraw epoch snapshots as age-graded strata over the faded ghosts
+  river.epochs.forEach((e, k) => {
+    const col = EPOCH_PAL[Math.min(EPOCH_PAL.length - 1,
+      Math.floor(k / Math.max(1, river.epochs.length) * EPOCH_PAL.length))];
+    trx.strokeStyle = col;
+    trx.globalAlpha = 0.9;
+    trx.lineWidth = 2;
+    centerline(trx, e);
+    trx.stroke();
+    trx.globalAlpha = 1;
+  });
+}
+
+/* ---------------- frame rendering ---------------- */
+const MONO = '"SF Mono", Menlo, Consolas, "Liberation Mono", monospace';
+const SERIF = 'Georgia, "Times New Roman", serif';
+
+function drawEventFlash(e, ageMs){
+  const t = ageMs / 1600;                       // ring life 1.6s
+  if (t >= 1) return;
+  // hot core
+  const coreA = Math.max(0, 0.85 * (1 - ageMs / 450));
+  if (coreA > 0){
+    const g = vctx.createRadialGradient(e.x, e.y, 0, e.x, e.y, 26);
+    g.addColorStop(0, "rgba(255,244,224," + coreA.toFixed(3) + ")");
+    g.addColorStop(1, "rgba(255,180,90,0)");
+    vctx.fillStyle = g;
+    vctx.beginPath(); vctx.arc(e.x, e.y, 26, 0, 6.2832); vctx.fill();
+  }
+  // expanding ring, plus a delayed second one
+  for (const [delay, maxR] of [[0, 95], [0.18, 58]]){
+    const rt = (t - delay) / (1 - delay);
+    if (rt < 0 || rt > 1) continue;
+    vctx.strokeStyle = "rgba(255,179,94," + (0.85 * (1 - rt)).toFixed(3) + ")";
+    vctx.lineWidth = 2.5 * (1 - rt) + 0.5;
+    vctx.beginPath(); vctx.arc(e.x, e.y, 6 + rt * maxR, 0, 6.2832); vctx.stroke();
+  }
+}
+
+function drawMarker(e){
+  const age = river.year - e.year;
+  const col = hexLerp("#ffb35e", "#5f87a8", Math.min(1, age / 250));
+  const s = 5 - Math.min(2, age / 200);
+  vctx.save();
+  vctx.translate(e.x, e.y); vctx.rotate(Math.PI / 4);
+  vctx.fillStyle = col;
+  vctx.globalAlpha = 0.9;
+  vctx.fillRect(-s/2, -s/2, s, s);
+  vctx.restore();
+}
+
+function drawUI(now){
+  const pad = Math.max(18, LW * 0.022);
+  vctx.textBaseline = "alphabetic";
+  // kicker
+  vctx.font = "500 " + Math.round(LH*0.020) + "px " + MONO;
+  vctx.fillStyle = "rgba(125,147,168,0.85)";
+  vctx.fillText("№9005 · NINE HUNDRED YEARS", pad, pad + LH*0.018);
+  // year counter
+  const y = String(Math.min(YEARS, river.year)).padStart(4, "0");
+  vctx.font = "600 " + Math.round(LH*0.052) + "px " + MONO;
+  vctx.fillStyle = "#e8f2f8";
+  vctx.fillText("YEAR " + y, pad, pad + LH*0.018 + LH*0.062);
+  const yearW = vctx.measureText("YEAR " + y).width;
+  vctx.font = "500 " + Math.round(LH*0.020) + "px " + MONO;
+  vctx.fillStyle = "rgba(125,147,168,0.85)";
+  vctx.fillText("/ 0900", pad + yearW + 12, pad + LH*0.018 + LH*0.062);
+  // cutoff ledger
+  vctx.fillStyle = "#ffb35e";
+  vctx.fillText("CUTOFFS " + String(river.cutoffs).padStart(2, "0"),
+                pad, pad + LH*0.018 + LH*0.062 + LH*0.034);
+  vctx.fillStyle = "rgba(125,147,168,0.85)";
+  vctx.fillText("  OXBOWS " + river.lakes.length,
+                pad + vctx.measureText("CUTOFFS " + String(river.cutoffs).padStart(2, "0")).width,
+                pad + LH*0.018 + LH*0.062 + LH*0.034);
+  if (!done){
+    vctx.textAlign = "right";
+    vctx.fillStyle = "rgba(125,147,168,0.7)";
+    vctx.fillText("click for a new river", LW - pad, LH - pad);
+    vctx.textAlign = "left";
+  }
+}
+
+function drawEndCard(now){
+  const t = Math.min(1, (now - endT) / 1400);
+  if (t <= 0) return;
+  vctx.save();
+  vctx.globalAlpha = t;
+  const cx = LW / 2, cy = LH * 0.5;
+  // soft dark scrim so the card reads over the bright accumulation
+  const scrim = vctx.createRadialGradient(cx, cy, 0, cx, cy, LH * 0.30);
+  scrim.addColorStop(0, "rgba(4,7,12,0.72)");
+  scrim.addColorStop(1, "rgba(4,7,12,0)");
+  vctx.fillStyle = scrim;
+  vctx.fillRect(cx - LH*0.32, cy - LH*0.32, LH*0.64, LH*0.64);
+  vctx.textAlign = "center";
+  vctx.font = "500 " + Math.round(LH*0.024) + "px " + MONO;
+  vctx.fillStyle = "rgba(125,147,168,0.9)";
+  vctx.fillText("A RIVER THAT NEVER EXISTED", cx, cy - LH*0.105);
+  vctx.font = Math.round(LH*0.075) + "px " + SERIF;
+  vctx.fillStyle = "#f2f8fd";
+  vctx.fillText("Nine Hundred Years", cx, cy - LH*0.028);
+  vctx.font = "500 " + Math.round(LH*0.021) + "px " + MONO;
+  vctx.fillStyle = "rgba(200,220,235,0.85)";
+  vctx.fillText("900 years · " + river.cutoffs + " cutoffs · seed " + seed,
+                cx, cy + LH*0.022);
+  vctx.fillStyle = "rgba(125,147,168,0.8)";
+  vctx.fillText("click anywhere for a new river", cx, cy + LH*0.058);
+  vctx.restore();
+}
+
+let flowPhase = 0;
+function frame(now){
+  if (!document.hidden){
+    if (!done && !toyHold){
+      const target = Math.min(YEARS, (now - startT) / RUN_MS * YEARS);
+      while (river.year < Math.floor(target)){
+        river.step();
+        drawYearOnTrail();
+        if (river.year >= YEARS) break;
+      }
+      if (river.year >= YEARS){
+        finishEpochPass();
+        done = true; endT = now;
+      }
+    }
+    flowPhase -= 0.6;
+
+    vctx.drawImage(bgC, 0, 0);
+    vctx.drawImage(trailC, 0, 0);
+
+    // oxbow lakes: amber at birth, cooling to blue ghosts
+    for (const L of river.lakes){
+      vctx.strokeStyle = lakeColor(L.age);
+      vctx.globalAlpha = Math.max(0.22, 0.95 - L.age / 520 * 0.7);
+      vctx.lineWidth = 1.6;
+      vctx.beginPath();
+      const p = L.pts;
+      vctx.moveTo(p[0].x, p[0].y);
+      for (let i = 1; i < p.length; i++) vctx.lineTo(p[i].x, p[i].y);
+      vctx.closePath();
+      vctx.stroke();
+      vctx.globalAlpha = 1;
+    }
+
+    // cutoff events: flash, then a permanent diamond marker
+    for (const e of river.events){
+      const ageMs = now - e.bornT;
+      if (ageMs < 1700) drawEventFlash(e, ageMs);
+      drawMarker(e);
+    }
+
+    // the living channel: glow, ice ribbon, animated flow dashes
+    const w = river.width;
+    ribbonPath(vctx, river.pts, w + 12);
+    vctx.strokeStyle = "rgba(120,190,230,0.16)";
+    vctx.lineWidth = 12; vctx.stroke();
+    ribbonPath(vctx, river.pts, w);
+    vctx.fillStyle = "#eef7fd"; vctx.fill();
+    vctx.strokeStyle = "rgba(20,45,70,0.55)";
+    vctx.lineWidth = 1.2; vctx.stroke();
+    vctx.strokeStyle = "rgba(110,160,195,0.85)";
+    vctx.lineWidth = 1.6;
+    vctx.setLineDash([7, 11]);
+    vctx.lineDashOffset = flowPhase;
+    centerline(vctx, river.pts);
+    vctx.stroke();
+    vctx.setLineDash([]);
+
+    drawUI(now);
+    if (done) drawEndCard(now);
+  }
+  if (Q.get("reflashloop") === "1" && river.events.length)
+    river.events[river.events.length - 1].bornT = now - 200;
+  requestAnimationFrame(frame);
+}
+
+/* cutoff birth timestamps are wall-clock; stamp them as they happen */
+const _step = River.prototype.step;
+River.prototype.step = function(){
+  const before = this.cutoffs;
+  _step.call(this);
+  if (this.cutoffs > before){
+    this.events[this.events.length - 1].bornT = performance.now();
+  }
+};
+
+stage.addEventListener("click", () => {
+  initSim((Math.random() * 2**31) | 0);
+});
+stage.addEventListener("touchstart", e => { e.preventDefault(); initSim((Math.random() * 2**31) | 0); },
+                       {passive: false});
+
+initSim(seed);
+
+/* dev hooks */
+if (Q.get("instant") === "1"){
+  while (river.year < YEARS){ river.step(); drawYearOnTrail(); }
+  finishEpochPass();
+  done = true; endT = performance.now();
+} else if (Q.get("toy")){
+  const n = Math.min(YEARS, parseInt(Q.get("toy"), 10) || 400);
+  while (river.year < n){ river.step(); drawYearOnTrail(); }
+  toyHold = true;
+  if (Q.get("reflash") === "1" && river.events.length)
+    river.events[river.events.length - 1].bornT = performance.now() - 250;
+}
+
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
