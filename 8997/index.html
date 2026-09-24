@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>№8997 · Feedback — Generative Doodles</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    background: #14110c;
+    color: #e8e2d2;
+    font-family: Georgia, serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-height: 100vh;
+    padding: 5vmin 20px 8vmin;
+  }
+  header { text-align: center; margin-bottom: 4vmin; max-width: 620px; }
+  header .kicker {
+    font-size: 12px; letter-spacing: 0.42em; text-transform: uppercase;
+    color: #8f8875; margin-bottom: 14px;
+  }
+  header h1 { font-size: 26px; font-weight: normal; margin-bottom: 10px; }
+  header h1 .num { color: #d9a441; }
+  header p { color: #8f8875; font-size: 14px; line-height: 1.7; font-style: italic; }
+  header p b { color: #c9c2ad; font-weight: normal; }
+  #stage {
+    width: min(92vw, 760px);
+    aspect-ratio: 1 / 1;
+    background: #0b0e1a;
+    box-shadow: 0 18px 60px rgba(0,0,0,0.55);
+    cursor: pointer;
+  }
+  #stage canvas { display: block; width: 100%; height: 100%; }
+  #status {
+    margin-top: 14px; color: #6b6455; font-size: 13px; font-style: italic;
+    min-height: 20px;
+  }
+  footer { margin-top: 2vmin; color: #6b6455; font-size: 13px; font-style: italic; }
+  footer a { color: #d9a441; text-decoration: none; }
+</style>
+</head>
+<body>
+<header>
+  <div class="kicker">Generative Doodles</div>
+  <h1><span class="num">№8997</span> · Feedback</h1>
+  <p>One buffer of noise, re-sampled through its own ghost until it settles
+  into flowing grain. The settle is the event; the frozen frame is the piece.
+  <b>Click to run it again.</b></p>
+</header>
+<div id="stage"><canvas id="c"></canvas></div>
+<div id="status">settling&hellip;</div>
+<footer><a href="../">← all doodles</a> · drawn with code, no libraries</footer>
+<script>
+"use strict";
+// Seeded PRNG (mulberry32)
+function mulberry32(a){
+  return function(){
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+const params = new URLSearchParams(location.search);
+let seed = parseInt(params.get("seed") || "", 10);
+if (!Number.isFinite(seed)) seed = 899701;
+const frozenParam = params.get("frozen") === "1";
+const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+const TAU = Math.PI * 2;
+const VU = 1000;
+const W = 160, H = 160;
+const STEPS = 450, PER_FRAME = 2;
+
+function clamp(v, a, b){ return v < a ? a : v > b ? b : v; }
+
+// seeded 2D value noise
+function makeNoise2D(rnd){
+  const perm = new Uint8Array(512);
+  const p0 = new Uint8Array(256);
+  for (let i = 0; i < 256; i++) p0[i] = i;
+  for (let i = 255; i > 0; i--){
+    const j = (rnd() * (i + 1)) | 0;
+    const t = p0[i]; p0[i] = p0[j]; p0[j] = t;
+  }
+  for (let i = 0; i < 512; i++) perm[i] = p0[i & 255];
+  const g = new Float32Array(256);
+  for (let i = 0; i < 256; i++) g[i] = rnd();
+  const fade = t => t * t * (3 - 2 * t);
+  return function(x, y){
+    const xi = Math.floor(x), yi = Math.floor(y);
+    const xf = x - xi, yf = y - yi;
+    const X = xi & 255, Y = yi & 255;
+    const aa = g[perm[(perm[X] + Y) & 255]], ab = g[perm[(perm[X] + Y + 1) & 255]];
+    const ba = g[perm[(perm[X + 1] + Y) & 255]], bb = g[perm[(perm[X + 1] + Y + 1) & 255]];
+    const u = fade(xf), v = fade(yf);
+    const x1 = aa + (ba - aa) * u, x2 = ab + (bb - ab) * u;
+    return x1 + (x2 - x1) * v;
+  };
+}
+
+// one restrained palette: indigo night to bone (single hue family)
+function buildLUT(){
+  const stops = [
+    [0.00, [11, 14, 26]], [0.30, [29, 36, 64]], [0.55, [58, 74, 122]],
+    [0.78, [138, 148, 184]], [1.00, [232, 228, 216]]
+  ];
+  const lut = new Uint8Array(256 * 3);
+  for (let i = 0; i < 256; i++){
+    const t = i / 255;
+    let s = 0;
+    while (s < stops.length - 2 && t > stops[s + 1][0]) s++;
+    const f = clamp((t - stops[s][0]) / (stops[s + 1][0] - stops[s][0]), 0, 1);
+    const e = f * f * (3 - 2 * f);
+    for (let c = 0; c < 3; c++)
+      lut[i * 3 + c] = stops[s][1][c] + (stops[s + 1][1][c] - stops[s][1][c]) * e;
+  }
+  return lut;
+}
+const LUT = buildLUT();
+
+let buf = new Float32Array(W * H);
+let nxt = new Float32Array(W * H);
+let P = null; // sim params
+
+function initSim(){
+  const rnd = mulberry32(seed);
+  const noise = makeNoise2D(mulberry32(seed ^ 0x51ab));
+  const nscale = 0.020 + rnd() * 0.030;
+  for (let y = 0; y < H; y++)
+    for (let x = 0; x < W; x++)
+      buf[y * W + x] = noise(x * nscale * 4, y * nscale * 4);
+  P = {
+    bend: 5 + rnd() * 8,           // smear distance in px
+    dscale: 0.025 + rnd() * 0.035, // displacement field scale (finer cells)
+    drift: 0.006 + rnd() * 0.010,  // how fast the displacement field turns
+    swirl: (rnd() - 0.5) * 1.2,    // fixed rotation of the displacement
+    gain: 1.015 + rnd() * 0.030,   // contrast regeneration per frame
+    inject: 0.008 + rnd() * 0.012, // fresh noise per frame
+    noise
+  };
+}
+
+function bilinear(src, x, y){
+  x = clamp(x, 0, W - 1.001); y = clamp(y, 0, H - 1.001);
+  const x0 = x | 0, y0 = y | 0, fx = x - x0, fy = y - y0;
+  const i = y0 * W + x0;
+  const a = src[i], b = src[i + 1], c = src[i + W], d = src[i + W + 1];
+  return a + (b - a) * fx + (c - a) * fy + (a - b - c + d) * fx * fy;
+}
+
+function stepSim(frame){
+  const { bend, dscale, drift, swirl, gain, inject, noise } = P;
+  const cs = Math.cos(swirl), sn = Math.sin(swirl);
+  const t = frame * drift;
+  // pass 1: advect the buffer through the displacement field
+  for (let y = 0; y < H; y++){
+    for (let x = 0; x < W; x++){
+      const i = y * W + x;
+      // slowly-turning displacement field drags the buffer into streaks;
+      // a finer second octave keeps grain-scale texture alive
+      let dx = (noise(x * dscale + t, y * dscale) - 0.5) * 2 * bend;
+      let dy = (noise(x * dscale, y * dscale + t * 0.8) - 0.5) * 2 * bend;
+      dx += (noise(x * dscale * 3.1 + t * 0.6, y * dscale * 3.1) - 0.5) * bend * 0.7;
+      dy += (noise(x * dscale * 3.1, y * dscale * 3.1 + t * 0.5) - 0.5) * bend * 0.7;
+      const rx = dx * cs - dy * sn, ry = dx * sn + dy * cs;
+      nxt[i] = bilinear(buf, x + rx, y + ry);
+    }
+  }
+  // pass 2: DC-restore the mean toward mid, then feed a whisper of fresh
+  // noise to keep the flow alive. Contrast is handled at display time by
+  // a percentile stretch, so the dynamics only have to make structure.
+  let mu = 0;
+  for (let i = 0; i < W * H; i++) mu += nxt[i];
+  mu /= W * H;
+  const restore = (0.5 - mu) * 0.25;
+  for (let y = 0; y < H; y++){
+    for (let x = 0; x < W; x++){
+      const i = y * W + x;
+      let v = nxt[i] + restore;
+      v += inject * (noise(x * 0.07 + t * 2.0, y * 0.07 - t * 1.7) - 0.5);
+      buf[i] = clamp(v, 0, 1);
+    }
+  }
+}
+
+let ctx, simCanvas, simCtx, simImg, rafId = 0, frame = 0;
+
+function setupCanvas(){
+  const canvas = document.getElementById("c");
+  const stage = document.getElementById("stage");
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  const S = stage.clientWidth;
+  const K = S / VU;
+  canvas.width = S * dpr; canvas.height = S * dpr;
+  ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr * K, 0, 0, dpr * K, 0, 0);
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  simCanvas = document.createElement("canvas");
+  simCanvas.width = W; simCanvas.height = H;
+  simCtx = simCanvas.getContext("2d");
+  simImg = simCtx.createImageData(W, H);
+}
+
+function blit(){
+  // percentile stretch: map the 2nd-98th percentile to the full palette
+  // so every frame carries full tonal range without posterizing
+  const hist = new Uint32Array(256);
+  for (let i = 0; i < W * H; i++) hist[(clamp(buf[i], 0, 1) * 255) | 0]++;
+  const total = W * H;
+  let acc = 0, p2 = 0, p98 = 255;
+  for (let i = 0; i < 256; i++){ acc += hist[i]; if (acc >= total * 0.02){ p2 = i; break; } }
+  acc = 0;
+  for (let i = 255; i >= 0; i--){ acc += hist[i]; if (acc >= total * 0.02){ p98 = i; break; } }
+  if (p98 - p2 < 6){ p2 = Math.max(0, p2 - 3); p98 = Math.min(255, p98 + 3); }
+  const lo = p2 / 255, span = (p98 - p2) / 255;
+  const d = simImg.data;
+  for (let i = 0; i < W * H; i++){
+    const v = clamp((clamp(buf[i], 0, 1) - lo) / span, 0, 1);
+    const li = (v * 255) | 0;
+    d[i * 4] = LUT[li * 3]; d[i * 4 + 1] = LUT[li * 3 + 1]; d[i * 4 + 2] = LUT[li * 3 + 2];
+    d[i * 4 + 3] = 255;
+  }
+  simCtx.putImageData(simImg, 0, 0);
+  ctx.drawImage(simCanvas, 0, 0, VU, VU);
+}
+
+const statusEl = document.getElementById("status");
+
+function setStatus(t){ statusEl.innerHTML = t; }
+
+function runAll(){
+  cancelAnimationFrame(rafId);
+  initSim();
+  for (frame = 0; frame < STEPS; frame++) stepSim(frame);
+  setupCanvas();
+  blit();
+  setStatus(`settled after ${STEPS} frames · click to run it again`);
+}
+
+function animate(){
+  cancelAnimationFrame(rafId);
+  initSim();
+  setupCanvas();
+  frame = 0;
+  setStatus("settling…");
+  const tick = () => {
+    for (let k = 0; k < PER_FRAME && frame < STEPS; k++, frame++) stepSim(frame);
+    blit();
+    if (frame < STEPS) rafId = requestAnimationFrame(tick);
+    else setStatus(`settled after ${STEPS} frames · click to run it again`);
+  };
+  rafId = requestAnimationFrame(tick);
+}
+
+window.addEventListener("resize", () => {
+  // keep the finished frame, just re-fit the canvas
+  setupCanvas();
+  blit();
+});
+document.getElementById("stage").addEventListener("click", () => {
+  seed = (Math.random() * 1e9) | 0;
+  history.replaceState(null, "", "?seed=" + seed);
+  if (frozenParam || reduced) runAll(); else animate();
+});
+if (frozenParam || reduced) runAll(); else animate();
+</script>
+</body>
+</html>
