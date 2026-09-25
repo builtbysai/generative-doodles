@@ -1,6 +1,6 @@
 # Olivia Jack / Hydra — Deep Study Notes
 
-**Date:** 2026-09-23 (study pass)
+**Date:** 2026-09-23 (study pass), second pass 2026-09-25
 **Artist:** Olivia Jack, ojack.xyz. Programmer and artist, San Francisco to
 Bogota. Works in open-source software, live coding, cartography, experimental
 interfaces. Research: algorithmic representations of uncertainty and chaos,
@@ -21,6 +21,15 @@ what follows is text-deep on the docs (cheatsheet, hydra-book, getting
 started, audio guide) plus a local WebGL re-render of three canonical
 patches, built from the documented semantics and visually inspected at
 1280x720.
+
+**Second pass (2026-09-25):** the real engine this time. hydra-synth 1.4.0
+source read end to end (hydra-synth.js, glsl/glsl-functions.js,
+generate-glsl.js, output.js, lib/audio.js), and three canonical sketches
+run in the actual hydra editor code in headless Chrome (software WebGL)
+with the frames visually inspected at 1280x800, zero console errors. Two
+hops followed outward: PIXELSYNTH (full bundle source read, live UI and
+real pointer-drawn strokes inspected) and fubbles (concept plus video
+frames inspected).
 
 ## The instrument
 
@@ -132,6 +141,99 @@ modulator driving it, feedback at 0.9 with no color discipline. Hans's
 rule maps cleanly here: the instrument rewards restraint, one palette,
 one modulator, one feedback amount.
 
+## Under the hood: hydra-synth source, read end to end (2026-09-25)
+
+The first pass reconstructed hydra from its docs. This pass read the
+machine itself, and the docs hold up: the implementation matches the
+documented semantics almost exactly, with a few details the docs never
+mention.
+
+**The chain compiler (generate-glsl.js).** Every chain compiles to ONE
+fragment shader drawn on one fullscreen triangle. The five types from the
+source header comment are the whole type system: `src` creates `vec4 c`,
+`color` rewrites `c`, `coord` rewrites `uv` before the source evaluates
+(which means coordinate transforms in a chain apply in reverse written
+order), `combine` merges two sub-chains, `combineCoord` warps one chain's
+coordinates with another chain's color. Arguments that are themselves
+chains (the classic `modulate(noise(3))`) compile into nested generator
+calls with their own uv copies. Uniforms dedupe by name.
+
+**The function bodies (glsl/glsl-functions.js).** Pleasingly un-magic.
+`osc` is three sine ramps on st.x with r/g/b phase-shifted by the offset
+argument. `kaleid` folds the polar angle with mod and abs. `voronoi` is
+the standard 3x3 neighborhood search, points jittered by
+`sin(time*speed...)`. `modulate` is one line: `_st + _c0.xy * amount`.
+`shape` is the polygon SDF trick (atan, then
+`cos(floor(.5+a/r)*r-a)*length(st)`). `modulateHue` really does shift by
+`vec2(_c0.g - _c0.r, _c0.b - _c0.g) * amount / resolution`, confirming the
+first pass's note that it ignores its name's promise of hue math.
+
+**The ping-pong (output.js).** Four outputs o0 to o3, each owning two
+framebuffers swapped every frame. `prev` and self-referencing `src(o0)`
+sample the framebuffer that just rendered, which is the entire feedback
+mechanism: no special feedback code exists, it falls out of the buffer
+design.
+
+**The live sketches, actually run.** `osc(20, 0.1, 0.8).out()` gave the
+rainbow sine bars with visibly phase-shifted RGB channels.
+`voronoi(6, 0.3, 0.3).modulate(noise(2.5), 0.4).colorama(0.01).out()`
+dissolved the cells into gray marble flows. And
+`src(o0).scale(1.01).rotate(0.01).blend(osc(10, 0.03, 0.8).kaleid(4),
+0.7).out()` settled into a soft blue and orange tunnel converging on a
+dark red center. All three frames inspected at 1280x800, zero console
+errors.
+
+**Audio (lib/audio.js).** Meyda loudness analysis on the mic, `a.fft`
+bins (default 4, `a.setBins(n)` to change), beat detection borrowed from
+the p5 music-viz demos. Headless there is no mic, so the bins sit at zero
+and none of this was exercised live; the code path is as documented.
+
+## Hop: PIXELSYNTH deep dive (2026-09-25)
+
+**Live:** https://ojack.github.io/PIXELSYNTH. The reverse direction from
+hydra: image to sound, after the ANS synthesizer (Evgeny Murzin, 1937).
+
+The full bundle source was read (browserify, unminified). The drawing IS
+the score: a playhead scans canvas columns left to right and loops, so x
+is time, y is pitch (100 rows, chromatic scale from C3 by default, top row
+highest), pixel brightness is loudness. The synth is 100 sine oscillators
+created once and left running; each frame's column sets their gains with a
+0.1 second linear ramp. Per row the value is (image red plus drawn red
+times drawn alpha) over 255. A DynamicsCompressor sits on the master. The
+playhead draws a hot-pink bar with mint amplitude ticks on an overlay
+canvas; spacebar toggles playback. A NexusUI panel gives image
+select/upload, invert/brightness/contrast, and repetitions/spacing/offset/
+rotation dials for the stroke engine.
+
+Seen live in headless Chrome: the UI inspected, and a trusted CDP mouse
+drag drew three repeated parallel white strokes across the default
+night-sky image (the 0.3 repetitions setting doing its work), zero console
+errors. The playhead scan and the audio were not exercised in the harness
+(no speakers, and the spacebar dispatch never visibly started the loop),
+so the scan claims are from the source, which is unambiguous.
+
+What sings: the oldest idea in this whole study (optical synthesis, 1937)
+with modern plumbing. Draw a diagonal and you have drawn a glissando; the
+score and the picture are the same object. Nothing for the avoid-list,
+it is a clean one-idea instrument.
+
+## Hop: fubbles doorway (2026-09-25)
+
+**Page:** https://ojack.xyz/work/fubbles/. "Research into drawing as an
+interface for creating live-codeable functions in real time."
+
+The concept: a hand-drawn curve becomes a function evaluated live, a
+modulation source you draw instead of type. Video frames visually
+inspected: black background, a neon orange curve with square endpoint
+handles being dragged in real time. Ryan Challinor saw the NIME 2020
+workshop talk and built a "fubbles modulator" into Bespoke Synth the same
+year. Presented at Hybrid Live Coding Interfaces (2020); residency at
+hangar.org, Barcelona (2022).
+
+What sings: it erases the code/value boundary. The drawing is the
+parameter, not a picture of the parameter. No avoid-list notes; this is
+research, not a product.
+
 ## Doorways from here
 
 - Char Stiles: hydra performer, openprocessing sketches, the scene around
@@ -140,5 +242,12 @@ one modulator, one feedback amount.
 - CultureHub residency "Undefined Spaces": the telepresence + non-linear
   dynamics axis, multi-browser distributed synth over WebRTC.
 - PIXELSYNTH: the reverse direction, image to sound, ANS lineage.
+  Consumed 2026-09-25, see the deep dive above.
+- fubbles: consumed 2026-09-25 as a doorway, see above. The Bespoke Synth
+  fubbles modulator is the implementation to study next.
+- flok.cc: collaborative live coding with a hydra target.
+- The hydra sketch gallery on social.toplap.org and the hydra book: the
+  scene's own canon.
+- videoface: her hybrid code-and-graphics editor.
 - Maps for getting lost: cartography doorway, cross-links to the Hodgin
   meander study from this same day.
