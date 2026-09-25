@@ -9,7 +9,7 @@ stay RETIRED and must never be built again.
 
 ## Concept
 A living creature in dark water. A bioluminescent organism drifts on its
-own: a differential-growth membrane breathing around a seeded harmonic
+own: a spring-softened harmonic membrane breathing around a seeded harmonic
 rest shape, glowing organelles with bright nuclei drifting inside on slow
 orbits, faint current lines between them, trailing tentacles with lit
 tips, marine snow in the water column. Prod it and it flinches: nearby
