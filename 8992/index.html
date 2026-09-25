@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>№8992 · Confluence - Generative Doodles</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: #000; overflow: hidden;
+    overscroll-behavior: none;
+  }
+  canvas { display: block; position: fixed; inset: 0; cursor: crosshair; }
+  .cap {
+    position: fixed; left: 14px; bottom: 12px; z-index: 2;
+    font: 12px/1.5 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+    color: rgba(255,255,255,0.42); letter-spacing: 0.04em;
+    user-select: none; pointer-events: none;
+  }
+  .cap b { color: rgba(255,255,255,0.72); font-weight: 600; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="cap"><b>№8992 · Confluence</b> &nbsp;·&nbsp; click for a new field</div>
+<script>
+"use strict";
+// Confluence: additive smoke particles ride a seeded flow field.
+// Each particle is tinted by the field direction under it, so hue reads
+// as direction with no arrows drawn, and glow pools where the field
+// converges. Recipe after Shiffman, Nature of Code ch. 4-5:
+// emitter lifecycle, lifespan as alpha, procedural radial smoke texture,
+// additive blending on black, flow-field lookup with the 0..4PI bias fix.
+
+// ---------- seeded PRNG ----------
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// ---------- seeded value noise (2D + 3D via z slices) ----------
+function makeNoise(rand) {
+  const P = new Uint8Array(512);
+  const p = new Uint8Array(256);
+  for (let i = 0; i < 256; i++) p[i] = i;
+  for (let i = 255; i > 0; i--) {
+    const j = (rand() * (i + 1)) | 0;
+    const t = p[i]; p[i] = p[j]; p[j] = t;
+  }
+  for (let i = 0; i < 512; i++) P[i] = p[i & 255];
+  const fade = t => t * t * t * (t * (t * 6 - 15) + 10);
+  const g2 = (h, x, y) => {
+    switch (h & 3) {
+      case 0: return  x + y;
+      case 1: return -x + y;
+      case 2: return  x - y;
+      default: return -x - y;
+    }
+  };
+  function noise2(x, y) {
+    const X = Math.floor(x) & 255, Y = Math.floor(y) & 255;
+    x -= Math.floor(x); y -= Math.floor(y);
+    const u = fade(x), v = fade(y);
+    const a = P[X] + Y, b = P[X + 1] + Y;
+    const l1 = g2(P[a], x, y),     l2 = g2(P[b], x - 1, y);
+    const l3 = g2(P[a + 1], x, y - 1), l4 = g2(P[b + 1], x - 1, y - 1);
+    return (l1 + (l2 - l1) * u + ((l3 + (l4 - l3) * u) - (l1 + (l2 - l1) * u)) * v) * 0.7071;
+  }
+  // cheap 3D: blend two 2D slices offset in z
+  function noise3(x, y, z) {
+    const zi = Math.floor(z), zf = z - zi;
+    const s = zf * zf * (3 - 2 * zf);
+    const a = noise2(x + zi * 13.7, y + zi * 7.3);
+    const b = noise2(x + (zi + 1) * 13.7, y + (zi + 1) * 7.3);
+    return a + (b - a) * s;
+  }
+  function fbm3(x, y, z, oct) {
+    let v = 0, amp = 0.5, f = 1, norm = 0;
+    for (let i = 0; i < oct; i++) {
+      v += amp * noise3(x * f, y * f, z * f);
+      norm += amp; amp *= 0.5; f *= 2.03;
+    }
+    return v / norm; // roughly -1..1
+  }
+  return { fbm3 };
+}
+
+// ---------- tinted smoke sprites, one bucket per 15 degrees of hue ----------
+const BUCKETS = 24;
+function makeSprites() {
+  const S = 64, out = [];
+  for (let b = 0; b < BUCKETS; b++) {
+    const cv = document.createElement("canvas");
+    cv.width = cv.height = S;
+    const g = cv.getContext("2d");
+    const h = b * 15;
+    const grad = g.createRadialGradient(S/2, S/2, 0, S/2, S/2, S/2);
+    grad.addColorStop(0.00, "hsla(" + h + ",65%,88%,0.55)");
+    grad.addColorStop(0.35, "hsla(" + h + ",85%,60%,0.22)");
+    grad.addColorStop(0.70, "hsla(" + h + ",85%,52%,0.06)");
+    grad.addColorStop(1.00, "hsla(" + h + ",85%,50%,0)");
+    g.fillStyle = grad;
+    g.fillRect(0, 0, S, S);
+    out.push(cv);
+  }
+  return out;
+}
+const SPRITES = makeSprites();
+
+// ---------- world ----------
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+let W = 0, H = 0, DPR = 1;
+
+const world = {
+  seed: 899201,
+  rand: null, noise: null,
+  cell: 26, cols: 0, rows: 0,
+  gx: null, gy: null,          // flow grid unit vectors
+  vortices: [], sinks: [], emitters: [],
+  hueOffset: 0, fade: 0.05, t: 0,
+  maxspeed: 1.6, maxforce: 0.08,
+  parts: [], cap: 1200,
+  fieldScale: 0.0016, timeScale: 0.05
+};
+
+function buildWorld(seed) {
+  world.seed = seed;
+  const rand = mulberry32(seed);
+  world.rand = rand;
+  world.noise = makeNoise(mulberry32(seed ^ 0x9e3779b9));
+  world.fieldScale = 0.0011 + rand() * 0.0012;
+  world.timeScale = 0.03 + rand() * 0.05;
+  world.hueOffset = rand() * 360;
+  world.fade = 0.026 + rand() * 0.008;
+  world.maxspeed = 0.6 + rand() * 0.4;
+  world.maxforce = 0.04 + rand() * 0.04;
+  world.t = rand() * 100;
+
+  // two vortices: one dominant swirl, one smaller counter or co swirl
+  world.vortices = [];
+  const v1 = {
+    x: 0.28 + rand() * 0.44, y: 0.30 + rand() * 0.40,
+    r: 0.30 + rand() * 0.18, s: 0.7 + rand() * 0.5,
+    dir: rand() < 0.5 ? 1 : -1
+  };
+  world.vortices.push(v1);
+  world.vortices.push({
+    x: rand() < 0.5 ? 0.08 + rand() * 0.15 : 0.77 + rand() * 0.15,
+    y: 0.15 + rand() * 0.70,
+    r: 0.16 + rand() * 0.10, s: 0.3 + rand() * 0.3,
+    dir: rand() < 0.5 ? 1 : -1
+  });
+
+  // one gentle sink where the glow is meant to pool, never a black hole
+  world.sinks = [{
+    x: Math.min(0.9, Math.max(0.1, v1.x + (rand() - 0.5) * 0.55)),
+    y: Math.min(0.9, Math.max(0.1, v1.y + (rand() - 0.5) * 0.55)),
+    r: 0.30 + rand() * 0.20, s: 0.12 + rand() * 0.16
+  }];
+
+  // emitters: ring around the main vortex plus several spread wide
+  world.emitters = [];
+  const nRing = 5 + ((rand() * 3) | 0);
+  for (let i = 0; i < nRing; i++) {
+    const a = (i / nRing) * Math.PI * 2 + rand() * 0.5;
+    const rr = v1.r * (1.05 + rand() * 0.5);
+    world.emitters.push({
+      x: v1.x + Math.cos(a) * rr * 1.4,
+      y: v1.y + Math.sin(a) * rr,
+      rate: 2 + ((rand() * 2) | 0)
+    });
+  }
+  const nFree = 4 + ((rand() * 3) | 0);
+  for (let i = 0; i < nFree; i++) {
+    world.emitters.push({ x: 0.06 + rand() * 0.88, y: 0.06 + rand() * 0.88,
+      rate: 1 + ((rand() * 2) | 0) });
+  }
+
+  world.parts.length = 0;
+  layout();
+  // seed the whole frame: the field itself is the emitter
+  for (let i = 0; i < world.cap; i++) {
+    spawnParticle(0, 0, true);
+    const p = world.parts[world.parts.length - 1];
+    p.life = 40 + world.rand() * 215; // desync the fade phases
+  }
+}
+
+function layout() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = Math.round(W * DPR);
+  canvas.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  world.cell = W < 500 ? 30 : 26;
+  world.cols = Math.ceil(W / world.cell) + 2;
+  world.rows = Math.ceil(H / world.cell) + 2;
+  world.gx = new Float32Array(world.cols * world.rows);
+  world.gy = new Float32Array(world.cols * world.rows);
+  world.cap = Math.max(800, Math.min(2000, Math.round((W * H) / 650)));
+  rebuildField();
+}
+
+// flow direction at a grid node: noise field plus analytic features
+function nodeVector(i, j, out) {
+  const x = (i - 1) * world.cell, y = (j - 1) * world.cell;
+  const n = world.noise.fbm3(
+    x * world.fieldScale + 11.3, y * world.fieldScale + 7.7, world.t, 4);
+  // 0..4PI flattens the noise distribution bias (Nature of Code, ch. 5)
+  const ang = (n * 0.5 + 0.5) * Math.PI * 4;
+  let dx = Math.cos(ang), dy = Math.sin(ang);
+  for (const v of world.vortices) {
+    const cx = v.x * W, cy = v.y * H;
+    let rx = x - cx, ry = y - cy;
+    const d = Math.hypot(rx, ry), R = v.r * Math.min(W, H);
+    if (d < R && d > 1e-3) {
+      const f = v.s * (1 - d / R);
+      dx += (-ry / d) * f * v.dir;
+      dy += ( rx / d) * f * v.dir;
+    }
+  }
+  for (const s of world.sinks) {
+    const cx = s.x * W, cy = s.y * H;
+    let rx = x - cx, ry = y - cy;
+    const d = Math.hypot(rx, ry), R = s.r * Math.min(W, H);
+    if (d < R && d > 1e-3) {
+      const f = s.s * (1 - d / R) * (d / R + 0.25);
+      dx += (-rx / d) * f;
+      dy += (-ry / d) * f;
+    }
+  }
+  const m = Math.hypot(dx, dy) || 1;
+  out.x = dx / m; out.y = dy / m;
+}
+
+const _nv = { x: 0, y: 0 };
+function rebuildField() {
+  for (let j = 0; j < world.rows; j++)
+    for (let i = 0; i < world.cols; i++) {
+      nodeVector(i, j, _nv);
+      const k = j * world.cols + i;
+      world.gx[k] = _nv.x; world.gy[k] = _nv.y;
+    }
+}
+
+// bilinear sample of the grid; returns angle of the blended vector
+function sampleAngle(x, y) {
+  const fx = x / world.cell, fy = y / world.cell;
+  let i = Math.floor(fx), j = Math.floor(fy);
+  i = Math.max(0, Math.min(world.cols - 2, i));
+  j = Math.max(0, Math.min(world.rows - 2, j));
+  const tx = fx - i, ty = fy - j;
+  const k = j * world.cols + i;
+  const x0 = world.gx[k]     * (1 - tx) + world.gx[k + 1]     * tx;
+  const x1 = world.gx[k + world.cols] * (1 - tx) + world.gx[k + world.cols + 1] * tx;
+  const y0 = world.gy[k]     * (1 - tx) + world.gy[k + 1]     * tx;
+  const y1 = world.gy[k + world.cols] * (1 - tx) + world.gy[k + world.cols + 1] * tx;
+  return Math.atan2(y0 + (y1 - y0) * ty, x0 + (x1 - x0) * ty);
+}
+
+// ---------- particles: emitter lifecycle, lifespan as alpha ----------
+function spawnParticle(ex, ey, randomPos) {
+  const r = world.rand;
+  const x = randomPos ? r() * W : ex * W + (r() - 0.5) * 70;
+  const y = randomPos ? r() * H : ey * H + (r() - 0.5) * 70;
+  const a = sampleAngle(x, y);
+  world.parts.push({
+    x, y,
+    vx: Math.cos(a) * 0.3, vy: Math.sin(a) * 0.3,
+    life: 255,
+    decay: 0.9 + r() * 0.6,
+    size: 14 + r() * 18,
+    grow: 0.18 + r() * 0.22,
+    alpha: 0.05 + r() * 0.05,
+    seedJit: (r() - 0.5) * 8   // tiny personal hue jitter, degrees
+  });
+}
+
+// a dead particle has faded away; the field re-emits it, usually near an
+// emitter, sometimes anywhere, so coverage stays full-frame
+function reemit(p) {
+  const r = world.rand;
+  let x, y;
+  if (world.emitters.length && r() < 0.6) {
+    const e = world.emitters[(r() * world.emitters.length) | 0];
+    x = e.x * W + (r() - 0.5) * 70;
+    y = e.y * H + (r() - 0.5) * 70;
+  } else {
+    x = r() * W; y = r() * H;
+  }
+  const a = sampleAngle(x, y);
+  p.x = x; p.y = y;
+  p.vx = Math.cos(a) * 0.3; p.vy = Math.sin(a) * 0.3;
+  p.life = 255;
+  p.decay = 0.9 + r() * 0.6;
+  p.size = 14 + r() * 18;
+  p.alpha = 0.05 + r() * 0.05;
+  p.seedJit = (r() - 0.5) * 8;
+}
+
+function stepParticles(draw) {
+  const pts = world.parts;
+
+  for (let i = pts.length - 1; i >= 0; i--) {
+    const p = pts[i];
+    // steering: desired velocity minus current velocity, limited (NoC 5)
+    const a = sampleAngle(p.x, p.y);
+    const dvx = Math.cos(a) * world.maxspeed - p.vx;
+    const dvy = Math.sin(a) * world.maxspeed - p.vy;
+    const dm = Math.hypot(dvx, dvy);
+    const cl = dm > world.maxforce ? world.maxforce / dm : 1;
+    p.vx += dvx * cl; p.vy += dvy * cl;
+    const vm = Math.hypot(p.vx, p.vy), vmax = world.maxspeed * 1.6;
+    if (vm > vmax) { p.vx *= vmax / vm; p.vy *= vmax / vm; }
+    p.x += p.vx; p.y += p.vy;
+    p.life -= p.decay;
+    p.size += p.grow;
+
+    if (p.life <= 0) {           // dead particles have faded away: re-emit
+      reemit(p);
+      continue;
+    }
+    // wrap edges so the field keeps its density
+    if (p.x < -40) p.x += W + 80; else if (p.x > W + 40) p.x -= W + 80;
+    if (p.y < -40) p.y += H + 80; else if (p.y > H + 40) p.y -= H + 80;
+
+    if (draw) {
+      // hue carries the field angle under the particle: color as direction
+      let hue = (a * 180 / Math.PI) + world.hueOffset + p.seedJit;
+      hue = ((hue % 360) + 360) % 360;
+      const b = (hue / 15) | 0;
+      const s = p.size;
+      ctx.globalAlpha = (p.life / 255) * p.alpha;
+      ctx.drawImage(SPRITES[b], p.x - s / 2, p.y - s / 2, s, s);
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+function frame() {
+  world.t += world.timeScale * 0.016;
+  rebuildField();
+  ctx.globalCompositeOperation = "source-over";
+  ctx.fillStyle = "rgba(0,0,0," + world.fade + ")";
+  ctx.fillRect(0, 0, W, H);
+  ctx.globalCompositeOperation = "lighter"; // additive: dense regions bloom
+  stepParticles(true);
+}
+
+// warmup so the first visible frame is already a composed field
+function warmup(iters) {
+  for (let i = 0; i < iters; i++) {
+    world.t += world.timeScale * 0.016;
+    rebuildField();
+    ctx.globalCompositeOperation = "source-over";
+    ctx.fillStyle = "rgba(0,0,0," + world.fade + ")";
+    ctx.fillRect(0, 0, W, H);
+    ctx.globalCompositeOperation = "lighter";
+    stepParticles(true);
+  }
+}
+
+function boot() {
+  const q = new URLSearchParams(location.search);
+  const s = parseInt(q.get("seed"), 10);
+  buildWorld(Number.isFinite(s) ? s : 899204);
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, W, H);
+  warmup(170);
+  requestAnimationFrame(function loop() {
+    frame();
+    requestAnimationFrame(loop);
+  });
+}
+
+canvas.addEventListener("pointerdown", () => {
+  const s = 899200 + ((Math.random() * 700) | 0) + 1;
+  const url = new URL(location.href);
+  url.searchParams.set("seed", s);
+  history.replaceState(null, "", url);
+  buildWorld(s);
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, W, H);
+  warmup(90);
+});
+
+let rto = null;
+window.addEventListener("resize", () => {
+  clearTimeout(rto);
+  rto = setTimeout(() => {
+    layout();
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, W, H);
+    warmup(90);
+  }, 200);
+});
+
+boot();
+</script>
+</body>
+</html>
