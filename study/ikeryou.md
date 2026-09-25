@@ -1,4 +1,4 @@
-# ikeryou — GLSL particle font (and the GPU particle-typography vein)
+# ikeryou: GLSL particle font (and the GPU particle-typography vein)
 
 Studied 2026-09-25 (Hans: study never finishes; this is a living source).
 Depth: technique-deep. The technique was re-rendered locally in raw WebGL and
