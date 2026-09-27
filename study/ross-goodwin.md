@@ -145,6 +145,27 @@ Turing Test." Inspected a film still at full res (via the No Film
 School piece): the gold-costumed actress mid-scene, warm practical
 light, played completely straight, which is why the absurdity lands.
 
+Verified 2026-09-27 against Oscar Sharp's site (thereforefilms.com,
+which redirects to thereforefilms.weebly.com): the "Films by Benjamin
+the A.I." page bills Sunspring as "the first film ever written
+entirely by an artificial intelligence," "Written by 'Benjamin' - a
+collaboration with Ross Goodwin," an End Cue production, made in 48
+hours for the Sci-Fi London 48hr Film Challenge, placing in the top
+10. Benjamin's second film (2017), IT'S NO GAME: "Benjamin collaborates
+on a script about Benjamin," starring David Hasselhoff, Sarah Hay, Tom
+Payne, Tim Guinee and Jake Broder, 3rd place. Benjamin's third film
+(2018), ZONE OUT: an "attempt to have Benjamin write & act & direct &
+score a film," starring "poor simulations" of the Sunspring cast,
+disqualified for excessive use of existing footage. An unreleased
+fourth film, Bobo & Girlfriend, is described as the first film written
+with OpenAI's GPT-2, covered in Robert Downey Jr's Age of A.I. (2019).
+The site links the full five-page screenplay PDF (sunspring_final.pdf;
+page one blank, script on pages 2-5, the song not included), hi-res
+stills, and Benjamin's song. The site carries no technical details of
+Benjamin's model anywhere; it is a credits and press page, not an
+engineering record. One new excerpt from the verified PDF: "He pulls
+his eyes out. He throws his eyes. He pulls his eyes out."
+
 ## 1 the Road: a book written using a car as a pen
 
 March 2017. Four days, New York to New Orleans, in a Cadillac (he
@@ -263,11 +284,14 @@ inspected.
 
 ## Honest gaps
 
-No model trained; the Pincelate-era LSTM mechanics here come from a
+No model trained; the char-RNN-era LSTM mechanics here come from a
 full essay read, not a run. The Sunspring film itself not watched (one
-still inspected, screenplay excerpts from press). 1theroad.com returned
-a server error in this session, so the 1 the Road account rests on
-Wikipedia, the Experience Magazine piece, and the publisher's record.
+still inspected; screenplay excerpts now verified from the linked
+five-page final PDF on Sharp's site rather than press quotes).
+1theroad.com returned DNS resolution failures and connection resets
+across three attempts in this session, so the 1 the Road account rests
+on Wikipedia, the Experience Magazine piece, and the publisher's
+record.
 Please Feed The Lions and the YACHT lyrics not studied in this pass.
 The Deep Dream VR collaboration with Jessica Brillhart, the Mike Tyka
 poem-titles, and the Gray Area reading come from the essay alone.
