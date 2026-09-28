@@ -14,7 +14,8 @@ kinematics, hardware, typography, mechanical installation.
 (see kinematics section below) plus this visual pass: full SFMOMA essay
 "Jurg Lehni and the Poetic Potential of Drawing Machines" read end to end,
 full 2020 postdigitalgraphicdesign interview read in the Hektor/Scriptographer/
-Paper.js sections, and 8 images visually inspected at full res: Hektor
+Paper.js sections, and 8 images visually inspected at full res, 7 of them
+Lehni works: Hektor
 installed on a gallery wall drawing a spray rosette (SFMOMA, 1024px), Hektor
 live at the Swiss Institute 2007 (Core77), Hektor writing "Design and the
 Elastic Mind" at MoMA 2008 (1000px), Viktor drawing on a black ICA-style
