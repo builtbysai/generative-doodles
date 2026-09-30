@@ -10,37 +10,42 @@ Partiels.
 and AMY studies, four times over. The piece is the doctrine of the tuning
 theory turned into an orchestra.
 **Depth:** deep on text plus two local procedural re-renders visually
-inspected. Read end to end: Kalvos and Damian 1997 Toronto interview on
-eContact (the Clang/Quintext passage: "based on the harmonic series," "didn't
-dare to ask players in an orchestra to do very much except kind of bend their
-pitches a little bit in certain directions"), Assaf Shatil's Single Instrumental
-Gesture essay (SIG category 2: works where a continuous shape is realized
-through the recurrence of one gesture; Pre-Meta+Hodos prose; Meta+Hodos
-holarchy correction), Wannamaker/Hasegawa "The Spectral Music of James
-Tenney" via its searchable full text (score instructions quoted verbatim,
-pitch collection, formal scheme; Figure 1 and Figure 2 descriptions pending
-live-browser read), the plainsound.org catalog entry (CLANG 1972, 12',
-orchestra), Sethares "Relating Tuning and Timbre" opening (Mathews and
-Pierce on the thirteenth root of three with odd-partial timbres), and the
+inspected. Read: the Clang/Quintext passage of the Kalvos and Damian 1997
+Toronto interview on eContact (first 166 of 390 lines: "based on the
+harmonic series," "didn't dare to ask players in an orchestra to do very
+much except kind of bend their pitches a little bit in certain
+directions"), the opening of Assaf Shatil's Single Instrumental Gesture
+essay (first 164 of 546 lines: SIG category 2, works where a continuous
+shape is realized through the recurrence of one gesture), the full Clang
+section of Wannamaker/Hasegawa "The Spectral Music of James Tenney" via
+live-browser extraction (print pp. 94-98, endnotes 8-10, and the
+Conclusions mention; score instructions quoted verbatim, pitch
+collection, formal scheme, Figures 1 and 2 described in words), the
+plainsound.org catalog entry (CLANG 1972, 12', orchestra), Sethares
+"Relating Tuning and Timbre" opening (Mathews and Pierce on the
+thirteenth root of three with odd-partial timbres), and the
 Bohlen-Pierce conference account (Bohlen's 1972-73 thirteen-step organ,
 Pierce's "P3579" recreation). Two local procedural re-renders built from the
-published definitions and visually inspected: a 60:1 scale-model synthesis of
+published definitions and visually inspected: a 4:1 scale-model synthesis of
 the available-pitch process (180 s, 16 players, prime-partial pitch set,
 swell-fade tones, three percussive clangs, accumulative then dissolutive
 arc, spectrogram and formal-scheme diagram), and a Plomp-Levelt dissonance
 curve for an odd-harmonic timbre over the 3:1 tritave with 3^(n/13) steps.
 
-**Honest gaps:** Wannamaker's Figures 1-2 seen only via the browser task's
-description, not my own pixels; no recording of Clang heard (none found in
-session); the full score not read; the 15-30 minute duration in the
-article's OCR versus the catalog's 12' left unresolved; dissonance-curve
-re-render uses five partials, so shallow dips are incomplete; WAV never
-auditioned.
+**Honest gaps:** Wannamaker's Figures 1-2 known only from the browser
+task's written description, not from my own pixels; no recording of Clang
+heard (none found in session); the full score not read; no player count
+established from the sources read; dissonance-curve re-render uses five
+partials, so shallow dips are incomplete; WAV never auditioned.
 
 ## The piece, stated plainly
 
-Clang is twelve minutes (catalog) for orchestra, based on the harmonic
-series on E. Three fortississimo percussive clangs frame it: one to open,
+Clang is roughly fifteen and a half minutes (Wannamaker gives "roughly
+15'30""; the Plainsound catalog lists 12'), for orchestra, based on the
+harmonic series on E. The title is borrowed from Tenney's own temporal
+gestalt perception research, but Wannamaker reads it here as more
+onomatopoeic than technical. Three fortississimo percussive clangs frame
+it: one to open,
 one about two-thirds of the way through, one to close. Between the first
 and second clang runs an accumulative process; between the second and
 third, a dissolutive one. The second clang sits at the golden section.
@@ -77,7 +82,7 @@ early texts: similarity and proximity as the unifying forces, the clang
 as a holarchy of inclusions rather than a hierarchy of power. The orchestra
 never plays a melody, never develops a theme. It swells and fades, and the
 form is only the density of that swelling. This is the "one-idea piece"
-doctrine from the For Ann study, now carried by eighty people.
+doctrine from the For Ann study, now carried by the full orchestra.
 
 The indeterminacy is post-Cageian but not Cage's: Tenney does not care
 about the local decisions (who plays what when) because he has decided
@@ -96,13 +101,17 @@ octave-folded into one octave:
 - 3 -> B (702 cents, the fifth)
 - 5 -> G# (386 cents, the just major third)
 - 7 -> D, 969 cents, 31 cents flat of D (approximated as a quartertone-flat D)
-- 11 -> A, 551 cents, 49 cents flat of A (quartertone-flat A)
+- 11 -> A, 551 cents, 51 cents sharp of A (quartertone-sharp A, one cent
+  above the quartertone grid)
 - 13 -> C, 841 cents, 41 cents sharp of C (quartertone-sharp C)
 - 17 -> F, 105 cents (F)
 - 19 -> G, 298 cents (G)
 
-Eight pitch classes: E F G G# A(quarter-flat) B C(quarter-sharp) D(quarter-flat).
-A just-intoned octatonic scale. The odd, "out" partials 7, 11, and 13 are
+Eight pitch classes: E F G G# A(quarter-sharp) B C(quarter-sharp)
+D(quarter-flat). A just-intoned octatonic scale. Figure 2 in Wannamaker's
+article tabulates each harmonic's deviation from its quartertone
+approximation in cents: F +5, G -2, G# -14, A-quarter-sharp +1, B +2,
+C-quarter-sharp -9, D-quarter-flat +19. The odd, "out" partials 7, 11, and 13 are
 notated as equal-tempered quartertones because Tenney would not ask an
 orchestra for more precision than that. And the score is explicit that
 great precision is obviously not expected: in fact, the beats resulting
@@ -120,7 +129,7 @@ use the coarse grid for what the fine grid cannot hold.
 
 Three clangs. Accumulative, then dissolutive. The second clang at two
 thirds. The form is one swell with an asymmetric peak, the same shape as
-a single player's tone writ large across twelve minutes: soft, louder,
+a single player's tone writ large across the whole piece: soft, louder,
 gone. Tenney's "swell" pieces (Koan, Swell) do this at the gesture level;
 Clang does it at the section level. The hinge is not a climax, it is a
 percussive marker that says: now the other direction. For generative
@@ -128,11 +137,69 @@ pieces this is a form worth stealing outright: no development, no
 recapitulation, just accumulation then dissolution with a marked hinge,
 and the hinge placed off-center so the piece leans.
 
-The re-render confirms the shape reads: the 60:1 model's RMS rises
+The accumulative process starts from a single pitch class. The opening
+clang is a unison of all the Es from E1 to E7, and the available gamut
+then expands symmetrically above and below E4 in stages, like widening
+the bandwidth of a bandpass filter so it passes more and more frequency
+components. The orchestration is staged so the change is extraordinarily
+smooth: instruments enter fractions of a choir at a time, the percussion
+delayed to varying degrees, the timpani last. The score's intended
+effect: a single continuous pitch with gradually changing timbre,
+followed by a gradually expanding, quasi-random texture of changing
+timbres and pitches. The result is what Wannamaker calls a churning ocean
+of sound, with varied and haunting harmonic efflorescences rising out of
+it.
+
+The second clang is deliberately unlike the other two. Where the opening
+and closing clangs are extreme consonances, the middle one is an extreme
+dissonance: approximations to partials 1, 3, 17, and 11 of E, with
+tempered B-flat accepted as the 11th partial, voiced as interlocking
+tempered major sevenths and minor ninths. Its voicing is a symmetrical
+cyclical stacking of semitone intervals, 7, 6, 5, 6, 7, 6, 5, 6, 7, 6, 5
+from the bass, an alternation of interval classes 5 and 6. All sustaining
+instruments fall silent for about three seconds in response, then
+continue as before, and the dissolutive process begins.
+
+The dissolutive half runs on what Wannamaker calls the conceptual
+fundamental. At the second clang, every available pitch can be heard as a
+harmonic of an infrasonic E-3; each stage of the dissolution then raises
+that conceptual fundamental by an octave, and any pitch that cannot be
+read as a harmonic of the new fundamental drops out of the available set.
+The first to go are F1 and G1 (partials 17 and 19 of E-3); pitches in
+pitch class E are treated specially and all are retained. The set is
+weeded stage by stage until only the Es from E1 to E7 remain, at which
+point the final clang reinforces and releases them. The texture grows
+progressively less noiselike and more tonal, until the available pitches
+are all harmonics of a single sounding tone. The large-scale trajectory
+is a broad arc: from the simplicity of one tone, through a complex welter
+of pitches and fleeting harmonic relationships, back to a unitary
+percept by a different route.
+
+The re-render confirms the shape reads: the 4:1 model's RMS rises
 steadily from 0.067 to 0.185 across the first two thirds, the 2/3 clang
 lands as the peak, and the last third falls to 0.080. The spectrogram
 shows individual swell-fade tones as lens-shaped blobs, exactly the
 "available pitch process" made visible.
+
+## Publication and afterlife
+
+Clang is published, but despite modest technical demands it never had a
+concert premiere. It got a reading by the Los Angeles Philharmonic soon
+after it was written, and a bootleg-quality cassette of that reading
+survives. Near the end of his life, Tenney, guessing the indeterminate
+aspects of the score had kept orchestras away, re-realized Clang's
+accumulative and dissolutive processes in a conventionally notated
+12-tone equal-tempered work, Panacousticon (2005) for orchestra. It
+builds its opening cluster upward from the bass rather than outward from
+the middle register and invents new kinds of clang events; the processes
+are the same. Panacousticon was premiered in Munich in July 2007 by the
+Bavarian Radio Symphony Orchestra.
+
+One lineage note, from Wannamaker's endnote 10: Tenney's structural use
+of the ascending conceptual fundamental in Clang predates its appearance
+in the music of composers such as Gerard Grisey. Clang and Quintext, both
+1972, are the earliest examples of paradigmatic spectral music in North
+America.
 
 ## Hop 2: the thirteenth root of three (Mathews/Pierce, and Bohlen)
 
@@ -165,7 +232,7 @@ harmony outside the structure it sits in.
 
 ## What makes it sing
 
-- The single ritual. Eighty players doing the same swell-fade with random
+- The single ritual. The whole orchestra doing the same swell-fade with random
   pitch choice is a texture no composed line can produce: statistically
   smooth, locally unpredictable.
 - The menu is small and strange. Eight pitch classes, three of them
@@ -178,6 +245,9 @@ harmony outside the structure it sits in.
 - The distribution, not the events. Tenney composes density and dynamics;
   the pitches and timings are sampled. This is the generative contract
   in its cleanest historical form.
+- The dissonant hinge. The middle clang is the one extreme dissonance in
+  a piece of extreme consonances, and it sits exactly on the structural
+  joint. Contrast placed at the turn does double work.
 
 ## Avoid-list additions
 
