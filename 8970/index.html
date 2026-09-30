@@ -1,0 +1,602 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>&#8470;8970 &middot; Greedy Squiggle</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; overflow: hidden; }
+  body {
+    background: #efe9d8;
+    font-family: Georgia, 'Times New Roman', serif;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+    user-select: none;
+  }
+  #c { display: block; width: 100vw; height: 100vh; }
+  .plate {
+    position: fixed; left: 18px; top: 14px; z-index: 5;
+    color: #4a4234; font-style: italic; font-size: 15px;
+    letter-spacing: 0.04em; pointer-events: none;
+  }
+  .plate .num { font-style: normal; }
+  .hint {
+    position: fixed; right: 18px; bottom: 14px; z-index: 5;
+    color: #8a8069; font-style: italic; font-size: 13px;
+    pointer-events: none; transition: opacity 1.2s;
+  }
+  .hint.gone { opacity: 0; }
+  body.thumbmode .plate, body.thumbmode .hint { display: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="plate"><span class="num">&#8470;8970</span> &middot; Greedy Squiggle</div>
+<div class="hint" id="hint">click or tap for a new field</div>
+<script>
+"use strict";
+/* ============================================================
+   GREEDY SQUIGGLE · №8970
+   A plotter-style line that hunts the darkest remaining pixel of
+   a generative driver field. Each step it probes candidate
+   directions and keeps the darkest, erases its working buffer
+   as it goes, and holds mostly one continuous line.
+   ============================================================ */
+
+const LW = 1280, LH = 800;            // logical drawing field (16:10)
+const STEP = 3.4;                     // pen advance per step (px)
+const ERASE_R = 3.6;                  // eraser disc radius (px)
+const PROBE_N = 24;                   // candidate directions per step
+const MAX_STEPS = 30000;
+const CHUNK = 110;                    // sim steps per animation frame
+const DARK_STOP = 0.055;              // stop when darkest pixel below this
+
+/* ---------- URL params (dev/QA only) ---------- */
+function parseParams() {
+  const q = new URLSearchParams(location.search);
+  const driver = q.get('driver') || 'storm';
+  const seed = parseInt(q.get('seed') || '7', 10);
+  const fast = q.get('fast') === '1';
+  const thumb = q.get('thumb') === '1';
+  return { driver, seed, fast, thumb };
+}
+const params = parseParams();
+
+/* ---------- seeded PRNG + noise ---------- */
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function makeNoise1D(rand) {
+  const N = 256, g = new Float32Array(N);
+  for (let i = 0; i < N; i++) g[i] = rand();
+  const at = (x) => {
+    const xi = Math.floor(x), xf = x - xi;
+    const a = g[((xi % N) + N) % N], b = g[(((xi + 1) % N) + N) % N];
+    const u = xf * xf * (3 - 2 * xf);
+    return a + (b - a) * u;
+  };
+  return (x, oct) => {
+    let v = 0, amp = 0.5, f = 1, tot = 0;
+    for (let o = 0; o < (oct || 3); o++) { v += at(x * f) * amp; tot += amp; amp *= 0.5; f *= 2.03; }
+    return v / tot;
+  };
+}
+// deterministic per-step jitter for the hand-drawn wobble
+function hash01(n) {
+  let x = (n * 2654435761) >>> 0;
+  x ^= x >>> 15; x = Math.imul(x, 2246822519); x ^= x >>> 13;
+  return (x >>> 0) / 4294967296;
+}
+
+/* ---------- driver fields: darkness 0..1 ---------- */
+function newBuffer() { return new Float32Array(LW * LH); }
+const idx = (x, y) => (y | 0) * LW + (x | 0);
+
+function paintDisc(buf, cx, cy, r, dark) {
+  const x0 = Math.max(0, Math.floor(cx - r)), x1 = Math.min(LW - 1, Math.ceil(cx + r));
+  const y0 = Math.max(0, Math.floor(cy - r)), y1 = Math.min(LH - 1, Math.ceil(cy + r));
+  for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+    const d = Math.hypot(x - cx, y - cy);
+    if (d <= r) {
+      const i = y * LW + x, k = 1 - d / r;
+      const v = dark * (0.35 + 0.65 * k);
+      if (v > buf[i]) buf[i] = v;
+    }
+  }
+}
+function paintPolyline(buf, pts, w, dark) {
+  for (let s = 0; s < pts.length - 1; s++) {
+    const [ax, ay] = pts[s], [bx, by] = pts[s + 1];
+    const len = Math.hypot(bx - ax, by - ay), n = Math.max(1, Math.ceil(len / 2));
+    for (let i = 0; i <= n; i++) {
+      const t = i / n;
+      paintDisc(buf, ax + (bx - ax) * t, ay + (by - ay) * t, w / 2, dark);
+    }
+  }
+}
+
+/* Design A: ridgeline landscape */
+function driverLandscape(buf, rand) {
+  const n1 = makeNoise1D(rand), n1b = makeNoise1D(rand), n1c = makeNoise1D(rand);
+  // sky wash
+  for (let i = 0; i < buf.length; i++) buf[i] = 0.02;
+  // cloud bands
+  for (let b = 0; b < 4; b++) {
+    const yb = 90 + b * 55 + rand() * 30, th = 16 + rand() * 18, dk = 0.34 + rand() * 0.16;
+    for (let x = 0; x < LW; x += 2) {
+      const lump = n1(x * 0.006 + b * 9.1, 3);
+      const yy = yb + (lump - 0.5) * 40;
+      for (let y = Math.max(0, yy - th); y < Math.min(LH, yy + th); y += 2) {
+        const fall = 1 - Math.abs(y - yy) / th;
+        const i = (y | 0) * LW + x, v = dk * fall * (0.4 + 0.6 * lump);
+        if (v > buf[i]) buf[i] = v;
+      }
+    }
+  }
+  // sun
+  paintDisc(buf, 990 + rand() * 60, 150 + rand() * 40, 64, 0.88);
+  // birds: little double-arcs
+  for (let b = 0; b < 3 + (rand() * 3 | 0); b++) {
+    const bx = 120 + rand() * 700, by = 130 + rand() * 160, s = 14 + rand() * 12;
+    const pts = [];
+    for (let t = -1; t <= 1.001; t += 0.25) pts.push([bx + t * s, by - Math.abs(t) * s * 0.55]);
+    paintPolyline(buf, pts, 3, 0.8);
+  }
+  // three ridges, far to near
+  const ridges = [
+    { base: 400, amp: 95, fill: [0.52, 0.26], crest: 0.95, bottom: 585 },
+    { base: 500, amp: 75, fill: [0.58, 0.30], crest: 0.95, bottom: 668 },
+    { base: 622, amp: 52, fill: [0.58, 0.30], crest: 0.90, bottom: 800 },
+  ];
+  const noises = [n1, n1b, n1c];
+  ridges.forEach((r, ri) => {
+    const nz = noises[ri];
+    const crestPts = [];
+    for (let x = 0; x < LW; x += 3) {
+      const y = r.base + (nz(x * 0.004 + ri * 37.7, 4) - 0.5) * 2 * r.amp
+                      + (nz(x * 0.021 + ri * 11.3, 2) - 0.5) * r.amp * 0.35;
+      crestPts.push([x, y]);
+    }
+    // filled mass with vertical gradient
+    for (let s = 0; s < crestPts.length; s++) {
+      const [x, cy] = crestPts[s];
+      const xi = x | 0;
+      for (let y = Math.max(0, cy | 0); y < r.bottom; y += 2) {
+        const t = (y - cy) / (r.bottom - cy);
+        const v = r.fill[0] + (r.fill[1] - r.fill[0]) * t;
+        const i = y * LW + xi;
+        if (v > buf[i]) buf[i] = v;
+      }
+    }
+    // dark crest line: the thing the pen loves to trace
+    paintPolyline(buf, crestPts, 5, r.crest);
+  });
+  // winding stream through the near meadow: a dark line the pen traces
+  const stream = [];
+  let sx = 640 + (rand() - 0.5) * 300, sy = 600;
+  while (sy < 830) { stream.push([sx, sy]); sx += (n1(sx * 0.01, 2) - 0.5) * 60; sy += 20; }
+  paintPolyline(buf, stream, 4.5, 0.82);
+  // grass tufts on the near hill
+  for (let g = 0; g < 130; g++) {
+    const gx = rand() * LW, gy = 640 + rand() * 150;
+    const h = 9 + rand() * 12, lean = (rand() - 0.5) * 10;
+    paintPolyline(buf, [[gx, gy], [gx + lean, gy - h]], 2.8, 0.85);
+  }
+}
+
+/* Design B: koi */
+function driverKoi(buf, rand) {
+  for (let i = 0; i < buf.length; i++) buf[i] = 0.02;
+  const n1 = makeNoise1D(rand);
+  // water ripple bands
+  for (let y = 0; y < LH; y += 2) {
+    const band = 0.5 + 0.5 * Math.sin(y * 0.045 + n1(y * 0.01, 2) * 6);
+    for (let x = 0; x < LW; x += 3) {
+      const w = 0.5 + 0.5 * Math.sin(x * 0.02 + y * 0.03);
+      const v = 0.10 * band * w;
+      const i = y * LW + x;
+      if (v > buf[i]) buf[i] = v;
+    }
+  }
+  const cx = 640, cy = 400, ang = -0.32 + (rand() - 0.5) * 0.2;
+  const R = (t, x, y) => {
+    const dx = x - cx, dy = y - cy, c = Math.cos(-ang), s = Math.sin(-ang);
+    return [dx * c - dy * s, dx * s + dy * c];
+  };
+  // body: tapered ellipse, rear at t=-1, head at t=1
+  for (let y = 180; y < 620; y += 2) for (let x = 260; x < 1020; x += 2) {
+    const [lx, ly] = R(0, x, y);
+    const t = lx / 250;
+    if (t < -1.05 || t > 1.05) continue;
+    const wdt = 92 * Math.pow(Math.max(0, Math.cos(t * Math.PI / 2.2)), 0.75) + 6;
+    if (Math.abs(ly) < wdt) {
+      const edge = 1 - Math.abs(ly) / wdt;
+      const v = 0.16 + 0.16 * edge;
+      const i = y * LW + x;
+      if (v > buf[i]) buf[i] = v;
+    }
+  }
+  // body outline contour: the pen traces the fish shape
+  {
+    const pts = [];
+    for (let t = -1.0; t <= 1.001; t += 0.04) {
+      const lx = t * 250;
+      const wdt = 92 * Math.pow(Math.max(0, Math.cos(t * Math.PI / 2.2)), 0.75) + 6;
+      const c = Math.cos(ang), s = Math.sin(ang);
+      pts.push([cx + lx * c - (-wdt) * s, cy + lx * s + (-wdt) * c]);
+    }
+    for (let t = 1.0; t >= -1.0; t -= 0.04) {
+      const lx = t * 250;
+      const wdt = 92 * Math.pow(Math.max(0, Math.cos(t * Math.PI / 2.2)), 0.75) + 6;
+      const c = Math.cos(ang), s = Math.sin(ang);
+      pts.push([cx + lx * c - wdt * s, cy + lx * s + wdt * c]);
+    }
+    paintPolyline(buf, pts, 4.5, 0.78);
+  }
+  // koi markings: dark patches along the back
+  const marks = 5 + (rand() * 3 | 0);
+  for (let m = 0; m < marks; m++) {
+    const t = -0.7 + (m / marks) * 1.5 + (rand() - 0.5) * 0.15;
+    const lx = t * 250, ly = -20 - rand() * 40;
+    const c = Math.cos(ang), s = Math.sin(ang);
+    paintDisc(buf, cx + lx * c - ly * s, cy + lx * s + ly * c, 26 + rand() * 22, 0.86);
+  }
+  // spine curve
+  const spine = [];
+  for (let t = -0.9; t <= 1.0; t += 0.08) {
+    const lx = t * 250, ly = -58 * Math.pow(Math.max(0, Math.cos(t * Math.PI / 2.2)), 0.75);
+    const c = Math.cos(ang), s = Math.sin(ang);
+    spine.push([cx + lx * c - ly * s, cy + lx * s + ly * c]);
+  }
+  paintPolyline(buf, spine, 4, 0.9);
+  // tail fin: triangle fan
+  const tx = cx - Math.cos(ang) * 250, ty = cy - Math.sin(ang) * 250;
+  for (let f = -1; f <= 1.001; f += 0.1) {
+    const fx = tx - Math.cos(ang) * (90 + rand() * 30), fy = ty - Math.sin(ang) * (90 + rand() * 30) + f * 95;
+    paintPolyline(buf, [[tx, ty], [fx, fy]], 7, 0.52);
+  }
+  // pectoral fins
+  [[0.35, 1], [0.15, -1]].forEach(([tt, side]) => {
+    const lx = tt * 250, c = Math.cos(ang), s = Math.sin(ang);
+    const px = cx + lx * c, py = cy + lx * s;
+    paintPolyline(buf, [[px, py], [px - s * side * 95, py + c * side * 95]], 9, 0.5);
+  });
+  // eye
+  {
+    const lx = 195, ly = -18, c = Math.cos(ang), s = Math.sin(ang);
+    paintDisc(buf, cx + lx * c - ly * s, cy + lx * s + ly * c, 11, 0.95);
+  }
+  // whiskers
+  {
+    const lx = 235, c = Math.cos(ang), s = Math.sin(ang);
+    const hx = cx + lx * c, hy = cy + lx * s;
+    paintPolyline(buf, [[hx, hy], [hx + 70, hy - 46], [hx + 120, hy - 40]], 2.6, 0.8);
+    paintPolyline(buf, [[hx, hy], [hx + 66, hy + 52], [hx + 116, hy + 58]], 2.6, 0.8);
+  }
+  // concentric ripple arcs around the fish
+  for (let r = 0; r < 3; r++) {
+    const rr = 300 + r * 55 + rand() * 20;
+    const pts = [];
+    for (let a = 0; a <= Math.PI * 2.01; a += 0.06)
+      pts.push([cx + Math.cos(a) * rr * 1.35, cy + Math.sin(a) * rr * 0.8]);
+    paintPolyline(buf, pts, 3, 0.30);
+  }
+  // lily pads
+  for (let p = 0; p < 2; p++) {
+    const px = 130 + rand() * 220 + p * 760, py = 620 + rand() * 90, pr = 52 + rand() * 22;
+    for (let a = 0.5; a < Math.PI * 2 - 0.2; a += 0.02)
+      paintDisc(buf, px + Math.cos(a) * pr, py + Math.sin(a) * pr, 4, 0.62);
+    paintDisc(buf, px, py, pr * 0.55, 0.30);
+  }
+}
+
+/* Design C: storm */
+function driverStorm(buf, rand) {
+  for (let i = 0; i < buf.length; i++) buf[i] = 0.02;
+  const n1 = makeNoise1D(rand);
+  // cloud bank: overlapping dark blobs with darker cores
+  const blobs = 9 + (rand() * 4 | 0);
+  for (let b = 0; b < blobs; b++) {
+    const bx = (b / blobs) * LW + (rand() - 0.5) * 160;
+    const by = 90 + rand() * 150, br = 90 + rand() * 110;
+    paintDisc(buf, bx, by, br, 0.66);
+    paintDisc(buf, bx + (rand() - 0.5) * 60, by + (rand() - 0.5) * 40, br * 0.55, 0.9);
+  }
+  // rain slashes under the clouds
+  for (let r = 0; r < 130; r++) {
+    const rx = rand() * LW, ry = 250 + rand() * 300, len = 30 + rand() * 46;
+    paintPolyline(buf, [[rx, ry], [rx - len * 0.28, ry + len]], 3, 0.68);
+  }
+  // lightning bolt: jagged, mostly vertical
+  let lx = 420 + rand() * 440, ly = 230;
+  const bolt = [[lx, ly]];
+  while (ly < 600) { lx += (rand() - 0.5) * 130; ly += 26 + rand() * 26; bolt.push([lx, ly]); }
+  paintPolyline(buf, bolt, 5, 0.96);
+  paintPolyline(buf, bolt, 11, 0.35);
+  // far hill silhouette
+  const crest = [];
+  for (let x = 0; x < LW; x += 3) {
+    const y = 640 + (n1(x * 0.005, 4) - 0.5) * 120;
+    crest.push([x, y]);
+  }
+  for (let s = 0; s < crest.length; s++) {
+    const [x, cy] = crest[s], xi = x | 0;
+    for (let y = Math.max(0, cy | 0); y < LH; y += 2) {
+      const t = (y - cy) / (LH - cy);
+      const v = 0.56 - t * 0.22;
+      const i = y * LW + xi;
+      if (v > buf[i]) buf[i] = v;
+    }
+  }
+  paintPolyline(buf, crest, 5, 0.92);
+  const hillY = (x) => 640 + (n1(x * 0.005, 4) - 0.5) * 120;
+  // lone tree on the hill
+  const txp = 200 + rand() * 500;
+  const ty = hillY(txp);
+  paintPolyline(buf, [[txp, ty], [txp + 8, ty - 90]], 7, 0.85);
+  paintDisc(buf, txp + 8, ty - 130, 46, 0.62);
+  paintDisc(buf, txp - 20, ty - 110, 30, 0.7);
+  // small house: outlines for the pen to trace, dark door to scribble
+  const hxp = 750 + rand() * 280, hyp = hillY(hxp), hw = 44, hh = 36;
+  paintPolyline(buf, [[hxp - hw, hyp], [hxp - hw, hyp - hh], [hxp + hw, hyp - hh], [hxp + hw, hyp]], 4, 0.8);
+  paintPolyline(buf, [[hxp - hw - 10, hyp - hh], [hxp, hyp - hh - 30], [hxp + hw + 10, hyp - hh]], 4.5, 0.85);
+  paintDisc(buf, hxp, hyp - hh / 2, 13, 0.9);
+  paintDisc(buf, hxp - hw / 2, hyp - hh / 2, 8, 0.88);
+  // bush by the house
+  paintDisc(buf, hxp + hw + 26, hyp - 16, 20, 0.66);
+}
+
+/* ---------- the greedy squiggle ---------- */
+function buildDriver(buf, rand, which) {
+  if (which === 'koi') return driverKoi(buf, rand);
+  if (which === 'storm') return driverStorm(buf, rand);
+  return driverLandscape(buf, rand);
+}
+function darkestPixel(buf, coarse) {
+  let bx = 0, by = 0, bv = -1;
+  for (let y = 0; y < LH; y += coarse) for (let x = 0; x < LW; x += coarse) {
+    const v = buf[y * LW + x];
+    if (v > bv) { bv = v; bx = x; by = y; }
+  }
+  return [bx, by, bv];
+}
+function sampleBuf(buf, x, y) {
+  const xi = Math.max(0, Math.min(LW - 1, x | 0));
+  const yi = Math.max(0, Math.min(LH - 1, y | 0));
+  return buf[yi * LW + xi];
+}
+function eraseDisc(buf, cx, cy, r, k) {
+  const x0 = Math.max(0, Math.floor(cx - r)), x1 = Math.min(LW - 1, Math.ceil(cx + r));
+  const y0 = Math.max(0, Math.floor(cy - r)), y1 = Math.min(LH - 1, Math.ceil(cy + r));
+  const r2 = r * r;
+  for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+    const dx = x - cx, dy = y - cy, d2 = dx * dx + dy * dy;
+    if (d2 <= r2) {
+      const i = y * LW + x;
+      buf[i] *= 1 - k * (1 - d2 / r2);
+    }
+  }
+}
+
+class Squiggle {
+  constructor(buf, rand) {
+    this.buf = buf;
+    this.rand = rand;
+    const [sx, sy] = darkestPixel(buf, 6);
+    this.x = sx; this.y = sy;
+    this.heading = rand() * Math.PI * 2;
+    this.segs = [];            // {x1,y1,x2,y2,d} drawn segments
+    this.lifts = 0;
+    this.steps = 0;
+    this.done = false;
+    eraseDisc(buf, sx, sy, ERASE_R * 2.2, 0.5);
+  }
+  stepOne() {
+    const { buf } = this;
+    let bv = -1, ba = this.heading, bestScore = -1;
+    for (let k = 0; k < PROBE_N; k++) {
+      const a = (k / PROBE_N) * Math.PI * 2;
+      const dx = Math.cos(a), dy = Math.sin(a);
+      // probe three points along the candidate ray
+      const s = (sampleBuf(buf, this.x + dx * 6, this.y + dy * 6) * 0.5 +
+                 sampleBuf(buf, this.x + dx * 12, this.y + dy * 12) * 0.3 +
+                 sampleBuf(buf, this.x + dx * 20, this.y + dy * 20) * 0.2);
+      // momentum: prefer continuing roughly the same way
+      let turn = a - this.heading;
+      while (turn > Math.PI) turn -= Math.PI * 2;
+      while (turn < -Math.PI) turn += Math.PI * 2;
+      // a breath of noise so uniform areas wander like a hand, not a ruler
+      const wob = (hash01(this.steps * 31 + k) - 0.5) * 0.008;
+      const score = s + 0.07 * Math.cos(turn) + wob;
+      // gentle pull away from the frame edge
+      const m = 40;
+      let edge = 0;
+      if (this.x < m) edge += Math.cos(a) * 0.05;
+      if (this.x > LW - m) edge += Math.cos(a) * -0.05;
+      if (this.y < m) edge += Math.sin(a) * 0.05;
+      if (this.y > LH - m) edge += Math.sin(a) * -0.05;
+      if (score + edge > bv) { bv = score + edge; ba = a; bestScore = s; }
+    }
+    // blend toward the winner for smooth curves
+    let turn = ba - this.heading;
+    while (turn > Math.PI) turn -= Math.PI * 2;
+    while (turn < -Math.PI) turn += Math.PI * 2;
+    this.heading += turn * 0.6;
+    // erase where the pen HAS BEEN, never where it is going
+    eraseDisc(buf, this.x, this.y, ERASE_R, 0.55);
+    const stride = STEP * (0.82 + 0.36 * hash01(this.steps * 7 + 3));
+    // hard clamp: the pen never leaves the frame
+    const nx = Math.max(2, Math.min(LW - 2, this.x + Math.cos(this.heading) * stride));
+    const ny = Math.max(2, Math.min(LH - 2, this.y + Math.sin(this.heading) * stride));
+    const d = sampleBuf(buf, nx, ny);
+    this.segs.push({ x1: this.x, y1: this.y, x2: nx, y2: ny, d });
+    this.x = nx; this.y = ny;
+    this.steps++;
+    const needLift = bestScore < 0.045;
+    const relocate = this.steps % 700 === 0;
+    if (needLift || relocate) {
+      // pen lift: hunt the darkest remaining pixel
+      const [hx, hy, hv] = darkestPixel(buf, 6);
+      if (hv < DARK_STOP || this.steps >= MAX_STEPS) { this.done = true; return; }
+      if (relocate && !needLift && hv < 0.22) {
+        // nothing rich left elsewhere; keep the line going locally
+      } else {
+        this.x = hx; this.y = hy;
+        this.heading = this.rand() * Math.PI * 2;
+        this.lifts++;
+        eraseDisc(buf, hx, hy, ERASE_R * 2, 0.4);
+      }
+    }
+    if (this.steps >= MAX_STEPS) this.done = true;
+  }
+  run(n) { for (let i = 0; i < n && !this.done; i++) this.stepOne(); }
+}
+
+/* ---------- rendering ---------- */
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let view = { w: 0, h: 0, s: 1, ox: 0, oy: 0 };
+
+const paper = document.createElement('canvas');   // static background
+const ink = document.createElement('canvas');     // accumulated line work
+const ictx = ink.getContext('2d');
+function paintPaper() {
+  paper.width = canvas.width; paper.height = canvas.height;
+  const p = paper.getContext('2d');
+  p.fillStyle = '#efe9d8';
+  p.fillRect(0, 0, paper.width, paper.height);
+  p.setTransform(view.s, 0, 0, view.s, view.ox, view.oy);
+  p.fillStyle = p.createPattern(grain, 'repeat');
+  p.fillRect(-view.ox / view.s, -view.oy / view.s, paper.width / view.s, paper.height / view.s);
+  p.strokeStyle = 'rgba(74,66,52,0.5)';
+  p.lineWidth = 3 / view.s;
+  p.strokeRect(0, 0, LW, LH);
+}
+function resize() {
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  view.w = window.innerWidth; view.h = window.innerHeight;
+  canvas.width = Math.round(view.w * dpr); canvas.height = Math.round(view.h * dpr);
+  view.s = Math.min(view.w / LW, view.h / LH) * dpr;
+  view.ox = (canvas.width - LW * view.s) / 2;
+  view.oy = (canvas.height - LH * view.s) / 2;
+  paintPaper();
+  ink.width = canvas.width; ink.height = canvas.height;
+  ictx.setTransform(view.s, 0, 0, view.s, view.ox, view.oy);
+  ictx.lineCap = 'round'; ictx.lineJoin = 'round';
+  if (sim) { drawnCount = 0; drawNewSegs(); renderFrame(); }
+}
+window.addEventListener('resize', resize);
+
+// paper grain tile
+const grain = document.createElement('canvas');
+grain.width = grain.height = 140;
+{
+  const g = grain.getContext('2d');
+  g.fillStyle = '#efe9d8'; g.fillRect(0, 0, 140, 140);
+  const gr = mulberry32(7);
+  for (let i = 0; i < 900; i++) {
+    const v = 225 + (gr() * 26 | 0);
+    g.fillStyle = `rgb(${v},${v - 6},${v - 18})`;
+    g.fillRect(gr() * 140 | 0, gr() * 140 | 0, 1.4, 1.4);
+  }
+}
+const INK = '#38312a';
+function drawSeg(c, s, i) {
+  const jx = (hash01(i * 2) - 0.5) * 1.3, jy = (hash01(i * 2 + 1) - 0.5) * 1.3;
+  const w = 0.75 + 1.7 * s.d;
+  c.strokeStyle = INK;
+  c.globalAlpha = 0.88;
+  c.lineWidth = w;
+  c.beginPath();
+  c.moveTo(s.x1 + jx, s.y1 + jy);
+  c.lineTo(s.x2 + jx, s.y2 + jy);
+  c.stroke();
+  c.globalAlpha = 1;
+}
+// append newly simulated segments into the accumulation layer
+function drawNewSegs() {
+  for (let i = drawnCount; i < sim.segs.length; i++) drawSeg(ictx, sim.segs[i], i);
+  drawnCount = sim.segs.length;
+}
+function drawPenDot() {
+  ctx.fillStyle = '#8a2f23';
+  ctx.beginPath();
+  ctx.arc(sim.x, sim.y, 3.4, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(138,47,35,0.35)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.arc(sim.x, sim.y, 8, 0, Math.PI * 2);
+  ctx.stroke();
+}
+function renderFrame() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.drawImage(paper, 0, 0);
+  ctx.drawImage(ink, 0, 0);
+  if (!sim.done) {
+    ctx.setTransform(view.s, 0, 0, view.s, view.ox, view.oy);
+    drawPenDot();
+  }
+}
+
+/* ---------- main loop ---------- */
+let sim = null, drawnCount = 0, lastTs = 0;
+
+function buildWorld(seed) {
+  const rand = mulberry32(seed);
+  const buf = newBuffer();
+  buildDriver(buf, rand, params.driver);
+  sim = new Squiggle(buf, rand);
+  drawnCount = 0;
+  ictx.save();
+  ictx.setTransform(1, 0, 0, 1, 0, 0);
+  ictx.clearRect(0, 0, ink.width, ink.height);
+  ictx.restore();
+  if (params.fast) {
+    sim.run(MAX_STEPS);
+    drawNewSegs();
+    renderFrame();
+  } else {
+    requestAnimationFrame(loop);
+  }
+}
+function loop(ts) {
+  if (!sim.done) {
+    sim.run(CHUNK);
+    drawNewSegs();
+    renderFrame();
+    requestAnimationFrame(loop);
+  } else {
+    renderFrame();
+    const hint = document.getElementById('hint');
+    if (hint) setTimeout(() => hint.classList.add('gone'), 2500);
+  }
+}
+
+const DRIVERS = ['landscape', 'storm', 'koi'];
+function regenerate() {
+  const seed = (Math.random() * 1e9) | 0;
+  const driver = DRIVERS[(Math.random() * DRIVERS.length) | 0];
+  history.replaceState(null, '', `?driver=${driver}&seed=${seed}`);
+  params.seed = seed;
+  params.driver = driver;
+  buildWorld(seed);
+}
+
+window.addEventListener('pointerdown', (e) => {
+  if (e.target.closest('.plate') || e.target.closest('.hint')) return;
+  regenerate();
+});
+
+resize();
+if (params.thumb) document.body.classList.add('thumbmode');
+buildWorld(params.seed);
+</script>
+</body>
+</html>
