@@ -29,15 +29,72 @@ textures; the main-section accelerando (5 s/attack to 0.83 s/attack,
 exponential, constant after the golden section at 5'30") with the harmonic
 ceiling rising to the 105th and thinning to open-string harmonics 5, 6, 7.
 
-**Honest gaps:** Wannamaker's Figures 4, 5, and 6 known from captions and
-prose descriptions plus my own reconstructions, not from the paper's pixels
-(no PDF pixel extraction succeeded in-session); the full score not read (no
-publicly accessible full score found; the one score-page image located was a
-200x220 thumbnail); no recording heard (the Bozzini complete recording,
-Frankfurt March 2008, exists but was not auditioned in-session); movement
-I-IV details come from Gilmore's review prose, not from Wannamaker or the
-score; attack-timing and pitch-order details in re-renders 2 and 4 are
-models of the described processes, not transcriptions.
+**Honest gaps:** the paper's figures are known from a detailed written
+description of the published figures, not from their pixels (no PDF pixel
+extraction succeeded in-session); the full score not read (no publicly
+accessible full score found; the one score-page image located was a 200x220
+thumbnail); no recording heard (the Bozzini complete recording, Frankfurt
+March 2008, exists but was not auditioned in-session); movements I and III
+are named-only in the paper, and II and IV appear nowhere in it, so their
+details come from Gilmore's review prose, not from Wannamaker or the score;
+attack-timing and pitch-order details in re-renders 2 and 4 are models of
+the described processes, not transcriptions. The paper itself draws no
+comparison between Quintext and Clang, and says nothing about any premiere,
+performance, or recording; the Clang comparison below is the study's own.
+
+## Supplement: the paper's three figures, described
+
+The Wannamaker article analyzes only movement V in detail: movements I and
+III are named only ("Some Recent THOUGHTS for Morton Feldman," "A Choir of
+ANGELS for Carl Ruggles"), and movements II and IV are not named or
+discussed anywhere in the article. Footnote 11 points to Polansky 1983
+(pp. 208-218) for an analytical treatment of the entire suite. The byline
+is Robert A. Wannamaker alone.
+
+- Figure 4, "Scordatura and string harmonics used in QUINTEXT V": a
+  five-column table (BASS, CELLO, VIOLA, VIOLIN II, VIOLIN I, all in treble
+  clef) showing each open string's available natural harmonics as
+  equal-tempered pitch approximations, in horizontal bands labeled
+  "natural harmonic number" (top 4-7, middle 2-3, bottom 1). The bottom
+  row gives the harmonic of F1 to which each open string is tuned: bass
+  string IV = 1; cello = 2, 3, 5; viola = 3, 5, 7, 10; violin II = 4, 6,
+  9, 13; violin I = 5, 7, 11, 15. The resonator strings (bass III-I, cello
+  IV) carry no numbers. This is the tuning machine itself, laid out as a
+  table: one column per instrument, fifteen open strings total, each a
+  harmonic of F1.
+- Figure 5, "Complete pitch set for QUINTEXT V," with cents deviations
+  above the staff: two staves of ascending noteheads covering harmonics
+  1-105 of F1. Upper staff (bass clef): harmonics 1, 2, 3, 4, 5, 6, 7, 8,
+  9, 10, 11, 12, 13, 14, 15, 16, 18, 20, 21, 22, 24, 25, 26, 27, 28, 30.
+  Lower staff (treble clef): harmonics 33, 35, 36, 39, 40, 42, 44, 45, 49,
+  50, 52, 54, 55, 60, 63, 65, 66, 70, 75, 77, 78, 90, 91, 105. Sampled
+  deviations: harmonic 11 at -49 cents, harmonic 33 at -47, harmonic 35 at
+  +45, harmonic 45 at +10, harmonic 49 at +38, harmonic 50 at -27. The
+  caption notes some pitches are obtainable on more than one instrument
+  and some appear with different enharmonic spellings in the score.
+- Figure 6, "Three systems from near the conclusion of QUINTEXT V":
+  reproductions of three handwritten score systems (five staves each:
+  violin I, violin II, viola, cello, bass, top to bottom) in proportional
+  time notation, illustrating the passage the text locates at
+  7'30"-8'15" (© 1972 Sonic Art Editions, Smith Publications). The staves
+  carry dynamics (mf, p, pp), parenthesized string-number indications
+  with open diamond noteheads marking touched nodes (e.g. (3/7), (2/7),
+  (5/3)), sustained tied notes, glissandi, and the continuing low bass
+  drone. The top system is marked 8'00" at the right.
+
+Two passages worth quoting verbatim from the article's framing: Quintext
+is "five pieces written by Tenney in tribute to fellow composers" that
+"represent markedly different sound worlds and methods of compositional
+organization," scored "for string quartet and bass." And on the end of the
+main section, where the bass skips F1 to F2 to F3: "The 'fundamental'
+thus becomes virtual since not all sounding tones are harmonics of these
+new bass pitches (although most are)." The thinning that precedes the skip
+runs 7'30" to 7'50", not 7'00" to 7'50". Finally, the article's
+Conclusions quote Polansky's debt to the piece verbatim: his "Movement
+for Lou Harrison" (1975-1977) "uses natural harmonics on just-tuned
+strings to achieve an evolving variety of pitch constellations within a
+given harmonic series, a technique that the composer indicates was first
+suggested to him by Tenney's QUINTEXT V: SPECTRA for Harry Partch."
 
 ## The suite, stated plainly
 
