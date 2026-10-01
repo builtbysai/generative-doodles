@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>№9033 · Gather</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #f4efe4; }
+  canvas { display: block; width: 100vw; height: 100vh; touch-action: none; cursor: crosshair; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+// №9033 · Gather (after j2rgb's physarum performances).
+// A slime-mold agent field runs continuously. Press and hold to gather
+// the whole swarm into a solid ink disc at your finger; release and it
+// streams back out. Every disc stays as a stamped mark: the piece is the
+// history of your gathers. One ink family on warm paper.
+"use strict";
+
+// ---------- seeded rng ----------
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const seedMatch = /[?&]seed=(-?\d+)/.exec(location.search);
+const SEED = seedMatch ? (parseInt(seedMatch[1], 10) >>> 0) : 20261001;
+const rng = mulberry32(SEED);
+
+// ---------- palette: one ink family on warm paper ----------
+const PAPER = [244, 239, 228];
+const INK_DEEP = [43, 38, 32];
+const INK_MID = [122, 108, 90];
+// trail LUT: 256 steps from paper to deep ink
+const LUT = new Uint8Array(256 * 3);
+for (let i = 0; i < 256; i++) {
+  const t = Math.pow(i / 255, 0.62);
+  // paper -> light wash -> mid -> deep
+  let r, g, b;
+  if (t < 0.55) {
+    const k = t / 0.55;
+    r = PAPER[0] + (196 - PAPER[0]) * k;
+    g = PAPER[1] + (186 - PAPER[1]) * k;
+    b = PAPER[2] + (168 - PAPER[2]) * k;
+  } else {
+    const k = (t - 0.55) / 0.45;
+    r = 196 + (INK_DEEP[0] - 196) * k;
+    g = 186 + (INK_DEEP[1] - 186) * k;
+    b = 168 + (INK_DEEP[2] - 168) * k;
+  }
+  LUT[i * 3] = r; LUT[i * 3 + 1] = g; LUT[i * 3 + 2] = b;
+}
+
+// ---------- canvas ----------
+const cv = document.getElementById("c");
+const ctx = cv.getContext("2d");
+let W = 0, H = 0, DPR = 1;
+
+// trail grid at 1/3 scale
+const SCALE = 3;
+let GW = 0, GH = 0, trail = null, trail2 = null, img = null;
+
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = Math.floor(window.innerWidth); H = Math.floor(window.innerHeight);
+  cv.width = W * DPR; cv.height = H * DPR;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  GW = Math.ceil(W / SCALE); GH = Math.ceil(H / SCALE);
+  const fresh = !trail || trail.length !== GW * GH;
+  trail = new Float32Array(GW * GH);
+  trail2 = new Float32Array(GW * GH);
+  trailCv.width = GW; trailCv.height = GH;
+  img = tctx.createImageData(GW, GH);
+  stampCv.width = W * DPR; stampCv.height = H * DPR;
+  sctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  // redraw old stamps scaled (cheap: just clear; stamps are history, keep them simple)
+  for (const s of stamps) drawStamp(s.x * W, s.y * H, s.r);
+  if (fresh) initAgents();
+}
+window.addEventListener("resize", resize);
+
+// ---------- persistent stamp layer (history of gathers) ----------
+const stampCv = document.createElement("canvas");
+const sctx = stampCv.getContext("2d");
+// offscreen trail canvas (grid is drawn here, then scaled up)
+const trailCv = document.createElement("canvas");
+const tctx = trailCv.getContext("2d");
+const stamps = []; // {x: 0..1, y: 0..1, r}
+function drawStamp(x, y, r) {
+  sctx.fillStyle = `rgb(${INK_DEEP[0]},${INK_DEEP[1]},${INK_DEEP[2]})`;
+  sctx.beginPath(); sctx.arc(x, y, r, 0, Math.PI * 2); sctx.fill();
+  // faint halo ring, like ink soaking in
+  sctx.strokeStyle = `rgba(${INK_MID[0]},${INK_MID[1]},${INK_MID[2]},0.5)`;
+  sctx.lineWidth = 3;
+  sctx.beginPath(); sctx.arc(x, y, r + 5, 0, Math.PI * 2); sctx.stroke();
+}
+
+// ---------- agents ----------
+// mode: 0 forage, 1 gathering (streaming in), 2 settled (in disc), 3 leaving
+let agents = [];
+const SA = 0.45, RA = 0.38, SD = 9, SS = 1.6; // sensor angle, rotation angle, sensor dist, step
+function initAgents() {
+  const n = Math.max(1800, Math.min(5000, Math.floor((W * H) / 300)));
+  agents = [];
+  for (let i = 0; i < n; i++) {
+    agents.push({
+      x: rng() * W, y: rng() * H,
+      a: rng() * Math.PI * 2,
+      mode: 0, wake: 0,
+      sx: 0, sy: 0, // disc slot while settled
+    });
+  }
+}
+
+function sense(x, y, a) {
+  const gx = Math.floor((x + Math.cos(a) * SD) / SCALE);
+  const gy = Math.floor((y + Math.sin(a) * SD) / SCALE);
+  if (gx < 0 || gy < 0 || gx >= GW || gy >= GH) return 0;
+  return trail[gy * GW + gx];
+}
+
+function turnToward(ag, tx, ty, strength) {
+  const want = Math.atan2(ty - ag.y, tx - ag.x);
+  let d = want - ag.a;
+  while (d > Math.PI) d -= Math.PI * 2;
+  while (d < -Math.PI) d += Math.PI * 2;
+  ag.a += d * strength;
+}
+
+// ---------- gather state ----------
+let gather = null; // {x, y}
+let settledCount = 0;
+let discR = 0;
+const DISC_SPACING = 3.6;
+
+function discSlot(i) {
+  // golden-angle spiral fill
+  const r = DISC_SPACING * Math.sqrt(i + 0.5);
+  const a = i * 2.399963;
+  return [Math.cos(a) * r, Math.sin(a) * r];
+}
+
+function startGather(x, y) {
+  gather = { x, y };
+  settledCount = 0; discR = 6;
+  for (const ag of agents) if (ag.mode === 0) ag.mode = 1;
+}
+function endGather() {
+  if (!gather) return;
+  // stamp the disc into history
+  if (discR > 10) {
+    stamps.push({ x: gather.x / W, y: gather.y / H, r: discR });
+    drawStamp(gather.x, gather.y, discR);
+  }
+  for (const ag of agents) {
+    if (ag.mode === 2) { ag.mode = 3; ag.wake = 0.4 + rng() * 1.6; }
+    else if (ag.mode === 1) ag.mode = 0;
+  }
+  gather = null; settledCount = 0; discR = 0;
+}
+
+// ---------- sim ----------
+function step() {
+  const gx = gather ? gather.x : 0, gy = gather ? gather.y : 0;
+  for (const ag of agents) {
+    if (ag.mode === 2) continue; // settled: part of the disc
+    if (ag.mode === 3) {
+      // leaving: drift outward, then resume foraging
+      ag.wake -= 1 / 60;
+      const dx = ag.x - ag.cx, dy = ag.y - ag.cy;
+      const d = Math.hypot(dx, dy) || 1;
+      ag.x += (dx / d) * SS * 2.2; ag.y += (dy / d) * SS * 2.2;
+      ag.a = Math.atan2(dy, dx) + (rng() - 0.5) * 0.6;
+      deposit(ag.x, ag.y, 0.5);
+      if (ag.wake <= 0) ag.mode = 0;
+      wrap(ag);
+      continue;
+    }
+    if (ag.mode === 1 && gather) {
+      // streaming toward the gather point
+      const dx = gx - ag.x, dy = gy - ag.y;
+      const d = Math.hypot(dx, dy);
+      turnToward(ag, gx + (rng() - 0.5) * 30, gy + (rng() - 0.5) * 30, 0.35);
+      const sp = SS * (1.4 + Math.min(2.2, 900 / (d + 60)));
+      ag.x += Math.cos(ag.a) * sp; ag.y += Math.sin(ag.a) * sp;
+      deposit(ag.x, ag.y, 1.0);
+      if (d < discR) {
+        ag.mode = 2;
+        const [ox, oy] = discSlot(settledCount);
+        ag.cx = gx; ag.cy = gy; // disc center, for the outward stream on release
+        ag.sx = gx + ox; ag.sy = gy + oy;
+        ag.x = ag.sx; ag.y = ag.sy;
+        settledCount++;
+        discR = DISC_SPACING * Math.sqrt(settledCount + 1) + 6;
+      }
+      wrap(ag);
+      continue;
+    }
+    // forage: classic physarum steering
+    const c = sense(ag.x, ag.y, ag.a);
+    const l = sense(ag.x, ag.y, ag.a - SA);
+    const r = sense(ag.x, ag.y, ag.a + SA);
+    if (c > l && c > r) { /* straight */ }
+    else if (c < l && c < r) ag.a += (rng() < 0.5 ? RA : -RA);
+    else if (l > r) ag.a -= RA;
+    else if (r > l) ag.a += RA;
+    ag.a += (rng() - 0.5) * 0.05;
+    ag.x += Math.cos(ag.a) * SS; ag.y += Math.sin(ag.a) * SS;
+    deposit(ag.x, ag.y, 0.7);
+    wrap(ag);
+  }
+  // diffuse + decay
+  const DECAY = 0.97;
+  for (let y = 0; y < GH; y++) {
+    const yw = y * GW;
+    const yu = ((y - 1 + GH) % GH) * GW, yd = ((y + 1) % GH) * GW;
+    for (let x = 0; x < GW; x++) {
+      const xl = (x - 1 + GW) % GW, xr = (x + 1) % GW;
+      trail2[yw + x] = (trail[yw + x] * 4 + trail[yu + x] + trail[yd + x] +
+        trail[yw + xl] + trail[yw + xr]) / 8 * DECAY;
+    }
+  }
+  const tmp = trail; trail = trail2; trail2 = tmp;
+}
+
+function deposit(x, y, amt) {
+  const gx = Math.floor(x / SCALE), gy = Math.floor(y / SCALE);
+  if (gx < 0 || gy < 0 || gx >= GW || gy >= GH) return;
+  trail[gy * GW + gx] = Math.min(9, trail[gy * GW + gx] + amt);
+}
+function wrap(ag) {
+  if (ag.x < 0) ag.x += W; else if (ag.x >= W) ag.x -= W;
+  if (ag.y < 0) ag.y += H; else if (ag.y >= H) ag.y -= H;
+}
+
+// ---------- render ----------
+function render() {
+  const d = img.data;
+  for (let i = 0; i < GW * GH; i++) {
+    const v = trail[i] * 42 | 0;
+    const c = v > 255 ? 255 : v;
+    d[i * 4] = LUT[c * 3]; d[i * 4 + 1] = LUT[c * 3 + 1]; d[i * 4 + 2] = LUT[c * 3 + 2];
+    d[i * 4 + 3] = 255;
+  }
+  ctx.imageSmoothingEnabled = true;
+  tctx.putImageData(img, 0, 0);
+  // scale the trail up to full canvas
+  ctx.drawImage(trailCv, 0, 0, GW, GH, 0, 0, W, H);
+  // history stamps under everything else? no: stamps are the deep marks, draw over trail
+  ctx.drawImage(stampCv, 0, 0, W, H);
+  // live disc while gathering
+  if (gather && discR > 8) {
+    ctx.fillStyle = `rgb(${INK_DEEP[0]},${INK_DEEP[1]},${INK_DEEP[2]})`;
+    ctx.beginPath(); ctx.arc(gather.x, gather.y, discR, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = `rgba(${INK_DEEP[0]},${INK_DEEP[1]},${INK_DEEP[2]},0.25)`;
+    ctx.lineWidth = 10;
+    ctx.beginPath(); ctx.arc(gather.x, gather.y, discR + 8, 0, Math.PI * 2); ctx.stroke();
+  }
+  // agent heads
+  ctx.fillStyle = `rgb(${INK_DEEP[0]},${INK_DEEP[1]},${INK_DEEP[2]})`;
+  for (const ag of agents) {
+    if (ag.mode === 2) continue;
+    ctx.fillRect(ag.x - 0.75, ag.y - 0.75, 1.5, 1.5);
+  }
+  // captions
+  ctx.fillStyle = "rgba(43,38,32,0.72)";
+  ctx.font = "13px Georgia, serif";
+  ctx.textBaseline = "alphabetic";
+  ctx.fillText("№9033 · Gather", 18, H - 18);
+  ctx.textAlign = "right";
+  ctx.fillStyle = "rgba(43,38,32,0.45)";
+  ctx.font = "italic 13px Georgia, serif";
+  ctx.fillText("press and hold to gather the swarm", W - 18, H - 18);
+  ctx.textAlign = "left";
+}
+
+// ---------- input ----------
+function pos(e) {
+  if (e.touches && e.touches[0]) return [e.touches[0].clientX, e.touches[0].clientY];
+  return [e.clientX, e.clientY];
+}
+cv.addEventListener("pointerdown", (e) => {
+  e.preventDefault();
+  const [x, y] = pos(e);
+  startGather(x, y);
+  cv.setPointerCapture && cv.setPointerCapture(e.pointerId);
+});
+cv.addEventListener("pointermove", (e) => {
+  if (!gather) return;
+  const [x, y] = pos(e);
+  gather.x = x; gather.y = y;
+});
+function release(e) { if (gather) endGather(); }
+cv.addEventListener("pointerup", release);
+cv.addEventListener("pointercancel", release);
+
+// ---------- main loop ----------
+resize();
+// one automatic gather shortly after load, so the first composition
+// already holds a disc; then the piece is yours.
+setTimeout(() => {
+  if (!gather) {
+    startGather(W * (0.35 + rng() * 0.3), H * (0.35 + rng() * 0.3));
+    setTimeout(() => endGather(), 1800);
+  }
+}, 1200);
+
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  const n = dt > 0.025 ? 2 : 1;
+  for (let i = 0; i < n; i++) step();
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
