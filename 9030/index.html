@@ -1,0 +1,707 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>&#8470;9030 &middot; River System</title>
+<style>
+  :root{ --ink:#23242c; --paper:#f4eeda; }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{height:100%;overflow:hidden;background:var(--paper)}
+  body{font-family:"Avenir Next","Segoe UI",system-ui,sans-serif;color:var(--ink);
+       -webkit-tap-highlight-color:transparent;overscroll-behavior:none}
+  #wrap{position:fixed;inset:0;overflow:hidden}
+  #stage{position:absolute;inset:0;width:100%;height:100%;display:block;
+         touch-action:none;cursor:pointer}
+  #plate{position:absolute;top:14px;left:18px;pointer-events:none;user-select:none;
+    font-size:13px;letter-spacing:.14em;color:rgba(35,36,44,.66);text-transform:uppercase}
+  #plate b{color:var(--ink);font-weight:700}
+  #rule{position:absolute;top:36px;left:18px;pointer-events:none;user-select:none;
+    font-size:11.5px;letter-spacing:.05em;color:rgba(35,36,44,.5)}
+  #hint{position:absolute;top:14px;right:18px;pointer-events:none;user-select:none;
+    font-size:11px;letter-spacing:.06em;color:rgba(35,36,44,.42);text-align:right}
+  @media (max-width:560px){
+    #plate{top:10px;left:12px;font-size:12px}
+    #rule{top:30px;left:12px;font-size:10.5px;max-width:70vw}
+    #hint{top:auto;bottom:70px;right:12px;font-size:10px}
+  }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="stage"></canvas>
+  <div id="plate"><b>&#8470;9030</b> &middot; River System</div>
+  <div id="rule">twenty-four small swimmers learn one river; each remembers its own recent luck</div>
+  <div id="hint">hold a spot to starve it<br>click for a new river</div>
+</div>
+<script>
+"use strict";
+/* Seed 268 "River System": an adaptive river ecosystem after the Nature of
+   Code ecosystem exercise (seed 63). One slow river on warm paper; 24 ink
+   fish are Vehicles whose weights over flow-follow / seek / arrive /
+   separation adapt to their own recent history: hunger raises seeking,
+   feeding raises settling, crowding raises spacing, calm raises drifting.
+   Each fish trails a ribbon colored by its currently dominant drive, and a
+   ledger strip along the bottom records how the whole school has been
+   spending its attention. Press and hold starves a patch of river; the
+   school reroutes. Click reseeds a fresh river. */
+
+const canvas = document.getElementById('stage');
+const ctx = canvas.getContext('2d');
+
+/* ---------- seeded rng ---------- */
+function mulberry32(a){
+  return function(){
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+function seedFromURL(){
+  const m = /[?&]seed=(\d+)/.exec(location.search);
+  return m ? (parseInt(m[1],10) >>> 0) : 268;
+}
+function fastFromURL(){
+  const m = /[?&]fast=(\d+(?:\.\d+)?)/.exec(location.search);
+  return m ? Math.min(40, parseFloat(m[1])) : 1;
+}
+let SEED = seedFromURL();
+const FAST = fastFromURL();
+
+/* ---------- palette ---------- */
+const PAPER = '#f4eeda';
+const INK = '#23242c';
+const DRIVES = [
+  { key:'flow', word:'riding the current', short:'current', color:'#3d5a8a' },
+  { key:'seek', word:'hunting food',      short:'food',    color:'#c0392b' },
+  { key:'arrive', word:'settling to feed', short:'settle',  color:'#b97f1f' },
+  { key:'sep',  word:'keeping distance',   short:'space',   color:'#2a7f7a' }
+];
+
+/* ---------- value noise (2D, seeded) ---------- */
+function makeNoise(rnd){
+  const p = new Uint8Array(512);
+  const perm = [...Array(256).keys()];
+  for (let i = 255; i > 0; i--){
+    const j = (rnd() * (i + 1)) | 0;
+    [perm[i], perm[j]] = [perm[j], perm[i]];
+  }
+  for (let i = 0; i < 512; i++) p[i] = perm[i & 255];
+  const fade = t => t * t * (3 - 2 * t);
+  function n2(x, y){
+    const xi = Math.floor(x), yi = Math.floor(y);
+    const xf = x - xi, yf = y - yi;
+    const X = xi & 255, Y = yi & 255;
+    const v00 = p[(p[X] + Y) & 255] / 255;
+    const v10 = p[(p[(X + 1) & 255] + Y) & 255] / 255;
+    const v01 = p[(p[X] + Y + 1) & 255] / 255;
+    const v11 = p[(p[(X + 1) & 255] + Y + 1) & 255] / 255;
+    const u = fade(xf), v = fade(yf);
+    return (v00 * (1 - u) + v10 * u) * (1 - v) + (v01 * (1 - u) + v11 * u) * v;
+  }
+  return n2;
+}
+
+/* ---------- world state ---------- */
+let W = 0, H = 0, DPR = 1, S = 1;        // S: global size scale
+let rnd, noise;
+let fishes = [], motes = [], patches = [], streaks = [];
+let ledger = [];                          // {flow,seek,arrive,sep} means
+let ledgeTimer = 0, simT = 0;
+let starve = null;                        // {x,y,r,strength,decay}
+let pointer = { down:false, x:0, y:0, t0:0, held:false };
+let bankTop = [], bankBot = [], centerY = [], halfW = [];
+let backdrop = null;
+
+const N_FISH = 24;
+const LEDGE_H_DESK = 66, LEDGE_H_MOB = 54;
+function ledgeH(){ return W < 560 ? LEDGE_H_MOB : LEDGE_H_DESK; }
+function riverH(){ return H - ledgeH(); }
+
+/* channel centerline y at x (fractions of river height) */
+function portrait(){ return W < H * 0.8; }
+function channelCenter(x){
+  const t = x / Math.max(1, W);
+  const base = portrait() ? 0.43 : 0.46;
+  const amp = portrait() ? 0.72 : 1;
+  return riverH() * (base
+    + amp * 0.13 * Math.sin(t * 4.4 + rndPhase[0])
+    + amp * 0.06 * Math.sin(t * 9.7 + rndPhase[1])
+    + amp * 0.04 * Math.sin(t * 2.1 + rndPhase[2]));
+}
+function channelHalf(x){
+  const t = x / Math.max(1, W);
+  const wScale = portrait() ? 1.3 : 1;
+  return riverH() * wScale * (0.19 + 0.04 * Math.sin(t * 6.3 + rndPhase[3]));
+}
+let rndPhase = [0, 0, 0, 0];
+
+function fieldAngle(x, y, t){
+  /* downstream along the channel tangent, bent by drifting noise */
+  const dx = 14;
+  const slope = (channelCenter(x + dx) - channelCenter(x - dx)) / (2 * dx);
+  const base = Math.atan2(slope * 3.2, 1);       // tangent follow
+  const n = noise(x * 0.0021 + t * 0.011, y * 0.0021 + t * 0.007);
+  const n2v = noise(x * 0.006 - t * 0.017, y * 0.006 + 40 + t * 0.013);
+  return base + (n - 0.5) * 1.9 + (n2v - 0.5) * 0.7;
+}
+
+/* ---------- ecosystem build ---------- */
+function buildBackdrop(){
+  backdrop = document.createElement('canvas');
+  backdrop.width = Math.max(2, W * DPR); backdrop.height = Math.max(2, H * DPR);
+  const b = backdrop.getContext('2d');
+  b.scale(DPR, DPR);
+  b.fillStyle = PAPER; b.fillRect(0, 0, W, H);
+  /* paper grain */
+  const gr = mulberry32(SEED ^ 0x9e37);
+  b.globalAlpha = 0.05;
+  for (let i = 0; i < W * H / 260; i++){
+    b.fillStyle = gr() > 0.5 ? '#8a7f5c' : '#fffdf2';
+    b.fillRect(gr() * W, gr() * H, 1.2, 1.2);
+  }
+  b.globalAlpha = 1;
+  /* river channel wash */
+  const rh = riverH();
+  b.beginPath();
+  for (let x = -10; x <= W + 10; x += 8) {
+    const y = channelCenter(x) - channelHalf(x);
+    x === -10 ? b.moveTo(x, y) : b.lineTo(x, y);
+  }
+  for (let x = W + 10; x >= -10; x -= 8) b.lineTo(x, channelCenter(x) + channelHalf(x));
+  b.closePath();
+  const g = b.createLinearGradient(0, rh * 0.2, 0, rh * 0.9);
+  g.addColorStop(0, 'rgba(96,124,140,0.13)');
+  g.addColorStop(0.5, 'rgba(96,124,140,0.20)');
+  g.addColorStop(1, 'rgba(96,124,140,0.10)');
+  b.fillStyle = g; b.fill();
+  /* banks: two wavy ink strokes */
+  b.strokeStyle = 'rgba(35,36,44,0.55)'; b.lineWidth = 1.4; b.lineCap = 'round';
+  for (const sgn of [-1, 1]){
+    b.beginPath();
+    for (let x = -6; x <= W + 6; x += 6){
+      const y = channelCenter(x) + sgn * channelHalf(x)
+        + (noise(x * 0.02, sgn * 7.3) - 0.5) * 5;
+      x === -6 ? b.moveTo(x, y) : b.lineTo(x, y);
+    }
+    b.stroke();
+  }
+  /* faint bank hatch ticks */
+  b.strokeStyle = 'rgba(35,36,44,0.20)'; b.lineWidth = 1;
+  for (let x = 10; x < W; x += 26 + rnd() * 20){
+    for (const sgn of [-1, 1]){
+      const y = channelCenter(x) + sgn * channelHalf(x);
+      b.beginPath(); b.moveTo(x, y); b.lineTo(x - 3, y + sgn * 7); b.stroke();
+    }
+  }
+}
+
+function seedPatches(){
+  patches = [];
+  const n = Math.max(3, Math.round(W / 340));
+  for (let i = 0; i < n; i++){
+    const x = W * (0.16 + 0.68 * (i + 0.25 + rnd() * 0.5) / n);
+    const y = channelCenter(x) + (rnd() - 0.5) * channelHalf(x) * 0.9;
+    patches.push({ x, y, r: 46 + rnd() * 30, rich: 0.45 + rnd() * 0.5,
+                   regrow: 0.011 + rnd() * 0.007, seedPhase: rnd() * 9 });
+  }
+}
+
+function newFish(x, y){
+  const a = rnd() * Math.PI * 2;
+  return {
+    x, y, vx: Math.cos(a) * 30, vy: Math.sin(a) * 30,
+    w: { flow: 0.58, seek: 0.16, arrive: 0.14, sep: 0.12 },
+    energy: 0.35 + rnd() * 0.4,
+    hFood: 0, hCrowd: 0, phase: rnd() * 10, size: 0.8 + rnd() * 0.45,
+    anchorA: rnd() * Math.PI * 2, anchorR: 0.25 + rnd() * 0.6,
+    metab: 0.8 + rnd() * 0.5, trail: [], adapt: 0
+  };
+}
+
+function init(seed){
+  SEED = seed >>> 0;
+  rnd = mulberry32(SEED);
+  noise = makeNoise(mulberry32(SEED ^ 0x51ab));
+  rndPhase = [rnd() * 9, rnd() * 9, rnd() * 9, rnd() * 9];
+  simT = 0; ledger = []; ledgeTimer = 0; starve = null;
+  buildBackdrop();
+  seedPatches();
+  fishes = []; motes = []; streaks = [];
+  for (let i = 0; i < N_FISH; i++){
+    /* start spread along the whole river, drifting with the current */
+    const x = W * (0.04 + rnd() * 0.92);
+    const y = channelCenter(x) + (rnd() - 0.5) * channelHalf(x) * 1.2;
+    fishes.push(newFish(x, y));
+  }
+  for (let i = 0; i < 26; i++) spawnMote(true);
+  const nStreak = Math.round(W / 14);
+  for (let i = 0; i < nStreak; i++){
+    const x = rnd() * W;
+    streaks.push({ x, y: channelCenter(x) + (rnd() - 0.5) * channelHalf(x) * 1.7,
+                   life: rnd() * 6 });
+  }
+  if (history.replaceState) history.replaceState(null, '', '?seed=' + SEED);
+}
+
+function spawnMote(anywhere){
+  /* plankton rains along the whole river, then rides the current */
+  const x = anywhere ? rnd() * W : (rnd() < 0.3 ? -12 : rnd() * W);
+  motes.push({ x, y: channelCenter(Math.max(0, x)) + (rnd() - 0.5) * channelHalf(Math.max(0, x)) * 1.5,
+               r: 1.6 + rnd() * 1.6, drift: 0.7 + rnd() * 0.6 });
+}
+
+/* ---------- adaptation ---------- */
+/* The heart of the piece: every 0.4s each fish re-reads its own recent
+   history (exponential traces of feeding and crowding) and re-aims its
+   weight vector. Weights then relax toward those targets slowly, so a
+   school that starts as drifters becomes hunters, settlers, spacers. */
+function adapt(f, dt){
+  f.adapt -= dt;
+  const crowdTarget = Math.min(1, f.hCrowd * 1.5);
+  const hunger = 1 - f.energy;
+  const fedWell = Math.min(1, f.hFood * 2.2);
+  let tFlow = 0.16 + 0.52 * (1 - hunger) * (1 - crowdTarget);
+  let tSeek = 0.10 + 0.66 * hunger * hunger;
+  let tArrive = 0.08 + 0.55 * fedWell * (1 - crowdTarget * 0.6);
+  let tSep = 0.06 + 0.62 * crowdTarget;
+  const sum = tFlow + tSeek + tArrive + tSep;
+  tFlow /= sum; tSeek /= sum; tArrive /= sum; tSep /= sum;
+  if (f.adapt <= 0){
+    f.adapt = 0.4;
+    f.target = { flow: tFlow, seek: tSeek, arrive: tArrive, sep: tSep };
+  }
+  const k = 1 - Math.exp(-dt / 16);     // slow relaxation: minutes, not frames
+  f.w.flow += (tFlow - f.w.flow) * k;
+  f.w.seek += (tSeek - f.w.seek) * k;
+  f.w.arrive += (tArrive - f.w.arrive) * k;
+  f.w.sep += (tSep - f.w.sep) * k;
+}
+
+/* ---------- simulation step ---------- */
+function step(dt){
+  simT += dt;
+  const maxSp = 92 * S, minSp = 16 * S;
+
+  /* patches regrow; starved ground stays barren */
+  for (const p of patches){
+    const starved = starve && Math.hypot(p.x - starve.x, p.y - starve.y) < starve.r + p.r * 0.4;
+    if (starved) p.rich = Math.max(0, p.rich - dt * 0.25 * starve.strength);
+    else p.rich = Math.min(1, p.rich + p.regrow * dt);
+  }
+  if (starve && starve.decay > 0){
+    starve.strength = Math.max(0, starve.strength - dt / 14);
+    if (starve.strength <= 0) starve = null;
+  }
+
+  /* motes drift with the current */
+  if (rnd() < dt * 1.7 && motes.length < 70) spawnMote(false);
+  for (let i = motes.length - 1; i >= 0; i--){
+    const m = motes[i];
+    const a = fieldAngle(m.x, m.y, simT);
+    m.x += Math.cos(a) * 26 * S * m.drift * dt;
+    m.y += Math.sin(a) * 26 * S * m.drift * dt;
+    if (starve && Math.hypot(m.x - starve.x, m.y - starve.y) < starve.r) motes.splice(i, 1);
+    else if (m.x > W + 16 || m.x < -20 || Math.abs(m.y - channelCenter(Math.max(0, m.x))) > channelHalf(Math.max(0, m.x)) * 1.2) motes.splice(i, 1);
+  }
+
+  /* streaks ride the field */
+  for (const st of streaks){
+    const a = fieldAngle(st.x, st.y, simT);
+    st.x += Math.cos(a) * 34 * S * dt;
+    st.y += Math.sin(a) * 34 * S * dt;
+    st.life -= dt;
+    if (st.life <= 0 || st.x > W + 8 ||
+        Math.abs(st.y - channelCenter(Math.max(0, st.x))) > channelHalf(Math.max(0, st.x)) * 1.12){
+      st.x = -6 - rnd() * 200;
+      st.y = channelCenter(0) + (rnd() - 0.5) * channelHalf(0) * 1.6;
+      st.life = 6 + rnd() * 7;
+    }
+  }
+
+  /* fishes */
+  for (const f of fishes){
+    adapt(f, dt);
+    let fx = 0, fy = 0;
+
+    /* neighbourhood pressure */
+    let crowd = 0, sx = 0, sy = 0;
+    for (const o of fishes){
+      if (o === f) continue;
+      const dx = f.x - o.x, dy = f.y - o.y;
+      const d2 = dx * dx + dy * dy;
+      const R = 30 * S;
+      if (d2 < R * R && d2 > 0.01){
+        const d = Math.sqrt(d2);
+        crowd += 1 - d / R;
+        sx += (dx / d) * (1 - d / R); sy += (dy / d) * (1 - d / R);
+      }
+    }
+    f.hCrowd += ((crowd > 1.2 ? 1 : crowd / 1.2) - f.hCrowd) * Math.min(1, dt / 6);
+
+    /* flow-follow */
+    const fa = fieldAngle(f.x, f.y, simT);
+    const fvx = Math.cos(fa), fvy = Math.sin(fa);
+    fx += (fvx * maxSp * 0.62 - f.vx) * f.w.flow * 1.15;
+    fy += (fvy * maxSp * 0.62 - f.vy) * f.w.flow * 1.15;
+
+    /* seek: nearest mote, else the most worthwhile patch anywhere */
+    let tx = null, ty = null, best = 320 * S;
+    for (const m of motes){
+      const d = Math.hypot(m.x - f.x, m.y - f.y);
+      if (d < best){ best = d; tx = m.x; ty = m.y; }
+    }
+    if (tx === null){
+      let score = -1;
+      for (const p of patches){
+        if (p.rich < 0.12) continue;
+        const d = Math.hypot(p.x - f.x, p.y - f.y);
+        const s = p.rich * 900 / (140 + d);       /* rich and near wins */
+        if (s > score){ score = s; tx = p.x; ty = p.y; }
+      }
+    }
+    if (tx !== null){
+      const d = Math.max(1, Math.hypot(tx - f.x, ty - f.y));
+      fx += ((tx - f.x) / d * maxSp - f.vx) * f.w.seek * 1.25;
+      fy += ((ty - f.y) / d * maxSp - f.vy) * f.w.seek * 1.25;
+    }
+
+    /* arrive: settle on the richest near patch */
+    let home = null, hd = 1e9;
+    for (const p of patches){
+      if (p.rich < 0.1) continue;
+      const d = Math.hypot(p.x - f.x, p.y - f.y);
+      if (d < hd){ hd = d; home = p; }
+    }
+    if (home){
+      /* each settler holds its own spot on the patch, not the same point */
+      f.anchorA += dt * 0.05;
+      const ax = home.x + Math.cos(f.anchorA) * home.r * f.anchorR;
+      const ay = home.y + Math.sin(f.anchorA) * home.r * f.anchorR * 0.75;
+      const slow = 78 * S;
+      const sp = hd < slow ? maxSp * 0.35 * (hd / slow) : maxSp * 0.7;
+      const d = Math.max(1, hd);
+      fx += ((ax - f.x) / d * sp - f.vx) * f.w.arrive * 1.1;
+      fy += ((ay - f.y) / d * sp - f.vy) * f.w.arrive * 1.1;
+      if (hd < home.r * 0.95 && home.rich > 0.02){
+        const bite = Math.min(home.rich, dt * 0.16 * f.w.arrive + dt * 0.02);
+        home.rich -= bite * 0.22;
+        f.energy = Math.min(1, f.energy + bite * 2.2);
+        f.hFood += (1 - f.hFood) * Math.min(1, dt * 0.8);
+      }
+    }
+    f.hFood += (0 - f.hFood) * Math.min(1, dt / 55);
+
+    /* separation */
+    fx += sx * 430 * S * f.w.sep;
+    fy += sy * 430 * S * f.w.sep;
+
+    /* starved ground repels: nothing to eat there, and the fish learn it */
+    if (starve && starve.strength > 0.05){
+      const dx = f.x - starve.x, dy = f.y - starve.y;
+      const d = Math.hypot(dx, dy), R = starve.r + 30 * S;
+      if (d < R && d > 1){
+        const push = (1 - d / R) * 340 * S * starve.strength;
+        fx += (dx / d) * push; fy += (dy / d) * push;
+      }
+    }
+
+    /* banks: soft steer back toward the channel, firmer the further out */
+    const cy = channelCenter(f.x), hh = channelHalf(f.x);
+    const off = (f.y - cy) / hh;
+    if (Math.abs(off) > 0.65){
+      fy += (cy - f.y) * (2.2 + 7 * (Math.abs(off) - 0.65));
+      fx += 14 * S;
+    }
+    if (f.y < 6) fy += 60 * S; if (f.y > riverH() - 6) fy -= 60 * S;
+    if (f.x < 34 * S) fx += (34 * S - f.x) * 3.2;   /* soft wall at the inlet */
+
+    /* integrate */
+    f.vx += fx * dt; f.vy += fy * dt;
+    const sp2 = Math.hypot(f.vx, f.vy) || 1;
+    const spC = Math.min(maxSp, Math.max(minSp, sp2));
+    const cruise = spC + Math.sin(simT * 2.2 + f.phase) * 5 * S; // tail-beat pulse
+    f.vx = f.vx / sp2 * cruise; f.vy = f.vy / sp2 * cruise;
+    f.x += f.vx * dt; f.y += f.vy * dt;
+
+    /* the river is a loop: leave downstream, re-enter upstream */
+    if (f.x > W + 24){
+      const rel = f.y - channelCenter(W);
+      f.x = -22;
+      f.y = channelCenter(0) + rel * (channelHalf(0) / channelHalf(W));
+      f.trail.length = 0;
+    }
+
+    /* metabolism: swimming costs; riding the current is nearly free */
+    const align = (f.vx * fvx + f.vy * fvy) / (Math.hypot(f.vx, f.vy) || 1);
+    f.energy = Math.max(0, f.energy - dt * f.metab * (0.005 + 0.008 * (1 - Math.max(0, align))));
+
+    /* eat motes on contact */
+    for (let i = motes.length - 1; i >= 0; i--){
+      const m = motes[i];
+      if (Math.abs(m.x - f.x) < 9 * S && Math.abs(m.y - f.y) < 9 * S &&
+          Math.hypot(m.x - f.x, m.y - f.y) < 9 * S){
+        motes.splice(i, 1);
+        f.energy = Math.min(1, f.energy + 0.10);
+        f.hFood += (1 - f.hFood) * 0.25;
+      }
+    }
+
+    /* ribbon trail, stamped with the drive that leads right now */
+    const dom = dominant(f);
+    f.trail.push({ x: f.x, y: f.y, d: dom });
+    if (f.trail.length > 46) f.trail.shift();
+  }
+
+  /* ledger sampling: how the school spends its attention */
+  ledgeTimer -= dt;
+  if (ledgeTimer <= 0){
+    ledgeTimer = 1.0;
+    const mean = { flow: 0, seek: 0, arrive: 0, sep: 0 };
+    for (const f of fishes){ mean.flow += f.w.flow; mean.seek += f.w.seek; mean.arrive += f.w.arrive; mean.sep += f.w.sep; }
+    for (const k in mean) mean[k] /= fishes.length;
+    ledger.push(mean);
+    if (ledger.length > 300) ledger.shift();   // about 5 minutes of memory
+  }
+}
+
+function dominant(f){
+  let bi = 0, bv = -1;
+  DRIVES.forEach((d, i) => { if (f.w[d.key] > bv){ bv = f.w[d.key]; bi = i; } });
+  return bi;
+}
+
+/* ---------- drawing ---------- */
+function draw(){
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.drawImage(backdrop, 0, 0, W, H);
+
+  /* food patches: soft amber blooms, alpha follows richness */
+  for (const p of patches){
+    const r = p.r * S;
+    const g = ctx.createRadialGradient(p.x, p.y, 2, p.x, p.y, r);
+    g.addColorStop(0, `rgba(196,138,38,${0.30 * p.rich + 0.03})`);
+    g.addColorStop(1, 'rgba(196,138,38,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, 7); ctx.fill();
+    ctx.fillStyle = `rgba(150,102,26,${0.35 * p.rich + 0.05})`;
+    for (let i = 0; i < 7; i++){
+      const a = p.seedPhase + i * 2.4 + simT * 0.05;
+      const rr = r * (0.25 + 0.5 * ((i * 37 % 10) / 10));
+      ctx.beginPath();
+      ctx.arc(p.x + Math.cos(a) * rr, p.y + Math.sin(a) * rr * 0.7, 1.6, 0, 7);
+      ctx.fill();
+    }
+  }
+
+  /* starved ground: a dry, grey blotch that the school avoids */
+  if (starve && starve.strength > 0.02){
+    const r = starve.r;
+    const g = ctx.createRadialGradient(starve.x, starve.y, 4, starve.x, starve.y, r);
+    g.addColorStop(0, `rgba(112,96,74,${0.34 * starve.strength})`);
+    g.addColorStop(0.75, `rgba(112,96,74,${0.22 * starve.strength})`);
+    g.addColorStop(1, 'rgba(112,96,74,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(starve.x, starve.y, r, 0, 7); ctx.fill();
+    ctx.strokeStyle = `rgba(90,76,55,${0.5 * starve.strength})`;
+    ctx.lineWidth = 1.2; ctx.setLineDash([5, 5]);
+    ctx.beginPath(); ctx.arc(starve.x, starve.y, r * 0.92, 0, 7); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = `rgba(70,60,44,${0.75 * starve.strength})`;
+    ctx.font = '10px "Avenir Next","Segoe UI",system-ui,sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('starved', starve.x, starve.y - r - 8);
+  }
+
+  /* current streaks */
+  ctx.strokeStyle = 'rgba(70,92,122,0.38)';
+  ctx.lineWidth = 1.4; ctx.lineCap = 'round';
+  ctx.beginPath();
+  for (const st of streaks){
+    const a = fieldAngle(st.x, st.y, simT);
+    const L = 17 * S;
+    ctx.moveTo(st.x, st.y);
+    ctx.lineTo(st.x - Math.cos(a) * L, st.y - Math.sin(a) * L);
+  }
+  ctx.stroke();
+
+  /* motes */
+  ctx.fillStyle = 'rgba(146,102,30,0.85)';
+  for (const m of motes){ ctx.beginPath(); ctx.arc(m.x, m.y, m.r, 0, 7); ctx.fill(); }
+
+  /* ribbons */
+  for (const f of fishes){
+    const tr = f.trail;
+    for (let i = 1; i < tr.length; i++){
+      const p0 = tr[i - 1], p1 = tr[i];
+      if (Math.abs(p1.x - p0.x) > 60 || Math.abs(p1.y - p0.y) > 60) continue;
+      ctx.strokeStyle = DRIVES[p1.d].color;
+      ctx.globalAlpha = (i / tr.length) * 0.55;
+      ctx.lineWidth = (0.8 + 2.2 * (i / tr.length)) * S * f.size;
+      ctx.beginPath(); ctx.moveTo(p0.x, p0.y); ctx.lineTo(p1.x, p1.y); ctx.stroke();
+    }
+  }
+  ctx.globalAlpha = 1;
+
+  /* fish bodies with tiny weight readouts */
+  for (const f of fishes){
+    const ang = Math.atan2(f.vy, f.vx);
+    const L = 13 * S * f.size, B = 4.6 * S * f.size;
+    const wig = Math.sin(simT * 7 + f.phase) * 0.35;
+    ctx.save();
+    ctx.translate(f.x, f.y); ctx.rotate(ang);
+    ctx.fillStyle = INK;
+    ctx.beginPath();                       /* teardrop body */
+    ctx.moveTo(L * 0.62, 0);
+    ctx.quadraticCurveTo(L * 0.1, -B, -L * 0.42, 0);
+    ctx.quadraticCurveTo(L * 0.1, B, L * 0.62, 0);
+    ctx.fill();
+    ctx.beginPath();                       /* tail fin */
+    ctx.moveTo(-L * 0.38, 0);
+    ctx.lineTo(-L * 0.78, -B * 0.95 + wig * B * 0.5);
+    ctx.lineTo(-L * 0.78, B * 0.95 + wig * B * 0.5);
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle = PAPER;                 /* eye */
+    ctx.beginPath(); ctx.arc(L * 0.34, -B * 0.3, 1.1 * S, 0, 7); ctx.fill();
+    ctx.restore();
+
+    /* 4-segment readout beside the head: the fish's own weight vector */
+    const bw = 15 * S, bh = 2.6 * S;
+    let bx = f.x - bw / 2;
+    const by = f.y - 14 * S * f.size;
+    const order = ['flow', 'seek', 'arrive', 'sep'];
+    ctx.fillStyle = 'rgba(244,238,218,0.55)';
+    ctx.fillRect(bx - 0.8, by - 0.8, bw + 1.6, bh + 1.6);
+    for (let i = 0; i < 4; i++){
+      const wseg = bw * f.w[order[i]];
+      ctx.fillStyle = DRIVES[i].color;
+      ctx.globalAlpha = 0.92;
+      ctx.fillRect(bx, by, Math.max(0.5, wseg - 0.5), bh);
+      bx += wseg;
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  drawLedger();
+}
+
+function drawLedger(){
+  const lh = ledgeH(), top = H - lh;
+  ctx.fillStyle = 'rgba(238,230,205,0.97)';
+  ctx.fillRect(0, top, W, lh);
+  ctx.strokeStyle = 'rgba(35,36,44,0.35)';
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(0, top + 0.5); ctx.lineTo(W, top + 0.5); ctx.stroke();
+
+  ctx.fillStyle = 'rgba(35,36,44,0.62)';
+  ctx.font = '10px "Avenir Next","Segoe UI",system-ui,sans-serif';
+  ctx.textAlign = 'left';
+  ctx.fillText('how the school has been spending its attention', 12, top + 14);
+
+  /* legend chips */
+  let lx = 12;
+  ctx.font = '9.5px "Avenir Next","Segoe UI",system-ui,sans-serif';
+  const narrow = W < 560;
+  for (const d of DRIVES){
+    const label = narrow ? d.short : d.word;
+    ctx.fillStyle = d.color;
+    ctx.fillRect(lx, top + lh - 13, 7, 7);
+    ctx.fillStyle = 'rgba(35,36,44,0.66)';
+    ctx.fillText(label, lx + 10, top + lh - 6);
+    lx += 10 + ctx.measureText(label).width + (narrow ? 9 : 14);
+  }
+
+  /* stacked history columns, newest at right */
+  const x0 = 12, x1 = W - 12, plotTop = top + 20, plotBot = top + lh - 18;
+  const ph = plotBot - plotTop;
+  const cw = Math.max(2, (x1 - x0) / 240);
+  const maxCols = Math.floor((x1 - x0) / cw);
+  const data = ledger.slice(-maxCols);
+  data.forEach((m, i) => {
+    const x = x1 - (data.length - i) * cw;
+    let y = plotBot;
+    const order = ['flow', 'seek', 'arrive', 'sep'];
+    for (let k = 0; k < 4; k++){
+      const h = m[order[k]] * ph;
+      ctx.fillStyle = DRIVES[k].color;
+      ctx.globalAlpha = 0.88;
+      ctx.fillRect(x, y - h, cw - 0.5, h);
+      y -= h;
+    }
+  });
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = 'rgba(35,36,44,0.45)';
+  ctx.font = '9px "Avenir Next","Segoe UI",system-ui,sans-serif';
+  ctx.textAlign = 'right';
+  ctx.fillText('now', x1, top + 14);
+}
+
+/* ---------- pointer: hold starves, quick click reseeds ---------- */
+function canvasPos(e){
+  const r = canvas.getBoundingClientRect();
+  return { x: e.clientX - r.left, y: e.clientY - r.top };
+}
+canvas.addEventListener('pointerdown', e => {
+  const p = canvasPos(e);
+  pointer = { down: true, x: p.x, y: p.y, t0: performance.now(), held: false };
+  canvas.setPointerCapture && (() => { try { canvas.setPointerCapture(e.pointerId); } catch(_){} })();
+});
+canvas.addEventListener('pointermove', e => {
+  if (!pointer.down) return;
+  const p = canvasPos(e);
+  pointer.x = p.x; pointer.y = p.y;
+  if (starve && starve.decay === 0){ starve.x = p.x; starve.y = p.y; }
+});
+function endPointer(){
+  if (!pointer.down) return;
+  const wasHeld = pointer.held;
+  pointer.down = false; pointer.held = false;
+  if (starve && starve.decay === 0) starve.decay = 1;   /* release: it fades */
+  if (!wasHeld) init((Math.random() * 1e9) | 0);        /* quick click: new river */
+}
+canvas.addEventListener('pointerup', endPointer);
+canvas.addEventListener('pointercancel', endPointer);
+
+/* ---------- main loop ---------- */
+let last = performance.now();
+function frame(now){
+  requestAnimationFrame(frame);
+  let dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+
+  /* hold-to-starve detection lives in the loop so short taps stay clicks */
+  if (pointer.down && !pointer.held && now - pointer.t0 > 380){
+    pointer.held = true;
+    starve = { x: pointer.x, y: pointer.y, r: 0, strength: 0, decay: 0 };
+  }
+  if (starve && starve.decay === 0){
+    starve.r = Math.min(112 * S + 26, starve.r + dt * 90);
+    starve.strength = Math.min(1, starve.strength + dt * 1.4);
+  }
+
+  const steps = Math.max(1, Math.round(FAST));
+  const sub = dt * FAST / steps;
+  for (let i = 0; i < steps; i++) step(sub);
+  draw();
+}
+requestAnimationFrame(frame);
+
+/* ---------- layout ---------- */
+function resize(){
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  S = Math.max(0.55, Math.min(1.15, Math.min(W, 1000) / 900));
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+  init(SEED);                       /* rebuilds backdrop + school for the new frame */
+}
+let rzT = 0;
+window.addEventListener('resize', () => {
+  clearTimeout(rzT);
+  rzT = setTimeout(resize, 120);
+});
+resize();
+</script>
+</body>
+</html>

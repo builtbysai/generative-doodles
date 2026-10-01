@@ -1,0 +1,863 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>№8937 · Gesture Atlas</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%; overflow: hidden;
+    background: #0e1218;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    overscroll-behavior: none;
+  }
+  #stage { position: fixed; inset: 0; display: block; touch-action: none; cursor: crosshair; }
+  .label {
+    position: fixed; z-index: 2; pointer-events: none;
+    color: rgba(207, 214, 223, 0.92);
+  }
+  #title { top: 16px; left: 18px; font-size: 12px; letter-spacing: 0.22em; text-transform: uppercase; }
+  #title .dim { color: rgba(139, 150, 165, 0.85); letter-spacing: 0.14em; }
+  #readout {
+    top: 44px; left: 18px; max-width: min(520px, 78vw);
+    font-size: 12.5px; line-height: 1.75; letter-spacing: 0.04em;
+    color: rgba(207, 214, 223, 0.78);
+  }
+  #readout .hit { color: #ff6a4a; }
+  #readout .dim { color: rgba(139, 150, 165, 0.8); font-size: 11px; }
+  #hint {
+    left: 18px; font-size: 11px; letter-spacing: 0.05em; line-height: 1.7;
+    color: rgba(139, 150, 165, 0.75); max-width: 74vw;
+  }
+  #seedtag {
+    right: 16px; font-size: 10px; letter-spacing: 0.14em;
+    color: rgba(139, 150, 165, 0.55); text-align: right;
+  }
+  .tools { position: fixed; z-index: 3; top: 14px; right: 14px; display: flex; gap: 8px; }
+  .tools button {
+    font-family: inherit; font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase;
+    color: rgba(207, 214, 223, 0.75); background: rgba(19, 26, 35, 0.85);
+    border: 1px solid rgba(90, 104, 122, 0.55); border-radius: 20px;
+    padding: 7px 13px; cursor: pointer;
+  }
+  .tools button:hover { color: #ece5d3; border-color: rgba(160, 175, 195, 0.8); }
+  @media (max-width: 560px) {
+    #title { font-size: 10.5px; top: 12px; left: 12px; letter-spacing: 0.14em; max-width: calc(100vw - 206px); }
+    #readout { top: 60px; left: 12px; font-size: 11.5px; }
+    #hint { left: 12px; font-size: 10px; max-width: 92vw; }
+    .tools { top: 10px; right: 10px; }
+    .tools button { padding: 6px 10px; font-size: 9px; }
+    #seedtag { right: 12px; }
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="title" class="label">№8937 · Gesture Atlas<br><span class="dim">a search instrument for drawn shapes</span></div>
+<div id="readout" class="label"><span class="dim">the corpus is listening.</span></div>
+<div id="hint" class="label">draw a gesture on the slate. the closest stored shape rotates onto your stroke, ends first. backwards counts too.</div>
+<div id="seedtag" class="label"></div>
+<div class="tools">
+  <button id="btnCorpus" type="button">new corpus</button>
+  <button id="btnClear" type="button">clear</button>
+</div>
+<script>
+"use strict";
+/* ============================================================
+   Gesture Atlas - No.8937
+   A gesture-matching instrument. Draw a stroke; the piece
+   resamples it, normalizes it, and searches a stored corpus of
+   polylines with the closed-form optimal-rotation cosine
+   distance (both drawing directions). The best match is then
+   fitted back onto your stroke with an endpoint-weighted
+   similarity transform, endpoints weighted about 100x, and
+   animated rotating under your hand until it lands.
+   Strokes you draw join the corpus for the rest of the session.
+   Seed 269 (Zach Lieberman study, Land Lines lineage; this is
+   an instrument of search, not a copy of that piece).
+   ============================================================ */
+
+const TAU = Math.PI * 2;
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const lerp = (a, b, t) => a + (b - a) * t;
+const easeInOutCubic = t => t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+const sm = /[?&]seed=(\d+)/.exec(location.search);
+let seed = sm ? (parseInt(sm[1], 10) >>> 0) : 269;
+const seedtag = document.getElementById("seedtag");
+function showSeed() { seedtag.textContent = "seed " + seed; }
+showSeed();
+
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const readoutEl = document.getElementById("readout");
+const hintEl = document.getElementById("hint");
+
+const N = 64;               // resample count for matching
+const END_W = 100;          // endpoint weight multiplier in the fit
+
+// ---------- polyline helpers ----------
+
+function pathLength(pts) {
+  let L = 0;
+  for (let i = 1; i < pts.length; i++) {
+    const dx = pts[i][0] - pts[i - 1][0], dy = pts[i][1] - pts[i - 1][1];
+    L += Math.hypot(dx, dy);
+  }
+  return L;
+}
+
+function resample(pts, n) {
+  if (pts.length < 2) return pts.map(p => [p[0], p[1]]);
+  const L = pathLength(pts);
+  if (L < 1e-9) return Array.from({ length: n }, () => [pts[0][0], pts[0][1]]);
+  const step = L / (n - 1);
+  const out = [[pts[0][0], pts[0][1]]];
+  let prev = pts[0], acc = 0;
+  for (let i = 1; i < pts.length; i++) {
+    let cur = pts[i];
+    let d = Math.hypot(cur[0] - prev[0], cur[1] - prev[1]);
+    while (acc + d >= step && out.length < n) {
+      const t = d < 1e-12 ? 0 : (step - acc) / d;
+      const nx = prev[0] + (cur[0] - prev[0]) * t;
+      const ny = prev[1] + (cur[1] - prev[1]) * t;
+      out.push([nx, ny]);
+      prev = [nx, ny];
+      d = Math.hypot(cur[0] - prev[0], cur[1] - prev[1]);
+      acc = 0;
+    }
+    acc += d;
+    prev = cur;
+  }
+  while (out.length < n) out.push([pts[pts.length - 1][0], pts[pts.length - 1][1]]);
+  return out;
+}
+
+// one light Chaikin pass plus a short moving average: takes the
+// tremor out of a hand stroke without flattening its corners away
+function smoothStroke(pts) {
+  if (pts.length < 4) return pts;
+  const c = [[pts[0][0], pts[0][1]]];
+  for (let i = 0; i < pts.length - 1; i++) {
+    const a = pts[i], b = pts[i + 1];
+    c.push([a[0] * 0.75 + b[0] * 0.25, a[1] * 0.75 + b[1] * 0.25]);
+    c.push([a[0] * 0.25 + b[0] * 0.75, a[1] * 0.25 + b[1] * 0.75]);
+  }
+  c.push([pts[pts.length - 1][0], pts[pts.length - 1][1]]);
+  const out = c.map(p => [p[0], p[1]]);
+  for (let i = 1; i < c.length - 1; i++) {
+    out[i] = [(c[i - 1][0] + 2 * c[i][0] + c[i + 1][0]) / 4,
+              (c[i - 1][1] + 2 * c[i][1] + c[i + 1][1]) / 4];
+  }
+  return out;
+}
+
+// centroid to origin, RMS radius to 1
+function normalize(pts) {
+  let cx = 0, cy = 0;
+  for (const p of pts) { cx += p[0]; cy += p[1]; }
+  cx /= pts.length; cy /= pts.length;
+  let s = 0;
+  const out = pts.map(p => {
+    const x = p[0] - cx, y = p[1] - cy;
+    s += x * x + y * y;
+    return [x, y];
+  });
+  const rms = Math.sqrt(s / pts.length) || 1;
+  for (const p of out) { p[0] /= rms; p[1] /= rms; }
+  return out;
+}
+
+function centroidOf(pts) {
+  let cx = 0, cy = 0;
+  for (const p of pts) { cx += p[0]; cy += p[1]; }
+  return [cx / pts.length, cy / pts.length];
+}
+function rmsOf(pts, c) {
+  let s = 0;
+  for (const p of pts) { const dx = p[0] - c[0], dy = p[1] - c[1]; s += dx * dx + dy * dy; }
+  return Math.sqrt(s / pts.length) || 1;
+}
+
+// closed-form optimal-rotation cosine distance between two
+// normalized polylines: a sums the dots, b sums the crosses,
+// the best rotation is atan2(b, a), no iterative search
+function cosDist(a, b) {
+  let A = 0, B = 0;
+  for (let i = 0; i < a.length; i++) {
+    A += a[i][0] * b[i][0] + a[i][1] * b[i][1];
+    B += a[i][0] * b[i][1] - a[i][1] * b[i][0];
+  }
+  return Math.acos(clamp(Math.hypot(A, B) / a.length, -1, 1));
+}
+
+// endpoint-weighted similarity fit: find rotation, scale and
+// translation taking corpus points P onto screen points Q,
+// with the two ends weighted about 100x the middle
+function fitWeighted(P, Q) {
+  const w = new Array(N);
+  for (let i = 0; i < N; i++) {
+    const pct = i / (N - 1);
+    w[i] = 1 + (END_W - 1) * (1 - Math.sin(Math.PI * pct));
+  }
+  let sw = 0, pcx = 0, pcy = 0, qcx = 0, qcy = 0;
+  for (let i = 0; i < N; i++) {
+    sw += w[i];
+    pcx += w[i] * P[i][0]; pcy += w[i] * P[i][1];
+    qcx += w[i] * Q[i][0]; qcy += w[i] * Q[i][1];
+  }
+  pcx /= sw; pcy /= sw; qcx /= sw; qcy /= sw;
+  let dot = 0, cross = 0, den = 0;
+  for (let i = 0; i < N; i++) {
+    const px = P[i][0] - pcx, py = P[i][1] - pcy;
+    const qx = Q[i][0] - qcx, qy = Q[i][1] - qcy;
+    dot += w[i] * (px * qx + py * qy);
+    cross += w[i] * (px * qy - py * qx);
+    den += w[i] * (px * px + py * py);
+  }
+  const theta = Math.atan2(cross, dot);
+  const s = den < 1e-12 ? 1 : (dot * Math.cos(theta) + cross * Math.sin(theta)) / den;
+  const cos = Math.cos(theta), sin = Math.sin(theta);
+  const tx = qcx - s * (cos * pcx - sin * pcy);
+  const ty = qcy - s * (sin * pcx + cos * pcy);
+  return { theta, s, tx, ty };
+}
+
+function applyT(T, p) {
+  const cos = Math.cos(T.theta), sin = Math.sin(T.theta);
+  return [T.s * (cos * p[0] - sin * p[1]) + T.tx, T.s * (sin * p[0] + cos * p[1]) + T.ty];
+}
+
+function smooth01(x) {
+  x = clamp(x, 0, 1);
+  return x * x * (3 - 2 * x);
+}
+
+// the fitted line plus its endpoint lock: the residual error at
+// each end, eased to zero by mid-stroke, so the ends sit exactly
+// on the stroke while the weighted fit owns the middle
+function landedPoint(land, T, i, lockScale) {
+  const base = applyT(T, land.dispPts[i]);
+  const t = i / (N - 1);
+  const wA = 1 - smooth01(t / 0.5), wB = smooth01((t - 0.5) / 0.5);
+  return [
+    base[0] + (land.lockA[0] * wA + land.lockB[0] * wB) * lockScale,
+    base[1] + (land.lockA[1] * wA + land.lockB[1] * wB) * lockScale
+  ];
+}
+
+// ---------- corpus generators ----------
+// each returns raw points in a rough [-1.2, 1.2] box, y down
+
+function catmull(ctrl, samples) {
+  const pts = [];
+  const P = [ctrl[0], ...ctrl, ctrl[ctrl.length - 1]];
+  for (let i = 0; i < P.length - 3; i++) {
+    const p0 = P[i], p1 = P[i + 1], p2 = P[i + 2], p3 = P[i + 3];
+    const seg = Math.max(4, Math.floor(samples / (P.length - 3)));
+    for (let j = 0; j < seg; j++) {
+      const t = j / seg, t2 = t * t, t3 = t2 * t;
+      pts.push([
+        0.5 * ((2 * p1[0]) + (-p0[0] + p2[0]) * t + (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2 + (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3),
+        0.5 * ((2 * p1[1]) + (-p0[1] + p2[1]) * t + (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2 + (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3)
+      ]);
+    }
+  }
+  pts.push([ctrl[ctrl.length - 1][0], ctrl[ctrl.length - 1][1]]);
+  return pts;
+}
+
+function joinParts(parts) {
+  const out = [];
+  for (const part of parts) {
+    for (const p of part) {
+      const last = out[out.length - 1];
+      if (!last || Math.hypot(p[0] - last[0], p[1] - last[1]) > 1e-6) out.push(p);
+    }
+  }
+  return out;
+}
+
+function arc(cx, cy, r, a0, a1, n, ry) {
+  const out = [];
+  for (let i = 0; i <= n; i++) {
+    const a = a0 + (a1 - a0) * (i / n);
+    out.push([cx + r * Math.cos(a), cy + r * (ry || 1) * Math.sin(a)]);
+  }
+  return out;
+}
+
+const GENERATORS = [
+  ["loop", () => arc(0, 0, 1.02, Math.PI * 0.35, Math.PI * 0.35 + TAU, 110, 0.96)],
+  ["double loop", () => joinParts([
+    arc(-0.52, 0.05, 0.52, Math.PI * 0.9, Math.PI * 0.9 + TAU, 60),
+    arc(0.55, -0.05, 0.52, Math.PI * 0.9, Math.PI * 0.9 + TAU, 60)
+  ])],
+  ["spiral in", () => {
+    const pts = [];
+    for (let i = 0; i <= 130; i++) {
+      const t = i / 130, a = 0.7 + t * TAU * 2.6, r = 1.08 * (1 - t) + 0.05;
+      pts.push([r * Math.cos(a), r * Math.sin(a)]);
+    }
+    return pts;
+  }],
+  ["spiral tail", () => {
+    const pts = [];
+    for (let i = 0; i <= 100; i++) {
+      const t = i / 100, a = 2.2 + t * TAU * 1.35, r = 0.08 + 0.6 * t;
+      pts.push([r * Math.cos(a) - 0.28, r * Math.sin(a) - 0.3]);
+    }
+    const last = pts[pts.length - 1];
+    for (let i = 1; i <= 30; i++) {
+      const t = i / 30;
+      pts.push([last[0] + 0.85 * t, last[1] + 0.85 * t - 0.12 * t * t]);
+    }
+    return pts;
+  }],
+  ["sharp zigzag", () => {
+    const pts = [];
+    for (let i = 0; i <= 120; i++) {
+      const t = i / 120, u = (t * 4) % 1;
+      const tri = u < 0.5 ? (u * 4 - 1) : (3 - u * 4);
+      pts.push([-1.35 + 2.7 * t, 0.66 * tri]);
+    }
+    return pts;
+  }],
+  // cosine-family corridors, measured by the search itself:
+  // a wave drawn at one frequency lands in a neighbouring cell
+  // unless the family is thinned to what a hand can tell apart
+  ["wave", () => {
+    const pts = [];
+    for (let i = 0; i <= 120; i++) {
+      const t = i / 120;
+      pts.push([-1.35 + 2.7 * t, 0.55 * Math.sin(TAU * 2.5 * t + 0.4)]);
+    }
+    return pts;
+  }],
+  ["swell", () => {
+    const pts = [];
+    for (let i = 0; i <= 120; i++) {
+      const t = i / 120;
+      pts.push([-1.35 + 2.7 * t, (0.1 + 0.95 * t) * Math.sin(TAU * 2 * t)]);
+    }
+    return pts;
+  }],
+  ["hook", () => catmull([[0.42, -1.05], [0.42, 0.25], [0.3, 0.68], [-0.05, 0.92], [-0.42, 0.78], [-0.52, 0.35], [-0.3, 0.18]], 130)],
+  ["crook", () => joinParts([
+    [[-0.08, 1.15], [-0.08, 0.35], [-0.08, -0.35]],
+    arc(0.14, -0.35, 0.22, Math.PI, Math.PI + TAU * 0.88, 60)
+  ])],
+  ["check mark", () => catmull([[-0.95, -0.02], [-0.4, 0.6], [-0.22, 0.4], [0.4, -0.35], [0.98, -0.88]], 110)],
+  ["teardrop", () => {
+    const pts = [];
+    for (let i = 0; i <= 120; i++) {
+      const a = (i / 120) * TAU;
+      const x = Math.cos(a), y = Math.sin(a) * Math.pow(Math.abs(Math.sin(a / 2)), 3) * Math.sign(Math.sin(a / 2) || 1);
+      pts.push([0.92 * y, -1.12 * x]);
+    }
+    return pts;
+  }],
+  ["figure eight", () => {
+    const pts = [];
+    for (let i = 0; i <= 130; i++) {
+      const a = (i / 130) * TAU;
+      pts.push([1.15 * Math.sin(a), 0.85 * Math.sin(a) * Math.cos(a)]);
+    }
+    return pts;
+  }],
+  ["crescent", () => arc(0, 0, 1.08, -Math.PI * 0.1, Math.PI * 1.32, 110)],
+  ["s curve", () => {
+    const pts = [];
+    for (let i = 0; i <= 120; i++) {
+      const t = i / 120;
+      pts.push([0.74 * Math.sin(Math.PI * (2 * t - 1)), -1.15 + 2.3 * t]);
+    }
+    return pts;
+  }],
+  ["reverse s", () => {
+    const pts = [];
+    for (let i = 0; i <= 120; i++) {
+      const t = i / 120;
+      pts.push([-0.74 * Math.sin(Math.PI * (2 * t - 1)), -1.15 + 2.3 * t]);
+    }
+    return pts;
+  }],
+  ["peak", () => catmull([[-1.1, 0.8], [-0.55, 0.02], [0, -0.85], [0.55, 0.02], [1.1, 0.8]], 120)],
+  ["valley", () => catmull([[-0.8, -0.95], [-0.36, 0.35], [0, 0.95], [0.36, 0.35], [0.8, -0.95]], 120)],
+  ["coil", () => {
+    const pts = [];
+    for (let i = 0; i <= 150; i++) {
+      const t = i / 150, a = TAU * 5 * t;
+      pts.push([-1.35 + 2.7 * t + 0.16 * Math.cos(a), 0.6 * Math.sin(a)]);
+    }
+    return pts;
+  }],
+  ["comet", () => {
+    const pts = [];
+    for (let i = 0; i <= 60; i++) {
+      const t = i / 60;
+      pts.push([-1.2 + 1.55 * t, 0.35 - 0.3 * t + 0.1 * Math.sin(Math.PI * t)]);
+    }
+    const head = pts[pts.length - 1];
+    for (let i = 1; i <= 70; i++) {
+      const t = i / 70, a = 2.4 + t * TAU * 1.6, r = 0.34 * (1 - t) + 0.03;
+      pts.push([head[0] + 0.34 + r * Math.cos(a) - 0.34, head[1] + r * Math.sin(a)]);
+    }
+    return pts;
+  }],
+  ["wave hook", () => {
+    const wave = [];
+    for (let i = 0; i <= 80; i++) {
+      const t = i / 80;
+      wave.push([-1.35 + 1.75 * t, 0.5 * Math.sin(TAU * 1.5 * t)]);
+    }
+    const tail = catmull([[0.4, 0.0], [0.62, -0.28], [0.82, -0.66], [0.92, -0.98]], 50);
+    return joinParts([wave, tail.slice(1)]);
+  }],
+  ["flat bow", () => {
+    const pts = [];
+    for (let i = 0; i <= 100; i++) {
+      const t = i / 100;
+      pts.push([-1.35 + 2.7 * t, 0.62 * Math.sin(Math.PI * t) - 0.31]);
+    }
+    return pts;
+  }],
+  ["staircase", () => {
+    const raw = [[-1.15, 0.85], [-0.58, 0.85], [-0.58, 0.28], [0, 0.28], [0, -0.3], [0.58, -0.3], [0.58, -0.85], [1.15, -0.85]];
+    let pts = raw.map(p => [p[0], p[1]]);
+    for (let k = 0; k < 1; k++) {
+      const c = [[pts[0][0], pts[0][1]]];
+      for (let i = 0; i < pts.length - 1; i++) {
+        const a = pts[i], b = pts[i + 1];
+        c.push([a[0] * 0.82 + b[0] * 0.18, a[1] * 0.82 + b[1] * 0.18]);
+        c.push([a[0] * 0.18 + b[0] * 0.82, a[1] * 0.18 + b[1] * 0.82]);
+      }
+      c.push([pts[pts.length - 1][0], pts[pts.length - 1][1]]);
+      pts = c;
+    }
+    return resample(pts, 130);
+  }],
+  ["nearly straight", () => {
+    const pts = [];
+    for (let i = 0; i <= 100; i++) {
+      const t = i / 100;
+      pts.push([-1.35 + 2.7 * t, 0.07 * Math.sin(TAU * t)]);
+    }
+    return pts;
+  }],
+  ["bell", () => catmull([[-1.05, 0.55], [-0.58, 0.08], [-0.38, -0.6], [0, -0.8], [0.38, -0.6], [0.58, 0.08], [1.05, 0.55]], 130)]
+];
+
+// ---------- corpus ----------
+
+let corpus = [];   // {name, yours, norm, maxR}
+let yoursCount = 0;
+
+function buildCorpus(s) {
+  const rng = mulberry32(s >>> 0);
+  corpus = GENERATORS.map(([name, gen]) => {
+    let pts = gen();
+    // a whisper of hand wobble, kept off the endpoints
+    const a1 = 0.028 + rng() * 0.02, a2 = 0.02 + rng() * 0.018;
+    const f1 = 1 + Math.floor(rng() * 3), f2 = 1 + Math.floor(rng() * 3);
+    const p1 = rng() * TAU, p2 = rng() * TAU;
+    pts = pts.map((p, i) => {
+      const t = i / (pts.length - 1);
+      const env = 0.25 + 0.75 * Math.sin(Math.PI * clamp(t, 0, 1));
+      return [
+        p[0] + a1 * env * Math.sin(TAU * f1 * t + p1),
+        p[1] + a2 * env * Math.sin(TAU * f2 * t + p2)
+      ];
+    });
+    const norm = normalize(resample(pts, N));
+    let maxR = 0.01;
+    for (const p of norm) maxR = Math.max(maxR, Math.hypot(p[0], p[1]));
+    return { name, yours: false, norm, maxR };
+  });
+  yoursCount = 0;
+}
+buildCorpus(seed);
+
+// ---------- state ----------
+
+let W = 0, H = 0, DPR = 1;
+let stage = { x: 0, y: 0, w: 0, h: 0 };
+let strip = { x: 0, y: 0, w: 0, h: 0, cols: 6, rows: 4, cell: 48, labelH: 20, pad: 10 };
+let cells = []; // screen rects per corpus entry
+
+let drawing = false, activePointer = null;
+let stroke = [];          // raw pointer points, current or last
+let landed = null;        // {name, dist, yours, dispPts, fit, endErr, runners:[], addedName}
+let anim = null;          // {t0, dur, from, to, dispPts}
+let hoverCell = -1;
+let flashUntil = 0, flashText = "";
+let idleAngle = 0;
+
+function setReadout(html) { readoutEl.innerHTML = html; }
+function idleReadout() {
+  setReadout('<span class="dim">the corpus holds ' + corpus.length +
+    ' gestures. draw one of your own and it will answer with the closest it knows.</span>');
+}
+idleReadout();
+
+function layout() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = Math.round(W * DPR);
+  canvas.height = Math.round(H * DPR);
+  canvas.style.width = W + "px";
+  canvas.style.height = H + "px";
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+  const cols = W >= 1000 ? 12 : W >= 640 ? 8 : 6;
+  const rows = Math.ceil(corpus.length / cols);
+  const pad = 10, labelH = 20, gap = 6;
+  const cellW = Math.min(56, (W - pad * 2 - gap * (cols - 1)) / cols);
+  const maxStripH = Math.floor(H * 0.36);
+  const cellH = Math.min(cellW + 6, (maxStripH - labelH - pad) / rows - gap);
+  const cell = Math.max(26, Math.min(cellW, cellH));
+  strip = {
+    x: 0, y: H - (labelH + rows * (cell + gap) + pad), w: W,
+    h: labelH + rows * (cell + gap) + pad, cols, rows, cell, labelH, pad, gap
+  };
+  stage = { x: 0, y: 0, w: W, h: strip.y };
+  cells = corpus.map((c, i) => {
+    const col = i % cols, row = Math.floor(i / cols);
+    return {
+      x: pad + col * (cell + gap), y: strip.y + labelH + row * (cell + gap),
+      w: cell, h: cell
+    };
+  });
+  hintEl.style.bottom = (strip.h + 10) + "px";
+  seedtag.style.bottom = (strip.h + 10) + "px";
+}
+window.addEventListener("resize", layout);
+
+// ---------- matching ----------
+
+function searchCorpus(qNorm) {
+  const qRev = qNorm.slice().reverse();
+  const scored = corpus.map((c, idx) => {
+    const dF = cosDist(qNorm, c.norm);
+    const dR = cosDist(qRev, c.norm);
+    return dR < dF ? { idx, dist: dR, reversed: true } : { idx, dist: dF, reversed: false };
+  });
+  scored.sort((a, b) => a.dist - b.dist);
+  return scored;
+}
+
+function finishStroke() {
+  if (stroke.length < 6 || pathLength(stroke) < 26) {
+    flashText = "too short. give it a real gesture.";
+    flashUntil = performance.now() + 1600;
+    stroke = [];
+    return;
+  }
+  const qPts = resample(smoothStroke(stroke), N);
+  const qNorm = normalize(qPts);
+  const scored = searchCorpus(qNorm);
+  const best = scored[0];
+  const entry = corpus[best.idx];
+  const dispPts = best.reversed ? entry.norm.slice().reverse() : entry.norm;
+  const fit = fitWeighted(dispPts, qPts);
+  const c = centroidOf(qPts);
+  const from = { theta: 0, s: rmsOf(qPts, c), tx: c[0], ty: c[1] };
+  let dTheta = fit.theta - from.theta;
+  while (dTheta > Math.PI) dTheta -= TAU;
+  while (dTheta < -Math.PI) dTheta += TAU;
+
+  // the endpoint lock: what the weighted fit still misses at
+  // each end becomes a smooth correction that owns the landing
+  const fA = applyT(fit, dispPts[0]), fB = applyT(fit, dispPts[N - 1]);
+  const lockA = [qPts[0][0] - fA[0], qPts[0][1] - fA[1]];
+  const lockB = [qPts[N - 1][0] - fB[0], qPts[N - 1][1] - fB[1]];
+  const endErr = Math.hypot(lockA[0], lockA[1]) + Math.hypot(lockB[0], lockB[1]);
+
+  landed = {
+    name: entry.name, yours: entry.yours, dist: best.dist, reversed: best.reversed,
+    dispPts, fit, from, dTheta, lockA, lockB, endErr,
+    runners: scored.slice(1, 3).map(r => ({ name: corpus[r.idx].name, dist: r.dist })),
+    idx: best.idx, addedName: null
+  };
+  anim = { t0: performance.now(), dur: 950 };
+
+  const quality = best.dist < 0.15 ? "a clean match" : best.dist < 0.35 ? "a good match" : "the nearest cousin it has";
+  const runnerTxt = landed.runners.map(r => r.name + " " + r.dist.toFixed(3)).join(" · ");
+  setReadout(
+    'closest: <span class="hit">' + entry.name + '</span> · distance ' + best.dist.toFixed(3) +
+    ' · ' + quality + (best.reversed ? ' · drawn backwards, still found' : '') +
+    '<br><span class="dim">also near: ' + runnerTxt + '</span>'
+  );
+
+  // your stroke joins the corpus for the rest of the session
+  yoursCount += 1;
+  const yoursName = "yours " + yoursCount;
+  const yNorm = normalize(qPts.map(p => [p[0], p[1]]));
+  let maxR = 0.01;
+  for (const p of yNorm) maxR = Math.max(maxR, Math.hypot(p[0], p[1]));
+  corpus.push({ name: yoursName, yours: true, norm: yNorm, maxR });
+  if (corpus.length > 60) corpus.splice(GENERATORS.length, 1);
+  landed.addedName = yoursName;
+  layout();
+}
+
+// ---------- pointer ----------
+
+function ptr(e) {
+  const r = canvas.getBoundingClientRect();
+  return [e.clientX - r.left, e.clientY - r.top];
+}
+
+canvas.addEventListener("pointerdown", e => {
+  const p = ptr(e);
+  if (p[1] > stage.h - 4) return; // the atlas strip is not a drawing surface
+  if (drawing) return;
+  drawing = true;
+  activePointer = e.pointerId;
+  try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* synthetic events */ }
+  stroke = [p];
+  landed = null;
+  anim = null;
+  idleReadout();
+  e.preventDefault();
+});
+
+canvas.addEventListener("pointermove", e => {
+  const p = ptr(e);
+  if (drawing && e.pointerId === activePointer) {
+    const last = stroke[stroke.length - 1];
+    if (!last || Math.hypot(p[0] - last[0], p[1] - last[1]) > 1.5) stroke.push(p);
+  } else if (!drawing) {
+    hoverCell = -1;
+    for (let i = 0; i < cells.length; i++) {
+      const c = cells[i];
+      if (p[0] >= c.x && p[0] <= c.x + c.w && p[1] >= c.y && p[1] <= c.y + c.h) { hoverCell = i; break; }
+    }
+  }
+});
+
+function endPointer(e) {
+  if (!drawing || e.pointerId !== activePointer) return;
+  drawing = false;
+  activePointer = null;
+  finishStroke();
+}
+canvas.addEventListener("pointerup", endPointer);
+canvas.addEventListener("pointercancel", endPointer);
+canvas.addEventListener("contextmenu", e => e.preventDefault());
+
+document.getElementById("btnCorpus").addEventListener("click", () => {
+  seed = (seed + 1) >>> 0;
+  buildCorpus(seed);
+  showSeed();
+  stroke = []; landed = null; anim = null;
+  layout();
+  flashText = "fresh corpus. same instrument, new memory.";
+  flashUntil = performance.now() + 1800;
+  idleReadout();
+});
+document.getElementById("btnClear").addEventListener("click", () => {
+  stroke = []; landed = null; anim = null;
+  idleReadout();
+});
+
+// ---------- drawing ----------
+
+function strokePath(pts, close) {
+  ctx.beginPath();
+  pts.forEach((p, i) => { if (i === 0) ctx.moveTo(p[0], p[1]); else ctx.lineTo(p[0], p[1]); });
+  if (close) ctx.closePath();
+}
+
+function drawGlyph(pts, maxR, rect, color, width) {
+  const pad = 7;
+  const sc = Math.min(rect.w, rect.h) / 2 - pad;
+  const k = sc / maxR;
+  const cx = rect.x + rect.w / 2, cy = rect.y + rect.h / 2;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = width;
+  ctx.lineJoin = "round"; ctx.lineCap = "round";
+  ctx.beginPath();
+  pts.forEach((p, i) => {
+    const x = cx + p[0] * k, y = cy + p[1] * k;
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+}
+
+function render(now) {
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = "#0e1218";
+  ctx.fillRect(0, 0, W, H);
+
+  // faint instrument grid on the slate
+  ctx.fillStyle = "rgba(160, 175, 195, 0.055)";
+  const gs = 30;
+  for (let x = gs / 2; x < W; x += gs) {
+    for (let y = gs / 2; y < stage.h; y += gs) ctx.fillRect(x, y, 1.6, 1.6);
+  }
+
+  // idle specimen: one corpus glyph, large and faint, turning slowly
+  if (!drawing && stroke.length === 0 && !landed) {
+    idleAngle += 0.0016;
+    const spec = corpus[seed % corpus.length];
+    const cx = stage.w / 2, cy = stage.h / 2 + 8;
+    const R = Math.min(stage.w, stage.h) * 0.26;
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(idleAngle);
+    ctx.strokeStyle = "rgba(160, 175, 195, 0.10)";
+    ctx.lineWidth = 2;
+    ctx.lineJoin = "round"; ctx.lineCap = "round";
+    ctx.beginPath();
+    spec.norm.forEach((p, i) => {
+      const x = p[0] * R, y = p[1] * R;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+    ctx.restore();
+    ctx.fillStyle = "rgba(139, 150, 165, 0.5)";
+    ctx.font = "10px ui-monospace, Menlo, monospace";
+    ctx.textAlign = "center";
+    ctx.fillText("draw here", cx, cy + R + 30);
+  }
+
+  // your stroke
+  if (stroke.length > 1) {
+    ctx.strokeStyle = landed || anim ? "rgba(236, 229, 211, 0.4)" : "#ece5d3";
+    ctx.lineWidth = 3;
+    ctx.lineJoin = "round"; ctx.lineCap = "round";
+    strokePath(stroke, false);
+    ctx.stroke();
+    if (!anim && !landed) {
+      ctx.fillStyle = "#ece5d3";
+      const p = stroke[stroke.length - 1];
+      ctx.beginPath(); ctx.arc(p[0], p[1], 3, 0, TAU); ctx.fill();
+    }
+  }
+
+  // the match, rotating under your hand and landing
+  if (landed) {
+    let T = landed.fit, alpha = 1, lockScale = 1;
+    if (anim) {
+      const t = clamp((now - anim.t0) / anim.dur, 0, 1);
+      const e = easeInOutCubic(t);
+      T = {
+        theta: landed.from.theta + landed.dTheta * e,
+        s: lerp(landed.from.s, landed.fit.s, e),
+        tx: lerp(landed.from.tx, landed.fit.tx, e),
+        ty: lerp(landed.from.ty, landed.fit.ty, e)
+      };
+      alpha = 0.25 + 0.75 * e;
+      lockScale = e;
+      if (t >= 1) {
+        anim = null;
+        setReadout(readoutEl.innerHTML +
+          '<br><span class="dim">your stroke joined the corpus as ' + landed.addedName +
+          ' · corpus now ' + corpus.length + '</span>');
+      }
+    }
+    const pts = landed.dispPts.map((p, i) => landedPoint(landed, T, i, lockScale));
+    ctx.strokeStyle = "rgba(255, 106, 74, " + alpha.toFixed(3) + ")";
+    ctx.lineWidth = 3.2;
+    ctx.lineJoin = "round"; ctx.lineCap = "round";
+    strokePath(pts, false);
+    ctx.stroke();
+    // endpoint pins
+    ctx.fillStyle = "rgba(255, 106, 74, " + alpha.toFixed(3) + ")";
+    for (const p of [pts[0], pts[pts.length - 1]]) {
+      ctx.beginPath(); ctx.arc(p[0], p[1], 4, 0, TAU); ctx.fill();
+    }
+    if (!anim && stroke.length > 1) {
+      const q0 = stroke[0], q1 = stroke[stroke.length - 1];
+      ctx.strokeStyle = "rgba(236, 229, 211, 0.85)";
+      ctx.lineWidth = 1.4;
+      for (const p of [q0, q1]) {
+        ctx.beginPath(); ctx.arc(p[0], p[1], 7, 0, TAU); ctx.stroke();
+      }
+    }
+  }
+
+  // flash line
+  if (now < flashUntil) {
+    ctx.fillStyle = "rgba(236, 229, 211, 0.85)";
+    ctx.font = "12px ui-monospace, Menlo, monospace";
+    ctx.textAlign = "center";
+    ctx.fillText(flashText, stage.w / 2, stage.h - 18);
+  }
+
+  // ----- the atlas strip -----
+  ctx.fillStyle = "#10161f";
+  ctx.fillRect(strip.x, strip.y, strip.w, strip.h);
+  ctx.fillStyle = "rgba(38, 48, 61, 1)";
+  ctx.fillRect(strip.x, strip.y, strip.w, 1);
+  ctx.fillStyle = "rgba(139, 150, 165, 0.85)";
+  ctx.font = "10px ui-monospace, Menlo, monospace";
+  ctx.textAlign = "left";
+  ctx.fillText("THE CORPUS", strip.pad + 2, strip.y + 14);
+  ctx.textAlign = "right";
+  const nYours = corpus.filter(c => c.yours).length;
+  ctx.fillText(corpus.length + " gestures · " + nYours + " yours", W - strip.pad - 2, strip.y + 14);
+
+  for (let i = 0; i < corpus.length; i++) {
+    const cell = cells[i];
+    if (!cell) continue;
+    const c = corpus[i];
+    const isHit = landed && landed.idx === i;
+    ctx.fillStyle = isHit ? "rgba(255, 106, 74, 0.10)" : "#121a24";
+    ctx.fillRect(cell.x, cell.y, cell.w, cell.h);
+    ctx.strokeStyle = isHit ? "#ff6a4a" : (i === hoverCell ? "rgba(160,175,195,0.6)" : "#26303d");
+    ctx.lineWidth = isHit ? 1.6 : 1;
+    ctx.strokeRect(cell.x + 0.5, cell.y + 0.5, cell.w - 1, cell.h - 1);
+    drawGlyph(c.norm, c.maxR, cell, isHit ? "#ff6a4a" : (c.yours ? "#c8a15e" : "#8494a7"), isHit ? 2 : 1.5);
+    if (c.yours) {
+      ctx.fillStyle = "#c8a15e";
+      ctx.beginPath(); ctx.arc(cell.x + cell.w - 6, cell.y + 6, 2.2, 0, TAU); ctx.fill();
+    }
+  }
+
+  // hover name tag
+  if (hoverCell >= 0 && corpus[hoverCell] && cells[hoverCell]) {
+    const c = corpus[hoverCell], cell = cells[hoverCell];
+    ctx.font = "10.5px ui-monospace, Menlo, monospace";
+    const label = c.name;
+    const tw = ctx.measureText(label).width + 14;
+    const tx = clamp(cell.x + cell.w / 2 - tw / 2, 6, W - tw - 6);
+    const ty = cell.y - 24;
+    ctx.fillStyle = "rgba(10, 14, 20, 0.92)";
+    ctx.fillRect(tx, ty, tw, 17);
+    ctx.strokeStyle = "#33405200";
+    ctx.fillStyle = "#cfd6df";
+    ctx.textAlign = "center";
+    ctx.fillText(label, tx + tw / 2, ty + 12.5);
+  }
+
+  requestAnimationFrame(render);
+}
+
+layout();
+requestAnimationFrame(render);
+
+// small handle for scripted QA: lets a headless test read back
+// what the instrument concluded, nothing more
+window.__gestureAtlas = {
+  get lastMatch() {
+    if (!landed) return null;
+    return { name: landed.name, dist: landed.dist, reversed: landed.reversed, endErrPx: landed.endErr, corpusSize: corpus.length };
+  },
+  corpusNames() { return corpus.map(c => c.name); }
+};
+</script>
+</body>
+</html>
