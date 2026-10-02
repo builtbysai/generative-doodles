@@ -1,4 +1,4 @@
-# №9044 · Smoke — process
+# №9044 · Smoke, process notes
 
 A single column of smoke rising from a point low on the sheet: stacked
 translucent curls that widen, drift sideways on a gentle S-curve, and
