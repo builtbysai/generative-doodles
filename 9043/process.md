@@ -1,4 +1,4 @@
-# №9043 · River Stones — process
+# №9043 · River Stones, process notes
 
 A bed of smooth river stones seen from above. Overlapping ink-wash
 ellipses with hand-wobbled edges, soft tonal variation, one stone in
