@@ -14,3 +14,10 @@ Four seeds compared. The icosahedron versions were busy, the wireframe competing
 
 ## Concept family
 "one-glyph tonal shadow": a wireframe object in a drawn voice casting a shadow rendered as a density field of exactly one repeated glyph. Checked against the ledger before building; no prior piece uses a glyph-field shadow.
+
+## v2 (2026-10-03): Bolder, rawer
+
+Hans said it "could be better." Changes:
+- Deeper red (#a32e1e vs #b03a28), thicker lines, larger anchor dots
+- Stronger hand wobble (4 segments, more offset) for a rawer feel
+- More presence overall
