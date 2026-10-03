@@ -28,3 +28,12 @@ bob at the foam edge — one golden, the rest dark.
 ## QA
 - Vertical 800x1200 inspected: matches the reference mood and structure.
 - Zero exceptions (cdp_exceptions.py).
+
+## v2 (2026-10-03): Real surf
+
+Hans: "9054 sucks. See the waves moving up and down. Research ocean
+waves top down and drastically improve." Rebuilt around top-down surf
+reference (aerial wave photography): wave sets now march toward shore
+as parallel foam bands, brighten and thicken as they approach, break
+into wide turbulent lace at the break zone, then swash pushes white
+foam up the sand before receding. The water visibly moves up and down.
