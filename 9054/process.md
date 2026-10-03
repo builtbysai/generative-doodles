@@ -29,11 +29,22 @@ bob at the foam edge — one golden, the rest dark.
 - Vertical 800x1200 inspected: matches the reference mood and structure.
 - Zero exceptions (cdp_exceptions.py).
 
-## v2 (2026-10-03): Real surf
+## v5 (2026-10-03): Foam as the subject
 
-Hans: "9054 sucks. See the waves moving up and down. Research ocean
-waves top down and drastically improve." Rebuilt around top-down surf
-reference (aerial wave photography): wave sets now march toward shore
-as parallel foam bands, brighten and thicken as they approach, break
-into wide turbulent lace at the break zone, then swash pushes white
-foam up the sand before receding. The water visibly moves up and down.
+Hans: "It's like you don't understand how waves work." Fair. This version
+was rebuilt from aerial wave photography research plus his reference image
+(teal surf, thick bubbly foam, shallow sand, pale beach):
+
+- The water is calm and glassy. Deep teal up top warming to pale turquoise
+  over shallow sand, sand shimmering through. No wave bands drawn on the
+  water at all.
+- Foam is the subject: discrete breaking events erupt as billowing organic
+  patches. Dense knotted white cores, big bubble cells with real holes in
+  the middle ring, feathery dissipating wisps at the rim. Each event blooms
+  fast, drifts shoreward, dissolves over its lifetime. Several generations
+  overlap, so the scene never empties.
+- Shoreline: a lacy foam wash breathes slowly up and down the pale sand,
+  with wet and dry sand bands.
+
+Palette from the reference: deep teal #2e565b, mid teal #52888f, light
+teal #7bafb6, sage #91998c, pale sand #e7d6c4. Click for another evening.
