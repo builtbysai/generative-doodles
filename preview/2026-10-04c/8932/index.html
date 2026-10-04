@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>№8932 · Budget Ink</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%; overflow: hidden;
+    background: #e7dcc3;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+  }
+  canvas { display: block; cursor: pointer; width: min(92vw, calc(100vh - 132px)); height: auto; }
+  .cap {
+    pointer-events: none; text-align: center;
+    color: #6b6250; font: italic 12.5px/1.5 Georgia, serif; opacity: 0.9;
+    max-width: 660px; padding: 10px 18px 12px;
+  }
+  .cap b { color: #3d382c; font-weight: normal; font-style: normal; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="cap"><b>№8932 · Budget Ink</b>, a still life shaded on a strict ink budget. Every region of tone is allowed one wandering stroke, and the length of that stroke is set by darkness times area. The darks turn obsessive. The lights are left alone. <span id="seedline"></span> Click for a new still life.</div>
+<script>
+'use strict';
+/*
+  Budget Ink: shading as an ink budget.
+
+  A quiet still life (vessels, a bowl, a sphere, folded cloth) is shaded
+  with nothing but wandering strokes. The scene is first reduced to a tone
+  field; the field is cut into tone bands; each band is handed a
+  path-length budget proportional to darkness times area. One wandering
+  stroke per band spends that budget: it meanders, hugs tone contours,
+  steers toward undrawn cells, and lifts its pen when it gets stuck. An
+  internal coverage model then finds sub-areas that stayed undrawn and
+  authorizes a second, shorter pass confined to those spots. Paper-white
+  regions get no budget at all and stay untouched.
+*/
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+const qs = new URLSearchParams(location.search);
+const parsed = parseInt(qs.get('seed'), 10);
+const DEFAULT_SEED = 7;
+let seed = (Number.isFinite(parsed) && parsed !== 0) ? parsed : DEFAULT_SEED;
+let rand = mulberry32(seed);
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const U = 1200;                 // virtual plate units, viewport-invariant
+
+function fit() {
+  const DPR = Math.min(2, window.devicePixelRatio || 1);
+  // CSS sizes the canvas via width:min(92vw, calc(100vh - 132px)); back it with pixels
+  const rect = cv.getBoundingClientRect();
+  const s = Math.max(2, rect.width || Math.min(window.innerWidth, window.innerHeight * 0.9));
+  cv.width = Math.round(s * DPR);
+  cv.height = Math.round(s * DPR);
+  ctx.setTransform(cv.width / U, 0, 0, cv.width / U, 0, 0);
+}
+window.addEventListener('resize', () => { fit(); render(); });
+
+function sm(a, b, x) { // smoothstep, works with a > b too
+  const t = Math.min(1, Math.max(0, (x - a) / (b - a)));
+  return t * t * (3 - 2 * t);
+}
+function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+function makeNoise2(r) {
+  const perm = []; for (let i = 0; i < 256; i++) perm[i] = i;
+  for (let i = 255; i > 0; i--) { const j = (r() * (i + 1)) | 0; const t = perm[i]; perm[i] = perm[j]; perm[j] = t; }
+  const p = new Uint8Array(512);
+  for (let i = 0; i < 512; i++) p[i] = perm[i & 255];
+  const val = (ix, iy) => p[(p[ix & 255] + iy) & 255] / 255;
+  return function (x, y) {
+    const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
+    const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+    const a = val(ix, iy), b = val(ix + 1, iy), c = val(ix, iy + 1), d = val(ix + 1, iy + 1);
+    return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
+  };
+}
+
+// ---------------------------------------------------------------- scene
+const PROFILES = {
+  vase:   { t: [0, .12, .30, .50, .68, .85, 1], r: [.52, .92, 1, .80, .48, .33, .42] },
+  jar:    { t: [0, .15, .35, .55, .75, .90, 1], r: [.58, 1, 1.02, .88, .70, .58, .66] },
+  bottle: { t: [0, .10, .30, .50, .65, .80, 1], r: [.60, .88, .95, .80, .36, .30, .37] },
+  bowl:   { t: [0, .20, .40, .60, .80, .90, 1], r: [.40, .72, .95, 1.05, 1.08, 1.08, 1.05] }
+};
+function profileAt(kind, t) {
+  const P = PROFILES[kind];
+  if (t <= 0) return P.r[0];
+  for (let i = 1; i < P.t.length; i++) {
+    if (t <= P.t[i]) {
+      const u = (t - P.t[i - 1]) / (P.t[i] - P.t[i - 1]);
+      const c = (1 - Math.cos(u * Math.PI)) / 2; // cosine ease, smooth silhouette
+      return P.r[i - 1] + (P.r[i] - P.r[i - 1]) * c;
+    }
+  }
+  return P.r[P.r.length - 1];
+}
+
+function buildScene(r) {
+  const horizon = 0.43 + r() * 0.14;
+  const folds = [];
+  const nf = 2 + Math.floor(r() * 2);
+  for (let i = 0; i < nf; i++) {
+    folds.push({
+      x: 0.08 + r() * 0.84,
+      y: Math.min(0.80, horizon + 0.07 + r() * 0.34),
+      a: (r() - 0.5) * 0.55,
+      amp: 0.030 + r() * 0.040,
+      w: 0.008 + r() * 0.010,
+      len: 0.22 + r() * 0.26 // creases are local, not plate-spanning
+    });
+  }
+  const tallKind = r() < 0.5 ? 'vase' : 'bottle';
+  const comp = [tallKind];
+  const nExtra = 1 + Math.floor(r() * 3);
+  const pool = ['jar', 'bowl', 'sphere', 'jar', 'sphere', 'bowl', 'vase'];
+  for (let i = 0; i < nExtra; i++) comp.push(pool[Math.floor(r() * pool.length)]);
+  // shuffle kinds across slots
+  for (let i = comp.length - 1; i > 0; i--) {
+    const j = Math.floor(r() * (i + 1));
+    const t = comp[i]; comp[i] = comp[j]; comp[j] = t;
+  }
+  const m = comp.length;
+  const objs = [];
+  for (let i = 0; i < m; i++) {
+    const kind = comp[i];
+    const cx = 0.15 + 0.70 * (m === 1 ? 0.5 : i / (m - 1)) + (r() - 0.5) * 0.07;
+    const baseY = Math.min(0.90, horizon + 0.14 + r() * 0.24);
+    let w, h;
+    if (kind === 'vase') { w = 0.16 + r() * 0.08; h = 0.32 + r() * 0.14; }
+    else if (kind === 'bottle') { w = 0.12 + r() * 0.06; h = 0.34 + r() * 0.14; }
+    else if (kind === 'jar') { w = 0.19 + r() * 0.09; h = 0.20 + r() * 0.10; }
+    else if (kind === 'bowl') { w = 0.24 + r() * 0.10; h = 0.13 + r() * 0.07; }
+    else { const d = 0.15 + r() * 0.11; w = d; h = d * (0.92 + r() * 0.12); }
+    h = Math.min(h, baseY - 0.07); // keep the crown inside the plate rule
+    objs.push({ kind, cx: clamp(cx, 0.045 + w * 0.55, 0.955 - w * 0.55), baseY, w, h });
+  }
+  // far to near for painter order
+  objs.sort((a, b) => a.baseY - b.baseY);
+  return { horizon, folds, objs };
+}
+
+// ---------------------------------------------------------------- tone field
+const N = 300, CELL = U / N;
+const tone = new Float32Array(N * N);
+const LX = -0.52, LY = -0.72, LZ = 0.46; // key light from upper left
+
+function buildTone(sc, mott) {
+  for (let j = 0; j < N; j++) {
+    const y = (j + 0.5) / N;
+    for (let i = 0; i < N; i++) {
+      const x = (i + 0.5) / N;
+      const vx = x - 0.5, vy = y - 0.5;
+      let t = 0.012 + (vx * vx + vy * vy) * 0.03; // wall + faint vignette
+      if (y > sc.horizon) {
+        const f = (y - sc.horizon) / (1 - sc.horizon);
+        t += 0.025 + 0.020 * f; // table barely above paper white
+        for (let k = 0; k < sc.folds.length; k++) {
+          const fl = sc.folds[k];
+          const dx = x - fl.x, dy = y - fl.y;
+          const ca = Math.cos(fl.a), sa = Math.sin(fl.a);
+          const along = dx * ca + dy * sa;               // position along the crease
+          const ahl = Math.abs(along) / (fl.len / 2);
+          if (ahl < 1) {
+            const d = -dx * sa + dy * ca;               // signed distance across it
+            const w = fl.w;
+            const e1 = (d + w * 0.9) / (w * 0.9), e2 = (d - w * 0.9) / (w * 0.9);
+            const fade = 1 - sm(0.55, 1.0, ahl);        // crease fades at its ends
+            t += fade * fl.amp * (1.15 * Math.exp(-e2 * e2) - Math.exp(-e1 * e1));
+          }
+        }
+      }
+      // cast shadows first (table only)
+      for (let k = 0; k < sc.objs.length; k++) {
+        const o = sc.objs[k];
+        if (y > sc.horizon) {
+          const sx = o.cx + o.w * 0.38, sy = o.baseY + 0.012;
+          const rx = o.w * 0.66, ry = Math.max(o.h * 0.085, 0.018);
+          const dx = (x - sx) / rx, dy = (y - sy) / ry;
+          const q = dx * dx + dy * dy;
+          if (q < 1) t += 0.34 * Math.pow(1 - q, 1.4) * (0.55 + 0.45 * Math.min(1, (1 - q) * 3));
+        }
+      }
+      // bodies, far to near
+      for (let k = 0; k < sc.objs.length; k++) {
+        const bt = bodyTone(sc.objs[k], x, y);
+        if (bt >= 0) t = bt;
+      }
+      t += 0.015 * (mott(x * 7.3, y * 7.3) - 0.5) * 2; // faint paper mottling in the light
+      // nothing draws outside the plate rule: keep the margin clean paper
+      if (x < 0.034 || x > 0.966 || y < 0.034 || y > 0.966) t = 0.012;
+      tone[j * N + i] = clamp(t, 0, 1);
+    }
+  }
+}
+
+function bodyTone(o, x, y) {
+  if (o.kind === 'sphere') {
+    const rx = o.w / 2, ry = o.h / 2;
+    const dx = (x - o.cx) / rx, dy = (y - (o.baseY - ry)) / ry;
+    const q = dx * dx + dy * dy;
+    if (q > 1) return -1;
+    const z = Math.sqrt(Math.max(0, 1 - q));
+    const diff = clamp(dx * LX + dy * LY + z * LZ, 0, 1);
+    let t = 0.10 + 0.42 * Math.pow(1 - diff, 1.35);
+    t += 0.12 * sm(0.78, 1.0, Math.sqrt(q));            // grounding rim
+    t -= 0.14 * Math.exp(-((dx + 0.42) * (dx + 0.42) + (dy + 0.52) * (dy + 0.52)) / 0.05);
+    return clamp(t, 0, 0.96);
+  }
+  const t01 = (o.baseY - y) / o.h;
+  if (t01 < 0 || t01 > 1) return -1;
+  const hw = (o.w / 2) * profileAt(o.kind, t01);
+  const nx = (x - o.cx) / hw;
+  if (Math.abs(nx) > 1) return -1;
+  const ax = Math.abs(nx);
+  let t = 0.13 + 0.36 * sm(-1, 1, nx * 0.8);            // light left, dark right
+  t += 0.30 * Math.exp(-Math.pow((nx - 0.40) / 0.30, 2)); // core shadow
+  t += 0.16 * sm(0.30, 0.0, t01);                        // base occlusion
+  t += 0.10 * sm(0.80, 1.0, t01);                        // under-lip shade
+  t += 0.24 * sm(0.70, 1.0, ax);                         // silhouette grounding
+  t -= 0.20 * Math.exp(-Math.pow((nx + 0.52) / 0.14, 2)); // sheen on the lit side
+  if (o.kind === 'bowl' && t01 > 0.80) {                  // dark open mouth
+    const it = sm(0.80, 1.0, t01);
+    const inner = 0.50 + 0.08 * (1 - it);
+    t = t * (1 - it) + inner * it;
+  }
+  return clamp(t, 0, 0.96);
+}
+
+// ---------------------------------------------------------------- bands, gradient, coverage
+const TH = [0.080, 0.15, 0.24, 0.35, 0.48, 0.62, 0.78]; // 7 bands; below TH[0] is untouched paper
+const band = new Uint8Array(N * N);
+const gx = new Float32Array(N * N), gy = new Float32Array(N * N);
+const cov = new Float32Array(N * N);
+
+function bandOf(t) {
+  if (t < TH[0]) return 0;
+  for (let k = 0; k < 6; k++) if (t < TH[k + 1]) return k + 1;
+  return 7;
+}
+
+function analyze() {
+  for (let j = 0; j < N; j++) {
+    for (let i = 0; i < N; i++) {
+      const idx = j * N + i;
+      band[idx] = bandOf(tone[idx]);
+      const xm = i > 0 ? tone[idx - 1] : tone[idx], xp = i < N - 1 ? tone[idx + 1] : tone[idx];
+      const ym = j > 0 ? tone[idx - N] : tone[idx], yp = j < N - 1 ? tone[idx + N] : tone[idx];
+      gx[idx] = (xp - xm) / 2; gy[idx] = (yp - ym) / 2;
+      cov[idx] = 0;
+    }
+  }
+}
+
+// ---------------------------------------------------------------- the wandering stroke
+const STEP = 0.8;          // grid cells per step
+const TARGET_PATH = 24000; // total path length, grid units, shared across bands
+
+function covAt(x, y) {
+  const i = clamp(Math.round(x), 0, N - 1), j = clamp(Math.round(y), 0, N - 1);
+  return cov[j * N + i];
+}
+function gradAt(x, y) {
+  const i = clamp(Math.round(x), 0, N - 1), j = clamp(Math.round(y), 0, N - 1);
+  const idx = j * N + i;
+  return [gx[idx], gy[idx]];
+}
+
+function pickStart(inside) {
+  let bx = N / 2, by = N / 2, bc = Infinity;
+  for (let s = 0; s < 60; s++) {
+    const i = 2 + Math.floor(rand() * (N - 4)), j = 2 + Math.floor(rand() * (N - 4));
+    if (!inside(i, j)) continue;
+    const c = cov[j * N + i];
+    if (c < bc) { bc = c; bx = i; by = j; }
+  }
+  return [bx, by];
+}
+
+function flushChunk(pts, pen, wBase, seedN, alpha) {
+  // pts: [x,y] in grid units; pen[i]=true means pen-up move to pts[i]
+  const wob = 0.78 + 0.44 * (0.5 + 0.5 * Math.sin(seedN * 12.9898) * Math.sin(seedN * 3.7));
+  ctx.strokeStyle = 'rgba(46,37,29,' + alpha.toFixed(3) + ')';
+  ctx.lineWidth = Math.max(0.6, wBase * wob) * CELL;
+  ctx.beginPath();
+  let started = false;
+  for (let i = 0; i < pts.length; i++) {
+    if (pen[i] || !started) { ctx.moveTo(pts[i][0] * CELL, pts[i][1] * CELL); started = true; }
+    else ctx.lineTo(pts[i][0] * CELL, pts[i][1] * CELL);
+  }
+  ctx.stroke();
+}
+
+// One wandering stroke spends `budget` (grid units) inside `inside(i,j)`.
+// It follows tone contours, steers toward undrawn cells, avoids over-inked
+// ones, and lifts the pen (teleports) when stuck so a single stroke can
+// serve a disjoint region. Segments that leave the region are drawn pen-up.
+// Ink saturates: once a spot holds well past its expected share, the stroke
+// lays less ink there, so dense regions stay textured instead of blobbing.
+function wander(budget, inside, expected, wBase) {
+  let start = pickStart(inside);
+  let px = start[0], py = start[1];
+  let heading = rand() * Math.PI * 2;
+  let remaining = budget;
+  let stuck = 0, liftCount = 0;
+  let pts = [[px, py]], pen = [true];
+  let n1 = rand() * 100;
+  let covSum = 0, covN = 0;
+
+  const insideAt = (x, y) => {
+    const i = Math.round(x), j = Math.round(y);
+    if (i < 1 || j < 1 || i >= N - 1 || j >= N - 1) return false;
+    return inside(i, j);
+  };
+  const flush = () => {
+    if (pts.length < 2) { pts = []; pen = []; covSum = 0; covN = 0; return; }
+    const sat = covN > 0 ? (covSum / covN) / expected : 0;
+    const alpha = 0.30 * clamp(1.7 - sat, 0.22, 1.0);
+    flushChunk(pts, pen, wBase, n1, alpha);
+    const last = pts[pts.length - 1];
+    pts = [[last[0], last[1]]]; pen = [true]; covSum = 0; covN = 0;
+  };
+
+  while (remaining > 0 && liftCount < 400) {
+    heading += (rand() - 0.5) * 0.5; // organic meander on top of the steering
+    let best = -1e9, bh = heading, bins = 0;
+    for (let c = -3; c <= 3; c++) {
+      const h = heading + c * 0.24;
+      const ch = Math.cos(h), sh = Math.sin(h);
+      let ins = 0;
+      for (let s = 1; s <= 3; s++) if (insideAt(px + ch * STEP * s, py + sh * STEP * s)) ins++;
+      ins /= 3;
+      const cxp = px + ch * STEP * 3, cyp = py + sh * STEP * 3;
+      const cc = covAt(cxp, cyp);
+      const unc = 1 - Math.min(1, cc / expected);
+      const over = cc > 2.0 * expected ? 1.5 : 0; // don't re-ink saturated spots
+      const g = gradAt(cxp, cyp);
+      const gm = Math.hypot(g[0], g[1]) + 1e-6;
+      const align = Math.abs(ch * -g[1] + sh * g[0]) / gm; // follow the contour
+      const gw = Math.min(1, gm * 5);
+      const score = 3.4 * ins + 2.2 * unc + 1.0 * align * gw - over - 1.1 * Math.abs(c) / 3 + rand() * 0.5;
+      if (score > best) { best = score; bh = h; bins = ins; }
+    }
+    if (bins < 0.34) stuck++; else stuck = 0;
+    if (stuck > 22) {
+      // lift the pen: relocate to the least-drawn part of the region
+      flush();
+      start = pickStart(inside);
+      px = start[0]; py = start[1];
+      heading = rand() * Math.PI * 2;
+      stuck = 0; liftCount++;
+      pts = [[px, py]]; pen = [true];
+      continue;
+    }
+    heading = bh;
+    const nx = px + Math.cos(heading) * STEP, ny = py + Math.sin(heading) * STEP;
+    const i0 = Math.round(nx), j0 = Math.round(ny);
+    const inn = i0 >= 1 && j0 >= 1 && i0 < N - 1 && j0 < N - 1 && inside(i0, j0);
+    if (inn) cov[j0 * N + i0] += STEP;
+    px = nx; py = ny;
+    remaining -= STEP;
+    pts.push([px, py]); pen.push(!inn); n1 += 0.13;
+    if (inn) { covSum += cov[j0 * N + i0]; covN++; }
+    if (pts.length >= 44) flush();
+  }
+  flush();
+}
+
+// Flood-fill undrawn clusters inside one band; each earns a second pass.
+function secondPass(k, expected, K, wBase) {
+  const label = new Int32Array(N * N).fill(-1);
+  const clusters = [];
+  const thresh = 0.30 * expected;
+  for (let j = 1; j < N - 1; j++) {
+    for (let i = 1; i < N - 1; i++) {
+      const idx = j * N + i;
+      if (band[idx] !== k || label[idx] !== -1 || cov[idx] >= thresh) continue;
+      // BFS
+      const cells = []; const stack = [idx]; label[idx] = clusters.length;
+      let ink = 0;
+      while (stack.length) {
+        const c = stack.pop(); cells.push(c); ink += tone[c];
+        const ci = c % N, cj = (c / N) | 0;
+        const nb = [c - 1, c + 1, c - N, c + N];
+        for (let n = 0; n < 4; n++) {
+          const d = nb[n];
+          const di = d % N, dj = (d / N) | 0;
+          if (di < 1 || dj < 1 || di >= N - 1 || dj >= N - 1) continue;
+          if (band[d] === k && label[d] === -1 && cov[d] < thresh) { label[d] = clusters.length; stack.push(d); }
+        }
+      }
+      if (cells.length >= 10) clusters.push({ id: clusters.length, cells, ink });
+      else { for (const c of cells) label[c] = -2; } // too small to bother
+    }
+  }
+  for (const cl of clusters) {
+    // small missed spots get a lighter touch-up so they stay textured, not blobby
+    const b2 = Math.max(60, (cl.cells.length < 60 ? 0.30 : 0.55) * K * cl.ink);
+    const inside = (i, j) => label[j * N + i] === cl.id;
+    wander(b2, inside, b2 / cl.cells.length, wBase * 0.9);
+  }
+  return clusters.length;
+}
+
+// ---------------------------------------------------------------- paper + plate
+function paper() {
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = '#f3ead6';
+  ctx.fillRect(0, 0, U, U);
+  // grain
+  for (let i = 0; i < 2400; i++) {
+    const x = rand() * U, y = rand() * U;
+    ctx.fillStyle = rand() < 0.72 ? 'rgba(90,70,50,0.028)' : 'rgba(255,252,240,0.05)';
+    ctx.fillRect(x, y, 1.6, 1.6);
+  }
+  // vignette
+  const g = ctx.createRadialGradient(U / 2, U / 2, U * 0.32, U / 2, U / 2, U * 0.74);
+  g.addColorStop(0, 'rgba(120,95,60,0)');
+  g.addColorStop(1, 'rgba(120,95,60,0.10)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, U, U);
+}
+
+function plateRule() {
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.strokeStyle = 'rgba(46,38,30,0.55)';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(34, 34, U - 68, U - 68);
+}
+
+// ---------------------------------------------------------------- render
+function render() {
+  rand = mulberry32(seed); // same seed always draws the same still life, even on resize
+  const mott = makeNoise2(rand);
+  const sc = buildScene(rand);
+  buildTone(sc, mott);
+  analyze();
+
+  const area = new Float64Array(8), ink = new Float64Array(8);
+  for (let idx = 0; idx < N * N; idx++) {
+    const k = band[idx];
+    if (k === 0) continue;
+    area[k]++; ink[k] += tone[idx];
+  }
+  let totalInk = 0;
+  for (let k = 1; k <= 7; k++) totalInk += ink[k];
+  const K = TARGET_PATH / Math.max(1e-6, totalInk);
+
+  paper();
+  ctx.globalCompositeOperation = 'multiply';
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+
+  // light bands first, darkest last; width grows slightly with darkness
+  for (let k = 1; k <= 7; k++) {
+    if (area[k] < 4) continue;
+    const budget = Math.max(40, K * ink[k]);
+    const expected = budget / area[k];
+    const wBase = 0.55 + 0.04 * k;
+    wander(budget, (i, j) => band[j * N + i] === k, expected, wBase);
+    secondPass(k, expected, K, wBase);
+  }
+
+  plateRule();
+  document.getElementById('seedline').textContent = 'seed ' + seed + '.';
+}
+
+cv.addEventListener('click', () => {
+  seed = (Math.random() * 1e9) | 0;
+  try { history.replaceState(null, '', '?seed=' + seed); } catch (e) { /* file:// */ }
+  rand = mulberry32(seed);
+  render();
+});
+
+fit();
+render();
+</script>
+</body>
+</html>
