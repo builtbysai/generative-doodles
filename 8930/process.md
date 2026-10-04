@@ -74,3 +74,27 @@ Family name recorded: "ghost-track beat-detected polar ring".
 - Static checks: no `<audio>`/WebAudio anywhere (the one "audio" hit is a
   code comment), no em dashes, no date strings, no absolute URLs in visible
   copy, viewport meta present.
+
+## Revision 2026-10-04 (Hans: "Improve 8930")
+Visual analysis: the ring was a 1.2px hairline at 42% — nearly invisible on
+phones/daylight; the playhead comet whispered instead of performing; beat
+pulses were hard to see; the center was void; caption crowded the ring.
+Worse, a real bug: `pal.accent` is hex ("#e0a458") but was interpolated into
+`rgba(...)` strings — invalid, so EVERY accent glow (trail, playhead, beads,
+pulses) had been silently rendering nothing since launch. The piece had been
+performing without its lighting.
+Changes:
+- Fixed the hex-in-rgba bug (new `pal.accentRgb` triplet); all accent glows
+  now actually render.
+- Ring: 1.6px at 55% + soft bone glow — present but calm.
+- Playhead: 5.5px dot, stronger glow, halo breath, 2-beat comet trail.
+- Beat pulses: retuned twice — first pass (0.85 alpha) created a permanent
+  second ring (beats every 0.5s at 120bpm outlasted the 0.9s fade); final:
+  0.55s life, 0.5 peak alpha — the ring breathes with the beat.
+- Center record label: ghostly BPM numerals + "BPM · GHOST BASS" in a hairline
+  circle (font scales with R0 for mobile); anchors the void, deepens the
+  vinyl metaphor.
+- Layout: R0 0.375→0.355, ring lifted, caption clears the waveform.
+QA: cdp_exceptions.py exit 0 at 1280x800, 390x844, and ?seed=777 (indigo
+palette). Thumb recaptured from the revised build. Reduced-motion still path
+untouched and intact.
