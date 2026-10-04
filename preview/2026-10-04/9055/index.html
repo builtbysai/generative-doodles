@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>№9055 · Tide Worm</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #04100f; }
+  canvas { display: block; width: 100vw; height: 100vh; touch-action: none; cursor: crosshair; }
+  .cap {
+    position: fixed; left: 18px; bottom: 14px; max-width: 86vw;
+    font: italic 13px Georgia, serif; color: #5e7d78; letter-spacing: .02em;
+    pointer-events: none; user-select: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="cap">№9055 · Tide Worm · drift slowly and it follows · hurry and it hides · click for a new worm</div>
+<script>
+'use strict';
+// Tide Worm: a chain-follow ribbon creature with inverted escalation.
+// Calm pointer -> unfurls into a long glowing ribbon.
+// Agitated pointer -> knots into a tight ember ball and hides.
+// The calm state is only discoverable by being calm.
+
+let seed = 555;
+const qs = new URLSearchParams(location.search);
+if (qs.get('seed') !== null && qs.get('seed') !== '') seed = parseInt(qs.get('seed'), 10) >>> 0;
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// ---------- world: everything seeded lives here ----------
+function buildWorld(s) {
+  const R = mulberry32(s);
+  const w = { seed: s };
+  const FAMS = [{ h: 168, s: 74 }, { h: 266, s: 66 }, { h: 40, s: 82 }];
+  w.fam = FAMS[(R() * 3) | 0];
+  w.N = 24 + ((R() * 17) | 0);
+  w.waveAmp = 9 + R() * 13;
+  w.waveFreq = 0.32 + R() * 0.25;
+  w.waveRate = 1.0 + R() * 0.9;
+  w.bands = 3 + ((R() * 3) | 0);
+  w.bandRate = 1.4 + R() * 1.2;
+  w.glowI = 0.7 + R() * 0.6;
+  w.headR = 8 + R() * 5;
+  w.coilR = 24 + R() * 10;
+  w.coilTurns = 2.6 + R() * 1.6;
+  w.restFrac = R();
+  w.dp = {
+    ax: 0.10 + R() * 0.08, bx: 0.03 + R() * 0.05, fx: 0.10 + R() * 0.08, gx: 0.23 + R() * 0.15,
+    ay: 0.09 + R() * 0.07, by: 0.03 + R() * 0.05, fy: 0.09 + R() * 0.08, gy: 0.21 + R() * 0.14,
+    p1: R() * 6.283, p2: R() * 6.283, p3: R() * 6.283, p4: R() * 6.283
+  };
+  w.snow = [];
+  for (let i = 0; i < 110; i++) {
+    w.snow.push({
+      x: R() * 2000, y: R() * 2000, r: 0.5 + R() * 1.2,
+      a: 0.05 + R() * 0.17, vy: 3 + R() * 7, ph: R() * 6.283,
+      hue: R() < 0.3
+    });
+  }
+  w.washes = [
+    { fx: 0.2 + R() * 0.25, fy: 0.25 + R() * 0.5, rr: 0.42 + R() * 0.12, a: 0.055 + R() * 0.03, ph: R() * 6.283 },
+    { fx: 0.55 + R() * 0.25, fy: 0.2 + R() * 0.55, rr: 0.38 + R() * 0.12, a: 0.045 + R() * 0.03, ph: R() * 6.283 }
+  ];
+  w.pts = [];
+  for (let i = 0; i < w.N; i++) w.pts.push({ x: 0, y: 0 });
+  w.a0 = R() * 6.2832; // initial lay direction
+  return w;
+}
+
+let world = buildWorld(seed);
+
+// ---------- canvas ----------
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+let W = 0, H = 0, spreadRest = 30;
+function resize() {
+  const DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  spreadRest = Math.min(W, H) * (0.55 + world.restFrac * 0.20) / (world.N - 1);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ---------- simulation state ----------
+let simT = 0;
+let k = 0;                        // knot factor 0..1
+let ema = 0;                      // pointer speed EMA, px/s
+let px = 0, py = 0, lastMoveT = -10, hasPointer = false;
+let fadeIn = 0;                   // 1 -> 0 after a rebuild
+const CALM_TH = 55, AGI_TH = 420; // pointer speed thresholds, px/s
+
+function drift(w, t) {
+  const p = w.dp;
+  return {
+    x: W * 0.5 + Math.sin(t * p.fx + p.p1) * W * p.ax + Math.sin(t * p.gx + p.p2) * W * p.bx,
+    y: H * 0.5 + Math.sin(t * p.fy + p.p3) * H * p.ay + Math.sin(t * p.gy + p.p4) * H * p.by
+  };
+}
+
+function chainStep(w, dt, t, knot) {
+  const sinceMove = (performance.now() / 1000) - lastMoveT;
+  let tx, ty;
+  if (hasPointer && sinceMove < 2.5) { tx = px; ty = py; }
+  else {
+    const d = drift(w, t);
+    // soft leash: pull the drift target toward center when it roams far,
+    // so the long trailing body stays composed inside the frame
+    const dx = d.x - W / 2, dy = d.y - H / 2;
+    const dist = Math.hypot(dx, dy), maxR = Math.min(W, H) * 0.24;
+    const pull = Math.max(0, (dist - maxR) / (maxR * 0.9));
+    tx = d.x - dx * Math.min(0.85, pull);
+    ty = d.y - dy * Math.min(0.85, pull);
+  }
+  tx = Math.max(46, Math.min(W - 46, tx));
+  ty = Math.max(60, Math.min(H - 46, ty));
+  const pts = w.pts, N = w.N;
+  const lag = 0.05 - 0.02 * knot;
+  const f = 1 - Math.pow(1 - lag, dt * 60);
+  pts[0].x += (tx - pts[0].x) * f;
+  pts[0].y += (ty - pts[0].y) * f;
+  const spread = spreadRest * (1 - knot) + 6 * knot;
+  for (let i = 1; i < N; i++) {
+    const dx = pts[i].x - pts[i - 1].x, dy = pts[i].y - pts[i - 1].y;
+    const d = Math.hypot(dx, dy) || 0.0001;
+    pts[i].x = pts[i - 1].x + dx / d * spread;
+    pts[i].y = pts[i - 1].y + dy / d * spread;
+  }
+  // knot curl: ease segments onto a tightening spiral around the head
+  if (knot > 0.001) {
+    for (let i = 1; i < N; i++) {
+      const fr = i / (N - 1);
+      const ang = fr * w.coilTurns * 6.2832 + t * 0.55;
+      const rr = w.coilR * (0.22 + 0.78 * fr);
+      const tr = Math.sin(t * 37 + i * 2.3) * 1.6 * knot;
+      const gx = pts[0].x + Math.cos(ang) * rr + tr;
+      const gy = pts[0].y + Math.sin(ang) * rr * 0.9 - tr;
+      pts[i].x += (gx - pts[i].x) * knot * 0.09;
+      pts[i].y += (gy - pts[i].y) * knot * 0.09;
+    }
+  }
+}
+
+// lay the body along a gentle seeded S-curve, then trail the drift path
+// at 1x speed for 4 simulated seconds so the first frame is already alive
+function settle(w) {
+  const d0 = drift(w, 0);
+  for (let i = 0; i < w.N; i++) {
+    const fr = i / (w.N - 1);
+    const bend = Math.sin(fr * 3.1) * spreadRest * 1.4;
+    w.pts[i].x = d0.x - Math.cos(w.a0) * spreadRest * i + Math.sin(w.a0) * bend;
+    w.pts[i].y = d0.y - Math.sin(w.a0) * spreadRest * i - Math.cos(w.a0) * bend;
+  }
+  for (let s = 0; s < 240; s++) chainStep(w, 1 / 60, -4 + (s / 240) * 4, 0);
+}
+settle(world);
+
+function radiusAt(w, i) {
+  const fr = i / (w.N - 1);
+  return w.headR * (1 - 0.85 * Math.pow(fr, 1.35)) + 1.4;
+}
+
+// ---------- input ----------
+window.addEventListener('pointermove', (e) => {
+  const now = performance.now() / 1000;
+  if (hasPointer) {
+    const dt = Math.max(1 / 240, now - lastMoveT);
+    const v = Math.hypot(e.clientX - px, e.clientY - py) / dt;
+    ema += (Math.min(v, 4000) - ema) * 0.15;
+  }
+  px = e.clientX; py = e.clientY; lastMoveT = now; hasPointer = true;
+});
+window.addEventListener('click', () => {
+  seed = (Math.random() * 4294967296) >>> 0;
+  world = buildWorld(seed);
+  resize();
+  settle(world);
+  simT = 0; k = 0; ema = 0; fadeIn = 1;
+  history.replaceState(null, '', location.pathname + '?seed=' + seed);
+});
+
+// ---------- render ----------
+const rp = [];
+for (let i = 0; i < 40; i++) rp.push({ x: 0, y: 0 });
+
+function computeRenderPts(w, t) {
+  const N = w.N;
+  for (let i = 0; i < N; i++) { rp[i].x = w.pts[i].x; rp[i].y = w.pts[i].y; }
+  const amp = w.waveAmp * (1 - k);
+  if (amp > 0.2) {
+    for (let i = 1; i < N - 1; i++) {
+      const fr = i / (N - 1);
+      const dx = rp[i + 1].x - rp[i - 1].x, dy = rp[i + 1].y - rp[i - 1].y;
+      const d = Math.hypot(dx, dy) || 1;
+      const off = Math.sin(t * w.waveRate - fr * w.waveFreq * 6.2832) * amp * Math.pow(fr, 0.8);
+      rp[i].x += -dy / d * off;
+      rp[i].y += dx / d * off;
+    }
+  }
+}
+
+function segColor(w, i, t) {
+  const fr = i / (w.N - 1);
+  const bb = 0.5 + 0.5 * Math.sin(fr * w.bands * 6.2832 - t * w.bandRate);
+  const hue = w.fam.h + (14 - w.fam.h) * k;
+  const sat = w.fam.s + (85 - w.fam.s) * k;
+  const li = (16 + 40 * bb) * (1 - k) + (8 + 18 * bb) * k;
+  return { hue, sat, li };
+}
+
+function drawBackground(w, t) {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#071512');
+  g.addColorStop(0.55, '#04100f');
+  g.addColorStop(1, '#020a09');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  ctx.globalCompositeOperation = 'lighter';
+  const m = Math.min(W, H);
+  for (const wsh of w.washes) {
+    const wx = wsh.fx * W + Math.sin(t * 0.05 + wsh.ph) * 24;
+    const wy = wsh.fy * H + Math.cos(t * 0.04 + wsh.ph) * 20;
+    const rg = ctx.createRadialGradient(wx, wy, 0, wx, wy, wsh.rr * m);
+    rg.addColorStop(0, `hsla(${w.fam.h},60%,30%,${wsh.a})`);
+    rg.addColorStop(1, 'hsla(0,0%,0%,0)');
+    ctx.fillStyle = rg;
+    ctx.fillRect(wx - wsh.rr * m, wy - wsh.rr * m, wsh.rr * m * 2, wsh.rr * m * 2);
+  }
+  ctx.globalCompositeOperation = 'source-over';
+  for (const s of w.snow) {
+    const sx = (((s.x % W) + W) % W) + Math.sin(t * 0.3 + s.ph) * 8;
+    const sy = ((s.y % H) + H) % H;
+    ctx.fillStyle = s.hue
+      ? `hsla(${w.fam.h},55%,62%,${s.a})`
+      : `hsla(170,20%,80%,${s.a * 0.8})`;
+    ctx.beginPath();
+    ctx.arc(sx, sy, s.r, 0, 6.2832);
+    ctx.fill();
+  }
+}
+
+function drawRibbon(w, t) {
+  const N = w.N;
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  const dim = 1 - 0.3 * k;
+  for (let i = 1; i < N; i++) {
+    const c = segColor(w, i, t);
+    const fr = i / (N - 1);
+    // tail dissolve: fade the last stretch of the body into the dark
+    const fade = 1 - 0.75 * Math.max(0, Math.min(1, (fr - 0.86) / 0.14));
+    const rr = radiusAt(w, i);
+    const x0 = rp[i - 1].x, y0 = rp[i - 1].y, x1 = rp[i].x, y1 = rp[i].y;
+    // outer glow
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.strokeStyle = `hsla(${c.hue},${c.sat}%,${Math.min(70, c.li + 20)}%,${0.06 * w.glowI * dim * fade})`;
+    ctx.lineWidth = rr * 3.6;
+    ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+    // body
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.strokeStyle = `hsla(${c.hue},${c.sat}%,${c.li}%,${0.94 * fade})`;
+    ctx.lineWidth = rr * 2;
+    ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+    // bright core
+    ctx.strokeStyle = `hsla(${c.hue},${Math.min(100, c.sat + 12)}%,${Math.min(90, c.li + 40)}%,${0.5 * dim * fade})`;
+    ctx.lineWidth = Math.max(1, rr * 0.55);
+    ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+  }
+}
+
+function drawHead(w, t) {
+  const c = segColor(w, 0, t);
+  const dim = 1 - 0.25 * k;
+  ctx.globalCompositeOperation = 'lighter';
+  const rg = ctx.createRadialGradient(rp[0].x, rp[0].y, 0, rp[0].x, rp[0].y, w.headR * 2.4);
+  rg.addColorStop(0, `hsla(${c.hue},90%,68%,${0.75 * dim})`);
+  rg.addColorStop(0.45, `hsla(${c.hue},80%,45%,${0.28 * dim})`);
+  rg.addColorStop(1, 'hsla(0,0%,0%,0)');
+  ctx.fillStyle = rg;
+  ctx.beginPath();
+  ctx.arc(rp[0].x, rp[0].y, w.headR * 2.4, 0, 6.2832);
+  ctx.fill();
+  ctx.fillStyle = `hsla(${c.hue},95%,88%,${0.85 * dim})`;
+  ctx.beginPath();
+  ctx.arc(rp[0].x, rp[0].y, w.headR * 0.34, 0, 6.2832);
+  ctx.fill();
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+function drawVignette() {
+  const m = Math.min(W, H);
+  const rg = ctx.createRadialGradient(W / 2, H / 2, m * 0.32, W / 2, H / 2, m * 0.78);
+  rg.addColorStop(0, 'rgba(0,0,0,0)');
+  rg.addColorStop(1, 'rgba(0,4,3,0.6)');
+  ctx.fillStyle = rg;
+  ctx.fillRect(0, 0, W, H);
+}
+
+// ---------- main loop ----------
+let last = performance.now();
+function frame(now) {
+  let dt = (now - last) / 1000;
+  last = now;
+  dt = Math.min(dt, 0.05);
+  simT += dt;
+  const t = simT;
+  ema *= Math.pow(0.25, dt);
+  const s = Math.max(0, Math.min(1, (ema - CALM_TH) / (AGI_TH - CALM_TH)));
+  const kT = s * s * (3 - 2 * s);
+  k += Math.max(-dt * 0.45, Math.min(dt * 1.6, kT - k));
+  chainStep(world, dt, t, k);
+  for (const sn of world.snow) sn.y += sn.vy * dt;
+  drawBackground(world, t);
+  computeRenderPts(world, t);
+  drawRibbon(world, t);
+  drawHead(world, t);
+  drawVignette();
+  if (fadeIn > 0) {
+    fadeIn = Math.max(0, fadeIn - dt * 2.5);
+    ctx.fillStyle = `rgba(4,16,15,${fadeIn})`;
+    ctx.fillRect(0, 0, W, H);
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// ---------- debug hooks (invisible) ----------
+window.__worm = {
+  step(n) {
+    for (let i = 0; i < n; i++) { simT += 1 / 60; chainStep(world, 1 / 60, simT, k); }
+    return world.pts.map(p => p.x.toFixed(2) + ',' + p.y.toFixed(2)).join(';');
+  },
+  rebuild(s) {
+    world = buildWorld(s); resize(); settle(world); simT = 0; k = 0;
+    return 'ok';
+  },
+  params() {
+    const w = world;
+    return { seed: w.seed, N: w.N, famH: w.fam.h, famS: w.fam.s, bands: w.bands, waveAmp: +w.waveAmp.toFixed(3), headR: +w.headR.toFixed(3) };
+  },
+  driftAt(t) { const d = drift(world, t); return d.x.toFixed(3) + ',' + d.y.toFixed(3); },
+  knot: () => k,
+  speed: () => ema,
+  seed: () => seed
+};
+</script>
+</body>
+</html>
