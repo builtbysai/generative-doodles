@@ -14,14 +14,72 @@ in the pacing: what darkens, what releases, and where the hinge sits.
 ## Sources
 
 Biography, publication, and scholarship via a delegated research dossier
-(text-only pass; this study's visual inspections are mine). Series facts
-carried from firsthand reads: 80 plates, etched and aquatinted
-1797-1799, announced 6 February 1799 in the Diario de Madrid, 300 copies
-sold at the Calle del Desengano No. 1 perfume shop, withdrawn after
-about two weeks, the copper plates given to the King in 1803 (the
-Calcografia Nacional). The six plates below were visually inspected at
-Met source resolution (2500-2700 px). Tonal stats measured on the plate
-area with a fixed fractional crop, verified by overlay.
+(text-only pass; this study's visual inspections are mine), integrated
+after the first push. Key facts, carried:
+
+- The series was first conceived as "Suenos" (Dreams), after Quevedo's
+  satirical dream-visions; at least 28 preparatory drawings survive, the
+  drawings show moistening for transfer to the copper, and all but three
+  of the dream designs carried over when Goya retitled it Caprichos. The
+  definitive 80-print form was finished by 17 January 1799 (Osuna
+  Archive receipt), announced 6 February 1799 in the Diario de Madrid
+  (320 reales the set, sold at the Calle del Desengano No. 1 perfume
+  shop, the ad's literary polish probably a friend's hand), 300 copies
+  printed, 27 sold, withdrawn after about fourteen days (Goya's own 1803
+  letter says two days, incorrectly), the copper plates and 240 unsold
+  sets given to the King in 1803 for the Royal Chalcography in exchange
+  for a lifetime pension for his son Javier. First-edition ink was
+  slightly reddish or sepia; later Calcografia editions wore the
+  aquatints down. Plate size holds at about 21.5 x 15 cm across the
+  series.
+- Technique: etching plus aquatint used together, which was new. Aquatint
+  for the backgrounds and tonal modeling, highlights lifted with the
+  burnisher scraping back toward white, drypoint and burin touches per
+  plate. Goya drew first on paper, meticulously, then simplified and
+  lightened in transfer (Lemoisne's Rembrandt comparison: the etchings
+  read brighter than the drawings). The light is deliberately
+  artificial: deep aquatint blacks that make the lit passages flare, the
+  gray tones graded figure by figure for different emotional
+  temperatures inside one plate.
+- The scholarship's working division: plates 1 to 3 as prologue (the
+  programmatic self-portrait, the marriage satire's opening, the
+  bogeyman announcing the register of fear); the first-half satires
+  (marriage, education, the Inquisition plates 23-26, the tight asses
+  run 37-42); plate 43 as the axis, originally designed as the
+  frontispiece ("Suenos, the first universal language," the Author
+  Dreaming), moved to the midpoint instead: the first half satirizes
+  from reason's point of view, the second half follows dream logic;
+  then the witchcraft sequence (44, 45, 59, 61, 62, 64-69, 71) and the
+  duendes group in parallel (46, 49, 52, 70, 74, 79, 80), where "duende"
+  was slang for friar, which is why the goblins wear habits. The finale
+  is plates 79-80: the Met reads "Ya es hora" two ways, it is time for
+  the night creatures to wake, or it is time for their actions to be
+  exposed.
+- Plate-to-plate mechanics, documented: the 19-20-21 chain on
+  prostitution (19 sets the lure, 20 shows the plucked, 21 reverses it
+  and the prostitute is plucked by law, Hughes's reading); the 64/65
+  flight pair (the night flight, then the mother flying off to join
+  it); the 42/63 long echo (42: peasants carrying the idle as donkeys,
+  the world upside down but reformable; 63: the peasants themselves
+  donkey-like, the riders monsters, no hope left). Whether the looser
+  overall ordering is real or protective camouflage against the censor
+  is widely repeated but thinly sourced; it sits uneasily beside these
+  deliberate local pairings.
+- The captions: Goya's own engraved titles under each plate, brief and
+  aphoristic, doing half the satirical work. Around publication,
+  handwritten commentaries circulated: the Prado manuscript (cautious,
+  defusing, possibly a smokescreen), the Ayala manuscript (naming names,
+  anticlerical), the Biblioteca Nacional manuscript (published by
+  Helman, 1951). The three agree and diverge plate by plate; on 55 the
+  Prado is flat while Ayala names the Duchess of Osuna and others see
+  the queen.
+- Conflicts carried: 1803 vs 1807 for the plate gift (1803 per the body
+  sources and the Calcografia shop, working date); fourteen days vs two
+  days on sale; thirteen official editions vs twenty evidenced; the
+  protective-disorder theory thinly sourced; Helman's Moratin witchcraft
+  source doubted on chronology though the visual coincidences stand;
+  "sueno" meaning both sleep and dream, so the monsters are either what
+  happens when reason sleeps or what reason itself dreams.
 
 ## The six plates
 
@@ -153,9 +211,14 @@ no book.
 No original handled. Six of eighty plates inspected; the series arc
 strip interpolates between six measured anchors and is schematic, not a
 measurement of all eighty. Plate 43 referenced from the 2026-10-04 etcher
-study's inspection, not re-inspected here. Captions read from the prints
-only; the three manuscript commentaries (Prado, Ayala, Biblioteca
-Nacional) not compared plate by plate. The delegated research dossier's
-scholarship on the series groupings (Helman, Tomlinson, Sayre, Prado)
-was still being written at push time; this note carries my firsthand
-findings and will be re-pushed with the dossier integrated.
+study's inspection, not re-inspected here. No Prado catalogue pages for
+the six plates were reachable; the Ayala and Biblioteca Nacional texts
+for the six plates were not individually located. No verified Sayre or
+Tomlinson statement on plate order was found in accessible sources. The
+Diario de Madrid announcement was not checked against a newspaper scan.
+The 1797 Suenos subscription advertisement, the 1803 donation document,
+and the plate-43 frontispiece inscription are reported secondhand. The
+dossier's own flagged items (Hughes via the JSTOR blog, the Goldmark
+plate-80 commentary, the Hansons plate-20 Goya quote, the Canizares
+source for plate 50) are carried as unverified, not quoted. Schematics
+single-pass.
