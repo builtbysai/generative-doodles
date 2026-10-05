@@ -12,15 +12,14 @@ revised the GROUND: each series rethinks what the dark is for.
 
 Biography, technique, and criticism via a delegated research dossier
 (text-only pass, no artwork inspected by the dossier author; this
-study's visual inspections are mine). The dossier's full text did not
-reach this session's context, so the factual base below is from this
-session's own firsthand reads: Wikipedia's Los Caprichos, Los
-Disparates, and Los Desastres de la Guerra articles (the technique
-passages and series histories), the Prado's Cruel Folly page, and the
-museum catalogue data on the inspected impressions (MET DP series,
-NGA, RISD, AGO). Anything beyond that is flagged.
+study's visual inspections are mine). The dossier arrived after the
+visual pass and first push; its key facts are integrated below, with
+this session's own firsthand reads (Wikipedia's Los Caprichos, Los
+Disparates, and Los Desastres articles, the Prado's Cruel Folly page,
+museum catalogue data on the inspected impressions) where noted. The
+dossier's own honest gaps are listed at the end.
 
-Key facts, carried from the reads:
+Key facts, carried:
 
 - Francisco de Goya y Lucientes, 1746-1828. The print career starts when
   he is already an established painter; he learned etching (a
@@ -30,34 +29,59 @@ Key facts, carried from the reads:
   and aquatint together was new, and the results were "very like
   paintings" (Wikipedia, Los Caprichos). Burnishing the aquatint let
   him pull light back out of the dark: the scratch is the highlight.
+  Who taught him aquatint is undocumented; the sources treat him as
+  essentially self-taught as a printmaker (dossier).
+- The Rembrandt comparison, via Lemoisne in the dossier: Rembrandt
+  builds tone through accumulated fine curving lines; Goya gets his
+  darks as broad fields of tone and carves light back out of them.
+  Goya drew meticulously on paper first, then simplified and lightened
+  the drawing when transferring it to copper. He did not cross-hatch
+  the way Rembrandt did, and used a single type of aquatint to fill
+  whole backgrounds uniformly. His darkness is a field, not a weave.
 - Los Caprichos: 80 plates, finished January 17, 1799 (the Osuna
-  Archive receipt for four sets bought by the Duchess of Osuna), sale
-  announced in the Diario de Madrid on February 6, 1799, 300 copies,
-  sold at the perfumery on Calle del Desengano No. 1, the building
-  where he lived. Grew out of the "Dreams" drawings; the title follows
-  Callot's and Tiepolo's Capricci, "imaginations of reality."
-- Los Desastres de la Guerra: 80 plates, 1810-1820, the Peninsular War
-  years. Never published in his lifetime; the first edition came in
-  1863 from the Real Academia de Bellas Artes de San Fernando, which
-  "corrected" the titles of plates 9, 32-36, 39, and 47: the famous
-  captions are partly the Academy's, not all Goya's own.
-- La Tauromaquia: 33 plates, c.1815-1816 (plate count from the museum
-  catalogue data; not independently verified this session).
+  Archive receipt), sale announced in the Diario de Madrid on
+  February 6, 1799, 300 copies at the perfumery on Calle del Desengano
+  No. 1. Only 27 sold before he withdrew the album, apparently fearing
+  the Inquisition; in 1807 he gave the plates and the 240 unsold sets
+  to Charles IV in exchange for a lifetime pension for his son Javier
+  (dossier; one source says 1803, flagged). Grew out of the "Dreams"
+  drawings after Quevedo; the title follows Callot's and Tiepolo's
+  Capricci. The personal-revenge reading (the Duchess of Alba) is real
+  but partial: he denied any plate depicted a specific person.
+- Los Desastres de la Guerra: 80 plates (82 in the Bermudez proof
+  album, plus three small "Prisioneros"), 1810-1820, the Peninsular
+  War years. Goya's own title: "Fatal consequences of Spain's bloody
+  war with Bonaparte, and other emphatic caprices"; "The Disasters of
+  War" is the Academy's 1863 invention. The individual captions ARE
+  his, etched on the plates with his spelling mistakes; the Academy
+  changed only one title and retouched one plate (dossier correction
+  to this session's earlier read). The series breaks into three
+  movements: 47 plates of atrocities, 16 of the 1811-12 famine, and
+  the final "emphatic caprices" on the postwar repression.
+- La Tauromaquia: 33 plates published October 1816 plus 7 unissued,
+  c.1815-1816, the only series after the Caprichos he published
+  himself. The most conventional and commercially minded of the four.
 - Los Disparates: etching and aquatint with drypoint and engraving
   retouching, 1815-1823, made at the Quinta del Sordo alongside the
-  Black Paintings, never published in his lifetime for the same
-  political reasons. First published 1864 by the Academy as
-  "Proverbios": the proverb titles are the publishers', from Goya's
-  proofs the series is the Disparates. 22 prints survive (18 plus 4
-  added later); the highest proof number is 25. The 1864 ordering was
-  random. The preparatory drawing for Cruel Folly shows how far he
-  reworked: a soldier expelling people with a rifle at a sentry box
-  became a civilian with a pike and no sentry box at all.
-- Critical through-lines from the reads: the Disparates as the
-  continuation of the Caprichos and the late "emphatic caprices" of
-  the Desastres; the nightmare and grotesque quality; Glendinning's
-  Carnaval reading (the subversion of authority: soldiers, marriage,
-  clergy); the 20th-century avant-garde's claim on the series' modernity.
+  Black Paintings (the estate was named for a prior owner's deafness,
+  not his). Never published in his lifetime. First published 1864 by
+  the Academy as "Proverbios": the proverb titles are the publishers',
+  from Goya's proofs the series is the Disparates. 22 prints survive
+  (18 plus 4 added later, published 1877 in L'Art); the highest proof
+  number is 25. The 1864 ordering was random. The preparatory drawing
+  for Cruel Folly shows how far he reworked: a soldier expelling
+  people with a rifle at a sentry box became a civilian with a pike
+  and no sentry box at all.
+- Robert Hughes's formulation, carried from the dossier: in the late
+  work, darkness is not absence but a positive presence, "pervasive,
+  as demons were to the medieval mind"; the late career is "cumulative
+  despair," with plate 15's "y no hai remedio" (and there is no remedy)
+  as its motto.
+- Critical through-lines: the Disparates as the continuation of the
+  Caprichos and the late "emphatic caprices" of the Desastres; the
+  nightmare and grotesque quality; Glendinning's Carnaval reading
+  (the subversion of authority: soldiers, marriage, clergy); the
+  20th-century avant-garde's claim on the series' modernity.
 
 ## The four series as compositional species
 
@@ -199,7 +223,33 @@ What makes the work good, as decisions:
   The ratio is the rhetoric.
 - The caption is inside the work. Sleep of Reason writes its title on
   the desk; the Desastres titles bite because the image withholds what
-  the caption says.
+  the caption says. And his own caption for Capricho 43 complicates
+  the easy Enlightenment reading: "Fantasy abandoned by reason
+  produces impossible monsters; united with her, she is the mother of
+  the arts and the origin of their marvels." The print stages both the
+  fear of unreason and the defense of imagination in one frame
+  (dossier, via Hughes).
+- The plate is a two-layer system (dossier): a sparse gestural line
+  drawing carries the figures, and a separate tonal layer carries the
+  background mass. Light is not built up; it is recovered from
+  darkness by burnishing. That inversion of the usual drawing process,
+  dark out of light, is one of his most usable devices.
+- Grande hazana delivers horror through classical composition, not
+  mess (dossier, via the MAPFRE catalog): the bodies are distributed
+  around the tree "with an almost aesthetic criterion," the inverted
+  torso recalling the Torso Belvedere, the victims calm-faced and
+  beautiful. He does not try to horrify; he forces reflection, and
+  the bitter caption does the accusing.
+- Lo mismo works by pairing (dossier): plate 2 asks "With or without
+  reason," plate 3 answers "The same." The composition repeats the
+  firing-squad geometry, so the doubling does the philosophy in two
+  words.
+- The refusal of heroics is formal, not just moral (dossier): no
+  battles, no generals, no establishing shot, no anecdotal
+  background. Both sides commit atrocities; the captions offer no
+  consolation. The images behave like photojournalism before
+  photography: immediacy plus the refusal to compose the event into a
+  story.
 
 What would make a derivative fail:
 
@@ -224,11 +274,15 @@ What would make a derivative fail:
 
 - No original handled; all six plates via museum reproductions.
 - Tonal stats are relative (mount pollution, web JPEGs).
-- The delegated research dossier's full text did not reach this
-  session; the factual base is this session's own firsthand reads
-  (listed under Sources), narrower than a full dossier. The
-  Tauromaquia plate count and dating are from catalogue data, not
-  independently verified here.
+- The delegated research dossier arrived after the visual pass and the
+  first push; its facts are integrated above but were not re-verified
+  source by source. Its own gaps: T.J. Clark's Goya chapter not read,
+  no dedicated MET Heilbrunn or British Museum essay located, Juliet
+  Wilson-Bareau not read standalone, Goya's aquatint teacher
+  undocumented, and small facts (the 14-day Caprichos withdrawal, 27
+  copies sold, 240 unsold, the 1807 vs 1803 plate transfer, the
+  Academy's one changed title and one retouched plate) from snippets,
+  not full reads.
 - The Tauromaquia series represented by one plate only; the Caprichos
   by one; the Disparates' full 22-print run not surveyed.
 - Re-renders are schematic species/control demonstrations, single pass.
