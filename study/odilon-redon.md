@@ -19,11 +19,12 @@ naming and the Bresdin/Fantin-Latour/print-series facts
 (snippet-sourced, flagged). A delegated research dossier on criticism
 and high-res sources was commissioned this session and completed; its
 full text had not reached this session's context by push time, so only
-its reported source list is carried here: Wikipedia end to end, the
-Getty's "Black is the most essential color" article, the Studio
-International review of MoMA's 2005 "Beyond the Visible" exhibition,
-and MoMA's Eye-Balloon page. Re-run the dossier read in a future
-session to fold its critical readings into this note.
+its reported source list is carried here, now fully integrated:
+Wikipedia, the Getty's "Black is the most essential color" article,
+the Studio International review of MoMA's 2005 "Beyond the Visible"
+exhibition, MoMA's Eye-Balloon object page, and the Art Institute of
+Chicago's public API records (the dossier's snippet-only items are
+flagged where they appear).
 
 Key facts, carried:
 
@@ -37,8 +38,11 @@ Key facts, carried:
   1864 and found academic neoclassicism alien; took up sculpture back
   in Bordeaux; Rodolphe Bresdin instructed him in etching and
   lithography (Wikipedia). Discovered Corot, Courbet, Manet, Pissarro
-  at the 1868 Salon; lithography learned in 1878 from Henri
-  Fantin-Latour (Lempertz, snippet-sourced).
+  at the 1868 Salon (Lempertz, snippet-sourced). One snippet-sourced
+  article claims he learned lithography from Henri Fantin-Latour in
+  1878; the dossier flags this as conflicting with Wikipedia's
+  Bresdin account and treats it as dubious; this study carries the
+  Bresdin apprenticeship as the reliable account.
 - Franco-Prussian War 1870-71 interrupted the career; after the war he
   moved to Paris and worked almost exclusively in charcoal and
   lithography. He called his visionary works, conceived in shades of
@@ -78,6 +82,122 @@ Key facts, carried:
   Dadaism). Per Lempertz he conceived part of the lithographs as
   illustrations for writers he revered: Poe, Baudelaire, Flaubert
   (A Edgar Poe 1882, La Tentation de saint Antoine 1888-1896).
+  Discrepancies carried from the dossier: (a) noirs end date,
+  Wikipedia says none after 1900, the Getty says 1870 to 1890;
+  consensus is a transition through the 1890s, finished by about
+  1900. (b) The Eye-Balloon exists twice: MoMA holds a CHARCOAL
+  Eye-Balloon (Oeil-ballon) dated 1878 (object 4.1964, gift of
+  Larry Aldrich), the famous LITHOGRAPH "The Eye, Like a Strange
+  Balloon, Moves Towards Infinity" is plate 1 of the A Edgar Poe
+  portfolio, 1882 (AIC, LACMA). The Commons file inspected in this
+  study is the 1878 charcoal; the two must not be conflated.
+  (c) Birth date: Wikipedia 20 April 1840; one snippet-sourced
+  article says 22 April. (d) One textbook chapter
+  (snippet-sourced) wrongly claims he joined the army in 1878 for
+  the Franco-Prussian War; Wikipedia's 1870-1871 service is the
+  reliable account. (e) Caliban and the Masque of the Red Death
+  series appear in secondary sources but were snippet-flagged by
+  the dossier, not verified in museum copy it read.
+
+## Critical readings (from the dossier)
+
+MoMA's 2019 Highlights text on the Eye-Balloon page gives the key
+line about the name: "Redon called his charcoal drawings noirs
+(blacks), linking the medium to its color and making the drawings'
+materiality central to their mystery." That is the quality
+doctrine's core lesson in museum language: the medium IS the
+compositional idea.
+
+The famous black quote, verified wording from MoMA's 2005 Beyond
+the Visible catalogue via Studio International: "Black is the most
+essential colour ... [it] should be respected. Nothing prostitutes
+it. It does not please the eye and does not awaken sensuality. It
+is the agent of the spirit much more than the splendid colour of
+the palette or of the prism." A second published translation
+reads: "Black is the most essential of all colors. Above all, if I
+may say so, it draws its excitement and vitality from deep and
+secret sources of health.... One must admire black. Nothing can
+debauch it." Related: "My drawings inspire, and are not to be
+defined. They place us, as does music, in the ambiguous realm of
+the undetermined"; and his method, "putting, as far as possible,
+the logic of the visible at the service of the invisible."
+
+Black as atmosphere, not background. MoMA on the Eye-Balloon:
+"At once descriptive and evanescent, the diffuse pigment creates
+an atmosphere beyond what is merely represented, for instance, in
+the way the blurred and erased charcoal around the eye-balloon
+charges the sky with a foreboding nebulousness." The black ground
+is the subject's weather.
+
+Erasure as drawing. The Getty on Apparition (ca. 1880-90): "the
+floating black charcoal is an essential part of the oneiric
+subject; it rains down in heavy deposits in front of a mysterious
+bearded man," adding that his choice of tools was "sometimes even
+more important than the subject itself." AIC medium lines confirm
+the method: "stumping, erasing, incising, and subtractive sponge
+work, heightened with traces of white chalk." The MET's Pegasus
+and Bellerophon (ca. 1888, Robert Lehman Collection) is
+catalogued as "highlighting by erasure." Lights are pulled out of
+dark, not laid on top of it. This independently confirms Study B's
+finding.
+
+A full vocabulary of black. Jodi Hauptman's catalogue research
+(via Studio International): Redon worked oiled charcoal against
+newly manufactured charcoals in varied hardnesses, bore down with
+the stick's point or turned it on its side, wiped powder with hand
+or rag, ponded crystals with a stump, outlined in black chalk, and
+intensified velvety passages in black pastel. "Redon could not
+bear a blank piece of paper. He had to apply line and mass to it."
+A derivative that uses one flat digital black has already failed
+at the material level.
+
+Rendered-plausible impossibility. His own program: "bringing to
+life, in a human way, improbable beings and making them live
+according to the laws of probability." The eye has a real iris
+and lashes; the spider has jointed, credible legs; the cactus-man
+stands with botanical weight. The fantastic is drawn as if
+observed, which is why scale dissonance (monumental head,
+miniature boat in Guardian Spirit of the Waters) reads as sublime
+rather than silly.
+
+Titles that refuse to define. The Getty quotes him: a title "is
+not justified unless it is vague, indeterminate, and aspiring,
+even confusedly equivocal," and "Redon's artworks do not lend
+themselves to singular interpretations." The title is a
+compositional device that protects the ambiguity; naming the
+meaning would collapse the piece.
+
+Exemplary noirs named by critics (dossier): Guardian Spirit of
+the Waters 1878, Melancholy 1876, Cauldron of the Sorceress 1879,
+the A Edgar Poe plates 1882 (The Eye, plate 1; A Mask Sounds the
+Funeral Knell, plate 3), Les Origines 1883 (The Misshapen Polyp,
+plate 3; There Was Perhaps a First Vision Attempted in the
+Flower, plate 2), The Sphinx 1883, Pegasus and Bellerophon ca.
+1888, the Temptation of Saint Anthony first series 1888
+(Everywhere eyeballs are aflame, plate 9), Des Esseintes,
+frontispiece for A rebours 1888, Apparition ca. 1880-90,
+Germination ca. 1890-96, Head within an Aureole ca. 1894-95.
+Some 170 lithographs and 30 etchings, mostly 1878-1900, across
+the portfolios Dans le Reve, A Edgar Poe, Les Origines, Hommage
+a Goya, the two Temptations of Saint Anthony, and the Apocalypse
+of Saint John.
+
+What is overdone vs the actual craft. Overdone: the "precursor
+to Surrealism" label as craft analysis (it is reception history,
+not a compositional idea), dream-symbol decoding, and the
+lonely-childhood-as-explanation biography. The actual craft per
+the critics: tonal material handling (Hauptman), the lithographic
+portfolio as a deliberate transmission system for charcoal
+effects, and Marina van Zuylen's reading of the monsters as
+occupying the space "between the rational and the irrational," a
+way of seeing, not a code to crack.
+
+What would make a derivative fail (dossier, carried): illustrating
+the dream literally (over-rendered horror monsters); one flat
+black instead of varied atmosphere; too many elements; hard
+outlines everywhere instead of stumped, wiped, erased edges; a
+title that explains the image; chasing the surrealist label
+instead of the tonal craft.
 
 ## The artworks (all visually inspected at source resolution)
 
@@ -224,15 +344,26 @@ product.
 - Vignette or crushed-black filters as his darkness.
 - Narrative settings: floors, horizons, props.
 - Two or more competing figures; detail spread evenly.
+- One flat digital black instead of a varied atmosphere (the
+  Hauptman lesson: his black is a whole vocabulary of charcoals,
+  stumps, rags, and erasers, not a fill value).
+- Over-rendered literal horror monsters; hard outlines everywhere
+  instead of stumped, wiped, erased edges.
+- A title that explains the image; titles must protect the
+  ambiguity.
 
 ## Honest gaps
 
-No original handled. The delegated research dossier completed but its
-full text had not reached this session by push time; only its reported
-source list is carried above (Wikipedia, the Getty "Black is the most
-essential color" article, the Studio International "Beyond the
-Visible" review, MoMA's Eye-Balloon page); its critical readings are
-not integrated and should be folded in on a revisit.
+No original handled. The delegated research dossier's full text
+arrived after the first push and its critical readings are now
+integrated; its own flagged gaps are carried here: the MET
+collection API returned an error for its query (no MET image URLs),
+Wikimedia Commons denied API access from its environment, and the
+Caliban and Masque of the Red Death series are snippet-flagged,
+not verified in museum copy. The "Black is the most essential
+colour" quotation is the MoMA 2005 Beyond the Visible catalogue
+wording via Studio International; a second published translation
+is given alongside it.
 Mediums and dates follow the museum file data (Commons/NGA/BM/
 Cleveland/MoMA-via-Google-Art-Project); no catalogue raisonne
 consulted. The Eye-Balloon file is dated 1878 on Commons while the
@@ -254,7 +385,14 @@ decorative work were not inspected.
   from the Goya study, the darkest field in painting.
 - The etching revival (Whistler, Haden, Meryon): still open.
 - The symbolist print network: Bresdin to Redon to the Nabis
-  (Redon showed with Les XX and the Nabis circle).
+  (Redon showed with Les XX and the Nabis circle). The dossier's
+  doorways: Bresdin himself, the back-link (his teacher; study
+  what Redon subtracted from Bresdin's obsessive density);
+  James Ensor (Les XX Brussels, his 1887 Temptation of Saint
+  Anthony answers Redon's directly); the Nabis as printmakers
+  (Bonnard, Vuillard, Denis, Serusier); the Surrealists as a
+  caution (Breton collected Redon, but their dream-decoding
+  reading is the overdone one, the real debt is compositional).
 - The Getty "Otherworldly Visions" catalogue when it is available.
 
 Evidence: goals/generative-doodles-site/hidden_files/study-2026-10-04-redon/
