@@ -349,9 +349,12 @@ VIII and X, the cycle would be one long shout.
   1890 etching after it; the symbolist mood-landscape vs Klinger's
   serial print grammar. The unverified "Böcklin gave him subjects"
   claim is worth one careful check.
-- Alfred Kubin: the 1984 Galerie St. Etienne exhibition already hangs
+- Alfred Kubin: the Galerie St. Etienne exhibition already hangs
   the three names together (Klinger, Kollwitz, Kubin). Kubin's dream
   drawings are the Klinger lineage carried into the twentieth century.
+  (Date correction from the 2026-10-06 Kubin dossier: the show was
+  1990, not 1984. "Max Klinger, Käthe Kollwitz, Alfred Kubin: A Study
+  in Influences," March 27 - June 2, 1990.)
 - The Villa Romana founders' circle: the 1905-06 recipients (Beckmann,
   Kollwitz, Dora Hitz, Hermann Schlittgen, Ulrich Hübner, Georg Kolbe,
   Richard Pietzsch, Kurt Tuch, Max Kurzweil) and how the prize network
