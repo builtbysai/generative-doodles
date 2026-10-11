@@ -1,0 +1,564 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>№9063 · Oxbow</title>
+<style>
+html,body { margin:0; padding:0; height:100%; overflow:hidden; background:#141210; }
+#stage { position:fixed; inset:0; display:block; }
+.hint { position:fixed; left:0; right:0; bottom:max(12px, env(safe-area-inset-bottom)); text-align:center; color:rgba(232,226,210,0.38); font:12px/1.4 -apple-system,"Segoe UI",system-ui,sans-serif; letter-spacing:0.14em; pointer-events:none; user-select:none; text-shadow:0 1px 8px rgba(0,0,0,0.7); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div class="hint">click for another river</div>
+<script>
+'use strict';
+/*
+№9063 · Oxbow
+
+A fluvial geomorphology study, not a flow field. One main meander grows
+across the square from west to east. Its heading is driven by seeded
+meander waves plus bend episodes: sustained signed turns that tighten
+with the reach's age, closing into S-curves and hairpins until the necks
+pinch through, leaving oxbow lake scar arcs behind. Tributaries rise in
+free ground, meander as they home in, and join the main stem at acute
+confluence angles, never crossing existing water. A younger avulsion
+channel splits off late, drawn in ochre, the single accent color.
+
+Rendering: active channels are drawn as paired bank lines with the water
+left as negative space between them. Abandoned bends are thin fading
+crescents with a faint halo, clearly separated from live water. An
+occupancy grid enforces the no crossing rule: a channel stops before it
+can touch another. Deep slate ground, bone ink, one ochre accent.
+*/
+function mulberry32(a){return function(){a|=0;a=(a+0x6D2B79F5)|0;let t=Math.imul(a^(a>>>15),1|a);t=(t+Math.imul(t^(t>>>7),61|t))^t;return((t^(t>>>14))>>>0)/4294967296}}
+
+const qs = new URLSearchParams(location.search);
+let seed = parseInt(qs.get('seed') || '9063', 10) || 9063;
+
+const canvas = document.getElementById('stage');
+const ctx = canvas.getContext('2d');
+let W=0, H=0, S=0, OX=0, OY=0, DPR=1;
+
+const GROUND = '#232a30';
+const MARG = 0.07;
+
+let rng = mulberry32(seed);
+function rr(a,b){ return a + (b-a)*rng(); }
+function ri(a,b){ return Math.floor(rr(a, b+1)); }
+function wrapAngle(a){ while(a>Math.PI)a-=2*Math.PI; while(a<-Math.PI)a+=2*Math.PI; return a; }
+function clampM(v){ return Math.max(MARG+0.01, Math.min(1-MARG-0.01, v)); }
+
+/* seeded 1D value noise on a lattice, for organic irregularity */
+function vnoise(lattice, x){
+  const n=lattice.length;
+  let xi=Math.floor(x); const t=x-xi;
+  xi=((xi%n)+n)%n;
+  const a=lattice[xi], b=lattice[(xi+1)%n];
+  const u=t*t*(3-2*t);
+  return a+(b-a)*u;
+}
+function noiseLattice(m){ const l=[]; for(let i=0;i<m;i++) l.push(rng()); return l; }
+
+/* ---------- occupancy grid: the no crossing rule ----------
+   Cells store the id of the channel that claimed them. A channel ignores
+   its own id when probing, so only OTHER water blocks it. */
+const GN = 150;
+let occ = new Uint16Array(GN*GN);
+function occClear(){ occ.fill(0); }
+function cellIdx(ix,iy){ return iy*GN+ix; }
+function stamp(x,y,r,id,force){
+  const c0x=Math.max(0,Math.floor((x-r)*GN)), c1x=Math.min(GN-1,Math.ceil((x+r)*GN));
+  const c0y=Math.max(0,Math.floor((y-r)*GN)), c1y=Math.min(GN-1,Math.ceil((y+r)*GN));
+  for(let iy=c0y;iy<=c1y;iy++)for(let ix=c0x;ix<=c1x;ix++){
+    const dx=(ix+0.5)/GN-x, dy=(iy+0.5)/GN-y;
+    if(dx*dx+dy*dy<=r*r){
+      const ci=cellIdx(ix,iy);
+      // first claim wins: a channel can never pave over another channel's
+      // bed to sneak across it. Scar sealing passes force=true.
+      if(force||occ[ci]===0||occ[ci]===id) occ[ci]=id;
+    }
+  }
+}
+function blockedWhy(x,y,r,myId){
+  if(x<MARG||x>1-MARG||y<MARG||y>1-MARG) return 'margin';
+  const c0x=Math.max(0,Math.floor((x-r)*GN)), c1x=Math.min(GN-1,Math.ceil((x+r)*GN));
+  const c0y=Math.max(0,Math.floor((y-r)*GN)), c1y=Math.min(GN-1,Math.ceil((y+r)*GN));
+  for(let iy=c0y;iy<=c1y;iy++)for(let ix=c0x;ix<=c1x;ix++){
+    const v=occ[cellIdx(ix,iy)];
+    if(v!==0 && v!==myId) return 'occ';
+  }
+  return null;
+}
+
+/* ---------- meander growth: bend episodes tighten with age ----------
+   Heading = base + bend episodes + meander waves + noise. Bend episodes
+   are sustained signed turns (up to ~380 degrees) with smooth ramps, so a
+   committed bend closes into a hairpin and the neck pinches off. Episode
+   turns alternate sign so the river keeps trending across the page. */
+function growChannel(o){
+  // o: {id,x,y,theta,maxSteps,ds,w0,wVar,cutoffs,maxCutoffs,grace,belt,drift,stopX,stampBed}
+  const pts=[{x:o.x,y:o.y}], wds=[o.w0];
+  const scars=[];
+  let x=o.x, y=o.y;
+  const ds=o.ds, myId=o.id, grace=o.grace||0;
+  const maxCutoffs=o.maxCutoffs||5;
+  // bend episodes: sustained signed turns that close into hairpins.
+  // Turns mostly alternate sign so the river trends across the page
+  // instead of wandering it solid. Episodes are rebuilt after every
+  // cutoff so the new reach heads for fresh ground, not back over
+  // the scar it just abandoned.
+  const epScale=o.epScale||1;
+  function makeEpisodes(fromS, firstCap){
+    const eps=[]; let es2=fromS, acc2=0, fe=true;
+    while(es2<o.maxSteps-120){
+      const dur=ri(130,230);
+      let turnMag=rr(2.6,5.6)*epScale;
+      if(fe) turnMag=Math.min(turnMag,firstCap);
+      fe=false;
+      let sgn=rng()<0.5?-1:1;
+      if(rng()<0.85) sgn=acc2>=0?-1:1;
+      const turn=turnMag*sgn;
+      eps.push({s0:es2, s1:Math.min(es2+dur,o.maxSteps-1), turn});
+      acc2+=turn;
+      es2+=dur+ri(90,200);
+    }
+    return eps;
+  }
+  let episodes=makeEpisodes(ri(140,220), 3.4);
+  function bendOffset(s){
+    let off=0;
+    for(const e of episodes){
+      if(s<=e.s0) continue;
+      if(s>=e.s1){ off+=e.turn; continue; }
+      const u=(s-e.s0)/(e.s1-e.s0);
+      off+=e.turn*(u*u*(3-2*u));
+    }
+    return off;
+  }
+  // meander waves: S-curves between the hairpins
+  const w1=2*Math.PI/rr(0.35,0.55), p1=rr(0,6.283);
+  const w2=2*Math.PI/rr(0.14,0.22), p2=rr(0,6.283);
+  const a1=rr(0.5,0.8), a2=rr(0.2,0.35);
+  const noiseAmp=rr(0.25,0.45), noiseF=1/rr(0.10,0.18);
+  const nz=noiseLattice(64);
+  let base=o.theta;
+  let dist=0, w=o.w0, cutoffCount=0, lastCut=-999, marginTurns=0;
+  let easeRemain=0, easeFrom=0; // softens the heading change after a cutoff
+  let prevTheta=base; // turn-rate limiter state
+  const phase=rr(0,6.283), beltPhase=rr(0,6.283);
+  for(let s=0;s<o.maxSteps;s++){
+    const t=s/o.maxSteps;                       // age of this reach
+    const k1=a1*(0.65+1.0*t), k2=a2*(0.65+1.0*t);
+    const m1=k1*Math.sin(dist*w1+p1), m2=k2*Math.sin(dist*w2+p2);
+    const nzc=noiseAmp*(vnoise(nz,dist*noiseF)-0.5)*2;
+    let theta=base+bendOffset(s)+m1+m2+nzc;
+    if(o.belt){                                  // follow the wandering belt
+      const beltY=0.5+0.17*Math.sin(x*4.5+beltPhase);
+      const want=Math.atan2(beltY-y, 0.06);
+      const dev=Math.min(1,Math.abs(y-beltY)/0.28);
+      const pull=0.03+0.14*Math.max(0,dev-0.5)/0.5;
+      theta+=wrapAngle(want-theta)*pull;
+    }else if(o.drift!==undefined){
+      theta+=wrapAngle(o.drift-theta)*0.006;      // faint downstream pull
+    }
+    // soft margins: lean back toward open water before the edge, so the
+    // channel turns in a clean arc instead of scribbling along the rim
+    const edge=0.045;
+    const prox=Math.max((MARG+edge)-x, x-(1-MARG-edge),
+                        (MARG+edge)-y, y-(1-MARG-edge), 0);
+    if(prox>0){
+      const wantC=Math.atan2(0.5-y,0.5-x);
+      theta+=wrapAngle(wantC-theta)*Math.min(0.5,(prox/edge)*0.4);
+    }
+    if(easeRemain>0){ theta+=easeFrom*(easeRemain/14); easeRemain--; }
+    // turn-rate limit: no sharp kinks. Rivers bend, they do not fold.
+    // 0.05 rad/step at ds=1/450 keeps min radius ~0.045; hairpin episodes
+    // (avg ~0.011-0.043 rad/step) pass through unclipped.
+    theta=prevTheta+Math.max(-0.05,Math.min(0.05,wrapAngle(theta-prevTheta)));
+    prevTheta=theta;
+    let nx=x+Math.cos(theta)*ds, ny=y+Math.sin(theta)*ds;
+    const r=w*0.5+0.004;
+    let bw=s>=grace?blockedWhy(nx,ny,r,myId):null;
+    if(bw==='margin' && marginTurns<60){
+      // turn back toward open water instead of dying at the edge
+      theta+=wrapAngle(Math.atan2(0.5-y,0.5-x)-theta)*0.6;
+      marginTurns++;
+      nx=x+Math.cos(theta)*ds; ny=y+Math.sin(theta)*ds;
+      bw=blockedWhy(nx,ny,r,myId);
+    }
+    if(bw) break;
+    marginTurns=0;
+    x=nx; y=ny; dist+=ds;
+    const wGoal=o.w0*(1+o.wVar*Math.sin(dist*31+phase));
+    w+=(wGoal-w)*0.05+rr(-1,1)*0.0004;
+    w=Math.max(0.006,Math.min(0.034,w));
+    pts.push({x,y}); wds.push(w);
+    if(o.stampBed!==false) stamp(x,y,r,myId);
+    // cutoff: the neck pinches when the head closes a loop. Pinch
+    // aggressively so bends become scars instead of coils: a real pinch
+    // has the head near its own old bed with opposed headings, so tight
+    // S-wiggles are not mistaken for cutoffs.
+    if(o.cutoffs && cutoffCount<maxCutoffs && s>100 && s-lastCut>90 && s%3===0){
+      const neck=w*4.0+0.02;
+      const n=pts.length;
+      let found=-1;
+      const i0=Math.max(0,n-320);
+      const iTop=Math.min(n-3,n-70), iBot=Math.max(i0,2);
+      for(let i=iTop;i>=iBot;i-=3){
+        const dx=pts[i].x-x, dy=pts[i].y-y;
+        if(dx*dx+dy*dy<neck*neck){
+          const hi=Math.atan2(pts[i+2].y-pts[i-2].y, pts[i+2].x-pts[i-2].x);
+          if(Math.abs(wrapAngle(theta-hi))>1.2 && n-i>=70){ found=i; break; }
+        }
+      }
+      if(found>=0){
+        const arc=pts.slice(found,n);            // the abandoned bend
+        scars.push({pts:arc, w:w});
+        const A=pts[found], B={x,y};
+        // Note: scars do not seal the occupancy grid. Only live beds
+        // block other channels; an abandoned scar is open ground, which
+        // is also why tributaries can still find room after cutoffs.
+        // The new reach leaves A along the old bed's tangent and arrives
+        // at B along the current heading: a cubic Bezier, not a straight
+        // chord, so the cutoff never reads as a folded corner.
+        const A2=pts[Math.max(0,found-3)];
+        const t0x=A.x-A2.x, t0y=A.y-A2.y, m0=Math.hypot(t0x,t0y)||1;
+        const t1x=Math.cos(theta), t1y=Math.sin(theta);
+        const d=Math.hypot(B.x-A.x,B.y-A.y);
+        const seg=16, cut=[];
+        for(let k=1;k<=seg;k++){
+          const t=k/seg, u=1-t;
+          const px=u*u*u*A.x+3*u*u*t*(A.x+t0x/m0*d*0.4)+3*u*t*t*(B.x-t1x*d*0.4)+t*t*t*B.x;
+          const py=u*u*u*A.y+3*u*u*t*(A.y+t0y/m0*d*0.4)+3*u*t*t*(B.y-t1y*d*0.4)+t*t*t*B.y;
+          cut.push({x:px,y:py});
+          if(o.stampBed!==false) stamp(px,py,r,myId);
+        }
+        pts.length=found+1; wds.length=found+1;
+        for(const p of cut){ pts.push(p); wds.push(w); }
+        // re-phase so the new reach leaves the scar behind: fresh bend
+        // episodes (no looping straight back over the scar) and an eased
+        // heading change instead of a hard corner
+        const neckDir=Math.atan2(B.y-A.y,B.x-A.x);
+        easeFrom=wrapAngle(theta-neckDir); easeRemain=14;
+        episodes=makeEpisodes(s+ri(120,200), 5.6);
+        base=neckDir-m1-m2-nzc;
+        cutoffCount++; lastCut=s;
+      }
+    }
+    if(o.stopX!==undefined && x>o.stopX) break;  // reached the sea
+  }
+  return {pts,wds,scars,cutoffCount,dist,episodes:episodes.length};
+}
+
+/* ---------- tributary: rises in free ground, meanders, joins at acute angle ---------- */
+function growTributary(T, mainTheta, wMain, myId){
+  const conf=rr(20,45)*Math.PI/180;
+  const wT=wMain*rr(0.45,0.6);
+  const ds=1/450;
+  let sx=0, sy=0, placed=false;
+  for(let pa=0;pa<40 && !placed;pa++){
+    const spawnD=rr(0.18,0.50);
+    const spawnA=mainTheta+Math.PI+rr(-1.6,1.6); // upstream hemisphere
+    sx=clampM(T.x+Math.cos(spawnA)*spawnD);
+    sy=clampM(T.y+Math.sin(spawnA)*spawnD);
+    if(!blockedWhy(sx,sy,0.015,myId)) placed=true;
+  }
+  if(!placed) return null;
+  let x=sx, y=sy;
+  let theta=Math.atan2(T.y-y,T.x-x);
+  const pts=[{x,y}], wds=[wT*0.7];
+  // weave: tributaries draw their own S-curves while homing; the weave
+  // fades as the junction nears so the confluence stays clean
+  const weaveA=rr(0.40,0.65), weaveW=2*Math.PI/rr(0.16,0.26), weaveP=rr(0,6.283);
+  const tNz=noiseLattice(32);
+  let joined=false, tdist=0, mTurns=0, breakWhy=null;
+  let _pt=theta; // turn-rate limiter state
+  const maxSteps=1000;
+  for(let s=0;s<maxSteps;s++){
+    const dx=T.x-x, dy=T.y-y;
+    const dist=Math.hypot(dx,dy);
+    if(dist<0.09){
+      // final approach: pure pursuit of a point just downstream of the
+      // junction. Coming from upstream, the confluence lands acute.
+      // The weave has faded by now so the junction stays clean.
+      const jx=T.x+Math.cos(mainTheta)*0.03, jy=T.y+Math.sin(mainTheta)*0.03;
+      const want=Math.atan2(jy-y,jx-x);
+      theta += wrapAngle(want-theta)*0.22 + wrapAngle(mainTheta-theta)*0.10;
+    }else{
+      const want=Math.atan2(dy,dx);
+      const fade=Math.min(1,dist/0.22);
+      const hwant=want+fade*weaveA*Math.sin(tdist*weaveW+weaveP)
+        +0.25*(vnoise(tNz,tdist*8)-0.5)*2;
+      theta += wrapAngle(hwant-theta)*0.18 + rr(-1,1)*1.0*ds;
+    }
+    // soft margins: lean back toward the junction before the edge
+    const tEdge=0.045;
+    const tProx=Math.max((MARG+tEdge)-x, x-(1-MARG-tEdge),
+                         (MARG+tEdge)-y, y-(1-MARG-tEdge), 0);
+    if(tProx>0){
+      const wantT=Math.atan2(T.y-y,T.x-x);
+      theta+=wrapAngle(wantT-theta)*Math.min(0.5,(tProx/tEdge)*0.4);
+    }
+    let nx=x+Math.cos(theta)*ds, ny=y+Math.sin(theta)*ds;
+    let bw=blockedWhy(nx,ny,wT*0.5+0.003,myId);
+    if(bw==='margin' && mTurns<40){
+      theta+=wrapAngle(Math.atan2(T.y-y,T.x-x)-theta)*0.5;
+      mTurns++;
+      nx=x+Math.cos(theta)*ds; ny=y+Math.sin(theta)*ds;
+      bw=blockedWhy(nx,ny,wT*0.5+0.003,myId);
+    }
+    // turn-rate limit: tributaries bend, they do not fold
+    theta=_pt+Math.max(-0.09,Math.min(0.09,wrapAngle(theta-_pt)));
+    _pt=theta;
+    if(dist>wMain*2.2 && bw){ breakWhy=bw; break; } // stop before crossing
+    mTurns=0;
+    x=nx; y=ny; tdist+=ds;
+    pts.push({x,y});
+    const wt=wT*(0.7+0.5*(s/maxSteps));
+    wds.push(wt);
+    stamp(x,y,wt*0.5+0.003,myId);
+    if(dist<wMain*1.8){ joined=true; break; }
+  }
+  if(!joined||pts.length<100) return null;
+  // small second order branches feeding this tributary
+  const branches=[];
+  const nb=ri(1,2);
+  for(let b=0;b<nb;b++){
+    const bi=ri(Math.floor(pts.length*0.25),Math.floor(pts.length*0.7));
+    if(bi<4||bi>=pts.length-2) continue;
+    const J=pts[bi];
+    const jt=Math.atan2(pts[bi+1].y-pts[bi-1].y,pts[bi+1].x-pts[bi-1].x);
+    const bd=rr(0.08,0.16), ba=jt+Math.PI+rr(-0.7,0.7);
+    let bx=clampM(J.x+Math.cos(ba)*bd), by=clampM(J.y+Math.sin(ba)*bd);
+    let bth=Math.atan2(J.y-by,J.x-bx);
+    const bp=[{x:bx,y:by}], bw2=[wT*0.32];
+    const bWeave=rr(0.5,0.8), bWf=2*Math.PI/rr(0.10,0.16), bP=rr(0,6.283);
+    let bok=false, bdist=0, _bt=bth;
+    for(let s=0;s<200;s++){
+      const ddx=J.x-bx, ddy=J.y-by, dd=Math.hypot(ddx,ddy);
+      const want=Math.atan2(ddy,ddx);
+      const hw=want+bWeave*Math.sin(bdist*bWf+bP);
+      bth += wrapAngle(hw-bth)*0.2 + rr(-1,1)*1.2*ds;
+      bth=_bt+Math.max(-0.06,Math.min(0.06,wrapAngle(bth-_bt))); _bt=bth;
+      const nbx=bx+Math.cos(bth)*ds, nby=by+Math.sin(bth)*ds;
+      if(dd>wT*1.4 && blockedWhy(nbx,nby,wT*0.2+0.002,myId)) break;
+      bx=nbx; by=nby; bdist+=ds;
+      bp.push({x:bx,y:by}); bw2.push(wT*0.32+0.001);
+      stamp(bx,by,wT*0.2+0.002,myId);
+      if(dd<wT*0.7){ bok=true; break; }
+    }
+    if(bok&&bp.length>10) branches.push({pts:bp,wds:bw2});
+  }
+  return {pts,wds,branches,conf:conf*180/Math.PI};
+}
+
+/* ---------- compose the whole river system, retry until it holds ----------
+   Safety gate: the main stem must pinch off 2+ cutoffs, at least 3
+   tributaries must join, the avulsion must run, and the main reach must
+   travel real distance. Otherwise retry with a derived seed. */
+function compose(seedIn){
+  let best=null;
+  for(let attempt=0;attempt<18;attempt++){
+    rng=mulberry32((seedIn ^ Math.imul(attempt+1,0x9E3779B9))>>>0);
+    occClear();
+    // paleo river: an older system, never drawn; only its cutoff scars
+    // remain as faint arcs. It is a ghost: neither its bed nor its scars
+    // block the live river, so it is grown first on an empty grid.
+    const paleo=growChannel({
+      id:30,
+      x:MARG+0.005, y:rr(0.25,0.75), theta:rr(-0.25,0.25),
+      maxSteps:1150, ds:1/450, w0:rr(0.018,0.022), wVar:0.35,
+      cutoffs:true, belt:true, stopX:1-MARG-0.004, stampBed:false
+    });
+    const paleoScars=paleo.scars;
+    // main stem, west to east. Grown second so tributaries can read the
+    // finished valley and join it.
+    const main=growChannel({
+      id:1,
+      x:MARG+0.005, y:rr(0.30,0.70), theta:rr(-0.25,0.25),
+      maxSteps:900, ds:1/450, w0:rr(0.020,0.024), wVar:0.35,
+      cutoffs:true, belt:true, stopX:1-MARG-0.004
+    });
+    // young avulsion: the ochre channel, splits off mid reach. Grown
+    // right after the main stem: it only needs one good run, and the
+    // tributary network fills around it afterwards.
+    const n=main.pts.length;
+    let avul=null;
+    for(let a=0;a<24 && !avul && n>12;a++){
+      const idx=Math.max(3,Math.min(n-4,ri(Math.floor(n*0.3),Math.floor(n*0.8))));
+      const A=main.pts[idx];
+      const mth=Math.atan2(main.pts[idx+2].y-main.pts[idx-2].y,main.pts[idx+2].x-main.pts[idx-2].x);
+      const side=rng()<0.5?1:-1;
+      const ch=growChannel({
+        id:20,
+        x:A.x+Math.cos(mth+side*0.7)*0.02, y:A.y+Math.sin(mth+side*0.7)*0.02,
+        theta:mth+side*rr(0.6,1.1), grace:30, epScale:0.7,
+        maxSteps:ri(260,420), ds:1/450, w0:0.0125, wVar:0.25,
+        cutoffs:true, maxCutoffs:3
+      });
+      if(ch.pts.length>60) avul=ch;
+    }
+    // tributaries join the main stem or each other: a dendritic network.
+    // The junction target is biased toward the main stem.
+    const targets=[{pts:main.pts,wds:main.wds}];
+    const tribs=[];
+    let guard=0, tid=10;
+    while(tribs.length<6 && guard++<400 && n>12){
+      const ch=rng()<0.6?targets[0]:targets[ri(0,targets.length-1)];
+      const cn=ch.pts.length;
+      if(cn<12) continue;
+      const idx=Math.max(3,Math.min(cn-4,ri(Math.floor(cn*0.08),Math.floor(cn*0.95))));
+      const T=ch.pts[idx];
+      const mth=Math.atan2(ch.pts[idx+2].y-ch.pts[idx-2].y,ch.pts[idx+2].x-ch.pts[idx-2].x);
+      const tr=growTributary(T,mth,ch.wds[idx],tid++);
+      if(tr){ tribs.push(tr); targets.push({pts:tr.pts,wds:tr.wds}); }
+    }
+    const ok = main.cutoffCount>=2 && tribs.length>=3 && avul && main.dist>1.0;
+    let yMin=1,yMax=0;
+    for(const p of main.pts){ if(p.y<yMin)yMin=p.y; if(p.y>yMax)yMax=p.y; }
+    const scarCount=main.scars.length+(avul?avul.scars.length:0)+paleoScars.length;
+    // score leans hard toward the safety gate so the fallback best is the
+    // attempt closest to passing it
+    const score = (main.cutoffCount>=2?60:0) + (tribs.length>=3?60:0)
+      + (avul?60:0) + (main.dist>1.0?25:0)
+      + main.cutoffCount*3 + tribs.length*3 + (avul?5:0)
+      + main.dist*2 + (yMax-yMin)*3 + scarCount*1.5;
+    if(!best || score>best.score) best={score, main, tribs, avul, paleoScars, attempt};
+    if(ok) return {main, tribs, avul, paleoScars, attempt};
+  }
+  return best;
+}
+
+/* ---------- drawing ---------- */
+function X(u){ return OX+u*S; }
+function Y(v){ return OY+v*S; }
+
+function bankLines(ch){
+  const p=ch.pts, n=p.length;
+  const L=[], Rr=[];
+  for(let i=0;i<n;i++){
+    const a=p[Math.max(0,i-1)], b=p[Math.min(n-1,i+1)];
+    let dx=b.x-a.x, dy=b.y-a.y;
+    const m=Math.hypot(dx,dy)||1; dx/=m; dy/=m;
+    const hw=ch.wds[i]/2;
+    L.push({x:p[i].x-dy*hw, y:p[i].y+dx*hw});
+    Rr.push({x:p[i].x+dy*hw, y:p[i].y-dx*hw});
+  }
+  return {L,Rr};
+}
+function strokePath(pts, style, lw){
+  ctx.strokeStyle=style; ctx.lineWidth=lw; ctx.lineCap='round'; ctx.lineJoin='round';
+  ctx.beginPath();
+  ctx.moveTo(X(pts[0].x),Y(pts[0].y));
+  for(let i=1;i<pts.length;i++) ctx.lineTo(X(pts[i].x),Y(pts[i].y));
+  ctx.stroke();
+}
+function drawChannel(ch, ink, bankPx, waterAlpha){
+  const {L,Rr}=bankLines(ch);
+  if(waterAlpha>0){ // water as negative space: darken between banks
+    ctx.fillStyle='rgba(6,8,10,'+waterAlpha+')';
+    ctx.beginPath();
+    ctx.moveTo(X(L[0].x),Y(L[0].y));
+    for(let i=1;i<L.length;i++) ctx.lineTo(X(L[i].x),Y(L[i].y));
+    for(let i=Rr.length-1;i>=0;i--) ctx.lineTo(X(Rr[i].x),Y(Rr[i].y));
+    ctx.closePath(); ctx.fill();
+  }
+  strokePath(L, ink, bankPx);
+  strokePath(Rr, ink, bankPx);
+}
+/* An oxbow scar reads as a thin fading crescent: a faint halo lifts it
+   off the ground, then a crisp dimmer-bone arc that fades along its
+   length, thinnest at the abandoned ends. */
+function drawScar(pts, baseAlpha){
+  const n=pts.length;
+  if(n<6) return;
+  ctx.lineCap='round'; ctx.lineJoin='round';
+  const segs=Math.min(n-1, 120);
+  const sx=[], sy=[];
+  for(let i=0;i<=segs;i++){
+    const p=pts[Math.floor(i*(n-1)/segs)];
+    sx.push(X(p.x)); sy.push(Y(p.y));
+  }
+  ctx.strokeStyle='rgba(232,226,210,'+(baseAlpha*0.20).toFixed(3)+')';
+  ctx.lineWidth=Math.max(2,S*0.007);
+  ctx.beginPath();
+  ctx.moveTo(sx[0],sy[0]);
+  for(let i=1;i<=segs;i++) ctx.lineTo(sx[i],sy[i]);
+  ctx.stroke();
+  ctx.lineWidth=Math.max(1,S*0.0013);
+  for(let i=0;i<segs;i++){
+    const t=i/segs;
+    const alpha=baseAlpha*(1-t*0.45)*(0.65+0.35*Math.sin(t*Math.PI));
+    ctx.strokeStyle='rgba(216,208,188,'+alpha.toFixed(3)+')';
+    ctx.beginPath();
+    ctx.moveTo(sx[i],sy[i]); ctx.lineTo(sx[i+1],sy[i+1]);
+    ctx.stroke();
+  }
+}
+
+let comp=null;
+function redraw(){
+  rng=mulberry32(seed);
+  comp=compose(seed);
+  window.__stats={attempt:comp.attempt,cutoffs:comp.main.cutoffCount,
+    mainScars:comp.main.scars.length,
+    tribs:comp.tribs.length,
+    avul:comp.avul?comp.avul.pts.length:0,
+    avulScars:comp.avul?comp.avul.scars.length:0,
+    main:comp.main.pts.length,dist:+comp.main.dist.toFixed(2),
+    paleo:comp.paleoScars.length};
+  window.__mainPts=comp.main.pts;
+  DPR=Math.min(2, window.devicePixelRatio||1);
+  canvas.width=Math.round(W*DPR); canvas.height=Math.round(H*DPR);
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+  // page and ground
+  ctx.fillStyle='#141210'; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle=GROUND; ctx.fillRect(OX,OY,S,S);
+  // soft vignette on the ground
+  const vg=ctx.createRadialGradient(OX+S/2,OY+S/2,S*0.28,OX+S/2,OY+S/2,S*0.78);
+  vg.addColorStop(0,'rgba(0,0,0,0)');
+  vg.addColorStop(1,'rgba(0,0,0,0.42)');
+  ctx.fillStyle=vg; ctx.fillRect(OX,OY,S,S);
+
+  const bankPx=Math.max(1.1,S*0.0016);
+  // oldest marks first: paleo scars, then this river's cutoff scars
+  for(const g of comp.paleoScars) drawScar(g.pts, 0.30);
+  for(const s of comp.main.scars) drawScar(s.pts, 0.62);
+  if(comp.avul) for(const s of comp.avul.scars) drawScar(s.pts, 0.50);
+  // tributaries and their branches
+  for(const t of comp.tribs){
+    for(const b of t.branches) drawChannel(b,'rgba(232,226,210,0.66)',bankPx*0.8,0);
+    drawChannel(t,'rgba(232,226,210,0.88)',bankPx,0.22);
+  }
+  // main stem in bone
+  drawChannel(comp.main,'rgba(232,226,210,0.94)',bankPx*1.15,0.30);
+  // youngest channel in ochre, the single accent
+  if(comp.avul) drawChannel(comp.avul,'rgba(201,138,46,0.95)',bankPx,0.26);
+
+  // restrained grain
+  for(let i=0;i<3800;i++){
+    const gx=OX+rng()*S, gy=OY+rng()*S;
+    ctx.fillStyle=rng()<0.6?'rgba(232,226,210,0.045)':'rgba(0,0,0,0.06)';
+    ctx.fillRect(gx,gy,1,1);
+  }
+}
+
+function resize(){
+  W=window.innerWidth; H=window.innerHeight;
+  S=Math.min(W,H);
+  OX=(W-S)/2; OY=(H-S)/2;
+  redraw();
+}
+window.addEventListener('resize', resize);
+canvas.addEventListener('click', ()=>{
+  seed=(Math.random()*1e9)|0;
+  history.replaceState(null,'','?seed='+seed);
+  redraw();
+});
+resize();
+</script>
+</body>
+</html>
