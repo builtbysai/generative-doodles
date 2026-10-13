@@ -1,27 +1,35 @@
-# №10 · Impression
-
-Replaces fly's "Bloom" (a generic network hairball) at Hans's "improve or discard" verdict.
+# №10 · Drift - process notes
 
 ## Concept
+A living flow field. 350 capsules ride three slow-orbiting vortex
+attractors, laying stitched trails in neon on near-black. The vortices
+breathe on Lissajous paths, so the current never repeats exactly.
+Click for a new current. Brief concept #1 (vortex capsules), animated.
 
-Brief concept #11: halftone falloff. A dot grid on cream where each dot's
-radius follows a radial cosine falloff from a seeded off-center origin, so
-the field reads as a single pressed weight in the paper. A second, weaker
-lobe interferes with the first, carving a shallow valley between them.
+## Construction
+- Single self-contained page, canvas 2D, requestAnimationFrame, no
+  libraries. mulberry32 PRNG; default seed 10. `?seed=` shareable;
+  click mints a new current. DPR capped at 2; Visual Viewport sizing;
+  canvas pinned by style.
+- Field: three vortices with seeded base position, orbit radii
+  (Lissajous, slow), strength sign, and reach; plus a gentle background
+  drift so nothing stalls. Particle velocity follows the field angle.
+- Rendering: fade with rgba(ground, 0.055) each frame instead of clear,
+  building trails. Each particle is a short round capsule tangent to
+  its velocity, 1-2px, alpha 0.85. 90-frame pre-roll so the first
+  visible frame already has trails.
+- Palette: magenta #ff2e88, gold #ffb020, cyan #38e1ff, warm white
+  #f2ead8 on near-black #0d0b14. 350 particles, 60fps on phones.
 
-One indigo ink (#2b3a67) on cream (#f5f1e4). The dots carry a whisper of
-seeded jitter so the field feels plotted, not stamped. The name is a
-printmaking term: the impression is the print pulled from the plate, and
-the piece renders an impression pressed into the dot field.
+## Differentiation
+- vs No.8925 (Chord Orbits): static string geometry. Drift is a living
+  system; its interest is in motion and trails, not fixed webs.
+- vs No.8924 (Contour Drift): Contour Drift is static topographic lines
+  on paper. Drift is neon particles on black, in motion.
+- vs No.9078 (Shimmer): Shimmer vibrates via static dash interference.
+  Drift moves for real.
+- Family name: "living systems". First animated piece in the series.
 
-## Why it clears the bar
-
-- One function, one ink, full image. Nothing decorative.
-- Off-center origin + elliptical falloff with seeded tilt: never a bullseye.
-- Second lobe interference gives each seed a distinct asymmetric character.
-- Per-dot jitter keeps it machined, not stamped.
-
-## Phone rules
-
-Canvas pinned via style width/height. Phone detection via visualViewport
-with window size fallback. Field piece runs full-bleed on all screens.
+## Motion
+Continuous evolution, not a loop. Vortices orbit slowly; particles
+advect, wrap at edges, leave fading trails. Hypnotic, never chaotic.
