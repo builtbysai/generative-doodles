@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>No9082 · Afterglow</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body { background: #141210; overflow: hidden; touch-action: none; overscroll-behavior: none; }
+  #scene { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+</style>
+</head>
+<body>
+<canvas id="scene"></canvas>
+<script>
+/* Afterglow — shared painting engine (browser + node).
+ * Jason Anderson-inspired: stained-glass jigsaw cells, palette-knife impasto,
+ * luminous landscape zones, and a moving light that rakes across the ridges.
+ * Works with any Canvas2D context. No DOM access in here.
+ */
+'use strict';
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function hexRgb(hex) {
+  return [parseInt(hex.slice(1, 3), 16), parseInt(hex.slice(3, 5), 16), parseInt(hex.slice(5, 7), 16)];
+}
+function rgbHsl(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+  let h = 0, s = 0, l = (mx + mn) / 2;
+  if (mx !== mn) {
+    const d = mx - mn;
+    s = l > 0.5 ? d / (2 - mx - mn) : d / (mx + mn);
+    if (mx === r) h = ((g - b) / d + (g < b ? 6 : 0));
+    else if (mx === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+    h *= 60;
+  }
+  return [h, s * 100, l * 100];
+}
+function hslHex(h, s, l) {
+  h = ((h % 360) + 360) % 360; s = Math.max(0, Math.min(100, s)); l = Math.max(0, Math.min(100, l));
+  s /= 100; l /= 100;
+  const k = n => (n + h / 30) % 12;
+  const a = s * Math.min(l, 1 - l);
+  const f = n => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+  const to = x => Math.round(255 * x).toString(16).padStart(2, '0');
+  return '#' + to(f(0)) + to(f(8)) + to(f(4));
+}
+/* Nudge a base color: hue drift, lightness swing. The "mixed on the knife" look. */
+function varyColor(hex, rnd, dl, dh) {
+  const [r, g, b] = hexRgb(hex);
+  const [h, s, l] = rgbHsl(r, g, b);
+  return hslHex(h + (rnd() - 0.5) * 2 * dh, s + (rnd() - 0.5) * 12, l + (rnd() - 0.5) * 2 * dl);
+}
+
+/* ---- Voronoi via half-plane clipping ---- */
+function clipHalf(poly, mx, my, dx, dy) {
+  const out = [];
+  const n = poly.length;
+  if (!n) return out;
+  for (let i = 0; i < n; i++) {
+    const a = poly[i], b = poly[(i + 1) % n];
+    const da = (a[0] - mx) * dx + (a[1] - my) * dy;
+    const db = (b[0] - mx) * dx + (b[1] - my) * dy;
+    const ain = da <= 0, bin = db <= 0;
+    if (ain) out.push(a);
+    if (ain !== bin) {
+      const t = da / (da - db);
+      out.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]);
+    }
+  }
+  return out;
+}
+function voronoiCells(sites, W, H) {
+  return sites.map((s, i) => {
+    let poly = [[0, 0], [W, 0], [W, H], [0, H]];
+    for (let j = 0; j < sites.length; j++) {
+      if (i === j) continue;
+      const o = sites[j];
+      const mx = (s.x + o.x) / 2, my = (s.y + o.y) / 2;
+      poly = clipHalf(poly, mx, my, o.x - s.x, o.y - s.y);
+      if (poly.length < 3) break;
+    }
+    return poly;
+  });
+}
+function centroid(poly) {
+  let x = 0, y = 0;
+  for (const p of poly) { x += p[0]; y += p[1]; }
+  return [x / poly.length, y / poly.length];
+}
+function cellRadius(poly, cx, cy) {
+  let m = 0;
+  for (const p of poly) m = Math.max(m, Math.hypot(p[0] - cx, p[1] - cy));
+  return m;
+}
+function pathPoly(ctx, poly) {
+  ctx.beginPath();
+  ctx.moveTo(poly[0][0], poly[0][1]);
+  for (let i = 1; i < poly.length; i++) ctx.lineTo(poly[i][0], poly[i][1]);
+  ctx.closePath();
+}
+
+/* ---- Palettes: luminous landscape zones ---- */
+const SKY  = ['#2a1a4a', '#4a2a6a', '#6a2a5a', '#8a3a6a', '#3a2a5a', '#5a2a4a'];
+const BAND = ['#ff6a2a', '#ff8a3a', '#ffaa4a', '#ff4a2a', '#ffca6a', '#ff7a4a'];
+const LAND = ['#1a0f1e', '#241428', '#120a14', '#2e1a2e', '#0e0810', '#1e1220'];
+function zoneColor(rnd, x, y, W, H, phase) {
+  const t = y / H + 0.07 * Math.sin(x * 0.006 + phase) + 0.03 * Math.sin(x * 0.017 + phase * 2.3);
+  let pal;
+  if (t < 0.52) pal = SKY;
+  else if (t < 0.64) pal = BAND;
+  else pal = LAND;
+  if (rnd() < 0.05) pal = [SKY, BAND, LAND][(rnd() * 3) | 0]; // stray accent
+  return pal[(rnd() * pal.length) | 0];
+}
+
+function makeSites(rnd, W, H, count) {
+  const cols = Math.max(4, Math.round(Math.sqrt(count * W / H)));
+  const rows = Math.max(4, Math.round(count / cols));
+  const pts = [];
+  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+    pts.push({
+      x: ((c + 0.12 + rnd() * 0.76) * W) / cols,
+      y: ((r + 0.12 + rnd() * 0.76) * H) / rows
+    });
+  }
+  for (let it = 0; it < 2; it++) { // Lloyd relax: organic, even cells
+    const cells = voronoiCells(pts, W, H);
+    for (let i = 0; i < pts.length; i++) {
+      if (cells[i].length < 3) continue;
+      const [cx, cy] = centroid(cells[i]);
+      pts[i].x += (cx - pts[i].x) * 0.85;
+      pts[i].y += (cy - pts[i].y) * 0.85;
+    }
+  }
+  return pts;
+}
+
+/* Paint one cell: flat base, clipped palette-knife blades, dark grout leading.
+ * Returns ridge descriptor for the animated highlight pass. */
+function paintCell(ctx, poly, base, rnd, phase) {
+  const [cx, cy] = centroid(poly);
+  const R = Math.max(6, cellRadius(poly, cx, cy));
+  const knife = rnd() * Math.PI;
+
+  pathPoly(ctx, poly);
+  ctx.fillStyle = base;
+  ctx.fill();
+
+  ctx.save();
+  pathPoly(ctx, poly);
+  ctx.clip();
+  // knife blades: chunky overlapping ellipses, edges left rough by doubles
+  const n = 4 + ((rnd() * 4) | 0);
+  for (let i = 0; i < n; i++) {
+    const col = varyColor(base, rnd, 13, 14);
+    const px = cx + (rnd() - 0.5) * R * 1.7;
+    const py = cy + (rnd() - 0.5) * R * 1.7;
+    const rot = knife + (rnd() - 0.5) * 0.55;
+    const rx = R * (0.45 + rnd() * 0.85);
+    const ry = rx * (0.30 + rnd() * 0.22);
+    for (let k = 0; k < 2; k++) {
+      ctx.globalAlpha = 0.42 + rnd() * 0.30;
+      ctx.fillStyle = k ? varyColor(col, rnd, 6, 8) : col;
+      ctx.beginPath();
+      ctx.ellipse(px + (rnd() - 0.5) * 3, py + (rnd() - 0.5) * 3, rx, ry, rot, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+  // static lee-side shadow: the paint has thickness
+  ctx.globalAlpha = 0.28;
+  ctx.fillStyle = '#101418';
+  ctx.beginPath();
+  ctx.ellipse(cx - Math.cos(knife) * R * 0.30, cy - Math.sin(knife) * R * 0.30,
+    R * 0.85, R * 0.30, knife, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+
+  // stained-glass leading between cells
+  pathPoly(ctx, poly);
+  ctx.globalAlpha = 1;
+  ctx.strokeStyle = 'rgba(22,16,11,0.55)';
+  ctx.lineWidth = Math.max(1.5, R * 0.055);
+  ctx.stroke();
+
+  // ridge highlight descriptor: along the knife, offset to one flank
+  const off = R * 0.30;
+  const pxn = -Math.sin(knife), pyn = Math.cos(knife);
+  return {
+    x: cx + pxn * off, y: cy + pyn * off,
+    rx: R * 0.72, ry: R * 0.20, rot: knife
+  };
+}
+
+/* Build the whole painting. makeCanvas(w,h) -> canvas (DOM or node). */
+function buildPainting(makeCanvas, W, H, seed) {
+  const rnd = mulberry32(seed);
+  const phase = rnd() * Math.PI * 2;
+  const base = makeCanvas(Math.max(2, Math.round(W)), Math.max(2, Math.round(H)));
+  const ctx = base.getContext('2d');
+
+  // deep ground so cell seams never show paper
+  ctx.fillStyle = '#120a14';
+  ctx.fillRect(0, 0, W, H);
+
+  const count = Math.round(Math.min(170, Math.max(90, (W * H) / 16000)));
+  const sites = makeSites(rnd, W, H, count);
+  const cells = voronoiCells(sites, W, H);
+  const ridges = [];
+  for (let i = 0; i < sites.length; i++) {
+    const poly = cells[i];
+    if (poly.length < 3) continue;
+    const [cx, cy] = centroid(poly);
+    const col = zoneColor(rnd, cx, cy, W, H, phase);
+    ridges.push(paintCell(ctx, poly, col, rnd, phase));
+  }
+  return { base, ridges, W, H, seed };
+}
+
+/* One animated frame: base + raking-light ridges + soft sheen. */
+function renderFrame(ctx, painting, W, H, lightAng, lx, ly) {
+  ctx.clearRect(0, 0, W, H);
+  ctx.drawImage(painting.base, 0, 0, W, H);
+  // ridge highlights, brighter where the knife faces the light
+  ctx.fillStyle = '#ffffff';
+  for (const r of painting.ridges) {
+    const facing = Math.cos(lightAng - r.rot);
+    const a = 0.06 + 0.50 * Math.pow(Math.max(0, facing), 1.6);
+    ctx.globalAlpha = a;
+    ctx.beginPath();
+    ctx.ellipse(r.x, r.y, r.rx, r.ry, r.rot, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  // broad sheen drifting with the light
+  const g = ctx.createRadialGradient(lx, ly, 0, lx, ly, Math.max(W, H) * 0.7);
+  g.addColorStop(0, 'rgba(255,244,220,0.10)');
+  g.addColorStop(1, 'rgba(255,244,220,0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  // gentle vignette to hold the edges
+  const v = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.35, W / 2, H / 2, Math.max(W, H) * 0.75);
+  v.addColorStop(0, 'rgba(0,0,0,0)');
+  v.addColorStop(1, 'rgba(8,6,4,0.35)');
+  ctx.fillStyle = v;
+  ctx.fillRect(0, 0, W, H);
+}
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { mulberry32, buildPainting, renderFrame };
+}
+
+
+(function () {
+  'use strict';
+  var cv = document.getElementById('scene');
+  var ctx = cv.getContext('2d');
+  var W = 0, H = 0, DPR = 1;
+  var painting = null;
+  var seed = 9082;
+
+  var lightAng = -0.9, targetAng = -0.9;
+  var lx = 0, ly = 0, tlx = 0, tly = 0;
+  var lastPointer = 0, idleOrbit = true;
+
+  function makeCanvas(w, h) {
+    var c = document.createElement('canvas');
+    c.width = w; c.height = h;
+    return c;
+  }
+  function resize() {
+    DPR = Math.min(2, window.devicePixelRatio || 1);
+    W = window.innerWidth; H = window.innerHeight;
+    cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+    cv.style.width = W + 'px'; cv.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    rebuild();
+  }
+  function rebuild() {
+    painting = buildPainting(makeCanvas, W, H, seed);
+    lx = tlx = W * 0.3; ly = tly = H * 0.25;
+  }
+  function shortestLerp(a, b, t) {
+    var d = ((b - a + Math.PI * 3) % (Math.PI * 2)) - Math.PI;
+    return a + d * t;
+  }
+
+  var lastTap = 0;
+  function onDown(e) {
+    var x = e.clientX, y = e.clientY;
+    // light swings toward the pointer: walking around the painting
+    targetAng = Math.atan2(y - H / 2, x - W / 2);
+    tlx = x; tly = y;
+    idleOrbit = false;
+    lastPointer = performance.now();
+    var now = performance.now();
+    if (now - lastTap < 320) { // double-tap: another from the series
+      seed = (Math.random() * 1e9) | 0;
+      rebuild();
+      lastTap = 0;
+    } else lastTap = now;
+  }
+  function onMove(e) {
+    if (e.buttons || e.pointerType === 'touch' || true) {
+      targetAng = Math.atan2(e.clientY - H / 2, e.clientX - W / 2);
+      tlx = e.clientX; tly = e.clientY;
+      idleOrbit = false;
+      lastPointer = performance.now();
+    }
+  }
+  window.addEventListener('pointerdown', onDown, { passive: true });
+  window.addEventListener('pointermove', onMove, { passive: true });
+
+  var t0 = performance.now();
+  function frame(now) {
+    var t = (now - t0) / 1000;
+    if (!idleOrbit && now - lastPointer > 6000) idleOrbit = true;
+    if (idleOrbit) targetAng = -0.9 + Math.sin(t * 0.10) * 0.9; // slow drift
+    lightAng = shortestLerp(lightAng, targetAng, 0.045);
+    lx += (tlx - lx) * 0.05; ly += (tly - ly) * 0.05;
+    if (painting) renderFrame(ctx, painting, W, H, lightAng, lx, ly);
+    requestAnimationFrame(frame);
+  }
+
+  var rT;
+  window.addEventListener('resize', function () {
+    clearTimeout(rT); rT = setTimeout(resize, 180);
+  });
+  resize();
+  requestAnimationFrame(frame);
+})();
+
+</script>
+</body>
+</html>
