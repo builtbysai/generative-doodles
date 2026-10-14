@@ -1,35 +1,26 @@
-# №14 · Burst - process notes
+# №14 · Armature
 
-## Concept
-Radial hairlines from a single off-center origin on near-black.
-Every ray's length is set by one angular function (two layered sines
-plus seeded jitter), so the burst swells and pinches around the
-circle instead of exploding evenly. Warm white throughout, except the
-contiguous sector where the function peaks, which is gold.
+Two wireframe solids turning against each other: an outer frame and an inner
+frame, counter-rotating, drawn in two flat neons on near-black.
 
-## Construction
-- Single self-contained page, canvas 2D, no libraries. mulberry32 PRNG;
-  default seed 14. `?seed=` shareable; click mints a new build. DPR
-  capped at 2; Visual Viewport sizing; canvas pinned by style; field
-  full-bleed on phones via the screen check, square on desktop.
-- 330 rays; length reaches the farthest corner of the field so long
-  rays can bleed off the edges on the swollen side.
-- Compositional safety: the function's peak must exceed 0.88 and the
-  gold half-band stays under 0.34 radians, so the gold reads as a
-  wedge, not a flood. The peak angle is found by sampling 720 angles
-  per candidate seed.
+## Method
 
-## Differentiation
-- vs No.9077 (Compass): needles of fixed length on a grid, rotated by
-  an angle field. Burst's marks all share one origin and vary in
-  length, not angle; the origin is the composition.
-- Family name: "angular-function radial burst".
+- Seeded PRNG (mulberry32, default seed 14; click mints a new form).
+- Outer solid: icosahedron or torus (seeded). Inner solid: octahedron or small
+  icosahedron (seeded), counter-rotating.
+- Each frame: rotate vertices about X and Y, perspective-project, sort every
+  edge far-to-near, draw with depth-cued alpha and line weight.
+- The whole figure breathes (slow scale pulse) and wobbles on its tilt axis.
+- Two flat neon colors, no gradients. Ground is near-black.
 
-## QA log
-- Default seed rendered from the actual page script (node-canvas) at
-  1280x900 desktop, 390x844 mobile and 720x720 thumbnail size, and
-  inspected before pushing. Phone presentation follows the current
-  house rules. Hans's real-device check is the final gate.
-- Visible copy check: no em dashes, no date strings, no absolute URLs;
-  hint is lowercase and short.
-- Files: `14/index.html`, `14/thumb.png` (720x720, rendered from the live script), `14/process.md`. Gallery entry appended at the end of page3.html with the formula date.
+## Motion
+
+requestAnimationFrame loop; rotation speeds ~0.2–0.5 rad/s, slow enough to
+read as a physical armature turning in space. ~600 edges max: trivial for
+phones at 60fps.
+
+## Phone rules
+
+Canvas pinned via style width/height (no doubling), sizing from visualViewport
+with window fallback, DPR capped at 2. On tall portrait viewports the figure
+scales up 1.55x so it fills the frame instead of floating small and centered.
