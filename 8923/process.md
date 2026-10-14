@@ -12,28 +12,30 @@ looked like a piece. This is that visual, distilled, with no text on top.
 - Each mote breathes (size/alpha oscillation, own phase and rate) and
   drifts on a slow random walk with wraparound
 - Pointer position adds subtle depth parallax
-- Click/tap mints a new tide (new seed)
+- Double-tap mints a new tide (new seed)
 - requestAnimationFrame; DPR capped at 2; canvas pinned via style size
 - Phone: window.screen detection with aspect fallback, full-bleed field
 
 Palette: near-black #0a0a0d ground, blue-teal motes, nothing else.
 
-## Interaction (rebuilt 2026-10-13)
+## Interaction (final, 2026-10-13)
 
-Touch is now the instrument, not a reset button:
+Touch is the instrument, not a reset button. Hans tested two physics
+variants (attract vs repel) and picked repel with the ripples removed.
 
+- **Repel.** Touch pushes motes away: fingers carry and part the water,
+  fast drags swirl it into eddies via a perpendicular velocity component.
 - **Bioluminescent wake.** Motes ignite where fingers pass: hue shifts
   toward cyan (166), lightness and saturation climb, the mote swells as if
   swimming closer. Charge decays over ~3 seconds, so touches leave fading
   trails of light.
-- **Pressure ripples.** Every touchdown fires two expanding rings; fast
-  drags shed smaller ones. Rings shove motes radially as they pass and
-  ignite them, and are drawn as faint luminous circles.
-- **Eddies.** Finger velocity adds a perpendicular swirl component, so fast
-  drags curl the drift into visible eddies while slow touches only part
-  the water gently.
 - **Light painting.** The frame uses a fade fill instead of a hard clear,
   so excited motes paint short luminous trails; calm motes smear
   invisibly.
+- **No ripples.** Hans removed the expanding touch rings; the water
+  answers with light and motion alone.
+- **Dormant cycle.** Untouched motes drift slowly inward toward the
+  middle, dissolve at the center, and are reborn at a random point on the
+  edges. Born-at-edges → flow-in. The drift pauses while any finger is
+  down and resumes on lift.
 - **Multi-touch.** Each finger is its own current (pointer-ID tracked).
-- Tap no longer reseeds; double-tap mints a new tide.
