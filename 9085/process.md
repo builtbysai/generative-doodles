@@ -1,27 +1,27 @@
-# №9085 · Orbit
+# №9085 · Fission
 
-A hard-edge geometric composition of circles and arcs, in the concrete art tradition after Lucien Groen. Companion to №9080 "Concrete" — same family, curved vocabulary.
+A rectilinear recursive-subdivision composition in the concrete art tradition. Replaces the earlier "Orbit" (circles/arcs) at Hans's direction — same muted palette family, purely orthogonal vocabulary.
 
 ## Concept
 
-Concentric ring systems, rotating quarter-arcs, half-discs, and dot constellations on a cool bone ground (#D8D4C8). Flat colors, crisp edges, no gradients. One vermilion accent (#C23E1D) among stone greys and graphite — restraint with a single shout. The composition uses a loose jittered lattice rather than 9080's strict 5×7 grid, so the two pieces read as siblings, not twins.
+The canvas is a field of rectangles that endlessly divides and heals. A binary space partition splits the bone ground into cells along the longer axis; each cell is a flat tone from a muted stone/graphite/paper palette, with one or two vermilion accents for the single shout. Thin ground-colored gaps read as grout lines between the blocks. Mondrian-adjacent, but the motion is contemporary: the composition is never finished, it breathes through fission and fusion.
 
 ## Motion
 
-Quiet and orbital:
-- Rings breathe at ±2–4.5% on slow phase-offset oscillation
-- Quarter-arcs rotate continuously at their own slow speeds
-- Every ~12 seconds one motif reconfigures to a new circular form with a soft pop
-- Tap reconfigures the nearest motif
+- Every 5–9 seconds (idle), a random cell splits with the divider sweeping in from the edge, or a clean pair merges back into one
+- Splits favor the longer axis with occasional cross-splits; split positions land at 32–68%
+- Tap any cell to split it (resets the idle clock)
+- All animation eased in-out, ~0.7s per transition
 
 ## Palette
 
-Bone ground #D8D4C8; graphite #2E2C28, slate #5A6068, stone #8A867B, warm grey #A39E8E; single vermilion accent #C23E1D.
+Bone ground #D8D4C8; graphite #2E2C28, #3A3833; slate #5A6068; stone #8A867B, #6E6A5E; warm greys #A39E8E, #B8B2A2, #CFC9B8; vermilion accent #C23E1D (max 2 cells).
 
 ## Technical
 
-- Seeded RNG (9085) for stable composition
-- Canvas 2D, ~12 motifs, trivial per-frame cost, 60fps
+- Seeded RNG (mulberry32, seed 9085) for a stable canonical composition
+- Binary space partition tree in normalized coordinates — resolution independent
+- Canvas 2D, ~15–30 leaves, trivial per-frame cost, 60fps
 - DPR capped at 2, visualViewport-safe full-bleed, touch-action none
 - No text in artwork
 - Date: 2026 · 11 · 26 (base 2002-01-10 + 9086 days)
