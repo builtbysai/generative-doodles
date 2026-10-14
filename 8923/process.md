@@ -17,3 +17,23 @@ looked like a piece. This is that visual, distilled, with no text on top.
 - Phone: window.screen detection with aspect fallback, full-bleed field
 
 Palette: near-black #0a0a0d ground, blue-teal motes, nothing else.
+
+## Interaction (rebuilt 2026-10-13)
+
+Touch is now the instrument, not a reset button:
+
+- **Bioluminescent wake.** Motes ignite where fingers pass: hue shifts
+  toward cyan (166), lightness and saturation climb, the mote swells as if
+  swimming closer. Charge decays over ~3 seconds, so touches leave fading
+  trails of light.
+- **Pressure ripples.** Every touchdown fires two expanding rings; fast
+  drags shed smaller ones. Rings shove motes radially as they pass and
+  ignite them, and are drawn as faint luminous circles.
+- **Eddies.** Finger velocity adds a perpendicular swirl component, so fast
+  drags curl the drift into visible eddies while slow touches only part
+  the water gently.
+- **Light painting.** The frame uses a fade fill instead of a hard clear,
+  so excited motes paint short luminous trails; calm motes smear
+  invisibly.
+- **Multi-touch.** Each finger is its own current (pointer-ID tracked).
+- Tap no longer reseeds; double-tap mints a new tide.
