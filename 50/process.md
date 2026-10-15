@@ -1,32 +1,28 @@
-# №50 · Mandelbulb Orbit - process notes
+# №50 · Neon Drift - process notes
 
 ## Concept
-A ray-marched Mandelbulb fractal filling the frame, lit from one
-side, on a slow closed orbit (after darien.brito; prompt 15 in
-Bug's ig-artist-study queue, after his Genuary 2026 day 31 piece).
-Bone #e8e4d8 shading to shadow on #000000, one neon rim in cyan
-#3dd6e8 where the surface turns away. The AV-show feel, kept to
-three colors.
+Replaces the original Mandelbulb Orbit (2026-10-15). The CPU sphere-traced
+Mandelbulb could not achieve acceptable visual quality at interactive frame
+rates on phones; even at 150px grid it rendered as coarse blocks. Hans sent
+a phone screenshot showing the pixelation and ordered "Improve 50 or replace."
+
+The replacement is a particle flow field: 900 particles ride a curl-noise
+vector field on near-black, leaving phosphor trails. One neon hue (#d8ff3e,
+kept from the original's rim color) with bone-white hot cores on fast
+particles. The field breathes on a slow cycle. Drag stirs the current;
+particles near the drag point get pushed outward. No grid, no text, no UI.
 
 ## Construction
-- Single self-contained page, canvas 2D, no libraries, no WebGL:
-  the prompt's own CPU fallback route. The power-8 Mandelbulb SDF
-  is sphere-traced over a coarse aspect-correct grid (about 104
-  cells across), normals come from the depth buffer, so the same
-  code runs in the node-canvas QA harness and on any device.
-  The camera rides a closed 30 second orbit; drag tilts the
-  orbit plane and dollies within safe bounds, easing back on
-  release.
-- Full-bleed on phones via the screen-size check (the bulb bleeds
-  off the tall frame), square on desktop; Visual Viewport sizing;
-  canvas pinned by style.
+- Single self-contained page, canvas 2D, no libraries.
+- Value-noise curl field (no dependencies), seeded PRNG for particle init.
+- Trails via translucent ground-colored fade rect (alpha 0.045).
+- Drag sets a stir point; particles within 190px get radial impulse decaying
+  over 1.6s. No click-to-reload.
+- Visual Viewport sizing; canvas pinned by style; full-bleed on phones.
 
 ## QA log
-- Frames rendered from the actual page script (node-canvas) at
-  1280x900 desktop, 390x844 mobile and 720x720 thumbnail size and
-  inspected before pushing. First mobile pass stretched the bulb
-  (square grid on a tall rect); the grid is now aspect-correct.
-  Hans's real-device check is the final gate.
-- Visible copy check: no em dashes, no date strings, no absolute
-  URLs; hint is lowercase and short.
-- Files: `50/index.html`, `50/thumb.png` (720x720, rendered from the live script), `50/process.md`. Gallery entry added to pieces.json with the formula date.
+- JS syntax verified with node --check.
+- Rendered locally at 1280x900 and 390x844; particles visible and moving.
+  Static screenshots cannot show trail buildup (requires motion over time).
+- No em dashes, no hint text, no date strings, no absolute URLs.
+- Files: `50/index.html`, `50/process.md`. Gallery entry unchanged.
