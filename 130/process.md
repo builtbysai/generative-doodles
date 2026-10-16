@@ -1,0 +1,20 @@
+# No.130 · The Proxy - process notes
+
+## Concept
+After Kepes: a field you cannot see, known only by proxy. An invisible dipole field fills a near-black frame and is never drawn directly. Thousands of tiny dash filings, like iron filings on paper over a magnet, align, chain and clump until the field reads in aggregate: nested arcs looping between and around the two poles, dense chains along the strong lines, and honest voids and strays where the field is weak or the filings never settled. The irregularity is the piece; nothing is cleaned up.
+
+## Construction
+- Single self-contained page, no libraries. 2D canvas. Ground #0A0A0A, filings warm white #E8E2D4 at varying alpha, nothing else. 5,200 filings drawn as short lines of 3.6 to 5px, bucketed into five alpha bands so the frame stays cheap.
+- Field: a dipole computed from the two pole positions as opposite charges, each contributing q times r over |r| cubed, with the core softened inside 12px so filings arc around the bars instead of collapsing into them. The field itself is never rendered: no streamlines, no arrows, no field lines, no glow, no grid, no axes, no text.
+- Each filing holds a position and an angle. Every frame its angle relaxes toward the local field angle (wrapped for undirected dashes) plus seeded noise, and it drifts slowly along its own direction so the texture keeps living. Chaining: every fourth frame a spatial hash (12px cells) nudges a random subset of filings toward the double-angle mean of their neighbours within 12px, which is what pulls loose dashes into chains and clumps and leaves voids elsewhere.
+- Poles: two small dark rounded bars with a thin light edge and a centre dot, placed off-centre on a shallow diagonal (0.365/0.44 and 0.635/0.57 of the frame). Seeded PRNG (mulberry32, seed 301) drives the scatter, noise and chaining, so the opening composition is reproducible.
+- Pre-warm: the simulation settles for 120 frames before the first frame is drawn, so the piece opens with formed arcs rather than a random scatter.
+
+## Interaction
+- Drag either pole bar to move it: the cloud is thrown off, filings near the moved pole swing first, and on release the whole field re-settles with real irregularity, the extra turbulence decaying over about 10 seconds. Double-tap re-scatters the filings from scratch (the reseed exception this prompt specces); it then re-forms on its own. No other click behaviour, never click-to-reload.
+- Visual Viewport sizing with resize listened to on visualViewport and window; canvas pinned in draw() via style width and height in px; phone detection via window.screen (min dimension under 700px) with aspect fallback (h > w*1.15); full-bleed at every size. One synchronous frame is drawn at load and requestAnimationFrame is guarded with a typeof check so node-canvas QA works. Timing uses Date.now only.
+
+## QA log
+- Frames rendered from the actual page script (node-canvas) at 1280x900 desktop, 390x844 mobile and 720x720 thumbnail size and inspected before shipping. First pass read too radial and uniform, closer to two starbursts than a dipole. Fixed by lengthening the filings within the specced 3 to 5px band, widening the alpha spread, raising drift speed, strengthening the chaining pass (more nudges per pass, stronger pull) and pre-warming under mild turbulence so filings migrate along the field before the first frame. Second pass shows nested arcs looping between and around both poles on all three renders, chained clumps, a clear void between the poles on the thumbnail, and strays throughout; pole bars visible at every size; nothing reads as clean field lines or uniform random dashes. Hans's real-device check is the final gate.
+- Visible copy check: no em dashes, no date strings, no absolute URLs; hint is lowercase and short: "drag a pole to bend the field". No on-canvas text at all.
+- Files: `130/index.html`, `130/thumb.png` (720x720, rendered from the live script), `130/process.md`. Gallery entry for the parent to add: No.130, title "The Proxy", formula date 2002 · 05 · 21, note ending "Drag a pole to bend the field."
