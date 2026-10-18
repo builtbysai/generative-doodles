@@ -31,11 +31,18 @@ requestAnimationFrame.
 
 ## QA log
 Rendered with render-piece.js at 1280x900, 390x844 and 720x720
-and inspected all three. One fault was caught and fixed during
-QA: the 4-point star parameter for the smallest tiles drove the
-inner radius to zero and the square motifs collapsed into thin
-crosses; the step parameter is now chosen per tile size and the
-squares carry small diamond motifs. Frame one: the 4.8.8 wall
+and inspected all three, plus forced renders of families 2, 3
+and 4 (the tap cycle cannot be driven headlessly, so the family
+index was set directly in test copies; all four families produce
+coherent full tapestries in palette). Two faults were caught and
+fixed during QA. The 4-point star parameter for the smallest
+tiles drove the inner radius to zero and the square motifs
+collapsed into thin crosses; the step parameter is now chosen
+per tile size and the squares carry small diamond motifs. And
+the lattice ranges were fixed counts sized from the smaller
+frame dimension, which left plaster bands at the top and bottom
+of the tall phone frame; ranges are now computed from the width
+and height separately, and the phone render fills edge to edge. Frame one: the 4.8.8 wall
 fills the frame, eight-point stars in the octagons, diamonds in
 the squares, red links stitching every shared boundary. Palette
 audit: plaster #EFE9DA, pencil tiling #B9B2A0, motifs #1A1A1A,
