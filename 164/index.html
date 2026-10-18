@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>No.164 Zellij Skeleton</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #2B2B2B; overflow: hidden; }
+  canvas { display: block; }
+  #hint {
+    position: fixed; left: 0; right: 0; bottom: 14px;
+    text-align: center; font: 13px/1.4 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+    color: #F7F4EC; opacity: 0.75; pointer-events: none; letter-spacing: 0.04em;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hint">tap to reseed the composition</div>
+<script>
+'use strict';
+// No.164 Zellij Skeleton. A freeform zellij skeleton composed
+// fresh per seed: a seeded cellular partition of the panel,
+// its cells classified and replaced by cut tiles (8-pointed
+// stars where a cell is many-sided or large, shuttle safts
+// where it is elongated, plain filler stones elsewhere),
+// grout showing between every tile. A still piece: nothing
+// moves until a tap reseeds the composition, old tiles
+// shrinking away and the new field assembling centre-out.
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var COBALT = '#1E4FA3', EMERALD = '#0E7C5B', WHITE = '#F7F4EC',
+    OCHRE = '#D9A441', GROUT = '#2B2B2B';
+var W = 0, H = 0, tiles = [], seed = 20240624;
+var phase = 'idle', phaseT0 = 0, nextTiles = null, rafOn = false;
+
+function rng(seedIn) {
+  var a = seedIn >>> 0;
+  return function () {
+    a = (a + 0x6D2B79F5) >>> 0;
+    var t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function clamp01(x) { return x < 0 ? 0 : (x > 1 ? 1 : x); }
+function smooth(x) { x = clamp01(x); return x * x * (3 - 2 * x); }
+function easeOut(x) { x = clamp01(x); return 1 - (1 - x) * (1 - x) * (1 - x); }
+
+// clip a convex polygon by the half-plane that keeps points
+// on seed i's side of the bisector between seeds i and j
+function clipBisector(poly, si, sj) {
+  var mx = (si[0] + sj[0]) / 2, my = (si[1] + sj[1]) / 2;
+  var nx = sj[0] - si[0], ny = sj[1] - si[1];
+  var out = [], i, cur, prv, dc, dp;
+  for (i = 0; i < poly.length; i++) {
+    cur = poly[i]; prv = poly[(i + poly.length - 1) % poly.length];
+    dc = (cur[0] - mx) * nx + (cur[1] - my) * ny;
+    dp = (prv[0] - mx) * nx + (prv[1] - my) * ny;
+    if (dc <= 0) {
+      if (dp > 0) { var t1 = dp / (dp - dc); out.push([prv[0] + (cur[0] - prv[0]) * t1, prv[1] + (cur[1] - prv[1]) * t1]); }
+      out.push(cur);
+    } else if (dp <= 0) {
+      var t2 = dp / (dp - dc); out.push([prv[0] + (cur[0] - prv[0]) * t2, prv[1] + (cur[1] - prv[1]) * t2]);
+    }
+  }
+  return out;
+}
+function clipRect(poly, x0, y0, x1, y1) {
+  function half(p, axis, val, keepLow) {
+    var out = [], i, cur, prv, dc, dp;
+    for (i = 0; i < p.length; i++) {
+      cur = p[i]; prv = p[(i + p.length - 1) % p.length];
+      dc = keepLow ? cur[axis] - val : val - cur[axis];
+      dp = keepLow ? prv[axis] - val : val - prv[axis];
+      if (dc <= 0) {
+        if (dp > 0) { var t = dp / (dp - dc); out.push([prv[0] + (cur[0] - prv[0]) * t, prv[1] + (cur[1] - prv[1]) * t]); }
+        out.push(cur);
+      } else if (dp <= 0) {
+        var t2 = dp / (dp - dc); out.push([prv[0] + (cur[0] - prv[0]) * t2, prv[1] + (cur[1] - prv[1]) * t2]);
+      }
+    }
+    return out;
+  }
+  poly = half(poly, 0, x0, false); poly = half(poly, 0, x1, true);
+  poly = half(poly, 1, y0, false); poly = half(poly, 1, y1, true);
+  return poly;
+}
+// distance from an interior point to a convex polygon's
+// boundary along a unit direction (ray against every edge)
+function rayDist(poly, c, dx, dy) {
+  var best = 1e9, i;
+  for (i = 0; i < poly.length; i++) {
+    var a = poly[i], b = poly[(i + 1) % poly.length];
+    var ex = b[0] - a[0], ey = b[1] - a[1];
+    var den = dx * ey - dy * ex;
+    if (Math.abs(den) < 1e-12) continue;
+    var t = ((a[0] - c[0]) * ey - (a[1] - c[1]) * ex) / den;
+    var u = ((a[0] - c[0]) * dy - (a[1] - c[1]) * dx) / den;
+    if (t > 0 && u >= -1e-9 && u <= 1 + 1e-9 && t < best) best = t;
+  }
+  return best;
+}
+// the largest 8-pointed star silhouette, rotated by rot,
+// that fits a convex cell with margin m to spare: scaled so
+// every point and valley clears the boundary in its direction
+function starInCell(poly, c, rot, m) {
+  var s = 1e9, k;
+  for (k = 0; k < 16; k++) {
+    var a = rot + k * Math.PI / 8;
+    var prof = (k % 2 === 0) ? 1 : 0.541;
+    var d = rayDist(poly, c, Math.cos(a), Math.sin(a));
+    s = Math.min(s, (d - m) / prof);
+  }
+  var pts = [];
+  for (k = 0; k < 16; k++) {
+    var a2 = rot + k * Math.PI / 8;
+    var r = s * ((k % 2 === 0) ? 1 : 0.541);
+    pts.push([c[0] + r * Math.cos(a2), c[1] + r * Math.sin(a2)]);
+  }
+  return pts;
+}
+function polyArea(poly) {
+  var a = 0, i;
+  for (i = 0; i < poly.length; i++) {
+    var p = poly[i], q = poly[(i + 1) % poly.length];
+    a += p[0] * q[1] - q[0] * p[1];
+  }
+  return a / 2;
+}
+function polyCentroid(poly) {
+  var a = polyArea(poly), cx = 0, cy = 0, i, cr;
+  for (i = 0; i < poly.length; i++) {
+    var p = poly[i], q = poly[(i + 1) % poly.length];
+    cr = p[0] * q[1] - q[0] * p[1];
+    cx += (p[0] + q[0]) * cr; cy += (p[1] + q[1]) * cr;
+  }
+  if (Math.abs(a) < 1e-6) return [poly[0][0], poly[0][1]];
+  return [cx / (6 * a), cy / (6 * a)];
+}
+// exact inset of a convex polygon by distance d: every edge
+// shifted inward, vertices recomputed as line intersections
+function insetPoly(poly, d) {
+  var n = poly.length, area = polyArea(poly), sgn = area >= 0 ? 1 : -1;
+  var lines = [], i, out = [];
+  for (i = 0; i < n; i++) {
+    var p = poly[i], q = poly[(i + 1) % n];
+    var ex = q[0] - p[0], ey = q[1] - p[1], el = Math.sqrt(ex * ex + ey * ey) || 1;
+    // inward unit normal (left of travel for CCW polygons)
+    var nx = -ey / el * sgn, ny = ex / el * sgn;
+    lines.push({ nx: nx, ny: ny, c: nx * p[0] + ny * p[1] + d });
+  }
+  for (i = 0; i < n; i++) {
+    var l1 = lines[(i + n - 1) % n], l2 = lines[i];
+    var det = l1.nx * l2.ny - l2.nx * l1.ny;
+    if (Math.abs(det) < 1e-9) { out.push(poly[i]); continue; }
+    out.push([(l1.c * l2.ny - l2.c * l1.ny) / det, (l1.nx * l2.c - l2.nx * l1.c) / det]);
+  }
+  return out;
+}
+
+function build(seedIn) {
+  var rand = rng(seedIn);
+  var ext = Math.min(W, H) * 0.88;
+  var px = (W - ext) / 2, py = (H - ext) / 2;
+  var n = 6, step = ext / n, seeds = [], i, j;
+  for (j = -1; j <= n; j++) for (i = -1; i <= n; i++) {
+    seeds.push([px + (i + 0.5) * step + (rand() - 0.5) * 0.64 * step,
+                py + (j + 0.5) * step + (rand() - 0.5) * 0.64 * step]);
+  }
+  var cells = [];
+  seeds.forEach(function (s, si) {
+    var big = step * 3.2;
+    var poly = [[s[0] - big, s[1] - big], [s[0] + big, s[1] - big], [s[0] + big, s[1] + big], [s[0] - big, s[1] + big]];
+    seeds.forEach(function (o, oi) {
+      if (oi === si) return;
+      var dx = o[0] - s[0], dy = o[1] - s[1];
+      if (dx * dx + dy * dy > (3.4 * step) * (3.4 * step)) return;
+      poly = clipBisector(poly, s, o);
+    });
+    poly = clipRect(poly, px, py, px + ext, py + ext);
+    if (poly.length >= 3 && Math.abs(polyArea(poly)) > step * step * 0.08) cells.push(poly);
+  });
+  var areas = cells.map(function (c) { return Math.abs(polyArea(c)); });
+  var sorted = areas.slice().sort(function (a, b) { return a - b; });
+  var medA = sorted[Math.floor(sorted.length / 2)] || 1;
+  var list = [], fillerCount = 0, starCount = 0;
+  cells.forEach(function (poly) {
+    var c = polyCentroid(poly);
+    var area = Math.abs(polyArea(poly));
+    // covariance of the vertices: elongation and main axis
+    var sxx = 0, sxy = 0, syy = 0, k;
+    poly.forEach(function (p) { var dx = p[0] - c[0], dy = p[1] - c[1]; sxx += dx * dx; sxy += dx * dy; syy += dy * dy; });
+    var tr = sxx + syy, det = sxx * syy - sxy * sxy;
+    var disc = Math.sqrt(Math.max(0, tr * tr / 4 - det));
+    var l1 = tr / 2 + disc, l2 = Math.max(1e-6, tr / 2 - disc);
+    var elong = Math.sqrt(l1 / l2);
+    var theta = 0.5 * Math.atan2(2 * sxy, sxx - syy);
+    var ux = Math.cos(theta), uy = Math.sin(theta), vx = -uy, vy = ux;
+    var maxR = 0, inr = 1e9, L = 0, Wd = 0;
+    poly.forEach(function (p) {
+      var dx = p[0] - c[0], dy = p[1] - c[1];
+      maxR = Math.max(maxR, Math.sqrt(dx * dx + dy * dy));
+      L = Math.max(L, Math.abs(dx * ux + dy * uy));
+      Wd = Math.max(Wd, Math.abs(dx * vx + dy * vy));
+    });
+    for (k = 0; k < poly.length; k++) {
+      var p = poly[k], q = poly[(k + 1) % poly.length];
+      var ex = q[0] - p[0], ey = q[1] - p[1], el = Math.sqrt(ex * ex + ey * ey) || 1;
+      inr = Math.min(inr, Math.abs((c[0] - p[0]) * ey - (c[1] - p[1]) * ex) / el);
+    }
+    var type;
+    if (area < 0.3 * medA) type = 'filler';
+    else if (elong > 1.5 && L > step * 0.45 && Wd > step * 0.15) type = 'saft';
+    else if (poly.length >= 7 || area > 1.3 * medA) type = 'star';
+    else type = 'filler';
+    var pts, color;
+    if (type === 'star') {
+      starCount++;
+      pts = starInCell(poly, c, rand() * Math.PI / 4, 1.3);
+      color = COBALT;
+    } else if (type === 'saft') {
+      var Lh = Math.min(Math.max(4, L - 1.3), step * 0.95), Wh = Math.max(3, (Wd - 1.3) * 0.85);
+      var rel = [[Lh, 0], [0.25 * Lh, Wh], [-0.25 * Lh, Wh], [-Lh, 0], [-0.25 * Lh, -Wh], [0.25 * Lh, -Wh]];
+      pts = rel.map(function (r) { return [c[0] + ux * r[0] + vx * r[1], c[1] + uy * r[0] + vy * r[1]]; });
+      // clamp every vertex inside its own cell: the corner
+      // combining full length and full width can cross the
+      // diagonal edge between the cell's extreme vertices
+      pts = pts.map(function (p) {
+        var dx = p[0] - c[0], dy = p[1] - c[1], dp = Math.sqrt(dx * dx + dy * dy);
+        if (dp < 1e-6) return p;
+        var dc = rayDist(poly, c, dx / dp, dy / dp);
+        if (dp <= dc - 1.3) return p;
+        var s = Math.max(0, (dc - 1.3) / dp);
+        return [c[0] + dx * s, c[1] + dy * s];
+      });
+      color = EMERALD;
+    } else {
+      pts = insetPoly(poly, 1.3);
+      color = (fillerCount % 2 === 0) ? WHITE : OCHRE;
+      fillerCount++;
+    }
+    var dcx = c[0] - W / 2, dcy = c[1] - H / 2;
+    list.push({ pts: pts, c: c, color: color, dist: Math.sqrt(dcx * dcx + dcy * dcy), type: type });
+  });
+  // keep the skeleton star-rich: promote the largest fillers
+  // until at least a quarter of the tiles are stars
+  var want = Math.ceil(list.length * 0.25);
+  if (starCount < want) {
+    var fillers = list.filter(function (t) { return t.type === 'filler'; });
+    fillers.sort(function (a, b) { return b.pts.length - a.pts.length; });
+    // promote by cell size, approximated by point spread
+    fillers.sort(function (a, b) {
+      function spread(t) { var m = 0; t.pts.forEach(function (p) { var dx = p[0] - t.c[0], dy = p[1] - t.c[1]; m = Math.max(m, dx * dx + dy * dy); }); return m; }
+      return spread(b) - spread(a);
+    });
+    for (var f = 0; f < fillers.length && starCount < want; f++) {
+      var t = fillers[f];
+      // t.pts at this point is the cell polygon already inset
+      // by the grout margin, so the star may use it as-is
+      t.pts = starInCell(t.pts, t.c, Math.PI / 8, 0);
+      t.type = 'star'; t.color = COBALT; starCount++;
+    }
+  }
+  var maxDist = 0;
+  list.forEach(function (t) { maxDist = Math.max(maxDist, t.dist); });
+  list.forEach(function (t) { t.distN = maxDist > 0 ? t.dist / maxDist : 0; });
+  return list;
+}
+
+function drawTile(t, scale, alpha) {
+  if (alpha <= 0 || scale <= 0) return;
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = t.color;
+  ctx.beginPath();
+  t.pts.forEach(function (p, i) {
+    var x = t.c[0] + (p[0] - t.c[0]) * scale, y = t.c[1] + (p[1] - t.c[1]) * scale;
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  });
+  ctx.closePath();
+  ctx.fill();
+  ctx.globalAlpha = 1;
+}
+function draw(now) {
+  ctx.fillStyle = GROUT;
+  ctx.fillRect(0, 0, W, H);
+  if (phase === 'idle') {
+    tiles.forEach(function (t) { drawTile(t, 1, 1); });
+  } else if (phase === 'out') {
+    var p = clamp01((now - phaseT0) / 300);
+    var s = 1 - 0.45 * smooth(p), a = 1 - 0.85 * smooth(p);
+    tiles.forEach(function (t) { drawTile(t, s, a); });
+  } else if (phase === 'in') {
+    var el = now - phaseT0;
+    (nextTiles || []).forEach(function (t) {
+      var lp = clamp01((el - t.distN * 550) / 650);
+      drawTile(t, 0.5 + 0.5 * easeOut(lp), easeOut(lp));
+    });
+  }
+}
+function loop(now) {
+  if (phase === 'out' && now - phaseT0 >= 300) {
+    tiles = nextTiles; nextTiles = null; phase = 'in'; phaseT0 = now;
+  }
+  if (phase === 'in' && now - phaseT0 >= 1250) {
+    phase = 'idle'; draw(now); rafOn = false; return;
+  }
+  draw(now);
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+  else rafOn = false;
+}
+function reseed(now) {
+  if (phase !== 'idle') return;
+  seed = (seed * 9301 + 49297) % 233280 + 17;
+  nextTiles = build(seed);
+  phase = 'out'; phaseT0 = now;
+  if (!rafOn && typeof requestAnimationFrame === 'function') { rafOn = true; requestAnimationFrame(loop); }
+  else if (typeof requestAnimationFrame !== 'function') {
+    // headless fallback: swap instantly
+    tiles = nextTiles; nextTiles = null; phase = 'idle'; draw(now);
+  }
+}
+var dX = 0, dY = 0, dT = 0;
+canvas.addEventListener('pointerdown', function (e) { dX = e.clientX; dY = e.clientY; dT = performance.now(); });
+canvas.addEventListener('pointerup', function (e) {
+  var dx = e.clientX - dX, dy = e.clientY - dY;
+  if (performance.now() - dT < 500 && dx * dx + dy * dy < 144) reseed(performance.now());
+});
+function resize() {
+  var vv = window.visualViewport;
+  W = vv ? vv.width : (window.innerWidth || 1280);
+  H = vv ? vv.height : (window.innerHeight || 900);
+  var dpr = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.width = Math.round(W * dpr);
+  canvas.height = Math.round(H * dpr);
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  tiles = build(seed);
+  draw(performance.now());
+}
+if (window.visualViewport) window.visualViewport.addEventListener('resize', resize);
+window.addEventListener('resize', resize);
+resize();
+</script>
+</body>
+</html>
