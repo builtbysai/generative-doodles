@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>No.278 Smoke Resist</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; overflow:hidden; background:#0B0B0D; }
+  canvas { display:block; touch-action:none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+'use strict';
+// No.278 Smoke Resist (Njalikwa Chongwe).
+// After her wax-resist raku firing: a cream vessel on
+// near-black, smoke streaming across it and laying soot
+// everywhere except where wax resist has been painted.
+// Drag paints permanent resist; double-tap clears the
+// soot and turns the smoke. Data only throughout: the
+// resist mask is a list of stroke polylines checked by
+// distance, and the soot is a list of deposit points
+// clipped to the vessel silhouette. No offscreen canvas.
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var GROUND = '#0B0B0D', CREAM = '#EFE6D2';
+var SOOT = '#141210', EDGE = '#C98F2D';
+var DW = 1280, DH = 900;
+var W = 0, H = 0, phone = false;
+var S = 1, OX = 0, OY = 0;
+var T = 2, lastNow = -1;
+
+function rng(s0) {
+  var s = s0 >>> 0;
+  return function () {
+    s = (s + 0x6D2B79F5) >>> 0;
+    var t = s;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+var rand = rng(27841);
+var dirRand = rng(27899);
+
+// ---- the vessel profile -------------------------------------------------
+// Centred side profile, 75 percent of frame height: rim
+// at y 113, foot at y 787 in the 1280 by 900 design
+// space. The lathe width is a piecewise function of
+// height, knots of (fraction down, half width in px),
+// smoothstep interpolated, the same bottle family as
+// the banded vessel pieces.
+var CX = 640, VTOP = 113, VBOT = 787, VH = VBOT - VTOP;
+var CY = (VTOP + VBOT) / 2;
+var PROFILE = [
+  [0.00, 74], [0.03, 72], [0.09, 58], [0.16, 60],
+  [0.24, 84], [0.34, 128], [0.46, 168], [0.58, 188],
+  [0.68, 186], [0.78, 168], [0.87, 132], [0.94, 96],
+  [0.98, 84], [1.00, 82]
+];
+function interp(knots, v) {
+  if (v <= knots[0][0]) return knots[0][1];
+  for (var i = 0; i < knots.length - 1; i++) {
+    var a = knots[i], b = knots[i + 1];
+    if (v <= b[0]) {
+      var f = (v - a[0]) / (b[0] - a[0]);
+      var s = f * f * (3 - 2 * f);
+      return a[1] + (b[1] - a[1]) * s;
+    }
+  }
+  return knots[knots.length - 1][1];
+}
+function halfWidth(y) {
+  return interp(PROFILE, (y - VTOP) / VH);
+}
+function inVessel(x, y) {
+  if (y < VTOP || y > VBOT) return false;
+  return Math.abs(x - CX) <= halfWidth(y);
+}
+function profilePath() {
+  var N = 72, i, y;
+  ctx.beginPath();
+  ctx.moveTo(CX - halfWidth(VTOP), VTOP);
+  for (i = 1; i <= N; i++) {
+    y = VTOP + VH * i / N;
+    ctx.lineTo(CX - halfWidth(y), y);
+  }
+  ctx.lineTo(CX + halfWidth(VBOT), VBOT);
+  for (i = N - 1; i >= 0; i--) {
+    y = VTOP + VH * i / N;
+    ctx.lineTo(CX + halfWidth(y), y);
+  }
+  ctx.closePath();
+}
+
+// ---- the resist mask, as data -------------------------------------------
+// Strokes are polylines kept for the thin edge line;
+// segments are flattened into a coarse grid bucket so
+// a deposit point only tests the segments near it.
+// A point is masked when its distance to a segment is
+// within that segment half width.
+var CELL = 48;
+var deposits = [];  // soot points, filled in the soot section below
+var strokes = [];   // { pts: [{x, y}...], w: width }
+var segs = [];      // { x1, y1, x2, y2, hw }
+var bucket = {};    // "gx,gy" -> array of segment indices
+function cellKey(gx, gy) { return gx + ',' + gy; }
+function indexSegment(idx) {
+  var sg = segs[idx];
+  var pad = sg.hw + 4;
+  var gx0 = Math.floor((Math.min(sg.x1, sg.x2) - pad) / CELL);
+  var gx1 = Math.floor((Math.max(sg.x1, sg.x2) + pad) / CELL);
+  var gy0 = Math.floor((Math.min(sg.y1, sg.y2) - pad) / CELL);
+  var gy1 = Math.floor((Math.max(sg.y1, sg.y2) + pad) / CELL);
+  for (var gx = gx0; gx <= gx1; gx++) {
+    for (var gy = gy0; gy <= gy1; gy++) {
+      var k = cellKey(gx, gy);
+      if (!bucket[k]) bucket[k] = [];
+      bucket[k].push(idx);
+    }
+  }
+}
+function distToSegment(px, py, sg) {
+  var dx = sg.x2 - sg.x1, dy = sg.y2 - sg.y1;
+  var len2 = dx * dx + dy * dy;
+  var t = 0;
+  if (len2 > 0) t = ((px - sg.x1) * dx + (py - sg.y1) * dy) / len2;
+  if (t < 0) t = 0; else if (t > 1) t = 1;
+  var ex = sg.x1 + dx * t - px, ey = sg.y1 + dy * t - py;
+  return Math.sqrt(ex * ex + ey * ey);
+}
+function isMasked(x, y) {
+  var list = bucket[cellKey(Math.floor(x / CELL), Math.floor(y / CELL))];
+  if (!list) return false;
+  for (var i = 0; i < list.length; i++) {
+    var sg = segs[list[i]];
+    if (distToSegment(x, y, sg) <= sg.hw + 2) return true;
+  }
+  return false;
+}
+function addSegment(x1, y1, x2, y2, hw) {
+  segs.push({ x1: x1, y1: y1, x2: x2, y2: y2, hw: hw });
+  indexSegment(segs.length - 1);
+}
+// Painting wax over soot clears the soot beneath it, so
+// a fresh stroke stands cream at once.
+function purgeDepositsNear(x1, y1, x2, y2, hw) {
+  var sg = { x1: x1, y1: y1, x2: x2, y2: y2 };
+  var kept = [];
+  for (var i = 0; i < deposits.length; i++) {
+    var d = deposits[i];
+    if (distToSegment(d.x, d.y, sg) > hw + 3) kept.push(d);
+  }
+  deposits = kept;
+}
+function addStrokePoint(st, x, y) {
+  var pts = st.pts;
+  var prev = pts[pts.length - 1];
+  pts.push({ x: x, y: y });
+  if (prev) {
+    addSegment(prev.x, prev.y, x, y, st.w / 2);
+    purgeDepositsNear(prev.x, prev.y, x, y, st.w / 2);
+  } else {
+    addSegment(x, y, x, y, st.w / 2);
+    purgeDepositsNear(x, y, x, y, st.w / 2);
+  }
+}
+// One seeded resist band across the belly, present from
+// frame one so the mechanism reads before the first
+// drag: a gently sagging stroke, painted before any
+// soot is seeded.
+(function seedBand() {
+  var st = { pts: [], w: 38 };
+  strokes.push(st);
+  var yMid = VTOP + VH * 0.52;
+  for (var i = 0; i <= 12; i++) {
+    var x = CX - 158 + i * (316 / 12);
+    var y = yMid + Math.sin(i / 12 * Math.PI) * 10 - 5;
+    addStrokePoint(st, x, y);
+  }
+})();
+
+// ---- the soot, as data ----------------------------------------------------
+// Deposit points clipped to the vessel silhouette,
+// drawn each frame in the soot colour. Frame one is
+// pre-sooted: points seeded denser on the upwind (left)
+// side, since the first smoke flows left to right, and
+// never inside the seeded resist band.
+(function seedSoot() {
+  var r = rng(27807);
+  var tries = 0;
+  while (deposits.length < 5200 && tries < 45000) {
+    tries++;
+    var y = VTOP + 4 + r() * (VH - 8);
+    var hw = halfWidth(y) - 3;
+    if (hw <= 4) continue;
+    var fx = r();
+    var x = CX - hw + fx * 2 * hw;
+    if (isMasked(x, y)) continue;
+    var p = 0.98 - 0.5 * fx; // denser where the smoke arrives first
+    if (r() > p) continue;
+    deposits.push({ x: x, y: y });
+  }
+})();
+
+// ---- the smoke --------------------------------------------------------------
+// Live particles ride a seeded curl-ish flow along the
+// current smoke direction. They are never drawn; only
+// the soot they deposit inside the vessel shows. The
+// direction starts left to right and is reseeded on
+// double-tap.
+var flowAngle = 0;
+var particles = [];
+var MAXP = 800;
+function spawnParticle(p, scatter) {
+  var dirx = Math.cos(flowAngle), diry = Math.sin(flowAngle);
+  var perpx = -diry, perpy = dirx;
+  var along = scatter ? (rand() * 2 - 1) * 380 : -380 - rand() * 40;
+  var across = (rand() * 2 - 1) * 330;
+  p.x = CX + dirx * along + perpx * across;
+  p.y = CY + diry * along + perpy * across;
+  p.life = 0;
+  return p;
+}
+(function initParticles() {
+  for (var i = 0; i < MAXP; i++) particles.push(spawnParticle({}, true));
+})();
+function stepSmoke(dt) {
+  if (dt <= 0) return;
+  var dirx = Math.cos(flowAngle), diry = Math.sin(flowAngle);
+  var speed = 130;
+  for (var i = 0; i < particles.length; i++) {
+    var p = particles[i];
+    var curl = Math.sin(p.y * 0.011 + T * 0.7 + Math.sin(p.x * 0.006 + T * 0.3) * 1.6) * 46;
+    var vx = dirx * speed + (-diry) * curl;
+    var vy = diry * speed + dirx * curl;
+    p.x += vx * dt;
+    p.y += vy * dt;
+    p.life += dt;
+    if (inVessel(p.x, p.y) && !isMasked(p.x, p.y)) {
+      if (rand() < 0.3 && deposits.length < 9000) {
+        deposits.push({ x: p.x + (rand() - 0.5) * 5, y: p.y + (rand() - 0.5) * 5 });
+      }
+    }
+    var dx = p.x - CX, dy = p.y - CY;
+    if (p.life > 14 || dx * dx + dy * dy > 430 * 430) spawnParticle(p, false);
+  }
+}
+function refire() {
+  deposits = [];
+  var choices = [0, -0.45, 0.5, Math.PI, 2.6, -2.7, 1.35, -1.3];
+  var next = choices[Math.floor(dirRand() * choices.length) % choices.length];
+  if (Math.abs(next - flowAngle) < 0.01) next = choices[(choices.indexOf(next) + 3) % choices.length];
+  flowAngle = next;
+  for (var i = 0; i < particles.length; i++) spawnParticle(particles[i], true);
+}
+
+function draw() {
+  ctx.fillStyle = GROUND;
+  ctx.fillRect(-20, -20, DW + 40, DH + 40);
+  // the cream vessel
+  profilePath();
+  ctx.fillStyle = CREAM;
+  ctx.fill();
+  // the soot deposits, clipped to the silhouette
+  ctx.save();
+  profilePath();
+  ctx.clip();
+  ctx.fillStyle = SOOT;
+  for (var i = 0; i < deposits.length; i++) {
+    var d = deposits[i];
+    ctx.fillRect(d.x - 3.7, d.y - 3.7, 7.4, 7.4);
+  }
+  ctx.restore();
+  // the resist strokes: a thin edge line so the painted
+  // wax reads against both cream and soot
+  ctx.strokeStyle = EDGE;
+  ctx.lineWidth = 2;
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
+  for (var s = 0; s < strokes.length; s++) {
+    var pts = strokes[s].pts;
+    if (!pts.length) continue;
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (var j = 1; j < pts.length; j++) ctx.lineTo(pts[j].x, pts[j].y);
+    ctx.stroke();
+  }
+}
+
+// ---- interaction ------------------------------------------------------------
+// Drag paints resist; double-tap re-fires. Pointer
+// coords convert through the stored fit transform.
+var painting = null;
+var lastTapAt = -1000, lastTapX = 0, lastTapY = 0;
+function toDesign(e) {
+  return { x: (e.clientX - OX) / S, y: (e.clientY - OY) / S };
+}
+canvas.addEventListener('pointerdown', function (e) {
+  var now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+  var p = toDesign(e);
+  if (now - lastTapAt < 400 && Math.abs(p.x - lastTapX) < 60 && Math.abs(p.y - lastTapY) < 60) {
+    painting = null;
+    lastTapAt = -1000;
+    refire();
+    return;
+  }
+  lastTapAt = now; lastTapX = p.x; lastTapY = p.y;
+  painting = { pts: [], w: 30 };
+  strokes.push(painting);
+  addStrokePoint(painting, p.x, p.y);
+  if (canvas.setPointerCapture && e.pointerId !== undefined) {
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+  }
+  if (e.preventDefault) e.preventDefault();
+});
+canvas.addEventListener('pointermove', function (e) {
+  if (!painting) return;
+  var p = toDesign(e);
+  var prev = painting.pts[painting.pts.length - 1];
+  if (!prev || Math.abs(p.x - prev.x) + Math.abs(p.y - prev.y) > 5) addStrokePoint(painting, p.x, p.y);
+  if (e.preventDefault) e.preventDefault();
+});
+function endPaint() { painting = null; }
+canvas.addEventListener('pointerup', endPaint);
+canvas.addEventListener('pointercancel', endPaint);
+
+// ---- resize -----------------------------------------------------------------------------
+function resize() {
+  var vv = window.visualViewport;
+  W = Math.round(vv ? vv.width : window.innerWidth);
+  H = Math.round(vv ? vv.height : window.innerHeight);
+  canvas.width = W; canvas.height = H;
+  var sw = window.screen ? window.screen.width : W;
+  var sh = window.screen ? window.screen.height : H;
+  phone = Math.min(sw, sh) < 700 || H > W * 1.15;
+}
+if (window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', resize);
+window.addEventListener('resize', resize);
+
+// ---- frame --------------------------------------------------------------------------------
+function frame(time) {
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  ctx.fillStyle = GROUND;
+  ctx.fillRect(0, 0, W, H);
+  // centred fit: the vessel keeps its shape at any
+  // aspect, with the page ground in the piece ground
+  S = Math.min(W / DW, H / DH);
+  OX = (W - DW * S) / 2;
+  OY = (H - DH * S) / 2;
+  ctx.setTransform(S, 0, 0, S, OX, OY);
+  var dt = 0;
+  if (lastNow >= 0 && time > 0) dt = Math.min(0.05, (time - lastNow) / 1000);
+  lastNow = time;
+  T += dt;
+  stepSmoke(dt);
+  draw();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+}
+resize();
+frame(0);
+if (typeof requestAnimationFrame === 'function') {
+  var loop = function (now) { frame(now); requestAnimationFrame(loop); };
+  requestAnimationFrame(loop);
+}
+})();
+</script>
+</body>
+</html>
