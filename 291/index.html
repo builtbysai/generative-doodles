@@ -1,0 +1,473 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>No.291 Puffer Time</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; overflow:hidden; background:#EDE6D6; }
+  canvas { display:block; touch-action:none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+'use strict';
+// No.291 Puffer Time (Ruby Waters).
+// A spiky sun-shaped puffer creature that is also a working
+// clock. Exactly 14 spikes. The top half is cadmium yellow
+// covered in black hand-drawn squiggle marks; the bottom half
+// is white with orange polka dots, split hard at the middle.
+// Two enormous googly eyes track the pointer, a blue oval
+// mouth carries white teeth, and orange-yellow fins are
+// tipped cobalt. Black clock hands pivot from a brass centre
+// and show real time. The creature breathes on a slow 6
+// second squash-stretch. Dragging a spike wobbles it on
+// spring physics; tapping the body puffs it up to scale 1.15
+// with longer spines, then it relaxes. Nothing ever reloads.
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var GROUND = '#EDE6D6', YELLOW = '#F5B301', INK = '#141414', WHITE = '#FFFFFF',
+    ORANGE = '#E8722A', COBALT = '#2B5EA7', BRASS = '#B08D3E';
+var DW = 1280, DH = 900;
+var CX = 640, CY = 450;
+var W = 0, H = 0, phone = false;
+var S = 1, OX = 0, OY = 0; // stored centred-fit transform, used by the pointer handlers
+var T = 0, lastNow = -1, acc = 0; // frame one: creature at rest breath phase
+var TICK = 1 / 60;
+
+function rng(s0) {
+  var s = s0 >>> 0;
+  return function () {
+    s = (s + 0x6D2B79F5) >>> 0;
+    var t = s;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function clamp(x, a, b) { return x < a ? a : (x > b ? b : x); }
+
+// ---- silhouette: a radial star polygon, exactly 14 spikes -----------------------
+// Tip and valley radii jitter per spike from a fixed seed, so
+// the sun outline is hand-made rather than machined. The puff
+// parameter lengthens the tips more than the valleys.
+var SPIKES = 14;
+var R_TIP = 355, R_VALLEY = 248;
+var spikeJit = [], valleyJit = [], angJit = [];
+(function () {
+  var r = rng(291101);
+  for (var i = 0; i < SPIKES; i++) {
+    spikeJit.push(0.94 + r() * 0.11);
+    valleyJit.push(0.96 + r() * 0.08);
+    angJit.push((r() - 0.5) * 0.05);
+  }
+})();
+function silhouettePath(spineMul) {
+  var step = Math.PI * 2 / SPIKES;
+  ctx.beginPath();
+  for (var i = 0; i < SPIKES; i++) {
+    var aT = i * step + angJit[i];
+    var rT = R_TIP * spikeJit[i] * spineMul;
+    var tx = Math.cos(aT) * rT, ty = Math.sin(aT) * rT;
+    if (i === 0) ctx.moveTo(tx, ty); else ctx.lineTo(tx, ty);
+    var aV = aT + step / 2;
+    var rV = R_VALLEY * valleyJit[i] * (1 + (spineMul - 1) * 0.25);
+    ctx.lineTo(Math.cos(aV) * rV, Math.sin(aV) * rV);
+  }
+  ctx.closePath();
+}
+
+// ---- squiggle field (top half) ---------------------------------------------------
+// Fixed-count short random-walk strokes, no two alike, held
+// purely as point data and drawn each frame clipped to the
+// top half of the silhouette. Seeded, so the field is stable.
+var squiggles = [];
+(function () {
+  var r = rng(291771);
+  for (var i = 0; i < 120; i++) {
+    var x = (r() * 2 - 1) * 352;
+    var maxY = Math.sqrt(Math.max(0, 355 * 355 - x * x));
+    var y = -(4 + r() * 0.96 * maxY);
+    var pts = [[x, y]];
+    var a = r() * Math.PI * 2;
+    var steps = 5 + Math.floor(r() * 3);
+    for (var k = 0; k < steps; k++) {
+      a += (r() - 0.5) * 1.5;
+      var len = 10 + r() * 7;
+      x += Math.cos(a) * len;
+      y += Math.sin(a) * len;
+      pts.push([x, y]);
+    }
+    squiggles.push(pts);
+  }
+})();
+
+// ---- dot field (bottom half) -------------------------------------------------------
+// Poisson-disc style orange dots, dart-thrown from a fixed
+// seed with a relaxed minimum distance, held as data and
+// drawn each frame clipped to the bottom half.
+var dots = [];
+(function () {
+  var r = rng(291331);
+  var attempts = 0;
+  while (dots.length < 130 && attempts < 6000) {
+    attempts++;
+    var x = (r() * 2 - 1) * 358;
+    var y = 8 + r() * 348;
+    if (x * x + y * y > 360 * 360) continue;
+    var ok = true;
+    for (var i = 0; i < dots.length; i++) {
+      var dx = x - dots[i][0], dy = y - dots[i][1];
+      if (dx * dx + dy * dy < 37 * 37) { ok = false; break; }
+    }
+    if (ok) dots.push([x, y, 6.5 + r() * 4]);
+  }
+})();
+
+// ---- interaction state --------------------------------------------------------------
+// Pupils track the pointer in design coords via the stored
+// transform. Dragging on the creature drives a spring wobble;
+// a tap on the body starts the puff envelope.
+var gaze = null; // design coords, null means pupils centred
+var isDown = false, dragging = false, downT = 0;
+var downX = 0, downY = 0, dragX = 0, dragY = 0;
+var wobX = 0, wobY = 0, wobVX = 0, wobVY = 0, wobTX = 0, wobTY = 0;
+var puffStart = -100;
+function puffEnv() {
+  if (puffStart < 0) return 0;
+  var u = (T - puffStart) / 1.5;
+  if (u >= 1) return 0;
+  if (u <= 0) return 0;
+  return Math.sin(u * Math.PI);
+}
+function stepSim() {
+  T += TICK;
+  if (dragging) {
+    var nx = wobX + (wobTX - wobX) * Math.min(1, TICK * 14);
+    var ny = wobY + (wobTY - wobY) * Math.min(1, TICK * 14);
+    wobVX = (nx - wobX) / TICK;
+    wobVY = (ny - wobY) / TICK;
+    wobX = nx; wobY = ny;
+  } else {
+    // damped spring back to rest: squash then settle
+    wobVX += (-120 * wobX - 9 * wobVX) * TICK;
+    wobVY += (-120 * wobY - 9 * wobVY) * TICK;
+    wobX += wobVX * TICK;
+    wobY += wobVY * TICK;
+  }
+}
+
+// ---- drawing ---------------------------------------------------------------------------
+function drawFin(side) {
+  ctx.save();
+  ctx.translate(232 * side, 46);
+  ctx.scale(side, 1);
+  ctx.rotate(0.18);
+  var layers = [
+    { s: 1.00, col: COBALT },
+    { s: 0.80, col: ORANGE },
+    { s: 0.55, col: YELLOW }
+  ];
+  for (var i = 0; i < layers.length; i++) {
+    var L = layers[i];
+    ctx.save();
+    ctx.scale(L.s, L.s);
+    ctx.beginPath();
+    ctx.moveTo(0, -30);
+    ctx.quadraticCurveTo(52, -30, 98, 0);
+    ctx.quadraticCurveTo(54, 30, 2, 34);
+    ctx.quadraticCurveTo(-16, 0, 0, -30);
+    ctx.closePath();
+    ctx.fillStyle = L.col;
+    ctx.fill();
+    if (i === 0) { ctx.strokeStyle = INK; ctx.lineWidth = 5; ctx.stroke(); }
+    ctx.restore();
+  }
+  ctx.restore();
+}
+function drawHand(angle, len, wBase, wTip, tail) {
+  var dx = Math.sin(angle), dy = -Math.cos(angle);
+  var px = -dy, py = dx;
+  ctx.beginPath();
+  ctx.moveTo(dx * -tail + px * wBase, dy * -tail + py * wBase);
+  ctx.lineTo(dx * len + px * wTip, dy * len + py * wTip);
+  ctx.lineTo(dx * len - px * wTip, dy * len - py * wTip);
+  ctx.lineTo(dx * -tail - px * wBase, dy * -tail - py * wBase);
+  ctx.closePath();
+  ctx.fillStyle = INK;
+  ctx.fill();
+}
+function draw() {
+  ctx.fillStyle = GROUND;
+  ctx.fillRect(-80, -80, DW + 160, DH + 160);
+  var puff = puffEnv();
+  var br = Math.sin(T * Math.PI * 2 / 6); // 6 second breathing cycle
+  var sc = 1 + 0.15 * puff;
+  var spine = 1 + 0.10 * puff;
+  ctx.save();
+  ctx.translate(CX + wobX * 0.35, CY + wobY * 0.35 + br * 3);
+  ctx.rotate(wobX * 0.0011);
+  ctx.scale(sc * (1 + 0.028 * br) * (1 + wobY * 0.0006),
+            sc * (1 - 0.028 * br) * (1 - wobY * 0.0006));
+
+  // body: hard split at the local middle, yellow over white,
+  // all pattern clipped to the silhouette as path clips
+  // recomputed this frame (data only, no offscreen canvas)
+  ctx.save();
+  silhouettePath(spine);
+  ctx.clip();
+  ctx.fillStyle = YELLOW;
+  ctx.fillRect(-440, -440, 880, 440);
+  ctx.fillStyle = WHITE;
+  ctx.fillRect(-440, 0, 880, 440);
+  // squiggles, top half only
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(-440, -440, 880, 438);
+  ctx.clip();
+  ctx.strokeStyle = INK;
+  ctx.lineWidth = 5;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  for (var i = 0; i < squiggles.length; i++) {
+    var pts = squiggles[i];
+    ctx.beginPath();
+    for (var j = 0; j < pts.length; j++) {
+      if (j === 0) ctx.moveTo(pts[j][0], pts[j][1]);
+      else ctx.lineTo(pts[j][0], pts[j][1]);
+    }
+    ctx.stroke();
+  }
+  ctx.restore();
+  // polka dots, bottom half only
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(-440, 2, 880, 438);
+  ctx.clip();
+  ctx.fillStyle = ORANGE;
+  for (var d = 0; d < dots.length; d++) {
+    ctx.beginPath();
+    ctx.arc(dots[d][0], dots[d][1], dots[d][2], 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+  // the hard split line itself
+  ctx.fillStyle = INK;
+  ctx.fillRect(-440, -2, 880, 4);
+  ctx.restore();
+  // bold tattoo-flash outline
+  silhouettePath(spine);
+  ctx.strokeStyle = INK;
+  ctx.lineWidth = 7;
+  ctx.lineJoin = 'round';
+  ctx.stroke();
+
+  // fins, on the body at the sides
+  drawFin(1);
+  drawFin(-1);
+
+  // mouth: blue oval with white teeth
+  ctx.save();
+  ctx.translate(0, 108);
+  ctx.beginPath();
+  ctx.ellipse(0, 0, 105, 52, 0, 0, Math.PI * 2);
+  ctx.fillStyle = COBALT;
+  ctx.fill();
+  ctx.save();
+  ctx.beginPath();
+  ctx.ellipse(0, 0, 105, 52, 0, 0, Math.PI * 2);
+  ctx.clip();
+  ctx.fillStyle = WHITE;
+  var teeth = [[-82, 26, 26], [-50, 26, 31], [-18, 26, 24], [14, 26, 30], [46, 26, 25]];
+  for (var ti = 0; ti < teeth.length; ti++) {
+    var tx = teeth[ti][0], tw = teeth[ti][1], th = teeth[ti][2];
+    ctx.beginPath();
+    ctx.moveTo(tx, -52);
+    ctx.lineTo(tx + tw, -52);
+    ctx.lineTo(tx + tw - 3, -52 + th);
+    ctx.lineTo(tx + 3, -52 + th);
+    ctx.closePath();
+    ctx.fill();
+  }
+  var fangs = [[-30, 20, 14], [10, 20, 14]];
+  for (var fi = 0; fi < fangs.length; fi++) {
+    var fx = fangs[fi][0], fw = fangs[fi][1], fh = fangs[fi][2];
+    ctx.beginPath();
+    ctx.moveTo(fx, 52);
+    ctx.lineTo(fx + fw, 52);
+    ctx.lineTo(fx + fw - 3, 52 - fh);
+    ctx.lineTo(fx + 3, 52 - fh);
+    ctx.closePath();
+    ctx.fill();
+  }
+  ctx.restore();
+  ctx.beginPath();
+  ctx.ellipse(0, 0, 105, 52, 0, 0, Math.PI * 2);
+  ctx.strokeStyle = INK;
+  ctx.lineWidth = 6;
+  ctx.stroke();
+  ctx.restore();
+
+  // googly eyes: huge whites, pupils tracking the pointer
+  var eyeXs = [-92, 92];
+  for (var e = 0; e < 2; e++) {
+    var ex = eyeXs[e], ey = -98;
+    ctx.beginPath();
+    ctx.arc(ex, ey, 60, 0, Math.PI * 2);
+    ctx.fillStyle = WHITE;
+    ctx.fill();
+    ctx.strokeStyle = INK;
+    ctx.lineWidth = 6;
+    ctx.stroke();
+    var pox = 0, poy = 0;
+    if (gaze) {
+      var gdx = gaze[0] - (CX + ex), gdy = gaze[1] - (CY + ey);
+      var gl = Math.sqrt(gdx * gdx + gdy * gdy);
+      if (gl > 1) {
+        var pm = Math.min(24, gl * 0.15);
+        pox = gdx / gl * pm;
+        poy = gdy / gl * pm;
+      }
+    }
+    ctx.beginPath();
+    ctx.arc(ex + pox, ey + poy, 25, 0, Math.PI * 2);
+    ctx.fillStyle = INK;
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(ex + pox - 8, ey + poy - 9, 7, 0, Math.PI * 2);
+    ctx.fillStyle = WHITE;
+    ctx.fill();
+  }
+
+  // clock hands from the brass centre, real time via Date;
+  // the second hand sweeps smoothly with milliseconds
+  var now = new Date();
+  var sec = now.getSeconds() + now.getMilliseconds() / 1000;
+  var min = now.getMinutes() + sec / 60;
+  var hr = (now.getHours() % 12) + min / 60;
+  drawHand(hr / 12 * Math.PI * 2, 102, 11, 3.5, 18);
+  drawHand(min / 60 * Math.PI * 2, 150, 8.5, 2.5, 20);
+  var aS = sec / 60 * Math.PI * 2;
+  var sdx = Math.sin(aS), sdy = -Math.cos(aS);
+  ctx.strokeStyle = INK;
+  ctx.lineWidth = 3.5;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(sdx * -36, sdy * -36);
+  ctx.lineTo(sdx * 168, sdy * 168);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(sdx * -36, sdy * -36, 6, 0, Math.PI * 2);
+  ctx.fillStyle = INK;
+  ctx.fill();
+  // brass centre cap
+  ctx.beginPath();
+  ctx.arc(0, 0, 17, 0, Math.PI * 2);
+  ctx.fillStyle = BRASS;
+  ctx.fill();
+  ctx.strokeStyle = INK;
+  ctx.lineWidth = 3.5;
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(0, 0, 5.5, 0, Math.PI * 2);
+  ctx.fillStyle = INK;
+  ctx.fill();
+
+  ctx.restore();
+}
+
+// ---- resize ----------------------------------------------------------------------------
+function resize() {
+  var vv = window.visualViewport;
+  W = Math.round(vv ? vv.width : window.innerWidth);
+  H = Math.round(vv ? vv.height : window.innerHeight);
+  canvas.width = W; canvas.height = H;
+  var sw = window.screen ? window.screen.width : W;
+  var sh = window.screen ? window.screen.height : H;
+  phone = Math.min(sw, sh) < 700 || H > W * 1.15;
+}
+if (window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', resize);
+window.addEventListener('resize', resize);
+
+// ---- interaction: drag a spike to wobble, tap the body to puff -------------------------
+function toDesign(e) {
+  var rect = canvas.getBoundingClientRect();
+  return [((e.clientX - rect.left) - OX) / S, ((e.clientY - rect.top) - OY) / S];
+}
+canvas.addEventListener('pointerdown', function (e) {
+  var p = toDesign(e);
+  gaze = p;
+  var lx = p[0] - CX, ly = p[1] - CY;
+  if (lx * lx + ly * ly > 410 * 410) return; // grabs land on the creature only
+  isDown = true;
+  dragging = false;
+  downX = p[0]; downY = p[1];
+  dragX = p[0]; dragY = p[1];
+  downT = Date.now();
+  if (canvas.setPointerCapture && e.pointerId !== undefined) {
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+  }
+});
+canvas.addEventListener('pointermove', function (e) {
+  var p = toDesign(e);
+  gaze = p;
+  if (!isDown) return;
+  dragX = p[0]; dragY = p[1];
+  var dx = dragX - downX, dy = dragY - downY;
+  if (dx * dx + dy * dy > 100) dragging = true;
+  if (dragging) {
+    var dl = Math.sqrt(dx * dx + dy * dy);
+    var cap = 80;
+    if (dl > cap) { dx = dx / dl * cap; dy = dy / dl * cap; }
+    wobTX = dx; wobTY = dy;
+  }
+});
+canvas.addEventListener('pointerup', function (e) {
+  if (!isDown) return;
+  var wasDrag = dragging;
+  isDown = false;
+  dragging = false;
+  wobTX = 0; wobTY = 0;
+  if (!wasDrag && Date.now() - downT < 600) {
+    puffStart = T; // tap on the body: puff up, then relax
+  }
+});
+canvas.addEventListener('pointercancel', function () {
+  isDown = false;
+  dragging = false;
+  wobTX = 0; wobTY = 0;
+});
+
+// ---- frame -----------------------------------------------------------------------------------
+function frame(time) {
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  ctx.fillStyle = GROUND;
+  ctx.fillRect(0, 0, W, H);
+  // centred fit: the shaped composition keeps its proportions,
+  // centred, with the page ground in the piece ground colour
+  S = Math.min(W / DW, H / DH);
+  OX = (W - DW * S) / 2; OY = (H - DH * S) / 2;
+  ctx.setTransform(S, 0, 0, S, OX, OY);
+  var dt = 0;
+  if (lastNow >= 0 && time > 0) dt = Math.min(0.05, (time - lastNow) / 1000);
+  lastNow = time;
+  acc += dt;
+  var guard = 0;
+  while (acc >= TICK && guard < 4) { stepSim(); acc -= TICK; guard++; }
+  if (guard === 4) acc = 0;
+  draw();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+}
+resize();
+frame(0);
+if (typeof requestAnimationFrame === 'function') {
+  var loop = function (now) { frame(now); requestAnimationFrame(loop); };
+  requestAnimationFrame(loop);
+}
+})();
+</script>
+</body>
+</html>
