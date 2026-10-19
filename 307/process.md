@@ -1,0 +1,9 @@
+# No.307 Scrying Cauldron
+
+After Xanthe Caesia's cauldron mugs: a squat round-bellied vessel, widest at mid-body and low-slung, sitting directly on a dark wood surface with no feet. The rim is the star of the piece, an irregular jagged flame-like broken lip built from seeded high-frequency displacement, never smooth. Two small round cutout vents pierce the body, asserted as exactly two, and breathe a faint warm glow in layered translucency.
+
+The glaze is deep brown-black with rust-red mottling laid on as seeded patches and light salt-and-pepper speckling over the top. The interior is pure black and holds the scrying liquid as a flat disc. Inside the disc, seeded fragment shards drift, slow concentric ripples expand, and exactly five pre-authored vision clusters cross the pool, one at each twelve second beat of a sixty second seamless idle loop, asserted as exactly five. Frame one opens mid-loop, with the candle already flickering, ripples already moving and the first vision mid-drift so the pool reads at once.
+
+A single lit tea-light stands low-left, its flame leaning and stretching on a seeded flicker envelope built from whole cycles per loop, so the sixtieth second matches the first exactly. The two vents glow in phase with that flicker. Dried gypsophila sprigs sit soft at frame right, drawn as thin stems carrying many tiny pale blossoms.
+
+Dragging across the liquid stirs it: the fragment shards swirl with the drag vector and the swirl decays back to the idle ripple. Tapping the rim sends one gold-lustre fleck travelling the jagged lip, glinting as it goes, then fading. Nothing reloads. The liquid is plain canvas 2D path data redrawn each frame on a single canvas, with no WebGL and no offscreen layer. The palette is only the dark glaze, the rust mottle, the pale speckle, the black interior, the wood ground, the warm candlelight and the night air around it.
