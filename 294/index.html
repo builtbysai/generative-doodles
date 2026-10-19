@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>No.294 Dala Engine</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; overflow:hidden; background:#D9C7A0; }
+  canvas { display:block; touch-action:none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+'use strict';
+// No.294 Dala Engine (Ruby Waters).
+// A blocky carved wooden-toy horse in profile, straight-cut
+// block body with chamfered joints and no smooth anatomy,
+// painted flat: black body with white polka-dot fields, a big
+// white S-curve flourish along the flank, a teal saddle band
+// with yellow dash marks, an orange saddle medallion with
+// navy spots, a mane striped navy and yellow, an orange muzzle
+// with a navy triangle, a white crescent eye, and a tail of
+// exactly 100 verlet raffia strands. A 40 second seamless loop
+// carries one stamp: front hoof lift, head dip, tail flick.
+// Dragging across the tail parts the strands and they spring
+// back; tapping the saddle medallion ripples its spots once
+// in a dot scale cascade. Nothing ever reloads.
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var BLACK = '#141414', WHITE = '#F5F0E6', TEAL = '#4FA3A3', YELLOW = '#E8B93B',
+    ORANGE = '#E8722A', NAVY = '#26356E', GROUND = '#D9C7A0';
+var DW = 1280, DH = 900;
+var W = 0, H = 0, phone = false;
+var S = 1, OX = 0, OY = 0; // stored centred-fit transform, used by the pointer handlers
+var T = 6.0, lastNow = -1, acc = 0; // frame one: tail already mid-sway, no stamp in the first seconds
+var TICK = 1 / 60;
+
+function rng(s0) {
+  var s = s0 >>> 0;
+  return function () {
+    s = (s + 0x6D2B79F5) >>> 0;
+    var t = s;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function clamp(x, a, b) { return x < a ? a : (x > b ? b : x); }
+function smooth(x) { x = clamp(x, 0, 1); return x * x * (3 - 2 * x); }
+
+// ---- stamp timeline: one stamp inside the 40s loop, at 28s to 31s ---------------
+function stampEnv() {
+  var lt = T % 40;
+  var u = (lt - 28) / 3;
+  if (u <= 0 || u >= 1) return 0;
+  return Math.sin(u * Math.PI);
+}
+
+// ---- polka-dot fields: fixed seeded white dots on the black body -----------------
+var bodyDots = [];
+(function () {
+  var r = rng(294331);
+  var attempts = 0;
+  while (bodyDots.length < 46 && attempts < 4000) {
+    attempts++;
+    var x = 372 + r() * 462, y = 342 + r() * 162;
+    if (x > 798) continue; // keep dots clear of the neck overlap
+    var ok = true;
+    for (var i = 0; i < bodyDots.length; i++) {
+      var dx = x - bodyDots[i][0], dy = y - bodyDots[i][1];
+      if (dx * dx + dy * dy < 42 * 42) { ok = false; break; }
+    }
+    if (ok) bodyDots.push([x, y, 7 + r() * 5]);
+  }
+})();
+
+// ---- tail: exactly 100 verlet rope strands ----------------------------------------
+// Each strand is plain point data: an anchor fixed at the tail
+// root plus six segments of 32 design units, integrated with
+// gravity and a seeded per-strand wind, then distance solved.
+// Dragging through the tail pushes points out of the pointer
+// disc; released, gravity and the root anchor settle them back.
+var TAIL_N = 100, TAIL_SEG = 6, TAIL_LEN = 32;
+var strands = [];
+(function () {
+  var r = rng(294771);
+  for (var i = 0; i < TAIL_N; i++) {
+    var ax = 350 - Math.floor(i / 10) * 1.6;
+    var ay = 332 + (i % 10) * 5.2;
+    var phase = r() * Math.PI * 2;
+    var ang = Math.PI * 0.62 + (r() - 0.5) * 0.66; // fanned hang, down and back
+    var dirx = Math.cos(ang), diry = Math.sin(ang);
+    var segLen = TAIL_LEN * (0.88 + r() * 0.3); // ragged raffia ends
+    var sway = Math.sin(6.0 * 1.35 + phase); // mid-sway at frame one
+    var pts = [], prev = [];
+    for (var k = 0; k <= TAIL_SEG; k++) {
+      var bend = Math.sin(k / TAIL_SEG * 1.2 + phase * 0.3) * 10 + sway * k * 5;
+      var fan = (ang - Math.PI * 0.62) * k * 12;
+      var x = ax + dirx * segLen * k + bend - fan * diry;
+      var y = ay + diry * segLen * k + fan * dirx;
+      pts.push([x, y]);
+      // previous points trail the sway velocity, so the tail
+      // is already moving when the first frame draws
+      prev.push([x - Math.cos(6.0 * 1.35 + phase) * 1.1 * (k / TAIL_SEG), y]);
+    }
+    strands.push({ ax: ax, ay: ay, phase: phase, len: segLen, pts: pts, prev: prev });
+  }
+})();
+if (strands.length !== 100) throw new Error('tail strand count must be exactly 100');
+
+// ---- interaction state -------------------------------------------------------------
+var pointer = null;      // design coords of the current pointer, or null
+var pointerDown = false; // true while dragging
+var downX = 0, downY = 0, downT = 0, downTime = 0;
+var rippleStart = -100;  // sim time the medallion ripple began
+var MEDAL = [655, 380];
+
+function stepTail() {
+  var dt = TICK;
+  var flick = stampEnv();
+  for (var i = 0; i < strands.length; i++) {
+    var st = strands[i];
+    var wind = Math.sin(T * 1.35 + st.phase) * 150 + Math.sin(T * 0.53 + st.phase * 1.7) * 70;
+    wind += flick * Math.sin((T % 40 - 28) / 3 * Math.PI * 3) * 620; // stamp flick
+    var k, p;
+    for (k = 1; k <= TAIL_SEG; k++) {
+      p = st.pts[k];
+      var vx = (p[0] - st.prev[k][0]) * 0.985;
+      var vy = (p[1] - st.prev[k][1]) * 0.985;
+      st.prev[k][0] = p[0]; st.prev[k][1] = p[1];
+      p[0] += vx + wind * dt * dt * (k / TAIL_SEG);
+      p[1] += vy + 760 * dt * dt;
+    }
+    // drag parting: points inside the pointer disc are pushed out
+    if (pointerDown && pointer) {
+      for (k = 1; k <= TAIL_SEG; k++) {
+        p = st.pts[k];
+        var pdx = p[0] - pointer[0], pdy = p[1] - pointer[1];
+        var pd2 = pdx * pdx + pdy * pdy, PR = 95;
+        if (pd2 < PR * PR && pd2 > 0.01) {
+          var pd = Math.sqrt(pd2), push = (PR - pd) * 0.42;
+          p[0] += pdx / pd * push; p[1] += pdy / pd * push;
+        }
+      }
+    }
+    // distance constraints, root pinned
+    for (var iter = 0; iter < 3; iter++) {
+      st.pts[0][0] = st.ax; st.pts[0][1] = st.ay;
+      for (k = 0; k < TAIL_SEG; k++) {
+        var a = st.pts[k], b = st.pts[k + 1];
+        var dx = b[0] - a[0], dy = b[1] - a[1];
+        var d = Math.sqrt(dx * dx + dy * dy) || 0.001;
+        var diff = (d - st.len) / d;
+        if (k === 0) {
+          b[0] -= dx * diff; b[1] -= dy * diff;
+        } else {
+          a[0] += dx * diff * 0.5; a[1] += dy * diff * 0.5;
+          b[0] -= dx * diff * 0.5; b[1] -= dy * diff * 0.5;
+        }
+      }
+    }
+  }
+}
+function stepSim() {
+  T += TICK;
+  stepTail();
+}
+// Pre-roll the tail before the first frame: the strands settle
+// under gravity into curved hanging raffia, already mid-sway,
+// instead of opening as the straight construction rays. The
+// stamp sits at 28s in the loop, so 90 steps from T=6s stays
+// well clear of it.
+for (var pre = 0; pre < 90; pre++) stepSim();
+
+// ---- horse geometry ------------------------------------------------------------------
+function bodyPath() {
+  ctx.beginPath();
+  ctx.moveTo(350, 352);
+  ctx.lineTo(372, 326);
+  ctx.lineTo(828, 326);
+  ctx.lineTo(854, 352);
+  ctx.lineTo(854, 494);
+  ctx.lineTo(832, 520);
+  ctx.lineTo(372, 520);
+  ctx.lineTo(350, 494);
+  ctx.closePath();
+}
+function legPath(x) {
+  ctx.beginPath();
+  ctx.moveTo(x, 512);
+  ctx.lineTo(x + 56, 512);
+  ctx.lineTo(x + 52, 646);
+  ctx.lineTo(x + 4, 646);
+  ctx.closePath();
+}
+function drawTail() {
+  ctx.strokeStyle = BLACK;
+  ctx.lineWidth = 1.9;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  for (var i = 0; i < strands.length; i++) {
+    var pts = strands[i].pts;
+    ctx.beginPath();
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    for (var k = 1; k < pts.length; k++) ctx.lineTo(pts[k][0], pts[k][1]);
+    ctx.stroke();
+  }
+  // root tuft block covering the anchors
+  ctx.beginPath();
+  ctx.moveTo(338, 330);
+  ctx.lineTo(364, 330);
+  ctx.lineTo(364, 386);
+  ctx.lineTo(342, 380);
+  ctx.closePath();
+  ctx.fillStyle = BLACK;
+  ctx.fill();
+}
+function drawHeadGroup(env) {
+  ctx.save();
+  ctx.translate(830, 392);
+  ctx.rotate(env * 0.07); // head dip with the stamp
+  ctx.translate(-830, -392);
+  ctx.translate(0, env * 10);
+  // neck: one straight-cut diagonal block
+  ctx.beginPath();
+  ctx.moveTo(786, 350);
+  ctx.lineTo(876, 210);
+  ctx.lineTo(962, 232);
+  ctx.lineTo(892, 386);
+  ctx.lineTo(828, 404);
+  ctx.closePath();
+  ctx.fillStyle = BLACK;
+  ctx.fill();
+  // head: chamfered block, axis straight, no smooth anatomy
+  ctx.beginPath();
+  ctx.moveTo(872, 204);
+  ctx.lineTo(1032, 204);
+  ctx.lineTo(1056, 226);
+  ctx.lineTo(1056, 284);
+  ctx.lineTo(1032, 306);
+  ctx.lineTo(884, 296);
+  ctx.closePath();
+  ctx.fillStyle = BLACK;
+  ctx.fill();
+  // ear: small upright block
+  ctx.beginPath();
+  ctx.moveTo(888, 208);
+  ctx.lineTo(896, 172);
+  ctx.lineTo(922, 178);
+  ctx.lineTo(916, 208);
+  ctx.closePath();
+  ctx.fillStyle = BLACK;
+  ctx.fill();
+  // mane: striped blocks along the back edge of the neck,
+  // alternating navy and yellow, tips pointing up and back
+  var mx0 = 876, my0 = 210, mx1 = 786, my1 = 350;
+  for (var i = 0; i < 7; i++) {
+    var u0 = i / 7, u1 = (i + 0.92) / 7;
+    var bx0 = mx0 + (mx1 - mx0) * u0, by0 = my0 + (my1 - my0) * u0;
+    var bx1 = mx0 + (mx1 - mx0) * u1, by1 = my0 + (my1 - my0) * u1;
+    ctx.beginPath();
+    ctx.moveTo(bx0, by0);
+    ctx.lineTo(bx1, by1);
+    ctx.lineTo(bx1 - 24, by1 - 14);
+    ctx.lineTo(bx0 - 24, by0 - 14);
+    ctx.closePath();
+    ctx.fillStyle = (i % 2 === 0) ? NAVY : YELLOW;
+    ctx.fill();
+  }
+  // muzzle: orange block at the front of the head
+  ctx.beginPath();
+  ctx.moveTo(1002, 218);
+  ctx.lineTo(1056, 226);
+  ctx.lineTo(1056, 284);
+  ctx.lineTo(1002, 294);
+  ctx.closePath();
+  ctx.fillStyle = ORANGE;
+  ctx.fill();
+  // navy triangle on the muzzle
+  ctx.beginPath();
+  ctx.moveTo(1024, 240);
+  ctx.lineTo(1050, 254);
+  ctx.lineTo(1024, 272);
+  ctx.closePath();
+  ctx.fillStyle = NAVY;
+  ctx.fill();
+  // crescent eye: white disc cut by an offset black disc
+  ctx.beginPath();
+  ctx.arc(948, 242, 13, 0, Math.PI * 2);
+  ctx.fillStyle = WHITE;
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(954, 238, 11.5, 0, Math.PI * 2);
+  ctx.fillStyle = BLACK;
+  ctx.fill();
+  ctx.restore();
+}
+
+// medallion spots: centre plus a ring of six, fixed data
+var medalSpots = [[0, 0, 9.5]];
+(function () {
+  for (var i = 0; i < 6; i++) {
+    var a = i / 6 * Math.PI * 2 - Math.PI / 2;
+    medalSpots.push([Math.cos(a) * 30, Math.sin(a) * 30, 7.5]);
+  }
+})();
+function medalSpotScale(idx, dist) {
+  if (rippleStart < 0) return 1;
+  var el = T - rippleStart;
+  var local = (el - dist * 0.0045) / 0.55; // cascade outward by distance
+  if (local <= 0 || local >= 1) return 1;
+  return 1 + 0.75 * Math.sin(local * Math.PI);
+}
+
+function draw() {
+  var env = stampEnv();
+  // page ground and the flat ochre ground line at the lower third
+  ctx.fillStyle = GROUND;
+  ctx.fillRect(-80, -80, DW + 160, DH + 160);
+  ctx.fillStyle = BLACK;
+  ctx.fillRect(130, 644, 1020, 6);
+
+  // tail behind the body
+  drawTail();
+
+  // rear leg, planted
+  legPath(378);
+  ctx.fillStyle = BLACK;
+  ctx.fill();
+
+  // front leg: lifts and tucks during the stamp
+  ctx.save();
+  ctx.translate(803, 516);
+  ctx.rotate(-env * 0.38);
+  ctx.translate(-803, -516);
+  ctx.translate(0, -env * 16);
+  legPath(775);
+  ctx.fillStyle = BLACK;
+  ctx.fill();
+  ctx.restore();
+
+  // body block with its white polka-dot field clipped inside
+  ctx.save();
+  bodyPath();
+  ctx.fillStyle = BLACK;
+  ctx.fill();
+  ctx.clip();
+  ctx.fillStyle = WHITE;
+  for (var i = 0; i < bodyDots.length; i++) {
+    ctx.beginPath();
+    ctx.arc(bodyDots[i][0], bodyDots[i][1], bodyDots[i][2], 0, Math.PI * 2);
+    ctx.fill();
+  }
+  // big white S-curve flourish along the flank: one full sine
+  // period plotted as data, a tilde sweep across the body
+  ctx.beginPath();
+  for (var sx = 0; sx <= 40; sx++) {
+    var fx = 392 + sx * 10;
+    var fy = 452 + 58 * Math.sin(sx / 40 * Math.PI * 2);
+    if (sx === 0) ctx.moveTo(fx, fy); else ctx.lineTo(fx, fy);
+  }
+  ctx.strokeStyle = WHITE;
+  ctx.lineWidth = 19;
+  ctx.lineCap = 'round';
+  ctx.stroke();
+  ctx.restore();
+
+  // saddle band: teal block over the back, yellow dash marks
+  ctx.beginPath();
+  ctx.moveTo(578, 318);
+  ctx.lineTo(732, 318);
+  ctx.lineTo(738, 330);
+  ctx.lineTo(738, 432);
+  ctx.lineTo(726, 444);
+  ctx.lineTo(584, 444);
+  ctx.lineTo(572, 432);
+  ctx.lineTo(572, 330);
+  ctx.closePath();
+  ctx.fillStyle = TEAL;
+  ctx.fill();
+  ctx.fillStyle = YELLOW;
+  for (var d = 0; d < 5; d++) {
+    ctx.fillRect(596 + d * 30, 334, 18, 8);
+    ctx.fillRect(596 + d * 30, 418, 18, 8);
+  }
+  for (var v = 0; v < 2; v++) {
+    ctx.fillRect(588, 360 + v * 34, 8, 18);
+    ctx.fillRect(714, 360 + v * 34, 8, 18);
+  }
+
+  // saddle medallion: orange disc, navy spots that ripple on tap
+  ctx.beginPath();
+  ctx.arc(MEDAL[0], MEDAL[1], 52, 0, Math.PI * 2);
+  ctx.fillStyle = ORANGE;
+  ctx.fill();
+  ctx.strokeStyle = BLACK;
+  ctx.lineWidth = 5;
+  ctx.stroke();
+  ctx.fillStyle = NAVY;
+  for (var m = 0; m < medalSpots.length; m++) {
+    var sp = medalSpots[m];
+    var dist = Math.sqrt(sp[0] * sp[0] + sp[1] * sp[1]);
+    ctx.beginPath();
+    ctx.arc(MEDAL[0] + sp[0], MEDAL[1] + sp[1], sp[2] * medalSpotScale(m, dist), 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // neck and head group, dipping with the stamp
+  drawHeadGroup(env);
+}
+
+// ---- resize --------------------------------------------------------------------------------
+function resize() {
+  var vv = window.visualViewport;
+  W = Math.round(vv ? vv.width : window.innerWidth);
+  H = Math.round(vv ? vv.height : window.innerHeight);
+  canvas.width = W; canvas.height = H;
+  var sw = window.screen ? window.screen.width : W;
+  var sh = window.screen ? window.screen.height : H;
+  phone = Math.min(sw, sh) < 700 || H > W * 1.15;
+}
+if (window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', resize);
+window.addEventListener('resize', resize);
+
+// ---- interaction: drag the tail to part it, tap the medallion to ripple --------------------
+function toDesign(e) {
+  var rect = canvas.getBoundingClientRect();
+  return [((e.clientX - rect.left) - OX) / S, ((e.clientY - rect.top) - OY) / S];
+}
+canvas.addEventListener('pointerdown', function (e) {
+  var p = toDesign(e);
+  pointer = p;
+  pointerDown = true;
+  downX = p[0]; downY = p[1];
+  downTime = Date.now();
+  if (canvas.setPointerCapture && e.pointerId !== undefined) {
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+  }
+});
+canvas.addEventListener('pointermove', function (e) {
+  pointer = toDesign(e);
+});
+canvas.addEventListener('pointerup', function (e) {
+  if (!pointerDown) return;
+  var p = toDesign(e);
+  pointer = p;
+  pointerDown = false;
+  var moved = Math.sqrt((p[0] - downX) * (p[0] - downX) + (p[1] - downY) * (p[1] - downY));
+  if (moved < 14 && Date.now() - downTime < 600) {
+    var md = Math.sqrt((p[0] - MEDAL[0]) * (p[0] - MEDAL[0]) + (p[1] - MEDAL[1]) * (p[1] - MEDAL[1]));
+    if (md < 58) rippleStart = T; // tap on the medallion only
+  }
+});
+canvas.addEventListener('pointercancel', function () {
+  pointerDown = false;
+});
+
+// ---- frame -----------------------------------------------------------------------------------
+function frame(time) {
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  ctx.fillStyle = GROUND;
+  ctx.fillRect(0, 0, W, H);
+  // centred fit: the shaped composition keeps its proportions,
+  // centred, with the page ground in the piece ground colour
+  S = Math.min(W / DW, H / DH);
+  OX = (W - DW * S) / 2; OY = (H - DH * S) / 2;
+  ctx.setTransform(S, 0, 0, S, OX, OY);
+  var dt = 0;
+  if (lastNow >= 0 && time > 0) dt = Math.min(0.05, (time - lastNow) / 1000);
+  lastNow = time;
+  acc += dt;
+  var guard = 0;
+  while (acc >= TICK && guard < 4) { stepSim(); acc -= TICK; guard++; }
+  if (guard === 4) acc = 0;
+  draw();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+}
+resize();
+frame(0);
+if (typeof requestAnimationFrame === 'function') {
+  var loop = function (now) { frame(now); requestAnimationFrame(loop); };
+  requestAnimationFrame(loop);
+}
+})();
+</script>
+</body>
+</html>
