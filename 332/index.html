@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>No.332 Cartographies of Cloth</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; overflow:hidden; background:#E7DCC8; }
+  canvas { display:block; touch-action:none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+'use strict';
+// No.332 Cartographies of Cloth (arunima-dazess-wangchuk).
+// After her 2025 textile work: flowing topographic contour
+// lines felted in rust, terracotta and burnt orange across
+// a cloth ground, with exactly ONE dark blue-black river
+// ribbon meandering through on the steepest-descent path.
+// The terrain is an elevation field held as JS data on a
+// fixed node grid: layered value noise from fixed seeds
+// over a broad diagonal fall. Contours are marching squares
+// extracted from that field as path data on every draw; no
+// offscreen canvas, no pre-rendered texture. The felt look
+// is data only: per-segment stroke width jitter from a
+// fixed seed table, plus fibre speckle marks drawn as
+// short strokes along the contour paths. The river starts
+// at the highest border node of the grid (corners excluded
+// by construction and asserted) and follows steepest
+// descent on a depression-filled copy of the field, so it
+// runs as one clean flow line and stops at the first
+// border node on a different edge; grid corners are never
+// stepped on. Idle the terrain is perfectly still, a
+// hanging cloth map. A drag adds a gaussian bump to the
+// elevation field in design coords; contours re-form and
+// the river re-routes, and the new terrain holds when the
+// touch lifts. No spring back. All marks are drawn
+// directly each draw on one canvas.
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var RUST = '#A9502E', TERRA = '#C96F4A', BURNT = '#D97B3F';
+var GROUND = '#E7DCC8', RIVER = '#1E2A33';
+var BANDS = [RUST, TERRA, BURNT];
+var DW = 1280, DH = 900;
+var W = 0, H = 0, phone = false;
+var S = 1, OX = 0, OY = 0;
+
+function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+// ---- fixed seed tables ---------------------------------------
+// Integer hash lattice for the value noise. Deterministic:
+// Math.imul arithmetic only, no runtime random anywhere.
+function hash2(ix, iy) {
+  var h = Math.imul(ix, 374761393) + Math.imul(iy, 668265263) + Math.imul(90210, 1442695041);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  h ^= h >>> 16;
+  return (h >>> 0) / 4294967296;
+}
+// Jitter table for contour widths and fibre decisions.
+var JIT = new Float32Array(1024);
+(function () {
+  var s = 123456789;
+  for (var i = 0; i < JIT.length; i++) {
+    s = (Math.imul(s, 1103515245) + 12345) & 0x7fffffff;
+    JIT[i] = s / 0x7fffffff;
+  }
+})();
+function jit(n) { return JIT[n & 1023]; }
+
+// ---- elevation field on a fixed node grid --------------------
+// 86 by 60 cells, nodes 87 by 61. Node spacing is about 15
+// design px, fine enough for smooth marching squares.
+var COLS = 86, ROWS = 60;
+var NX = COLS + 1, NY = ROWS + 1;
+var CELLW = DW / COLS, CELLH = DH / ROWS;
+var NNODES = NX * NY;
+var elev = new Float32Array(NNODES);
+
+function vnoise(x, y) {
+  var ix = Math.floor(x), iy = Math.floor(y);
+  var fx = x - ix, fy = y - iy;
+  var ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+  var a = hash2(ix, iy), b = hash2(ix + 1, iy);
+  var c = hash2(ix, iy + 1), d = hash2(ix + 1, iy + 1);
+  return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
+}
+function fbm(x, y) {
+  return 0.55 * vnoise(x, y)
+       + 0.27 * vnoise(x * 2 + 13.7, y * 2 + 7.3)
+       + 0.13 * vnoise(x * 4 + 31.1, y * 4 + 17.9)
+       + 0.065 * vnoise(x * 8 + 47.3, y * 8 + 29.5);
+}
+function buildField() {
+  for (var j = 0; j < NY; j++) {
+    for (var i = 0; i < NX; i++) {
+      var x = i * CELLW, y = j * CELLH;
+      var u = x / DW, v = y / DH;
+      // Layered noise over a broad diagonal fall, high
+      // toward the top-left, low toward the bottom-right,
+      // so the river crosses the cloth rather than pooling.
+      var n = fbm(x * 0.0047, y * 0.0047);
+      var ramp = 1 - (0.66 * u + 0.34 * v);
+      elev[j * NX + i] = n * 0.92 + ramp * 0.34;
+    }
+  }
+}
+buildField();
+var EMIN = Infinity, EMAX = -Infinity;
+(function () {
+  for (var k = 0; k < NNODES; k++) {
+    if (elev[k] < EMIN) EMIN = elev[k];
+    if (elev[k] > EMAX) EMAX = elev[k];
+  }
+})();
+// Contour levels stay inside the field range even after a
+// drag raises the land, so new rings form around bumps.
+var LEVELS = [];
+(function () {
+  var lo = EMIN + (EMAX - EMIN) * 0.03, hi = EMAX - (EMAX - EMIN) * 0.02;
+  var NL = 15;
+  for (var k = 0; k < NL; k++) LEVELS.push(lo + (hi - lo) * (k / (NL - 1)));
+})();
+
+// ---- the one river: steepest descent from the highest -------
+// border node. Raw noise is full of pits, so the descent
+// runs on a depression-filled copy of the field (priority
+// flood from the three non-entry edges, Barnes style):
+// every node gets a
+// filled elevation plus a flood order, and the descent
+// field adds a hair of the flood order so filled flats
+// still drain. On that field every interior node has a
+// strictly lower neighbour (its flood parent), so the walk
+// is a clean flow line, never a knot. Corners are excluded
+// as start candidates and are never stepped on; the
+// start-edge border nodes are traversable but never
+// terminal, so the ribbon enters at one edge and exits at
+// another.
+function isCorner(i, j) {
+  return (i === 0 || i === COLS) && (j === 0 || j === ROWS);
+}
+function edgeOf(i, j) {
+  if (j === 0) return 0;        // top
+  if (j === ROWS) return 2;     // bottom
+  if (i === 0) return 3;        // left
+  if (i === COLS) return 1;     // right
+  return -1;
+}
+var filled = new Float32Array(NNODES);
+var drain = new Float32Array(NNODES);
+// The flood is seeded from the three edges other than the
+// entry edge, so in filled terms the entry edge is a
+// watershed divide, not an outlet: every node's flood
+// parent chain then leads off the map through a different
+// edge, which is what keeps the river from pooling in a
+// hollow on its own entry edge.
+function computeFilled(excludeEdge) {
+  var i, j, k;
+  for (k = 0; k < NNODES; k++) { filled[k] = Infinity; drain[k] = Infinity; }
+  var order = new Int32Array(NNODES);
+  var seen = new Uint8Array(NNODES);
+  var hv = [], hn = [];
+  function push(v, n) {
+    hv.push(v); hn.push(n);
+    var c = hv.length - 1;
+    while (c > 0) {
+      var p = (c - 1) >> 1;
+      if (hv[p] <= hv[c]) break;
+      var tv = hv[p]; hv[p] = hv[c]; hv[c] = tv;
+      var tn = hn[p]; hn[p] = hn[c]; hn[c] = tn;
+      c = p;
+    }
+  }
+  function pop() {
+    var top = hn[0];
+    var lv = hv.pop(), ln = hn.pop();
+    if (hv.length > 0) {
+      hv[0] = lv; hn[0] = ln;
+      var c = 0;
+      for (;;) {
+        var l = c * 2 + 1, r = l + 1, m = c;
+        if (l < hv.length && hv[l] < hv[m]) m = l;
+        if (r < hv.length && hv[r] < hv[m]) m = r;
+        if (m === c) break;
+        var tv = hv[m]; hv[m] = hv[c]; hv[c] = tv;
+        var tn = hn[m]; hn[m] = hn[c]; hn[c] = tn;
+        c = m;
+      }
+    }
+    return top;
+  }
+  function seedable(i, j) {
+    var e = edgeOf(i, j);
+    if (e < 0) return false;
+    if (e !== excludeEdge) return true;
+    // A corner sits on two edges; it seeds through its
+    // other edge, never through the entry edge.
+    if (isCorner(i, j)) {
+      var e2 = (j === 0 || j === ROWS) ? (i === 0 ? 3 : 1) : (j === 0 ? 0 : 2);
+      return e2 !== excludeEdge;
+    }
+    return false;
+  }
+  var ord = 0;
+  for (j = 0; j < NY; j++) {
+    for (i = 0; i < NX; i++) {
+      if (!seedable(i, j)) continue;
+      var idx = j * NX + i;
+      filled[idx] = elev[idx];
+      seen[idx] = 1;
+      order[idx] = ord++;
+      push(filled[idx], idx);
+    }
+  }
+  while (hv.length > 0) {
+    var u = pop();
+    var ui = u % NX, uj = (u / NX) | 0;
+    for (var dj = -1; dj <= 1; dj++) {
+      for (var di = -1; di <= 1; di++) {
+        if (di === 0 && dj === 0) continue;
+        var vi = ui + di, vj = uj + dj;
+        if (vi < 0 || vj < 0 || vi > COLS || vj > ROWS) continue;
+        var v = vj * NX + vi;
+        if (seen[v]) continue;
+        seen[v] = 1;
+        filled[v] = Math.max(elev[v], filled[u]);
+        order[v] = ord++;
+        push(filled[v], v);
+      }
+    }
+  }
+  for (k = 0; k < NNODES; k++) drain[k] = filled[k] + order[k] * 2e-7;
+}
+function computeRiver() {
+  // A border node within three steps of a corner counts as
+  // touching the corner: it is never the river's start, the
+  // walk may pass through such nodes but never ends there.
+  function nearCorner(i, j) {
+    var d = Math.min(i + j, (COLS - i) + j, i + (ROWS - j), (COLS - i) + (ROWS - j));
+    return d <= 3;
+  }
+  var si = -1, sj = -1, best = -Infinity;
+  for (var j = 0; j < NY; j++) {
+    for (var i = 0; i < NX; i++) {
+      if (edgeOf(i, j) < 0 || isCorner(i, j) || nearCorner(i, j)) continue;
+      var e = elev[j * NX + i];
+      if (e > best) { best = e; si = i; sj = j; }
+    }
+  }
+  if (si < 0) throw new Error('Cartographies needs a border start');
+  if (isCorner(si, sj) || nearCorner(si, sj)) throw new Error('Cartographies river start touches a corner');
+  var startEdge = edgeOf(si, sj);
+  computeFilled(startEdge);
+  var path = [[si, sj]];
+  var visited = new Uint8Array(NNODES);
+  visited[sj * NX + si] = 1;
+  var ci = si, cj = sj;
+  for (var step = 0; step < NNODES; step++) {
+    var ce = edgeOf(ci, cj);
+    if ((ci !== si || cj !== sj) && ce >= 0 && ce !== startEdge && !nearCorner(ci, cj)) break;
+    var cur = drain[cj * NX + ci];
+    var bi = -1, bj = -1, bVal = Infinity;   // lowest lower neighbour
+    var ei = -1, ej = -1, eVal = Infinity;   // lowest escape neighbour
+    for (var dj = -1; dj <= 1; dj++) {
+      for (var di = -1; di <= 1; di++) {
+        if (di === 0 && dj === 0) continue;
+        var ni = ci + di, nj = cj + dj;
+        if (ni < 0 || nj < 0 || ni > COLS || nj > ROWS) continue;
+        if (isCorner(ni, nj)) continue;
+        if (visited[nj * NX + ni]) continue;
+        var nv = drain[nj * NX + ni];
+        if (nv < cur && nv < bVal) { bVal = nv; bi = ni; bj = nj; }
+        if (nv < eVal) { eVal = nv; ei = ni; ej = nj; }
+      }
+    }
+    // Strict descent first. If the walk pools against a lip
+    // (only possible where a drag has walled off a corner),
+    // it spills over the lowest unvisited neighbour and
+    // resumes descending; visited marks keep it a single
+    // line, never a knot.
+    if (bi >= 0) { ci = bi; cj = bj; }
+    else if (ei >= 0) { ci = ei; cj = ej; }
+    else break;
+    visited[cj * NX + ci] = 1;
+    path.push([ci, cj]);
+  }
+  return path;
+}
+var rivers = [computeRiver()];
+if (rivers.length !== 1) throw new Error('Cartographies needs exactly one river');
+var riverDirty = false;
+
+// Smooth a node path with two Chaikin passes and extend the
+// ends past the frame edges so the ribbon visibly enters
+// and exits the cloth.
+function smoothPath(path) {
+  var pts = [];
+  var i;
+  for (i = 0; i < path.length; i++) pts.push([path[i][0] * CELLW, path[i][1] * CELLH]);
+  if (pts.length > 1) {
+    var d0x = pts[0][0] - pts[1][0], d0y = pts[0][1] - pts[1][1];
+    var l0 = Math.sqrt(d0x * d0x + d0y * d0y) || 1;
+    pts.unshift([pts[0][0] + d0x / l0 * 46, pts[0][1] + d0y / l0 * 46]);
+    var n = pts.length - 1;
+    var d1x = pts[n][0] - pts[n - 1][0], d1y = pts[n][1] - pts[n - 1][1];
+    var l1 = Math.sqrt(d1x * d1x + d1y * d1y) || 1;
+    pts.push([pts[n][0] + d1x / l1 * 46, pts[n][1] + d1y / l1 * 46]);
+  }
+  for (var pass = 0; pass < 2; pass++) {
+    var out = [pts[0]];
+    for (i = 0; i < pts.length - 1; i++) {
+      var ax = pts[i][0], ay = pts[i][1], bx = pts[i + 1][0], by = pts[i + 1][1];
+      out.push([ax * 0.75 + bx * 0.25, ay * 0.75 + by * 0.25]);
+      out.push([ax * 0.25 + bx * 0.75, ay * 0.25 + by * 0.75]);
+    }
+    out.push(pts[pts.length - 1]);
+    pts = out;
+  }
+  return pts;
+}
+function drawRiver() {
+  var pts = smoothPath(rivers[0]);
+  if (pts.length < 2) return;
+  var half = 6.5;
+  var left = [], right = [];
+  for (var i = 0; i < pts.length; i++) {
+    var px = pts[Math.max(0, i - 1)][0], py = pts[Math.max(0, i - 1)][1];
+    var qx = pts[Math.min(pts.length - 1, i + 1)][0], qy = pts[Math.min(pts.length - 1, i + 1)][1];
+    var dx = qx - px, dy = qy - py;
+    var l = Math.sqrt(dx * dx + dy * dy) || 1;
+    var nx = -dy / l, ny = dx / l;
+    left.push([pts[i][0] + nx * half, pts[i][1] + ny * half]);
+    right.push([pts[i][0] - nx * half, pts[i][1] - ny * half]);
+  }
+  ctx.fillStyle = RIVER;
+  ctx.beginPath();
+  ctx.moveTo(left[0][0], left[0][1]);
+  for (i = 1; i < left.length; i++) ctx.lineTo(left[i][0], left[i][1]);
+  for (i = right.length - 1; i >= 0; i--) ctx.lineTo(right[i][0], right[i][1]);
+  ctx.closePath();
+  ctx.fill();
+}
+
+// ---- marching squares, extracted as data each draw -----------
+// Corner order: a top-left, b top-right, c bottom-right,
+// d bottom-left. Edges: T a-b, R b-c, B d-c, Lf a-d.
+function cellSegments(a, b, c, d, L, x0, y0) {
+  var idx = (a > L ? 1 : 0) | (b > L ? 2 : 0) | (c > L ? 4 : 0) | (d > L ? 8 : 0);
+  if (idx === 0 || idx === 15) return null;
+  var T = null, R = null, B = null, Lf = null;
+  function top() { var t = (L - a) / (b - a); return [x0 + t * CELLW, y0]; }
+  function rgt() { var t = (L - b) / (c - b); return [x0 + CELLW, y0 + t * CELLH]; }
+  function bot() { var t = (L - d) / (c - d); return [x0 + t * CELLW, y0 + CELLH]; }
+  function lft() { var t = (L - a) / (d - a); return [x0, y0 + t * CELLH]; }
+  switch (idx) {
+    case 1: case 14: return [[lft(), top()]];
+    case 2: case 13: return [[top(), rgt()]];
+    case 3: case 12: return [[lft(), rgt()]];
+    case 4: case 11: return [[rgt(), bot()]];
+    case 6: case 9: return [[top(), bot()]];
+    case 7: case 8: return [[lft(), bot()]];
+    case 5: {
+      var m = (a + b + c + d) / 4;
+      if (m > L) return [[top(), rgt()], [lft(), bot()]];
+      return [[lft(), top()], [rgt(), bot()]];
+    }
+    case 10: {
+      var m2 = (a + b + c + d) / 4;
+      if (m2 > L) return [[lft(), top()], [rgt(), bot()]];
+      return [[top(), rgt()], [lft(), bot()]];
+    }
+  }
+  return null;
+}
+
+function drawContours() {
+  ctx.lineCap = 'round';
+  for (var li = 0; li < LEVELS.length; li++) {
+    var L = LEVELS[li];
+    var col = BANDS[li % 3];
+    ctx.strokeStyle = col;
+    for (var j = 0; j < ROWS; j++) {
+      var y0 = j * CELLH;
+      for (var i = 0; i < COLS; i++) {
+        var a = elev[j * NX + i], b = elev[j * NX + i + 1];
+        var c = elev[(j + 1) * NX + i + 1], d = elev[(j + 1) * NX + i];
+        if ((a > L) === (b > L) && (b > L) === (c > L) && (c > L) === (d > L)) continue;
+        var segs = cellSegments(a, b, c, d, L, i * CELLW, y0);
+        if (!segs) continue;
+        var seed = (i * 73856093) ^ (j * 19349663) ^ (li * 83492791);
+        var wid = 4.6 + (jit(seed) - 0.5) * 3.4;
+        for (var s = 0; s < segs.length; s++) {
+          var p = segs[s][0], q = segs[s][1];
+          ctx.lineWidth = wid;
+          ctx.beginPath();
+          ctx.moveTo(p[0], p[1]);
+          ctx.lineTo(q[0], q[1]);
+          ctx.stroke();
+          // Fibre speckle: a short stroke just off the
+          // contour, seeded per segment, in the band colour
+          // or the cloth ground, both at low alpha.
+          var r1 = jit(seed + 57), r2 = jit(seed + 131), r3 = jit(seed + 271);
+          if (r1 < 0.42) {
+            var mx = (p[0] + q[0]) / 2, my = (p[1] + q[1]) / 2;
+            var dx = q[0] - p[0], dy = q[1] - p[1];
+            var dl = Math.sqrt(dx * dx + dy * dy) || 1;
+            var nx = -dy / dl, ny = dx / dl;
+            var off = (r2 - 0.5) * 11;
+            var fx = mx + nx * off, fy = my + ny * off;
+            var ang = Math.atan2(dy, dx) + (r3 - 0.5) * 0.9;
+            var fl = 4.5 + r2 * 6;
+            ctx.strokeStyle = r3 < 0.4 ? GROUND : col;
+            ctx.globalAlpha = 0.5;
+            ctx.lineWidth = 1.5;
+            ctx.beginPath();
+            ctx.moveTo(fx - Math.cos(ang) * fl / 2, fy - Math.sin(ang) * fl / 2);
+            ctx.lineTo(fx + Math.cos(ang) * fl / 2, fy + Math.sin(ang) * fl / 2);
+            ctx.stroke();
+            ctx.globalAlpha = 1;
+            ctx.strokeStyle = col;
+          }
+        }
+      }
+    }
+  }
+}
+
+// ---- drawing ---------------------------------------------------
+var dirty = true;
+function draw() {
+  ctx.fillStyle = GROUND;
+  ctx.fillRect(0, 0, DW, DH);
+  if (riverDirty) { rivers[0] = computeRiver(); riverDirty = false; }
+  drawContours();
+  drawRiver();
+}
+
+// ---- interaction: drag raises the land, and it holds ---------
+var SIG = 120, BUMP_R = 360;
+function bump(x, y, amp) {
+  var i0 = Math.max(0, Math.floor((x - BUMP_R) / CELLW)), i1 = Math.min(COLS, Math.ceil((x + BUMP_R) / CELLW));
+  var j0 = Math.max(0, Math.floor((y - BUMP_R) / CELLH)), j1 = Math.min(ROWS, Math.ceil((y + BUMP_R) / CELLH));
+  var twoS2 = 2 * SIG * SIG;
+  for (var j = j0; j <= j1; j++) {
+    for (var i = i0; i <= i1; i++) {
+      var dx = i * CELLW - x, dy = j * CELLH - y;
+      var d2 = dx * dx + dy * dy;
+      if (d2 > BUMP_R * BUMP_R) continue;
+      var nv = elev[j * NX + i] + amp * Math.exp(-d2 / twoS2);
+      elev[j * NX + i] = nv > EMAX + 1.2 ? EMAX + 1.2 : nv;
+    }
+  }
+  riverDirty = true;
+  dirty = true;
+}
+var drag = null;
+function resize() {
+  var vv = window.visualViewport;
+  W = Math.round(vv ? vv.width : window.innerWidth);
+  H = Math.round(vv ? vv.height : window.innerHeight);
+  canvas.width = W; canvas.height = H;
+  var sw = window.screen ? window.screen.width : W;
+  var sh = window.screen ? window.screen.height : H;
+  phone = Math.min(sw, sh) < 700 || H > W * 1.15;
+  dirty = true;
+}
+if (window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', resize);
+window.addEventListener('resize', resize);
+
+function toDesign(e) {
+  var rect = canvas.getBoundingClientRect();
+  return [((e.clientX - rect.left) - OX) / S, ((e.clientY - rect.top) - OY) / S];
+}
+canvas.addEventListener('pointerdown', function (e) {
+  var p = toDesign(e);
+  drag = { x: p[0], y: p[1] };
+  bump(p[0], p[1], 0.22);
+});
+canvas.addEventListener('pointermove', function (e) {
+  if (!drag) return;
+  var p = toDesign(e);
+  drag.x = p[0]; drag.y = p[1];
+  bump(p[0], p[1], 0.15);
+});
+canvas.addEventListener('pointerup', function () { drag = null; });
+canvas.addEventListener('pointercancel', function () { drag = null; });
+
+function frame(time) {
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  S = Math.max(W / DW, H / DH);
+  OX = (W - DW * S) / 2; OY = (H - DH * S) / 2;
+  ctx.setTransform(S, 0, 0, S, OX, OY);
+  if (dirty) { draw(); dirty = false; }
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+}
+resize();
+frame(0);
+if (typeof requestAnimationFrame === 'function') {
+  var loop = function (now) { frame(now); if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop); };
+  requestAnimationFrame(loop);
+}
+})();
+</script>
+</body>
+</html>
