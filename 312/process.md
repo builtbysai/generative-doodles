@@ -1,0 +1,7 @@
+# No.312 Marble & Transfer
+
+After Xanthe Caesia's marbled mugs: a single large ceramic mug centred on a dark ground, its clay swirled agateware-style in brown and cream. The marbling is a seeded two-colour domain-warped fbm field, recomputed as plain data each frame and clipped to the mug's rounded lathe profile, handle included. There is no offscreen layer: the warp lives in the numbers, and dragging across the mug advects the warp phase by the drag vector, so the clay slowly re-swirls under the finger and then holds still when the hand lifts.
+
+Stamped on the face is a crisp silkscreen transfer in flat underglaze black with a single accent colour. Exactly one motif shows at a time, asserted. The authored cycle runs wattle sprig in wattle gold, bee in bee amber, banksia in banksia rust, and butterfly in bee amber, always in that order, never a random pick. Frame one opens with the marbling already developed and the wattle sprig already stamped.
+
+The transfer is drawn after the clay, unwarped, as flat path data, so the print stays perfectly sharp while the clay moves beneath it. That contrast, soft marbled ground against hard graphic overlay, is the point of the piece. Tapping the mug stamps the next motif with a brief press-and-lift: a small scale pop as the ink settles. Nothing reloads. The palette is only the clay brown, the clay cream, the transfer ink, the three named accents, and the dark ground.

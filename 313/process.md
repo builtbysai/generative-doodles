@@ -1,0 +1,9 @@
+# No.313 Potion Pair
+
+After Xanthe Caesia's potion bottles: two small ceramic bottles, squat and round with cork stoppers, sitting left and right in generous dark space. One is raku black, its glaze carrying six seeded feather-carbon trails with fine barbs and a pale salt speckle burnt into the surface. The other is cream, wrapped in cobalt underglaze: two broad sweep bands under four tight spiral swirls. Exactly two bottles, asserted in code. There is no glass and no visible liquid anywhere.
+
+The potion shows only as light. At each cork seam a band of ember glow breathes slowly, and at each base a faint hum ring answers it, both drawn as layered translucent strokes with no gradient and no blur. A thin thread of gold light arcs between the two corks, stroked in softening layers so it reads as light rather than wire. Idle, the pair runs an eighteen second seamless loop: both glows breathe on offset phases and the link holds its faint arc, brightening and dimming with them. Frame one opens mid-breath, the pair at home and the link already drawn.
+
+Drag one bottle and it moves with the pointer while its pair follows through a critically-damped spring, lagging softly behind the leader's displacement, staying upright and unflipped the whole time. The gold link stretches as the separation grows and brightens with it, capped at an authored maximum so the pair can never be pulled apart. Release, and both bottles ease back to their home positions on the same spring. Tap a cork and that bottle's seam glow pulses once while a single bubble rises through its seam light and fades, recycled fresh on the next tap. Nothing reloads.
+
+The palette is only the raku black, the cream, the cobalt, the cork brown, the link gold, the fixed ember glow and the dark ground. All decoration is seeded path data drawn each frame on a single canvas, with no offscreen layer.
