@@ -3,764 +3,924 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-<title>№9104 · Two Tables, One Marble</title>
+<title>№ 9104</title>
+<!-- 9104-FROM-SCRATCH-V3 -->
 <style>
-  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #6f6152; }
-  canvas { display: block; width: 100vw; height: 100vh; touch-action: none; }
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #1a120b; }
+  canvas { display: block; width: 100%; height: 100%; touch-action: none; }
   #mute { position: fixed; top: 14px; right: 14px; width: 44px; height: 44px;
-    border: none; border-radius: 50%; background: rgba(20,14,8,.55); cursor: pointer;
-    display: flex; align-items: center; justify-content: center; z-index: 5; padding: 0; }
-  #mute svg { width: 24px; height: 24px; fill: #f2ead8; }
-  #mute .slash { display: none; }
-  #mute.off .slash { display: block; }
-  #mute.off .waves { display: none; }
-  #switcher { position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%);
-    display: flex; gap: 14px; z-index: 5; }
-  #switcher .dot { width: 16px; height: 16px; border-radius: 50%; padding: 0;
-    border: 2px solid rgba(242,234,216,.85); background: transparent; cursor: pointer; }
-  #switcher .dot.on { background: #f2c200; }
-  #enginelog { display: none; }
+    border: none; border-radius: 50%; background: rgba(20, 12, 6, 0.55);
+    cursor: pointer; padding: 0; display: flex; align-items: center; justify-content: center; }
+  #mute svg { width: 26px; height: 26px; fill: #f5ead2; }
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
-<button id="mute" aria-label="sound toggle"><svg viewBox="0 0 24 24"><path d="M3 9v6h4l5 5V4L7 9H3z"/><path class="waves" d="M16 8a5 5 0 0 1 0 8M18.5 5.5a9 9 0 0 1 0 13"/><line class="slash" x1="2" y1="2" x2="22" y2="22" stroke="#f2ead8" stroke-width="2"/></svg></button>
-<div id="switcher"><button id="dot0" class="dot on"></button><button id="dot1" class="dot"></button></div>
-<div id="enginelog"></div>
+<button id="mute" aria-label="sound"></button>
 <script>
-(function () {
-  "use strict";
+// 9104 from-scratch rigid-body simulation.
+// One unified impulse-based engine, fixed timestep, deterministic (no randomness).
+// No DOM dependency: usable from Node tests and from the browser renderer.
+// Rules enforced by construction (no exceptions anywhere in this file):
+//  - no capture zones, no lerping to centers, no fixed release velocities
+//  - no angle-threshold triggers for behavior (logging only)
+//  - no scripted stage state machine driving motion; motion comes only from
+//    gravity, contact impulses, friction, and pinned-body torques.
+// A "hand block" static segment holds ball 1 on the ramp until t = 0.6 s and
+// is then removed: a release, not a velocity preset.
+(function (global) {
+  'use strict';
+  var GRAV = 2000;
+  var DT = 1 / 480;
+  var CAT = { BALL: 1, DOMINO: 2, STATIC: 4, ROTOR: 8, SEESAW: 16, CRANK: 32 };
+  var ALL = 0xFFFF;
 
-  // №9104 — MARBLE-MACHINE ENGINE, v2 (ENGINE-V2).
-  // A general, deterministic 2D physics core plus a parts library.
-  // A machine is DATA: channels, segments, domino rows, trapdoor cups,
-  // spinner gates, seesaws, gap trays, end boxes. The stepper below
-  // knows nothing about any one machine: adding or rearranging a part
-  // means editing the description, not the physics.
-  // Two machines ship on the same engine: A "Two Tables, One Marble"
-  // (the original 9104 chain) and B "The Long Way Round" (same parts,
-  // different route and part order). One continuous take, follow-cam
-  // with eased lookahead, no cuts. Watch-first; drag nudges the marble
-  // or tips the seesaw early. Nothing restarts, nothing reloads, no
-  // legible text. The two dots below (or a horizontal swipe) choose a
-  // machine; choosing a machine is not restarting a chain.
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function rotX(x, y, c, s) { return x * c - y * s; }
+  function rotY(x, y, c, s) { return x * s + y * c; }
 
-  var WORLD_W = 1600, WORLD_H = 2300;
-  var GRAV = 1400, DT = 1 / 240, BALL_R = 16;
-  var canvas = document.getElementById('c');
-  var ctx = canvas.getContext('2d');
-  var logEl = document.getElementById('enginelog');
-
-  function mulberry(s) {
-    var a = s >>> 0;
-    return function () {
-      a |= 0; a = (a + 0x6D2B79F5) | 0;
-      var t = Math.imul(a ^ (a >>> 15), 1 | a);
-      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-    };
+  // ---------------- bodies ----------------
+  // Circle body: {kind:'circle', x,y,vx,vy,angle,omega,mass,invMass,inertia,invInertia,...}
+  function circleBody(id, x, y, r, density, cat, mask, fric, rest) {
+    var m = Math.PI * r * r * density / 100;
+    // Dummy fixture (never used for shape, only for mask checks) so the
+    // body-vs-static-box loop processes circles: without it, balls fell
+    // straight through the shelf, housing, and box floor.
+    return { id: id, kind: 'circle', type: 'dyn', x: x, y: y, vx: 0, vy: 0,
+      angle: 0, omega: 0, r: r, mass: m, invMass: 1 / m,
+      inertia: 0.5 * m * r * r, invInertia: 1 / (0.5 * m * r * r),
+      cat: cat, mask: mask, fric: fric, rest: rest,
+      fixtures: [fixture(0, 0, 0, 0, 0, cat, mask, fric, rest, 'circle')] };
   }
-  var rng = mulberry(9104);
-
-  // ---------- stage logging (headless tests read this) ----------
-  function logStage(name) {
-    if (!R || R.stages.indexOf(name) !== -1) return;
-    R.stages.push(name);
-    try { console.log('ENGINE-STAGE:' + name); } catch (e) {}
-    logEl.textContent = R.idx + ':' + R.stages.join(',');
-    if (name === 'DONE' && window.__ENGINE) window.__ENGINE.done = true;
+  // Box fixture: local center (cx,cy), size (w,h), local angle a.
+  function fixture(cx, cy, w, h, a, cat, mask, fric, rest, name) {
+    return { cx: cx, cy: cy, w: w, h: h, a: a || 0, cat: cat, mask: mask,
+      fric: fric, rest: rest, name: name || '' };
   }
-
-  // ---------- audio ----------
-  var AC = null, master = null, rollGain = null, rollFilter = null, muted = false;
-  var lastKnock = 0;
-  function ensureAudio() {
-    if (AC) { if (AC.state === 'suspended') AC.resume(); return; }
-    try {
-      AC = new (window.AudioContext || window.webkitAudioContext)();
-      master = AC.createGain(); master.gain.value = 0.5; master.connect(AC.destination);
-      var len = AC.sampleRate, buf = AC.createBuffer(1, len, AC.sampleRate), d = buf.getChannelData(0);
-      for (var i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
-      var src = AC.createBufferSource(); src.buffer = buf; src.loop = true;
-      rollFilter = AC.createBiquadFilter(); rollFilter.type = 'lowpass'; rollFilter.frequency.value = 420;
-      rollGain = AC.createGain(); rollGain.gain.value = 0;
-      src.connect(rollFilter); rollFilter.connect(rollGain); rollGain.connect(master);
-      src.start();
-    } catch (e) { AC = null; }
-  }
-  function knock(freq, vol, dur) {
-    if (!AC || muted) return;
-    var now = AC.currentTime;
-    if (now - lastKnock < 0.045) return;
-    lastKnock = now;
-    var o = AC.createOscillator(), g = AC.createGain(), f = AC.createBiquadFilter();
-    o.type = 'triangle'; o.frequency.setValueAtTime(freq, now);
-    o.frequency.exponentialRampToValueAtTime(Math.max(60, freq * 0.4), now + dur);
-    f.type = 'bandpass'; f.frequency.value = freq; f.Q.value = 1.2;
-    g.gain.setValueAtTime(vol, now); g.gain.exponentialRampToValueAtTime(0.001, now + dur);
-    o.connect(f); f.connect(g); g.connect(master);
-    o.start(now); o.stop(now + dur + 0.02);
-  }
-  function click(vol) {
-    if (!AC || muted) return;
-    var now = AC.currentTime, len = Math.floor(AC.sampleRate * 0.03);
-    var buf = AC.createBuffer(1, len, AC.sampleRate), d = buf.getChannelData(0);
-    for (var i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / len);
-    var s = AC.createBufferSource(); s.buffer = buf;
-    var f = AC.createBiquadFilter(); f.type = 'highpass'; f.frequency.value = 2800;
-    var g = AC.createGain(); g.gain.value = vol;
-    s.connect(f); f.connect(g); g.connect(master); s.start(now);
-  }
-  document.getElementById('mute').addEventListener('click', function (e) {
-    e.stopPropagation(); ensureAudio(); muted = !muted;
-    this.classList.toggle('off', muted);
-    if (rollGain) rollGain.gain.value = 0;
-  });
-  window.addEventListener('pointerdown', ensureAudio, { once: false });
-
-  // ================= PHYSICS CORE =================
-  // Circle vs segment collision. Returns impact speed along normal (or 0).
-  var contact = false;
-  function collide(b, s) {
-    var dx = s.x2 - s.x1, dy = s.y2 - s.y1;
-    var len2 = dx * dx + dy * dy;
-    var t = len2 === 0 ? 0 : ((b.x - s.x1) * dx + (b.y - s.y1) * dy) / len2;
-    t = Math.max(0, Math.min(1, t));
-    var cx = s.x1 + dx * t, cy = s.y1 + dy * t;
-    var nx = b.x - cx, ny = b.y - cy;
-    var d = Math.sqrt(nx * nx + ny * ny), min = BALL_R + s.thick;
-    if (d >= min) return 0;
-    if (d === 0) { nx = 0; ny = -1; d = 1; } else { nx /= d; ny /= d; }
-    b.x = cx + nx * min; b.y = cy + ny * min;
-    var vn = b.vx * nx + b.vy * ny;
-    if (vn < 0) {
-      b.vx -= (1 + s.e) * vn * nx; b.vy -= (1 + s.e) * vn * ny;
-      b.vx *= 0.9995; b.vy *= 0.9995;
-      contact = true;
-      return -vn;
+  // Dynamic single/multi-fixture box body.
+  function polyBody(id, x, y, angle, fixtures, density) {
+    var m = 0, ix = 0, iy = 0;
+    for (var i = 0; i < fixtures.length; i++) {
+      var f = fixtures[i], fm = f.w * f.h * density / 100;
+      m += fm; ix += fm * f.cx; iy += fm * f.cy;
     }
-    return 0;
+    var comX = ix / m, comY = iy / m, inertia = 0;
+    for (var j = 0; j < fixtures.length; j++) {
+      var g = fixtures[j], gm = g.w * g.h * density / 100;
+      var dx = g.cx - comX, dy = g.cy - comY;
+      inertia += gm * (g.w * g.w + g.h * g.h) / 12 + gm * (dx * dx + dy * dy);
+    }
+    return { id: id, kind: 'poly', type: 'dyn', x: x, y: y, vx: 0, vy: 0,
+      angle: angle, omega: 0, mass: m, invMass: 1 / m, inertia: inertia,
+      invInertia: 1 / inertia, comX: comX, comY: comY, fixtures: fixtures };
+  }
+  // Pinned body: rotates about `anchor`, position derived from angle.
+  // Fixture centers are local to the pivot. A torsional spring (k) and
+  // angular damping (c) may be supplied; both are physical torques.
+  function pinnedBody(id, anchorX, anchorY, fixtures, density, springK, dampC) {
+    var b = polyBody(id, anchorX, anchorY, 0, fixtures, density);
+    b.type = 'pinned'; b.invMass = 0;
+    b.anchorX = anchorX; b.anchorY = anchorY;
+    b.springK = springK || 0; b.springA0 = 0; b.dampC = dampC || 0;
+    return b;
+  }
+  // Numerical safety rails only: they engage solely on pathological
+  // penetration/velocity (vise cases), never in normal operation.
+  function clampVelocity(b) {
+    if (b.type !== 'dyn') return;
+    var sp = Math.sqrt(b.vx * b.vx + b.vy * b.vy);
+    if (sp > 5000) { b.vx *= 5000 / sp; b.vy *= 5000 / sp; }
+    if (Math.abs(b.omega) > 50) b.omega = 50 * Math.sign(b.omega);
+  }
+  function staticBox(id, cx, cy, w, h, angle, mask) {
+    return { id: id, kind: 'poly', type: 'static', x: cx, y: cy, vx: 0, vy: 0,
+      angle: angle || 0, omega: 0, mass: Infinity, invMass: 0, inertia: Infinity,
+      invInertia: 0, comX: 0, comY: 0,
+      fixtures: [fixture(0, 0, w, h, 0, CAT.STATIC, mask, 0.8, 0, 'static')] };
+  }
+  // Pinned-body hinge limits are mechanical stops, not scripted motion.
+  function applyHingeLimits(b) {
+    if (b.type !== 'pinned') return;
+    if (b.angleMin !== undefined && b.angle < b.angleMin) { b.angle = b.angleMin; if (b.omega < 0) b.omega = 0; }
+    if (b.angleMax !== undefined && b.angle > b.angleMax) { b.angle = b.angleMax; if (b.omega > 0) b.omega = 0; }
+  }
+  function staticSeg(id, x1, y1, x2, y2, mask, fric, rest) {
+    return { id: id, kind: 'seg', type: 'static', x1: x1, y1: y1, x2: x2, y2: y2,
+      x: (x1 + x2) / 2, y: (y1 + y2) / 2, vx: 0, vy: 0, angle: 0, omega: 0,
+      mass: Infinity, invMass: 0, inertia: Infinity, invInertia: 0,
+      cat: CAT.STATIC, mask: mask, fric: fric || 0.5, rest: rest || 0.1 };
   }
 
-  // A plank (domino or seesaw) as the segment it currently occupies.
-  function plankSeg(p) {
-    if (p.kind === 'domino') {
-      var s = Math.sin(p.th), c = Math.cos(p.th);
-      return { x1: p.x, y1: p.base, x2: p.x + p.dir * p.h * s, y2: p.base - p.h * c,
-               e: 0.1, thick: 8, kind: 'domino' };
+  // World-space corners of a fixture of a poly body.
+  function fixtureCorners(b, f) {
+    var c = Math.cos(b.angle), s = Math.sin(b.angle);
+    var cc = Math.cos(b.angle + f.a), ss = Math.sin(b.angle + f.a);
+    var wx = b.x + rotX(f.cx, f.cy, c, s), wy = b.y + rotY(f.cx, f.cy, c, s);
+    var hw = f.w / 2, hh = f.h / 2;
+    var pts = [[hw, -hh], [hw, hh], [-hw, hh], [-hw, -hh]];
+    var out = [];
+    for (var i = 0; i < 4; i++) {
+      out.push([wx + rotX(pts[i][0], pts[i][1], cc, ss),
+                wy + rotY(pts[i][0], pts[i][1], cc, ss)]);
     }
-    var c2 = Math.cos(p.ang), s2 = Math.sin(p.ang);
-    return { x1: p.pivotX - p.half * c2, y1: p.pivotY - p.half * s2,
-             x2: p.pivotX + p.half * c2, y2: p.pivotY + p.half * s2,
-             e: 0.10, thick: 9, kind: 'plank' };
+    return out;
+  }
+  function bodyPoint(b, lx, ly) {
+    var c = Math.cos(b.angle), s = Math.sin(b.angle);
+    return [b.x + rotX(lx, ly, c, s), b.y + rotY(lx, ly, c, s)];
   }
 
-  // ================= PARTS LIBRARY =================
-  // Channel: two continuous rails offset +-40 from a center polyline.
-  // Each rail is one polyline with mitered vertices (vertex normal =
-  // average of adjacent segment normals), so joints are sealed with no
-  // crossing extensions for the ball to wedge in.
-  // skipFirstSide: omit one side's rail on the first segment only, for
-  // an open-top drop-in entry (a ball falling in from above must not
-  // meet a top rail across its fall path).
-  function buildChannel(pts, e, skipFirstSide) {
-    var out = [], n = pts.length, normals = [];
-    for (var i = 0; i < n - 1; i++) {
-      var dx = pts[i + 1][0] - pts[i][0], dy = pts[i + 1][1] - pts[i][1];
-      var len = Math.sqrt(dx * dx + dy * dy);
-      normals.push([-dy / len, dx / len]);
+  // ---------------- contact detection ----------------
+  // Contact: {a, b, px, py, nx, ny, pen, fric, rest} with normal from A to B.
+  function project(corners, ax, ay) {
+    var mn = Infinity, mx = -Infinity;
+    for (var i = 0; i < corners.length; i++) {
+      var d = corners[i][0] * ax + corners[i][1] * ay;
+      if (d < mn) mn = d; if (d > mx) mx = d;
     }
-    function vnormal(i) {
-      if (i === 0) return normals[0];
-      if (i === n - 1) return normals[n - 2];
-      var nx = normals[i - 1][0] + normals[i][0], ny = normals[i - 1][1] + normals[i][1];
-      var l = Math.sqrt(nx * nx + ny * ny) || 1;
-      return [nx / l, ny / l];
+    return [mn, mx];
+  }
+  function faceNormal(corners, i) {
+    var p1 = corners[i], p2 = corners[(i + 1) % 4];
+    var ex = p2[0] - p1[0], ey = p2[1] - p1[1];
+    var mx = (p1[0] + p2[0]) / 2, my = (p1[1] + p2[1]) / 2;
+    var cx = (corners[0][0] + corners[2][0]) / 2, cy = (corners[0][1] + corners[2][1]) / 2;
+    var nx = ey, ny = -ex, len = Math.sqrt(nx * nx + ny * ny) || 1;
+    nx /= len; ny /= len;
+    if (nx * (mx - cx) + ny * (my - cy) < 0) { nx = -nx; ny = -ny; }
+    return [nx, ny];
+  }
+  function clipSegment(p1, p2, nx, ny, offset) {
+    var d1 = p1[0] * nx + p1[1] * ny - offset;
+    var d2 = p2[0] * nx + p2[1] * ny - offset;
+    var out = [];
+    if (d1 <= 0) out.push(p1);
+    if (d2 <= 0) out.push(p2);
+    if (d1 * d2 < 0) {
+      var t = d1 / (d1 - d2);
+      out.push([p1[0] + (p2[0] - p1[0]) * t, p1[1] + (p2[1] - p1[1]) * t]);
     }
-    for (var side = -1; side <= 1; side += 2) {
-      for (var j = 0; j < n - 1; j++) {
-        if (j === 0 && side === skipFirstSide) continue;
-        var vn1 = vnormal(j), vn2 = vnormal(j + 1);
-        out.push({ x1: pts[j][0] + vn1[0] * 40 * side, y1: pts[j][1] + vn1[1] * 40 * side,
-                   x2: pts[j + 1][0] + vn2[0] * 40 * side, y2: pts[j + 1][1] + vn2[1] * 40 * side,
-                   e: e, thick: 6, kind: 'rail' });
+    return out;
+  }
+  // Box-box via SAT + reference/incident face clipping. Returns contacts (0..2).
+  function collideBoxBox(bA, fA, bB, fB) {
+    var cA = fixtureCorners(bA, fA), cB = fixtureCorners(bB, fB);
+    var best = { sep: -Infinity, ref: null, refFace: -1, nx: 0, ny: 0 };
+    function testFaces(cornersRef, cornersInc, refIsA) {
+      for (var i = 0; i < 4; i++) {
+        var n = faceNormal(cornersRef, i);
+        var p = cornersRef[i];
+        var minSep = Infinity;
+        for (var j = 0; j < 4; j++) {
+          var sep = (cornersInc[j][0] - p[0]) * n[0] + (cornersInc[j][1] - p[1]) * n[1];
+          if (sep < minSep) minSep = sep;
+        }
+        // Separation of the incident box from the reference face plane:
+        // positive means fully outside on that side. We track the LARGEST
+        // (least penetrating) separation; collision needs all <= 0.
+        if (minSep > best.sep) {
+          best.sep = minSep; best.refIsA = refIsA; best.refFace = i;
+          best.nx = n[0]; best.ny = n[1];
+        }
+      }
+    }
+    testFaces(cA, cB, true);
+    testFaces(cB, cA, false);
+    if (best.sep > 0) return [];
+    // Reference face / incident face.
+    var refC, incC, nRef;
+    if (best.refIsA) {
+      refC = cA; incC = cB;
+      var nA = faceNormal(cA, best.refFace);
+      nRef = nA;
+    } else {
+      refC = cB; incC = cA;
+      var nB = faceNormal(cB, best.refFace);
+      nRef = nB;
+    }
+    // Incident face: most anti-parallel to nRef.
+    var incFace = -1, minDot = Infinity;
+    for (var k = 0; k < 4; k++) {
+      var nn = faceNormal(incC, k);
+      var d = nn[0] * nRef[0] + nn[1] * nRef[1];
+      if (d < minDot) { minDot = d; incFace = k; }
+    }
+    var r1 = refC[best.refFace], r2 = refC[(best.refFace + 1) % 4];
+    var i1 = incC[incFace], i2 = incC[(incFace + 1) % 4];
+    var tx = r2[0] - r1[0], ty = r2[1] - r1[1];
+    var tl = Math.sqrt(tx * tx + ty * ty) || 1; tx /= tl; ty /= tl;
+    var seg = clipSegment(i1, i2, -tx, -ty, -(r1[0] * tx + r1[1] * ty));
+    seg = clipSegment(seg[0], seg[1], tx, ty, r2[0] * tx + r2[1] * ty);
+    var out = [];
+    var refOff = r1[0] * nRef[0] + r1[1] * nRef[1];
+    for (var m = 0; m < seg.length; m++) {
+      var sep = seg[m][0] * nRef[0] + seg[m][1] * nRef[1] - refOff;
+      if (sep <= 0.5) {
+        // Solver normal points from A to B.
+        var nx = best.refIsA ? nRef[0] : -nRef[0];
+        var ny = best.refIsA ? nRef[1] : -nRef[1];
+        out.push({ px: seg[m][0], py: seg[m][1], nx: nx, ny: ny, pen: -sep });
       }
     }
     return out;
   }
+  function collideCircleSeg(c, s) {
+    var dx = s.x2 - s.x1, dy = s.y2 - s.y1;
+    var len2 = dx * dx + dy * dy || 1;
+    var t = clamp(((c.x - s.x1) * dx + (c.y - s.y1) * dy) / len2, 0, 1);
+    var qx = s.x1 + dx * t, qy = s.y1 + dy * t;
+    var nx = c.x - qx, ny = c.y - qy;
+    var d = Math.sqrt(nx * nx + ny * ny);
+    if (d >= c.r) return null;
+    if (d < 1e-6) { nx = -dy / Math.sqrt(len2); ny = dx / Math.sqrt(len2); d = 1; }
+    else { nx /= d; ny /= d; }
+    return { px: qx, py: qy, nx: nx, ny: ny, pen: c.r - d };
+  }
+  function collideCircleBox(c, b, f) {
+    var corners = fixtureCorners(b, f);
+    var cx = (corners[0][0] + corners[2][0]) / 2, cy = (corners[0][1] + corners[2][1]) / 2;
+    var best = { pen: Infinity, nx: 0, ny: 0 };
+    for (var i = 0; i < 2; i++) {
+      var n = faceNormal(corners, i); // faces 0,1 = the two DISTINCT axes
+      var pr = project(corners, n[0], n[1]);
+      var cc = c.x * n[0] + c.y * n[1];
+      var ov = Math.min(pr[1], cc + c.r) - Math.max(pr[0], cc - c.r);
+      if (ov < 0) return null;
+      if (ov < best.pen) {
+        var sgn = (cc - (pr[0] + pr[1]) / 2) >= 0 ? 1 : -1;
+        best = { pen: ov, nx: n[0] * sgn, ny: n[1] * sgn };
+      }
+    }
+    // Axis from box center to circle center.
+    var ax = c.x - cx, ay = c.y - cy, al = Math.sqrt(ax * ax + ay * ay);
+    if (al > 1e-6) {
+      ax /= al; ay /= al;
+      var pr2 = project(corners, ax, ay);
+      var cc2 = c.x * ax + c.y * ay;
+      var ov2 = Math.min(pr2[1], cc2 + c.r) - Math.max(pr2[0], cc2 - c.r);
+      if (ov2 < 0) return null;
+      if (ov2 < best.pen) best = { pen: ov2, nx: ax, ny: ay };
+    }
+    // Contact point: circle surface toward the box, pulled halfway into overlap.
+    var px = c.x - best.nx * (c.r - best.pen / 2);
+    var py = c.y - best.ny * (c.r - best.pen / 2);
+    return { px: px, py: py, nx: best.nx, ny: best.ny, pen: best.pen };
+  }
+  function collideCircleCircle(a, b) {
+    var dx = b.x - a.x, dy = b.y - a.y, d = Math.sqrt(dx * dx + dy * dy);
+    var rr = a.r + b.r;
+    if (d >= rr) return null;
+    if (d < 1e-6) { dx = 1; dy = 0; d = 1; }
+    return { px: a.x + dx / d * a.r, py: a.y + dy / d * a.r,
+      nx: dx / d, ny: dy / d, pen: rr - d };
+  }
 
+  // ---------------- solver ----------------
+  function velAtPoint(b, px, py) {
+    if (b.type === 'static') return [0, 0];
+    if (b.type === 'pinned') {
+      var rx = px - b.anchorX, ry = py - b.anchorY;
+      return [-b.omega * ry, b.omega * rx];
+    }
+    var rx2 = px - b.x, ry2 = py - b.y;
+    return [b.vx - b.omega * ry2, b.vy + b.omega * rx2];
+  }
+  function refPoint(b, px, py) {
+    if (b.type === 'pinned') return [b.anchorX, b.anchorY];
+    return [b.x, b.y];
+  }
+  function applyImpulse(b, jx, jy, px, py) {
+    if (b.type === 'static') return;
+    if (b.type === 'pinned') {
+      var rx = px - b.anchorX, ry = py - b.anchorY;
+      b.omega += b.invInertia * (rx * jy - ry * jx);
+      return;
+    }
+    b.vx += b.invMass * jx; b.vy += b.invMass * jy;
+    var rx2 = px - b.x, ry2 = py - b.y;
+    b.omega += b.invInertia * (rx2 * jy - ry2 * jx);
+  }
+  function solveContacts(contacts, dt) {
+    var SLOP = 0.01, BETA = 0.2, REST_VEL = 100;
+    for (var i = 0; i < contacts.length; i++) {
+      var c = contacts[i];
+      var va = velAtPoint(c.a, c.px, c.py), vb = velAtPoint(c.b, c.px, c.py);
+      var vn0 = (vb[0] - va[0]) * c.nx + (vb[1] - va[1]) * c.ny;
+      c.restBias = vn0 < -REST_VEL ? -c.rest * vn0 : 0;
+      c.jn = 0; c.jt = 0;
+    }
+    for (var it = 0; it < 20; it++) {
+      for (var k = 0; k < contacts.length; k++) {
+        var c2 = contacts[k];
+        var va2 = velAtPoint(c2.a, c2.px, c2.py), vb2 = velAtPoint(c2.b, c2.px, c2.py);
+        var rvx = vb2[0] - va2[0], rvy = vb2[1] - va2[1];
+        var ra = refPoint(c2.a, c2.px, c2.py), rb = refPoint(c2.b, c2.px, c2.py);
+        var rax = c2.px - ra[0], ray = c2.py - ra[1];
+        var rbx = c2.px - rb[0], rby = c2.py - rb[1];
+        var cnx = rax * c2.ny - ray * c2.nx, cnbx = rbx * c2.ny - rby * c2.nx;
+        var kn = c2.a.invMass + c2.b.invMass + cnx * cnx * c2.a.invInertia + cnbx * cnbx * c2.b.invInertia;
+        if (kn <= 0) continue;
+        var vn = rvx * c2.nx + rvy * c2.ny;
+        var bias = Math.min(Math.max(BETA / dt * Math.max(0, c2.pen - SLOP), c2.restBias), 300);
+        var dl = (bias - vn) / kn;
+        var oldJn = c2.jn;
+        c2.jn = Math.max(0, oldJn + dl);
+        dl = c2.jn - oldJn;
+        applyImpulse(c2.b, c2.nx * dl, c2.ny * dl, c2.px, c2.py);
+        applyImpulse(c2.a, -c2.nx * dl, -c2.ny * dl, c2.px, c2.py);
+        // Friction.
+        var tx = -c2.ny, ty = c2.nx;
+        va2 = velAtPoint(c2.a, c2.px, c2.py); vb2 = velAtPoint(c2.b, c2.px, c2.py);
+        rvx = vb2[0] - va2[0]; rvy = vb2[1] - va2[1];
+        var ctx = rax * ty - ray * tx, cty = rbx * ty - rby * tx;
+        var kt = c2.a.invMass + c2.b.invMass + ctx * ctx * c2.a.invInertia + cty * cty * c2.b.invInertia;
+        if (kt <= 0) continue;
+        var vt = rvx * tx + rvy * ty;
+        var dlt = -vt / kt;
+        var maxF = c2.fric * c2.jn;
+        var oldJt = c2.jt;
+        c2.jt = clamp(oldJt + dlt, -maxF, maxF);
+        dlt = c2.jt - oldJt;
+        applyImpulse(c2.b, tx * dlt, ty * dlt, c2.px, c2.py);
+        applyImpulse(c2.a, -tx * dlt, -ty * dlt, c2.px, c2.py);
+      }
+    }
+  }
+
+  // ---------------- machine ----------------
+  var WORLD_W = 1400, WORLD_H = 2000;
   var DOM_COLORS = ['#f2c200', '#e23b2e', '#f07f13', '#2b6cb0', '#38a169', '#ed64a6', '#805ad5'];
+  function rail(x1, y1, x2, y2) { return staticSeg('rail', x1, y1, x2, y2, CAT.BALL, 0.5, 0.1); }
 
-  // ================= MACHINE DESCRIPTIONS (data only) =================
-  // Segment spec: [x1, y1, x2, y2, restitution, thickness, kind].
-  var MACHINES = [
-    {
-      // A: the original 9104 chain, unchanged in look or grammar.
-      ballStart: [262, 237],
-      channels: [
-        { pts: [[250, 250], [520, 340], [850, 390], [1150, 420], [1360, 470], [1400, 580], [1330, 700]], e: 0.15 },
-        { pts: [[1330, 700], [1100, 790], [800, 850], [500, 880], [370, 930]], e: 0.15 },
-        { pts: [[370, 930], [330, 960], [330, 1000], [345, 1025], [385, 1038], [440, 1041], [500, 1041]], e: 0.15 },
-        { pts: [[680, 1120], [820, 1130], [1060, 1150], [1180, 1160]], e: 0.15 },
-        { pts: [[1250, 1210], [1250, 1330], [1150, 1380], [950, 1400], [800, 1420], [660, 1480], [660, 1500]], e: 0.15 },
-        { pts: [[800, 1630], [1050, 1730], [1180, 1760]], e: 0.15 },
-        { pts: [[1360, 1960], [1200, 1965], [1000, 1975], [850, 1990]], e: 0.15, skip: 1 }
-      ],
-      segments: [
-        [440, 1075, 600, 1075, 0.10, 6, 'floor'],
-        [664, 1075, 1200, 1075, 0.10, 6, 'floor'],
-        [664, 1025, 664, 1075, 0.20, 6, 'wall'],
-        [600, 1135, 700, 1135, 0.10, 6, 'floor'],
-        [1180, 1200, 1210, 1200, 0.10, 6, 'floor'],
-        [1290, 1200, 1300, 1200, 0.10, 6, 'floor'],
-        [1300, 1140, 1300, 1200, 0.20, 6, 'wall'],
-        [1350, 1925, 1560, 1905, 0.12, 6, 'floor'],
-        [1560, 1820, 1560, 1905, 0.20, 6, 'wall'],
-        [700, 2070, 700, 2240, 0.15, 6, 'wall'],
-        [840, 2070, 840, 2240, 0.15, 6, 'wall'],
-        [700, 2240, 840, 2240, 0.05, 6, 'floor']
-      ],
-      trap: { seg: [600, 1075, 664, 1075], pivot: [600, 1075],
-              capture: { x1: 620, x2: 672, yMin: 1000, maxSpeed: 200 } },
-      dominoes: { x0: 640, count: 15, spacing: 36, base: 1075, h: 66, dir: 1 },
-      spinner: { x: 1250, y: 1090, arm: 78, capture: { x: 1250, y: 1178, r: 60, yMin: 1140 },
-                 releaseRot: 3 * Math.PI, releaseVel: [0, 250] },
-      seesaw: { pivotX: 620, pivotY: 1570, half: 150 },
-      gapSlot: [1190, 1850, 150, 75],
-      box: { x1: 700, x2: 840, yTop: 2070, yFloor: 2240 },
-      milestones: [
-        { n: 'TRACK_A', x1: 1300, x2: 1600, y1: 0, y2: 750 },
-        { n: 'RETURN', x1: 0, x2: 400, y1: 900, y2: 1000 },
-        { n: 'DOMINO_ROW', x1: 440, x2: 1300, y1: 1040, y2: 1080 },
-        { n: 'CHUTE', x1: 600, x2: 1350, y1: 1200, y2: 1400 },
-        { n: 'SEESAW', x1: 470, x2: 770, y1: 1510, y2: 1630 },
-        { n: 'SEESAW_EXIT', x1: 800, x2: 1180, y1: 1600, y2: 1800 },
-        { n: 'GAP_FLIGHT', x1: 1180, x2: 1350, y1: 1760, y2: 1900 },
-        { n: 'TRAY', x1: 1350, x2: 1560, y1: 1850, y2: 2000 },
-        { n: 'FINAL', x1: 0, x2: 1000, y1: 1950, y2: 2010 },
-        { n: 'BOX', x1: 700, x2: 840, y1: 2070, y2: 2300 }
-      ]
-    },
-    {
-      // B: same parts, different route — release top-right, one long
-      // winding descent down the light table to the domino floor (no
-      // U-turn: the ball stays moving right all the way), a shorter
-      // domino row, a spinner gate on the dark table, a lower seesaw,
-      // a wider end box at bottom-left. The cup mirrors A's structure:
-      // the trapdoor sits where the ball bounces back to after the row,
-      // the first domino stands just inside it, and the capture zone
-      // covers the bounce-back rest position — so the cup works by
-      // construction, not by a lucky corner ratchet.
-      ballStart: [1388, 237],
-      channels: [
-        { pts: [[1400, 250], [1150, 330], [850, 390], [550, 440], [350, 500], [310, 560], [280, 620], [260, 780], [300, 900], [420, 970], [460, 1010], [480, 1050]], e: 0.15 },
-        { pts: [[560, 1120], [700, 1130], [900, 1150], [1150, 1200], [1330, 1240], [1340, 1300]], e: 0.15 },
-        { pts: [[1350, 1400], [1350, 1500], [1280, 1540], [1150, 1570], [1050, 1600], [1050, 1630]], e: 0.15 },
-        { pts: [[900, 1740], [700, 1790], [500, 1820]], e: 0.15 },
-        { pts: [[350, 1990], [450, 2040], [480, 2050]], e: 0.15, skip: -1 }
-      ],
-      segments: [
-        [450, 1075, 480, 1075, 0.10, 6, 'floor'],
-        [574, 1075, 950, 1075, 0.10, 6, 'floor'],
-        [574, 1025, 574, 1075, 0.20, 6, 'wall'],
-        [480, 1135, 580, 1135, 0.10, 6, 'floor'],
-        [1280, 1390, 1310, 1390, 0.10, 6, 'floor'],
-        [1390, 1390, 1400, 1390, 0.10, 6, 'floor'],
-        [1400, 1330, 1400, 1390, 0.20, 6, 'wall'],
-        [140, 1930, 350, 1950, 0.12, 6, 'floor'],
-        [140, 1845, 140, 1930, 0.20, 6, 'wall'],
-        [480, 2120, 480, 2240, 0.15, 6, 'wall'],
-        [700, 2120, 700, 2240, 0.15, 6, 'wall'],
-        [480, 2240, 700, 2240, 0.05, 6, 'floor']
-      ],
-      trap: { seg: [480, 1075, 574, 1075], pivot: [480, 1075],
-              capture: { x1: 490, x2: 540, yMin: 1000, maxSpeed: 200 } },
-      dominoes: { x0: 540, count: 10, spacing: 36, base: 1075, h: 66, dir: 1 },
-      spinner: { x: 1350, y: 1280, arm: 78, capture: { x: 1350, y: 1368, r: 60, yMin: 1330 },
-                 releaseRot: 3 * Math.PI, releaseVel: [0, 250] },
-      seesaw: { pivotX: 1100, pivotY: 1680, half: 150 },
-      gapSlot: [350, 1870, 150, 80],
-      box: { x1: 480, x2: 700, yTop: 2120, yFloor: 2240 },
-      milestones: [
-        { n: 'CURVE', x1: 0, x2: 400, y1: 400, y2: 600 },
-        { n: 'SWEEP', x1: 260, x2: 500, y1: 780, y2: 1050 },
-        { n: 'DOMINO_ROW', x1: 490, x2: 950, y1: 1040, y2: 1080 },
-        { n: 'CHUTE', x1: 1150, x2: 1350, y1: 1400, y2: 1580 },
-        { n: 'SEESAW', x1: 950, x2: 1250, y1: 1620, y2: 1760 },
-        { n: 'SEESAW_EXIT', x1: 500, x2: 900, y1: 1740, y2: 1820 },
-        { n: 'GAP_FLIGHT', x1: 350, x2: 500, y1: 1820, y2: 1920 },
-        { n: 'TRAY', x1: 140, x2: 350, y1: 1900, y2: 1990 },
-        { n: 'FINAL', x1: 350, x2: 500, y1: 1990, y2: 2070 },
-        { n: 'BOX', x1: 480, x2: 700, y1: 2120, y2: 2300 }
-      ]
-    }
-  ];
+  function buildWorld() {
+    var bodies = [], statics = [], segs = [];
+    function addB(b) { bodies.push(b); return b; }
+    function addS(s) { statics.push(s); return s; }
+    function addSeg(s) { segs.push(s); return s; }
 
-  // ================= RUNTIME: build a machine from its description =================
-  var R = null, doneSound = false;
-  function updateDots() {
-    var d0 = document.getElementById('dot0'), d1 = document.getElementById('dot1');
-    if (d0 && d0.classList) d0.classList.toggle('on', R.idx === 0);
-    if (d1 && d1.classList) d1.classList.toggle('on', R.idx === 1);
-  }
-  function loadMachine(idx) {
-    var d = MACHINES[idx];
-    var segs = [];
-    d.channels.forEach(function (ch) { segs = segs.concat(buildChannel(ch.pts, ch.e, ch.skip)); });
-    d.segments.forEach(function (s) {
-      segs.push({ x1: s[0], y1: s[1], x2: s[2], y2: s[3], e: s[4], thick: s[5] || 6, kind: s[6] || 'wood' });
-    });
+    // Ball 1: red glass, starts on the ramp held by the hand block.
+    // Approach ends so ball 1 strikes domino 0 MID-HEIGHT (r ~43 px from
+    // its base, center y ~477): a pivoted domino's effective mass is
+    // I_pivot/r^2, which equals the ball's mass at r ~43, so ball 1 stops
+    // dead instead of ramming the rotating face (high strike) or bouncing
+    // back off the shelf (low strike). It then sits clear of domino 0's
+    // fall while the wave runs. A catch wall at x 760..780 stops it if
+    // the retention is slightly negative.
+    var ball1 = addB(circleBody('ball1', 290.7, 307.8, 14, 1, CAT.BALL, ALL, 0.5, 0.1));
+    // Ball 2: ivory, waits against the gate arm.
+    var ball2 = addB(circleBody('ball2', 1227, 586.4, 14, 1, CAT.BALL, ALL, 0.5, 0.1));
+    // Ball 1 path: ramp + approach slope.
+    addSeg(rail(170, 280, 560, 418));
+    addSeg(rail(560, 418, 800, 490));
+    // Hand block: removed at t = 0.6 s (a release, not a velocity).
+    var handBlock = addSeg(staticSeg('hand', 299, 293, 311, 325, CAT.BALL, 0.5, 0));
+    // Domino shelf (static box, top y = 520), extended left to hold the
+    // catch wall and ball 1's rest spot.
+    addS(staticBox('shelf', 1030, 535, 540, 30, 0, CAT.BALL | CAT.DOMINO));
+    // Catch wall: ball 1 only (dominoes never touch it).
+    addS(staticBox('catchWall', 770, 511, 20, 18, 0, CAT.BALL));
+    // Domino row: 9 dominoes, centers 828 + i*50, base y = 520.
+    // Real-domino proportions (thickness 12, spacing 50): the shingled stack
+    // settles at arccos(t/s) = arccos(12/50) = 76 deg from vertical, matching
+    // a real toppled row, instead of the chunky 68 deg of 16/42.
     var dominoes = [];
-    for (var i = 0; i < d.dominoes.count; i++) {
-      dominoes.push({ kind: 'domino', x: d.dominoes.x0 + i * d.dominoes.spacing, base: d.dominoes.base,
-        h: d.dominoes.h, w: 16, th: 0, om: 0, color: DOM_COLORS[i % DOM_COLORS.length],
-        ticked: false, falling: false, dir: d.dominoes.dir || 1 });
+    for (var i = 0; i < 9; i++) {
+      var d = addB(polyBody('dom' + i, 828 + i * 50, 487, 0,
+        [fixture(0, 0, 12, 66, 0, CAT.DOMINO, CAT.STATIC | CAT.BALL | CAT.DOMINO | CAT.CRANK, 0.15, 0, 'dom' + i)], 1));
+      d.domIndex = i;
+      dominoes.push(d);
     }
-    R = {
-      idx: idx, desc: d, segs: segs,
-      trapSeg: { x1: d.trap.seg[0], y1: d.trap.seg[1], x2: d.trap.seg[2], y2: d.trap.seg[3],
-                 e: 0.10, thick: 6, kind: 'floor' },
-      trapOpen: 0, trapOpened: false, cupDone: false,
-      dominoes: dominoes,
-      spin: { x: d.spinner.x, y: d.spinner.y, arm: d.spinner.arm, phi: 0, om: 0, rot: 0, released: false },
-      seesaw: { kind: 'seesaw', pivotX: d.seesaw.pivotX, pivotY: d.seesaw.pivotY, half: d.seesaw.half, ang: 0 },
-      ball: { x: d.ballStart[0], y: d.ballStart[1], vx: 0, vy: 0, state: 'HELD_HAND' },
-      simTime: 0, handT: 0, settleT: 0, escaped: false, stalled: false, stallT: 0,
-      stages: []
-    };
-    contact = false; doneSound = false;
-    window.__ENGINE.stages = R.stages; window.__ENGINE.machine = idx; window.__ENGINE.done = false;
-    logStage('HAND');
-    updateDots();
+    // Bell crank: pivot (1265, 510). Arm A (trigger, left, y 498..510) is
+    // struck by the falling last domino and then pressed down by the lying
+    // domino's weight (lying top y = 508 overlaps arm A by 2 px), holding
+    // the gate open; it clears ball 1's path (ball top y = 492) by 6 px.
+    // Arm B (gate, down) blocks ball 2's track. The crank's center of mass
+    // sits slightly right of the pivot, so gravity supplies a closing
+    // torque (~212k) that ball 2's push alone (~140k) cannot overcome:
+    // the gate stays shut until domino 8 presses it, then opens fully.
+    // (A balanced crank let ball 2 push the gate open by itself.)
+    // Note: the last two dominoes rest on arm A at ~66 deg (they hold the
+    // gate open by their weight, as a real trigger lever works); the row
+    // proper (dom 0-6) lies flat at ~76 deg.
+    var crank = addB(pinnedBody('crank', 1265, 510, [
+      fixture(-13.5, -6, 27, 12, 0, CAT.CRANK, CAT.DOMINO | CAT.BALL, 0.4, 0, 'crankA'),
+      fixture(25, 0, 50, 12, 0, CAT.CRANK, 0, 0.4, 0, 'crankStub'),
+      fixture(0, 57.5, 12, 115, 0, CAT.CRANK, CAT.BALL, 0.4, 0, 'crankB'),
+      fixture(0, -30, 12, 60, 0, CAT.CRANK, 0, 0.4, 0, 'crankC'),
+      fixture(0, -100, 24, 24, 0, CAT.CRANK, 0, 0.4, 0, 'crankW')
+    ], 1, 100000, 100000));
+    crank.springA0 = 0; crank.angleMin = -0.85; crank.angleMax = 0.2;
+    // Ball 2 track, right wall, funnel floor.
+    addSeg(rail(1080, 580, 1330, 615));
+    addSeg(staticSeg('wallR', 1360, 560, 1360, 900, CAT.BALL, 0.4, 0.1));
+    // Funnel floor ends at 1040 so ball 2 drops LEFT of the spinner center
+    // (lands ~x898) and rides the left paddle counterclockwise to the exit.
+    addSeg(rail(1360, 900, 1040, 980));
+    // Spinner: center (920, 1330), housing outer r = 132, inner r = 118.
+    // Housing arc boxes every 15 deg except entry gap [240, 300] (top) and
+    // exit gap [135, 175] (bottom-left). Angles: 0 = +x, 90 = +y (down).
+    var SCX = 920, SCY = 1330;
+    for (var a = 0; a < 360; a += 15) {
+      var mid = a + 7.5;
+      if ((mid >= 240 && mid <= 300) || (mid >= 100 && mid <= 185)) continue;
+      var rad = mid * Math.PI / 180;
+      var hx = SCX + Math.cos(rad) * 125, hy = SCY + Math.sin(rad) * 125;
+      addS(staticBox('hous' + a, hx, hy, 34, 14, rad + Math.PI / 2, CAT.BALL));
+    }
+    // Rotor: hub + 3 long paddles (tip r = 115, just inside the housing
+    // inner wall at 118), pockets centered at 30 / 150 / 270 deg, so the
+    // top pocket (270) receives the ball falling through the top gap.
+    // Paddles run nearly to the housing so the ball stays on its paddle
+    // until the pocket aligns with the exit gap; with short paddles the
+    // ball slid off early, rolled to the housing bottom (dead center,
+    // zero torque), and stalled there.
+    var rotorFix = [fixture(0, 0, 36, 36, 0, CAT.ROTOR, CAT.BALL, 0.3, 0, 'hub')];
+    [330, 90, 210].forEach(function (deg) {
+      var r = deg * Math.PI / 180;
+      rotorFix.push(fixture(Math.cos(r) * 60, Math.sin(r) * 60, 110, 16, r,
+        CAT.ROTOR, CAT.BALL, 0.3, 0, 'paddle' + deg));
+    });
+    var rotor = addB(pinnedBody('rotor', SCX, SCY, rotorFix, 1, 0, 60000));
+    // Seesaw: plank pivoted at center (760, 1560), 380 long, hinge-limited.
+    var seesaw = addB(pinnedBody('seesaw', 760, 1560,
+      [fixture(0, 0, 380, 14, 0, CAT.SEESAW, CAT.BALL, 0.4, 0.05, 'plank')], 1, 0, 100000));
+    seesaw.angleMin = -0.5; seesaw.angleMax = 0.5;
+    // Exit rail (spinner -> seesaw) starts at 920 to catch ball 2 leaving
+    // the exit gap anywhere from 100 to 185 deg and guide it onto the
+    // seesaw's LEFT side.
+    addSeg(rail(920, 1470, 690, 1520));
+    // Tray rail starts at 640 so it catches ball 2 leaving the seesaw's
+    // left end (~x593) instead of letting it fall past the rail's end.
+    addSeg(rail(640, 1700, 360, 1760));
+    addS(staticBox('trayWall', 550, 1660, 20, 80, 0, CAT.BALL));
+    addS(staticBox('boxL', 240, 1850, 20, 100, 0, CAT.BALL));
+    addS(staticBox('boxR', 420, 1850, 20, 100, 0, CAT.BALL));
+    addS(staticBox('boxF', 330, 1910, 220, 20, 0, CAT.BALL));
+
+    return { W: WORLD_W, H: WORLD_H, t: 0, stepCount: 0, bodies: bodies, statics: statics,
+      segs: segs, ball1: ball1, ball2: ball2, dominoes: dominoes,
+      crank: crank, rotor: rotor, seesaw: seesaw, handBlock: handBlock,
+      handReleased: false, events: [], stats: { maxPen: 0, maxEnergy: 0, energy0: 0,
+        seesawMax: 0, deepPens: [], overspeeds: [] },
+      domFirst: {}, domFlat: {}, gateOpenedAt: 0, spinEnteredAt: 0,
+      spinExitedAt: 0, rotorAngleAtEntry: 0, boxRestAt: 0, done: false };
   }
 
-  // World mechanisms that advance even while the ball is held: the
-  // trapdoor swing and the domino chain. Held states must not freeze
-  // the world, or a ball captured before the last domino falls waits
-  // forever for a trapdoor that can never open.
-  function updateMechanisms() {
-    if (R.trapOpened && R.trapOpen < 1) R.trapOpen = Math.min(1, R.trapOpen + DT / 0.4);
-    var doms = R.dominoes;
-    var lastIdx = doms[0].dir === 1 ? doms.length - 1 : 0;
-    for (var k = 0; k < doms.length; k++) {
-      var dd = doms[k];
-      if (!dd.falling) continue;
-      dd.om += (3 * GRAV / (2 * dd.h)) * Math.sin(dd.th) * DT;
-      dd.th += dd.om * DT;
-      if (!dd.ticked && Math.abs(dd.th) > 0.3) { dd.ticked = true; knock(800 + k * 8, 0.12, 0.05); }
-      var nxt = k + dd.dir;
-      if (Math.abs(dd.th) > 0.45 && nxt >= 0 && nxt < doms.length && !doms[nxt].falling) {
-        doms[nxt].falling = true;
-        doms[nxt].om = doms[nxt].dir * Math.max(Math.abs(doms[nxt].om), 1.5);
-        knock(800 + k * 8, 0.12, 0.05);
-      }
-      if (Math.abs(dd.th) >= 1.35) { dd.th = dd.dir * 1.35; dd.om = 0; }
-      if (k === lastIdx && Math.abs(dd.th) > 1.0 && !R.trapOpened) {
-        R.trapOpened = true; logStage('DOMINO_LAST');
-      }
+  function energy(w) {
+    var e = 0;
+    for (var i = 0; i < w.bodies.length; i++) {
+      var b = w.bodies[i];
+      if (b.type === 'static') continue;
+      var v2 = (b.type === 'pinned') ? 0 : (b.vx * b.vx + b.vy * b.vy);
+      var com = b.type === 'pinned' ? bodyPoint(b, b.comX, b.comY) : [b.x, b.y];
+      // PE = -m*g*y because y points DOWN and gravity accelerates +y:
+      // falling must DECREASE total energy, not increase it.
+      e += 0.5 * b.mass * v2 + 0.5 * b.inertia * b.omega * b.omega - b.mass * GRAV * com[1];
     }
+    return e;
+  }
+  function log(w, type, data) {
+    data = data || {}; data.t = w.t; data.type = type;
+    w.events.push(data);
   }
 
-  // ================= STEPPER: knows parts, not machines =================
-  function step() {
-    var d = R.desc, b = R.ball;
-    R.simTime += DT;
-
-    // Hand phase: ball waits while the hand lifts away.
-    if (b.state === 'HELD_HAND') {
-      R.handT += DT;
-      if (R.handT > 0.6) { b.state = 'ROLL'; logStage('RAMP_ROLL'); }
-      return;
+  function stepWorld(w) {
+    w.t += DT;
+    if (!w.handReleased && w.t >= 0.6) {
+      w.handReleased = true;
+      var hi = w.segs.indexOf(w.handBlock);
+      if (hi >= 0) w.segs.splice(hi, 1);
+      log(w, 'handRelease');
     }
-    if (b.state === 'HELD_CUP') {
-      updateMechanisms();
-      if (R.trapOpened && R.trapOpen > 0.9) {
-        // One-shot release: without this the ball is recaptured every
-        // step (it is still slow and still inside the zone) and only
-        // inches out by flicker. The cup, like the spinner gate, fires once.
-        R.cupDone = true;
-        b.state = 'ROLL'; b.vx = 60; b.vy = 20; logStage('TRAPDOOR');
-      }
-      return;
-    }
-    if (b.state === 'HELD_SPINNER') {
-      updateMechanisms();
-      var sp = R.spin;
-      sp.om *= Math.exp(-0.6 * DT);
-      sp.phi += sp.om * DT;
-      sp.rot += Math.abs(sp.om) * DT;
-      // The gate settles the ball to the cup's center while it spins.
-      var settle = 1 - Math.exp(-4 * DT);
-      b.x += (d.spinner.capture.x - b.x) * settle;
-      b.y += (d.spinner.capture.y - b.y) * settle;
-      if (!sp.released && sp.rot >= d.spinner.releaseRot) {
-        sp.released = true;
-        b.state = 'ROLL'; b.vx = d.spinner.releaseVel[0]; b.vy = d.spinner.releaseVel[1];
-        logStage('SPINNER_RELEASE');
-      }
-      return;
-    }
-    if (b.state === 'DONE') return;
-
-    // Seesaw angle follows the ball's offset from the pivot, eased.
-    // (A torque-driven plank would stall here: the ball is light and the
-    // plank is long, so the eased-follow keeps the crossing reliable by
-    // construction while the plank still behaves as a pivoting part.)
-    var ss = R.seesaw;
-    var onPlank = (b.x > ss.pivotX - ss.half - 20 && b.x < ss.pivotX + ss.half + 20 &&
-                   Math.abs(b.y - ss.pivotY) < 60);
-    var target = 0;
-    if (onPlank) target = Math.max(-0.38, Math.min(0.38, (b.x - ss.pivotX) * 0.0022));
-    ss.ang += (target - ss.ang) * (1 - Math.exp(-6 * DT));
-
-    updateMechanisms();
-
-    contact = false;
-    b.vy += GRAV * DT;
-    var drag = Math.exp(-0.05 * DT);
-    b.vx *= drag; b.vy *= drag;
-    b.x += b.vx * DT; b.y += b.vy * DT;
-
-    // Static segments (trapdoor removed once open).
-    for (var i = 0; i < R.segs.length; i++) {
-      var s = R.segs[i];
-      var imp = collide(b, s);
-      if (imp > 120) {
-        if (s.kind === 'rail' || s.kind === 'floor') knock(700 + imp * 0.4, Math.min(0.25, imp / 4000), 0.08);
-        else knock(500, Math.min(0.2, imp / 5000), 0.07);
+    // Integrate dynamics.
+    for (var i = 0; i < w.bodies.length; i++) {
+      var b = w.bodies[i];
+      if (b.type === 'dyn') {
+        b.vy += GRAV * DT;
+        b.x += b.vx * DT; b.y += b.vy * DT; b.angle += b.omega * DT;
+      } else if (b.type === 'pinned') {
+        var com = bodyPoint(b, b.comX, b.comY);
+        var tq = (com[0] - b.anchorX) * b.mass * GRAV
+          - b.springK * (b.angle - b.springA0) - b.dampC * b.omega;
+        b.omega += (tq / b.inertia) * DT;
+        b.angle += b.omega * DT;
+        applyHingeLimits(b);
+        b.x = b.anchorX; b.y = b.anchorY;
       }
     }
-    if (R.trapOpen <= 0.5) {
-      var timp = collide(b, R.trapSeg);
-      if (timp > 120) knock(600, 0.15, 0.08);
+    // Detect contacts.
+    var contacts = [];
+    function maskOk(fa, fb) { return (fa.mask & fb.cat) && (fb.mask & fa.cat); }
+    function pushContact(a, b, res, fric, rest) {
+      if (!res) return;
+      contacts.push({ a: a, b: b, px: res.px, py: res.py, nx: res.nx, ny: res.ny,
+        pen: res.pen, fric: fric, rest: rest, jn: 0, jt: 0, restBias: 0 });
+      if (res.pen > w.stats.maxPen) w.stats.maxPen = res.pen;
     }
-    // Seesaw plank.
-    var pl = plankSeg(ss);
-    var pimp = collide(b, pl);
-    if (pimp > 120) knock(600, 0.15, 0.08);
-
-    // Dominoes: ball impact starts the fall (angular physics + chain
-    // live in updateMechanisms, so the row also falls while held).
-    var doms = R.dominoes, firstIdx = doms[0].dir === 1 ? 0 : doms.length - 1;
-    for (var j = 0; j < doms.length; j++) {
-      var dm = doms[j];
-      if (Math.abs(dm.th) > 1.2) continue; // lying flat: the ball rolls on past
-      var ds = plankSeg(dm);
-      var dimp = collide(b, ds);
-      if (dimp > 0 && !dm.falling) {
-        dm.falling = true;
-        dm.om = dm.dir * Math.max(Math.abs(dm.om), dimp * 0.006);
-        b.vx *= 0.3; b.vy *= 0.5;
-        knock(900, 0.2, 0.06);
-        if (j === firstIdx) logStage('DOMINO_FIRST');
-      }
-    }
-
-    // Captures.
-    if (b.state === 'ROLL') {
-      var cz = d.trap.capture;
-      var spd0 = Math.sqrt(b.vx * b.vx + b.vy * b.vy);
-      if (!R.cupDone && b.x > cz.x1 && b.x < cz.x2 && b.y > cz.yMin && spd0 < cz.maxSpeed) {
-        b.state = 'HELD_CUP'; b.vx = 0; b.vy = 0; logStage('CUP_HELD');
-      } else {
-        var sc = d.spinner.capture;
-        var dxs = b.x - sc.x, dys = b.y - sc.y;
-        if (dxs * dxs + dys * dys < sc.r * sc.r && b.y > sc.yMin && !R.spin.released) {
-          b.state = 'HELD_SPINNER'; b.vx = 0; b.vy = 0;
-          R.spin.om = 8; R.spin.rot = 0; logStage('SPINNER_CAPTURE');
+    // Body vs static segments (circles only in practice).
+    for (var bi = 0; bi < w.bodies.length; bi++) {
+      var bb = w.bodies[bi];
+      if (bb.type === 'static') continue;
+      for (var si = 0; si < w.segs.length; si++) {
+        var sg = w.segs[si];
+        if (!(bb.mask & sg.cat) || !(sg.mask & bb.cat)) continue;
+        if (bb.kind === 'circle') {
+          var r = collideCircleSeg(bb, sg);
+          pushContact(sg, bb, r, // normal already points segment -> circle (A -> B)
+            Math.sqrt(bb.fric * sg.fric), Math.min(bb.rest, sg.rest));
         }
       }
     }
-
-    // Progress milestones (position rects from the description).
-    if (b.state === 'ROLL') {
-      for (var m = 0; m < d.milestones.length; m++) {
-        var ms = d.milestones[m];
-        if (b.x >= ms.x1 && b.x <= ms.x2 && b.y >= ms.y1 && b.y <= ms.y2) logStage(ms.n);
+    // Body vs static boxes.
+    for (var bj = 0; bj < w.bodies.length; bj++) {
+      var bc = w.bodies[bj];
+      if (bc.type === 'static' || !bc.fixtures) continue;
+      for (var sj = 0; sj < w.statics.length; sj++) {
+        var sb = w.statics[sj];
+        for (var fj = 0; fj < bc.fixtures.length; fj++) {
+          var ff = bc.fixtures[fj];
+          if (!maskOk(ff, sb.fixtures[0])) continue;
+          if (bc.kind === 'circle') {
+            var rb = collideCircleBox(bc, sb, sb.fixtures[0]);
+            // Normal from box to circle; solver wants A = box, B = circle.
+            pushContact(sb, bc, rb, Math.sqrt(bc.fric * sb.fixtures[0].fric),
+              Math.min(bc.rest, sb.fixtures[0].rest));
+          } else {
+            var list = collideBoxBox(sb, sb.fixtures[0], bc, ff);
+            for (var q = 0; q < list.length; q++) {
+              pushContact(sb, bc, list[q], Math.sqrt(ff.fric * sb.fixtures[0].fric),
+                Math.min(ff.rest, sb.fixtures[0].rest));
+            }
+          }
+        }
       }
     }
-
-    // Settle in the box = the end. No payoff after this, just rest.
-    var bx = d.box;
-    if (b.x > bx.x1 && b.x < bx.x2 && b.y > bx.yTop) {
-      var sp2 = Math.sqrt(b.vx * b.vx + b.vy * b.vy);
-      if (sp2 < 30) { R.settleT += DT; if (R.settleT > 0.5) { b.state = 'DONE'; logStage('DONE'); } }
-      else R.settleT = 0;
-    } else R.settleT = 0;
-
-    // Failure monitors (test assertions read these).
-    if (b.x < -50 || b.x > WORLD_W + 50 || b.y > WORLD_H + 50) {
-      if (!R.escaped) { R.escaped = true; logStage('ESCAPE'); }
+    // Body vs body.
+    for (var p = 0; p < w.bodies.length; p++) {
+      for (var q2 = p + 1; q2 < w.bodies.length; q2++) {
+        var A = w.bodies[p], B = w.bodies[q2];
+        if (A.type === 'static' || B.type === 'static') continue;
+        if (A.kind === 'circle' && B.kind === 'circle') {
+          if (!((A.mask & B.cat) && (B.mask & A.cat))) continue;
+          var rc = collideCircleCircle(A, B);
+          pushContact(A, B, rc, Math.sqrt(A.fric * B.fric), Math.min(A.rest, B.rest));
+          continue;
+        }
+        if (A.kind === 'circle' || B.kind === 'circle') {
+          var circ = A.kind === 'circle' ? A : B;
+          var poly = A.kind === 'circle' ? B : A;
+          for (var fp = 0; fp < poly.fixtures.length; fp++) {
+            var pf = poly.fixtures[fp];
+            if (!((circ.mask & pf.cat) && (pf.mask & circ.cat))) continue;
+            var rcb = collideCircleBox(circ, poly, pf);
+            // collideCircleBox normal points box -> circle. Solver A = box.
+            pushContact(poly, circ, rcb, Math.sqrt(circ.fric * pf.fric),
+              Math.min(circ.rest, pf.rest));
+          }
+          continue;
+        }
+        for (var fa = 0; fa < A.fixtures.length; fa++) {
+          for (var fb = 0; fb < B.fixtures.length; fb++) {
+            var fA = A.fixtures[fa], fB = B.fixtures[fb];
+            if (!maskOk(fA, fB)) continue;
+            var lst = collideBoxBox(A, fA, B, fB);
+            for (var qq = 0; qq < lst.length; qq++) {
+              pushContact(A, B, lst[qq], Math.sqrt(fA.fric * fB.fric),
+                Math.min(fA.rest, fB.rest));
+            }
+          }
+        }
+      }
     }
-    var spd = Math.sqrt(b.vx * b.vx + b.vy * b.vy);
-    if (b.state === 'ROLL' && spd < 5) { R.stallT += DT; if (R.stallT > 3 && !R.stalled) { R.stalled = true; logStage('STALL'); } }
-    else R.stallT = 0;
+    solveContacts(contacts, DT);
+    for (var cv = 0; cv < w.bodies.length; cv++) clampVelocity(w.bodies[cv]);
+    // Diagnostics (logging only): deep penetrations and runaway speeds.
+    for (var dp = 0; dp < contacts.length; dp++) {
+      if (contacts[dp].pen > 2 && w.stats.deepPens.length < 60) {
+        w.stats.deepPens.push({ t: +w.t.toFixed(2), pen: +contacts[dp].pen.toFixed(2),
+          a: contacts[dp].a.id || 'seg', b: contacts[dp].b.id || 'seg' });
+      }
+    }
+    [w.ball1, w.ball2].forEach(function (bl) {
+      var sp = Math.sqrt(bl.vx * bl.vx + bl.vy * bl.vy);
+      if (sp > 3000 && w.stats.overspeeds.length < 20) {
+        w.stats.overspeeds.push({ t: +w.t.toFixed(2), id: bl.id, sp: Math.round(sp),
+          x: Math.round(bl.x), y: Math.round(bl.y) });
+      }
+    });
+    if (Math.abs(w.seesaw.angle) > w.stats.seesawMax) w.stats.seesawMax = Math.abs(w.seesaw.angle);
+    // Rolling resistance for balls in contact: viscous material damping
+    // (1.0/s). It gives slope terminal velocities but stops ball 1 on the
+    // flat shelf before the trigger arm. Uniform property, not staged.
+    for (var ci = 0; ci < contacts.length; ci++) {
+      var cc = contacts[ci];
+      [cc.a, cc.b].forEach(function (bd) {
+        if (bd.kind === 'circle' && bd.type === 'dyn') {
+          var f = Math.exp(-1.0 * DT);
+          bd.vx *= f; bd.vy *= f;
+        }
+      });
+    }
+    // Expose this step's contacts for traces and renderer audio impulses.
+    w.lastContacts = contacts;
+    // Drag-to-nudge force (browser sets w.nudge = {x, y} in world coords).
+    if (w.nudge) {
+      [w.ball1, w.ball2].forEach(function (bl) {
+        var dx = w.nudge.x - bl.x, dy = w.nudge.y - bl.y;
+        var d = Math.sqrt(dx * dx + dy * dy);
+        if (d < 90 && d > 1) {
+          var F = Math.min(60000, 800 * d);
+          bl.vx += (dx / d) * F * bl.invMass * DT;
+          bl.vy += (dy / d) * F * bl.invMass * DT;
+        }
+      });
+    }
+    // ---- logging: causes only, never behavior ----
+    // Domino first contacts (cause = ball or earlier domino).
+    for (var di = 0; di < w.dominoes.length; di++) {
+      var dm = w.dominoes[di];
+      if (w.domFirst[di] || Math.abs(dm.omega) < 0.5) continue;
+      var cause = null;
+      for (var ck = 0; ck < contacts.length; ck++) {
+        var ct = contacts[ck];
+        if (ct.jn <= 0) continue;
+        var other = null;
+        if (ct.a === dm) other = ct.b; else if (ct.b === dm) other = ct.a;
+        if (!other) continue;
+        if (other === w.ball1) cause = 'ball1';
+        else if (other.domIndex !== undefined && other.domIndex < di) cause = 'dom' + other.domIndex;
+        if (cause) break;
+      }
+      if (cause) { w.domFirst[di] = { by: cause, t: w.t }; log(w, 'dominoFirst', { i: di, by: cause }); }
+    }
+    for (var dj = 0; dj < w.dominoes.length; dj++) {
+      var dm2 = w.dominoes[dj];
+      if (w.domFlat[dj]) continue;
+      var sp = Math.sqrt(dm2.vx * dm2.vx + dm2.vy * dm2.vy);
+      if (Math.abs(dm2.angle) > 1.30 && Math.abs(dm2.omega) < 0.5 && sp < 30) {
+        w.domFlat[dj] = { angle: dm2.angle, t: w.t };
+        log(w, 'dominoFlat', { i: dj, angle: dm2.angle });
+      }
+    }
+    if (!w.gateOpenedAt && Math.abs(w.crank.angle) > 0.35) {
+      w.gateOpenedAt = w.t; log(w, 'gateOpen', { angle: w.crank.angle });
+    }
+    var dxs = w.ball2.x - 920, dys = w.ball2.y - 1330;
+    var dSpin = Math.sqrt(dxs * dxs + dys * dys);
+    if (!w.spinEnteredAt && dSpin < 118) {
+      w.spinEnteredAt = w.t; w.rotorAngleAtEntry = w.rotor.angle;
+      log(w, 'spinEntry', { rotorAngle: w.rotor.angle });
+    }
+    if (w.spinEnteredAt && !w.spinExitedAt && dSpin > 150) {
+      w.spinExitedAt = w.t;
+      log(w, 'spinExit', { rotorAngle: w.rotor.angle, turned: w.rotor.angle - w.rotorAngleAtEntry });
+    }
+    if (!w.boxRestAt && w.ball2.x > 250 && w.ball2.x < 410 && w.ball2.y > 1840 && w.ball2.y < 1900) {
+      var sp2 = Math.sqrt(w.ball2.vx * w.ball2.vx + w.ball2.vy * w.ball2.vy);
+      if (sp2 < 20) { w.boxRestAt = w.t; log(w, 'boxRest'); }
+    }
+    // Energy sampling (every 240 steps; step 0 establishes the baseline).
+    if (w.stepCount === 0) {
+      w.stats.energy0 = energy(w); w.stats.maxEnergy = w.stats.energy0;
+    } else if (w.stepCount % 240 === 0) {
+      var e2 = energy(w);
+      if (e2 > w.stats.maxEnergy) w.stats.maxEnergy = e2;
+    }
+    w.stepCount += 1;
+    // NaN guard.
+    for (var ni = 0; ni < w.bodies.length; ni++) {
+      var nb = w.bodies[ni];
+      if (!isFinite(nb.x + nb.y + nb.vx + nb.vy + nb.angle + nb.omega)) {
+        log(w, 'nan', { id: nb.id }); w.done = true; return;
+      }
+    }
+    if (w.boxRestAt && w.t - w.boxRestAt > 2) w.done = true;
   }
 
-  // ---------- interaction: drag to nudge only; dots / swipe choose a machine ----------
-  var dragMode = null, dragId = null, downX = 0, downY = 0;
+  var api = { CAT: CAT, DT: DT, GRAV: GRAV, buildWorld: buildWorld, stepWorld: stepWorld,
+    fixtureCorners: fixtureCorners, bodyPoint: bodyPoint };
+  if (typeof module !== 'undefined' && module.exports) module.exports = api;
+  else (typeof window !== 'undefined' ? window : global).SIM9104 = api;
+})(typeof window !== 'undefined' ? window : global);
+
+</script>
+<script>
+(function () {
+  var SIM = window.SIM9104;
+  var MARKER = '9104-FROM-SCRATCH-V3';
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var w = SIM.buildWorld();
+  var DPR = Math.min(2, window.devicePixelRatio || 1);
+  var vw = 0, vh = 0, scale = 1;
+  var camX = 700, camY = 1000, camTX = 700, camTY = 1000;
+  var muted = false, actx = null, lastSoundAt = {};
+  var params = new URLSearchParams(location.search);
+  var freezeT = params.has('t') ? parseFloat(params.get('t')) : null;
+
+  function resize() {
+    vw = window.innerWidth; vh = window.innerHeight;
+    canvas.width = Math.round(vw * DPR); canvas.height = Math.round(vh * DPR);
+    scale = vh / 1300;
+  }
+  window.addEventListener('resize', resize); resize();
+
+  // ---- audio: knocks/clicks from real collision impulses ----
+  function ensureAudio() {
+    if (!actx) { try { actx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+    if (actx && actx.state === 'suspended') actx.resume();
+  }
+  function knock(jn, woody) {
+    if (!actx || muted) return;
+    var t = actx.currentTime;
+    var vol = Math.min(0.4, jn / 3000);
+    if (vol < 0.02) return;
+    var dur = woody ? 0.09 : 0.05;
+    var buf = actx.createBuffer(1, Math.floor(actx.sampleRate * dur), actx.sampleRate);
+    var d = buf.getChannelData(0);
+    for (var i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / d.length);
+    var src = actx.createBufferSource(); src.buffer = buf;
+    var f = actx.createBiquadFilter();
+    f.type = woody ? 'lowpass' : 'bandpass';
+    f.frequency.value = woody ? 900 : 3200;
+    var g = actx.createGain(); g.gain.value = vol;
+    src.connect(f); f.connect(g); g.connect(actx.destination);
+    src.start(t);
+  }
+  function audioStep() {
+    if (!actx || muted || !w.lastContacts) return;
+    var now = performance.now(), n = 0;
+    for (var i = 0; i < w.lastContacts.length && n < 8; i++) {
+      var c = w.lastContacts[i];
+      var jn = Math.abs(c.jn || 0);
+      if (jn < 120) continue;
+      var key = (c.a.id || 's') + '|' + (c.b.id || 's');
+      if (now - (lastSoundAt[key] || 0) < 40) continue;
+      lastSoundAt[key] = now;
+      var woody = /dom|rail|shelf|plank|tray|box/.test(key);
+      knock(jn, woody); n++;
+    }
+  }
+
+  // ---- pointer: drag to nudge (physical spring force in the sim) ----
   function toWorld(e) {
     var r = canvas.getBoundingClientRect();
-    return { x: (e.clientX - r.left) / view.scale + view.x,
-             y: (e.clientY - r.top) / view.scale + view.y };
+    var sx = (e.clientX - r.left) * DPR, sy = (e.clientY - r.top) * DPR;
+    var viewW = vw / scale, viewH = vh / scale;
+    return { x: camX - viewW / 2 + sx / DPR / scale, y: camY - viewH / 2 + sy / DPR / scale };
   }
-  canvas.addEventListener('pointerdown', function (e) {
-    ensureAudio();
-    var w = toWorld(e);
-    var ss = R.seesaw;
-    var db = Math.sqrt((w.x - R.ball.x) * (w.x - R.ball.x) + (w.y - R.ball.y) * (w.y - R.ball.y));
-    if (db < 80 && R.ball.state === 'ROLL') dragMode = 'ball';
-    else if (Math.abs(w.x - ss.pivotX) < 190 && Math.abs(w.y - ss.pivotY) < 120) dragMode = 'seesaw';
-    else dragMode = null;
-    dragId = e.pointerId; downX = e.clientX; downY = e.clientY;
-    try { canvas.setPointerCapture(dragId); } catch (err) {}
-  });
-  canvas.addEventListener('pointermove', function (e) {
-    if (e.pointerId !== dragId || !dragMode) return;
-    var w = toWorld(e);
-    if (dragMode === 'ball' && R.ball.state === 'ROLL') {
-      var dx = w.x - R.ball.x, dy = w.y - R.ball.y;
-      var dd = Math.sqrt(dx * dx + dy * dy);
-      if (dd > 4) {
-        R.ball.vx += (dx / dd) * 260 * DT * 60 * 0.016;
-        R.ball.vy += (dy / dd) * 260 * DT * 60 * 0.016;
-        var s = Math.sqrt(R.ball.vx * R.ball.vx + R.ball.vy * R.ball.vy);
-        if (s > 320) { R.ball.vx *= 320 / s; R.ball.vy *= 320 / s; }
-      }
-    } else if (dragMode === 'seesaw') {
-      R.seesaw.ang = Math.max(-0.38, Math.min(0.38, (w.x - R.seesaw.pivotX) * 0.0022));
-    }
-  });
-  function endDrag(e) {
-    if (e.pointerId === dragId) {
-      // A horizontal swipe with no part grabbed chooses the other machine.
-      if (!dragMode && Math.abs(e.clientX - downX) > 80 && Math.abs(e.clientY - downY) < 100) {
-        loadMachine(1 - R.idx);
-      }
-      dragMode = null; dragId = null;
-    }
+  var dragging = false;
+  canvas.addEventListener('pointerdown', function (e) { ensureAudio(); dragging = true; var p = toWorld(e); w.nudge = p; });
+  window.addEventListener('pointermove', function (e) { if (dragging) w.nudge = toWorld(e); });
+  window.addEventListener('pointerup', function () { dragging = false; w.nudge = null; });
+
+  // ---- mute toggle (text-free SVG) ----
+  var muteBtn = document.getElementById('mute');
+  function muteIcon() {
+    var waves = muted ? '' : '<path d="M16 8a5 5 0 0 1 0 8M19 5a9 9 0 0 1 0 14" stroke="#f5ead2" stroke-width="1.8" fill="none" stroke-linecap="round"/>';
+    var slash = muted ? '<line x1="4" y1="4" x2="22" y2="20" stroke="#f5ead2" stroke-width="2" stroke-linecap="round"/>' : '';
+    muteBtn.innerHTML = '<svg viewBox="0 0 24 24"><path d="M4 9v6h4l5 4V5L8 9H4z"/>' + waves + slash + '</svg>';
   }
-  canvas.addEventListener('pointerup', endDrag);
-  canvas.addEventListener('pointercancel', endDrag);
-  document.getElementById('dot0').addEventListener('click', function (e) { e.stopPropagation(); loadMachine(0); });
-  document.getElementById('dot1').addEventListener('click', function (e) { e.stopPropagation(); loadMachine(1); });
+  muteBtn.addEventListener('click', function () { ensureAudio(); muted = !muted; muteIcon(); });
+  muteIcon();
 
-  // ---------- rendering ----------
-  var view = { x: 0, y: 0, scale: 1, w: 1600, h: 1350 };
-  var DPR = 1;
-  function resize() {
-    DPR = Math.min(2, window.devicePixelRatio || 1);
-    canvas.width = Math.floor(window.innerWidth * DPR);
-    canvas.height = Math.floor(window.innerHeight * DPR);
-    view.scale = window.innerHeight / 1350;
-    view.w = window.innerWidth / view.scale;
-    view.h = 1350;
+  // ---- drawing ----
+  var RAINBOW = ['#e5484d', '#f76b15', '#ffb224', '#46a758', '#00a2c7', '#0091ff', '#6e56cf', '#d6409f', '#ff5c7a'];
+  function poly(corners) {
+    ctx.beginPath();
+    ctx.moveTo(corners[0][0], corners[0][1]);
+    for (var i = 1; i < corners.length; i++) ctx.lineTo(corners[i][0], corners[i][1]);
+    ctx.closePath();
   }
-  window.addEventListener('resize', resize);
-  resize();
-
-  var grainLight = [], grainDark = [];
-  for (var gi = 0; gi < 90; gi++) grainLight.push([rng() * 1600, rng() * 1200, 100 + rng() * 400, 2 + rng() * 2, (rng() - 0.5) * 6]);
-  for (var gj = 0; gj < 70; gj++) grainDark.push([rng() * 1600, 1200 + rng() * 800, 100 + rng() * 400, 2 + rng() * 2, (rng() - 0.5) * 6]);
-
-  function starPath(cx, cy, r) {
+  function star(cx, cy, r) {
     ctx.beginPath();
     for (var i = 0; i < 10; i++) {
-      var rad = i % 2 === 0 ? r : r * 0.45;
+      var rr = i % 2 === 0 ? r : r * 0.45;
       var a = -Math.PI / 2 + i * Math.PI / 5;
-      var px = cx + rad * Math.cos(a), py = cy + rad * Math.sin(a);
-      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+      var x = cx + Math.cos(a) * rr, y = cy + Math.sin(a) * rr;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
     }
     ctx.closePath();
   }
-
-  function drawSeg(s) {
-    ctx.strokeStyle = s.kind === 'rail' ? '#b98a5a' : (s.kind === 'floor' ? '#a87c4e' : '#8a5a32');
-    ctx.lineWidth = s.kind === 'rail' ? 14 : 12;
-    ctx.lineCap = 'round';
-    ctx.beginPath(); ctx.moveTo(s.x1, s.y1); ctx.lineTo(s.x2, s.y2); ctx.stroke();
-  }
-
   function draw() {
-    var d = R.desc, dpr = DPR, sc = view.scale;
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.fillStyle = '#6f6152'; ctx.fillRect(0, 0, canvas.width, canvas.height);
-    ctx.setTransform(dpr * sc, 0, 0, dpr * sc, -view.x * dpr * sc, -view.y * dpr * sc);
-
-    // Floor planks.
-    ctx.fillStyle = '#6f6152'; ctx.fillRect(0, 2000, 1600, 300);
-    ctx.strokeStyle = 'rgba(0,0,0,0.15)'; ctx.lineWidth = 2;
-    for (var fy = 2110; fy < 2300; fy += 110) {
-      ctx.beginPath(); ctx.moveTo(0, fy); ctx.lineTo(1600, fy); ctx.stroke();
-    }
-    // Tables.
-    ctx.fillStyle = '#d9b98a'; ctx.fillRect(0, 0, 1600, 1200);
-    ctx.strokeStyle = 'rgba(196,160,110,0.25)';
-    for (var i = 0; i < grainLight.length; i++) {
-      var g = grainLight[i];
-      ctx.lineWidth = g[3];
-      ctx.beginPath(); ctx.moveTo(g[0], g[1]); ctx.lineTo(g[0] + g[2], g[1] + g[4]); ctx.stroke();
-    }
-    ctx.fillStyle = '#5a3a22'; ctx.fillRect(0, 1200, 1600, 800);
-    ctx.strokeStyle = 'rgba(40,25,12,0.35)';
-    for (var j = 0; j < grainDark.length; j++) {
-      var gd = grainDark[j];
-      ctx.lineWidth = gd[3];
-      ctx.beginPath(); ctx.moveTo(gd[0], gd[1]); ctx.lineTo(gd[0] + gd[2], gd[1] + gd[4]); ctx.stroke();
-    }
-    ctx.fillStyle = 'rgba(0,0,0,0.30)'; ctx.fillRect(0, 1196, 1600, 5); ctx.fillRect(0, 1996, 1600, 5);
-    // Gap slot (the void the marble flies over).
-    var gs = d.gapSlot;
-    ctx.fillStyle = '#241407'; ctx.fillRect(gs[0], gs[1], gs[2], gs[3]);
-    ctx.strokeStyle = 'rgba(0,0,0,0.5)'; ctx.lineWidth = 3;
-    ctx.strokeRect(gs[0], gs[1], gs[2], gs[3]);
-
-    // Track rails, walls, floors.
-    for (var si = 0; si < R.segs.length; si++) drawSeg(R.segs[si]);
-    // Trapdoor plank (swings down when the last domino falls).
-    var tp = d.trap.pivot;
+    var viewW = vw / scale, viewH = vh / scale;
+    ctx.setTransform(DPR * scale, 0, 0, DPR * scale, 0, 0);
+    ctx.clearRect(0, 0, viewW, viewH);
     ctx.save();
-    ctx.translate(tp[0], tp[1]); ctx.rotate(R.trapOpen * 1.2);
-    ctx.fillStyle = '#b98a5a'; ctx.fillRect(0, -6, R.trapSeg.x2 - R.trapSeg.x1, 12);
-    ctx.restore();
-
-    // Dominoes.
-    for (var di = 0; di < R.dominoes.length; di++) {
-      var dm = R.dominoes[di];
-      ctx.save(); ctx.translate(dm.x, dm.base); ctx.rotate(dm.th * dm.dir);
-      ctx.fillStyle = dm.color;
-      ctx.fillRect(-8, -dm.h, 16, dm.h);
-      ctx.fillStyle = 'rgba(255,255,255,0.25)'; ctx.fillRect(-8, -dm.h, 4, dm.h);
-      ctx.restore();
+    ctx.translate(-(camX - viewW / 2), -(camY - viewH / 2));
+    // tables
+    ctx.fillStyle = '#d9b98a'; ctx.fillRect(0, 0, 1400, 1000);
+    ctx.fillStyle = '#5a3a22'; ctx.fillRect(0, 1000, 1400, 1000);
+    ctx.strokeStyle = 'rgba(0,0,0,0.07)'; ctx.lineWidth = 2;
+    for (var y = 200; y < 1000; y += 200) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(1400, y); ctx.stroke(); }
+    ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+    for (var y2 = 1200; y2 < 2000; y2 += 200) { ctx.beginPath(); ctx.moveTo(0, y2); ctx.lineTo(1400, y2); ctx.stroke(); }
+    ctx.strokeStyle = '#2a1a0c'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(0, 1000); ctx.lineTo(1400, 1000); ctx.stroke();
+    // statics: shelf, walls, housing
+    w.statics.forEach(function (sb) {
+      var f = sb.fixtures[0];
+      var corners = SIM.fixtureCorners(sb, f);
+      poly(corners);
+      if (sb.id === 'shelf') ctx.fillStyle = '#c4a06a';
+      else if (sb.id === 'catchWall') ctx.fillStyle = '#8a6a42';
+      else if (sb.id.indexOf('hous') === 0) ctx.fillStyle = '#33415a';
+      else ctx.fillStyle = '#3a2a1a';
+      ctx.fill();
+    });
+    // rails (segments)
+    ctx.strokeStyle = '#6b4a2f'; ctx.lineWidth = 5; ctx.lineCap = 'round';
+    w.segs.forEach(function (sg) {
+      ctx.beginPath(); ctx.moveTo(sg.x1, sg.y1); ctx.lineTo(sg.x2, sg.y2); ctx.stroke();
+    });
+    // star mark in the floor box (mark, not text)
+    ctx.fillStyle = '#f2c14e'; star(330, 1885, 18); ctx.fill();
+    // seesaw
+    (function () {
+      var corners = SIM.fixtureCorners(w.seesaw, w.seesaw.fixtures[0]);
+      poly(corners); ctx.fillStyle = '#7a5230'; ctx.fill();
+      ctx.beginPath(); ctx.arc(760, 1560, 10, 0, Math.PI * 2); ctx.fillStyle = '#2a1a0c'; ctx.fill();
+    })();
+    // rotor
+    (function () {
+      w.rotor.fixtures.forEach(function (f) {
+        poly(SIM.fixtureCorners(w.rotor, f)); ctx.fillStyle = '#2f7de1'; ctx.fill();
+      });
+      ctx.beginPath(); ctx.arc(920, 1330, 7, 0, Math.PI * 2); ctx.fillStyle = '#f5ead2'; ctx.fill();
+    })();
+    // dominoes
+    w.dominoes.forEach(function (d, i) {
+      poly(SIM.fixtureCorners(d, d.fixtures[0]));
+      ctx.fillStyle = RAINBOW[i % RAINBOW.length]; ctx.fill();
+      ctx.strokeStyle = 'rgba(0,0,0,0.15)'; ctx.lineWidth = 1; ctx.stroke();
+    });
+    // balls (rotation mark turns with the body's angle: rolling, not sliding)
+    function ball(b, fill, dot) {
+      ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2); ctx.fillStyle = fill; ctx.fill();
+      ctx.beginPath(); ctx.arc(b.x + Math.cos(b.angle) * b.r * 0.55, b.y + Math.sin(b.angle) * b.r * 0.55, b.r * 0.28, 0, Math.PI * 2);
+      ctx.fillStyle = dot; ctx.fill();
+      ctx.beginPath(); ctx.arc(b.x - b.r * 0.35, b.y - b.r * 0.35, b.r * 0.22, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(255,255,255,0.5)'; ctx.fill();
     }
-
-    // Spinner gate (blue, three arms).
-    var SP = R.spin;
-    ctx.save(); ctx.translate(SP.x, SP.y); ctx.rotate(SP.phi);
-    ctx.strokeStyle = '#2b6cb0'; ctx.lineWidth = 26; ctx.lineCap = 'round';
-    for (var a = 0; a < 3; a++) {
-      var ang = a * Math.PI * 2 / 3;
-      ctx.beginPath(); ctx.moveTo(0, 0);
-      ctx.lineTo(Math.cos(ang) * SP.arm, Math.sin(ang) * SP.arm); ctx.stroke();
-      ctx.fillStyle = '#b8bec6';
-      ctx.beginPath(); ctx.arc(Math.cos(ang) * 68, Math.sin(ang) * 68, 11, 0, Math.PI * 2); ctx.fill();
-    }
-    ctx.restore();
-    ctx.fillStyle = '#b8bec6';
-    ctx.beginPath(); ctx.arc(SP.x, SP.y, 18, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = '#5a3a22';
-    ctx.beginPath(); ctx.arc(SP.x, SP.y, 6, 0, Math.PI * 2); ctx.fill();
-
-    // Seesaw.
-    var SS = R.seesaw;
-    ctx.fillStyle = '#8a5a32';
-    ctx.beginPath(); ctx.moveTo(SS.pivotX - 20, SS.pivotY + 50); ctx.lineTo(SS.pivotX + 20, SS.pivotY + 50); ctx.lineTo(SS.pivotX, SS.pivotY); ctx.closePath(); ctx.fill();
-    ctx.save(); ctx.translate(SS.pivotX, SS.pivotY); ctx.rotate(SS.ang);
-    ctx.fillStyle = '#b98a5a'; ctx.fillRect(-SS.half, -9, SS.half * 2, 18);
-    ctx.fillStyle = 'rgba(255,255,255,0.18)'; ctx.fillRect(-SS.half, -9, SS.half * 2, 5);
-    ctx.restore();
-
-    // Box (open, seen from above) with a star mark on its rim.
-    var bx = d.box, bw = bx.x2 - bx.x1;
-    ctx.fillStyle = '#8a5a32'; ctx.fillRect(bx.x1 - 6, bx.yTop - 6, bw + 12, bx.yFloor - bx.yTop + 12);
-    ctx.fillStyle = '#3a2716'; ctx.fillRect(bx.x1 + 6, bx.yTop + 6, bw - 12, bx.yFloor - bx.yTop - 12);
-    ctx.fillStyle = '#8a5a32'; ctx.fillRect(bx.x1, bx.yFloor + 6, bw, 24);
-    ctx.fillStyle = '#f2c200'; starPath((bx.x1 + bx.x2) / 2, bx.yFloor + 18, 10); ctx.fill();
-
-    // Hand: releases the marble, then leaves frame.
-    var hx = d.ballStart[0];
-    if (R.handT < 1.3) {
-      var hy = 185 - Math.min(1, R.handT / 1.1) * 345;
-      ctx.fillStyle = '#e8b48c';
-      ctx.strokeStyle = 'rgba(0,0,0,0.15)'; ctx.lineWidth = 2;
-      ctx.beginPath(); ctx.ellipse(hx, hy, 48, 36, 0, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
-      var fx = [-38, -18, 2, 26];
-      for (var fi = 0; fi < 4; fi++) {
-        ctx.beginPath(); ctx.ellipse(hx + fx[fi], hy + 48, 9, 26, 0, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    ball(w.ball1, '#d9281c', '#7d130a');
+    ball(w.ball2, '#f5ead2', '#c9b48a');
+    // crank (in front: the gate visibly blocks ball 2)
+    w.crank.fixtures.forEach(function (f) {
+      poly(SIM.fixtureCorners(w.crank, f)); ctx.fillStyle = '#c9a227'; ctx.fill();
+    });
+    ctx.beginPath(); ctx.arc(1265, 510, 8, 0, Math.PI * 2); ctx.fillStyle = '#2a1a0c'; ctx.fill();
+    // hand: holds ball 1, then leaves frame after release
+    if (w.t < 1.5) {
+      var ha = w.t < 0.6 ? 1 : Math.max(0, 1 - (w.t - 0.6) / 0.9);
+      var hy = w.t < 0.6 ? 0 : -(w.t - 0.6) * 250;
+      if (ha > 0) {
+        ctx.save(); ctx.globalAlpha = ha; ctx.translate(0, hy);
+        ctx.fillStyle = '#e8b48c';
+        ctx.beginPath(); ctx.ellipse(262, 268, 38, 26, -0.35, 0, Math.PI * 2); ctx.fill();
+        for (var fi = 0; fi < 4; fi++) {
+          ctx.beginPath(); ctx.ellipse(288 + fi * 3, 282 + fi * 9, 10, 20, 0.5, 0, Math.PI * 2); ctx.fill();
+        }
+        ctx.restore();
       }
-      ctx.beginPath(); ctx.ellipse(hx - 48, hy + 18, 22, 10, -0.6, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
     }
-
-    // The marble.
-    ctx.fillStyle = '#d92b2e';
-    ctx.beginPath(); ctx.arc(R.ball.x, R.ball.y, BALL_R, 0, Math.PI * 2); ctx.fill();
-    ctx.strokeStyle = '#a81f22'; ctx.lineWidth = 2; ctx.stroke();
-    ctx.fillStyle = 'rgba(255,255,255,0.85)';
-    ctx.beginPath(); ctx.arc(R.ball.x - 5, R.ball.y - 6, 5, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = 'rgba(255,255,255,0.30)';
-    ctx.beginPath(); ctx.arc(R.ball.x + 4, R.ball.y + 7, 2.5, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
   }
 
-  // ---------- audio follow ----------
-  var whir = null;
-  function updateAudio() {
-    if (!AC) return;
-    var spd = Math.sqrt(R.ball.vx * R.ball.vx + R.ball.vy * R.ball.vy);
-    if (rollGain) rollGain.gain.value = (!muted && R.ball.state === 'ROLL' && contact) ? Math.min(0.14, spd / 1500 * 0.14) : 0;
-    if (R.spin.om > 0.3 && !muted) {
-      if (!whir) {
-        var len = AC.sampleRate, buf = AC.createBuffer(1, len, AC.sampleRate), dd = buf.getChannelData(0);
-        for (var i = 0; i < len; i++) dd[i] = Math.random() * 2 - 1;
-        var src = AC.createBufferSource(); src.buffer = buf; src.loop = true;
-        var f = AC.createBiquadFilter(); f.type = 'bandpass'; f.Q.value = 2;
-        var g = AC.createGain(); g.gain.value = 0;
-        src.connect(f); f.connect(g); g.connect(master); src.start();
-        whir = { f: f, g: g };
-      }
-      whir.f.frequency.value = 250 + R.spin.om * 130;
-      whir.g.gain.value = Math.min(0.12, R.spin.om * 0.015);
-    } else if (whir) whir.g.gain.value = 0;
-    if (R.ball.state === 'DONE' && !doneSound) {
-      doneSound = true; knock(180, 0.25, 0.15); click(0.15);
-    }
+  // ---- camera + loop ----
+  function followTarget() {
+    if (w.gateOpenedAt || w.ball2.x > 1260) return w.ball2;
+    return w.ball1;
   }
-
-  // ---------- camera + main loop ----------
-  var qs = new URLSearchParams(location.search);
-  var freezeT = qs.get('t') !== null ? parseFloat(qs.get('t')) : null;
-  var manual = qs.get('manual') !== null;
-  var startM = qs.get('m');
-  var startIdx = (startM === '1' || startM === 'B' || startM === 'b') ? 1 : 0;
-  window.__ENGINE = { stages: [], machine: startIdx, done: false, pos: null };
-  loadMachine(startIdx);
-  view.x = 0; view.y = 0;
-  var acc = 0, last = performance.now();
   function frame(now) {
-    requestAnimationFrame(frame);
-    var el = (now - last) / 1000; last = now;
-    if (el > 0.1) el = 0.1;
-    acc += el;
-    var n = 0;
-    while (acc >= DT && n < 4000) {
-      if (freezeT !== null && R.simTime >= freezeT) break;
-      step(); acc -= DT; n++;
+    if (freezeT === null) {
+      // step sim in real time (DT = 1/480, up to 24 steps/frame catch-up)
+      var target = w.t + 1 / 60;
+      var n = 0;
+      while (w.t < target && n < 24 && !w.done) { SIM.stepWorld(w); n++; }
+      audioStep();
+      var b = followTarget();
+      var look = 0.25;
+      camTX = b.x + b.vx * look; camTY = b.y + b.vy * look;
+      var k = 1 - Math.exp(-5 / 60);
+      camX += (camTX - camX) * k; camY += (camTY - camY) * k;
+      var viewW = vw / scale, viewH = vh / scale;
+      camX = viewW >= 1400 ? 700 : Math.max(viewW / 2, Math.min(1400 - viewW / 2, camX));
+      camY = viewH >= 2000 ? 1000 : Math.max(viewH / 2, Math.min(2000 - viewH / 2, camY));
+      draw();
+      requestAnimationFrame(frame);
     }
-    if (n >= 4000) acc = 0;
-    if (window.__ENGINE) {
-      window.__ENGINE.pos = { x: Math.round(R.ball.x), y: Math.round(R.ball.y),
-        vx: Math.round(R.ball.vx), vy: Math.round(R.ball.vy), state: R.ball.state,
-        t: Math.round(R.simTime * 10) / 10 };
-    }
-    // Follow-cam with eased lookahead.
-    var tx = R.ball.x + R.ball.vx * 0.35 - view.w / 2;
-    var ty = R.ball.y + R.ball.vy * 0.35 - 675;
-    var k = 1 - Math.exp(-3 * el);
-    view.x += (tx - view.x) * k;
-    view.y += (ty - view.y) * k;
-    if (view.w >= WORLD_W) view.x = (WORLD_W - view.w) / 2;
-    else view.x = Math.max(0, Math.min(WORLD_W - view.w, view.x));
-    view.y = Math.max(0, Math.min(WORLD_H - 1350, view.y));
-    updateAudio();
-    draw();
   }
-  // Debug hooks for headless testing (read-only state exposure).
-  window.__ENGINE_STEP = step;
-  window.__ENGINE_LOAD = loadMachine;
-  window.__ENGINE_STATE = function () {
-    return { machine: R.idx, stages: R.stages.slice(), simTime: R.simTime,
-             ball: { x: R.ball.x, y: R.ball.y, vx: R.ball.vx, vy: R.ball.vy, state: R.ball.state } };
-  };
-  if (!manual) requestAnimationFrame(frame);
+  if (freezeT !== null) {
+    while (w.t < freezeT && !w.done) SIM.stepWorld(w);
+    var fb = (w.ball2.x > 1260 || w.gateOpenedAt) ? w.ball2 : w.ball1;
+    camX = fb.x; camY = fb.y;
+    var viewW = vw / scale, viewH = vh / scale;
+    camX = viewW >= 1400 ? 700 : Math.max(viewW / 2, Math.min(1400 - viewW / 2, camX));
+    camY = viewH >= 2000 ? 1000 : Math.max(viewH / 2, Math.min(2000 - viewH / 2, camY));
+    draw();
+  } else {
+    requestAnimationFrame(frame);
+  }
 })();
 </script>
 </body>
