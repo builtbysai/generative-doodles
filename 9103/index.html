@@ -53,7 +53,7 @@
     <button id="btnView">Reset view</button>
   </div>
 </div>
-<div class="ui" id="hint">Pull a stick along its own length, or grab an end and swing it around the stick lying across it — the crossing point is what the pile feels. Hold a pull against the screen edge and the table follows. Pinch or scroll to zoom into a cluster.</div>
+<div class="ui" id="hint">Pull a stick along its own length, or grab an end and swing it around the stick lying across it — the crossing point is what the pile feels. The camera follows the stick you hold, and a stick is yours once it stops crossing the pile. Pinch or scroll to zoom into a cluster.</div>
 <script>
 (function () {
   "use strict";
@@ -70,6 +70,36 @@
   //  15 × Samurai  green, three stripes                3 pts
   //  15 × Kuli     red, two stripes                    2 pts
   //
+  // v4 (2026-10-24): the playable rebuild. v3's disturbance law was
+  // honest but the game was not playable: a human-style phone
+  // playtest proved (1) only 1 of 41 sticks had nothing resting on
+  // it (median load ~17), (2) even the one free stick faulted on a
+  // slow axis pull — off-centre grab torque swept the far end,
+  // (3) clearing a stick needed ~2 stick-lengths of travel, 97 of
+  // 111 pull steps pinned at the screen edge waiting for edge-pan.
+  // v4 fixes, nothing else changes:
+  //  * SPARSER DROP + A GUARANTEE: centres scatter wider, more
+  //    loners land clear, and the drop is re-dealt until at least
+  //    5 sticks carry nothing. A real drop has a free top layer.
+  //  * WEIGHT-BASED TOLERANCE: a loader's fault threshold scales
+  //    with how much of it actually rests on the pulled stick — a
+  //    stick resting on five others does not fault because one of
+  //    them moved. Light grazes creep and tremble, they do not fault.
+  //  * TORQUE COMPENSATION: a stick with no loaders no longer
+  //    rotates itself into a roll. Axial error translates purely;
+  //    cross-axis error inside a deadzone is finger wobble and is
+  //    ignored; beyond it the stick rotates slowly about the grab
+  //    point, capped, while still following the finger.
+  //  * COLLECT WHEN CLEAR OF THE CROSSING WEB + CAMERA FOLLOW:
+  //    a stick is yours once it no longer crosses anything in the
+  //    pile (not once it is a clearance-distance away from every
+  //    near stick), and the camera follows a held stick so an
+  //    extraction finishes on screen. Edge-pan stays as a fallback
+  //    for inspecting the pile, not as the extraction path.
+  //  * Kept honest: careless heaves still fault, pivots around a
+  //    resting stick still work, supported sticks still sag when
+  //    their support is taken.
+  // ---------------------------------------------------------------
   // v3 research (blinky.games rules/strategy; Kubiya's history;
   // classic rule sheets; a 3D-modelling thread on simulated piles):
   //  * A real heap is a STACK, not a pattern: sticks land one at a
@@ -238,6 +268,7 @@
   var trayRects = [null, null];
   var DPR = 1, W = 0, H = 0;
   var dropStart = 0;
+  var lastDealAttempts = 0, lastDealFree = 0;
 
   function stickEnds(s) {
     var c = Math.cos(s.ang), n = Math.sin(s.ang), hl = s.len / 2;
@@ -269,44 +300,59 @@
     for (var i = bag.length - 1; i > 0; i--) {
       var j = (rng() * (i + 1)) | 0, tmp = bag[i]; bag[i] = bag[j]; bag[j] = tmp;
     }
-    // THE FAN: a fist of upright sticks opened on the table. Centres
-    // scatter over a wide ellipse (~1.6 units across the long axis),
-    // angles fan radially with a wild minority, a few loners land on
-    // the perimeter lying clear. ~38% of drops tighten into a nest.
-    var nest = rng() < 0.38;
-    var R = nest ? 0.20 : 0.30;
-    var bundleAng = rng() * Math.PI * 2;
-    bag.forEach(function (ri, idx) {
-      var loner = rng() < 0.14;
-      var rr = Math.pow(rng(), 1.35) * R + (loner ? 0.10 + rng() * 0.08 : 0);
-      var th = rng() * Math.PI * 2;
-      var pick = rng();
-      var ang;
-      if (pick < 0.45) ang = th + Math.PI / 2 + (rng() - 0.5) * 1.5;   // tangential fan
-      else if (pick < 0.75) ang = th + (rng() - 0.5) * 1.5;           // radial spoke
-      else ang = rng() * Math.PI * 2;                                 // wild
-      var s = {
-        id: idx, rank: RANKS[ri], rankIdx: ri,
-        cx: Math.cos(th) * rr, cy: Math.sin(th) * rr * 0.8,
-        ang: ang,
-        len: STICK_LEN, lenScale: 1,
-        tol: 0.020 * (0.85 + rng() * 0.45),
-        disturb: 0,
-        // v3 physical layer: spring-damped response offset (rendered,
-        // driven by crossing travel), grab lift, landing + sound state
-        respX: 0, respY: 0, respAng: 0, respVX: 0, respVY: 0, respAngV: 0,
-        liftK: 0, landed: false, strainAcc: 0, lastRespTick: 0,
-        hSamples: null, hPrev: null, hBlendT0: 0,
-        state: "pile",
-        dropDelay: idx * 16,
-        fromCx: (rng() - 0.5) * 0.06, fromCy: (rng() - 0.5) * 0.05,
-        fromAng: bundleAng + (rng() - 0.5) * 0.35,
-        anim: null, trayPlayer: -1, traySlot: -1
-      };
-      s.finalCx = s.cx; s.finalCy = s.cy; s.finalAng = s.ang;
-      sticks.push(s);
-    });
+    // THE FAN (v4): a fist of upright sticks opened on the table.
+    // Centres scatter over a WIDER ellipse than v3 (~2.2 units
+    // across), angles fan radially with a wild minority, and more
+    // loners land on the perimeter lying clear.
+    // THE GUARANTEE: the drop is re-dealt until at least 5 sticks
+    // carry nothing — a real drop has a free top layer, and a knot
+    // where the first move is a forced fault is not a game. The
+    // best deal seen is kept if 200 re-deals all fall short.
+    // (Dealing is instant — no animation runs per attempt — so
+    // 200 attempts cost well under a second even in the worst case.)
+    var bestDeal = null, bestFree = -1;
+    for (var attempt = 0; attempt < 200; attempt++) {
+      sticks = [];
+      var nest = rng() < 0.38;
+      var R = nest ? 0.34 : 0.46;
+      var bundleAng = rng() * Math.PI * 2;
+      bag.forEach(function (ri, idx) {
+        var loner = rng() < 0.26;
+        var rr = Math.pow(rng(), 1.35) * R + (loner ? 0.22 + rng() * 0.20 : 0);
+        var th = rng() * Math.PI * 2;
+        var pick = rng();
+        var ang;
+        if (pick < 0.45) ang = th + Math.PI / 2 + (rng() - 0.5) * 1.5;   // tangential fan
+        else if (pick < 0.75) ang = th + (rng() - 0.5) * 1.5;           // radial spoke
+        else ang = rng() * Math.PI * 2;                                 // wild
+        var s = {
+          id: idx, rank: RANKS[ri], rankIdx: ri,
+          cx: Math.cos(th) * rr, cy: Math.sin(th) * rr * 0.8,
+          ang: ang,
+          len: STICK_LEN, lenScale: 1,
+          tol: 0.020 * (0.85 + rng() * 0.45),
+          disturb: 0,
+          respX: 0, respY: 0, respAng: 0, respVX: 0, respVY: 0, respAngV: 0,
+          liftK: 0, landed: false, strainAcc: 0, lastRespTick: 0,
+          hSamples: null, hPrev: null, hBlendT0: 0,
+          state: "pile",
+          dropDelay: idx * 16,
+          fromCx: (rng() - 0.5) * 0.06, fromCy: (rng() - 0.5) * 0.05,
+          fromAng: bundleAng + (rng() - 0.5) * 0.35,
+          anim: null, trayPlayer: -1, traySlot: -1
+        };
+        s.finalCx = s.cx; s.finalCy = s.cy; s.finalAng = s.ang;
+        sticks.push(s);
+      });
+      buildGraph();
+      var freeN = 0;
+      sticks.forEach(function (s) { if (loads[s.id].length === 0) freeN++; });
+      if (freeN > bestFree) { bestFree = freeN; bestDeal = sticks; }
+      if (freeN >= 5) break;
+    }
+    sticks = bestDeal;
     buildGraph();
+    lastDealAttempts = Math.min(attempt + 1, 200); lastDealFree = bestFree;
     busy = true;
     dropStart = performance.now();
     setStatus(mode === "2p" ? "<span class='turn'>Player 1</span> to move" : "Your pile. Take it apart.");
@@ -409,6 +455,18 @@
   }
   function loadersOf(id) { return loads[id] || []; }
   function supportsOf(id) { return supports[id] || []; }
+  // v4 WEIGHT-BASED TOLERANCE: a loader's fault threshold scales
+  // with how much of it actually rests on the pulled stick. A stick
+  // resting on five others is held mostly by the other four — the
+  // pulled one carries ~1/5 of it, so its threshold is ~2.6x the
+  // base. A stick resting on ONLY the pulled stick keeps the base
+  // threshold: its full weight is on you. Light grazes stay below
+  // every threshold and only creep/tremble, never fault.
+  function effTolFor(loader) {
+    var nSup = Math.max(1, supportsOf(loader.id).length);
+    var share = 1 / nSup;
+    return loader.tol * Math.min(3, 1 + 2.0 * (1 - share));
+  }
   // sticks physically present on the table (a settling or rolling stick
   // is still there, still holding up whatever lies on it)
   function graphSticks() {
@@ -601,12 +659,12 @@
     var zoom = view.baseS ? view.s / view.baseS : 1;
     var landscape = W >= H * 0.92;
     if (landscape) {
-      view.baseS = Math.min(W * 0.36, H * 0.60);
+      view.baseS = Math.min(W * 0.32, H * 0.60);
       view.cx = W * 0.40; view.cy = H * 0.54;
       trayRects[0] = { x: W * 0.755, y: H * 0.13, w: W * 0.225, h: H * 0.36 };
       trayRects[1] = { x: W * 0.755, y: H * 0.545, w: W * 0.225, h: H * 0.36 };
     } else {
-      view.baseS = Math.min(W * 0.42, H * 0.30);
+      view.baseS = Math.min(W * 0.36, H * 0.30);
       view.cx = W * 0.5; view.cy = H * 0.42;
       trayRects[0] = { x: W * 0.04, y: H * 0.70, w: W * 0.44, h: H * 0.26 };
       trayRects[1] = { x: W * 0.52, y: H * 0.70, w: W * 0.44, h: H * 0.26 };
@@ -668,7 +726,7 @@
     s.startCx = s.cx; s.startCy = s.cy; s.startAng = s.ang;
     var e = stickEnds(s);
     s.startAx = e.a.x; s.startAy = e.a.y; s.startBx = e.b.x; s.startBy = e.b.y;
-    s.grabT = pick.t; s.angVel = 0;
+    s.grabT = pick.t; s.angVel = 0; s.rotAccum = 0;
     smX = pointer.x; smY = pointer.y;
     sticks.forEach(function (o) { o.disturb = 0; });
     contacts = [];
@@ -676,7 +734,7 @@
       var other = sticks[L.other];
       if (other.state !== "pile") return;
       var hit = segInt(e.a, e.b, stickEnds(other).a, stickEnds(other).b);
-      contacts.push({ other: other, isLoader: true, acc: 0, x: hit ? hit.x : L.x, y: hit ? hit.y : L.y });
+      contacts.push({ other: other, isLoader: true, acc: 0, effTol: effTolFor(other), x: hit ? hit.x : L.x, y: hit ? hit.y : L.y });
     });
     supportsOf(s.id).forEach(function (L) {
       var other = sticks[L.other];
@@ -838,14 +896,39 @@
       s.cy += uy * dAx + ny * push;
       s.angVel = 0;
     } else {
-      s.cx += dX; s.cy += dY;
-      var eN = stickEnds(s);
-      var g2x = eN.a.x + (eN.b.x - eN.a.x) * s.grabT;
-      var g2y = eN.a.y + (eN.b.y - eN.a.y) * s.grabT;
-      var rx2 = g2x - s.cx, ry2 = g2y - s.cy;
-      var torque = (rx2 * errY - ry2 * errX) / (rx2 * rx2 + ry2 * ry2 + 0.015);
-      s.angVel = clamp((s.angVel || 0) * 0.72 + torque * 0.045, -0.04, 0.04);
-      s.ang += s.angVel;
+      // v4 TORQUE COMPENSATION: a stick with no loaders must not
+      // rotate itself into a roll. v3's spring + lever torque let
+      // an off-centre grab on a slow axis pull sweep the far end
+      // until something moved. Here the pointer error is split:
+      // axial error translates purely; cross-axis error inside a
+      // per-step deadzone is finger wobble and is ignored; beyond
+      // it the stick still follows the finger sideways (85% of the
+      // cross step) and rotates only slowly about the grab point,
+      // with total rotation soft-capped — a deliberate swing still
+      // turns the stick, an axis pull no longer does.
+      var ux2 = Math.cos(s.ang), uy2 = Math.sin(s.ang), nx2 = -uy2, ny2 = ux2;
+      var dAx = dX * ux2 + dY * uy2;
+      var dPr = dX * nx2 + dY * ny2;
+      s.cx += ux2 * dAx + nx2 * dPr * 0.85;
+      s.cy += uy2 * dAx + ny2 * dPr * 0.85;
+      var crossDz = 0.006;
+      if (Math.abs(dPr) > crossDz) {
+        var over = dPr - Math.sign(dPr) * crossDz;
+        var cap = Math.max(0, 1 - Math.abs(s.rotAccum || 0) / 0.5);
+        var dth = clamp(over * 0.30, -0.015, 0.015) * cap;
+        if (dth) {
+          var ge = stickEnds(s);
+          var gpx = ge.a.x + (ge.b.x - ge.a.x) * s.grabT;
+          var gpy = ge.a.y + (ge.b.y - ge.a.y) * s.grabT;
+          var cs = Math.cos(dth), sn = Math.sin(dth);
+          var rx = s.cx - gpx, ry = s.cy - gpy;
+          s.cx = gpx + rx * cs - ry * sn;
+          s.cy = gpy + rx * sn + ry * cs;
+          s.ang += dth;
+          s.rotAccum = (s.rotAccum || 0) + dth;
+        }
+      }
+      s.angVel = 0;
     }
 
     // disturbance: travel of each loader's crossing point since last step
@@ -862,13 +945,14 @@
         var moved = Math.hypot(mvx, mvy);
         c.acc += moved < 0.0006 ? moved * 0.25 : moved;   // friction deadband
         c.other.disturb = Math.max(c.other.disturb, c.acc);
+        c.other.disturbTol = c.effTol || c.other.tol;
         // THE WORLD ANSWERS: the loader rides its crossing. A share of
         // the crossing's travel drags the resting stick — more as its
         // tolerance fills — and travel across its own axis kicks it
         // into a slow roll. The spring in stepFeel pulls it home, so
         // what you see is strain, not teleporting: it creeps, trembles
         // under load, and either settles back or goes over (fault).
-        var ratio = clamp(c.acc / c.other.tol, 0, 1);
+        var ratio = clamp(c.acc / (c.effTol || c.other.tol), 0, 1);
         var share = 0.14 + 0.55 * ratio;
         c.other.respVX = (c.other.respVX || 0) + mvx * share * 2.6;
         c.other.respVY = (c.other.respVY || 0) + mvy * share * 2.6;
@@ -883,14 +967,18 @@
           lo.strainAcc = 0;
           lastStrainTick = nowMs;
         }
-        if (c.acc > c.other.tol && !faulted) faulted = c.other;
+        if (c.acc > (c.effTol || c.other.tol) && !faulted) faulted = c.other;
       }
       c.x = hit.x; c.y = hit.y;
     }
     if (faulted) { fault(faulted); return; }
 
-    // clear? the whole segment must be free of every other pile stick —
-    // and the stick must actually have travelled, not just been touched
+    // v4: collected once it no longer CROSSES anything in the pile
+    // — out of the crossing web is out, even if a parallel
+    // neighbour still lies nearby. v3's clearance-distance rule
+    // demanded extra clean travel past every near stick, which is
+    // what pushed pulls to the bezel. The stick must still have
+    // actually travelled, not just been touched.
     var movedTotal = Math.max(
       Math.hypot(s.cx - s.startCx, s.cy - s.startCy),
       Math.hypot(e2.a.x - s.startAx, e2.a.y - s.startAy),
@@ -901,7 +989,7 @@
       var o = sticks[k];
       if (o === s || o.state !== "pile") continue;
       var eo2 = stickEnds(o);
-      if (segSegDist(e2.a, e2.b, eo2.a, eo2.b) < HALF_W * 2 + 0.006) { clear = false; break; }
+      if (segInt(e2.a, e2.b, eo2.a, eo2.b)) { clear = false; break; }
     }
     if (clear) collect(s);
   }
@@ -1198,7 +1286,7 @@
     // tremble: a loader close to rolling shakes almost imperceptibly
     var tremble = 0;
     if (grabbed && s.state === "pile" && s.disturb > 0.001) {
-      var ratio0 = clamp(s.disturb / s.tol, 0, 1);
+      var ratio0 = clamp(s.disturb / (s.disturbTol || s.tol), 0, 1);
       if (ratio0 > 0.55) tremble = (ratio0 - 0.55) * 1.6;
     }
     ctx.save();
@@ -1296,7 +1384,7 @@
     // stress tint: now only a whisper — the loader itself creeping,
     // trembling and knocking is the real signal
     if (grabbed && s.state === "pile" && s.disturb > 0.001) {
-      var ratio = clamp(s.disturb / s.tol, 0, 1);
+      var ratio = clamp(s.disturb / (s.disturbTol || s.tol), 0, 1);
       traceOutline(gp.pts, gp.ts, gp.nx, gp.ny, gp.hw);
       ctx.fillStyle = "rgba(255,64,26," + (0.04 + 0.19 * ratio).toFixed(3) + ")";
       ctx.fill();
@@ -1410,6 +1498,22 @@
     var dt = lastNow ? clamp((now - lastNow) / 1000, 0, 0.05) : 0.016;
     lastNow = now;
     if (grabbed && grabbed.state === "grab" && !frozenPose) {
+      // v4 CAMERA FOLLOW: a held stick stays on screen. If its
+      // centre drifts out of the central band, the table slides so
+      // it stays visible — an extraction finishes on screen instead
+      // of blind at the bezel. Edge-pan below stays as the fallback
+      // for inspecting the pile.
+      var gsp = screenOf(grabbed.cx, grabbed.cy);
+      var mx = 0, my = 0;
+      if (gsp[0] < W * 0.22) mx = gsp[0] - W * 0.22;
+      else if (gsp[0] > W * 0.78) mx = gsp[0] - W * 0.78;
+      if (gsp[1] < H * 0.28) my = gsp[1] - H * 0.28;
+      else if (gsp[1] > H * 0.72) my = gsp[1] - H * 0.72;
+      if (mx || my) {
+        view.ox += mx / view.s;
+        view.oy += my / (view.s * SQUASH);
+        clampPan();
+      }
       // EDGE PAN: a long pull runs out of screen before the stick is
       // out of the pile — so while you hold a stick against the edge,
       // the table slides with you and the pull can finish. The stick
@@ -1590,6 +1694,8 @@
           helperReady: players[current].helperReady, holdsHelper: players[current].holdsHelper,
           grabbedId: grabbed ? grabbed.id : null,
           pile: pileCount(),
+          free: sticks.filter(function (s) { return s.state === "pile" && loads[s.id].length === 0; }).length,
+          dealAttempts: lastDealAttempts, dealFree: lastDealFree,
           zoom: view.s / view.baseS,
           status: statusEl.textContent
         };
