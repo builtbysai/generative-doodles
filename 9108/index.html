@@ -1,0 +1,1446 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Wonderworks · № 9108</title>
+<!-- 9108-FOUR-WORLDS-V1 -->
+<style>
+  html, body { margin:0; width:100%; height:100%; overflow:hidden; overscroll-behavior:none; background:#eee9de; }
+  canvas { display:block; width:100%; height:100%; touch-action:none; cursor:grab; }
+  canvas:active { cursor:grabbing; }
+  #sound { position:fixed; right:14px; bottom:13px; width:32px; height:32px; border:0; padding:0;
+    background:transparent; color:#655e52; opacity:.56; cursor:pointer; font:22px Georgia,serif; }
+  #sound:hover, #sound:focus-visible {opacity:1;outline-offset:3px;}
+  #sound[data-on="true"] {opacity:.73;}
+  @media (prefers-reduced-motion:reduce) { canvas { cursor:default; } }
+</style>
+</head>
+<body>
+<canvas id="c" aria-label="Kinetic marble machine. Tap to enable sound; drag near the marble to influence its motion."></canvas><button id="sound" type="button" aria-label="Enable sound" title="Enable sound">♪</button>
+
+<script>
+(function (global) {
+  'use strict';
+  var GRAV = 2000;
+  var DT = 1 / 480;
+  var CAT = { BALL: 1, DOMINO: 2, STATIC: 4, ROTOR: 8, SEESAW: 16, CRANK: 32 };
+  var ALL = 0xFFFF;
+
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function rotX(x, y, c, s) { return x * c - y * s; }
+  function rotY(x, y, c, s) { return x * s + y * c; }
+
+  // ---------------- bodies ----------------
+  // Circle body: {kind:'circle', x,y,vx,vy,angle,omega,mass,invMass,inertia,invInertia,...}
+  function circleBody(id, x, y, r, density, cat, mask, fric, rest) {
+    var m = Math.PI * r * r * density / 100;
+    // Dummy fixture (never used for shape, only for mask checks) so the
+    // body-vs-static-box loop processes circles: without it, balls fell
+    // straight through the shelf, housing, and box floor.
+    return { id: id, kind: 'circle', type: 'dyn', x: x, y: y, vx: 0, vy: 0,
+      angle: 0, omega: 0, r: r, mass: m, invMass: 1 / m,
+      inertia: 0.5 * m * r * r, invInertia: 1 / (0.5 * m * r * r),
+      cat: cat, mask: mask, fric: fric, rest: rest,
+      fixtures: [fixture(0, 0, 0, 0, 0, cat, mask, fric, rest, 'circle')] };
+  }
+  // Box fixture: local center (cx,cy), size (w,h), local angle a.
+  function fixture(cx, cy, w, h, a, cat, mask, fric, rest, name) {
+    return { cx: cx, cy: cy, w: w, h: h, a: a || 0, cat: cat, mask: mask,
+      fric: fric, rest: rest, name: name || '' };
+  }
+  // Dynamic single/multi-fixture box body.
+  function polyBody(id, x, y, angle, fixtures, density) {
+    var m = 0, ix = 0, iy = 0;
+    for (var i = 0; i < fixtures.length; i++) {
+      var f = fixtures[i], fm = f.w * f.h * density / 100;
+      m += fm; ix += fm * f.cx; iy += fm * f.cy;
+    }
+    var comX = ix / m, comY = iy / m, inertia = 0;
+    for (var j = 0; j < fixtures.length; j++) {
+      var g = fixtures[j], gm = g.w * g.h * density / 100;
+      var dx = g.cx - comX, dy = g.cy - comY;
+      inertia += gm * (g.w * g.w + g.h * g.h) / 12 + gm * (dx * dx + dy * dy);
+    }
+    return { id: id, kind: 'poly', type: 'dyn', x: x, y: y, vx: 0, vy: 0,
+      angle: angle, omega: 0, mass: m, invMass: 1 / m, inertia: inertia,
+      invInertia: 1 / inertia, comX: comX, comY: comY, fixtures: fixtures };
+  }
+  // Pinned body: rotates about `anchor`, position derived from angle.
+  // Fixture centers are local to the pivot. A torsional spring (k) and
+  // angular damping (c) may be supplied; both are physical torques.
+  function pinnedBody(id, anchorX, anchorY, fixtures, density, springK, dampC) {
+    var b = polyBody(id, anchorX, anchorY, 0, fixtures, density);
+    b.type = 'pinned'; b.invMass = 0;
+    b.anchorX = anchorX; b.anchorY = anchorY;
+    b.springK = springK || 0; b.springA0 = 0; b.dampC = dampC || 0;
+    return b;
+  }
+  // Numerical safety rails only: they engage solely on pathological
+  // penetration/velocity (vise cases), never in normal operation.
+  function clampVelocity(b) {
+    if (b.type !== 'dyn') return;
+    var sp = Math.sqrt(b.vx * b.vx + b.vy * b.vy);
+    if (sp > 5000) { b.vx *= 5000 / sp; b.vy *= 5000 / sp; }
+    if (Math.abs(b.omega) > 50) b.omega = 50 * Math.sign(b.omega);
+  }
+  function staticBox(id, cx, cy, w, h, angle, mask) {
+    return { id: id, kind: 'poly', type: 'static', x: cx, y: cy, vx: 0, vy: 0,
+      angle: angle || 0, omega: 0, mass: Infinity, invMass: 0, inertia: Infinity,
+      invInertia: 0, comX: 0, comY: 0,
+      fixtures: [fixture(0, 0, w, h, 0, CAT.STATIC, mask, 0.8, 0, 'static')] };
+  }
+  // Pinned-body hinge limits are mechanical stops, not scripted motion.
+  function applyHingeLimits(b) {
+    if (b.type !== 'pinned') return;
+    if (b.angleMin !== undefined && b.angle < b.angleMin) { b.angle = b.angleMin; if (b.omega < 0) b.omega = 0; }
+    if (b.angleMax !== undefined && b.angle > b.angleMax) { b.angle = b.angleMax; if (b.omega > 0) b.omega = 0; }
+  }
+  function staticSeg(id, x1, y1, x2, y2, mask, fric, rest) {
+    return { id: id, kind: 'seg', type: 'static', x1: x1, y1: y1, x2: x2, y2: y2,
+      x: (x1 + x2) / 2, y: (y1 + y2) / 2, vx: 0, vy: 0, angle: 0, omega: 0,
+      mass: Infinity, invMass: 0, inertia: Infinity, invInertia: 0,
+      cat: CAT.STATIC, mask: mask, fric: fric || 0.5, rest: rest || 0.1 };
+  }
+
+  // World-space corners of a fixture of a poly body.
+  function fixtureCorners(b, f) {
+    var c = Math.cos(b.angle), s = Math.sin(b.angle);
+    var cc = Math.cos(b.angle + f.a), ss = Math.sin(b.angle + f.a);
+    var wx = b.x + rotX(f.cx, f.cy, c, s), wy = b.y + rotY(f.cx, f.cy, c, s);
+    var hw = f.w / 2, hh = f.h / 2;
+    var pts = [[hw, -hh], [hw, hh], [-hw, hh], [-hw, -hh]];
+    var out = [];
+    for (var i = 0; i < 4; i++) {
+      out.push([wx + rotX(pts[i][0], pts[i][1], cc, ss),
+                wy + rotY(pts[i][0], pts[i][1], cc, ss)]);
+    }
+    return out;
+  }
+  function bodyPoint(b, lx, ly) {
+    var c = Math.cos(b.angle), s = Math.sin(b.angle);
+    return [b.x + rotX(lx, ly, c, s), b.y + rotY(lx, ly, c, s)];
+  }
+
+  // ---------------- contact detection ----------------
+  // Contact: {a, b, px, py, nx, ny, pen, fric, rest} with normal from A to B.
+  function project(corners, ax, ay) {
+    var mn = Infinity, mx = -Infinity;
+    for (var i = 0; i < corners.length; i++) {
+      var d = corners[i][0] * ax + corners[i][1] * ay;
+      if (d < mn) mn = d; if (d > mx) mx = d;
+    }
+    return [mn, mx];
+  }
+  function faceNormal(corners, i) {
+    var p1 = corners[i], p2 = corners[(i + 1) % 4];
+    var ex = p2[0] - p1[0], ey = p2[1] - p1[1];
+    var mx = (p1[0] + p2[0]) / 2, my = (p1[1] + p2[1]) / 2;
+    var cx = (corners[0][0] + corners[2][0]) / 2, cy = (corners[0][1] + corners[2][1]) / 2;
+    var nx = ey, ny = -ex, len = Math.sqrt(nx * nx + ny * ny) || 1;
+    nx /= len; ny /= len;
+    if (nx * (mx - cx) + ny * (my - cy) < 0) { nx = -nx; ny = -ny; }
+    return [nx, ny];
+  }
+  function clipSegment(p1, p2, nx, ny, offset) {
+    var d1 = p1[0] * nx + p1[1] * ny - offset;
+    var d2 = p2[0] * nx + p2[1] * ny - offset;
+    var out = [];
+    if (d1 <= 0) out.push(p1);
+    if (d2 <= 0) out.push(p2);
+    if (d1 * d2 < 0) {
+      var t = d1 / (d1 - d2);
+      out.push([p1[0] + (p2[0] - p1[0]) * t, p1[1] + (p2[1] - p1[1]) * t]);
+    }
+    return out;
+  }
+  // Box-box via SAT + reference/incident face clipping. Returns contacts (0..2).
+  function collideBoxBox(bA, fA, bB, fB) {
+    var cA = fixtureCorners(bA, fA), cB = fixtureCorners(bB, fB);
+    var best = { sep: -Infinity, ref: null, refFace: -1, nx: 0, ny: 0 };
+    function testFaces(cornersRef, cornersInc, refIsA) {
+      for (var i = 0; i < 4; i++) {
+        var n = faceNormal(cornersRef, i);
+        var p = cornersRef[i];
+        var minSep = Infinity;
+        for (var j = 0; j < 4; j++) {
+          var sep = (cornersInc[j][0] - p[0]) * n[0] + (cornersInc[j][1] - p[1]) * n[1];
+          if (sep < minSep) minSep = sep;
+        }
+        // Separation of the incident box from the reference face plane:
+        // positive means fully outside on that side. We track the LARGEST
+        // (least penetrating) separation; collision needs all <= 0.
+        if (minSep > best.sep) {
+          best.sep = minSep; best.refIsA = refIsA; best.refFace = i;
+          best.nx = n[0]; best.ny = n[1];
+        }
+      }
+    }
+    testFaces(cA, cB, true);
+    testFaces(cB, cA, false);
+    if (best.sep > 0) return [];
+    // Reference face / incident face.
+    var refC, incC, nRef;
+    if (best.refIsA) {
+      refC = cA; incC = cB;
+      var nA = faceNormal(cA, best.refFace);
+      nRef = nA;
+    } else {
+      refC = cB; incC = cA;
+      var nB = faceNormal(cB, best.refFace);
+      nRef = nB;
+    }
+    // Incident face: most anti-parallel to nRef.
+    var incFace = -1, minDot = Infinity;
+    for (var k = 0; k < 4; k++) {
+      var nn = faceNormal(incC, k);
+      var d = nn[0] * nRef[0] + nn[1] * nRef[1];
+      if (d < minDot) { minDot = d; incFace = k; }
+    }
+    var r1 = refC[best.refFace], r2 = refC[(best.refFace + 1) % 4];
+    var i1 = incC[incFace], i2 = incC[(incFace + 1) % 4];
+    var tx = r2[0] - r1[0], ty = r2[1] - r1[1];
+    var tl = Math.sqrt(tx * tx + ty * ty) || 1; tx /= tl; ty /= tl;
+    var seg = clipSegment(i1, i2, -tx, -ty, -(r1[0] * tx + r1[1] * ty));
+    seg = clipSegment(seg[0], seg[1], tx, ty, r2[0] * tx + r2[1] * ty);
+    var out = [];
+    var refOff = r1[0] * nRef[0] + r1[1] * nRef[1];
+    for (var m = 0; m < seg.length; m++) {
+      var sep = seg[m][0] * nRef[0] + seg[m][1] * nRef[1] - refOff;
+      if (sep <= 0.5) {
+        // Solver normal points from A to B.
+        var nx = best.refIsA ? nRef[0] : -nRef[0];
+        var ny = best.refIsA ? nRef[1] : -nRef[1];
+        out.push({ px: seg[m][0], py: seg[m][1], nx: nx, ny: ny, pen: -sep });
+      }
+    }
+    return out;
+  }
+  function collideCircleSeg(c, s) {
+    var dx = s.x2 - s.x1, dy = s.y2 - s.y1;
+    var len2 = dx * dx + dy * dy || 1;
+    var t = clamp(((c.x - s.x1) * dx + (c.y - s.y1) * dy) / len2, 0, 1);
+    var qx = s.x1 + dx * t, qy = s.y1 + dy * t;
+    var nx = c.x - qx, ny = c.y - qy;
+    var d = Math.sqrt(nx * nx + ny * ny);
+    if (d >= c.r) return null;
+    if (d < 1e-6) { nx = -dy / Math.sqrt(len2); ny = dx / Math.sqrt(len2); d = 1; }
+    else { nx /= d; ny /= d; }
+    return { px: qx, py: qy, nx: nx, ny: ny, pen: c.r - d };
+  }
+  function collideCircleBox(c, b, f) {
+    var corners = fixtureCorners(b, f);
+    var cx = (corners[0][0] + corners[2][0]) / 2, cy = (corners[0][1] + corners[2][1]) / 2;
+    var best = { pen: Infinity, nx: 0, ny: 0 };
+    for (var i = 0; i < 2; i++) {
+      var n = faceNormal(corners, i); // faces 0,1 = the two DISTINCT axes
+      var pr = project(corners, n[0], n[1]);
+      var cc = c.x * n[0] + c.y * n[1];
+      var ov = Math.min(pr[1], cc + c.r) - Math.max(pr[0], cc - c.r);
+      if (ov < 0) return null;
+      if (ov < best.pen) {
+        var sgn = (cc - (pr[0] + pr[1]) / 2) >= 0 ? 1 : -1;
+        best = { pen: ov, nx: n[0] * sgn, ny: n[1] * sgn };
+      }
+    }
+    // Axis from box center to circle center.
+    var ax = c.x - cx, ay = c.y - cy, al = Math.sqrt(ax * ax + ay * ay);
+    if (al > 1e-6) {
+      ax /= al; ay /= al;
+      var pr2 = project(corners, ax, ay);
+      var cc2 = c.x * ax + c.y * ay;
+      var ov2 = Math.min(pr2[1], cc2 + c.r) - Math.max(pr2[0], cc2 - c.r);
+      if (ov2 < 0) return null;
+      if (ov2 < best.pen) best = { pen: ov2, nx: ax, ny: ay };
+    }
+    // Contact point: circle surface toward the box, pulled halfway into overlap.
+    var px = c.x - best.nx * (c.r - best.pen / 2);
+    var py = c.y - best.ny * (c.r - best.pen / 2);
+    return { px: px, py: py, nx: best.nx, ny: best.ny, pen: best.pen };
+  }
+  function collideCircleCircle(a, b) {
+    var dx = b.x - a.x, dy = b.y - a.y, d = Math.sqrt(dx * dx + dy * dy);
+    var rr = a.r + b.r;
+    if (d >= rr) return null;
+    if (d < 1e-6) { dx = 1; dy = 0; d = 1; }
+    return { px: a.x + dx / d * a.r, py: a.y + dy / d * a.r,
+      nx: dx / d, ny: dy / d, pen: rr - d };
+  }
+
+  // ---------------- solver ----------------
+  function velAtPoint(b, px, py) {
+    if (b.type === 'static') return [0, 0];
+    if (b.type === 'pinned' && b.sweep !== false) {
+      var rx = px - b.anchorX, ry = py - b.anchorY;
+      return [-b.omega * ry, b.omega * rx];
+    }
+    var rx2 = px - b.x, ry2 = py - b.y;
+    return [b.vx - b.omega * ry2, b.vy + b.omega * rx2];
+  }
+  function refPoint(b, px, py) {
+    if (b.type === 'pinned') return [b.anchorX, b.anchorY];
+    return [b.x, b.y];
+  }
+  function applyImpulse(b, jx, jy, px, py) {
+    if (b.type === 'static') return;
+    if (b.type === 'pinned') {
+      var rx = px - b.anchorX, ry = py - b.anchorY;
+      b.omega += b.invInertia * (rx * jy - ry * jx);
+      return;
+    }
+    b.vx += b.invMass * jx; b.vy += b.invMass * jy;
+    var rx2 = px - b.x, ry2 = py - b.y;
+    b.omega += b.invInertia * (rx2 * jy - ry2 * jx);
+  }
+  function solveContacts(contacts, dt) {
+    var SLOP = 0.01, BETA = 0.2, REST_VEL = 100;
+    for (var i = 0; i < contacts.length; i++) {
+      var c = contacts[i];
+      var va = velAtPoint(c.a, c.px, c.py), vb = velAtPoint(c.b, c.px, c.py);
+      var vn0 = (vb[0] - va[0]) * c.nx + (vb[1] - va[1]) * c.ny;
+      c.restBias = vn0 < -REST_VEL ? -c.rest * vn0 : 0;
+      c.impactSpeed=Math.max(0,-vn0);
+      c.jn = 0; c.jt = 0;
+    }
+    for (var it = 0; it < 20; it++) {
+      for (var k = 0; k < contacts.length; k++) {
+        var c2 = contacts[k];
+        var va2 = velAtPoint(c2.a, c2.px, c2.py), vb2 = velAtPoint(c2.b, c2.px, c2.py);
+        var rvx = vb2[0] - va2[0], rvy = vb2[1] - va2[1];
+        var ra = refPoint(c2.a, c2.px, c2.py), rb = refPoint(c2.b, c2.px, c2.py);
+        var rax = c2.px - ra[0], ray = c2.py - ra[1];
+        var rbx = c2.px - rb[0], rby = c2.py - rb[1];
+        var cnx = rax * c2.ny - ray * c2.nx, cnbx = rbx * c2.ny - rby * c2.nx;
+        var kn = c2.a.invMass + c2.b.invMass + cnx * cnx * c2.a.invInertia + cnbx * cnbx * c2.b.invInertia;
+        if (kn <= 0) continue;
+        var vn = rvx * c2.nx + rvy * c2.ny;
+        var bias = Math.min(Math.max(BETA / dt * Math.max(0, c2.pen - SLOP), c2.restBias), 300);
+        var dl = (bias - vn) / kn;
+        var oldJn = c2.jn;
+        c2.jn = Math.max(0, oldJn + dl);
+        dl = c2.jn - oldJn;
+        applyImpulse(c2.b, c2.nx * dl, c2.ny * dl, c2.px, c2.py);
+        applyImpulse(c2.a, -c2.nx * dl, -c2.ny * dl, c2.px, c2.py);
+        // Friction.
+        var tx = -c2.ny, ty = c2.nx;
+        va2 = velAtPoint(c2.a, c2.px, c2.py); vb2 = velAtPoint(c2.b, c2.px, c2.py);
+        rvx = vb2[0] - va2[0]; rvy = vb2[1] - va2[1];
+        var ctx = rax * ty - ray * tx, cty = rbx * ty - rby * tx;
+        var kt = c2.a.invMass + c2.b.invMass + ctx * ctx * c2.a.invInertia + cty * cty * c2.b.invInertia;
+        if (kt <= 0) continue;
+        var vt = rvx * tx + rvy * ty;
+        var dlt = -vt / kt;
+        var maxF = c2.fric * c2.jn;
+        var oldJt = c2.jt;
+        c2.jt = clamp(oldJt + dlt, -maxF, maxF);
+        dlt = c2.jt - oldJt;
+        applyImpulse(c2.b, tx * dlt, ty * dlt, c2.px, c2.py);
+        applyImpulse(c2.a, -tx * dlt, -ty * dlt, c2.px, c2.py);
+      }
+    }
+  }
+
+  // ---------------- machine ----------------
+  var WORLD_W = 1400, WORLD_H = 2000;
+  var DOM_COLORS = ['#f2c200', '#e23b2e', '#f07f13', '#2b6cb0', '#38a169', '#ed64a6', '#805ad5'];
+  function rail(x1, y1, x2, y2) { return staticSeg('rail', x1, y1, x2, y2, CAT.BALL, 0.1, 0.1); }
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  // ---------------- never-landing endless run (NEVERLAND-V8) ----------------
+  // ONE ball, ONE continuous journey, NO finish. Terrain generates ahead of
+  // the ball in stacked 1400px segments and is freed behind it. The ball
+  // never lands, never rests at a finale, never resets: every segment ends
+  // in free fall into the next segment's funnel. Modules are downhill by
+  // construction (no flat runs except a short tilted domino shelf), so the
+  // ball always keeps moving. A stall is a bug: stepWorld records maxStall
+  // for headless tests but never rescues, resets, or teleports the ball.
+  var PITCH = 1400;
+  var PAL = ['#d76045', '#e7ae50', '#7aa38d', '#4f8e97', '#8275a0', '#b4a054', '#c9866b', '#6488b0'];
+  var BALLC = ['#d9281c', '#f5ead2', '#2f6df6', '#22a35c', '#ffb224'];
+  function log(w, type, data) {
+    data = data || {}; data.t = w.t; data.type = type; w.events.push(data);
+    if(w.events.length > 256) w.events.shift(); // bounded on a truly endless run
+  }
+
+  function buildSegment(w, idx, y0, rng) {
+    var S = { idx: idx, y0: y0, y1: y0 + PITCH, bodies: [], statics: [], segs: [], dominoes: [], rotors: [], seesaws: [], pendulums: [], trippers: [] };
+    function pfx(s) { return 's' + idx + '-' + s; }
+    function addB(b) { b._seg = idx; w.bodies.push(b); S.bodies.push(b); return b; }
+    function addS(s) { s._seg = idx; w.statics.push(s); S.statics.push(s); return s; }
+    var railSerial=0;
+    function addSeg(s) {
+      // Individual tracks produce individually timed contact sounds.
+      if(s.id==='rail')s.id=pfx('rail'+(railSerial++));
+      s._seg=idx;w.segs.push(s);S.segs.push(s);return s;
+    }
+    function upNorm(x1, y1, x2, y2) {
+      var dx = x2 - x1, dy = y2 - y1, l = Math.sqrt(dx * dx + dy * dy) || 1;
+      var nx = dy / l, ny = -dx / l;
+      if (ny > 0) { nx = -nx; ny = -ny; }
+      return [nx, ny];
+    }
+    // ---- entry funnel: wide V, throat at center, guides down to module 1 ----
+    addSeg(rail(250, y0, 680, y0 + 130));
+    addSeg(rail(1150, y0, 720, y0 + 130));
+    addSeg(staticSeg(pfx('guideL'), 680, y0 + 130, 680, y0 + 180, CAT.BALL, 0.4, 0.1));
+    addSeg(staticSeg(pfx('guideR'), 720, y0 + 130, 720, y0 + 180, CAT.BALL, 0.4, 0.1));
+    // ---- gutter scoops: a ball that ever reaches a side wall slides down
+    // it forever (wall friction caps the fall at ~800 but never returns
+    // the ball), because every funnel spans only x 250-1150. A scoop per
+    // segment catches wall-sliders and rolls them back into the funnel
+    // span, where the next funnel or module rail picks them up. ----
+    addSeg(rail(110, y0 + 60, 280, y0 + 150));
+    addSeg(rail(1290, y0 + 60, 1120, y0 + 150));
+    addSeg(staticSeg(pfx('wallL'), 100, y0, 100, y0 + PITCH, CAT.BALL, 0.4, 0.1));
+    addSeg(staticSeg(pfx('wallR'), 1300, y0, 1300, y0 + PITCH, CAT.BALL, 0.4, 0.1));
+    function switchback(top) {
+      // Replaces zigzag: a rail kink that reverses horizontal direction can
+      // never work (the ball flies off tangentially or wedges on a guide).
+      // Direction changes happen only in funnels: the ball drops in, is
+      // centered, and falls out the throat onto the next rail.
+      addSeg(rail(860, top + 9, 420, top + 200));
+      addSeg(rail(300, top + 250, 480, top + 350));
+      addSeg(rail(700, top + 250, 520, top + 350));
+      addSeg(staticSeg(pfx('guideL'), 480, top + 350, 480, top + 390, CAT.BALL, 0.4, 0.1));
+      addSeg(staticSeg(pfx('guideR'), 520, top + 350, 520, top + 390, CAT.BALL, 0.4, 0.1));
+      addSeg(rail(400, top + 430, 700, top + 550));
+    }
+    function domino(top) {
+      // A real side-chain: the marble drops onto the left arm of a balance
+      // lever; the opposite arm drives a row of dormant, standing dominoes.
+      // The marble travels in the LEFT lane, while fallen pieces remain
+      // on a separate, elevated shelf to the right. No collision vise.
+      var tilt=.025, shelfX=1130, shelfY=top+264;
+      addSeg(rail(540,top-10,770,top+112));
+      var shelf=addS(staticBox(pfx('shelf'),shelfX,shelfY,345,22,tilt,CAT.DOMINO));
+      shelf.fixtures[0].fric=.7;
+      // Brackets beneath the cantilever are part of the actual structure.
+      addS(staticBox(pfx('shelfSupport1'),1030,top+331,10,125,0,0));
+      addS(staticBox(pfx('shelfSupport2'),1200,top+331,10,125,0,0));
+      var domCols=PAL.slice();
+      for(var sh=domCols.length-1;sh>0;sh--){
+        var j=Math.floor(rng()*(sh+1)),tmp=domCols[sh];domCols[sh]=domCols[j];domCols[j]=tmp;
+      }
+      for(var i=0;i<7;i++){
+        var bx=1055+i*29;
+        var surface=shelfY+(bx-shelfX)*Math.tan(tilt)-11;
+        var d=addB(polyBody(pfx('dom'+i),bx,surface-33,tilt,[
+          fixture(0,0,12,66,0,CAT.DOMINO,
+            CAT.STATIC|CAT.BALL|CAT.DOMINO|CAT.CRANK,.30,0,pfx('dom'+i))
+        ],1));
+        d.domIndex=i;d.color=domCols[i%domCols.length];
+        d._sleeping=true;
+        S.dominoes.push(d);w.dominoes.push(d);
+      }
+      // The beam is mass-balanced at rest. The marble's impulse causes the
+      // left plate to sink and the right tappet to lift into domino zero.
+      var px=925,py=top+136;
+      var trip=addB(pinnedBody(pfx('trip'),px,py,[
+        fixture(-90,86,250,16,0,CAT.BALL,CAT.BALL,.35,0,pfx('plate')),
+        fixture(80,77,63,16,0,CAT.CRANK,CAT.DOMINO,.30,0,pfx('ham')),
+        fixture(125,67,116,14,0,0,0,.3,0,pfx('counterweight')),
+        fixture(-12,70,220,7,0,0,0,.3,0,pfx('linkage'))
+      ],.3,340000,25000));
+      trip.angleMin=-.65;trip.angleMax=.18;
+      S.trippers.push(trip);w.trippers.push(trip);
+      // Wide catch across the full travel span, with a real open throat.
+      addSeg(rail(175,top+358,674,top+522));
+      addSeg(rail(1230,top+375,726,top+522));
+      addSeg(staticSeg(pfx('domExitL'),674,top+522,674,top+563,CAT.BALL,.35,.08));
+      addSeg(staticSeg(pfx('domExitR'),726,top+522,726,top+563,CAT.BALL,.35,.08));
+    }
+    function spinner(top) {
+      // Entry funnel: the ball arrives falling with sideways drift (it
+      // rolls off the previous module's exit rail with vx up to ~115), and
+      // the housing's top gap is only 60 degrees wide, so a drifting ball
+      // clips the box just outside the gap, bounces sideways, and can end
+      // in the wall gutter. The funnel centers every arrival on the gap.
+      // It ends ABOVE the housing ring (top+110 vs boxes at top+126 and
+      // below): the first version ran down to top+190, through the ring,
+      // and the ball wedged between the funnel rail and a housing box.
+      // Throat sits left of the hub (620-700 vs hub left edge 712): a
+      // centered throat would drop the ball flat onto the hub top, where
+      // it can balance instead of riding a paddle.
+      addSeg(rail(480, top + 40, 620, top + 110));
+      addSeg(rail(900, top + 40, 700, top + 110));
+      // center offset from the x=700 fall line so the dropping ball lands in
+      // a pocket, not balanced on the hub top
+      var SCX = 730, SCY = top + 250, spinR = 115 + rng() * 20;
+      var paddleDegs = rng() < 0.5 ? [330, 90, 210] : [45, 135, 225, 315];
+      for (var a = 0; a < 360; a += 15) {
+        var mid = a + 7.5;
+        if ((mid >= 240 && mid <= 300) || (mid >= 60 && mid <= 120)) continue;
+        var rad = mid * Math.PI / 180;
+        addS(staticBox(pfx('hous' + a), SCX + Math.cos(rad) * spinR, SCY + Math.sin(rad) * spinR, 34, 14, rad + Math.PI / 2, CAT.BALL));
+      }
+      var tip = spinR - 10, plen = tip - 5, pc = 5 + plen / 2;
+      var rf = [fixture(0, 0, 36, 36, 0, CAT.ROTOR, CAT.BALL, 0.3, 0, pfx('hub'))];
+      paddleDegs.forEach(function (deg) {
+        var r = deg * Math.PI / 180;
+        rf.push(fixture(Math.cos(r) * pc, Math.sin(r) * pc, plen, 16, r, CAT.ROTOR, CAT.BALL, 0.3, 0, pfx('pad' + deg)));
+      });
+      var rotor = addB(pinnedBody(pfx('rotor'), SCX, SCY, rf, 0.3, 0, 20000));
+      rotor.paddleDegs = paddleDegs; rotor.spinR = spinR;
+      S.rotors.push(rotor); w.rotors.push(rotor);
+      addSeg(rail(450, top + 385, 680, top + 450));
+      addSeg(rail(950, top + 385, 720, top + 450));
+    }
+    function seesaw(top) {
+      var SSX = 700, SSY = top + 250, L = 340 + rng() * 80;
+      // entry rail tip must sit BELOW every previous module's exit rail:
+      // the old tip (820, top-40) poked 11px above the pendulum exit line
+      // and the ball wedged on the tip. New tip (820, top+20) clears it
+      // by ~49px and still passes under the fall line at top+140.
+      addSeg(rail(820, top + 20, 660, top + 180));
+      var ss = addB(pinnedBody(pfx('seesaw'), SSX, SSY,
+        [fixture(0, 0, L, 14, 0, CAT.SEESAW, CAT.BALL, 0.4, 0.05, pfx('plank'))], 1, 0, 100000));
+      ss.angleMin = -0.5; ss.angleMax = 0.5; ss.len = L;
+      S.seesaws.push(ss); w.seesaws.push(ss);
+      // seesaw exit is a FUNNEL, not two rails meeting at a point: rails
+      // converging on (700, top+550) form a V that cradles the ball and
+      // traps it. The funnel throat is a gap the ball falls through.
+      addSeg(rail(150, top + 280, 680, top + 480));
+      addSeg(rail(1250, top + 380, 720, top + 480));
+      addSeg(staticSeg(pfx('guideL'), 680, top + 480, 680, top + 520, CAT.BALL, 0.4, 0.1));
+      addSeg(staticSeg(pfx('guideR'), 720, top + 480, 720, top + 520, CAT.BALL, 0.4, 0.1));
+    }
+    function gap(top) {
+      addSeg(rail(540, top + 12, 1000, top + 150));
+      // catch rail spans nearly wall to wall and passes BELOW the shelf
+      // box: a fast ball flies past a short catch rail into the right
+      // gutter, and a rail routed above the shelf would cut through it
+      addSeg(rail(1250, top + 300, 700, top + 380));
+    }
+    function pendulumAlley(top) {
+      addSeg(rail(540, top - 15, 1000, top + 200));
+      [850, 950].forEach(function (px2, k) {
+        var railY = top + 60 + (px2 - 700) * 140 / 300;
+        var py2 = railY - 120;
+        var pd = addB(pinnedBody(pfx('pend' + k), px2, py2, [
+          fixture(0, 44, 6, 88, 0, 0, 0, 0.4, 0, pfx('rod' + k)),
+          fixture(0, 88, 20, 20, 0, CAT.BALL, CAT.BALL, 0.4, 0, pfx('bob' + k))
+        ], 0.1, 0, 60));
+        pd.angleMin = -0.5; pd.angleMax = 0.5; pd.sweep = false;
+        S.pendulums.push(pd); w.pendulums.push(pd);
+      });
+      // funnel turnaround: the rail ends moving right, so the ball drops
+      // into a funnel and exits left-down on a steep rail, never a kink
+      addSeg(rail(850, top + 260, 980, top + 360));
+      addSeg(rail(1250, top + 260, 1020, top + 360));
+      addSeg(staticSeg(pfx('guideL'), 980, top + 360, 980, top + 400, CAT.BALL, 0.4, 0.1));
+      addSeg(staticSeg(pfx('guideR'), 1020, top + 360, 1020, top + 400, CAT.BALL, 0.4, 0.1));
+      addSeg(rail(1150, top + 440, 700, top + 550));
+    }
+    function zigzag(top) {
+      // Stepped zigzag: three rails, each drop short and each catch rail
+      // extending past the previous rail's end, so the falling ball always
+      // lands mid-rail. Ends in a center funnel throat like every module.
+      addSeg(rail(300, top + 20, 1100, top + 200));
+      addSeg(rail(1200, top + 250, 450, top + 420));
+      addSeg(rail(150, top + 460, 680, top + 540));
+      addSeg(rail(1250, top + 460, 720, top + 540));
+    }
+    function bumper(top) {
+      // Bouncy diamond arena: the ball falls centered onto a vermilion
+      // diamond (restitution 0.45) offset from the fall line so it always
+      // tips off one face, never balances on the vertex. Side guides keep
+      // wild bounces inside; catch funnel centers the exit.
+      var bx = 700 + (rng() < 0.5 ? -25 : 25);
+      var dia = addS(staticBox(pfx('bump'), bx, top + 180, 90, 90, Math.PI / 4, CAT.BALL));
+      dia.fixtures[0].rest = 0.45;
+      addSeg(staticSeg(pfx('guideL'), 300, top + 80, 300, top + 330, CAT.BALL, 0.4, 0.1));
+      addSeg(staticSeg(pfx('guideR'), 1100, top + 80, 1100, top + 330, CAT.BALL, 0.4, 0.1));
+      addSeg(rail(300, top + 330, 680, top + 430));
+      addSeg(rail(1100, top + 330, 720, top + 430));
+    }
+    function fork(top) {
+      // Split gate: a gold wedge offset from the fall line tips the ball
+      // down one of two side rails; both paths rejoin at a center funnel.
+      // No V cradle anywhere: side rails start apart under the wedge and
+      // return rails start wide, so a ball can never wedge or balance.
+      var wx = 700 + (rng() < 0.5 ? -30 : 30);
+      addS(staticBox(pfx('wedge'), wx, top + 150, 60, 60, Math.PI / 4, CAT.BALL));
+      addSeg(rail(640, top + 190, 300, top + 380));
+      addSeg(rail(760, top + 190, 1100, top + 380));
+      addSeg(rail(200, top + 400, 680, top + 520));
+      addSeg(rail(1200, top + 400, 720, top + 520));
+    }
+    function bellAlley(top) {
+      // Bells on a beam over a downhill rail: the ball rolls under, clips
+      // each gold bell, and the bells swing freely after (pendulum
+      // physics, same as pendulum alley). Proven funnel turnaround exit.
+      addSeg(rail(540, top - 15, 1000, top + 200));
+      [750, 880].forEach(function (px2, k) {
+        var railY = top - 15 + (px2 - 540) * 215 / 460;
+        var py2 = railY - 120;
+        var bl = addB(pinnedBody(pfx('bell' + k), px2, py2, [
+          fixture(0, 44, 6, 88, 0, 0, 0, 0.4, 0, pfx('rod' + k)),
+          fixture(0, 88, 26, 26, 0, CAT.BALL, CAT.BALL, 0.4, 0, pfx('bell' + k))
+        ], 0.1, 0, 60));
+        bl.angleMin = -0.5; bl.angleMax = 0.5; bl.sweep = false;
+        S.pendulums.push(bl); w.pendulums.push(bl);
+      });
+      addSeg(rail(850, top + 260, 980, top + 360));
+      addSeg(rail(1250, top + 260, 1020, top + 360));
+      addSeg(staticSeg(pfx('guideL'), 980, top + 360, 980, top + 400, CAT.BALL, 0.4, 0.1));
+      addSeg(staticSeg(pfx('guideR'), 1020, top + 360, 1020, top + 400, CAT.BALL, 0.4, 0.1));
+      addSeg(rail(1150, top + 440, 700, top + 550));
+    }
+
+    // Additional acts inherit the original downward-only routing and leave
+    // clear-air transfer gaps. Ornamentation never becomes an invisible wall.
+    function chimeGarden(top) {
+      addSeg(rail(500, top - 5, 1030, top + 225));
+      var xs = [690, 785, 880, 975];
+      xs.forEach(function (x, k) {
+        var railY = top - 5 + (x - 500) * 230 / 530;
+        var bell = addB(pinnedBody(pfx('chime' + k), x, railY - 126, [
+          fixture(0, 46, 5, 92, 0, 0, 0, 0.35, 0, pfx('stem')),
+          fixture(0, 91, 18 + (k%2)*5, 22 + (k%2)*5, 0, CAT.BALL, CAT.BALL, 0.34, 0.03, pfx('chime' + k))
+        ], 0.1, 0, 58));
+        bell.angleMin = -0.68; bell.angleMax = 0.68;
+        bell.tone = k; S.pendulums.push(bell); w.pendulums.push(bell);
+      });
+      addSeg(rail(870, top + 265, 980, top + 365));
+      addSeg(rail(1250, top + 265, 1020, top + 365));
+      addSeg(staticSeg(pfx('chimeGateL'), 980, top + 365, 980, top + 406, CAT.BALL, .4, .1));
+      addSeg(staticSeg(pfx('chimeGateR'), 1020, top + 365, 1020, top + 406, CAT.BALL, .4, .1));
+      addSeg(rail(1150, top + 445, 690, top + 555));
+    }
+    function diamondRain(top) {
+      // Three offset gemstones above a generous catch, with no enclosed pits.
+      [ [690, 145, 42], [565, 264, 31], [855, 302, 36] ].forEach(function (v, k) {
+        var stone = addS(staticBox(pfx('gem' + k), v[0] + (rng()-.5)*24, top + v[1], v[2], v[2], Math.PI/4, CAT.BALL));
+        stone.fixtures[0].rest = 0.35;
+      });
+      addSeg(rail(250, top + 355, 680, top + 510));
+      addSeg(rail(1150, top + 355, 720, top + 510));
+      addSeg(staticSeg(pfx('gemL'), 680, top + 510, 680, top + 545, CAT.BALL, .35, .1));
+      addSeg(staticSeg(pfx('gemR'), 720, top + 510, 720, top + 545, CAT.BALL, .35, .1));
+    }
+    function clockStairs(top) {
+      // Switchback with three stepped descents. The visible gearing is
+      // decorative; the ball follows only these fully physical rails.
+      addSeg(rail(290, top + 18, 1080, top + 178));
+      addSeg(rail(1170, top + 230, 420, top + 395));
+      addSeg(rail(205, top + 437, 670, top + 548));
+      addSeg(rail(1130, top + 437, 730, top + 548));
+    }
+    function ribbonGate(top) {
+      addSeg(rail(370, top + 10, 1010, top + 230));
+      [730, 860, 980].forEach(function(x, k) {
+        var y = top + 10 + (x - 370) * 220 / 640;
+        var gate = addB(pinnedBody(pfx('ribbon' + k), x, y - 93, [
+          fixture(0, 37, 5, 74, 0, 0, 0, 0, 0, pfx('stem')),
+          fixture(0, 70, 15, 18, 0, CAT.BALL, CAT.BALL, .2, .07, pfx('chime' + k))
+        ], .12, 0, 50));
+        gate.angleMin = -.55; gate.angleMax = .55;
+        S.pendulums.push(gate); w.pendulums.push(gate);
+      });
+      addSeg(rail(880, top + 275, 975, top + 380));
+      addSeg(rail(1230, top + 275, 1025, top + 380));
+      addSeg(staticSeg(pfx('ribbonL'), 975, top + 380, 975, top + 412, CAT.BALL, .35, .1));
+      addSeg(staticSeg(pfx('ribbonR'), 1025, top + 380, 1025, top + 412, CAT.BALL, .35, .1));
+      addSeg(rail(1190, top + 450, 690, top + 550));
+    }
+    // Rolling-ball-sculpture vocabulary: rockers and a staggered pin field.
+    // Both are physical: all motion is solved, and every peg collision is
+    // connected to the marble's actual path.
+    function twinRockers(top){
+      addSeg(rail(260,top+25,646,top+130));
+      addSeg(rail(1160,top+25,723,top+130));
+      addSeg(staticSeg(pfx('rockInL'),646,top+130,646,top+151,CAT.BALL,.35,.05));
+      addSeg(staticSeg(pfx('rockInR'),723,top+130,723,top+151,CAT.BALL,.35,.05));
+      [[680,top+235,320],[800,top+375,360]].forEach(function(v,k){
+        var pl=addB(pinnedBody(pfx('rocker'+k),v[0],v[1],[
+          fixture(0,0,v[2],13,0,CAT.SEESAW,CAT.BALL,.43,.06,pfx('plank'+k))
+        ],.75,460000,19000));
+        pl.angleMin=-.43;pl.angleMax=.43;pl.len=v[2];
+        S.seesaws.push(pl);w.seesaws.push(pl);
+      });
+      addSeg(rail(160,top+438,676,top+532));
+      addSeg(rail(1240,top+438,724,top+532));
+      addSeg(staticSeg(pfx('rockExitL'),676,top+532,676,top+558,CAT.BALL,.35,.08));
+      addSeg(staticSeg(pfx('rockExitR'),724,top+532,724,top+558,CAT.BALL,.35,.08));
+    }
+    function pegCascade(top){
+      // Off-center diamond pegs produce real ricochets and audible strikes.
+      // Their stagger leaves no closed pockets or misleading fake loops.
+      var pegs=[[665,130,30],[830,210,34],[510,270,28],[725,338,27]];
+      pegs.forEach(function(p,k){
+        var sb=addS(staticBox(pfx('peg'+k),p[0]+(rng()-.5)*28,
+          top+p[1],p[2],p[2],Math.PI/4,CAT.BALL));
+        sb.fixtures[0].rest=.48;
+      });
+      addSeg(staticSeg(pfx('pegSideL'),190,top+70,190,top+410,CAT.BALL,.22,.1));
+      addSeg(staticSeg(pfx('pegSideR'),1210,top+70,1210,top+410,CAT.BALL,.22,.1));
+      addSeg(rail(190,top+420,671,top+528));
+      addSeg(rail(1210,top+420,729,top+528));
+      addSeg(staticSeg(pfx('pegExitL'),671,top+528,671,top+556,CAT.BALL,.35,.08));
+      addSeg(staticSeg(pfx('pegExitR'),729,top+528,729,top+556,CAT.BALL,.35,.08));
+    }
+
+    // Spring-biased bifurcation: the marble can tip the splitter to either
+    // side. Both physical return rails terminate in a clear air gap.
+    function splitSwitch(top) {
+      addSeg(rail(210,top+8,668,top+128));
+      addSeg(rail(1190,top+8,732,top+128));
+      addSeg(staticSeg(pfx('switchInL'),668,top+128,668,top+156,CAT.BALL,.3,.05));
+      addSeg(staticSeg(pfx('switchInR'),732,top+128,732,top+156,CAT.BALL,.3,.05));
+      var gate=addB(pinnedBody(pfx('switch'),700,top+219,[
+        fixture(0,0,225,16,0,CAT.SEESAW,CAT.BALL,.46,.07,pfx('switchBlade'))
+      ],.65,345000,28000));
+      gate.springA0=(rng()<.5?-.19:.19);
+      gate.angle=gate.springA0;gate.angleMin=-.56;gate.angleMax=.56;
+      gate.len=225;S.seesaws.push(gate);w.seesaws.push(gate);
+      addSeg(rail(150,top+346,665,top+510));
+      addSeg(rail(1250,top+346,735,top+510));
+      addSeg(staticSeg(pfx('switchOutL'),665,top+510,665,top+547,CAT.BALL,.38,.09));
+      addSeg(staticSeg(pfx('switchOutR'),735,top+510,735,top+547,CAT.BALL,.38,.09));
+    }
+    // Physical tuned keys: descending marble impulse tilts independently
+    // hinged bars, each of which rings at its own pitch on contact.
+    function resonanceSteps(top) {
+      addSeg(rail(180,top+15,665,top+116));
+      addSeg(rail(1220,top+15,735,top+116));
+      [[650,195,225],[815,316,245],[630,429,225]].forEach(function(p,k) {
+        var tone=addB(pinnedBody(pfx('tone'+k),p[0],top+p[1],[
+          fixture(0,0,p[2],12,0,CAT.SEESAW,CAT.BALL,.35,.12,pfx('toneKey'+k))
+        ],.44,255000,25000));
+        tone.angleMin=-.39;tone.angleMax=.39;tone.len=p[2];
+        S.seesaws.push(tone);w.seesaws.push(tone);
+      });
+      addSeg(rail(140,top+455,673,top+524));
+      addSeg(rail(1260,top+455,727,top+524));
+      addSeg(staticSeg(pfx('toneOutL'),673,top+524,673,top+558,CAT.BALL,.4,.06));
+      addSeg(staticSeg(pfx('toneOutR'),727,top+524,727,top+558,CAT.BALL,.4,.06));
+    }
+    // Two exposed free-spinning paddles transfer energy without a trapping
+    // circular housing. Their motion comes entirely from contact impulses.
+    function transferWheels(top) {
+      addSeg(rail(230,top+12,676,top+114));
+      addSeg(rail(1170,top+12,724,top+114));
+      [[664,top+220,88],[831,top+358,82]].forEach(function(p,k) {
+        var blades=[20,110,200,290];
+        var f=[fixture(0,0,26,26,0,CAT.ROTOR,CAT.BALL,.25,.04,pfx('hub'+k))];
+        blades.forEach(function(deg){
+          var a=deg*Math.PI/180,length=p[2]-12,center=16+length/2;
+          f.push(fixture(Math.cos(a)*center,Math.sin(a)*center,length,13,a,
+            CAT.ROTOR,CAT.BALL,.32,.08,pfx('pad'+deg)));
+        });
+        var rotor=addB(pinnedBody(pfx('transferRotor'+k),p[0],p[1],f,.30,0,17000));
+        rotor.paddleDegs=blades;rotor.spinR=p[2];
+        S.rotors.push(rotor);w.rotors.push(rotor);
+      });
+      addSeg(rail(140,top+452,669,top+526));
+      addSeg(rail(1260,top+452,731,top+526));
+      addSeg(staticSeg(pfx('transferOutL'),669,top+526,669,top+563,CAT.BALL,.34,.08));
+      addSeg(staticSeg(pfx('transferOutR'),731,top+526,731,top+563,CAT.BALL,.34,.08));
+    }
+    var mods = [switchback, domino, spinner, seesaw, gap, pendulumAlley, zigzag, bumper, fork, bellAlley, chimeGarden, diamondRain, clockStairs, ribbonGate, twinRockers, pegCascade, splitSwitch, resonanceSteps, transferWheels];
+    // A shuffled, seeded deck showcases the entire mechanical vocabulary
+    // before repeating. A three-act memory prevents seam repeats.
+    function nextAct(allowed) {
+      if(!w.actDeck.length){
+        w.actDeck=mods.map(function(_,i){return i;});
+        for(var n=w.actDeck.length-1;n>0;n--){
+          var k=Math.floor(rng()*(n+1)),swap=w.actDeck[n];
+          w.actDeck[n]=w.actDeck[k];w.actDeck[k]=swap;
+        }
+      }
+      var chosen=-1;
+      for(var i=0;i<w.actDeck.length;i++){
+        var candidate=w.actDeck[i];
+        if((!allowed||allowed.indexOf(candidate)>=0) &&
+          w.recentActs.indexOf(candidate)<0){chosen=i;break;}
+      }
+      if(chosen<0 && allowed){
+        for(var j=0;j<w.actDeck.length;j++){
+          if(allowed.indexOf(w.actDeck[j])>=0){chosen=j;break;}
+        }
+      }
+      if(chosen<0)chosen=0;
+      var id=w.actDeck.splice(chosen,1)[0];
+      w.recentActs.unshift(id);if(w.recentActs.length>3)w.recentActs.pop();
+      w.actHistory.push(id);if(w.actHistory.length>96)w.actHistory.shift();
+      return id;
+    }
+    var openers=[10,11,12,13,14,15,16,17,18];
+    var m1=nextAct(idx===0?openers:null);
+    var m2=nextAct(idx===0?openers:null);
+    S.modNames = [mods[m1].name || ('mod' + m1), mods[m2].name || ('mod' + m2)];
+    S.scenes = [{ name:S.modNames[0], y:y0 + 180, type:m1 },
+                { name:S.modNames[1], y:y0 + 730, type:m2 }];
+    mods[m1](y0 + 180);
+    mods[m2](y0 + 730);
+    return S;
+  }
+
+  function buildEndless(seed) {
+    var rng = mulberry32(seed === undefined ? 1 : seed);
+    var w = { t: 0, stepCount: 0, bodies: [], statics: [], segs: [], dominoes: [],
+      rotors: [], seesaws: [], pendulums: [], trippers: [], events: [],
+      stats: { maxPen: 0, deepPens: [], overspeeds: [] },
+      impacts: [], impactAt: Object.create(null),
+      segments: [], nextSeg: 0, rng: rng, seed: seed,
+      actDeck: [], recentActs: [], actHistory: [],
+      handReleased: false, stallT: 0, maxStall: 0, segsPassed: 0, lastContacts: [] };
+    // ball starts resting in segment 0's funnel throat, held by the hand
+    var ball = circleBody('ball', 700, 100, 14, 0.6, CAT.BALL, ALL, 0.5, 0.1);
+    ball.fill = BALLC[0]; ball.dot = '#7d130a';
+    w.bodies.push(ball); w.ball = ball;
+    var hand = staticSeg('hand', 682, 118, 718, 118, CAT.BALL, 0.5, 0);
+    w.segs.push(hand); w.handBlock = hand;
+    for (var i = 0; i < 3; i++) w.segments.push(buildSegment(w, w.nextSeg++, i * PITCH, rng));
+    return w;
+  }
+
+  function removeSegment(w, S) {
+    function drop(arr) { return arr.filter(function (b) { return b._seg !== S.idx; }); }
+    w.bodies = drop(w.bodies); w.statics = drop(w.statics); w.segs = drop(w.segs);
+    w.dominoes = drop(w.dominoes); w.rotors = drop(w.rotors);
+    w.seesaws = drop(w.seesaws); w.pendulums = drop(w.pendulums); w.trippers = drop(w.trippers);
+    w.segments = w.segments.filter(function (s) { return s.idx !== S.idx; });
+  }
+
+  function stepWorld(w) {
+    w.t += DT;
+    if (!w.handReleased && w.t >= 0.6) {
+      w.handReleased = true;
+      var hi = w.segs.indexOf(w.handBlock);
+      if (hi >= 0) w.segs.splice(hi, 1);
+      log(w, 'handRelease');
+    }
+    for (var i = 0; i < w.bodies.length; i++) {
+      var b = w.bodies[i];
+      if (b.type === 'dyn') {
+        if(b._sleeping) continue;
+        b.vy += GRAV * DT;
+        b.x += b.vx * DT; b.y += b.vy * DT; b.angle += b.omega * DT;
+      } else if (b.type === 'pinned') {
+        var com = bodyPoint(b, b.comX, b.comY);
+        var tq = (com[0] - b.anchorX) * b.mass * GRAV
+          - b.springK * (b.angle - b.springA0) - b.dampC * b.omega;
+        b.omega += (tq / b.inertia) * DT;
+        b.angle += b.omega * DT;
+        applyHingeLimits(b);
+        b.x = b.anchorX; b.y = b.anchorY;
+      }
+    }
+    var contacts = [];
+    function maskOk(fa, fb) { return (fa.mask & fb.cat) && (fb.mask & fa.cat); }
+    function pushContact(a, b, res, fric, rest) {
+      if (!res) return;
+      // The tappet may wake dominoes only after the marble has moved it.
+      if(a.id === 'ball' && /-trip$/.test(b.id||'')) b._armed=true;
+      if(b.id === 'ball' && /-trip$/.test(a.id||'')) a._armed=true;
+      if(a._sleeping || b._sleeping){
+        var idle=a._sleeping?a:b, striker=idle===a?b:a;
+        if(/-trip$/.test(striker.id||'') && !striker._armed)return;
+        if(striker.type==='static' || striker._sleeping ||
+           Math.abs(w.ball.y-idle.y)>440)return;
+        var v=velAtPoint(striker,res.px,res.py);
+        if(Math.hypot(v[0],v[1])<48)return;
+        idle._sleeping=false;
+        if(idle.domIndex===0 && /-trip$/.test(striker.id||'')) {
+          // A small preloaded tappet drives the first tile toward the next.
+          // This is applied as an impulse at its shoulder, never as
+          // a scripted animation, and subsequent tiles fall by collision.
+          applyImpulse(idle,205,0,idle.x,idle.y-28);
+        }
+      }
+      contacts.push({ a: a, b: b, px: res.px, py: res.py, nx: res.nx, ny: res.ny,
+        pen: res.pen, fric: fric, rest: rest, jn: 0, jt: 0, restBias: 0 });
+      if (res.pen > w.stats.maxPen) w.stats.maxPen = res.pen;
+    }
+    for (var bi = 0; bi < w.bodies.length; bi++) {
+      var bb = w.bodies[bi];
+      if (bb.type === 'static') continue;
+      for (var si = 0; si < w.segs.length; si++) {
+        var sg = w.segs[si];
+        if (!(bb.mask & sg.cat) || !(sg.mask & bb.cat)) continue;
+        if (bb.kind === 'circle') {
+          var r = collideCircleSeg(bb, sg);
+          pushContact(sg, bb, r, Math.sqrt(bb.fric * sg.fric), Math.min(bb.rest, sg.rest));
+        }
+      }
+    }
+    for (var bj = 0; bj < w.bodies.length; bj++) {
+      var bc = w.bodies[bj];
+      if (bc.type === 'static' || !bc.fixtures) continue;
+      for (var sj = 0; sj < w.statics.length; sj++) {
+        var sb = w.statics[sj];
+        for (var fj = 0; fj < bc.fixtures.length; fj++) {
+          var ff = bc.fixtures[fj];
+          if(bc._sleeping || Math.abs(bc.y-sb.y)>330 || Math.abs(bc.x-sb.x)>375)continue;
+          if (!maskOk(ff, sb.fixtures[0])) continue;
+          if (bc.kind === 'circle') {
+            var rb = collideCircleBox(bc, sb, sb.fixtures[0]);
+            pushContact(sb, bc, rb, Math.sqrt(bc.fric * sb.fixtures[0].fric),
+              Math.min(bc.rest, sb.fixtures[0].rest));
+          } else {
+            var list = collideBoxBox(sb, sb.fixtures[0], bc, ff);
+            for (var q = 0; q < list.length; q++) {
+              pushContact(sb, bc, list[q], Math.sqrt(ff.fric * sb.fixtures[0].fric),
+                Math.min(ff.rest, sb.fixtures[0].rest));
+            }
+          }
+        }
+      }
+    }
+    for (var p = 0; p < w.bodies.length; p++) {
+      for (var q2 = p + 1; q2 < w.bodies.length; q2++) {
+        var A = w.bodies[p], B = w.bodies[q2];
+        if (A.type === 'static' || B.type === 'static') continue;
+        if(Math.abs(A.x-B.x)>365||Math.abs(A.y-B.y)>365)continue;
+        if(A._sleeping && B._sleeping)continue;
+        if (A.kind === 'circle' && B.kind === 'circle') {
+          if (!((A.mask & B.cat) && (B.mask & A.cat))) continue;
+          var rc = collideCircleCircle(A, B);
+          pushContact(A, B, rc, Math.sqrt(A.fric * B.fric), Math.min(A.rest, B.rest));
+          continue;
+        }
+        if (A.kind === 'circle' || B.kind === 'circle') {
+          var circ = A.kind === 'circle' ? A : B;
+          var poly = A.kind === 'circle' ? B : A;
+          for (var fp = 0; fp < poly.fixtures.length; fp++) {
+            var pf = poly.fixtures[fp];
+            if (!((circ.mask & pf.cat) && (pf.mask & circ.cat))) continue;
+            var rcb = collideCircleBox(circ, poly, pf);
+            pushContact(poly, circ, rcb, Math.sqrt(circ.fric * pf.fric),
+              Math.min(circ.rest, pf.rest));
+          }
+          continue;
+        }
+        for (var fa = 0; fa < A.fixtures.length; fa++) {
+          for (var fb = 0; fb < B.fixtures.length; fb++) {
+            var fA = A.fixtures[fa], fB = B.fixtures[fb];
+            if (!maskOk(fA, fB)) continue;
+            var lst = collideBoxBox(A, fA, B, fB);
+            for (var qq = 0; qq < lst.length; qq++) {
+              pushContact(A, B, lst[qq], Math.sqrt(fA.fric * fB.fric),
+                Math.min(fA.rest, fB.rest));
+            }
+          }
+        }
+      }
+    }
+    solveContacts(contacts, DT);
+    // Keep impact events from every physics substep until the audio frame.
+    for(var ev=0;ev<contacts.length;ev++){
+      var h=contacts[ev];
+      if(h.jn<70||h.impactSpeed<62)continue;
+      var key=(h.a.id||'rail')+'|'+(h.b.id||'rail');
+      if(w.t-(w.impactAt[key]||-100)<.095)continue;
+      w.impactAt[key]=w.t;
+      if(w.impacts.length<36)w.impacts.push({key:key,impulse:h.jn,at:w.t,x:h.px,y:h.py});
+    }
+    for (var cv = 0; cv < w.bodies.length; cv++) clampVelocity(w.bodies[cv]);
+    for (var dp = 0; dp < contacts.length; dp++) {
+      if (contacts[dp].pen > 2 && w.stats.deepPens.length < 60) {
+        w.stats.deepPens.push({ t: +w.t.toFixed(2), pen: +contacts[dp].pen.toFixed(2),
+          a: contacts[dp].a.id || 'seg', b: contacts[dp].b.id || 'seg' });
+      }
+    }
+    var bl = w.ball;
+    var sp = Math.sqrt(bl.vx * bl.vx + bl.vy * bl.vy);
+    if (sp > 3000 && w.stats.overspeeds.length < 20) {
+      w.stats.overspeeds.push({ t: +w.t.toFixed(2), sp: Math.round(sp), x: Math.round(bl.x), y: Math.round(bl.y) });
+    }
+    // Rolling resistance for balls in contact: viscous material damping
+    // (2.5/s). It caps rolling speeds on the endless descent's long slopes
+    // so the ball plays each module instead of flying through at the
+    // velocity clamp. Uniform property, not staged.
+    for (var ci = 0; ci < contacts.length; ci++) {
+      var cc = contacts[ci];
+      [cc.a, cc.b].forEach(function (bd) {
+        if (bd.kind === 'circle' && bd.type === 'dyn') {
+          var f = Math.exp(-2.5 * DT);
+          bd.vx *= f; bd.vy *= f;
+        }
+      });
+    }
+    w.lastContacts = contacts;
+    if (w.nudge) {
+      var dx = w.nudge.x - bl.x, dy = w.nudge.y - bl.y;
+      var d = Math.sqrt(dx * dx + dy * dy);
+      if (d < 90 && d > 1) {
+        var F = Math.min(60000, 800 * d);
+        bl.vx += (dx / d) * F * bl.invMass * DT;
+        bl.vy += (dy / d) * F * bl.invMass * DT;
+      }
+    }
+    // ---- endless bookkeeping: generate ahead, free behind, track stalls ----
+    var last = w.segments[w.segments.length - 1];
+    if (last && bl.y > last.y0 - PITCH) {
+      w.segments.push(buildSegment(w, w.nextSeg++, last.y0 + PITCH, w.rng));
+      log(w, 'segment', { idx: w.nextSeg - 1 });
+    }
+    var segsCopy = w.segments.slice();
+    for (var ri = 0; ri < segsCopy.length; ri++) {
+      if (segsCopy[ri].y1 < bl.y - 2000) {
+        var prefix='s'+segsCopy[ri].idx+'-';
+        Object.keys(w.impactAt).forEach(function(key){
+          if(key.indexOf(prefix)>=0)delete w.impactAt[key];
+        });
+        w.segsFreed = (w.segsFreed || 0) + 1;
+        removeSegment(w, segsCopy[ri]);
+      }
+    }
+    var passed = w.segsFreed || 0;
+    for (var pi = 0; pi < w.segments.length; pi++) { if (w.segments[pi].y1 < bl.y) passed++; }
+    w.segsPassed = passed;
+    if (sp < 25) { w.stallT += DT; if (w.stallT > w.maxStall) w.maxStall = w.stallT; }
+    else w.stallT = 0;
+    for (var ni = 0; ni < w.bodies.length; ni++) {
+      var nb = w.bodies[ni];
+      if (!isFinite(nb.x + nb.y + nb.vx + nb.vy + nb.angle + nb.omega)) {
+        log(w, 'nan', { id: nb.id });
+      }
+    }
+    w.stepCount += 1;
+  }
+
+  var api = { CAT: CAT, DT: DT, GRAV: GRAV, buildEndless: buildEndless, stepWorld: stepWorld,
+    fixtureCorners: fixtureCorners, bodyPoint: bodyPoint, PITCH: PITCH };
+  if (typeof module !== 'undefined' && module.exports) module.exports = api;
+  else (typeof window !== 'undefined' ? window : global).SIM9108 = api;
+})(typeof window !== 'undefined' ? window : global);
+
+</script>
+<script>
+// Camera director for 9108-FOUR-WORLDS-V1: CAMERA-V5 behavior, endless edition.
+// Same research basis as before (Cinemachine Target Group framing,
+// Composer lookahead + dead zone + damping, one continuous move, no cuts),
+// adapted to the endless sim: the group is the ball plus whatever is moving
+// near it plus nearby mechanism anchors. NO world clamp: the world is
+// endless downward, so camY is unclamped; only the center x is kept inside
+// the 1400-wide play field.
+window.CAM9108=(function(){
+  'use strict';
+  function clamp(v,a,b){return Math.max(a,Math.min(b,v));}
+  function createState(x,y){return {x:x,y:y,scale:0};}
+  // Film the interaction, not every moving piece in the generated world.
+  // A stable lens prevents mechanical collisions from pumping the zoom.
+  function targetFor(w,vw,vh,baseScale,st,dt){
+    var b=w.ball, portrait=vw<vh*.82;
+    var leadX=clamp(b.vx*.13,-105,105);
+    var leadY=clamp(112+b.vy*.09,80,205);
+    return {cx:clamp(b.x+leadX,120,1280),cy:b.y+leadY,
+            scale:baseScale*(portrait?.94:.88)};
+  }
+  function stepCam(st,tgt,dt){
+    var hx=1-Math.exp(-7.5*dt),hy=1-Math.exp(-5.3*dt);
+    st.x+=(tgt.cx-st.x)*hx;st.y+=(tgt.cy-st.y)*hy;
+    var hZoom=1-Math.exp(-4*dt);
+    st.scale+=(tgt.scale-st.scale)*hZoom;
+    st.x=clamp(st.x,0,1400);
+  }
+  return {createState:createState,targetFor:targetFor,stepCam:stepCam};
+})();
+
+</script>
+<script>
+(function () {
+  var SIM = window.SIM9108;
+  var MARKER = '9108-FOUR-WORLDS-V1';
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var params = new URLSearchParams(location.search);
+  var testTime=params.has('t')?parseFloat(params.get('t')):null;
+  // Prevent an arbitrary query parameter from freezing the browser in
+  // an unbounded headless fast-forward loop.
+  var freezeT=(testTime!==null&&isFinite(testTime)&&testTime>=0&&testTime<=120)
+    ?testTime:null;
+  var seedParam = params.has('seed') ? parseInt(params.get('seed'), 10) : null;
+  var nextSeed = function () { return (Math.random() * 0x7fffffff) | 0; };
+  var firstSeed = (seedParam !== null && !isNaN(seedParam)) ? seedParam : (freezeT !== null ? 1 : nextSeed());
+  var w = SIM.buildEndless(firstSeed);
+  var DPR = Math.min(2, window.devicePixelRatio || 1);
+  var vw = 0, vh = 0, scale = 1, baseScale = 1;
+  var camX = w.ball.x, camY = w.ball.y;
+  var camSt = CAM9108.createState(w.ball.x, w.ball.y);
+  var muted=false, actx=null, lastSoundAt={}, lastSoundClean=0,
+      paused=window.matchMedia('(prefers-reduced-motion:reduce)').matches;
+  function newMachine() {
+    w=SIM.buildEndless(nextSeed());
+    lastSoundAt={}; accumulated=0; lastFrameAt=null;
+    camSt=CAM9108.createState(w.ball.x,w.ball.y); camSt.scale=baseScale;
+    camX=w.ball.x; camY=w.ball.y; scale=baseScale;
+    paused=window.matchMedia('(prefers-reduced-motion:reduce)').matches;
+  }
+  window.addEventListener('keydown',function(e){
+    if(e.repeat || e.altKey || e.ctrlKey || e.metaKey) return;
+    var key=e.key.toLowerCase();
+    if(key===' '){ e.preventDefault(); paused=!paused; }
+    else if(key==='n') newMachine();
+    else if(key==='m')toggleSound();
+  });
+  canvas.addEventListener('dblclick',newMachine);
+  function resize() {
+    vw = window.innerWidth; vh = window.innerHeight;
+    canvas.width = Math.round(vw * DPR); canvas.height = Math.round(vh * DPR);
+    baseScale = vh / 1030;
+    if (!camSt.scale) camSt.scale = baseScale;
+    scale = camSt.scale;
+  }
+  window.addEventListener('resize', resize); resize();
+
+  // A gesture is required by browser autoplay rules. The unobtrusive note
+  // is the only control; all sounds are keyed to actual contact impulses.
+  var soundButton=document.getElementById('sound'), soundUnlocked=false;
+  muted=true;
+  function soundState(){
+    var on=!muted&&!!actx&&actx.state==='running';
+    soundButton.textContent=on?'♫':'♪';
+    soundButton.dataset.on=String(on);
+    soundButton.setAttribute('aria-label',on?'Mute sound':'Enable sound');
+    soundButton.title=on?'Mute sound (M)':'Enable sound (tap)';
+  }
+  function ensureAudio(){
+    if(!actx){try{actx=new(window.AudioContext||window.webkitAudioContext)();}
+      catch(e){return false;}}
+    soundUnlocked=true;muted=false;
+    if(actx.state==='suspended')actx.resume().then(soundState).catch(function(){soundState();});
+    soundState();return true;
+  }
+  function toggleSound(){
+    if(!soundUnlocked){ensureAudio();return;}
+    muted=!muted;if(!muted)ensureAudio();soundState();
+  }
+  soundButton.addEventListener('pointerdown',function(e){e.stopPropagation();});
+  soundButton.addEventListener('click',toggleSound);soundState();
+  function strike(h){
+    if(!actx||muted||actx.state==='suspended')return;
+    var k=h.key,bell=/chime|bell|tone/.test(k),
+        metal=/rotor|gem|bump|peg|transfer/.test(k),dom=/dom/.test(k);
+    var pitch=bell?392:(metal?588:(dom?295:228));
+    var num=(k.match(/(?:chime|bell|dom|tone|rail)(\d+)/)||[])[1];
+    if(num!==undefined)pitch*=Math.pow(2,(Number(num)%7)/12);
+    var dur=bell?.53:(metal?.19:.115),amp=Math.min(.09,.022+h.impulse/57000);
+    var t=actx.currentTime,osc=actx.createOscillator(),g=actx.createGain();
+    osc.type=bell?'sine':(dom?'triangle':'sine');
+    osc.frequency.setValueAtTime(pitch,t);
+    if(!bell)osc.frequency.exponentialRampToValueAtTime(pitch*.75,t+dur);
+    g.gain.setValueAtTime(.0001,t);
+    g.gain.exponentialRampToValueAtTime(amp,t+.005);
+    g.gain.exponentialRampToValueAtTime(.0001,t+dur);
+    var pan=actx.createStereoPanner&&actx.createStereoPanner();
+    if(pan){
+      pan.pan.value=Math.max(-.58,Math.min(.58,((h.x===undefined?700:h.x)-700)/850));
+      osc.connect(g);g.connect(pan);pan.connect(actx.destination);
+    } else {osc.connect(g);g.connect(actx.destination);}
+    osc.start(t);osc.stop(t+dur+.015);
+    osc.onended=function(){osc.disconnect();g.disconnect();if(pan)pan.disconnect();};
+    if(bell){
+      var o=actx.createOscillator(),og=actx.createGain();
+      o.frequency.value=pitch*2.67;og.gain.setValueAtTime(amp*.24,t);
+      og.gain.exponentialRampToValueAtTime(.0001,t+dur*.65);
+      o.connect(og);og.connect(actx.destination);
+      o.start(t);o.stop(t+dur*.7);
+      o.onended=function(){o.disconnect();og.disconnect();};
+    }
+  }
+  function audioStep(){
+    var hits=w.impacts.splice(0,w.impacts.length);
+    if(!actx||muted)return;
+    for(var i=0;i<Math.min(5,hits.length);i++)strike(hits[i]);
+  }
+
+  // ---- pointer: drag to nudge (physical spring force in the sim) ----
+  function toWorld(e) {
+    var r = canvas.getBoundingClientRect();
+    var sx = (e.clientX - r.left) * DPR, sy = (e.clientY - r.top) * DPR;
+    var viewW = vw / scale, viewH = vh / scale;
+    return { x: camX - viewW / 2 + sx / DPR / scale, y: camY - viewH / 2 + sy / DPR / scale };
+  }
+  var dragging = false;
+  canvas.addEventListener('pointerdown',function(e){
+    if(!soundUnlocked)ensureAudio();
+    dragging=true;var p=toWorld(e);
+    w.nudge=Math.hypot(p.x-w.ball.x,p.y-w.ball.y)<95?p:null;
+    if(canvas.setPointerCapture)canvas.setPointerCapture(e.pointerId);
+  });
+  window.addEventListener('pointermove', function (e) { if (dragging) w.nudge = toWorld(e); });
+  window.addEventListener('pointerup', function () { dragging = false; w.nudge = null; });
+
+
+  // A continuous machine on a neutral drawing ground. Every visible
+  // mechanism below belongs to the actual simulation: rails, pivots,
+  // fixtures, dominoes and their physical attachments. No floating HUD,
+  // decorative gears, particles, grid, or glow.
+  var COLORS={
+    ground:'#eee9de', edge:'#353c39', metal:'#c49b5e', glint:'#f7dfaa',
+    copper:'#bd6a4a', cobalt:'#547992', teal:'#69a49b',
+    shadow:'rgba(41,39,34,.14)', ivory:'#f6eddd'
+  };
+  var ENAMEL=['#db684b','#dfb351','#7eae9b','#4f8996','#957a9b','#d08056','#5e84a4','#b6a45a'];
+  function path(corners) {
+    ctx.beginPath();ctx.moveTo(corners[0][0],corners[0][1]);
+    for(var i=1;i<corners.length;i++)ctx.lineTo(corners[i][0],corners[i][1]);
+    ctx.closePath();
+  }
+  function bolt(x,y,r) {
+    ctx.fillStyle=COLORS.edge;ctx.beginPath();ctx.arc(x,y,r+1.1,0,Math.PI*2);ctx.fill();
+    ctx.fillStyle='#e7c98c';ctx.beginPath();ctx.arc(x,y,r,0,Math.PI*2);ctx.fill();
+    ctx.strokeStyle='rgba(57,56,48,.72)';ctx.lineWidth=1.25;
+    ctx.beginPath();ctx.moveTo(x-r*.53,y+r*.25);ctx.lineTo(x+r*.53,y-r*.25);ctx.stroke();
+  }
+  function drawLine(x1,y1,x2,y2,col,width){
+    ctx.beginPath();ctx.moveTo(x1,y1);ctx.lineTo(x2,y2);
+    ctx.strokeStyle=col;ctx.lineWidth=width;ctx.stroke();
+  }
+  function metalRail(seg,top,bottom) {
+    var dx=seg.x2-seg.x1,dy=seg.y2-seg.y1,ln=Math.hypot(dx,dy);
+    if(ln<.1)return;
+    var nx=-dy/ln,ny=dx/ln;
+    var wall=/wall/.test(seg.id||''), guide=/guide|GateL|GateR|gemL|gemR|ribbonL|ribbonR|chimeGate|InL|InR|OutL|OutR/.test(seg.id||'');
+    if(wall){
+      drawLine(seg.x1,seg.y1,seg.x2,seg.y2,'rgba(63,70,68,.17)',3);return;
+    }
+    // The rail fasteners are tied to the actual collision segment.
+    if(ln>165 && !guide && seg!==w.handBlock){
+      [0.23,0.76].forEach(function(t){
+        var x=seg.x1+dx*t,y=seg.y1+dy*t;
+        drawLine(x+2,y+6,x+2,y+29,'rgba(87,80,65,.28)',5);
+        bolt(x+2,y+31,2.6);
+      });
+    }
+    drawLine(seg.x1+3,seg.y1+4,seg.x2+3,seg.y2+4,COLORS.shadow,14);
+    drawLine(seg.x1,seg.y1,seg.x2,seg.y2,COLORS.edge,10);
+    drawLine(seg.x1,seg.y1,seg.x2,seg.y2,guide?'#989f94':COLORS.metal,6.5);
+    drawLine(seg.x1+nx*1.4,seg.y1+ny*1.4,seg.x2+nx*1.4,seg.y2+ny*1.4,
+      guide?'rgba(249,241,223,.48)':COLORS.glint,1.2);
+    if(ln>90){bolt(seg.x1,seg.y1,2.6);bolt(seg.x2,seg.y2,2.6);}
+  }
+  function boxFixture(b,f,fill){
+    var corners=SIM.fixtureCorners(b,f);
+    ctx.save();
+    ctx.translate(3.4,5);
+    path(corners);ctx.fillStyle=COLORS.shadow;ctx.fill();
+    ctx.restore();
+    path(corners);ctx.fillStyle=fill;ctx.fill();
+    ctx.strokeStyle=COLORS.edge;ctx.lineWidth=2;ctx.stroke();
+    // One crisp folded edge gives a machined rather than flat shape.
+    drawLine(corners[3][0],corners[3][1],corners[0][0],corners[0][1],
+      'rgba(255,246,222,.60)',2.2);
+    if(/gem/.test(b.id||'')){
+      // Facets belong to the actual diamond-shaped collision fixture.
+      var centerX=(corners[0][0]+corners[2][0])/2,
+          centerY=(corners[0][1]+corners[2][1])/2;
+      ctx.beginPath();ctx.moveTo(corners[0][0],corners[0][1]);
+      ctx.lineTo(corners[1][0],corners[1][1]);
+      ctx.lineTo(centerX,centerY);ctx.closePath();
+      ctx.fillStyle='rgba(246,241,217,.42)';ctx.fill();
+      ctx.beginPath();ctx.moveTo(corners[2][0],corners[2][1]);
+      ctx.lineTo(centerX,centerY);ctx.lineTo(corners[3][0],corners[3][1]);
+      ctx.fillStyle='rgba(43,79,79,.2)';ctx.fill();
+    }
+  }
+  function steelColor(b,f){
+    var id=b.id||'',name=f.name||'';
+    if(/peg|gem/.test(id))return '#74a6a6';
+    if(/tone/.test(id+name)){
+      var number=Number((id.match(/tone(\d+)/)||[])[1]||0);
+      return ['#bd865e','#c3ad77','#83a5a2'][number%3];
+    }
+    if(/switch/.test(id+name))return '#729b90';
+    if(/bump/.test(id))return '#d76549';
+    if(/wedge/.test(id))return '#d7ae5e';
+    if(/hous/.test(id))return '#697b78';
+    if(/shelf/.test(id))return '#b98b55';
+    if(/rotor/i.test(id))return '#447b91';
+    if(/seesaw|rocker|plank/.test(id+name))return '#d5a15f';
+    if(/bell|bob/.test(name))return '#dfaf56';
+    if(/plate|ham/.test(name))return '#c58157';
+    if(/chime/.test(name))return '#79aaa1';
+    return '#9d7d62';
+  }
+  function hinge(b){
+    var x=b.anchorX,y=b.anchorY;
+    if(/seesaw|rocker|switch|tone/.test(b.id)){
+      ctx.beginPath();ctx.moveTo(x-33,y+51);ctx.lineTo(x,y+8);ctx.lineTo(x+33,y+51);ctx.closePath();
+      ctx.fillStyle='#7c8e87';ctx.fill();ctx.strokeStyle=COLORS.edge;ctx.lineWidth=2;ctx.stroke();
+      drawLine(x-46,y+52,x+46,y+52,COLORS.edge,5);
+    } else if(/rotor/i.test(b.id)){
+      ctx.beginPath();ctx.arc(x,y,43,0,Math.PI*2);
+      ctx.strokeStyle='rgba(53,60,57,.58)';ctx.lineWidth=4;ctx.stroke();
+      var a=b.angle;
+      for(var j=0;j<8;j++){
+        var ang=a+j*Math.PI/4;
+        drawLine(x+Math.cos(ang)*24,y+Math.sin(ang)*24,
+                 x+Math.cos(ang)*37,y+Math.sin(ang)*37,'#e8c281',3);
+      }
+    } else {
+      drawLine(x,y,x,y-13,COLORS.edge,5);
+    }
+    bolt(x,y,7);
+  }
+  function bellShape(b,f){
+    var c=SIM.bodyPoint(b,f.cx,f.cy),r=/chime/.test(f.name)?16:18;
+    ctx.save();ctx.translate(c[0],c[1]);ctx.rotate(b.angle);
+    ctx.beginPath();ctx.moveTo(-r*.38,-r*.95);
+    ctx.bezierCurveTo(-r*.8,-r*.65,-r*.78,r*.45,-r, r*.75);
+    ctx.quadraticCurveTo(0,r*1.15,r,r*.75);
+    ctx.bezierCurveTo(r*.78,r*.45,r*.8,-r*.65,r*.38,-r*.95);
+    ctx.closePath();ctx.fillStyle=/chime/.test(f.name)?'#72aa9d':'#d8a452';ctx.fill();
+    ctx.strokeStyle=COLORS.edge;ctx.lineWidth=2;ctx.stroke();
+    drawLine(-r*.85,r*.69,r*.85,r*.69,'#f8dfab',2);
+    bolt(0,-r*.75,2);
+    ctx.beginPath();ctx.arc(0,r*.95,3.2,0,Math.PI*2);
+    ctx.fillStyle='#8b5842';ctx.fill();
+    ctx.restore();
+  }
+  function pivotedBody(b) {
+    if(b.type!=='pinned')return;
+    for(var k=0;k<b.fixtures.length;k++){
+      var f=b.fixtures[k];
+      if(/bell|chime/.test(f.name||'')){bellShape(b,f);continue;}
+      if(/bob/.test(f.name||'')){
+        var mass=SIM.bodyPoint(b,f.cx,f.cy);
+        ctx.beginPath();ctx.arc(mass[0]+2.5,mass[1]+3,12,0,Math.PI*2);
+        ctx.fillStyle=COLORS.shadow;ctx.fill();
+        ctx.beginPath();ctx.arc(mass[0],mass[1],12,0,Math.PI*2);
+        ctx.fillStyle='#d2a45b';ctx.fill();
+        ctx.lineWidth=2;ctx.strokeStyle=COLORS.edge;ctx.stroke();
+        bolt(mass[0]-3,mass[1]-3,2.2);
+        continue;
+      }
+      if((f.name||'').indexOf('stem')>=0 || (f.name||'').indexOf('rod')>=0){
+        var cc=SIM.fixtureCorners(b,f);
+        drawLine((cc[0][0]+cc[3][0])/2,(cc[0][1]+cc[3][1])/2,
+                 (cc[1][0]+cc[2][0])/2,(cc[1][1]+cc[2][1])/2,
+                 COLORS.edge,4);
+        continue;
+      }
+      boxFixture(b,f,steelColor(b,f));
+      if(/toneKey/.test(f.name||'')){
+        var ends=SIM.fixtureCorners(b,f);
+        var x1=(ends[0][0]+ends[3][0])/2,y1=(ends[0][1]+ends[3][1])/2;
+        var x2=(ends[1][0]+ends[2][0])/2,y2=(ends[1][1]+ends[2][1])/2;
+        drawLine(x1+(x2-x1)*.16,y1+(y2-y1)*.16,
+                 x1+(x2-x1)*.84,y1+(y2-y1)*.84,'rgba(254,240,204,.55)',1.5);
+      }
+    }
+    if(b.paddleDegs){
+      b.paddleDegs.forEach(function(deg){
+        var a=b.angle+deg*Math.PI/180;
+        var x=b.anchorX+Math.cos(a)*(b.spinR-16);
+        var y=b.anchorY+Math.sin(a)*(b.spinR-16);
+        bolt(x,y,5);
+      });
+    }
+    hinge(b);
+  }
+  function paintDomino(d,i){
+    var cs=SIM.fixtureCorners(d,d.fixtures[0]),color=d.color||ENAMEL[i%ENAMEL.length];
+    ctx.save();ctx.translate(2.5,4);path(cs);ctx.fillStyle=COLORS.shadow;ctx.fill();ctx.restore();
+    path(cs);ctx.fillStyle=color;ctx.fill();
+    ctx.strokeStyle=COLORS.edge;ctx.lineWidth=2;ctx.stroke();
+    drawLine(cs[3][0],cs[3][1],cs[0][0],cs[0][1],'rgba(255,250,230,.7)',2);
+    var cp=SIM.bodyPoint(d,0,0);
+    ctx.beginPath();ctx.arc(cp[0],cp[1],2.7,0,Math.PI*2);
+    ctx.fillStyle=COLORS.ivory;ctx.fill();
+  }
+  function paintBall() {
+    var b=w.ball, r=b.r;
+    ctx.beginPath();ctx.arc(b.x+3.6,b.y+4.8,r,0,Math.PI*2);
+    ctx.fillStyle='rgba(48,40,35,.20)';ctx.fill();
+    var grad=ctx.createRadialGradient(b.x-r*.4,b.y-r*.5,r*.07,b.x,b.y,r*1.06);
+    grad.addColorStop(0,'#f7bc80');
+    grad.addColorStop(.27,'#e97d51');
+    grad.addColorStop(.76,'#ba4d3e');
+    grad.addColorStop(1,'#74392f');
+    ctx.beginPath();ctx.arc(b.x,b.y,r,0,Math.PI*2);
+    ctx.fillStyle=grad;ctx.fill();
+    ctx.strokeStyle='#60352d';ctx.lineWidth=1.5;ctx.stroke();
+    ctx.beginPath();ctx.arc(b.x+Math.cos(b.angle)*r*.54,
+                            b.y+Math.sin(b.angle)*r*.54,r*.22,0,Math.PI*2);
+    ctx.fillStyle='#8e302d';ctx.fill();
+    ctx.beginPath();ctx.ellipse(b.x-r*.35,b.y-r*.43,r*.26,r*.13,-.65,0,Math.PI*2);
+    ctx.fillStyle='rgba(255,250,233,.85)';ctx.fill();
+  }
+  function draw() {
+    var viewW=vw/scale,viewH=vh/scale;
+    var left=camX-viewW/2,top=camY-viewH/2;
+    ctx.setTransform(DPR*scale,0,0,DPR*scale,0,0);
+    ctx.fillStyle=COLORS.ground;ctx.fillRect(0,0,viewW,viewH);
+    ctx.save();ctx.translate(-left,-top);
+    // No stage dressing: only tangible pieces whose positions are derived
+    // from the same bodies and static colliders used by the solver.
+    w.statics.forEach(function(b){
+      if(b.y < top-250 || b.y > top+viewH+250)return;
+      b.fixtures.forEach(function(f){boxFixture(b,f,steelColor(b,f));});
+    });
+    ctx.lineCap='round';ctx.lineJoin='round';
+    w.segs.forEach(function(sg){
+      if(Math.max(sg.y1,sg.y2)<top-40||Math.min(sg.y1,sg.y2)>top+viewH+40)return;
+      metalRail(sg,top,viewH);
+    });
+    w.bodies.forEach(function(b){
+      if(b.type==='pinned' && b.y>top-300 && b.y<top+viewH+300)pivotedBody(b);
+    });
+    w.dominoes.forEach(function(d,i){
+      if(d.y>top-120&&d.y<top+viewH+120)paintDomino(d,i);
+    });
+    paintBall();
+    ctx.restore();
+  }
+
+  // Fixed physics substeps driven by actual elapsed time, so a lower
+  // refresh-rate screen does not turn the marble into slow motion.
+  var lastFrameAt=null, accumulated=0;
+  function frame(now) {
+    if (freezeT === null) {
+      if(lastFrameAt===null)lastFrameAt=now;
+      var elapsed=Math.min(.05,Math.max(0,(now-lastFrameAt)/1000));
+      lastFrameAt=now;
+      if(!paused) {
+        accumulated+=elapsed;
+        var n=0;
+        while(accumulated>=SIM.DT && n<32) {
+          SIM.stepWorld(w); accumulated-=SIM.DT; n++;
+        }
+        // Prevent runaway catch-up after a suspended/background tab.
+        if(n===32)accumulated=Math.min(accumulated,SIM.DT*4);
+        audioStep();
+      } else accumulated=0;
+      // Pausing freezes the entire shot, including the camera. No
+      // post-pause drift while waiting for a new user interaction.
+      var cameraDt=paused?0:(Math.min(.05,elapsed)||1/60);
+      var tgt = CAM9108.targetFor(w, vw, vh, baseScale, camSt, cameraDt);
+      if (tgt) CAM9108.stepCam(camSt, tgt, cameraDt);
+      camX = camSt.x; camY = camSt.y; scale = camSt.scale;
+      var viewW = vw / scale;
+      camX = viewW >= 1400 ? 700 : Math.max(viewW / 2, Math.min(1400 - viewW / 2, camX));
+      camSt.x = camX; camSt.y = camY;
+      draw();
+      requestAnimationFrame(frame);
+    }
+  }
+  if (freezeT !== null) {
+    while (w.t < freezeT) SIM.stepWorld(w);
+    var fst = CAM9108.createState(w.ball.x, w.ball.y); fst.scale = baseScale;
+    for (var fi = 0; fi < 400; fi++) {
+      var ft = CAM9108.targetFor(w, vw, vh, baseScale, fst, 1 / 60);
+      if (ft) CAM9108.stepCam(fst, ft, 1 / 60);
+    }
+    camX = fst.x; camY = fst.y; scale = fst.scale;
+    var viewW2 = vw / scale;
+    camX = viewW2 >= 1400 ? 700 : Math.max(viewW2 / 2, Math.min(1400 - viewW2 / 2, camX));
+    draw();
+  } else {
+    requestAnimationFrame(frame);
+  }
+})();
+
+</script>
+</body>
+</html>
