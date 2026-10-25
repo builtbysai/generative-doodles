@@ -4,6 +4,30 @@ You are continuing a **live code-art project**, not writing a proposal. Work in 
 
 Read [CREATIVE_BRIEF.md](./CREATIVE_BRIEF.md) in full before touching code. It preserves the source user's desired four-world, five-minute reference choreography and improvement goals. Reference: https://x.com/wustep/status/2102197062381253063. The user provided a ~301.9-second, 1920×1080 source MP4 in the ChatGPT session; it has **not** been committed to the public repository. Ask the user to attach the video to your environment only if you need frame-level comparison. Never publish its footage, soundtrack or copied assets.
 
+## Motion and drawing update — next continuation
+
+Feature commit: `d6f61c0` (subsequent QA/gallery documentation follows in git history).
+The world now has **four signature acts per biome**, 35 available modules total.
+New fixture IDs: 31 bucket pendulum, 32 mushroom, 33 paddlewheel boat, 34 coaster.
+`MOTION` defines variable-length sequences and `machinePose` supplies their shared
+simulation/render geometry. The eight transport mechanisms now have different
+trajectories/timings, not a recolored common path. The 19 legacy supporting modules
+remain; several still share too much downward/funnel vocabulary.
+
+New acts add angular swing/release, spring compression and real upward ballistic
+launch, semicircular wheel transport, and a complete coaster loop. The claw travels
+left after closing/lifting; rooted flower and curved bee flight separate; submarine
+uses curved dive/surfacing. Coaster car rotates with the track tangent. Collection
+rails are quieter, garden pendulums have flower silhouettes, ocean has a waterline
+and depth wash, and the fixed desktop lens is closer. Release accents follow the
+current world harmony. Gallery thumbnail now depicts working new mechanisms.
+
+Tests cover 24 isolated transport fixtures, unique motion signatures, upward travel,
+no captured ball crossing real rails, restored collisions and downstream handoff.
+Normal, 50-seed sweep and both ten-minute runs passed; see updated [QA.md](QA.md).
+Remaining: four more signature acts per world; stronger scenic composition and
+fewer repeated supporting funnels; physical ticket counter; human audio and device QA.
+
 ## Continuation update — 25 October 2026
 
 This update supersedes the older baseline counts below. Implementation commit: `9978c0b`; subsequent craft/QA/documentation changes appear after it in git history.
