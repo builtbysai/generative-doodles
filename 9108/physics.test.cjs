@@ -59,7 +59,7 @@ for(let world=1;world<=3;world++){
 }
 // Each new signature act must capture from an actual pan contact, visit all
 // three stages in order, release the SAME marble, and reach the next act.
-for(let act=27;act<=34;act++)for(const seed of [1,7,44]){
+for(let act=27;act<=38;act++)for(const seed of [1,7,44]){
  const w=sim.buildEndless(seed,act),ball=w.ball;
  w.ball.x=seed===1?694:seed===7?700:706;
  let last={x:ball.x,y:ball.y},captured=false,rise=0,high=ball.y;
@@ -77,7 +77,7 @@ for(let act=27;act<=34;act++)for(const seed of [1,7,44]){
   assert.equal(w.ball,ball,'identity is preserved');
   last={x:ball.x,y:ball.y};
  });
- const events=w.events.filter(e=>e.device===w.machines[0].id);
+ const events=w.events.filter(e=>e.device===w.machines[0].id && e.type!=='recolor' && e.type!=='ticket');
  assert(captured,'contact capture, act '+act);
  const stages=sim.machineMotion[w.machines[0].kind].length;
  assert.deepEqual(Array.from(events,e=>e.type),['capture',...Array(stages).fill('machineStage'),'release']);
@@ -85,6 +85,8 @@ for(let act=27;act<=34;act++)for(const seed of [1,7,44]){
  assert.equal(w.machines[0].state,'released');
  assert(ball.y>1000,'safe downstream handoff, act '+act);
  assert.equal(ball.mask,0xffff,'collision mask restored');
+ if(act===38)assert.deepEqual(Array.from(w.events.filter(e=>e.type==='ticket'&&e.device===w.machines[0].id),e=>e.index),[1,2,3],'three earned perforations');
+ if(act===37)assert(w.events.some(e=>e.type==='recolor'&&e.device===w.machines[0].id),'clam contact dyes marble');
  if(act!==32)assert(rise>40,'upward travel, act '+act);
  if(act===32){const release=events.find(e=>e.type==='release');assert(release.vy<-600,'mushroom releases stored spring energy');}
  results.push({act,seed,rise:Math.round(rise),stages});
@@ -99,7 +101,7 @@ for(const kind of Object.keys(sim.machineMotion)){
  }).flat()]);
  signatures.push(JSON.stringify(signature));
 }
-assert.equal(new Set(signatures).size,8,'eight different transport trajectories');
+assert.equal(new Set(signatures).size,12,'twelve different transport trajectories');
 // Dormant dominoes must not fall just because the generator ran ahead.
 for(const seed of [1,7,44]){
  const w=sim.buildEndless(seed,1);
