@@ -88,8 +88,8 @@ for (let seed = 1; seed <= 12; seed++) {
   let hammer=false,gong=false;
   advance(w,12,world=>{
     for(const h of world.impacts){
-      if(/s0-hammer\\|ball/.test(h.key))hammer=true;
-      if(/s0-hammer\\|s0-gong/.test(h.key))gong=true;
+      if(h.key.indexOf('s0-hammer|ball')>=0)hammer=true;
+      if(h.key.indexOf('s0-hammer|s0-gong')>=0)gong=true;
     }
   });
   assert(hammer,'ball collides with hammer during open-air transfer');
