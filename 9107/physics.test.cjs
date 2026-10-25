@@ -70,7 +70,7 @@ for (let seed = 1; seed <= 12; seed++) {
 
 // A linked transmission is powered by the real marble impulse, not a timer.
 {
-  const w = SIM.buildEndless(2);
+  const w = SIM.buildEndless(5);
   assert(w.segments[0].modNames.includes('beltTransmission'));
   assert.equal(w.linkages.length,1);
   let paddleHit=false;
@@ -81,7 +81,7 @@ for (let seed = 1; seed <= 12; seed++) {
   assert(paddleHit,'marble strikes primary drive paddles');
   assert(link && Math.abs(link.a.angle)>.05,'first wheel rotates');
   assert(Math.abs(link.b.angle)>.05,'second wheel is torque-coupled');
-  results.push({seed:2,primary:+link.a.angle.toFixed(2),
+  results.push({seed:5,primary:+link.a.angle.toFixed(2),
     follower:+link.b.angle.toFixed(2)});
 }
 
