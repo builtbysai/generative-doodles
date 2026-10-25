@@ -59,25 +59,47 @@ for(let world=1;world<=3;world++){
 }
 // Each new signature act must capture from an actual pan contact, visit all
 // three stages in order, release the SAME marble, and reach the next act.
-for(let act=27;act<=30;act++)for(const seed of [1,7,44]){
+for(let act=27;act<=34;act++)for(const seed of [1,7,44]){
  const w=sim.buildEndless(seed,act),ball=w.ball;
  w.ball.x=seed===1?694:seed===7?700:706;
- let last={x:ball.x,y:ball.y},captured=false;
+ let last={x:ball.x,y:ball.y},captured=false,rise=0,high=ball.y;
+ const trajectory=[];
  step(w,16,()=>{
   const distance=Math.hypot(ball.x-last.x,ball.y-last.y);
   assert(distance<11,'continuous transfer, act '+act);
-  if(ball.carrier){if(captured)assert(distance<1,'bounded carrier speed');captured=true;}
+  if(ball.carrier){if(captured)assert(distance<1,'bounded carrier speed');captured=true;
+   for(const rail of w.segs){
+    const dx=rail.x2-rail.x1,dy=rail.y2-rail.y1;
+    const u=Math.max(0,Math.min(1,((ball.x-rail.x1)*dx+(ball.y-rail.y1)*dy)/(dx*dx+dy*dy)));
+    assert(Math.hypot(ball.x-rail.x1-u*dx,ball.y-rail.y1-u*dy)>ball.r+1,'carrier clears real rail '+act+' '+rail.id);
+   }
+   trajectory.push([ball.x,ball.y]);high=Math.max(high,ball.y);rise=Math.max(rise,high-ball.y);}
   assert.equal(w.ball,ball,'identity is preserved');
   last={x:ball.x,y:ball.y};
  });
  const events=w.events.filter(e=>e.device===w.machines[0].id);
  assert(captured,'contact capture, act '+act);
- assert.deepEqual(Array.from(events,e=>e.type),['capture','machineStage','machineStage','machineStage','release']);
- assert.deepEqual(Array.from(events.filter(e=>e.type==='machineStage'),e=>e.stage),[0,1,2]);
+ const stages=sim.machineMotion[w.machines[0].kind].length;
+ assert.deepEqual(Array.from(events,e=>e.type),['capture',...Array(stages).fill('machineStage'),'release']);
+ assert.deepEqual(Array.from(events.filter(e=>e.type==='machineStage'),e=>e.stage),Array.from({length:stages},(_,i)=>i));
  assert.equal(w.machines[0].state,'released');
  assert(ball.y>1000,'safe downstream handoff, act '+act);
  assert.equal(ball.mask,0xffff,'collision mask restored');
+ if(act!==32)assert(rise>40,'upward travel, act '+act);
+ if(act===32){const release=events.find(e=>e.type==='release');assert(release.vy<-600,'mushroom releases stored spring energy');}
+ results.push({act,seed,rise:Math.round(rise),stages});
 }
+// Every transport has a distinct spatial/timing signature. Recoloring the
+// same animation cannot satisfy this regression.
+const signatures=[];
+for(const kind of Object.keys(sim.machineMotion)){
+ const m={kind,top:0,originX:700,originY:250},path=sim.machineMotion[kind];
+ const signature=path.flatMap((part,stage)=>[part[2],...Array.from({length:5},(_,i)=>{
+  const p=sim.machinePose(m,stage,i/4);return [Math.round(p.x),Math.round(p.y)];
+ }).flat()]);
+ signatures.push(JSON.stringify(signature));
+}
+assert.equal(new Set(signatures).size,8,'eight different transport trajectories');
 // Dormant dominoes must not fall just because the generator ran ahead.
 for(const seed of [1,7,44]){
  const w=sim.buildEndless(seed,1);
