@@ -1,6 +1,6 @@
 'use strict';
 /**
- * Wonderworks: deterministic, dependency-free physics regression.
+ * The Last Light: deterministic, dependency-free physics regression.
  * Run from the repository root: node 9107/physics.test.cjs
  *
  * No snapshots or hardcoded trajectories: checks motion, mechanism variety,
@@ -38,6 +38,8 @@ function advance(w, seconds, onStep) {
       assert(w.linkages.length <= 6, 'old drive linkages must be garbage-collected');
       assert(w.actDeck.length <= 21 && w.actHistory.length <= 96,
         'procedural history and bag remain bounded');
+      assert(w.storyImpacts.length <= 20 && w.storyTransitions.length <= 12,
+        'story event queues remain bounded');
     }
     assert(w.impacts.length <= 36, 'audio event buffer stays bounded');
     // In the browser, events are drained each frame by the audio engine.
@@ -57,6 +59,9 @@ for (let seed = 1; seed <= 12; seed++) {
       heardHit = true;
   });
   assert(heardHit, 'real impact events available for sound');
+  assert(w.segments.some(s => s.awakenedAt >= 0),
+    'physical collision awakens a scene');
+  assert.equal(w.segments[0].chapter, 0, 'the journey starts in the foundry');
   assert(w.ball.y > 1400, 'seed ' + seed + ': ball must keep descending');
   assert(w.maxStall < 3, 'seed ' + seed + ': excessive stall');
   assert(!w.events.some(e => e.type === 'nan'), 'no invalid physics');
@@ -65,7 +70,7 @@ for (let seed = 1; seed <= 12; seed++) {
 
 // A linked transmission is powered by the real marble impulse, not a timer.
 {
-  const w = SIM.buildEndless(5);
+  const w = SIM.buildEndless(2);
   assert(w.segments[0].modNames.includes('beltTransmission'));
   assert.equal(w.linkages.length,1);
   let paddleHit=false;
@@ -76,14 +81,14 @@ for (let seed = 1; seed <= 12; seed++) {
   assert(paddleHit,'marble strikes primary drive paddles');
   assert(link && Math.abs(link.a.angle)>.05,'first wheel rotates');
   assert(Math.abs(link.b.angle)>.05,'second wheel is torque-coupled');
-  results.push({seed:5,primary:+link.a.angle.toFixed(2),
+  results.push({seed:2,primary:+link.a.angle.toFixed(2),
     follower:+link.b.angle.toFixed(2)});
 }
 
 // The hammer hits a real spring-mounted gong. Low mass produces a softer
 // impulse, so its actual contact must be present in the audio queue.
 {
-  const w=SIM.buildEndless(6);
+  const w=SIM.buildEndless(1);
   assert(w.segments[0].modNames.includes('hammerBell'));
   let hammer=false,gong=false;
   advance(w,12,world=>{
@@ -95,12 +100,12 @@ for (let seed = 1; seed <= 12; seed++) {
   assert(hammer,'ball collides with hammer during open-air transfer');
   assert(gong,'hammer strikes sounding plate and creates audio event');
   assert(w.ball.y>1500,'marble continues after gong');
-  results.push({seed:6,hammer,gong});
+  results.push({seed:1,hammer,gong});
 }
 
 // The first domino remains dormant until its lever receives the marble.
-// Previously, seeds 31 and 35 either failed to trigger or toppled only one.
-for (const seed of [26, 29, 33, 36]) {
+// Current composition fixtures put the domino relay in section 1.
+for (const seed of [29, 36, 37, 45]) {
   const w = SIM.buildEndless(seed);
   const dominoes = w.dominoes.filter(d => d._seg === 1);
   assert.equal(dominoes.length, 7, 'the side-chain consists of seven dominoes');
@@ -113,5 +118,19 @@ for (const seed of [26, 29, 33, 36]) {
   assert(w.ball.y > 3000, 'the marble must exit the mechanism');
   results.push({ seed, dominoes: 7, y: Math.round(w.ball.y) });
 }
-console.log('PASS: Wonderworks physics, transmission, real gong and domino relay');
+// One continuous trip must visibly pass through all three story settings,
+ // then return to a newly generated foundry with the same living marble.
+{
+  const w = SIM.buildEndless(1);
+  advance(w, 65);
+  assert(w.storyTurns >= 3, 'foundry, glasshouse and observatory completed');
+  assert.equal(w.storyChapter, 0, 'the light returns to foundry without reset');
+  assert(w.storyTransitions.length >= 3, 'each crossing recorded');
+  assert(w.storyImpacts.length > 0, 'impact awakenings remain visible');
+  assert(w.segments.every(s => s.chapter === Math.floor(s.idx / 2) % 3),
+    'story settings derive from their actual generated positions');
+  results.push({seed:1,storyTurns:w.storyTurns,
+    chapter:w.storyChapter,depth:Math.round(w.ball.y)});
+}
+console.log('PASS: The Last Light: kinetic flow, three narrative chapters and responsive sets');
 console.log(JSON.stringify(results, null, 2));
