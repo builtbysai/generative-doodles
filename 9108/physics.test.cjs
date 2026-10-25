@@ -57,12 +57,50 @@ for(let world=1;world<=3;world++){
  assert(w.colorEvents.length>=1,'portal recolors the marble');
  results.push({portal:world,color:w.ball.fill});
 }
+// Each new signature act must capture from an actual pan contact, visit all
+// three stages in order, release the SAME marble, and reach the next act.
+for(let act=27;act<=30;act++)for(const seed of [1,7,44]){
+ const w=sim.buildEndless(seed,act),ball=w.ball;
+ w.ball.x=seed===1?694:seed===7?700:706;
+ let last={x:ball.x,y:ball.y},captured=false;
+ step(w,16,()=>{
+  const distance=Math.hypot(ball.x-last.x,ball.y-last.y);
+  assert(distance<11,'continuous transfer, act '+act);
+  if(ball.carrier){if(captured)assert(distance<1,'bounded carrier speed');captured=true;}
+  assert.equal(w.ball,ball,'identity is preserved');
+  last={x:ball.x,y:ball.y};
+ });
+ const events=w.events.filter(e=>e.device===w.machines[0].id);
+ assert(captured,'contact capture, act '+act);
+ assert.deepEqual(Array.from(events,e=>e.type),['capture','machineStage','machineStage','machineStage','release']);
+ assert.deepEqual(Array.from(events.filter(e=>e.type==='machineStage'),e=>e.stage),[0,1,2]);
+ assert.equal(w.machines[0].state,'released');
+ assert(ball.y>1000,'safe downstream handoff, act '+act);
+ assert.equal(ball.mask,0xffff,'collision mask restored');
+}
+// Dormant dominoes must not fall just because the generator ran ahead.
+for(const seed of [1,7,44]){
+ const w=sim.buildEndless(seed,1);
+ step(w,.5,()=>assert(w.dominoes.every(d=>d._sleeping),'no pre-activated dominoes'));
+ step(w,14);
+ assert(w.trippers.some(t=>t._armed),'marble hits the real trip');
+ assert(w.dominoes.some(d=>!d._sleeping),'trip wakes the chain');
+}
 if(process.env.LONG_TEST==='1'){
- const w=sim.buildEndless(7);step(w,180);
- assert(w.worldsVisited.includes(1),'garden reached');
- assert(w.worldsVisited.includes(2),'ocean reached');
- assert(w.colorEvents.length>=1,'visible color-change history');
- results.push({long:180,depth:Math.round(w.ball.y),worlds:Array.from(w.worldsVisited)});
+ for(const seed of [7,23]){
+  const w=sim.buildEndless(seed);let maxSections=0,maxBodies=0,maxKeys=0;
+  step(w,600,()=>{
+   maxSections=Math.max(maxSections,w.segments.length);
+   maxBodies=Math.max(maxBodies,w.bodies.length);
+   maxKeys=Math.max(maxKeys,Object.keys(w.impactAt).length);
+   assert(w.worldsVisited.length<=12,'bounded world history');
+   assert(w.machines.length<=8,'bounded carrier state');
+   assert(w.maxStall<3,'no stalled marble, seed '+seed);
+  });
+  assert(w.portalSerial>=8,'two complete four-world cycles, seed '+seed);
+  assert(maxKeys<512,'bounded collision cooldown keys');
+  results.push({long:600,seed,depth:Math.round(w.ball.y),portals:w.portalSerial,maxSections,maxBodies,maxKeys});
+ }
 }
 console.log('PASS 9108 Marble Atlas physics and world transitions');
 console.log(JSON.stringify(results,null,2));
