@@ -4,6 +4,20 @@ You are continuing a **live code-art project**, not writing a proposal. Work in 
 
 Read [CREATIVE_BRIEF.md](./CREATIVE_BRIEF.md) in full before touching code. It preserves the source user's desired four-world, five-minute reference choreography and improvement goals. Reference: https://x.com/wustep/status/2102197062381253063. The user provided a ~301.9-second, 1920×1080 source MP4 in the ChatGPT session; it has **not** been committed to the public repository. Ask the user to attach the video to your environment only if you need frame-level comparison. Never publish its footage, soundtrack or copied assets.
 
+## Continuation update — 25 October 2026
+
+This update supersedes the older baseline counts below. Implementation commit: `9978c0b`; subsequent craft/QA/documentation changes appear after it in git history.
+
+- Added four contact-latched, three-stage sequences: **lift/cart, vine/bee, submarine and gantry claw**. Each world now selects among three signature sequences, alongside the 19 shared modules (31 modules total). This is not eight signature acts per world or the reference's ~100 setpieces.
+- A solver contact with a loading pan creates an explicit carrier constraint on the existing marble. `stepMachines` advances a continuous path, logs capture/stage/release, then restores collision masks and free motion. No stall-triggered recovery or ball replacement. Captured balls deliberately bypass ordinary collision resolution; routes must therefore be checked for clearance when edited. This is authored actuation, not a full cable or fluid simulation.
+- Machines are stored in `w.machines`, owned/removed with sections. `buildEndless(seed, fixtureAct)` optionally puts a chosen module in section zero for isolated tests; production calls only pass seed. Current carrier module IDs: 27–30.
+- Fixed remote pointer grabs and stale nudges on cancellation/blur; reduced-motion mobile users can tap the canvas to start. Bounded world history at 12 entries. Guarded empty box-contact clipping.
+- Piano retains the original harmony, with four distinct motif shapes, deterministic seed/cycle phrase rotation and 85ms Web Audio lookahead rather than stacked overdue timestamps. Listening quality still needs a human headphone/speaker check.
+- Mechanism regressions assert real capture, ordered stages, continuous motion, identity, restored masks and downstream progress, plus dormant/triggered domino cases. `SEED_SWEEP=1` checks 50 seeds for 60 seconds; `LONG_TEST=1` checks seeds 7/23 for 600 seconds each and two full world cycles.
+- `browser.test.cjs` uses actual Chromium at desktop/mobile viewport sizes to verify gesture-gated audio scheduling, progression, frame delivery, no overflow/errors, pause, near-ball drag, pointer cancellation and reduced-motion resume. It can target the deployed page using `BASE_URL`.
+
+Read [QA.md](QA.md) for exact measured results, unresolved limitations and next priorities. Do not interpret bounded ten-minute simulations as hours of measured browser heap stability, or emulated mobile Chromium as a physical Android/iPhone test.
+
 ## Non-negotiable visual direction
 
 The original reference succeeds through **legible chain reactions**, a clear single-ball protagonist, clean flat geometric shapes with precise outlines, consistent world palettes and synchronized music. Make a more sophisticated kinetic artwork: better silhouettes, composition, material rhythm, playful anticipation, varied world-specific mechanical behavior and seamless transitions. Prioritize the *actual pieces and movements*, not UI decoration. No large header, cards, gradients, generic game HUD, fake score spam, sci-fi glass panels, particle fog, ornamental gears or gratuitous typography. Avoid 'AI slop'. No page scrolling. Mobile responsive, stable and beautiful on desktop.

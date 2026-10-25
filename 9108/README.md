@@ -8,23 +8,24 @@
 
 | World | Color / mood | New functional acts |
 | --- | --- | --- |
-| Mechanical | Light blue, brass, counterweights | Hinged counterweight rig, two physical paddlewheels |
-| Garden & Nature | Warm cream, leaves and blossoms | Contact-painted berry ricochet, pendulum flower chimes |
-| Ocean & Maritime | Pale blue sea, teal and mooring elements | Tipping buoys, physically struck coral field |
-| Neon Arcade & Carnival | Deep ink, precisely outlined pastels | Staggered pachinko pegs and hinged pinball flippers |
+| Mechanical | Light blue, brass, counterweights | Contact-latched counterweight lift/cart, hinged balance rig, paddlewheels |
+| Garden & Nature | Warm cream, leaves and blossoms | Flowering vine lift with bee transfer, contact-painted berries, flower chimes |
+| Ocean & Maritime | Pale blue sea, teal and mooring elements | Diving/traversing/surfacing submarine, tipping buoys, coral field |
+| Neon Arcade & Carnival | Deep ink, precisely outlined pastels | Gantry claw pickup/transfer/drop, pachinko, hinged flippers |
 
-The 19 core mechanisms from 9107 remain available. Each generated 1400px section combines one of the two biome-specific acts with a varied core act. A world lasts five sections; the entire world cycle repeats after 20 sections with a continuing seeded act order, real ball trajectory and changing music. Biome progression follows **depth reached**, not a scripted stopwatch. The machine generates ahead and frees unused sections behind.
+The 19 core mechanisms from 9107 remain available. Each generated 1400px section combines one of the three biome-specific acts with a varied core act. A world lasts five sections; the entire world cycle repeats after 20 sections with a continuing seeded act order, real ball trajectory and changing music. Biome progression follows **depth reached**, not a scripted stopwatch. The machine generates ahead and frees unused sections behind.
 
 Dimensional crossing generates a spinning localized ring at the ball's actual crossing position, changes the world rendering palette and applies a portal pigment. Contact with certain props paints the same continuously simulated marble again. These are triggered events rather than random time-based sprite effects.
 
 ## Audio
 
-There is no copyrighted backing track or external media dependency. An original four-harmony piano-like synthesizer plays eighth-note motifs at 110 BPM, timed from the simulation clock and scheduled on Web Audio's audio timeline. Physics impacts create additional pitched sounds with limited stereo positioning. World crossings add a three-note cadence. The user must opt into sound; the browser cannot autoplay it.
+There is no copyrighted backing track or external media dependency. An original four-harmony piano-like synthesizer plays eighth-note motifs at 110 BPM, timed from the simulation clock and scheduled with an 85ms lookahead on Web Audio's audio timeline. Each world has a distinct motif; seed and world cycle vary phrase rotation. Physics impacts create additional pitched sounds with limited stereo positioning. World crossings add a three-note cadence. The user must opt into sound; the browser cannot autoplay it.
 
 ## Controls
 
 - Tap or click anywhere on the canvas to activate audio; the small **♪** toggles mute.
-- Drag near the marble to nudge it physically.
+- Drag near the marble to nudge it physically. Pointer cancellation releases the nudge.
+- Reduced motion starts with a still scene; tap the canvas to opt into playback, or use Space.
 - Space: pause/resume. N or double-click: generate a new run. M: sound toggle.
 - `?seed=7`: deterministic machine; `?seed=7&t=30`: freeze at 30 seconds for inspection, up to 120 seconds.
 
@@ -41,7 +42,15 @@ python3 -m http.server 8000
 
 Do the audio test **with a real gesture and audible speakers/headphones**. Headless simulation and a mocked AudioContext cannot confirm final sound quality. The user asked **not to use TinyFish**.
 
-One simulated run (seed 7) was checked for 210 seconds: world transitions occurred at approximately 63s (Garden), 114s (Ocean), 163s (Arcade), and 204s (back to Mechanical). All 27 available mechanisms appeared in its generated sequence; at most five sections remained loaded; non-finite physics event count was zero. This is a headless simulation, **not** a real browser quality guarantee. Duration varies by generated arrangement.
+The new lifts/carriers use explicit authored constraints: real contact with the loading pan captures the same marble; three continuous, eased stages carry it visibly; the latch opens and restores free physics above the collection funnel. They are not full cable/fluid/animal simulations and never activate as stall recovery. There are now **three signature sequences per world**, plus 19 shared acts; eight per world remains a target.
+
+Current validation and confirmed bugs are recorded separately from future opportunities in [QA.md](QA.md). Optional browser checks require Playwright and Chromium:
+
+```sh
+SEED_SWEEP=1 node 9108/physics.test.cjs
+node 9108/browser.test.cjs
+VERIFY_SOURCE=1 BASE_URL=https://builtbysai.com/generative-doodles/9108/ node 9108/browser.test.cjs
+```
 
 ## For continued Codex development
 

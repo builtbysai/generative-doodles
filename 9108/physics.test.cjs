@@ -86,6 +86,20 @@ for(const seed of [1,7,44]){
  assert(w.trippers.some(t=>t._armed),'marble hits the real trip');
  assert(w.dominoes.some(d=>!d._sleeping),'trip wakes the chain');
 }
+if(process.env.SEED_SWEEP==='1'){
+ let minDepth=Infinity,maxStall=0;
+ for(let seed=1;seed<=50;seed++){
+  const w=sim.buildEndless(seed);
+  step(w,60,()=>{
+   assert(w.maxStall<3,'seed sweep stall '+seed);
+   for(const d of w.dominoes)if(w.ball.y<d.y-440)
+    assert(d._sleeping,'premature domino seed '+seed+' '+d.id);
+  });
+  assert(w.ball.y>5000,'first-minute progress seed '+seed);
+  minDepth=Math.min(minDepth,w.ball.y);maxStall=Math.max(maxStall,w.maxStall);
+ }
+ results.push({sweep:50,secondsEach:60,minDepth:Math.round(minDepth),maxStall});
+}
 if(process.env.LONG_TEST==='1'){
  for(const seed of [7,23]){
   const w=sim.buildEndless(seed);let maxSections=0,maxBodies=0,maxKeys=0;
