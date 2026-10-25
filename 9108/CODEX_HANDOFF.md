@@ -4,6 +4,21 @@ You are continuing a **live code-art project**, not writing a proposal. Work in 
 
 Read [CREATIVE_BRIEF.md](./CREATIVE_BRIEF.md) in full before touching code. It preserves the source user's desired four-world, five-minute reference choreography and improvement goals. Reference: https://x.com/wustep/status/2102197062381253063. The user provided a ~301.9-second, 1920×1080 source MP4 in the ChatGPT session; it has **not** been committed to the public repository. Ask the user to attach the video to your environment only if you need frame-level comparison. Never publish its footage, soundtrack or copied assets.
 
+## Further mechanisms — latest continuation
+
+Implementation commit: `2fac500`. Five signature acts per world; 39 available modules. IDs 35–38 add scissor lift /
+traversing trolley, frog tongue / hop / release, clam closure / pearl dye / ejection,
+and a roller-driven ticket press. These remain contact-latched authored constraints.
+The press advances three numbered perforations from marble travel, with bounded
+physical-event records and bell accents; it is not an accumulated game-score finale.
+The clam's pigment event occurs only after capture and closure.
+
+The normal suite now exercises 36 fixtures and twelve distinct motion signatures;
+adds clam-dye and exactly-three-ticket assertions; retains route clearance,
+continuous movement, identity and release checks. See QA.md for current runs.
+Next priorities remain spatial composition and pruning related legacy supporting
+acts, plus reaching eight signature acts per biome and physical-device/listening QA.
+
 ## Motion and drawing update — next continuation
 
 Feature commit: `d6f61c0` (subsequent QA/gallery documentation follows in git history).

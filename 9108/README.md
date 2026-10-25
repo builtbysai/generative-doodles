@@ -8,12 +8,12 @@
 
 | World | Color / mood | New functional acts |
 | --- | --- | --- |
-| Mechanical | Light blue, brass, counterweights | Counterweight lift/cart, swinging bucket launch, balance rig, paddlewheels |
-| Garden & Nature | Warm cream, leaves and blossoms | Vine/bee transfer, compressing mushroom launch, berries, flower chimes |
-| Ocean & Maritime | Pale blue sea, teal and mooring elements | Submarine dive, paddlewheel boat transfer, tipping buoys, coral |
-| Neon Arcade & Carnival | Deep ink, precisely outlined pastels | Claw pickup/leftward transfer/drop, full-loop coaster, pachinko, flippers |
+| Mechanical | Light blue, brass, counterweights | Counterweight cart, bucket launch, scissor lift/trolley, balance rig, paddlewheels |
+| Garden & Nature | Warm cream, leaves and blossoms | Vine/bee, mushroom launch, frog tongue/hop, berries, flower chimes |
+| Ocean & Maritime | Pale blue sea, teal and mooring elements | Submarine, paddlewheel boat, pearl-dye clam, buoys, coral |
+| Neon Arcade & Carnival | Deep ink, precisely outlined pastels | Claw, loop coaster, roller-driven ticket press, pachinko, flippers |
 
-The 19 core mechanisms from 9107 remain available. Each generated 1400px section combines one of the four biome-specific acts with a varied core act. A world lasts five sections; the entire world cycle repeats after 20 sections with a continuing seeded act order, real ball trajectory and changing music. Biome progression follows **depth reached**, not a scripted stopwatch. The machine generates ahead and frees unused sections behind.
+The 19 core mechanisms from 9107 remain available. Each generated 1400px section combines one of the five biome-specific acts with a varied core act. A world lasts five sections; the entire world cycle repeats after 20 sections with a continuing seeded act order, real ball trajectory and changing music. Biome progression follows **depth reached**, not a scripted stopwatch. The machine generates ahead and frees unused sections behind.
 
 Dimensional crossing generates a spinning localized ring at the ball's actual crossing position, changes the world rendering palette and applies a portal pigment. Contact with certain props paints the same continuously simulated marble again. These are triggered events rather than random time-based sprite effects.
 
@@ -42,7 +42,7 @@ python3 -m http.server 8000
 
 Do the audio test **with a real gesture and audible speakers/headphones**. Headless simulation and a mocked AudioContext cannot confirm final sound quality. The user asked **not to use TinyFish**.
 
-The new lifts/carriers use explicit authored constraints: real contact with the loading pan captures the same marble; a mechanism-specific sequence carries it visibly; the latch opens and restores free physics above the collection funnel. The eight transport/launch mechanisms have distinct trajectories and timing: angular swing, spring compression/ballistic launch, semicircular paddlewheel ride, full coaster loop, horizontal cart, winding growth/bee flight, submarine dive, and grip/lift/leftward/lower claw. They are authored constraints rather than full cable/fluid/animal simulations and never activate as stall recovery. There are now **four signature sequences per world**, plus 19 shared acts; eight per world remains a target.
+The new lifts/carriers use explicit authored constraints: real contact with the loading pan captures the same marble; a mechanism-specific sequence carries it visibly; the latch opens and restores free physics above the collection funnel. The twelve transport/launch mechanisms have distinct trajectories and timing: angular swing, spring compression/ballistic launch, semicircular paddlewheel ride, full coaster loop, horizontal cart, winding growth/bee flight, submarine dive, and grip/lift/leftward/lower claw, scissor lift/trolley, frog tongue/hop, closing clam and ticket press. The clam repaints the captured marble pearl white; the ticket press earns one numbered perforation per 60px of roller travel, with a short bell accent. They are authored constraints rather than full cable/fluid/animal simulations and never activate as stall recovery. There are now **five signature sequences per world**, plus 19 shared acts; eight per world remains a target.
 
 Current validation and confirmed bugs are recorded separately from future opportunities in [QA.md](QA.md). Optional browser checks require Playwright and Chromium:
 

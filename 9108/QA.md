@@ -1,11 +1,27 @@
 # 9108 continuation QA — 25 October 2026
 
 Implementation began at `7822c36`; the first verified feature commit is `9978c0b`.
-The distinct-motion continuation is `d6f61c0`.
+The distinct-motion continuation is `d6f61c0`; the latest four-act expansion is
+`2fac500`, rebased over independent upstream 9107 work without editing that file.
 Only `9108/` is changed. The private reference MP4 was not present in the workspace;
 no footage, soundtrack or reference assets were copied. The public X reference
 was attempted in Chromium but navigation failed with
 `ERR_HTTP_RESPONSE_CODE_FAILURE`; the checked-in scene inventory guided this pass.
+
+## Latest expansion
+
+Scissor lift/trolley, frog catch/hop, pearl-dye clam and roller-driven ticket press
+add four new silhouettes and contact-triggered sequences. The press produces one
+numbered perforation per 60px of loaded travel, with exactly three event records
+and bell accents. The clam recolors only after capture and closure. Regression
+coverage explicitly checks both behaviors. The frog returns toward its lily pad
+after releasing the marble; the clam stays closed during its dwell.
+
+Normal tests passed with all 36 fixtures. Browser inspection covered all four
+new mechanisms; desktop/mobile integration checks passed. The long-run results
+below cover their final trajectories; the subsequently added ticket event/audio
+records were checked by the normal suite and browser audio scheduling checks.
+Human listening, physical devices and hours of browser heap profiling remain open.
 
 ## Distinct-motion continuation
 
@@ -44,21 +60,21 @@ this is defensive audit work, not a claim of a reproduced production crash.
 ## Verification
 
 - `node 9108/physics.test.cjs`: passed. Includes existing seeded physics/portal
-  checks, 24 carrier fixtures (eight sequences × three seeds/entry offsets), ball
+  checks, 36 carrier fixtures (twelve sequences × three seeds/entry offsets), ball
   identity, continuous per-step motion, exact capture/stage/release ordering, distinct motion signatures, upward travel,
   clearance from all real rails during capture,
   restored collision masks and downstream handoff. Three isolated domino fixtures
   verify sleeping before marble arrival and activation by the real trip.
 - `SEED_SWEEP=1 node 9108/physics.test.cjs`: passed on the final carrier
-  geometry. Seeds 1–50 each ran for 60 simulated seconds. Minimum depth was 6271;
+  geometry. Seeds 1–50 each ran for 60 simulated seconds. Minimum depth was 5426;
   maximum low-speed interval was 0.553 seconds. No three-second stalls, premature
   domino activation, non-finite marble state or retained-history bounds failed.
 - `LONG_TEST=1 node 9108/physics.test.cjs`: passed, 600 simulated seconds each.
 
   | Seed | Depth | Portal crossings | Max loaded sections | Max bodies | Max cooldown keys |
   | --- | ---: | ---: | ---: | ---: | ---: |
-  | 7 | 74381 | 10 | 5 | 20 | 28 |
-  | 23 | 76407 | 10 | 5 | 21 | 28 |
+  | 7 | 73991 | 10 | 5 | 21 | 28 |
+  | 23 | 72025 | 10 | 5 | 22 | 30 |
 
   Both completed more than two four-world cycles without a three-second stall.
   Assertions cover retained machine/world/color/portal/impact histories and finite
@@ -79,11 +95,12 @@ this is defensive audit work, not a claim of a reproduced production crash.
 No marble stall or premature domino activation was confirmed in the completed
 runs above. This is a finite sample, not a universal guarantee.
 
-1. Each world has four signature sequences, not eight. Add web/frog,
-   real buoyancy/winch and physical ticket-counter sequences.
+1. Each world has five signature sequences, not eight. Add web transfer,
+   real buoyancy/winch and richer chained gates. The new ticket press is a local
+   three-ticket mechanism, not the reference finale or cumulative score counter.
    The existing counterweight bridge and rocking floats should not be described
    as complete cable or fluid simulations.
-2. The eight transport/launch mechanisms now have distinct profiles. The 19
+2. The twelve transport/launch mechanisms now have distinct profiles. The 19
    legacy supporting modules still contain related chime/peg/switchback variations
    and rely heavily on downward collection funnels. Curate or replace these next.
 3. Keep the same-ball authored constraint model explicit. Test real route clearance
