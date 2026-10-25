@@ -6,9 +6,9 @@ A full-bleed rolling-ball sculpture. One marble descends through a growing serie
 
 ## Mechanical vocabulary
 
-19 modules: switchbacks, lever-triggered dominoes, enclosed spinner, seesaw, gap, pendulum alley, stepped zigzag, bumper, bifurcating fork, bell alley, chime garden, diamond rain, clock stairs, ribbon gate, twin rockers, ricochet pegs, spring switch, resonant key staircase, and two exposed transfer wheels.
+21 modules: switchbacks, lever-triggered dominoes, enclosed spinner, seesaw, gap, pendulum alley, stepped zigzag, bumper, bifurcating fork, bell alley, chime garden, diamond rain, clock stairs, ribbon gate, twin rockers, ricochet pegs, spring switch, resonant key staircase, twin transfer wheels, **belt-linked paddlewheels**, and an **open-air pendulum hammer with a sprung sounding plate**.
 
-Each module uses real colliders, rigid bodies, or pinned spring-damped bodies. The metal keys and wheels respond to contact, not an unrelated animation clock. Dormant dominoes cannot fall before a strike; the marble triggers a counterweighted arm that wakes a seven-piece chain. A separate exit avoids wedging beneath fallen tiles.
+Each module uses real colliders, rigid bodies, or pinned spring-damped bodies. The drive has a damped angular coupling, visible tangent belt, and two collision-driven pulley wheels. A marble dropped from a short rail can strike a hammer, whose actual rigid-body contact causes a sprung gong to swing and ring. The metal keys and wheels respond to contact, not an unrelated animation clock. Dormant dominoes cannot fall before a strike; the marble triggers a counterweighted arm that wakes a seven-piece chain. A separate exit avoids wedging beneath fallen tiles.
 
 The seeded shuffle bag tries the whole module vocabulary before repeating it, and avoids three recent acts. A single section has two different acts. The construction is always downhill with generous catcher rails and open throats between stages.
 
@@ -37,7 +37,7 @@ The simulation is intentionally a small custom 2D engine, **not Box2D**. Referen
 node 9107/physics.test.cjs
 ```
 
-Deterministic checks cover 12 initial seeds, generation and garbage collection, sound-impact events, non-finite physics and stalls, plus four formerly unreliable domino approaches. Additional in-memory checks included extended simulated runs and a mocked Canvas/AudioContext smoke test. These are **not** substitutes for visual review in a real browser or listening on actual hardware.
+Deterministic checks cover 12 initial seeds, generation and garbage collection, sound-impact events, non-finite physics and stalls, four formerly unreliable domino approaches, coupled drive-wheel motion, and the actual hammer/gong event. Two rejected cradle prototypes were not shipped because they trapped the marble. In this revision, 100-second simulations of seeds 5, 6, and 29 advanced through 9–10 segments each, exercised every module type, used at most five loaded segments, and produced no non-finite physics events. Mocked Canvas rendering also completed on desktop and portrait-mobile sizes. These are **not** substitutes for visual review in a real browser or listening on actual hardware.
 
 ## Design constraints
 
