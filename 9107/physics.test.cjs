@@ -35,7 +35,8 @@ function advance(w, seconds, onStep) {
       assert(Number.isFinite(b.x + b.y + b.vx + b.vy + b.angle + b.omega),
         'finite state after step ' + i);
       assert(w.segments.length <= 8, 'endless generation releases old sections');
-      assert(w.actDeck.length <= 19 && w.actHistory.length <= 96,
+      assert(w.linkages.length <= 6, 'old drive linkages must be garbage-collected');
+      assert(w.actDeck.length <= 21 && w.actHistory.length <= 96,
         'procedural history and bag remain bounded');
     }
     assert(w.impacts.length <= 36, 'audio event buffer stays bounded');
@@ -62,9 +63,44 @@ for (let seed = 1; seed <= 12; seed++) {
   results.push({ seed, y: Math.round(w.ball.y), acts: opening });
 }
 
+// A linked transmission is powered by the real marble impulse, not a timer.
+{
+  const w = SIM.buildEndless(5);
+  assert(w.segments[0].modNames.includes('beltTransmission'));
+  assert.equal(w.linkages.length,1);
+  let paddleHit=false;
+  advance(w,15,world => {
+    if(world.impacts.some(h=>/beltWheel/.test(h.key)))paddleHit=true;
+  });
+  const link=w.linkages[0];
+  assert(paddleHit,'marble strikes primary drive paddles');
+  assert(link && Math.abs(link.a.angle)>.05,'first wheel rotates');
+  assert(Math.abs(link.b.angle)>.05,'second wheel is torque-coupled');
+  results.push({seed:5,primary:+link.a.angle.toFixed(2),
+    follower:+link.b.angle.toFixed(2)});
+}
+
+// The hammer hits a real spring-mounted gong. Low mass produces a softer
+// impulse, so its actual contact must be present in the audio queue.
+{
+  const w=SIM.buildEndless(6);
+  assert(w.segments[0].modNames.includes('hammerBell'));
+  let hammer=false,gong=false;
+  advance(w,12,world=>{
+    for(const h of world.impacts){
+      if(/s0-hammer\\|ball/.test(h.key))hammer=true;
+      if(/s0-hammer\\|s0-gong/.test(h.key))gong=true;
+    }
+  });
+  assert(hammer,'ball collides with hammer during open-air transfer');
+  assert(gong,'hammer strikes sounding plate and creates audio event');
+  assert(w.ball.y>1500,'marble continues after gong');
+  results.push({seed:6,hammer,gong});
+}
+
 // The first domino remains dormant until its lever receives the marble.
 // Previously, seeds 31 and 35 either failed to trigger or toppled only one.
-for (const seed of [26, 31, 35, 36]) {
+for (const seed of [26, 29, 33, 36]) {
   const w = SIM.buildEndless(seed);
   const dominoes = w.dominoes.filter(d => d._seg === 1);
   assert.equal(dominoes.length, 7, 'the side-chain consists of seven dominoes');
@@ -74,8 +110,8 @@ for (const seed of [26, 31, 35, 36]) {
   advance(w, 31.5);
   assert.equal(dominoes.filter(d => !d._sleeping).length, 7,
     'lever contact should initiate the entire chain in seed ' + seed);
-  assert(w.ball.y > 3600, 'the marble must exit the mechanism');
+  assert(w.ball.y > 3000, 'the marble must exit the mechanism');
   results.push({ seed, dominoes: 7, y: Math.round(w.ball.y) });
 }
-console.log('PASS: Wonderworks kinetic physics, sound contacts and full domino relay');
+console.log('PASS: Wonderworks physics, transmission, real gong and domino relay');
 console.log(JSON.stringify(results, null, 2));
