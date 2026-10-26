@@ -12,13 +12,28 @@ for(let k=0;k<scripts.length;k++)new vm.Script(scripts[k][1],{filename:'9108-scr
 const shim={exports:{}};
 vm.runInNewContext(scripts[0][1],{module:shim,Math,console,global:{}},{timeout:3000});
 const sim=shim.exports;
+const opening=[27,28,23,30],finale=[31,32,37,38];
+const middles=[[35,20,19],[22,21,36],[33,29,24],[25,26,34]];
+const supportingCast=[[1,2,16],[21,22,14],[23,24,17],[25,26,15]];
+function checkChapter(s){
+ const hero=s.scenes[s.beat===4?1:0].type,support=s.scenes[s.beat===4?0:1].type;
+ assert(supportingCast[s.world].includes(support),'support stays in biome palette: '+s.idx+' / '+support);
+ assert.notEqual(hero,support,'hero and support differ');
+ if(s.beat===0)assert.equal(hero,opening[s.world],'chapter opening');
+ else if(s.beat===4)assert.equal(hero,finale[s.world],'chapter payoff ends the section');
+ else assert(middles[s.world].includes(hero),'middle belongs to chapter');
+}
+
 assert.equal(sim.DT,1/480);
 function step(w,secs,onStep){
- const count=Math.round(secs/sim.DT);
+ const count=Math.round(secs/sim.DT),seen=new Set();
  for(let i=0;i<count;i++){
   sim.stepWorld(w);
   if(onStep)onStep(w);
   if(i%120===0){
+   if(w.fixtureAct===undefined)for(const s of w.segments)if(!seen.has(s.idx)){
+    checkChapter(s);seen.add(s.idx);
+   }
    assert(Number.isFinite(w.ball.x+w.ball.y+w.ball.vx+w.ball.vy),'finite position and velocity');
    assert(w.segments.length<=8,'bounded active section count');
    assert(w.colorEvents.length<=16,'bounded dye history');
@@ -38,6 +53,26 @@ for(let seed=1;seed<=8;seed++){
  assert(w.maxStall<3,'seed '+seed+' should not stall');
  assert(!w.events.some(e=>e.type==='nan'),'finite solver state');
  results.push({seed,y:Math.round(w.ball.y),acts:first});
+}
+// Seeded surprise changes the middle and framing, while keeping an opening.
+const arrangements=new Set(),homes=new Set();
+for(const seed of [6,7,8]){
+ const w=sim.buildEndless(seed);
+ assert(w.segments.every(s=>s.awakenedAt===undefined),'scenery waits for contact');
+ arrangements.add(JSON.stringify(w.segments.map(s=>s.modNames)));
+ homes.add(w.machines[0].homeX);
+}
+assert.equal(arrangements.size,3,'three seeded chapter arrangements');
+assert.equal(homes.size,3,'three horizontal staging positions');
+// Regression: refill an exhausted biome cast when every allowed act is
+// recent. The unrelated deck head must never become the fallback selection.
+{
+ const w=sim.buildEndless(7);
+ w.actDeck=[38];w.recentActs=[1,2,16];
+ // Isolated generator fixture, not runtime recovery: cross its build threshold.
+ w.ball.y=1500;sim.stepWorld(w);
+ const next=w.segments.find(s=>s.idx===3);
+ assert(next,'generated refill section');checkChapter(next);
 }
 // Golden seed determinism includes geometry and machine selection.
 const A=sim.buildEndless(44),B=sim.buildEndless(44);
@@ -62,20 +97,21 @@ for(let world=1;world<=3;world++){
 for(let act=27;act<=38;act++)for(const seed of [1,7,44]){
  const w=sim.buildEndless(seed,act),ball=w.ball;
  w.ball.x=seed===1?694:seed===7?700:706;
- let last={x:ball.x,y:ball.y},captured=false,rise=0,high=ball.y;
+ let last={x:ball.x,y:ball.y},captured=false,releasedWithCollision=false,rise=0,high=ball.y;
  const trajectory=[];
  step(w,16,()=>{
   const distance=Math.hypot(ball.x-last.x,ball.y-last.y);
   assert(distance<11,'continuous transfer, act '+act);
-  if(ball.carrier){if(captured)assert(distance<1,'bounded carrier speed');captured=true;
+  if(ball.carrier){if(last.carrier===ball.carrier)assert(distance<1,'bounded carrier speed '+act+' '+w.t);captured=true;
    for(const rail of w.segs){
     const dx=rail.x2-rail.x1,dy=rail.y2-rail.y1;
     const u=Math.max(0,Math.min(1,((ball.x-rail.x1)*dx+(ball.y-rail.y1)*dy)/(dx*dx+dy*dy)));
     assert(Math.hypot(ball.x-rail.x1-u*dx,ball.y-rail.y1-u*dy)>ball.r+1,'carrier clears real rail '+act+' '+rail.id);
    }
    trajectory.push([ball.x,ball.y]);high=Math.max(high,ball.y);rise=Math.max(rise,high-ball.y);}
+  if(last.carrier && !ball.carrier){assert.equal(ball.mask,0xffff,'release restores collision mask');releasedWithCollision=true;}
   assert.equal(w.ball,ball,'identity is preserved');
-  last={x:ball.x,y:ball.y};
+  last={x:ball.x,y:ball.y,carrier:ball.carrier};
  });
  const events=w.events.filter(e=>e.device===w.machines[0].id && e.type!=='recolor' && e.type!=='ticket');
  assert(captured,'contact capture, act '+act);
@@ -84,7 +120,7 @@ for(let act=27;act<=38;act++)for(const seed of [1,7,44]){
  assert.deepEqual(Array.from(events.filter(e=>e.type==='machineStage'),e=>e.stage),Array.from({length:stages},(_,i)=>i));
  assert.equal(w.machines[0].state,'released');
  assert(ball.y>1000,'safe downstream handoff, act '+act);
- assert.equal(ball.mask,0xffff,'collision mask restored');
+ assert(releasedWithCollision,'observed collision-enabled release');
  if(act===38)assert.deepEqual(Array.from(w.events.filter(e=>e.type==='ticket'&&e.device===w.machines[0].id),e=>e.index),[1,2,3],'three earned perforations');
  if(act===37)assert(w.events.some(e=>e.type==='recolor'&&e.device===w.machines[0].id),'clam contact dyes marble');
  if(act!==32)assert(rise>40,'upward travel, act '+act);
