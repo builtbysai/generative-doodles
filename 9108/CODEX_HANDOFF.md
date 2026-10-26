@@ -4,6 +4,49 @@ You are continuing a **live code-art project**, not writing a proposal. Work in 
 
 Read [CREATIVE_BRIEF.md](./CREATIVE_BRIEF.md) in full before touching code. It preserves the source user's desired four-world, five-minute reference choreography and improvement goals. Reference: https://x.com/wustep/status/2102197062381253063. The user provided a ~301.9-second, 1920×1080 source MP4 in the ChatGPT session; it has **not** been committed to the public repository. Ask the user to attach the video to your environment only if you need frame-level comparison. Never publish its footage, soundtrack or copied assets.
 
+## Connected procedural assemblies — latest continuation
+
+Implementation: `bdd615e`. This supersedes the fixed chapter openings/payoffs below. Production sections now
+choose two distinct carriers from a biome-specific grammar, with seeded continuous
+spacing/height and reflected left/right geometry. The source exit determines the
+receiver location. Do not restore independent two-slot V-funnel composition.
+
+Causal order: loading-pan contact → source transport → docking → bridge extension
+→ free rolling → actual pressure-key contact → receiver unlock/capture → bridge
+retraction → receiver release → real spring-pinned return plank → exit gate.
+The plank must receive a collision and physically rotate before it can open the
+gate. A receiving stop and short jump separate the feed rail from its full swept
+shape; the old overlapping connection pinched seed 7 after six minutes.
+No event is activated by a stall timer. No marble replacement or recovery teleport.
+
+New module 39 is a rowing/docking boat (13 carrier kinds, 40 modules available).
+Oars derive their stroke from traveled distance. This is explicit authored
+propulsion, not a fluid solver. The gate and telescoping bridge are also authored
+actuators whose triggers come from contact/docking state. The return plank itself
+uses ordinary rigid-body impulses, spring torque, damping and hinge stops.
+
+Capture now stores the actual seat offset and eases it into the loaded cradle;
+the carrier no longer jumps to the impact point. Advancing stages resets progress
+to zero for rendering. Coaster loop joins share tangents, and its orientation
+follows the rail without angular lag. A stable camera lens avoids capture/release
+zoom changes. Mirrored ticket presses earn perforations from signed local travel.
+
+`S.relay` owns the source, receiver, pressure key, extending rail, return plank and
+exit gate. All references are freed with the section. `stepRelays` updates actual
+rail endpoints and gate collision geometry; a fully retracted zero-length rail
+has no collision mask. `buildEndless(seed, fixtureAct)` retains the older isolated
+fixture layouts for regression testing; those are not the production generator.
+
+Tests check the full contact chain and prohibit bypassed receivers/gates, along
+with seeded geometry variation, captured-route clearance, capture/stage visual
+continuity, upward/free-rolling distance, bounded state and dormant legacy dominoes.
+See [QA.md](QA.md) for final measurements and [RESEARCH.md](RESEARCH.md) for the
+primary sources and playback findings behind this change.
+
+Next priorities: more than one connected assembly topology per biome; richer
+physical couplings and rolling corners; closer physical-device and listening QA.
+The signature catalog is 5/5/6/5, not eight per world or the reference's ~100 acts.
+
 ## Story and composition — 26 October 2026
 
 Implementation: `c562883`. This pass supersedes the random supporting-deck composition below. Four
