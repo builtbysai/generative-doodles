@@ -12,7 +12,7 @@ const base = process.env.BASE_URL || 'http://127.0.0.1:8000/9108/';
 // Instrument browser APIs before the artwork starts; no production debug HUD
 // or mutable global state is needed in the shipped page.
 function instrument() {
-  window.qa = { frames: 0, audioStarts: 0 };
+  window.qa = { frames: 0, audioStarts: 0, offscreenFrames: 0 };
   const arc = CanvasRenderingContext2D.prototype.arc;
   CanvasRenderingContext2D.prototype.arc = function (x, y, r, ...args) {
     if (r === 14) {
@@ -22,7 +22,11 @@ function instrument() {
     return arc.call(this, x, y, r, ...args);
   };
   const raf = window.requestAnimationFrame;
-  window.requestAnimationFrame = fn => raf.call(window, t => { qa.frames++; fn(t); });
+  window.requestAnimationFrame = fn => raf.call(window, t => {
+    qa.frames++;fn(t);
+    const p=qa.ballPixel;
+    if(p && qa.frames>2 && (p.x<0 || p.x>innerWidth || p.y<0 || p.y>innerHeight))qa.offscreenFrames++;
+  });
   const AC = window.AudioContext;
   window.AudioContext = function (...args) {
     const ac = new AC(...args);
@@ -39,7 +43,7 @@ function instrument() {
     configurable: true,
     set(v) {
       const build = v.buildEndless;
-      v.buildEndless = (...args) => { const w = build(...args); qa.world = w; return w; };
+      v.buildEndless = (...args) => { const w = build(...args); qa.world = w; qa.firstRelay=w.segments[0].relay; return w; };
       Object.defineProperty(window, 'SIM9108', { value: v });
     }
   });
@@ -94,6 +98,19 @@ function instrument() {
       await page.locator('canvas').dispatchEvent('pointercancel');
       assert.equal(await page.evaluate(() => qa.world.nudge), null, 'cancel releases nudge');
       await page.mouse.up();
+      await page.keyboard.press('Space');
+      await page.waitForFunction(() => qa.firstRelay.gate.openedAt!==undefined && qa.world.ball.y>1400, null, {timeout:20000});
+      const relay=await page.evaluate(()=>({
+        source:qa.firstRelay.source.kind,receiver:qa.firstRelay.receiver.kind,
+        dock:qa.firstRelay.source.dockedAt,release:qa.firstRelay.source.releasedAt,
+        key:qa.firstRelay.key.pressedAt,capture:qa.firstRelay.receiver.capturedAt,
+        loaded:qa.firstRelay.balance.loadAt,gate:qa.firstRelay.gate.openedAt,
+        offscreenFrames:qa.offscreenFrames
+      }));
+      assert(relay.dock<relay.release && relay.release<relay.key && relay.key<=relay.capture,'causal browser handoff');
+      assert(relay.loaded<relay.gate,'actual tipped plank opens exit');
+      assert.equal(relay.offscreenFrames,0,'marble stays visible through the whole assembly');
+      console.log(JSON.stringify({mobile,completedRelay:relay}));
       await page.close();
     }
     const page = await browser.newPage({
