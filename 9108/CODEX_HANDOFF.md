@@ -4,6 +4,31 @@ You are continuing a **live code-art project**, not writing a proposal. Work in 
 
 Read [CREATIVE_BRIEF.md](./CREATIVE_BRIEF.md) in full before touching code. It preserves the source user's desired four-world, five-minute reference choreography and improvement goals. Reference: https://x.com/wustep/status/2102197062381253063. The user provided a ~301.9-second, 1920×1080 source MP4 in the ChatGPT session; it has **not** been committed to the public repository. Ask the user to attach the video to your environment only if you need frame-level comparison. Never publish its footage, soundtrack or copied assets.
 
+## Story and composition — 26 October 2026
+
+Implementation: `c562883`. This pass supersedes the random supporting-deck composition below. Four
+five-scene chapters have fixed beginnings/payoffs and three seeded middle orders:
+workshop → bucket launch; garden → mushroom leap; coastal ocean → pearl clam;
+carnival → ticket press. The same continuous marble drives every chapter.
+Support selection is restricted to each biome. Fixed a refill fallback that could
+otherwise select an unrelated act when all allowed acts were recently used.
+
+Carriers now occupy three possible horizontal homes. Their renderer translates
+the exact same geometry as the constraint. Removed the unused receiving bank
+from both physics and drawing; long connecting rails have quieter linework.
+The desktop camera eases closer during capture. Contact awakens illustrated
+settings; the garden grows across its chapter, the ocean moves below water,
+and the frog has an articulated hop, a rooted lily pad and a landing pond.
+The clam has a scalloped shell and seabed cradle. Piano phrase endings leave
+space for collision replies. No new mechanism count is claimed in this pass.
+
+Tests now assert chapter openings/payoffs, supporting-cast membership, seeded
+staging variation and collision-enabled release even when a second carrier is
+entered during a fixture. See QA.md for measured runs and deployment verification.
+Next: make transitions between neighboring acts more directly causal and less
+reliant on long ramps, then expand the distinct cast toward eight per world.
+Human listening, physical-device QA and multi-hour browser heap profiling remain.
+
 ## Further mechanisms — latest continuation
 
 Implementation commit: `2fac500`. Five signature acts per world; 39 available modules. IDs 35–38 add scissor lift /

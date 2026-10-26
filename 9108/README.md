@@ -13,9 +13,11 @@
 | Ocean & Maritime | Pale blue sea, teal and mooring elements | Submarine, paddlewheel boat, pearl-dye clam, buoys, coral |
 | Neon Arcade & Carnival | Deep ink, precisely outlined pastels | Claw, loop coaster, roller-driven ticket press, pachinko, flippers |
 
-The 19 core mechanisms from 9107 remain available. Each generated 1400px section combines one of the five biome-specific acts with a varied core act. A world lasts five sections; the entire world cycle repeats after 20 sections with a continuing seeded act order, real ball trajectory and changing music. Biome progression follows **depth reached**, not a scripted stopwatch. The machine generates ahead and frees unused sections behind.
+Each world is now a five-scene chapter: workshop awakening ends in a bucket launch; garden growth ends in a mushroom leap; the ocean moves from coast to seabed and a pearl-dye clam; the carnival ends at its physical ticket press. Seed and cycle rearrange the middle scenes and horizontal staging. Supporting acts come from a small biome-specific cast rather than the entire legacy deck. The 19 legacy modules remain available to fixtures, but only selected ones appear in the film. Each generated 1400px section has two acts; the four-world cycle repeats after 20 sections with a real ball trajectory and changing music. Biome progression follows **depth reached**, not a scripted stopwatch. The machine generates ahead and frees unused sections behind.
 
 Dimensional crossing generates a spinning localized ring at the ball's actual crossing position, changes the world rendering palette and applies a portal pigment. Contact with certain props paints the same continuously simulated marble again. These are triggered events rather than random time-based sprite effects.
+
+Scenes have illustrated settings: workshop windows and contact-lit lamps, a growing garden and frog pond, lighthouse coast and kelp depths, and a carnival stage. Marble contact wakes the scenery. During a carrier sequence the desktop camera smoothly moves closer; the known release route uses a single receiving bank. The piano leaves phrase endings open for mechanical replies.
 
 ## Audio
 
