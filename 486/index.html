@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Selva</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #F2E8D0; height: 100%; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // Palette: three inks on cream, nothing else.
+  var ORANGE = '#C65A1E';  // burnt orange: the portrait
+  var BROWN = '#2E1D12';   // dark brown: ground panel, border, halftone
+  var SAGE = '#9AA87E';    // sage: botanical forms and laurel
+  var CREAM = '#F2E8D0';   // cream: page ground
+
+  var HOUSE_SEED = 486058; // fixed house seed: frame one is fully formed
+  var currentSeed = HOUSE_SEED;
+
+  // Seeded RNG (mulberry32)
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---- Leaf sprites, precomputed as data per seed ---------------------
+  // A leaf is a parametric outline: local +x runs base to tip, the
+  // half-width profile sin(pi * u^0.75) points both ends. Halftone dots
+  // are tested against that same profile in JS (a dot is kept when its
+  // across-axis offset falls inside the profile at its u) and cluster
+  // near the edges, where the offset fraction is high. No second canvas,
+  // no composite masking.
+  function makeLeaf(rnd, len, wid) {
+    var bend = (rnd() - 0.5) * 0.34;
+    var outline = [];
+    var N = 16, i, u, hw, cy;
+    function halfW(uu) { return (wid / 2) * Math.sin(Math.PI * Math.pow(uu, 0.75)); }
+    function centreY(uu) { return bend * Math.sin(Math.PI * uu) * len * 0.16; }
+    for (i = 0; i <= N; i++) {           // upper edge, base to tip
+      u = i / N; hw = halfW(u); cy = centreY(u);
+      outline.push({ x: (u - 0.5) * len, y: cy - hw });
+    }
+    for (i = N - 1; i >= 0; i--) {      // lower edge, tip back to base
+      u = i / N; hw = halfW(u); cy = centreY(u);
+      outline.push({ x: (u - 0.5) * len, y: cy + hw });
+    }
+    var dots = [];
+    var rows = Math.max(5, Math.floor(len / 10));
+    for (i = 0; i < rows; i++) {
+      u = 0.10 + 0.86 * (rows === 1 ? 0.5 : i / (rows - 1));
+      hw = halfW(u); cy = centreY(u);
+      if (hw < 3) continue;
+      var side = (i % 2 === 0) ? -1 : 1;
+      var frac = 0.55 + rnd() * 0.36;   // near the edge, inside the leaf
+      dots.push({ x: (u - 0.5) * len, y: cy + side * frac * hw, r: 1.9 + (1 - u) * 1.9 + rnd() * 0.7 });
+      if (rnd() < 0.62) {               // answering dot on the other edge
+        dots.push({ x: (u - 0.5) * len + (rnd() - 0.5) * 5, y: cy - side * (0.5 + rnd() * 0.38) * hw, r: 1.6 + (1 - u) * 1.5 });
+      }
+      if (rnd() < 0.30) {               // sparse interior dot
+        dots.push({ x: (u - 0.5) * len, y: cy + (rnd() - 0.5) * 0.5 * hw, r: 1.4 + rnd() * 1.1 });
+      }
+    }
+    return { len: len, wid: wid, outline: outline, dots: dots };
+  }
+
+  function drawLeaf(leaf, x, y, rot) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(rot);
+    ctx.fillStyle = SAGE;
+    ctx.beginPath();
+    ctx.moveTo(leaf.outline[0].x, leaf.outline[0].y);
+    for (var i = 1; i < leaf.outline.length; i++) ctx.lineTo(leaf.outline[i].x, leaf.outline[i].y);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = BROWN;
+    for (var d = 0; d < leaf.dots.length; d++) {
+      ctx.beginPath();
+      ctx.arc(leaf.dots[d].x, leaf.dots[d].y, leaf.dots[d].r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // ---- Whole composition state, derived from one seed -----------------
+  var state = null;
+
+  function buildState(seed) {
+    var rnd = mulberry32(seed);
+    var st = {};
+
+    // Profile parameters: brow slope, nose length and angle, chin set.
+    st.brow = (rnd() - 0.5) * 14;
+    st.noseLen = rnd() * 17;
+    st.noseAng = (rnd() - 0.5) * 15;
+    st.chinX = (rnd() - 0.5) * 11;
+    st.chinY = (rnd() - 0.5) * 10;
+    st.skull = (rnd() - 0.5) * 10;
+
+    // Botanical ring: leaf pairs mirrored about the vertical axis, on an
+    // ellipse around the portrait, tips pointing outward.
+    st.ring = [];
+    var phis = [-1.22, -0.82, -0.42, 0, 0.42, 0.82, 1.22];
+    for (var k = 0; k < phis.length; k++) {
+      for (var s = 0; s < 2; s++) {
+        var side = s === 0 ? 1 : -1;
+        var phi = side === 1 ? phis[k] : Math.PI - phis[k];
+        var jr = (rnd() - 0.5) * 26;
+        var px = 500 + Math.cos(phi) * (332 + jr);
+        var py = 492 + Math.sin(phi) * (318 + (rnd() - 0.5) * 22);
+        var len = 86 + rnd() * 44;
+        var leaf = makeLeaf(rnd, len, len * (0.36 + rnd() * 0.08));
+        st.ring.push({ x: px, y: py, rot: phi + (rnd() - 0.5) * 0.45, leaf: leaf });
+        if (rnd() < 0.55 && Math.abs(phis[k]) < 1.0) {  // berry by the leaf base, not up by the brow
+          st.ring.push({ berry: true, x: px - Math.cos(phi) * len * 0.52, y: py - Math.sin(phi) * len * 0.52, r: 8 + rnd() * 5 });
+        }
+      }
+    }
+
+    // Corner sprigs: a short stem into each corner of the panel with
+    // three leaves, answering the ring in the corners.
+    st.sprigs = [];
+    var corners = [
+      { bx: 118, by: 118, ang: Math.PI * 0.25 },
+      { bx: 882, by: 118, ang: Math.PI * 0.75 },
+      { bx: 118, by: 882, ang: -Math.PI * 0.25 },
+      { bx: 882, by: 882, ang: -Math.PI * 0.75 }
+    ];
+    for (var c = 0; c < corners.length; c++) {
+      var cn = corners[c];
+      var sprig = { bx: cn.bx, by: cn.by, ang: cn.ang + (rnd() - 0.5) * 0.16, leaves: [] };
+      var slen = 96 + rnd() * 20;
+      sprig.ex = cn.bx + Math.cos(sprig.ang) * slen;
+      sprig.ey = cn.by + Math.sin(sprig.ang) * slen;
+      sprig.mx = cn.bx + Math.cos(sprig.ang) * slen * 0.5 - Math.sin(sprig.ang) * 10;
+      sprig.my = cn.by + Math.sin(sprig.ang) * slen * 0.5 + Math.cos(sprig.ang) * 10;
+      for (var j = 0; j < 3; j++) {
+        var t = 0.22 + j * 0.32;
+        var lx = cn.bx + Math.cos(sprig.ang) * slen * t;
+        var ly = cn.by + Math.sin(sprig.ang) * slen * t;
+        var llen = 80 - j * 9 + rnd() * 10;
+        var lrot = sprig.ang + (j === 2 ? 0 : (j % 2 === 0 ? -1.0 : 1.0)) + (rnd() - 0.5) * 0.2;
+        sprig.leaves.push({ x: lx, y: ly, rot: lrot, leaf: makeLeaf(rnd, llen, llen * 0.42) });
+      }
+      st.sprigs.push(sprig);
+    }
+
+    // Laurel: leaves along an ellipse arc hugging the top of the head,
+    // each leaf pushed outward along its radial so the wreath reads
+    // clear of the silhouette instead of sinking into it.
+    st.laurel = [];
+    var cx = 498, cy = 422, rx = 176, ry = 236;
+    var a0 = 195 * Math.PI / 180, a1 = 345 * Math.PI / 180, steps = 12;
+    for (var m = 0; m <= steps; m++) {
+      var th = a0 + (a1 - a0) * (m / steps);
+      var ex = cx + Math.cos(th) * (rx + 14), ey = cy + Math.sin(th) * (ry + 14);
+      // Tangent of the ellipse, direction of travel along the arc
+      var tang = Math.atan2(Math.cos(th) * ry, -Math.sin(th) * rx);
+      var llen2 = 64 + rnd() * 16;
+      st.laurel.push({
+        x: ex, y: ey, rot: tang - 0.55 + (rnd() - 0.5) * 0.22,
+        leaf: makeLeaf(rnd, llen2, llen2 * 0.42)
+      });
+    }
+    st.laurelArc = { cx: cx, cy: cy, rx: rx, ry: ry, a0: a0, a1: a1 };
+    return st;
+  }
+
+  // ---- Profile silhouette ----------------------------------------------
+  // One smooth filled path through seeded control points, ordered from
+  // the front shoulder, up the neck and face, over the skull and down
+  // the back to the rear shoulder; the bust base closes straight.
+  function profilePoints(p) {
+    var b = p.brow, nl = p.noseLen, na = p.noseAng;
+    return [
+      { x: 352, y: 798 },                       // front shoulder, at the base
+      { x: 398, y: 770 },
+      { x: 458, y: 726 },                       // front of the neck
+      { x: 460, y: 664 },
+      { x: 436, y: 614 },                       // throat
+      { x: 398, y: 594 },                       // under the chin
+      { x: 372 + p.chinX, y: 568 + p.chinY },   // chin
+      { x: 390, y: 542 },
+      { x: 374, y: 522 },                       // lower lip
+      { x: 388, y: 506 },                       // mouth
+      { x: 372, y: 492 },                       // upper lip
+      { x: 384, y: 476 },
+      { x: 386, y: 460 },                       // under the nose
+      { x: 356, y: 464 },                       // nose underside
+      { x: 330 - nl, y: 444 + na },             // nose tip
+      { x: 358, y: 416 },                       // nose bridge
+      { x: 390, y: 386 },                       // bridge dip
+      { x: 372 + b * 0.4, y: 366 },             // brow bone
+      { x: 390 + b, y: 348 },                   // brow slope
+      { x: 386, y: 316 },                       // forehead
+      { x: 400, y: 262 },
+      { x: 436, y: 216 },
+      { x: 506 + p.skull, y: 196 },             // crown
+      { x: 580, y: 232 },                       // back of the skull
+      { x: 620, y: 316 },
+      { x: 634, y: 436 },
+      { x: 624, y: 556 },
+      { x: 584, y: 648 },                       // back of the neck
+      { x: 588, y: 722 },
+      { x: 664, y: 772 },
+      { x: 672, y: 798 }                        // rear shoulder, at the base
+    ];
+  }
+
+  function smoothThrough(pts) {
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (var i = 0; i < pts.length - 1; i++) {
+      var p0 = pts[Math.max(0, i - 1)], p1 = pts[i], p2 = pts[i + 1], p3 = pts[Math.min(pts.length - 1, i + 2)];
+      ctx.bezierCurveTo(
+        p1.x + (p2.x - p0.x) / 6, p1.y + (p2.y - p0.y) / 6,
+        p2.x - (p3.x - p1.x) / 6, p2.y - (p3.y - p1.y) / 6,
+        p2.x, p2.y
+      );
+    }
+  }
+
+  // ---- Dotted zigzag border ---------------------------------------------
+  function drawBorder() {
+    var inset = 54, amp = 13, step = 40;
+    var verts = [];
+    var side, t;
+    // top, right, bottom, left: corners land exactly on step multiples
+    for (t = 0; t <= 1000 - inset * 2; t += step) verts.push({ x: inset + t, y: inset, horiz: true });
+    for (t = step; t <= 1000 - inset * 2; t += step) verts.push({ x: 1000 - inset, y: inset + t, horiz: false });
+    for (t = step; t <= 1000 - inset * 2; t += step) verts.push({ x: 1000 - inset - t, y: 1000 - inset, horiz: true });
+    for (t = step; t <= 1000 - inset * 2 - step; t += step) verts.push({ x: inset, y: 1000 - inset - t, horiz: false });
+    // Offset alternate vertices perpendicular to their side; corners stay.
+    var pts = [];
+    for (var i = 0; i < verts.length; i++) {
+      var v = verts[i];
+      var onCorner = (v.x === inset || v.x === 1000 - inset) && (v.y === inset || v.y === 1000 - inset);
+      var off = (!onCorner && i % 2 === 1) ? amp : 0;
+      var inward = 1;
+      if (v.horiz) inward = v.y === inset ? 1 : -1; else inward = v.x === inset ? 1 : -1;
+      pts.push({ x: v.x + (v.horiz ? 0 : off * inward), y: v.y + (v.horiz ? off * inward : 0) });
+    }
+    ctx.strokeStyle = BROWN;
+    ctx.lineWidth = 5;
+    ctx.lineJoin = 'round';
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (var j = 1; j < pts.length; j++) ctx.lineTo(pts[j].x, pts[j].y);
+    ctx.closePath();
+    ctx.stroke();
+    ctx.fillStyle = ORANGE;
+    for (var d = 0; d < pts.length; d++) {
+      ctx.beginPath();
+      ctx.arc(pts[d].x, pts[d].y, 5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  // ---- Viewport -----------------------------------------------------------
+  var vw = 300, vh = 300, dpr = 1, isPhone = false;
+
+  function resize() {
+    var vv = window.visualViewport;
+    vw = vv ? vv.width : window.innerWidth;
+    vh = vv ? vv.height : window.innerHeight;
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.round(vw * dpr);
+    canvas.height = Math.round(vh * dpr);
+    if (window.screen && window.screen.width && window.screen.height) {
+      isPhone = Math.min(window.screen.width, window.screen.height) < 700;
+    } else {
+      isPhone = vh > vw * 1.15;
+    }
+    draw();
+  }
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', resize);
+  }
+  window.addEventListener('resize', resize);
+
+  // ---- Draw ----------------------------------------------------------------
+  function draw() {
+    canvas.style.width = vw + 'px';
+    canvas.style.height = vh + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    // Page ground: the cream, everywhere.
+    ctx.fillStyle = CREAM;
+    ctx.fillRect(0, 0, vw, vh);
+
+    // Design space 1000x1000, fitted and centred so the emblem keeps its
+    // shape on any screen, phones included.
+    var sc = Math.min(vw / 1000, vh / 1000);
+    var ox = (vw - 1000 * sc) / 2;
+    var oy = (vh - 1000 * sc) / 2;
+    ctx.save();
+    ctx.translate(ox, oy);
+    ctx.scale(sc, sc);
+
+    // Dark brown panel inside the border.
+    ctx.fillStyle = BROWN;
+    ctx.fillRect(84, 84, 832, 832);
+
+    // Corner sprigs, then the botanical ring, behind the portrait.
+    var i, it;
+    for (i = 0; i < state.sprigs.length; i++) {
+      var sp = state.sprigs[i];
+      ctx.strokeStyle = SAGE;
+      ctx.lineWidth = 5;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(sp.bx, sp.by);
+      ctx.quadraticCurveTo(sp.mx, sp.my, sp.ex, sp.ey);
+      ctx.stroke();
+    }
+    for (i = 0; i < state.sprigs.length; i++) {
+      for (var j = 0; j < state.sprigs[i].leaves.length; j++) {
+        it = state.sprigs[i].leaves[j];
+        drawLeaf(it.leaf, it.x, it.y, it.rot);
+      }
+    }
+    for (i = 0; i < state.ring.length; i++) {
+      it = state.ring[i];
+      if (it.berry) {
+        ctx.fillStyle = ORANGE;
+        ctx.beginPath();
+        ctx.arc(it.x, it.y, it.r, 0, Math.PI * 2);
+        ctx.fill();
+      } else {
+        drawLeaf(it.leaf, it.x, it.y, it.rot);
+      }
+    }
+
+    // The portrait: one burnt-orange silhouette.
+    var pts = profilePoints(state);
+    ctx.fillStyle = ORANGE;
+    smoothThrough(pts);
+    ctx.closePath();
+    ctx.fill();
+
+    // Cut details in the ground colour: one eye, one ear.
+    ctx.fillStyle = BROWN;
+    ctx.beginPath();
+    ctx.ellipse(419, 384, 13, 6.5, -0.12, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(46,29,18,0.55)';
+    ctx.lineWidth = 5;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.arc(533, 452, 17, 0.6, 5.2);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(533, 452, 8, 0.6, 5.2);
+    ctx.stroke();
+    // Drape line across the base of the neck.
+    ctx.beginPath();
+    ctx.moveTo(458, 700);
+    ctx.quadraticCurveTo(520, 748, 590, 706);
+    ctx.stroke();
+
+    // Laurel over the head: sage stem arc, then its leaves.
+    var L = state.laurelArc;
+    ctx.strokeStyle = SAGE;
+    ctx.lineWidth = 6;
+    ctx.beginPath();
+    ctx.ellipse(L.cx, L.cy, L.rx, L.ry, 0, L.a0, L.a1);
+    ctx.stroke();
+    for (i = 0; i < state.laurel.length; i++) {
+      it = state.laurel[i];
+      drawLeaf(it.leaf, it.x, it.y, it.rot);
+    }
+
+    // Dotted zigzag border on the cream, all four sides with corners.
+    drawBorder();
+
+    // The one hint.
+    ctx.fillStyle = 'rgba(46,29,18,0.50)';
+    ctx.font = 'italic 21px Georgia, serif';
+    ctx.textAlign = 'right';
+    ctx.fillText('tap', 962, 988);
+
+    ctx.restore();
+  }
+
+  // Tap reseeds: a new profile and foliage arrangement, same three inks.
+  function reseed() {
+    currentSeed = (Math.imul(currentSeed, 1664525) + 1013904223) >>> 0;
+    state = buildState(currentSeed);
+    draw();
+  }
+  canvas.addEventListener('pointerdown', reseed);
+
+  state = buildState(HOUSE_SEED);
+  resize();
+})();
+</script>
+</body>
+</html>
