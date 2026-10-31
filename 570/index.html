@@ -1,0 +1,582 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Soy Otra</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #FAF6EA; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // Palette: strict. Ink on paper; tattoos in faded blue-black. Nothing else.
+  var INK = '#141414', PAPER = '#FAF6EA', TAT = '#2A3A4A';
+
+  var PHASE0 = 1.7; // constant first-frame phase
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  function hashStr(s) {
+    var h = 2166136261;
+    for (var i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+    return h >>> 0;
+  }
+
+  // ---- variants: pose fixed, features parameterized -------------------------
+  // hair: 0 long, 1 bob, 2 bun, 3 curls, 4 crop
+  // gaze: 0 up, 1 left, 2 right, 3 closed
+  // mouth: 0 small smile, 1 flat, 2 small open
+  // earring / watch: 0 none, 1 left, 2 right
+  // tatArmSide: 0 left, 1 right, 2 both
+  var varRng = mulberry32(570069);
+  function sigOf(v) {
+    return v.hair + '|' + v.gaze + '|' + v.mouth + '|' + (v.septum ? 1 : 0) + '|' + v.earring;
+  }
+  function nextVariant(prev) {
+    var psig = prev ? sigOf(prev) : '', v, guard = 0;
+    do {
+      v = {
+        hair: (varRng() * 5) | 0,
+        hairLen: 0.35 + varRng() * 0.65,
+        gaze: (varRng() * 4) | 0,
+        mouth: (varRng() * 3) | 0,
+        septum: varRng() < 0.45,
+        earring: (varRng() * 3) | 0,
+        watch: (varRng() * 3) | 0,
+        tatArmSide: (varRng() * 3) | 0,
+        tatArmMotif: (varRng() * 6) | 0,
+        tatChest: varRng() >= 0.15,
+        tatChestMotif: (varRng() * 6) | 0
+      };
+      guard++;
+    } while (sigOf(v) === psig && guard < 40); // never the same face twice in a row
+    return v;
+  }
+
+  var cur = nextVariant(null);   // deterministic first variant
+  var curLen = cur.hairLen;     // live hair length (drag grows it)
+  var sketchStart = -10;        // first frame: fully drawn, not mid-sketch
+
+  // ---- point-path helpers (everything is sampled polylines) -----------------
+  function arcPts(cx, cy, rx, ry, a0, a1, n) {
+    var pts = [], i, a;
+    for (i = 0; i <= n; i++) {
+      a = a0 + (a1 - a0) * i / n;
+      pts.push([cx + rx * Math.cos(a), cy + ry * Math.sin(a)]);
+    }
+    return pts;
+  }
+  function circPts(cx, cy, r, n) { return arcPts(cx, cy, r, r, 0, Math.PI * 2, n || 28); }
+  function qbez(p0, p1, p2, n) {
+    var pts = [], i, t, u, x, y;
+    for (i = 0; i <= n; i++) {
+      t = i / n; u = 1 - t;
+      x = u * u * p0[0] + 2 * u * t * p1[0] + t * t * p2[0];
+      y = u * u * p0[1] + 2 * u * t * p1[1] + t * t * p2[1];
+      pts.push([x, y]);
+    }
+    return pts;
+  }
+  function cbez(p0, p1, p2, p3, n) {
+    var pts = [], i, t, u, x, y;
+    for (i = 0; i <= n; i++) {
+      t = i / n; u = 1 - t;
+      x = u * u * u * p0[0] + 3 * u * u * t * p1[0] + 3 * u * t * t * p2[0] + t * t * t * p3[0];
+      y = u * u * u * p0[1] + 3 * u * u * t * p1[1] + 3 * u * t * t * p2[1] + t * t * t * p3[1];
+      pts.push([x, y]);
+    }
+    return pts;
+  }
+  function joinPts() {
+    var out = [], i, j, seg, last;
+    for (i = 0; i < arguments.length; i++) {
+      seg = arguments[i];
+      for (j = 0; j < seg.length; j++) {
+        last = out[out.length - 1];
+        if (last && j === 0 && last[0] === seg[0][0] && last[1] === seg[0][1]) continue;
+        out.push(seg[j]);
+      }
+    }
+    return out;
+  }
+  // hand wobble: tiny seeded jitter per stroke index, identical every frame
+  function wobble(pts, idx, amt) {
+    var rng = mulberry32(570200 + idx * 37);
+    return pts.map(function (p, i) {
+      if (i === 0 || i === pts.length - 1) return p;
+      return [p[0] + (rng() - 0.5) * amt, p[1] + (rng() - 0.5) * amt];
+    });
+  }
+  function pathLen(pts) {
+    var L = 0, i;
+    for (i = 1; i < pts.length; i++) {
+      var dx = pts[i][0] - pts[i - 1][0], dy = pts[i][1] - pts[i - 1][1];
+      L += Math.sqrt(dx * dx + dy * dy);
+    }
+    return L;
+  }
+
+  // ---- figure geometry (1080 x 1080 design space) ---------------------------
+  var HX = 540, HY = 424, HRX = 74, HRY = 84;      // head
+  var SHL = [446, 550], SHR = [634, 550];          // shoulders
+  var ELBL = [390, 744], ELBR = [690, 744];        // elbows, outside the knees
+  var WRL = [498, 820], WRR = [582, 820];          // wrists at the clasp
+
+  function motif(kind, cx, cy, s) {
+    // small tattoo motifs, returned as one point list (TAT colour set by caller)
+    var pts = [], i, a;
+    if (kind === 0) {           // star
+      for (i = 0; i <= 10; i++) {
+        a = -Math.PI / 2 + i * Math.PI / 5;
+        var r = (i % 2 === 0) ? s : s * 0.45;
+        pts.push([cx + r * Math.cos(a), cy + r * Math.sin(a)]);
+      }
+    } else if (kind === 1) {    // crescent moon
+      pts = arcPts(cx, cy, s * 0.9, s, Math.PI * 0.35, Math.PI * 1.65, 16)
+        .concat(arcPts(cx + s * 0.38, cy, s * 0.62, s * 0.78, Math.PI * 1.6, Math.PI * 0.4, 14));
+    } else if (kind === 2) {    // flower
+      for (i = 0; i < 5; i++) {
+        a = -Math.PI / 2 + i * Math.PI * 2 / 5;
+        pts = pts.concat(circPts(cx + s * 0.55 * Math.cos(a), cy + s * 0.55 * Math.sin(a), s * 0.42, 12));
+      }
+      pts = pts.concat(circPts(cx, cy, s * 0.2, 10));
+    } else if (kind === 3) {    // heart outline
+      pts = joinPts(
+        cbez([cx, cy + s * 0.85], [cx - s * 1.2, cy + s * 0.2], [cx - s * 0.9, cy - s * 0.85], [cx, cy - s * 0.05], 12),
+        cbez([cx, cy - s * 0.05], [cx + s * 0.9, cy - s * 0.85], [cx + s * 1.2, cy + s * 0.2], [cx, cy + s * 0.85], 12));
+    } else if (kind === 4) {    // snake squiggle
+      for (i = 0; i <= 20; i++) {
+        var t = i / 20;
+        pts.push([cx - s + 2 * s * t, cy + Math.sin(t * Math.PI * 2.4) * s * 0.42]);
+      }
+    } else {                    // eye
+      pts = joinPts(
+        qbez([cx - s, cy], [cx, cy - s * 0.95], [cx + s, cy], 12),
+        qbez([cx + s, cy], [cx, cy + s * 0.95], [cx - s, cy], 12),
+        circPts(cx, cy, s * 0.3, 12));
+    }
+    return pts;
+  }
+
+  // hair that falls BEHIND the head/shoulders, per style; L = live length
+  function hairBack(v, L) {
+    var items = [];
+    function S(pts) { items.push({ pts: pts, color: INK, lw: 5.5, w: 2.2 }); }
+    if (v.hair === 0) {         // long: strands fall behind the shoulders
+      var drop = 190 + L * 250, k;
+      for (k = -1; k <= 1; k++) {
+        S(cbez([HX - 66 + k * 10, HY - 46], [HX - 104 + k * 12, HY + 60], [HX - 100 + k * 10, HY + drop * 0.7], [HX - 88 + k * 16, HY + drop], 22));
+        S(cbez([HX + 66 - k * 10, HY - 46], [HX + 104 - k * 12, HY + 60], [HX + 100 - k * 10, HY + drop * 0.7], [HX + 88 - k * 16, HY + drop], 22));
+      }
+      S(qbez([HX - 88, HY + drop], [HX, HY + drop + 26], [HX + 88, HY + drop], 14));
+    } else if (v.hair === 1) {  // bob: sides to a bottom edge above the shoulders
+      var endY = HY + 30 + L * 130;
+      S(cbez([HX - 70, HY - 50], [HX - 102, HY + 30], [HX - 98, HY + 60], [HX - 92, endY], 18));
+      S(cbez([HX + 70, HY - 50], [HX + 102, HY + 30], [HX + 98, HY + 60], [HX + 92, endY], 18));
+      S(qbez([HX - 92, endY], [HX, endY + 20], [HX + 92, endY], 14));
+    } else if (v.hair === 3) {  // curls: one row hugging each side of the head
+      var r, s2;
+      for (r = 0; r < 2; r++) {
+        for (s2 = -1; s2 <= 1; s2 += 2) {
+          S(arcPts(HX + s2 * (HRX + 2), HY - 4 + r * 46, 16, 15, 0, Math.PI * 2, 14));
+        }
+      }
+    }
+    return items;
+  }
+  // hair drawn over the skull, per style
+  function hairFront(v, L) {
+    var items = [];
+    function S(pts) { items.push({ pts: pts, color: INK, lw: 5.5, w: 2.2 }); }
+    if (v.hair === 0 || v.hair === 1) {
+      S(arcPts(HX, HY - 4, HRX + 9, HRY + 9, Math.PI * 1.02, Math.PI * 1.98, 22)); // cap over the skull
+      S(qbez([HX - 66, HY - 52], [HX, HY - 30], [HX + 66, HY - 52], 14));          // fringe line
+    } else if (v.hair === 2) {  // bun
+      S(arcPts(HX, HY - 4, HRX + 7, HRY + 7, Math.PI * 1.02, Math.PI * 1.98, 22));
+      S(circPts(HX, HY - HRY - 22, 30, 26));
+      S(qbez([HX - 24, HY - HRY - 40], [HX, HY - HRY - 18], [HX + 24, HY - HRY - 40], 10));
+      S(cbez([HX - 70, HY - 20], [HX - 92, HY + 40], [HX - 88, HY + 70], [HX - 84, HY + 96 + L * 30], 14));
+      S(cbez([HX + 70, HY - 20], [HX + 92, HY + 40], [HX + 88, HY + 70], [HX + 84, HY + 96 + L * 30], 14));
+    } else if (v.hair === 3) {  // curls over the top
+      var i, n = 7;
+      for (i = 0; i < n; i++) {
+        var a = Math.PI + (i + 0.5) * Math.PI / n;
+        S(arcPts(HX + (HRX + 4) * Math.cos(a), HY - 4 + (HRY + 4) * Math.sin(a), 18, 16, 0, Math.PI * 2, 14));
+      }
+      S(qbez([HX - 58, HY - 46], [HX, HY - 28], [HX + 58, HY - 46], 12));
+    } else {                    // crop: close cap + fringe ticks
+      S(arcPts(HX, HY - 4, HRX + 4, HRY + 4, Math.PI * 1.0, Math.PI * 2.0, 22));
+      var j;
+      for (j = 0; j < 5; j++) {
+        var fx = HX - 52 + j * 26;
+        S([[fx, HY - 56 + Math.abs(j - 2) * 3], [fx + 3, HY - 38 + Math.abs(j - 2) * 3]]);
+      }
+    }
+    return items;
+  }
+
+  // Build the ordered item list for the current variant. Items are strokes
+  // ({pts,color,lw,w}) or filled dots ({dot:[x,y],r,color}); the sketch-on
+  // transition spends its progress across items by weight.
+  function buildItems(v, L) {
+    var items = [];
+    function S(pts, color, lw, w) { items.push({ pts: pts, color: color || INK, lw: lw || 5.5, w: w || 2.2 }); }
+    function D(x, y, r, color) { items.push({ dot: [x, y], r: r, color: color || INK }); }
+    var i;
+
+    // hair behind the head
+    var hb = hairBack(v, L);
+    for (i = 0; i < hb.length; i++) items.push(hb[i]);
+
+    // legs: thighs rise to two round knees, shins drop to two feet.
+    // One outline stroke per leg: hip -> thigh front -> over the knee ->
+    // shin front -> ankle, then the foot as its own small mound + sole.
+    S(joinPts(
+      cbez([458, 890], [436, 780], [430, 700], [436, 664], 16),
+      arcPts(488, 660, 56, 46, Math.PI * 0.92, Math.PI * 2.02, 14),
+      cbez([538, 700], [528, 790], [508, 860], [500, 920], 16)), INK, 5.5);
+    S(qbez([466, 932], [492, 918], [524, 932], 10), INK, 5);                    // left foot
+    S([[462, 942], [528, 942]], INK, 4.5);
+    S(joinPts(
+      cbez([622, 890], [644, 780], [650, 700], [644, 664], 16),
+      arcPts(592, 660, 56, 46, 0, -Math.PI, 14),
+      cbez([542, 700], [552, 790], [572, 860], [580, 920], 16)), INK, 5.5);
+    S(qbez([556, 932], [588, 918], [614, 932], 10), INK, 5);                    // right foot
+    S([[552, 942], [618, 942]], INK, 4.5);
+    // inner thigh lines down to the hidden lap
+    S(cbez([522, 700], [528, 790], [530, 850], [530, 894], 12), INK, 5);
+    S(cbez([558, 700], [552, 790], [550, 850], [550, 894], 12), INK, 5);
+
+    // torso: long side lines from shoulders to hips, neck, collarbone
+    S(cbez(SHL, [424, 660], [440, 800], [466, 892], 18), INK, 5.5);
+    S(cbez(SHR, [656, 660], [640, 800], [614, 892], 18), INK, 5.5);
+    S([[521, 498], [519, 542]], INK, 5);
+    S([[559, 498], [561, 542]], INK, 5);
+    S(qbez(SHL, [HX, 588], SHR, 16), INK, 5);                                  // collarbone
+
+    // chest tattoo, on the upper chest above the knees
+    if (v.tatChest) S(motif(v.tatChestMotif, HX, 600, 16), TAT, 3.5);
+
+    // arms around the legs, hands clasped in front of the shins
+    S(cbez(SHL, [416, 640], [398, 696], ELBL, 14), INK, 5.5);
+    S(cbez(SHR, [664, 640], [682, 696], ELBR, 14), INK, 5.5);
+    S(cbez(ELBL, [420, 800], [458, 818], WRL, 12), INK, 5.5);
+    S(cbez(ELBR, [660, 800], [622, 818], WRR, 12), INK, 5.5);
+    S(arcPts(522, 826, 19, 13, Math.PI * 0.9, Math.PI * 2.1, 10), INK, 4.5);    // clasped hands
+    S(arcPts(558, 826, 19, 13, Math.PI * 0.9, Math.PI * 2.1, 10), INK, 4.5);
+
+    // forearm tattoos
+    if (v.tatArmSide === 0 || v.tatArmSide === 2) S(motif(v.tatArmMotif, 444, 788, 20), TAT, 3.5);
+    if (v.tatArmSide === 1 || v.tatArmSide === 2) S(motif((v.tatArmMotif + 3) % 6, 636, 788, 20), TAT, 3.5);
+
+    // watch on a wrist
+    if (v.watch === 1) { S(circPts(488, 812, 10, 16), INK, 4); S([[476, 800], [482, 794]], INK, 4); S([[494, 824], [500, 830]], INK, 4); }
+    if (v.watch === 2) { S(circPts(592, 812, 10, 16), INK, 4); S([[604, 800], [598, 794]], INK, 4); S([[586, 824], [580, 830]], INK, 4); }
+
+    // head
+    S(arcPts(HX, HY, HRX, HRY, 0, Math.PI * 2, 40), INK, 5.5, 1.2);
+    if (v.hair !== 3) {  // curls cover the ears; other styles show them
+      S(arcPts(HX - HRX - 2, HY + 8, 9, 13, Math.PI * 0.6, Math.PI * 1.7, 8), INK, 4.5, 1.2);
+      S(arcPts(HX + HRX + 2, HY + 8, 9, 13, Math.PI * 1.3, Math.PI * 0.4, 8), INK, 4.5, 1.2);
+    }
+
+    // hair in front
+    var hf = hairFront(v, L);
+    for (i = 0; i < hf.length; i++) items.push(hf[i]);
+
+    // face: head turned up, gaze is the variant's
+    var gx = v.gaze === 1 ? -5 : (v.gaze === 2 ? 5 : 0);
+    var gy = v.gaze === 0 ? -3 : 0;
+    S(qbez([HX - 48, HY - 36], [HX - 33, HY - 44], [HX - 18, HY - 37], 8), INK, 4.5, 1.0);  // brows
+    S(qbez([HX + 18, HY - 37], [HX + 33, HY - 44], [HX + 48, HY - 36], 8), INK, 4.5, 1.0);
+    if (v.gaze === 3) {
+      S(qbez([HX - 46, HY - 12], [HX - 33, HY - 3], [HX - 20, HY - 12], 8), INK, 4.5, 1.0);
+      S(qbez([HX + 20, HY - 12], [HX + 33, HY - 3], [HX + 46, HY - 12], 8), INK, 4.5, 1.0);
+    } else {
+      S(qbez([HX - 46, HY - 10], [HX - 33, HY - 20], [HX - 20, HY - 10], 8), INK, 4.5, 1.0);
+      S(qbez([HX + 20, HY - 10], [HX + 33, HY - 20], [HX + 46, HY - 10], 8), INK, 4.5, 1.0);
+      D(HX - 33 + gx, HY - 7 + gy, 5);
+      D(HX + 33 + gx, HY - 7 + gy, 5);
+    }
+    S(joinPts([[HX + 2, HY + 0], [HX - 3, HY + 15]], qbez([HX - 3, HY + 15], [HX + 1, HY + 20], [HX + 7, HY + 17], 6)), INK, 4.5, 1.0); // nose
+    if (v.septum) S(circPts(HX, HY + 28, 7, 16), INK, 3.5, 1.0);
+    if (v.mouth === 0) S(qbez([HX - 13, HY + 42], [HX, HY + 50], [HX + 13, HY + 42], 8), INK, 4.5, 1.0);
+    else if (v.mouth === 1) S([[HX - 12, HY + 45], [HX + 12, HY + 45]], INK, 4.5, 1.0);
+    else S(circPts(HX, HY + 45, 5.5, 14), INK, 4.5, 1.0);
+
+    // flower earring, hanging at the ear on its side
+    if (v.earring !== 0) {
+      var ex = v.earring === 1 ? HX - HRX - 6 : HX + HRX + 6, ey = HY + 36, p;
+      for (p = 0; p < 5; p++) {
+        var a = -Math.PI / 2 + p * Math.PI * 2 / 5;
+        S(circPts(ex + 7 * Math.cos(a), ey + 7 * Math.sin(a), 5, 10), INK, 3.5, 1.0);
+      }
+      D(ex, ey, 2.6);
+    }
+
+    // apply the hand wobble stroke by stroke (dots stay exact)
+    for (i = 0; i < items.length; i++)
+      if (items[i].pts) items[i].pts = wobble(items[i].pts, i, items[i].w || 2.2);
+    return items;
+  }
+
+  function drawStrokePartial(pts, frac) {
+    if (frac <= 0) return;
+    var total = pathLen(pts), target = total * Math.min(frac, 1), acc = 0, i;
+    ctx.beginPath();
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    for (i = 1; i < pts.length; i++) {
+      var dx = pts[i][0] - pts[i - 1][0], dy = pts[i][1] - pts[i - 1][1];
+      var seg = Math.sqrt(dx * dx + dy * dy);
+      if (acc + seg <= target) { ctx.lineTo(pts[i][0], pts[i][1]); acc += seg; }
+      else {
+        var r = seg > 0 ? (target - acc) / seg : 0;
+        ctx.lineTo(pts[i - 1][0] + dx * r, pts[i - 1][1] + dy * r);
+        break;
+      }
+    }
+    ctx.stroke();
+  }
+
+  function drawItem(it, frac) {
+    ctx.strokeStyle = it.color; ctx.fillStyle = it.color;
+    if (it.pts) {
+      ctx.lineWidth = it.lw; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+      drawStrokePartial(it.pts, frac);
+    } else if (frac >= 0.5) {
+      ctx.beginPath(); ctx.arc(it.dot[0], it.dot[1], it.r, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+
+  function drawFigure(t) {
+    var items = buildItems(cur, curLen);
+    var weights = [], total = 0, i;
+    for (i = 0; i < items.length; i++) {
+      var w = items[i].pts ? pathLen(items[i].pts) : 42;
+      weights.push(w); total += w;
+    }
+    var prog = Math.min((t - sketchStart) / 0.85, 1);
+    if (prog >= 1) {
+      for (i = 0; i < items.length; i++) drawItem(items[i], 1);
+    } else {
+      var budget = prog * total;
+      for (i = 0; i < items.length; i++) {
+        if (budget <= 0) break;
+        drawItem(items[i], Math.min(budget / weights[i], 1));
+        budget -= weights[i];
+      }
+    }
+  }
+
+  // ---- lettering (per-letter jitter seeded by the string) -------------------
+  function setFont(size, weight) {
+    ctx.font = (weight || 700) + ' ' + size + 'px "Arial Rounded MT Bold","Trebuchet MS",Verdana,sans-serif';
+  }
+  function lettered(str, cx, y, size, color, weight) {
+    setFont(size, weight);
+    var rng = mulberry32(570100 + hashStr(str));
+    var widths = [], total = 0, i, w;
+    for (i = 0; i < str.length; i++) { w = ctx.measureText(str[i]).width; widths.push(w); total += w; }
+    var x = cx - total / 2;
+    ctx.fillStyle = color; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+    for (i = 0; i < str.length; i++) {
+      var jx = (rng() - 0.5) * size * 0.07, jy = (rng() - 0.5) * size * 0.09;
+      ctx.save();
+      ctx.translate(x + widths[i] / 2 + jx, y + jy);
+      ctx.rotate((rng() - 0.5) * 0.05);
+      ctx.fillText(str[i], -widths[i] / 2, 0);
+      ctx.restore();
+      x += widths[i];
+    }
+    return total;
+  }
+  function letteredLeft(str, x0, y, size, color, weight) {
+    setFont(size, weight);
+    var rng = mulberry32(570100 + hashStr(str));
+    var x = x0, i, w;
+    ctx.fillStyle = color; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+    for (i = 0; i < str.length; i++) {
+      w = ctx.measureText(str[i]).width;
+      var jx = (rng() - 0.5) * size * 0.07, jy = (rng() - 0.5) * size * 0.09;
+      ctx.save();
+      ctx.translate(x + w / 2 + jx, y + jy);
+      ctx.rotate((rng() - 0.5) * 0.05);
+      ctx.fillText(str[i], -w / 2, 0);
+      ctx.restore();
+      x += w;
+    }
+  }
+
+  // wobbly rounded rect, jitter seeded per id
+  function wobRect(x, y, w, h, r, id) {
+    var rng = mulberry32(570300 + id * 131);
+    function j(v) { return v + (rng() - 0.5) * 5; }
+    ctx.beginPath();
+    ctx.moveTo(j(x + r), j(y));
+    ctx.lineTo(j(x + w - r), j(y)); ctx.quadraticCurveTo(j(x + w), j(y), j(x + w), j(y + r));
+    ctx.lineTo(j(x + w), j(y + h - r)); ctx.quadraticCurveTo(j(x + w), j(y + h), j(x + w - r), j(y + h));
+    ctx.lineTo(j(x + r), j(y + h)); ctx.quadraticCurveTo(j(x), j(y + h), j(x), j(y + h - r));
+    ctx.lineTo(j(x), j(y + r)); ctx.quadraticCurveTo(j(x), j(y), j(x + r), j(y));
+    ctx.closePath();
+  }
+
+  // ---- draw ------------------------------------------------------------------
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.fillStyle = PAPER;
+    ctx.fillRect(0, 0, W, H);
+    ctx.save();
+    ctx.translate(OX, OY);
+    ctx.scale(S / 1080, S / 1080);
+    ctx.lineJoin = 'round';
+
+    drawFigure(t);
+
+    // the bubble: her sentence, verbatim, always fully drawn
+    ctx.beginPath();
+    ctx.moveTo(552, 262); ctx.lineTo(574, 262); ctx.lineTo(556, 318); ctx.closePath();
+    ctx.fillStyle = PAPER; ctx.fill();
+    ctx.strokeStyle = INK; ctx.lineWidth = 5; ctx.stroke();
+    wobRect(190, 84, 700, 182, 30, 1);
+    ctx.fillStyle = PAPER; ctx.fill();
+    ctx.strokeStyle = INK; ctx.lineWidth = 5; ctx.stroke();
+    lettered('CADA VEZ QUE ME DIBUJO', HX, 142, 53, INK);
+    lettered('SOY OTRA.', HX, 208, 53, INK);
+
+    // signature, lower left, in her hand
+    letteredLeft('powerpaola 2026', 64, 1006, 34, INK, 400);
+
+    // hint
+    ctx.save();
+    ctx.globalAlpha = 0.45;
+    ctx.fillStyle = INK;
+    setFont(24, 700);
+    ctx.textAlign = 'right'; ctx.textBaseline = 'alphabetic';
+    ctx.fillText('tap', 1024, 1022);
+    ctx.restore();
+
+    ctx.restore();
+  }
+
+  // ---- sizing (Visual Viewport API; square stage; page ground is the paper) --
+  var W = 0, H = 0, S = 0, OX = 0, OY = 0;
+  var simT = PHASE0;
+
+  function isPhone() {
+    var sw = window.screen ? window.screen.width : 0;
+    var sh = window.screen ? window.screen.height : 0;
+    var minDim = Math.min(sw, sh);
+    if (minDim > 0) return minDim < 700;
+    return H > W * 1.15; // aspect fallback only
+  }
+
+  function resize() {
+    var vv = window.visualViewport;
+    W = vv ? vv.width : window.innerWidth;
+    H = vv ? vv.height : window.innerHeight;
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.round(W * dpr);
+    canvas.height = Math.round(H * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    if (isPhone()) {
+      S = W;
+      OX = 0; OY = (H - S) / 2;
+    } else {
+      S = Math.min(W, H);
+      OX = (W - S) / 2; OY = (H - S) / 2;
+    }
+    draw(simT);
+  }
+
+  // ---- interaction ------------------------------------------------------------
+  function toDesign(e) {
+    var rect = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    return {
+      x: (e.clientX - rect.left - OX) / S * 1080,
+      y: (e.clientY - rect.top - OY) / S * 1080
+    };
+  }
+  function inHair(p) {
+    var dx = (p.x - HX) / 165, dy = (p.y - (HY - 30)) / 150;
+    if (dx * dx + dy * dy < 1) return true;
+    // the fall of long/bob hair counts too
+    return Math.abs(p.x - HX) < 150 && p.y >= HY - 30 && p.y < HY + 60 + curLen * 300 &&
+           (Math.abs(p.x - HX) > 55);
+  }
+
+  var downInfo = null;
+  function onDown(e) {
+    var p = toDesign(e);
+    downInfo = { x: p.x, y: p.y, t: e.timeStamp || 0, hair: inHair(p), lastY: p.y, moved: 0 };
+  }
+  function onMove(e) {
+    if (!downInfo) return;
+    var p = toDesign(e);
+    var dx = p.x - downInfo.x, dy = p.y - downInfo.y;
+    downInfo.moved = Math.max(downInfo.moved, Math.sqrt(dx * dx + dy * dy));
+    if (downInfo.hair) {
+      var step = (p.y - downInfo.lastY) * 0.0022; // drag down, the hair grows
+      downInfo.lastY = p.y;
+      if (step !== 0) {
+        curLen += step;
+        if (curLen >= 1.15) {           // fully grown: it changes style instead
+          cur.hair = (cur.hair + 1) % 5;
+          curLen = 0.4;
+        }
+        if (curLen < 0.25) curLen = 0.25;
+        draw(simT);
+      }
+    }
+  }
+  function onUp(e) {
+    if (!downInfo) return;
+    var dt = (e.timeStamp || 0) - downInfo.t;
+    var wasTap = downInfo.moved < 14 && dt < 500;
+    downInfo = null;
+    if (!wasTap) return;
+    cur = nextVariant(cur);       // a new self, sketched on stroke by stroke
+    curLen = cur.hairLen;
+    sketchStart = simT;
+    draw(simT);
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', function () { downInfo = null; });
+  }
+
+  // ---- animation: anchored at PHASE0 + elapsed, never clock-derived frame one -
+  var startStamp = null;
+  function frame(ts) {
+    if (startStamp === null) startStamp = ts;
+    simT = PHASE0 + (ts - startStamp) / 1000;
+    draw(simT);
+    requestAnimationFrame(frame);
+  }
+
+  if (window.visualViewport && window.visualViewport.addEventListener)
+    window.visualViewport.addEventListener('resize', resize);
+  window.addEventListener('resize', resize);
+
+  resize();
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
