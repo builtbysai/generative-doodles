@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Two Plateaux</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #F4F1EA;
+  }
+  canvas {
+    display: block;
+    margin: 0;
+    padding: 0;
+    touch-action: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="field"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  var canvas = document.getElementById('field');
+  var ctx = canvas.getContext('2d');
+
+  // Palette (strict and complete): Carrara white, black marble,
+  // pool water, coin glint, colonnade whisper. Nothing else.
+  var WHITE = '#F4F1EA';
+  var BLACK = '#1F1F1F';
+  var POOL = [58, 74, 82];      // #3A4A52
+  var COIN = [216, 196, 122];   // #D8C47A
+  var WHISPER = '#D9D4C8';
+
+  // The Buren module: one stripe PAIR (one white band + one black
+  // band) is frame height / 34, the 8.7cm ratio carried through
+  // every piece in this study. A single band is half of that.
+  var PAIR_DIV = 34;
+
+  // Tide: heights breathe on a 40 s wave traveling along the
+  // diagonal coordinate. Glints shimmer on a 7 s cycle.
+  var TIDE_PERIOD = 40;
+  var TIDE_AMP = 0.16;
+  var TIDE_K = 2.3;
+  var GLINT_PERIOD = 7;
+
+  // Parallax: three depth layers by base height. Tall columns are
+  // near, stumps are far. The rendered offset chases the recorded
+  // drag target with a first-order lag, integrated in closed form.
+  var TAU_OFF = 0.5;
+  var LAYER_F = [0.22, 0.55, 1.0]; // far, mid, near
+  var WINDOW = 30;
+
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var r = Math.imul(a ^ (a >>> 15), 1 | a);
+      r = (r + Math.imul(r ^ (r >>> 7), 61 | r)) ^ r;
+      return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // Stable per-column hash so the layout jitter is a pure function
+  // of the lattice index, identical at any frame size.
+  function hash2(i, j, salt) {
+    var n = (i * 374761393 + j * 668265263 + salt * 974634211) | 0;
+    n = Math.imul(n ^ (n >>> 13), 1274126177);
+    return ((n ^ (n >>> 16)) >>> 0) / 4294967296;
+  }
+
+  var viewW = 0;
+  var viewH = 0;
+  var isPhone = false;
+
+  function measure() {
+    var vv = window.visualViewport;
+    viewW = vv ? vv.width : window.innerWidth;
+    viewH = vv ? vv.height : window.innerHeight;
+    var sw = window.screen ? window.screen.width : viewW;
+    var sh = window.screen ? window.screen.height : viewH;
+    isPhone = Math.min(sw, sh) < 700 || viewH > viewW * 1.15;
+    var dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.round(viewW * dpr);
+    canvas.height = Math.round(viewH * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  // ---- Layout ----------------------------------------------------
+  // Columns stand on a diamond lattice: two diagonal step vectors
+  // crossing at the field's center. A column's base height comes
+  // from a diagonal distance field: the diagonal coordinate d is
+  // the projection of the base point onto the (1,1) diagonal,
+  // normalized to [-1, 1]. Height peaks on the center diagonal
+  // (d = 0) and falls away along it to stumps at both ends.
+  // Columns are culled so none crosses the left, right, or top
+  // frame edge even at maximum parallax shift; crossing the bottom
+  // edge is allowed and intended (the hidden lower level).
+  var columns = []; // {x, baseY, hBase, d, layer, topCap}
+  var pools = [];   // {x, y, rx, ry, layer, glints:[{dx,dy,r,phase}]}
+  var colW = 0;
+  var stripeH = 0;  // one band, whole pixels: round(h / (34 * 2))
+
+  function buildLayout() {
+    columns = [];
+    pools = [];
+    var w = viewW, h = viewH;
+    // The module realized in whole pixels: the pair is nominally
+    // frame height / 34, and rounding the single band to a whole
+    // pixel count is what lets every band rasterize at exactly the
+    // same pixel height (a fractional band height cannot).
+    stripeH = Math.max(1, Math.round(h / (PAIR_DIV * 2)));
+    var s = w / 8;                       // lattice step scale
+    var ux = 0.92 * s, uy = 0.52 * s;    // diagonal step one way
+    var vx = -0.92 * s, vy = 0.52 * s;   // diagonal step the other
+    colW = Math.abs(ux) * 0.52;
+    var ox = w * 0.5, oy = h * 0.86;     // lattice origin
+    var halfDiag = 0.5 * (w + h);
+    var marginX = 0.055 * w;             // parallax clamp + slack
+    var N = 11;
+    var cand = [];
+    for (var i = -N; i <= N; i++) {
+      for (var j = -N; j <= N; j++) {
+        var px = ox + i * ux + j * vx;
+        var py = oy + i * uy + j * vy;
+        // Snap the base onto the shared band grid at an EVEN band
+        // index (boundaries at h - 2 * m * stripeH), a shift of at
+        // most one band. Stripes are still counted from each
+        // column's own base, but with every base an even number of
+        // bands from the frame's foot, any two columns assign the
+        // same color to the same grid band: boundaries AND parity
+        // coincide, so where one column occludes another at the
+        // same x the bands continue across the join instead of
+        // merging into a double-thick band or splitting around a
+        // parity-flipped band.
+        py = h - 2 * stripeH * Math.round((h - py) / (2 * stripeH));
+        if (px - colW / 2 < marginX || px + colW / 2 > w - marginX) continue;
+        if (py < 0.30 * h || py > 1.30 * h) continue;
+        var d = ((px - w / 2) + (py - h / 2)) / halfDiag;
+        var m = Math.max(0, 1 - Math.abs(d));
+        var hNorm = 0.06 + 0.94 * Math.pow(m, 2.0);
+        hNorm *= 0.92 + 0.16 * hash2(i, j, 1);
+        var hBase = hNorm * 0.58 * h;
+        // Headroom: the top may approach but never touch the top
+        // edge, with a per-column margin so capped tops do not
+        // align into a false ceiling line.
+        var topCap = py - (0.05 + 0.05 * hash2(i, j, 2)) * h;
+        if (Math.min(hBase, topCap) < 0.03 * h) continue;
+        var layer = hNorm >= 0.62 ? 2 : (hNorm >= 0.32 ? 1 : 0);
+        cand.push({
+          x: px, baseY: py, hBase: hBase, d: d,
+          layer: layer, topCap: topCap, i: i, j: j
+        });
+      }
+    }
+    // Painter's order: far bases first, near bases last.
+    cand.sort(function (a, b) { return a.baseY - b.baseY; });
+    columns = cand;
+
+    // Pools: at the bases of the lowest short columns near the
+    // bottom of the frame, spread across the width, capped at 7.
+    var rnd = mulberry32(784001);
+    var qual = [];
+    for (var c = 0; c < cand.length; c++) {
+      var col = cand[c];
+      if (col.baseY > 0.82 * h && col.baseY < 1.05 * h && col.hBase < 0.34 * h) {
+        qual.push(col);
+      }
+    }
+    qual.sort(function (a, b) { return a.x - b.x; });
+    var picked = [];
+    if (qual.length <= 7) {
+      picked = qual;
+    } else {
+      for (var pk = 0; pk < 7; pk++) {
+        picked.push(qual[Math.floor((pk + 0.5) * qual.length / 7)]);
+      }
+    }
+    for (var p = 0; p < picked.length; p++) {
+      var pc = picked[p];
+      var rx = colW * 0.98;
+      var glints = [];
+      var ng = 2 + Math.floor(rnd() * 2); // 2-3 coins per pool
+      for (var g = 0; g < ng; g++) {
+        var side = rnd() < 0.5 ? -1 : 1;
+        var gx = side * (colW / 2 + 2 + rnd() * (rx - colW / 2 - 4));
+        var gy = (rnd() * 2 - 1) * rx * 0.18;
+        glints.push({
+          dx: gx, dy: gy,
+          r: Math.max(1.6, colW * 0.055),
+          phase: rnd() * Math.PI * 2
+        });
+      }
+      pools.push({
+        x: pc.x, y: pc.baseY, rx: rx, ry: rx * 0.34,
+        layer: pc.layer, glints: glints
+      });
+    }
+  }
+
+  // ---- Drag offset timeline --------------------------------------
+  // Same closed-form span machinery as the sibling pieces: the
+  // target offset is recorded as spans, and the rendered offset is
+  // the exact integral of dx/dt = (T - x)/tau over them. At rest
+  // the target is (0,0), so release returns the field to neutral.
+  var spans = [];
+  var tail = null;
+  var pending = null;
+  var dragging = false;
+  var grab = null; // pointer position at drag start
+
+  function resetTimeline() {
+    spans = [];
+    tail = { ta: 0, pa: { x: 0, y: 0 } };
+    pending = null;
+    dragging = false;
+    grab = null;
+  }
+  resetTimeline();
+
+  function clampTarget(dx, dy) {
+    return {
+      x: Math.max(-0.05 * viewW, Math.min(0.05 * viewW, dx)),
+      y: Math.max(-0.03 * viewH, Math.min(0.03 * viewH, dy))
+    };
+  }
+
+  function lagStep(x, a, b, d, tau) {
+    if (d <= 0) return x;
+    var c = x - a + b * tau;
+    return a + b * d - b * tau + c * Math.exp(-d / tau);
+  }
+
+  function offsetAt(t) {
+    var t0 = Math.max(0, t - WINDOW);
+    var list = spans;
+    var acc = null;
+    var i;
+    for (i = 0; i < list.length; i++) {
+      if (t0 < list[i].tb) { acc = list[i]; break; }
+    }
+    var first = acc || { ta: tail.ta, tb: Infinity, pa: tail.pa, pb: tail.pa };
+    function targetIn(sp, s) {
+      if (!isFinite(sp.tb) || sp.tb === sp.ta) return sp.pb;
+      var u = (s - sp.ta) / (sp.tb - sp.ta);
+      return {
+        x: sp.pa.x + (sp.pb.x - sp.pa.x) * u,
+        y: sp.pa.y + (sp.pb.y - sp.pa.y) * u
+      };
+    }
+    var pos = targetIn(first, t0);
+    var cur = t0;
+    var idx = acc ? list.indexOf(acc) : list.length;
+    var chain = [];
+    for (i = idx; i < list.length; i++) chain.push(list[i]);
+    chain.push({ ta: tail.ta, tb: Infinity, pa: tail.pa, pb: tail.pa });
+    for (i = 0; i < chain.length; i++) {
+      var s2 = chain[i];
+      var segStart = Math.max(cur, s2.ta);
+      var segEnd = Math.min(t, s2.tb);
+      if (segEnd <= segStart) { if (s2.tb <= t) continue; else break; }
+      var dur = s2.tb - s2.ta;
+      var bx = dur > 0 ? (s2.pb.x - s2.pa.x) / dur : 0;
+      var by = dur > 0 ? (s2.pb.y - s2.pa.y) / dur : 0;
+      var off = segStart - s2.ta;
+      var ax = s2.pa.x + bx * off;
+      var ay = s2.pa.y + by * off;
+      var dd = segEnd - segStart;
+      pos = {
+        x: lagStep(pos.x, ax, bx, dd, TAU_OFF),
+        y: lagStep(pos.y, ay, by, dd, TAU_OFF)
+      };
+      cur = segEnd;
+      if (cur >= t) break;
+    }
+    return pos;
+  }
+
+  // ---- Pointer -----------------------------------------------------
+  var hasPerf = (typeof performance !== 'undefined') && typeof performance.now === 'function';
+  var startMs = hasPerf ? performance.now() : null;
+  var lastT = 0;
+
+  function eventT(e) {
+    if (hasPerf) return (performance.now() - startMs) / 1000;
+    if (e && typeof e.timeStamp === 'number' && startMs !== null) {
+      return (e.timeStamp - startMs) / 1000;
+    }
+    return lastT;
+  }
+
+  function pointerPos(e) {
+    var x = 0, y = 0;
+    if (typeof canvas.getBoundingClientRect === 'function') {
+      var r = canvas.getBoundingClientRect();
+      x = e.clientX - r.left;
+      y = e.clientY - r.top;
+    } else {
+      x = e.clientX; y = e.clientY;
+    }
+    return { x: x, y: y };
+  }
+
+  function dragTarget(p) {
+    return clampTarget((p.x - grab.x) * 0.30, (p.y - grab.y) * 0.30);
+  }
+
+  function onDown(e) {
+    var t = eventT(e);
+    var p = pointerPos(e);
+    grab = p;
+    var tgt = clampTarget(0, 0);
+    spans.push({ ta: tail.ta, tb: t, pa: tail.pa, pb: tail.pa });
+    tail = { ta: t, pa: tgt };
+    pending = { t: t, p: tgt };
+    dragging = true;
+    if (e && e.preventDefault) e.preventDefault();
+  }
+
+  function onMove(e) {
+    if (!dragging) return;
+    var t = eventT(e);
+    var tgt = dragTarget(pointerPos(e));
+    var dt = t - pending.t;
+    var dx = tgt.x - pending.p.x;
+    var dy = tgt.y - pending.p.y;
+    if (dt < 0.03 && (dx * dx + dy * dy) < 9) return;
+    spans.push({ ta: pending.t, tb: t, pa: pending.p, pb: tgt });
+    pending = { t: t, p: tgt };
+    tail = { ta: t, pa: tgt };
+    if (e && e.preventDefault) e.preventDefault();
+  }
+
+  function onUp(e) {
+    if (!dragging) return;
+    var t = eventT(e);
+    spans.push({ ta: pending.t, tb: t, pa: pending.p, pb: pending.p });
+    pending = null;
+    dragging = false;
+    grab = null;
+    tail = { ta: t, pa: { x: 0, y: 0 } }; // release returns to neutral
+  }
+
+  if (typeof canvas.addEventListener === 'function') {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+  }
+
+  // ---- Drawing -----------------------------------------------------
+  function drawColumn(col, off, t, stripeH) {
+    var lf = LAYER_F[col.layer];
+    var cx = col.x + off.x * lf;
+    var baseY = col.baseY + off.y * lf;
+    var tide = 1 + TIDE_AMP * Math.sin(
+      (Math.PI * 2 * t) / TIDE_PERIOD - TIDE_K * col.d);
+    var hDraw = Math.min(col.hBase * tide, col.topCap);
+    if (hDraw <= 0) return;
+    var topY = baseY - hDraw;
+    var x0 = cx - colW / 2;
+    // Stripes are counted from each column's own base, the way the
+    // courtyard columns themselves are striped from the ground they
+    // stand on. Band k covers exactly the k-th stripe height above
+    // the base; even bands are white, odd bands black. One
+    // continuous function of the base: no segment joins, no phase
+    // resets, no folding. The top band is clipped by the column's
+    // top edge and never resized; every full band is exactly
+    // stripeH tall. Because every base sits on the shared band
+    // grid (see buildLayout), these boundaries coincide across
+    // columns, so an occluding column's bands continue the bands
+    // of the column behind it instead of merging or splitting.
+    var lastColor = null;
+    var kMax = Math.ceil(hDraw / stripeH);
+    for (var k = 0; k < kMax; k++) {
+      var yB = baseY - k * stripeH;
+      var yA = Math.max(topY, baseY - (k + 1) * stripeH);
+      if (yB <= yA) continue;
+      var color = (k % 2 === 0) ? WHITE : BLACK;
+      if (color !== lastColor) {
+        ctx.fillStyle = color;
+        lastColor = color;
+      }
+      ctx.fillRect(x0, yA, colW, yB - yA);
+    }
+  }
+
+  function draw(t) {
+    var w = viewW;
+    var h = viewH;
+    if (!w || !h) return;
+    canvas.style.width = w + 'px';
+    canvas.style.height = h + 'px';
+
+    ctx.fillStyle = WHITE;
+    ctx.fillRect(0, 0, w, h);
+
+    // Colonnade whisper: faint horizontal bands behind everything,
+    // the classical courtyard reduced to a 5 percent rumor.
+    ctx.fillStyle = WHISPER;
+    ctx.globalAlpha = 0.30;
+    var bandYs = [0.06, 0.135, 0.21];
+    for (var b = 0; b < bandYs.length; b++) {
+      ctx.fillRect(0, bandYs[b] * h, w, 0.022 * h);
+    }
+    ctx.globalAlpha = 1;
+
+    var off = offsetAt(t);
+    // stripeH is the whole-pixel band height set by buildLayout.
+
+    // Pools first, so columns stand in the water.
+    for (var p = 0; p < pools.length; p++) {
+      var pool = pools[p];
+      var plf = LAYER_F[pool.layer];
+      var px = pool.x + off.x * plf;
+      var py = pool.y + off.y * plf;
+      ctx.fillStyle = 'rgba(' + POOL[0] + ',' + POOL[1] + ',' + POOL[2] + ',0.45)';
+      ctx.beginPath();
+      ctx.ellipse(px, py, pool.rx * 1.18, pool.ry * 1.35, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = 'rgba(' + POOL[0] + ',' + POOL[1] + ',' + POOL[2] + ',0.92)';
+      ctx.beginPath();
+      ctx.ellipse(px, py, pool.rx, pool.ry, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    for (var c = 0; c < columns.length; c++) {
+      drawColumn(columns[c], off, t, stripeH);
+    }
+
+    // Coin glints on the water, shimmering on a 7 s cycle, capped
+    // at 70 percent alpha.
+    for (var q = 0; q < pools.length; q++) {
+      var qp = pools[q];
+      var qlf = LAYER_F[qp.layer];
+      var qx = qp.x + off.x * qlf;
+      var qy = qp.y + off.y * qlf;
+      for (var g = 0; g < qp.glints.length; g++) {
+        var gl = qp.glints[g];
+        var tw = 0.5 + 0.5 * Math.sin(
+          (Math.PI * 2 * t) / GLINT_PERIOD + gl.phase);
+        var alpha = 0.7 * (0.30 + 0.70 * tw);
+        ctx.fillStyle = 'rgba(' + COIN[0] + ',' + COIN[1] + ',' + COIN[2] + ',' + alpha.toFixed(3) + ')';
+        ctx.beginPath();
+        ctx.ellipse(qx + gl.dx, qy + gl.dy, gl.r, gl.r * 0.62, 0, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+  }
+
+  function resize() {
+    measure();
+    buildLayout();
+    resetTimeline();
+    draw(lastT);
+  }
+
+  measure();
+  buildLayout();
+  resetTimeline();
+  draw(0);
+
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', resize);
+  }
+  window.addEventListener('resize', resize);
+
+  if (typeof window.requestAnimationFrame === 'function') {
+    var frame = function (ts) {
+      if (startMs === null) startMs = ts;
+      lastT = (ts - startMs) / 1000;
+      if (lastT < 0) lastT = 0;
+      draw(lastT);
+      window.requestAnimationFrame(frame);
+    };
+    window.requestAnimationFrame(frame);
+  }
+})();
+</script>
+</body>
+</html>
