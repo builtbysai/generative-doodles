@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>silly dither</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #000000; height: 100%; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+
+// ---------- seeded RNG (mulberry32) ----------
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const rng = mulberry32(908069);
+
+// ---------- seeded 3D value noise + fbm ----------
+// Integer lattice hash -> [0,1). Deterministic, no tables from Math.random.
+function hash3(ix, iy, iz) {
+  let h = (ix * 374761393 + iy * 668265263 + iz * 974634211) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+function smooth(t) { return t * t * (3 - 2 * t); }
+function vnoise(x, y, z) {
+  const ix = Math.floor(x), iy = Math.floor(y), iz = Math.floor(z);
+  const fx = x - ix, fy = y - iy, fz = z - iz;
+  const sx = smooth(fx), sy = smooth(fy), sz = smooth(fz);
+  const c000 = hash3(ix, iy, iz),     c100 = hash3(ix + 1, iy, iz);
+  const c010 = hash3(ix, iy + 1, iz), c110 = hash3(ix + 1, iy + 1, iz);
+  const c001 = hash3(ix, iy, iz + 1),     c101 = hash3(ix + 1, iy, iz + 1);
+  const c011 = hash3(ix, iy + 1, iz + 1), c111 = hash3(ix + 1, iy + 1, iz + 1);
+  const x00 = c000 + (c100 - c000) * sx, x10 = c010 + (c110 - c010) * sx;
+  const x01 = c001 + (c101 - c001) * sx, x11 = c011 + (c111 - c011) * sx;
+  const y0 = x00 + (x10 - x00) * sy, y1 = x01 + (x11 - x01) * sy;
+  return y0 + (y1 - y0) * sz;
+}
+function fbm(x, y, z) {
+  let v = 0, amp = 0.5, f = 1, norm = 0;
+  for (let o = 0; o < 4; o++) {
+    v += amp * vnoise(x * f, y * f, z * f);
+    norm += amp; amp *= 0.5; f *= 2.03;
+  }
+  return v / norm; // ~[0,1]
+}
+
+// ---------- ordered dither matrices (values 0..63) ----------
+const BAYER = [
+   0,32, 8,40, 2,34,10,42,
+  48,16,56,24,50,18,58,26,
+  12,44, 4,36,14,46, 6,38,
+  60,28,52,20,62,30,54,22,
+   3,35,11,43, 1,33, 9,41,
+  51,19,59,27,49,17,57,25,
+  15,47, 7,39,13,45, 5,37,
+  63,31,55,23,61,29,53,21
+];
+const CLUSTER = [
+  48,36,24,16,24,36,48,56,
+  36,24,12, 8,12,24,36,52,
+  24,12, 4, 0, 4,12,24,44,
+  16, 8, 0, 0, 0, 8,16,40,
+  24,12, 4, 0, 4,12,24,44,
+  36,24,12, 8,12,24,36,52,
+  48,36,24,16,24,36,48,56,
+  56,52,44,40,44,52,56,60
+];
+
+// ---------- canvas / viewport ----------
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let W = 0, H = 0, CELL = 6, COLS = 0, ROWS = 0;
+
+function isPhone() {
+  let ph = false;
+  try {
+    const sw = window.screen ? window.screen.width : 0;
+    const sh = window.screen ? window.screen.height : 0;
+    if (sw && sh && Math.min(sw, sh) < 700) ph = true;
+  } catch (e) {}
+  if (!ph && W > 0 && H > W * 1.15) ph = true;
+  return ph;
+}
+function resize() {
+  const vv = window.visualViewport;
+  W = vv && vv.width ? vv.width : window.innerWidth;
+  H = vv && vv.height ? vv.height : window.innerHeight;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.width = Math.round(W * dpr);
+  canvas.height = Math.round(H * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  CELL = isPhone() ? 7 : 6;
+  COLS = Math.max(1, Math.ceil(W / CELL));
+  ROWS = Math.max(1, Math.ceil(H / CELL));
+}
+if (window.visualViewport && window.visualViewport.addEventListener) {
+  window.visualViewport.addEventListener('resize', () => { resize(); draw(state.t); });
+}
+window.addEventListener('resize', () => { resize(); draw(state.t); });
+
+// ---------- interaction state (recorded events only) ----------
+const state = {
+  t: 0,
+  taps: [],        // times of completed taps
+  dragPts: [],     // {x, y, t} sampled while dragging
+  dragging: false,
+  lastDragT: -10,
+  downX: 0, downY: 0, downT: 0, downMoved: false
+};
+
+// Derive, from the tap list: how many pattern flips, and the active dissolve start.
+// A second tap within 0.35 s of the previous one consumes both taps as a double-tap.
+function deriveEvents(t) {
+  let flips = 0, dissolveT = -10;
+  const ts = state.taps;
+  let i = 0;
+  while (i < ts.length) {
+    if (i + 1 < ts.length && ts[i + 1] - ts[i] < 0.35) {
+      if (ts[i + 1] <= t) dissolveT = ts[i + 1];
+      i += 2;
+    } else {
+      if (ts[i] <= t) flips++;
+      i += 1;
+    }
+  }
+  return { flips: flips, dissolveT: dissolveT };
+}
+
+// ---------- audio (lazy, gesture-gated, guarded) ----------
+let AC = null, hissGain = null, audioOn = false, lastAudioPush = 0;
+let litFraction = 0, dissolveAmt = 0;
+function initAudio() {
+  if (audioOn) return;
+  audioOn = true;
+  try {
+    const Ctor = (typeof AudioContext !== 'undefined') ? AudioContext :
+                 (typeof webkitAudioContext !== 'undefined') ? webkitAudioContext : null;
+    if (!Ctor) return;
+    AC = new Ctor();
+    const len = 2 * AC.sampleRate;
+    const buf = AC.createBuffer(1, len, AC.sampleRate);
+    const d = buf.getChannelData(0);
+    const r = mulberry32(4242);
+    for (let i = 0; i < len; i++) d[i] = r() * 2 - 1;
+    const src = AC.createBufferSource();
+    src.buffer = buf; src.loop = true;
+    const bp = AC.createBiquadFilter();
+    bp.type = 'bandpass'; bp.frequency.value = 6200; bp.Q.value = 0.55;
+    hissGain = AC.createGain();
+    hissGain.gain.value = 0.0;
+    src.connect(bp); bp.connect(hissGain); hissGain.connect(AC.destination);
+    src.start();
+  } catch (e) { AC = null; hissGain = null; }
+}
+function pushAudio(t) {
+  if (!AC || !hissGain) return;
+  if (t - lastAudioPush < 0.1) return;
+  lastAudioPush = t;
+  try {
+    let g = 0.012 + litFraction * 0.055;
+    if (state.dragging || t - state.lastDragT < 0.4) g += 0.045;
+    g += dissolveAmt * 0.09;
+    hissGain.gain.setTargetAtTime(g, AC.currentTime, 0.12);
+  } catch (e) {}
+}
+
+// ---------- pointer handling ----------
+function evtPos(e) {
+  if (e.touches && e.touches.length) return { x: e.touches[0].clientX, y: e.touches[0].clientY };
+  if (e.changedTouches && e.changedTouches.length) return { x: e.changedTouches[0].clientX, y: e.changedTouches[0].clientY };
+  return { x: e.clientX, y: e.clientY };
+}
+function onDown(e) {
+  initAudio();
+  if (AC && AC.resume) { try { AC.resume(); } catch (err) {} }
+  const p = evtPos(e);
+  state.dragging = true;
+  state.downMoved = false;
+  state.downX = p.x; state.downY = p.y; state.downT = state.t;
+  state.dragPts.push({ x: p.x, y: p.y, t: state.t });
+}
+function onMove(e) {
+  if (!state.dragging) return;
+  const p = evtPos(e);
+  const dx = p.x - state.downX, dy = p.y - state.downY;
+  if (dx * dx + dy * dy > 36) state.downMoved = true;
+  const last = state.dragPts[state.dragPts.length - 1];
+  if (!last || Math.abs(p.x - last.x) + Math.abs(p.y - last.y) > 3) {
+    state.dragPts.push({ x: p.x, y: p.y, t: state.t });
+    if (state.dragPts.length > 600) state.dragPts.splice(0, state.dragPts.length - 600);
+  }
+  state.lastDragT = state.t;
+}
+function onUp(e) {
+  if (!state.dragging) return;
+  state.dragging = false;
+  const dur = state.t - state.downT;
+  if (!state.downMoved && dur < 0.35) {
+    state.taps.push(state.t);
+    if (state.taps.length > 64) state.taps.splice(0, state.taps.length - 64);
+  }
+}
+canvas.addEventListener('pointerdown', onDown);
+canvas.addEventListener('pointermove', onMove);
+canvas.addEventListener('pointerup', onUp);
+canvas.addEventListener('pointercancel', onUp);
+canvas.addEventListener('touchstart', onDown, { passive: true });
+canvas.addEventListener('touchmove', onMove, { passive: true });
+canvas.addEventListener('touchend', onUp);
+canvas.addEventListener('mousedown', onDown);
+canvas.addEventListener('mousemove', onMove);
+canvas.addEventListener('mouseup', onUp);
+
+// ---------- the draw ----------
+// Density: billowing volume. fbm over (u, v, t) shaped by a soft radial envelope.
+// u, v are centered coordinates in units of the frame's smaller dimension.
+function densityAt(u, v, t) {
+  // domain drift: the volume breathes through the noise's third axis and slides slowly
+  const z = t * 0.055;
+  const wx = u * 3.0 + 0.35 * Math.sin(t * 0.11) + fbm(u * 1.5 + 7.3, v * 1.5 + 2.1, z * 0.6) * 1.3;
+  const wy = v * 3.0 + 0.35 * Math.cos(t * 0.09) + fbm(u * 1.5 + 1.7, v * 1.5 + 8.4, z * 0.6 + 3.7) * 1.3;
+  let d = (fbm(wx, wy, z) - 0.33) * 2.3;
+  if (d < 0) d = 0; else if (d > 1.25) d = 1.25;
+  // envelope: full strength at the heart, dissolving to nothing at the margins
+  const r = Math.sqrt(u * u + v * v);
+  let env = 1 - (r - 0.10) / 0.40;
+  if (env < 0) env = 0; else if (env > 1) env = 1;
+  env = Math.pow(env, 1.4);
+  return d * env;
+}
+
+function draw(t) {
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  ctx.fillStyle = '#000000';
+  ctx.fillRect(0, 0, W, H);
+
+  const ev = deriveEvents(t);
+  const mat = (ev.flips % 2 === 0) ? BAYER : CLUSTER;
+
+  // dissolve envelope: 4 s, offset grows then relaxes
+  let scat = 0;
+  const de = (t - ev.dissolveT) / 4;
+  if (de >= 0 && de <= 1) scat = Math.sin(de * Math.PI);
+  dissolveAmt = scat;
+  const scatPx = scat * Math.min(W, H) * 0.16;
+
+  // drag threshold mask: splat decaying gaussian bumps into a per-cell offset grid
+  let offs = null;
+  const pts = state.dragPts;
+  // prune ancient points
+  while (pts.length && t - pts[0].t > 26) pts.shift();
+  if (pts.length) {
+    offs = new Float32Array(COLS * ROWS);
+    const sigma = 70, rad = Math.ceil(3 * sigma / CELL);
+    const recent = pts.slice(-140);
+    for (let i = 0; i < recent.length; i++) {
+      const p = recent[i];
+      const decay = Math.exp(-(t - p.t) / 6);
+      if (decay < 0.01) continue;
+      const amp = 0.38 * decay;
+      const cx = Math.floor(p.x / CELL), cy = Math.floor(p.y / CELL);
+      for (let gy = cy - rad; gy <= cy + rad; gy++) {
+        if (gy < 0 || gy >= ROWS) continue;
+        for (let gx = cx - rad; gx <= cx + rad; gx++) {
+          if (gx < 0 || gx >= COLS) continue;
+          const ddx = (gx + 0.5) * CELL - p.x, ddy = (gy + 0.5) * CELL - p.y;
+          const g = Math.exp(-(ddx * ddx + ddy * ddy) / (2 * sigma * sigma));
+          if (g > 0.02) offs[gy * COLS + gx] += amp * g;
+        }
+      }
+    }
+  }
+
+  const ccx = W / 2, ccy = H / 2;
+  const minWH = Math.min(W, H);
+  let lit = 0;
+  ctx.fillStyle = '#FFFFFF';
+  for (let gy = 0; gy < ROWS; gy++) {
+    for (let gx = 0; gx < COLS; gx++) {
+      let px = (gx + 0.5) * CELL, py = (gy + 0.5) * CELL;
+      const hu = (px - ccx) / minWH, hv = (py - ccy) / minWH;
+      if (scatPx > 0) {
+        let dx = px - ccx, dy = py - ccy;
+        const len = Math.sqrt(dx * dx + dy * dy) || 1;
+        dx /= len; dy /= len;
+        const j = hash3(gx * 3 + 11, gy * 5 + 7, 99) - 0.5;
+        px += dx * scatPx * (0.7 + 0.6 * j) + j * scatPx * 0.5;
+        py += dy * scatPx * (0.7 + 0.6 * j) - j * scatPx * 0.4;
+      }
+      const d = densityAt(hu, hv, t);
+      let thr = (mat[(gy & 7) * 8 + (gx & 7)] + 0.5) / 64;
+      if (offs) thr -= offs[gy * COLS + gx];
+      if (d > thr) {
+        ctx.fillRect(px - CELL / 2, py - CELL / 2, CELL - 1, CELL - 1);
+        lit++;
+      }
+    }
+  }
+  litFraction = lit / (COLS * ROWS);
+}
+
+// ---------- boot: frame one is the synchronous draw at t = 0 ----------
+resize();
+draw(0);
+
+if (typeof requestAnimationFrame !== 'undefined') {
+  let start = null;
+  const loop = function (ts) {
+    if (start === null) start = ts;
+    state.t = (ts - start) / 1000;
+    draw(state.t);
+    pushAudio(state.t);
+    requestAnimationFrame(loop);
+  };
+  requestAnimationFrame(loop);
+}
+</script>
+</body>
+</html>

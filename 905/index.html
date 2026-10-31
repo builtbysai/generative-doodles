@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>flow fields</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #1A2230; overflow: hidden; height: 100%; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded RNG (mulberry32) ----------
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a = (a + 0x6D2B79F5) >>> 0;
+      var t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(90566);
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ---------- palette (strict) ----------
+  var GROUND = '#1A2230';
+  var COL_FADE = '#3E4A5C';
+  var COL_MID = '#9AA5B1';
+  var COL_BRIGHT = '#DCE3EC';
+  var COL_CORE = '#FFFFFF';
+  var BUCKET_STYLES = [COL_FADE, COL_MID, COL_BRIGHT, COL_CORE];
+
+  // ---------- sizing (Visual Viewport API) ----------
+  var W = 720, H = 720, S = 720;
+  var isPhone = false;
+
+  function detectPhone(w, h) {
+    var scr = (typeof window !== 'undefined') ? window.screen : null;
+    if (scr && typeof scr.width === 'number' && typeof scr.height === 'number' &&
+        (scr.width > 0 || scr.height > 0)) {
+      return Math.min(scr.width, scr.height) < 700;
+    }
+    // fallback only: aspect test
+    return h > w * 1.15;
+  }
+
+  function resize() {
+    var vv = (typeof window !== 'undefined') ? window.visualViewport : null;
+    var w, h;
+    if (vv && typeof vv.width === 'number') { w = vv.width; h = vv.height; }
+    else if (typeof window !== 'undefined' && typeof window.innerWidth === 'number') {
+      w = window.innerWidth; h = window.innerHeight;
+    } else { w = W; h = H; }
+    W = Math.max(50, Math.round(w));
+    H = Math.max(50, Math.round(h));
+    S = Math.min(W, H);
+    canvas.width = W;
+    canvas.height = H;
+    isPhone = detectPhone(W, H);
+    buildSim();
+  }
+
+  // ---------- curl field: summed-sine stream function ----------
+  // psi(x,y,t) = sum_i a_i * sin(fx_i * X + px_i + w_i * t) * cos(fy_i * Y + py_i)
+  // velocity = ( dpsi/dY , -dpsi/dX ) in field units (coords scaled by S)
+  var comps = [];
+  (function initField() {
+    for (var i = 0; i < 5; i++) {
+      comps.push({
+        a: 0.5 + rng() * 0.9,
+        fx: 1.5 + rng() * 3.5,
+        fy: 1.5 + rng() * 3.5,
+        px: rng() * Math.PI * 2,
+        py: rng() * Math.PI * 2,
+        w: (rng() - 0.5) * 0.05
+      });
+    }
+  })();
+
+  var CURL_SPEED = 0.055;   // field units per second, scaled by S
+  var VORTEX_SPEED = 0.30;  // peak tangential speed near core, scaled by S
+
+  function fieldVel(x, y, t, out) {
+    var X = x / S, Y = y / S;
+    var dpsiY = 0, dpsiX = 0;
+    for (var i = 0; i < comps.length; i++) {
+      var c = comps[i];
+      var sx = Math.sin(c.fx * X + c.px + c.w * t);
+      var cx = Math.cos(c.fx * X + c.px + c.w * t);
+      var sy = Math.sin(c.fy * Y + c.py);
+      var cy = Math.cos(c.fy * Y + c.py);
+      dpsiY += c.a * sx * (-sy) * c.fy;
+      dpsiX += c.a * cx * c.fx * cy;
+    }
+    out.x = dpsiY * CURL_SPEED * S;
+    out.y = -dpsiX * CURL_SPEED * S;
+  }
+
+  // vortex contribution (tangential swirl + gentle inward pull)
+  function vortexVel(x, y, cx, cy, strength, out) {
+    var dx = x - cx, dy = y - cy;
+    var r = Math.sqrt(dx * dx + dy * dy);
+    if (r < 0.5) r = 0.5;
+    var fall = Math.exp(-r / (0.50 * S));
+    var tang = VORTEX_SPEED * S * fall * strength;
+    var inward = tang * 0.22;
+    var ux = dx / r, uy = dy / r;
+    out.x += (-uy) * tang - ux * inward;
+    out.y += (ux) * tang - uy * inward;
+  }
+
+  // ---------- events (functions of sim clock) ----------
+  var simTime = 0;
+  var surgeStart = -100;         // tap: speed x3 for 4 s
+  var drainStart = -100;         // double-tap: alpha to 10%, rebuild over ~4 s
+  var dragVortex = { active: false, x: 0, y: 0, releaseT: -100, held: false };
+
+  function surgeMult(t) {
+    var e = t - surgeStart;
+    if (e < 0 || e > 4) return 1;
+    if (e < 3) return 3;
+    return 3 - 2 * (e - 3); // linear settle in the last second
+  }
+  function drainAlpha(t) {
+    var e = t - drainStart;
+    if (e < 0) return 1;
+    if (e < 0.4) return 1 - 0.9 * (e / 0.4);
+    if (e > 4.4) return 1;
+    return 0.1 + 0.9 * ((e - 0.4) / 4.0);
+  }
+  function dragStrength(t) {
+    if (dragVortex.held) return 1;
+    if (!dragVortex.active) return 0;
+    var e = t - dragVortex.releaseT;
+    if (e < 0) return 1;
+    var s = Math.exp(-e / 2.7); // ~0.05 at 8 s
+    return s > 0.02 ? s : 0;
+  }
+
+  // ---------- particles ----------
+  var TRAIL = 8;
+  var particles = [];
+  var COUNT = 2400;
+  var meanSpeed = 0; // normalized (fraction of S per second), for audio
+
+  function spawn(p, anywhere) {
+    p.x = rng() * W;
+    p.y = rng() * H;
+    p.age = anywhere ? rng() * 4 : 0;
+    p.maxAge = 5 + rng() * 6;
+    p.trail.length = 0;
+    for (var i = 0; i < TRAIL; i++) p.trail.push({ x: p.x, y: p.y });
+  }
+
+  function buildSim() {
+    COUNT = isPhone ? 1400 : 2400;
+    particles = [];
+    var i;
+    for (i = 0; i < COUNT; i++) {
+      var p = { x: 0, y: 0, age: 0, maxAge: 5, trail: [] };
+      spawn(p, true);
+      particles.push(p);
+    }
+    // FIXED PRE-ROLL: 110 steps at 1/60 s so frame one already shows
+    // formed streaks flowing into the vortex.
+    simTime = 0;
+    for (i = 0; i < 110; i++) stepSim(1 / 60);
+  }
+
+  var velTmp = { x: 0, y: 0 };
+
+  function stepSim(dt) {
+    simTime += dt;
+    var mult = surgeMult(simTime);
+    var vx = W / 3, vy = H / 3;
+    var ds = dragStrength(simTime);
+    var speedSum = 0;
+    for (var i = 0; i < particles.length; i++) {
+      var p = particles[i];
+      fieldVel(p.x, p.y, simTime, velTmp);
+      vortexVel(p.x, p.y, vx, vy, 1, velTmp);
+      if (ds > 0) vortexVel(p.x, p.y, dragVortex.x, dragVortex.y, ds * 0.9, velTmp);
+      var sp = Math.sqrt(velTmp.x * velTmp.x + velTmp.y * velTmp.y);
+      speedSum += sp;
+      p.x += velTmp.x * mult * dt;
+      p.y += velTmp.y * mult * dt;
+      p.age += dt * mult;
+      // shift trail (record newest at end)
+      var tr = p.trail;
+      for (var j = 0; j < TRAIL - 1; j++) { tr[j].x = tr[j + 1].x; tr[j].y = tr[j + 1].y; }
+      tr[TRAIL - 1].x = p.x; tr[TRAIL - 1].y = p.y;
+      if (p.age > p.maxAge || p.x < -20 || p.x > W + 20 || p.y < -20 || p.y > H + 20) {
+        spawn(p, false);
+      }
+    }
+    meanSpeed = (speedSum / particles.length) / S;
+  }
+
+  // ---------- draw ----------
+  function bucketFor(x, y, speedNorm) {
+    var dx = x - W / 3, dy = y - H / 3;
+    var d = Math.sqrt(dx * dx + dy * dy) / S; // distance to vortex, in S units
+    var b = 0.58 - d * 0.80 + speedNorm * 1.3;
+    if (b > 0.78) return 3;
+    if (b > 0.52) return 2;
+    if (b > 0.30) return 1;
+    return 0;
+  }
+
+  function draw() {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.fillStyle = GROUND;
+    ctx.fillRect(0, 0, W, H);
+    var alpha = drainAlpha(simTime);
+    ctx.lineWidth = Math.max(1, S / 640);
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    // bucket subpaths so each color is one stroke; trails drawn fresh from state
+    var paths = [[], [], [], []];
+    var i, j;
+    for (i = 0; i < particles.length; i++) {
+      var p = particles[i];
+      var tr = p.trail;
+      var dx = tr[TRAIL - 1].x - tr[0].x, dy = tr[TRAIL - 1].y - tr[0].y;
+      var speedNorm = Math.sqrt(dx * dx + dy * dy) / (TRAIL / 60) / S;
+      var bucket = bucketFor(p.x, p.y, Math.min(1, speedNorm));
+      paths[bucket].push(tr);
+    }
+    for (var b = 0; b < 4; b++) {
+      var list = paths[b];
+      if (!list.length) continue;
+      ctx.strokeStyle = BUCKET_STYLES[b];
+      ctx.globalAlpha = alpha * (b === 0 ? 0.55 : b === 1 ? 0.75 : b === 2 ? 0.9 : 1.0);
+      ctx.beginPath();
+      for (i = 0; i < list.length; i++) {
+        var t = list[i];
+        ctx.moveTo(t[0].x, t[0].y);
+        for (j = 1; j < TRAIL; j++) ctx.lineTo(t[j].x, t[j].y);
+      }
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- audio (lazy, gesture-only, guarded) ----------
+  var AC = (typeof window !== 'undefined') ? (window.AudioContext || window.webkitAudioContext) : null;
+  var audio = null;
+  function initAudio() {
+    if (audio || typeof AC !== 'function') return;
+    try {
+      var ac = new AC();
+      var len = 2 * ac.sampleRate;
+      var buf = ac.createBuffer(1, len, ac.sampleRate);
+      var data = buf.getChannelData(0);
+      var r = mulberry32(40505);
+      var last = 0;
+      for (var i = 0; i < len; i++) { // pinkish noise
+        var white = r() * 2 - 1;
+        last = last * 0.94 + white * 0.06;
+        data[i] = last * 3.2;
+      }
+      var src = ac.createBufferSource();
+      src.buffer = buf; src.loop = true;
+      var lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 420; lp.Q.value = 0.4;
+      var g = ac.createGain(); g.gain.value = 0.05;
+      src.connect(lp); lp.connect(g); g.connect(ac.destination);
+      // drag swirl band
+      var src2 = ac.createBufferSource(); src2.buffer = buf; src2.loop = true; src2.playbackRate.value = 0.7;
+      var bp = ac.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 300; bp.Q.value = 6;
+      var g2 = ac.createGain(); g2.gain.value = 0.0;
+      src2.connect(bp); bp.connect(g2); g2.connect(ac.destination);
+      src.start(); src2.start();
+      audio = { ac: ac, lp: lp, bp: bp, g2: g2 };
+    } catch (e) { audio = null; }
+  }
+  function updateAudio() {
+    if (!audio) return;
+    try {
+      var cutoff = 240 + Math.min(1.6, meanSpeed * 6) * 1500;
+      if (surgeMult(simTime) > 1.1) cutoff *= 1.5;
+      audio.lp.frequency.setTargetAtTime(cutoff, audio.ac.currentTime, 0.15);
+      var ds = dragStrength(simTime);
+      audio.g2.gain.setTargetAtTime(ds * 0.06, audio.ac.currentTime, 0.1);
+      if (ds > 0) audio.bp.frequency.setTargetAtTime(220 + ds * 500, audio.ac.currentTime, 0.1);
+    } catch (e) { /* audio is decorative; visuals never depend on it */ }
+  }
+
+  // ---------- pointer interaction ----------
+  var downInfo = null;
+  var lastTapT = -100, lastTapX = 0, lastTapY = 0;
+
+  function pos(e) {
+    var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    var cx = (typeof e.clientX === 'number') ? e.clientX : (e.touches && e.touches[0] ? e.touches[0].clientX : 0);
+    var cy = (typeof e.clientY === 'number') ? e.clientY : (e.touches && e.touches[0] ? e.touches[0].clientY : 0);
+    return { x: cx - r.left, y: cy - r.top };
+  }
+
+  canvas.addEventListener('pointerdown', function (e) {
+    initAudio();
+    if (audio && audio.ac.state === 'suspended') { try { audio.ac.resume(); } catch (err) {} }
+    var p = pos(e);
+    downInfo = { x: p.x, y: p.y, t: simTime, moved: false };
+    dragVortex.x = p.x; dragVortex.y = p.y; dragVortex.held = true; dragVortex.active = true;
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (!downInfo) return;
+    var p = pos(e);
+    if (Math.abs(p.x - downInfo.x) + Math.abs(p.y - downInfo.y) > 8) downInfo.moved = true;
+    dragVortex.x = p.x; dragVortex.y = p.y;
+  });
+  function endPointer(e) {
+    if (!downInfo) return;
+    var p = pos(e);
+    dragVortex.held = false;
+    dragVortex.releaseT = simTime;
+    var quick = (simTime - downInfo.t) < 0.35;
+    if (quick && !downInfo.moved) {
+      var dtap = (simTime - lastTapT) < 0.35 &&
+        Math.abs(p.x - lastTapX) + Math.abs(p.y - lastTapY) < 40;
+      if (dtap) { drainStart = simTime; lastTapT = -100; }
+      else { surgeStart = simTime; lastTapT = simTime; lastTapX = p.x; lastTapY = p.y; }
+    }
+    downInfo = null;
+  }
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', endPointer);
+
+  // ---------- boot ----------
+  resize();
+  if (typeof window !== 'undefined') {
+    window.addEventListener('resize', resize);
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', resize);
+    }
+  }
+  draw(); // frame one: synchronous, after the fixed pre-roll
+
+  // ---------- loop (fixed timestep; frame one never depends on the clock) ----------
+  var STEP = 1 / 60, acc = 0, lastTs = -1;
+  function frame(ts) {
+    if (lastTs < 0) lastTs = ts;
+    var elapsed = (ts - lastTs) / 1000;
+    lastTs = ts;
+    if (elapsed > 0.25) elapsed = 0.25;
+    acc += elapsed;
+    while (acc >= STEP) { stepSim(STEP); acc -= STEP; }
+    draw();
+    updateAudio();
+    requestAnimationFrame(frame);
+  }
+  if (typeof requestAnimationFrame === 'function') {
+    requestAnimationFrame(frame);
+  }
+})();
+</script>
+</body>
+</html>
