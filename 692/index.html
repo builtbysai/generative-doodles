@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Precario</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #EFE8D8; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // Palette (strict, flat, matte, sun-bleached): sand, paper,
+  // feather gray, twig brown, shell pink, thread red, sky-wash.
+  // Nothing else; shading is done with alpha of these seven.
+  var SAND = '#D9C9A8';
+  var PAPER = '#F2EDE3';
+  var GRAY = '#8A8A86';
+  var TWIG = '#5C3A21';
+  var SHELL = '#D9A08E';
+  var THREAD = '#A83232';
+  var SKY = '#EFE8D8';
+
+  var BASE_SEED = 692001;
+  var CYCLE_S = 100;        // one precario lifespan, seconds
+  var FORCE_T = -1;         // QA hook: -1 = live clock, else fixed elapsed seconds
+
+  // QA seed hook: ?seed=tNN pins the elapsed time (used by the headless
+  // renderer to inspect later stages of the lifespan).
+  try {
+    if (typeof location !== 'undefined' && location.search) {
+      var qm = /[?&]seed=t([0-9]+(?:\.[0-9]+)?)/.exec(location.search);
+      if (qm) FORCE_T = parseFloat(qm[1]);
+    }
+  } catch (e) { /* live mode */ }
+
+  // Seeded RNG (mulberry32). Every arrangement, arrival and trace
+  // comes from this stream; no Math.random anywhere.
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function cycleSeed(k) {
+    var h = (BASE_SEED ^ Math.imul(k + 1, 0x9E3779B9)) >>> 0;
+    h = Math.imul(h ^ (h >>> 13), 0x85EBCA6B) >>> 0;
+    return (h ^ (h >>> 16)) >>> 0;
+  }
+
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+  function lerp(a, b, u) { return a + (b - a) * u; }
+  function smooth(u) { u = clamp(u, 0, 1); return u * u * (3 - 2 * u); }
+  function easeOut(u) { u = clamp(u, 0, 1); return 1 - Math.pow(1 - u, 3); }
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ------------------------------------------------------------------
+  // The debris library. Core five are always present (thread, paper,
+  // feather, twig, shell); extras (pebble, cap, leaf) join per cycle
+  // so each precario holds 5-8 pieces. Slots are fractions of the
+  // cluster width, dyF negative = above the base line. sizeF is the
+  // glyph's characteristic length as a fraction of cluster width.
+  // DEPART gives each kind's dismantling window inside the cycle:
+  // the fixed order of vulnerability. The thread goes first, the
+  // twig is dragged last and stays longest.
+  // ------------------------------------------------------------------
+  var KIND = {
+    twig:   { dxF:  0.00, dyF:  0.00, rot:  0.06, sizeF: 0.58 },
+    shell:  { dxF: -0.33, dyF:  0.00, rot:  0.00, sizeF: 0.30 },
+    pebble: { dxF:  0.36, dyF:  0.00, rot:  0.00, sizeF: 0.17 },
+    cap:    { dxF:  0.20, dyF:  0.00, rot:  0.00, sizeF: 0.15 },
+    paper:  { dxF: -0.06, dyF: -0.13, rot: -0.22, sizeF: 0.44 },
+    leaf:   { dxF:  0.10, dyF: -0.24, rot:  0.35, sizeF: 0.30 },
+    feather:{ dxF: -0.20, dyF: -0.22, rot: -0.85, sizeF: 0.52 },
+    thread: { dxF:  0.00, dyF: -0.34, rot:  0.00, sizeF: 0.95 }
+  };
+  var DEPART = {
+    thread: [50, 58], paper: [55, 67], twig: [58, 90],
+    feather: [63, 75], leaf: [69, 79], cap: [73, 82],
+    pebble: [76, 87], shell: [79, 88]
+  };
+  var DRAW_ORDER = ['twig', 'shell', 'pebble', 'cap', 'paper', 'leaf', 'feather', 'thread'];
+  // Heavy pieces arrive along the ground from an edge; light ones
+  // may also descend from the low sky.
+  var LIGHT = { thread: 1, paper: 1, feather: 1, leaf: 1 };
+
+  // One precario arrangement, a pure function of its cycle index.
+  function buildArrangement(k) {
+    var rng = mulberry32(cycleSeed(k));
+    var count = 5 + Math.floor(rng() * 4); // 5..8 pieces
+    var pool = ['pebble', 'leaf', 'cap'];
+    for (var i = pool.length - 1; i > 0; i--) {
+      var j = Math.floor(rng() * (i + 1));
+      var tmp = pool[i]; pool[i] = pool[j]; pool[j] = tmp;
+    }
+    var kinds = ['twig', 'shell', 'paper', 'feather', 'thread'];
+    for (i = 0; i < count - 5; i++) kinds.push(pool[i]);
+
+    var els = [];
+    for (i = 0; i < kinds.length; i++) {
+      var kind = kinds[i];
+      var d = KIND[kind];
+      var mode;
+      if (LIGHT[kind]) mode = Math.floor(rng() * 3);       // left, right, or sky
+      else mode = Math.floor(rng() * 2);                   // ground pieces: edges only
+      els.push({
+        kind: kind,
+        dxF: d.dxF + (rng() - 0.5) * 0.10,
+        dyF: d.dyF + (rng() - 0.5) * 0.04,
+        rot: d.rot + (rng() - 0.5) * 0.24,
+        sizeF: d.sizeF * (0.9 + rng() * 0.2),
+        mode: mode,
+        startXF: (rng() - 0.5),          // sky arrivals: horizontal offset
+        startYF: 0.10 + rng() * 0.16,    // sky arrivals: height fraction of H
+        startRot: (rng() - 0.5) * 1.6,
+        aStart: rng() * 3,               // assembly stagger, 0..3 s
+        aDur: 4 + rng() * 3,             // assembly drift, 4..7 s (all settled by 10 s)
+        arcF: 0.012 + rng() * 0.03,      // arrival arc lift, fraction of H
+        bobPh: rng() * Math.PI * 2
+      });
+    }
+    // Ground traces: faint marks this precario leaves where it stood.
+    var traces = [];
+    for (i = 0; i < 5; i++) {
+      traces.push({
+        dxF: (rng() - 0.5) * 0.95,
+        dyF: rng() * 0.02,
+        lenF: 0.05 + rng() * 0.09,
+        ang: (rng() - 0.5) * 0.5
+      });
+    }
+    return { els: els, traces: traces };
+  }
+
+  var arrCache = {};
+  function arrangement(k) {
+    if (!arrCache[k]) {
+      arrCache[k] = buildArrangement(k);
+      var keys = Object.keys(arrCache);
+      if (keys.length > 3) delete arrCache[keys[0]];
+    }
+    return arrCache[k];
+  }
+
+  // ------------------------------------------------------------------
+  // Geometry, recomputed on resize. Sky-wash above, sand below a
+  // ground line in the lower third. The precario is small at
+  // center-bottom: its smallness against the emptiness is the piece.
+  // ------------------------------------------------------------------
+  var W = 0, H = 0, S = 0, isPhone = false;
+  var groundY = 0, baseY = 0, clusterW = 0, clusterCX = 0;
+  var lastElapsed = 0;
+
+  function layout() {
+    groundY = Math.round(H * 0.68);
+    baseY = groundY + S * 0.035;
+    clusterW = S * (isPhone ? 0.26 : 0.17);
+    clusterCX = W / 2;
+  }
+
+  function slotPos(el) {
+    return [clusterCX + el.dxF * clusterW, baseY + el.dyF * clusterW];
+  }
+  function startPos(el) {
+    if (el.mode === 0) return [W * 0.03, baseY - H * 0.012];
+    if (el.mode === 1) return [W * 0.97, baseY - H * 0.012];
+    return [clusterCX + el.startXF * W * 0.15, H * el.startYF];
+  }
+
+  // Element state at cycle time tc: a pure function of tc and the
+  // element's seeded descriptor. Returns position, rotation, and
+  // kind-specific departure extras (hop height, flutter sway).
+  function elState(el, tc) {
+    var slot = slotPos(el);
+    var dep = DEPART[el.kind];
+    if (tc >= dep[0]) {
+      var v = clamp((tc - dep[0]) / (dep[1] - dep[0]), 0, 1);
+      var size = el.sizeF * clusterW;
+      var exit = (W + size) - slot[0]; // far enough to leave the right edge
+      var x = slot[0], y = slot[1], rot = el.rot, hop = 0;
+      if (el.kind === 'thread') {
+        var e = v * v;
+        x += v * W * 0.30;
+        y -= e * H * 0.85;
+        rot += v * 0.7;
+      } else if (el.kind === 'paper') {
+        x += easeOut(v) * exit;
+        hop = Math.abs(Math.sin(v * Math.PI * 5)) * H * 0.018 * (1 - v * 0.4);
+        rot += v * Math.PI * 5;
+      } else if (el.kind === 'feather') {
+        x += v * exit;
+        hop = Math.abs(Math.sin(v * Math.PI * 3)) * H * 0.008;
+        rot += v * Math.PI * 3;
+      } else if (el.kind === 'leaf') {
+        x += v * exit;
+        y -= Math.sin(v * Math.PI * 2.5) * H * 0.045 + v * H * 0.10;
+        rot += Math.sin(v * Math.PI * 4) * 0.9;
+      } else if (el.kind === 'cap') {
+        x += v * exit;
+        rot += v * Math.PI * 6;
+      } else if (el.kind === 'pebble') {
+        x += v * exit;
+        rot += v * Math.PI * 2;
+      } else if (el.kind === 'shell') {
+        x += easeOut(v) * exit;
+        hop = Math.sin(v * Math.PI * 2) * H * 0.014;
+        rot += v * Math.PI * 2;
+      } else if (el.kind === 'twig') {
+        // Stick-slip: six small dragged steps, then the final gust.
+        var steps = 6;
+        var sv = clamp(v * steps, 0, steps);
+        var whole = Math.floor(sv);
+        var slip = (whole + smooth(sv - whole)) / steps;
+        x += slip * exit;
+        rot += v * 0.18;
+      }
+      return { x: x, y: y - hop, rot: rot, dep: v };
+    }
+    // Assembly, then hold.
+    var u = clamp((tc - el.aStart) / el.aDur, 0, 1);
+    if (u >= 1) return { x: slot[0], y: slot[1], rot: el.rot, dep: 0 };
+    var st = startPos(el);
+    var eu = easeOut(u);
+    var px = lerp(st[0], slot[0], eu);
+    var py = lerp(st[1], slot[1], eu) - Math.sin(u * Math.PI) * el.arcF * H;
+    py += Math.sin(u * Math.PI * 3 + el.bobPh) * S * 0.004 * (1 - u);
+    return { x: px, y: py, rot: lerp(el.startRot, el.rot, eu), dep: 0 };
+  }
+
+  // ------------------------------------------------------------------
+  // Glyphs: flat, matte, hand-drawn in spirit. Each is drawn centered
+  // at the origin with characteristic length s.
+  // ------------------------------------------------------------------
+  function drawTwig(s) {
+    ctx.strokeStyle = TWIG;
+    ctx.lineWidth = Math.max(1.4, s * 0.13);
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(-s * 0.5, s * 0.10);
+    ctx.lineTo(-s * 0.15, -s * 0.05);
+    ctx.lineTo(s * 0.20, s * 0.08);
+    ctx.lineTo(s * 0.5, -s * 0.12);
+    ctx.stroke();
+    ctx.lineWidth = Math.max(1.1, s * 0.09);
+    ctx.beginPath();
+    ctx.moveTo(s * 0.05, s * 0.02);
+    ctx.lineTo(s * 0.22, -s * 0.26);
+    ctx.stroke();
+  }
+  function drawShell(s) {
+    var r = s * 0.5, i, a;
+    ctx.fillStyle = SHELL;
+    ctx.beginPath();
+    ctx.moveTo(-r, 0);
+    ctx.arc(0, 0, r, Math.PI, 0);
+    ctx.closePath();
+    ctx.fill();
+    ctx.strokeStyle = TWIG;
+    ctx.globalAlpha = 0.35;
+    ctx.lineWidth = Math.max(0.8, s * 0.035);
+    for (i = 0; i <= 4; i++) {
+      a = Math.PI + (i / 4) * Math.PI;
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.lineTo(Math.cos(a) * r, Math.sin(a) * r);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+  function drawPebble(s) {
+    ctx.fillStyle = GRAY;
+    ctx.beginPath();
+    ctx.ellipse(0, 0, s * 0.5, s * 0.34, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = TWIG;
+    ctx.globalAlpha = 0.3;
+    ctx.lineWidth = Math.max(0.8, s * 0.05);
+    ctx.beginPath();
+    ctx.ellipse(0, s * 0.05, s * 0.36, s * 0.2, 0, 0.25, Math.PI - 0.25);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+  function drawCap(s) {
+    var r = s * 0.5, i;
+    ctx.fillStyle = PAPER;
+    ctx.beginPath();
+    ctx.arc(0, 0, r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = GRAY;
+    ctx.lineWidth = Math.max(0.8, s * 0.05);
+    for (i = 0; i < 12; i++) {
+      var a = (i / 12) * Math.PI * 2;
+      ctx.beginPath();
+      ctx.moveTo(Math.cos(a) * r * 0.86, Math.sin(a) * r * 0.86);
+      ctx.lineTo(Math.cos(a) * r * 1.04, Math.sin(a) * r * 1.04);
+      ctx.stroke();
+    }
+    ctx.fillStyle = GRAY;
+    ctx.beginPath();
+    ctx.arc(0, 0, r * 0.16, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  function drawPaper(s) {
+    ctx.fillStyle = PAPER;
+    ctx.beginPath();
+    ctx.moveTo(-s * 0.50, -s * 0.28);
+    ctx.lineTo(s * 0.30, -s * 0.42);
+    ctx.lineTo(s * 0.50, s * 0.12);
+    ctx.lineTo(s * 0.08, s * 0.42);
+    ctx.lineTo(-s * 0.42, s * 0.30);
+    ctx.closePath();
+    ctx.fill();
+    ctx.strokeStyle = GRAY;
+    ctx.globalAlpha = 0.55;
+    ctx.lineWidth = Math.max(0.8, s * 0.03);
+    ctx.stroke();
+    ctx.globalAlpha = 0.4;
+    ctx.beginPath();
+    ctx.moveTo(s * 0.30, -s * 0.42);
+    ctx.lineTo(-s * 0.04, s * 0.02);
+    ctx.lineTo(s * 0.08, s * 0.42);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+  function drawLeaf(s) {
+    ctx.fillStyle = TWIG;
+    ctx.globalAlpha = 0.85;
+    ctx.beginPath();
+    ctx.moveTo(-s * 0.5, 0);
+    ctx.quadraticCurveTo(0, -s * 0.52, s * 0.5, 0);
+    ctx.quadraticCurveTo(0, s * 0.52, -s * 0.5, 0);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = SAND;
+    ctx.globalAlpha = 0.6;
+    ctx.lineWidth = Math.max(0.8, s * 0.04);
+    ctx.beginPath();
+    ctx.moveTo(-s * 0.5, 0);
+    ctx.lineTo(s * 0.5, 0);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+  function drawFeather(s) {
+    // Barbed arc: a bowed shaft with short barbs angled back.
+    var x0 = -s * 0.5, y0 = s * 0.10, cx = 0, cy = -s * 0.20, x1 = s * 0.5, y1 = -s * 0.10;
+    function qp(u) {
+      var w = 1 - u;
+      return [w * w * x0 + 2 * w * u * cx + u * u * x1,
+              w * w * y0 + 2 * w * u * cy + u * u * y1];
+    }
+    ctx.strokeStyle = GRAY;
+    ctx.lineWidth = Math.max(0.9, s * 0.035);
+    ctx.lineCap = 'round';
+    for (var i = 1; i <= 7; i++) {
+      var u = i / 8;
+      var p = qp(u);
+      var bl = s * 0.16 * (1 - Math.abs(u - 0.45) * 0.9);
+      ctx.beginPath();
+      ctx.moveTo(p[0], p[1]);
+      ctx.lineTo(p[0] - s * 0.10, p[1] - bl);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(p[0], p[1]);
+      ctx.lineTo(p[0] - s * 0.10, p[1] + bl);
+      ctx.stroke();
+    }
+    ctx.lineWidth = Math.max(1.1, s * 0.05);
+    ctx.beginPath();
+    ctx.moveTo(x0, y0);
+    ctx.quadraticCurveTo(cx, cy, x1, y1);
+    ctx.stroke();
+  }
+  function drawThread(el, s, t, dep) {
+    // A sine curve draped across the cluster: ends high, middle
+    // sagging. In hold it trembles slightly; while departing its
+    // ripple grows as the wind takes it.
+    var wHalf = s * 0.5;
+    var sag = s * 0.10;
+    var amp = s * 0.018 + dep * s * 0.05;
+    var tremble = Math.sin(t * 2.3) * s * 0.006 * (1 - dep);
+    ctx.strokeStyle = THREAD;
+    ctx.lineWidth = Math.max(1.2, S * 0.0032);
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    var N = 40;
+    for (var i = 0; i <= N; i++) {
+      var fx = (i / N) * 2 - 1;
+      var x = fx * wHalf;
+      var y = sag * (1 - fx * fx)
+        + Math.sin(fx * 4.6 + t * (2.0 + dep * 5.0)) * amp
+        + tremble * (1 - fx * fx);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+
+  var DRAW = {
+    twig: drawTwig, shell: drawShell, pebble: drawPebble, cap: drawCap,
+    paper: drawPaper, leaf: drawLeaf, feather: drawFeather
+  };
+
+  // Ground traces of cycle k, visible late in its own cycle and
+  // fading out during the next cycle's assembly.
+  function drawTraces(k, t) {
+    if (k < 0) return; // no precario before cycle 0: the first shore is pristine
+    var local = t - k * CYCLE_S;
+    if (local < 86 || local > 104) return;
+    var aIn = smooth((local - 86) / 6);
+    var aOut = 1 - smooth((local - 100) / 4);
+    var alpha = Math.min(aIn, aOut);
+    if (alpha <= 0.003) return;
+    var tr = arrangement(k).traces;
+    ctx.strokeStyle = TWIG;
+    ctx.lineCap = 'round';
+    for (var i = 0; i < tr.length; i++) {
+      var m = tr[i];
+      var x = clusterCX + m.dxF * clusterW;
+      var y = baseY + m.dyF * clusterW + S * 0.006;
+      var len = m.lenF * clusterW;
+      ctx.globalAlpha = 0.26 * alpha;
+      ctx.lineWidth = Math.max(1, S * 0.0022);
+      ctx.beginPath();
+      ctx.moveTo(x - Math.cos(m.ang) * len / 2, y - Math.sin(m.ang) * len / 2);
+      ctx.lineTo(x + Math.cos(m.ang) * len / 2, y + Math.sin(m.ang) * len / 2);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function draw(elapsed) {
+    lastElapsed = elapsed;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = SKY;
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = SAND;
+    ctx.fillRect(0, groundY, W, H - groundY);
+    // The ground line itself.
+    ctx.fillStyle = TWIG;
+    ctx.globalAlpha = 0.35;
+    ctx.fillRect(0, groundY - 1, W, 2);
+    ctx.globalAlpha = 1;
+
+    var k = Math.floor(elapsed / CYCLE_S);
+    var tc = elapsed - k * CYCLE_S;
+
+    drawTraces(k - 1, elapsed);
+    drawTraces(k, elapsed);
+
+    var arr = arrangement(k);
+    var byKind = {};
+    for (var i = 0; i < arr.els.length; i++) byKind[arr.els[i].kind] = arr.els[i];
+    for (i = 0; i < DRAW_ORDER.length; i++) {
+      var el = byKind[DRAW_ORDER[i]];
+      if (!el) continue;
+      var st = elState(el, tc);
+      ctx.save();
+      ctx.translate(st.x, st.y);
+      ctx.rotate(st.rot);
+      if (el.kind === 'thread') {
+        drawThread(el, el.sizeF * clusterW, elapsed, st.dep);
+      } else {
+        DRAW[el.kind](el.sizeF * clusterW);
+      }
+      ctx.restore();
+    }
+  }
+
+  function resize() {
+    var vv = window.visualViewport;
+    W = vv ? vv.width : window.innerWidth;
+    H = vv ? vv.height : window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    S = Math.min(W, H);
+    if (window.screen) {
+      isPhone = Math.min(window.screen.width, window.screen.height) < 700;
+    } else {
+      isPhone = H > W * 1.15;
+    }
+    layout();
+    draw(lastElapsed);
+  }
+
+  resize();
+  draw(FORCE_T >= 0 ? FORCE_T : 0);
+
+  if (typeof window.requestAnimationFrame === 'function') {
+    var t0 = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+    var raf = function () {
+      var now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : t0;
+      draw(FORCE_T >= 0 ? FORCE_T : (now - t0) / 1000);
+      window.requestAnimationFrame(raf);
+    };
+    window.requestAnimationFrame(raf);
+  }
+
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', resize);
+  }
+  if (window.addEventListener) window.addEventListener('resize', resize);
+})();
+</script>
+</body>
+</html>
