@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>One Impression</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #F5F0E6; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- palettes ----------
+  // Two readings of the SAME mark list. Roles, not colors, are stored.
+  var PAPER = '#F5F0E6';
+  var PALETTES = [
+    { // color channel (@adolfoserra)
+      body:   ['#4A3423', '#D9A441'],   // walnut, turmeric
+      dark:   ['#33241A', '#B9862F'],
+      light:  '#EFE3C8',
+      resist: '#EFE3C8',
+      mark:   '#4A3423'
+    },
+    { // pure-ink channel (@serradolfo)
+      body:   ['#1A1A1A', '#1A1A1A'],
+      dark:   ['#1A1A1A', '#1A1A1A'],
+      light:  '#F5F0E6',
+      resist: '#F5F0E6',
+      mark:   '#1A1A1A'
+    }
+  ];
+  var BW_BODY_ALPHA = 0.72; // ink reads stronger than pigment at same alpha
+
+  // ---------- seeded rng ----------
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 300, H = 300;
+
+  function viewSize() {
+    var w, h;
+    if (typeof window !== 'undefined' && window.visualViewport &&
+        typeof window.visualViewport.width === 'number') {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    } else if (typeof window !== 'undefined' && typeof window.innerWidth === 'number') {
+      w = window.innerWidth; h = window.innerHeight;
+    } else { w = W; h = H; }
+    return { w: Math.max(50, Math.floor(w)), h: Math.max(50, Math.floor(h)) };
+  }
+
+  function isPhone() {
+    var sw = 9999, sh = 9999;
+    if (typeof window !== 'undefined' && window.screen) {
+      sw = window.screen.width || 9999; sh = window.screen.height || 9999;
+    }
+    if (Math.min(sw, sh) < 700) return true;
+    return H > W * 1.15; // aspect fallback only
+  }
+
+  function resize() {
+    var s = viewSize();
+    W = s.w; H = s.h;
+    canvas.width = W; canvas.height = H;
+    draw(elapsed);
+  }
+
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', resize);
+    }
+    if (window.addEventListener) window.addEventListener('resize', resize);
+  }
+
+  // ---------- impression model ----------
+  // An impression is pure DATA: center, harmonic radius function, pigment
+  // index, baked grain dabs, wax-resist patches, birth time, smear vector.
+  // Both channels render from this list, so the color/B&W flip is a
+  // palette swap over identical marks: a LUT flip, never a re-draw.
+  var K = 64;               // contour samples
+  var SEED_BASE = 614000;
+  var MAX_MARKS = 40;
+
+  function makeImpression(cfg) {
+    var rng = mulberry32(cfg.seed);
+    var harm = [];
+    for (var i = 0; i < 5; i++) {
+      harm.push({ n: 2 + i, amp: 0.05 + rng() * 0.10, ph: rng() * Math.PI * 2 });
+    }
+    // baked-in grain: dabs positioned in polar coords inside the wash
+    var grain = [];
+    var ng = 120;
+    for (var j = 0; j < ng; j++) {
+      var tone = rng();
+      grain.push({
+        a: rng() * Math.PI * 2,
+        fr: Math.sqrt(rng()) * 0.94,
+        s: 0.012 + rng() * 0.030,          // size as fraction of radius
+        stretch: 0.5 + rng() * 1.4,
+        rot: rng() * Math.PI,
+        role: tone < 0.55 ? 'dark' : (tone < 0.78 ? 'body' : 'light'),
+        al: 0.25 + rng() * 0.5
+      });
+    }
+    // wax-resist blooms: pale patches where wax repelled the pigment
+    var resist = [];
+    var nr = 3 + Math.floor(rng() * 3);
+    for (var q = 0; q < nr; q++) {
+      var rh = [];
+      for (var m = 0; m < 4; m++) {
+        rh.push({ n: 2 + m, amp: 0.08 + rng() * 0.14, ph: rng() * Math.PI * 2 });
+      }
+      resist.push({
+        a: rng() * Math.PI * 2,
+        fr: 0.15 + rng() * 0.45,
+        r: 0.16 + rng() * 0.22,            // fraction of impression radius
+        harm: rh,
+        al: 0.35 + rng() * 0.25
+      });
+    }
+    return {
+      seed: cfg.seed,
+      nx: cfg.nx, ny: cfg.ny,             // center, fraction of W / H
+      baseR: cfg.baseR,                   // radius, fraction of min(W,H)
+      pigment: cfg.pigment,               // 0 walnut, 1 turmeric
+      harm: harm,
+      grain: grain,
+      resist: resist,
+      born: cfg.born,                     // anchored elapsed seconds
+      smearX: 0, smearY: 0,               // one-shot smear, fraction units
+      smeared: false
+    };
+  }
+
+  function radiusAt(imp, th) {
+    var r = 1;
+    for (var i = 0; i < imp.harm.length; i++) {
+      r += imp.harm[i].amp * Math.sin(imp.harm[i].n * th + imp.harm[i].ph);
+    }
+    return r;
+  }
+
+  // point on the (possibly smeared) contour, in local radius units
+  function contourPoint(imp, th, scale) {
+    var r = radiusAt(imp, th) * scale;
+    var ct = Math.cos(th), st = Math.sin(th);
+    // smear bulges the contour toward the drag direction
+    var along = ct * imp.smearX + st * imp.smearY;
+    var bulge = 1 + along * 1.6;
+    return { x: ct * r * bulge + imp.smearX * 0.35, y: st * r * bulge + imp.smearY * 0.35 };
+  }
+
+  function tracePath(imp, cx, cy, R, scale) {
+    ctx.beginPath();
+    for (var i = 0; i <= K; i++) {
+      var th = (i / K) * Math.PI * 2;
+      var p = contourPoint(imp, th, scale);
+      var x = cx + p.x * R, y = cy + p.y * R;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+  }
+
+  // ---------- state ----------
+  var marks = [];
+  var mode = 0;               // 0 color, 1 B&W
+  var tapCount = 0;
+  var elapsed = 0;            // anchored clock, seconds
+
+  // frame one: three seeded impressions, composed low, already dry
+  marks.push(makeImpression({ seed: SEED_BASE + 11, nx: 0.30, ny: 0.63, baseR: 0.165, pigment: 0, born: -10 }));
+  marks.push(makeImpression({ seed: SEED_BASE + 23, nx: 0.585, ny: 0.755, baseR: 0.130, pigment: 1, born: -10 }));
+  marks.push(makeImpression({ seed: SEED_BASE + 37, nx: 0.735, ny: 0.545, baseR: 0.100, pigment: 0, born: -10 }));
+
+  // faint paper tooth, fixed seed, normalized coords
+  var paperGrain = [];
+  (function () {
+    var rng = mulberry32(SEED_BASE + 7);
+    for (var i = 0; i < 260; i++) {
+      paperGrain.push({ x: rng(), y: rng(), s: 0.6 + rng() * 1.5, al: 0.02 + rng() * 0.03 });
+    }
+  })();
+
+  // ---------- rendering ----------
+  function dryness(imp, t) {
+    var age = t - imp.born;
+    if (age >= 3) return 1;
+    if (age <= 0) return 0;
+    return age / 3;
+  }
+
+  function drawImpression(imp, pal, t) {
+    var S = Math.min(W, H);
+    var cx = imp.nx * W, cy = imp.ny * H, R = imp.baseR * S;
+    var dry = dryness(imp, t);
+    var settle = 0.80 + 0.20 * dry;                  // wet reads lighter
+    var bodyA = (mode === 1 ? BW_BODY_ALPHA : 1) * settle;
+
+    // washy body: layered translucent passes, pooling toward the middle
+    ctx.fillStyle = pal.body[imp.pigment];
+    ctx.globalAlpha = 0.10 * bodyA;
+    tracePath(imp, cx, cy, R, 1.13); ctx.fill();
+    ctx.globalAlpha = 0.26 * bodyA;
+    tracePath(imp, cx, cy, R, 1.0); ctx.fill();
+    ctx.globalAlpha = 0.24 * bodyA;
+    tracePath(imp, cx, cy, R, 0.76); ctx.fill();
+    ctx.globalAlpha = 0.20 * bodyA;
+    tracePath(imp, cx, cy, R, 0.48); ctx.fill();
+
+    // grain + resist, clipped to the true contour
+    ctx.save();
+    tracePath(imp, cx, cy, R, 1.0);
+    ctx.clip();
+    var j, g;
+    for (j = 0; j < imp.grain.length; j++) {
+      g = imp.grain[j];
+      var gp = contourPoint(imp, g.a, g.fr * radiusAt(imp, g.a));
+      ctx.fillStyle = g.role === 'dark' ? pal.dark[imp.pigment]
+                    : g.role === 'light' ? pal.light : pal.body[imp.pigment];
+      ctx.globalAlpha = g.al * 0.55 * settle;
+      ctx.beginPath();
+      ctx.ellipse(cx + gp.x * R, cy + gp.y * R,
+                  Math.max(0.6, g.s * R), Math.max(0.6, g.s * R * g.stretch),
+                  g.rot, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    // wax-resist blooms
+    for (j = 0; j < imp.resist.length; j++) {
+      var rp = imp.resist[j];
+      var rc = contourPoint(imp, rp.a, rp.fr * radiusAt(imp, rp.a));
+      var rcx = cx + rc.x * R, rcy = cy + rc.y * R, rr = rp.r * R;
+      ctx.fillStyle = pal.resist;
+      ctx.globalAlpha = rp.al * (mode === 1 ? 0.95 : 0.8);
+      ctx.beginPath();
+      for (var s = 0; s <= 24; s++) {
+        var th2 = (s / 24) * Math.PI * 2;
+        var wob = 1;
+        for (var m2 = 0; m2 < rp.harm.length; m2++) {
+          wob += rp.harm[m2].amp * Math.sin(rp.harm[m2].n * th2 + rp.harm[m2].ph);
+        }
+        var px = rcx + Math.cos(th2) * rr * wob;
+        var py = rcy + Math.sin(th2) * rr * wob;
+        if (s === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+      }
+      ctx.closePath();
+      ctx.fill();
+    }
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
+  function markGeom() {
+    var S = Math.min(W, H);
+    var r = Math.max(10, S * 0.020);
+    var m = r + Math.max(14, S * 0.026);
+    return { x: W - m, y: H - m, r: r, hit: r + 14 };
+  }
+
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    var pal = PALETTES[mode];
+    ctx.fillStyle = PAPER;
+    ctx.fillRect(0, 0, W, H);
+    // paper tooth
+    ctx.fillStyle = mode === 1 ? '#1A1A1A' : '#4A3423';
+    for (var i = 0; i < paperGrain.length; i++) {
+      var pg = paperGrain[i];
+      ctx.globalAlpha = pg.al;
+      ctx.fillRect(pg.x * W, pg.y * H, pg.s, pg.s);
+    }
+    ctx.globalAlpha = 1;
+    for (var j = 0; j < marks.length; j++) drawImpression(marks[j], pal, t);
+    // corner mode mark: a circle, never a word
+    var mg = markGeom();
+    ctx.beginPath();
+    ctx.arc(mg.x, mg.y, mg.r, 0, Math.PI * 2);
+    if (mode === 0) {
+      ctx.fillStyle = pal.mark;
+      ctx.globalAlpha = 0.85;
+      ctx.fill();
+    } else {
+      ctx.strokeStyle = pal.mark;
+      ctx.lineWidth = 2;
+      ctx.globalAlpha = 0.85;
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- interaction ----------
+  // The anchored clock: elapsed is 0 at frame one and only advances via
+  // rAF timestamps relative to the first frame. Never Date.now().
+  var t0 = null;
+  function loop(ts) {
+    if (t0 === null) t0 = ts;
+    elapsed = (ts - t0) / 1000;
+    draw(elapsed);
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+  }
+
+  function wettest(t) {
+    var best = null;
+    for (var i = 0; i < marks.length; i++) {
+      var imp = marks[i];
+      if (!imp.smeared && t - imp.born < 3) {
+        if (!best || imp.born > best.born) best = imp;
+      }
+    }
+    return best;
+  }
+
+  var down = null;         // {x, y, moved, onMark}
+  var lastMarkTap = -10;   // anchored time of last tap on the mark
+
+  function posOf(e) {
+    var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    var cx = (typeof e.clientX === 'number') ? e.clientX : (e.touches && e.touches[0] ? e.touches[0].clientX : 0);
+    var cy = (typeof e.clientY === 'number') ? e.clientY : (e.touches && e.touches[0] ? e.touches[0].clientY : 0);
+    return { x: cx - r.left, y: cy - r.top };
+  }
+
+  function onMark(x, y) {
+    var mg = markGeom();
+    var dx = x - mg.x, dy = y - mg.y;
+    return (dx * dx + dy * dy) <= mg.hit * mg.hit;
+  }
+
+  function pointerDown(e) {
+    var p = posOf(e);
+    down = { x: p.x, y: p.y, moved: false, onMark: onMark(p.x, p.y) };
+    if (down.onMark) {
+      if (elapsed - lastMarkTap < 0.35) {
+        mode = 1 - mode;               // double-tap the mark: flip channel
+        lastMarkTap = -10;
+        down.consumed = true;
+        draw(elapsed);
+      } else {
+        lastMarkTap = elapsed;
+      }
+    }
+  }
+
+  function pointerMove(e) {
+    if (!down || down.consumed || down.onMark) return;
+    var p = posOf(e);
+    var dx = p.x - down.x, dy = p.y - down.y;
+    if (Math.abs(dx) + Math.abs(dy) > 6) down.moved = true;
+    if (down.moved) {
+      var imp = wettest(elapsed);
+      if (imp) {
+        var S = Math.min(W, H);
+        var cap = 0.06;                // smear stays slight
+        imp.smearX = Math.max(-cap, Math.min(cap, dx / S * 0.25));
+        imp.smearY = Math.max(-cap, Math.min(cap, dy / S * 0.25));
+        draw(elapsed);
+      }
+    }
+  }
+
+  function pointerUp(e) {
+    if (!down) return;
+    var wasDrag = down.moved;
+    if (wasDrag) {
+      var imp = wettest(elapsed);
+      if (imp && (imp.smearX !== 0 || imp.smearY !== 0)) imp.smeared = true; // dried by the gesture
+    }
+    if (!wasDrag && !down.onMark && !down.consumed) {
+      // a tap pulls one impression: one-shot, never editable, never undone
+      if (marks.length < MAX_MARKS) {
+        tapCount++;
+        var rngP = mulberry32(SEED_BASE + 500 + tapCount * 131);
+        marks.push(makeImpression({
+          seed: SEED_BASE + 500 + tapCount * 131,
+          nx: Math.max(0.02, Math.min(0.98, down.x / W)),
+          ny: Math.max(0.02, Math.min(0.98, down.y / H)),
+          baseR: 0.075 + rngP() * 0.075,
+          pigment: rngP() < 0.55 ? 0 : 1,
+          born: elapsed
+        }));
+        draw(elapsed);
+      }
+    }
+    down = null;
+  }
+
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', pointerDown);
+    canvas.addEventListener('pointermove', pointerMove);
+    canvas.addEventListener('pointerup', pointerUp);
+    canvas.addEventListener('pointercancel', function () { down = null; });
+  }
+
+  // ---------- first frame: synchronous, fixed, then the loop ----------
+  var s0 = viewSize();
+  W = s0.w; H = s0.h;
+  canvas.width = W; canvas.height = H;
+  draw(0);
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
