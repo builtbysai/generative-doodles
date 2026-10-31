@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gnawed</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0B0B0D; height: 100%; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+
+// Gnawed (EXPANSION #87 janine-antoni, block 1)
+// Two heavy cubes, one chocolate, one lard, on pedestals. An invisible mouth
+// has been at them: bites gouge their edges one by one, and the removed
+// material comes back as hearts under the chocolate, lipsticks under the lard.
+// Then the cubes quietly restore and the rows fade. The chewer is never seen.
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// Deterministic per-cell hash in [0,1), independent of iteration order.
+function hash01(a, b, c) {
+  var x = (Math.imul(a, 374761393) + Math.imul(b, 668265263) + Math.imul(c, 1274126177)) | 0;
+  x = Math.imul(x ^ (x >>> 13), 1274126177);
+  return ((x ^ (x >>> 16)) >>> 0) / 4294967296;
+}
+
+var COL = {
+  choc: '#3A1F14',
+  lard: '#EAD9B0',
+  hearts: '#5A2418',
+  lipstick: '#C1272D',
+  pedestal: '#141417',
+  bg: '#0B0B0D'
+};
+
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var W = 0, H = 0, isPhone = false;
+
+// Inert QA hook: ?seed=tNN forces the clock to NN seconds for still renders.
+var T0 = 0;
+if (typeof location !== 'undefined' && location.search) {
+  var sm = location.search.match(/t(\d+(?:\.\d+)?)/);
+  if (sm) T0 = parseFloat(sm[1]);
+}
+var curT = T0;
+
+// ---------------------------------------------------------------------------
+// Cycle model. One cycle is 70 s: erosion 0-45 s (bites land as steps),
+// renewal 45-70 s (cells fade back, rows fade out). All state is a pure
+// function of (cycle index, phase), so frame one and every still are exact.
+// ---------------------------------------------------------------------------
+var CYCLE = 70;
+var GRID = 16;           // cells per cube edge (front face is GRID x GRID)
+var BITES = 16;          // bites per cube per cycle = items per row set
+var ROW_PER = 8;         // spawn items per row (two rows per cube)
+
+var epochCycle = 0;      // cycle index at epochStart
+var epochStart = 0;      // anchored clock time when epochCycle began
+
+function buildCube(rng, seedBase, innerRight) {
+  // Bite anchors on the face boundary, weighted to the inner-facing edge.
+  var times = [];
+  for (var i = 0; i < BITES; i++) times.push(3 + rng() * 35);
+  times.sort(function (a, b) { return a - b; });
+
+  var gone = {};   // cellIndex -> { t: removal time, ret: renewal start }
+  var items = [];  // { t: spawn time, slot: 0..BITES-1 }
+
+  for (var b = 0; b < BITES; b++) {
+    var pick = rng();
+    var ax, ay;
+    if (pick < 0.55) {            // inner edge
+      ax = innerRight ? GRID + 0.2 : -0.2;
+      ay = rng() * GRID;
+    } else if (pick < 0.70) {     // top edge, biased toward the inner half
+      ax = innerRight ? GRID * (0.45 + 0.55 * rng()) : GRID * (0.55 * rng());
+      ay = -0.2;
+    } else if (pick < 0.82) {     // bottom edge
+      ax = rng() * GRID;
+      ay = GRID + 0.2;
+    } else if (pick < 0.90) {     // outer edge
+      ax = innerRight ? -0.2 : GRID + 0.2;
+      ay = rng() * GRID;
+    } else {                      // inner top or bottom corner
+      ax = innerRight ? GRID + 0.2 : -0.2;
+      ay = rng() < 0.5 ? -0.2 : GRID + 0.2;
+    }
+    var radius = 1.7 + rng() * 1.5;
+    var t1 = times[b];
+    var t2 = Math.min(44, t1 + 2 + rng() * 2.5);
+    items.push({ t: t1, slot: b });
+
+    for (var r = 0; r < GRID; r++) {
+      for (var c = 0; c < GRID; c++) {
+        var dx = (c + 0.5) - ax, dy = (r + 0.5) - ay;
+        var d = Math.sqrt(dx * dx + dy * dy);
+        if (d > radius * 1.25) continue;
+        var jit = 0.82 + 0.36 * hash01(seedBase, b * 977 + r * GRID + c, 31);
+        if (d >= radius * jit) continue;
+        var idx = r * GRID + c;
+        var deep = d < radius * 0.55;
+        var t = deep ? t2 : t1;
+        if (!gone[idx] || t < gone[idx].t) {
+          gone[idx] = { t: t, ret: 46 + hash01(seedBase, idx, 77) * 16 };
+        }
+      }
+    }
+  }
+  // Peeling pass: replay the removals in time order. Whenever a bite would
+  // cut a group of cells off from the main mass, the cut-off group goes at
+  // the same moment, so the surviving face is one connected piece at every
+  // instant and no cell ever floats on its own.
+  var order = Object.keys(gone).map(Number).sort(function (a, b) {
+    return gone[a].t - gone[b].t;
+  });
+  var presentArr = [];
+  for (var p0 = 0; p0 < GRID * GRID; p0++) presentArr.push(true);
+  var removed = {};
+  function neighbours(i) {
+    var rr = Math.floor(i / GRID), cc = i % GRID, out = [];
+    if (rr > 0) out.push(i - GRID);
+    if (rr < GRID - 1) out.push(i + GRID);
+    if (cc > 0) out.push(i - 1);
+    if (cc < GRID - 1) out.push(i + 1);
+    return out;
+  }
+  for (var oi = 0; oi < order.length; oi++) {
+    var cellIdx = order[oi];
+    if (removed[cellIdx]) continue;
+    var tNow = gone[cellIdx].t;
+    presentArr[cellIdx] = false;
+    removed[cellIdx] = true;
+    // Label the connected components of what survives.
+    var compOf = {}, compSizes = {}, nComp = 0;
+    for (var s = 0; s < GRID * GRID; s++) {
+      if (!presentArr[s] || compOf[s] !== undefined) continue;
+      var stack = [s], size = 0;
+      compOf[s] = nComp;
+      while (stack.length) {
+        var cur = stack.pop();
+        size++;
+        var nbs = neighbours(cur);
+        for (var k = 0; k < nbs.length; k++) {
+          if (presentArr[nbs[k]] && compOf[nbs[k]] === undefined) {
+            compOf[nbs[k]] = nComp;
+            stack.push(nbs[k]);
+          }
+        }
+      }
+      compSizes[nComp] = size;
+      nComp++;
+    }
+    if (nComp <= 1) continue;
+    var mainComp = 0;
+    for (var m = 1; m < nComp; m++) if (compSizes[m] > compSizes[mainComp]) mainComp = m;
+    for (var q = 0; q < GRID * GRID; q++) {
+      if (!presentArr[q] || compOf[q] === mainComp) continue;
+      if (!gone[q]) gone[q] = { t: tNow, ret: 46 + hash01(seedBase, q, 77) * 16 };
+      else gone[q].t = tNow;
+      presentArr[q] = false;
+      removed[q] = true;
+    }
+  }
+
+  return { gone: gone, items: items };
+}
+
+var cycleCache = null, cycleCacheIdx = -1;
+function cycleData(idx) {
+  if (cycleCacheIdx === idx && cycleCache) return cycleCache;
+  var rngC = mulberry32(71200 + idx * 131);
+  var rngL = mulberry32(71200 + idx * 131 + 50021);
+  cycleCache = {
+    choc: buildCube(rngC, 1000 + idx * 7, true),
+    lard: buildCube(rngL, 9000 + idx * 7, false)
+  };
+  cycleCacheIdx = idx;
+  return cycleCache;
+}
+
+function cellAlpha(cell, phase) {
+  if (!cell) return 1;
+  if (phase < cell.t) return 1;
+  var a = (phase - cell.ret) / 4;
+  return a <= 0 ? 0 : (a >= 1 ? 1 : a);
+}
+
+function itemAlpha(item, phase) {
+  var ain = (phase - item.t) / 0.6;
+  ain = ain <= 0 ? 0 : (ain >= 1 ? 1 : ain);
+  var aout = 1 - (phase - 50) / 14;
+  aout = aout <= 0 ? 0 : (aout >= 1 ? 1 : aout);
+  return ain * aout;
+}
+
+// ---------------------------------------------------------------------------
+// Drawing. Design space is 1000 x 1000, fit by the smaller viewport side.
+// ---------------------------------------------------------------------------
+var U = 1, OX = 0, OY = 0;
+function px(x) { return OX + x * U; }
+function py(y) { return OY + y * U; }
+
+var CUBE_Y = 215, CUBE_S = 320;
+var CHOC_X = 130, LARD_X = 550;
+
+function drawPedestal(cx) {
+  ctx.fillStyle = COL.pedestal;
+  ctx.fillRect(px(cx - 24), py(545), 368 * U, 23 * U);
+  ctx.fillRect(px(cx + 60), py(568), 200 * U, 80 * U);
+}
+
+function drawTopFace(x, color) {
+  ctx.save();
+  ctx.globalAlpha = 0.72;
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(px(x), py(CUBE_Y));
+  ctx.lineTo(px(x + CUBE_S), py(CUBE_Y));
+  ctx.lineTo(px(x + CUBE_S + 17), py(CUBE_Y - 14));
+  ctx.lineTo(px(x + 17), py(CUBE_Y - 14));
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawCube(x, color, data, phase) {
+  var cell = CUBE_S / GRID;
+  var gap = Math.max(0.5, 0.8 * U);
+  ctx.fillStyle = color;
+  for (var r = 0; r < GRID; r++) {
+    for (var c = 0; c < GRID; c++) {
+      var a = cellAlpha(data.gone[r * GRID + c], phase);
+      if (a <= 0) continue;
+      ctx.save();
+      ctx.globalAlpha = a;
+      ctx.fillRect(
+        px(x + c * cell) + gap / 2,
+        py(CUBE_Y + r * cell) + gap / 2,
+        cell * U - gap,
+        cell * U - gap
+      );
+      ctx.restore();
+    }
+  }
+}
+
+function drawHeart(cx, cy, s, alpha) {
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = COL.hearts;
+  ctx.beginPath();
+  ctx.moveTo(px(cx), py(cy + s * 0.85));
+  ctx.bezierCurveTo(px(cx - s * 1.25), py(cy - s * 0.15), px(cx - s * 0.62), py(cy - s * 1.05), px(cx), py(cy - s * 0.38));
+  ctx.bezierCurveTo(px(cx + s * 0.62), py(cy - s * 1.05), px(cx + s * 1.25), py(cy - s * 0.15), px(cx), py(cy + s * 0.85));
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawLipstick(cx, baseY, alpha) {
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  // Slanted red tip.
+  ctx.fillStyle = COL.lipstick;
+  ctx.beginPath();
+  ctx.moveTo(px(cx - 4), py(baseY - 13));
+  ctx.lineTo(px(cx + 4), py(baseY - 13));
+  ctx.lineTo(px(cx + 4), py(baseY - 20));
+  ctx.lineTo(px(cx - 1), py(baseY - 23));
+  ctx.closePath();
+  ctx.fill();
+  // Tube body.
+  ctx.fillStyle = COL.hearts;
+  ctx.fillRect(px(cx - 4.5), py(baseY - 13), 9 * U, 13 * U);
+  ctx.restore();
+}
+
+function drawRows(cx, data, phase, isChoc) {
+  var spacing = 36;
+  var x0 = cx + CUBE_S / 2 - ((ROW_PER - 1) * spacing) / 2;
+  data.items.forEach(function (item) {
+    var a = itemAlpha(item, phase);
+    if (a <= 0) return;
+    var row = Math.floor(item.slot / ROW_PER);
+    var col = item.slot % ROW_PER;
+    var x = x0 + col * spacing;
+    if (isChoc) {
+      var grow = 0.7 + 0.3 * a;
+      drawHeart(x, 712 + row * 46, 11 * grow, a);
+    } else {
+      drawLipstick(x, 726 + row * 46, a);
+    }
+  });
+}
+
+function draw(t) {
+  if (W === 0 || H === 0) return;
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+
+  var elapsed = t - epochStart;
+  var idx = epochCycle + Math.floor(elapsed / CYCLE);
+  var phase = elapsed - Math.floor(elapsed / CYCLE) * CYCLE;
+  var data = cycleData(idx);
+
+  var unit = Math.min(W, H);
+  U = unit / 1000;
+  OX = (W - unit) / 2;
+  OY = (H - unit) / 2;
+
+  ctx.fillStyle = COL.bg;
+  ctx.fillRect(0, 0, W, H);
+
+  drawPedestal(CHOC_X);
+  drawPedestal(LARD_X);
+  drawTopFace(CHOC_X, COL.choc);
+  drawTopFace(LARD_X, COL.lard);
+  drawCube(CHOC_X, COL.choc, data.choc, phase);
+  drawCube(LARD_X, COL.lard, data.lard, phase);
+  drawRows(CHOC_X, data.choc, phase, true);
+  drawRows(LARD_X, data.lard, phase, false);
+}
+
+// Tap: a fresh bite pattern begins (advance to the next cycle at once).
+if (canvas.addEventListener) {
+  canvas.addEventListener('pointerdown', function () {
+    epochCycle += Math.floor((curT - epochStart) / CYCLE) + 1;
+    epochStart = curT;
+    draw(curT);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Sizing and main loop.
+// ---------------------------------------------------------------------------
+function resize() {
+  var vw = (window.visualViewport && window.visualViewport.width) || window.innerWidth;
+  var vh = (window.visualViewport && window.visualViewport.height) || window.innerHeight;
+  W = Math.round(vw);
+  H = Math.round(vh);
+  canvas.width = W;
+  canvas.height = H;
+  var sw = (window.screen && window.screen.width) || 9999;
+  var sh = (window.screen && window.screen.height) || 9999;
+  isPhone = Math.min(sw, sh) < 700 || H > W * 1.15;
+  draw(curT);
+}
+
+if (window.visualViewport && window.visualViewport.addEventListener) {
+  window.visualViewport.addEventListener('resize', resize);
+}
+if (window.addEventListener) window.addEventListener('resize', resize);
+
+// Frame one: synchronous draw at the fixed starting phase (cycle 0, t=0
+// unless the inert QA hook set T0). Never derived from a wall clock.
+resize();
+
+var startStamp = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+if (typeof requestAnimationFrame === 'function') {
+  var loop = function () {
+    curT = T0 + (performance.now() - startStamp) / 1000;
+    draw(curT);
+    requestAnimationFrame(loop);
+  };
+  requestAnimationFrame(loop);
+}
+</script>
+</body>
+</html>

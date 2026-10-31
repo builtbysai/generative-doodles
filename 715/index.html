@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>One Thousand Blinks</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #F2EDE4; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // Palette (strict): warm canvas, dark marks, soft marks, edge vignette.
+  // Nothing else.
+  var FIELD = '#F2EDE4';
+  var MARK = '#1C1A17';
+  var SOFT = '#4A443B';
+  var VIG = '#E5DFD2';
+
+  var BASE_SEED = 715001;
+  var N_BLINKS = 1000;         // blinks per cycle ("a thousand blinks")
+  var T_CYCLE = 75;            // full build / hold / clear loop, seconds
+  var T_BUILD = 58;            // deposits land across this span
+  var T_HOLD_END = 68;         // full field held until here
+  // 68..75: gentle clear (fade out), then the next cycle seed begins.
+  var FORCE_T = -1;            // QA hook: -1 = live clock, else fixed elapsed
+
+  // QA seed hook: ?seed=tNN pins the elapsed time (used by the headless
+  // renderer to inspect later phases). Inert in normal viewing.
+  try {
+    if (typeof location !== 'undefined' && location.search) {
+      var qm = /[?&]seed=t([0-9]+(?:\.[0-9]+)?)/.exec(location.search);
+      if (qm) FORCE_T = parseFloat(qm[1]);
+    }
+  } catch (e) { /* live mode */ }
+
+  // Seeded RNG (mulberry32). Every blink in a cycle derives from that
+  // cycle's seed, so any frame is reproducible byte for byte.
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+  function smooth(u) { return u * u * (3 - 2 * u); }
+
+  // ---- Blink schedule (the accumulation layer) --------------------------
+  // There is no offscreen canvas: the accumulated field IS this schedule.
+  // For each cycle we precompute the full blink list: deposit time,
+  // origin on the Lissajous wander at that moment, fan base angle, tone,
+  // and per-stroke angle/length. A frame draws every blink whose deposit
+  // time has passed, with the hold/clear envelope applied: a pure
+  // function of cycle time, identical in the browser and the renderer.
+  var cache = { key: -1, blinks: null, wa: 0, wb: 0, pa: 0, pb: 0 };
+
+  function buildCycle(cycleIdx) {
+    var seed = (BASE_SEED + Math.imul(cycleIdx + 1, 7919)) | 0;
+    var rng = mulberry32(seed);
+    // Lissajous wander for this cycle: slow, incommensurate periods.
+    var wa = (Math.PI * 2) / (47 + rng() * 14);   // ~47-61 s
+    var wb = (Math.PI * 2) / (31 + rng() * 12);   // ~31-43 s
+    var pa = rng() * Math.PI * 2;
+    var pb = rng() * Math.PI * 2;
+    var blinks = [];
+    for (var i = 0; i < N_BLINKS; i++) {
+      var u = (i + 0.15 + rng() * 0.7) / N_BLINKS;
+      var t = 0.4 + T_BUILD * Math.pow(u, 0.9);   // first blink just after 0
+      var ox = 0.5 + 0.355 * Math.sin(wa * t + pa);
+      var oy = 0.5 + 0.33 * Math.sin(wb * t + pb);
+      var n = 8 + Math.floor(rng() * 7);          // 8-14 strokes per fan
+      var strokes = [];
+      var spread = 1.25 + rng() * 0.55;           // fan width, radians
+      for (var k = 0; k < n; k++) {
+        var frac = n === 1 ? 0.5 : k / (n - 1);
+        strokes.push({
+          da: (frac - 0.5) * spread + (rng() - 0.5) * 0.14,
+          ln: 0.55 + rng() * 0.75                 // fraction of base length
+        });
+      }
+      blinks.push({
+        t: t, x: ox, y: oy,
+        // Seeded scatter around the wander point: the wand presses and
+        // drifts a little at each blink, so fans distribute into a field
+        // instead of stacking on the Lissajous curve itself. (Fractions
+        // of the smaller canvas dimension, applied at draw time.)
+        jx: (rng() * 2 - 1) * 0.095,
+        jy: (rng() * 2 - 1) * 0.095,
+        base: rng() * Math.PI * 2,
+        soft: rng() < 0.28,                       // some kisses softer
+        strokes: strokes
+      });
+    }
+    blinks.sort(function (a, b) { return a.t - b.t; });
+    cache = { key: cycleIdx, blinks: blinks, wa: wa, wb: wb, pa: pa, pb: pb };
+  }
+
+  // ---- View -------------------------------------------------------------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0, DPR = 1, PHONE = false;
+
+  function viewSize() {
+    var w, h;
+    if (typeof window !== 'undefined' && window.visualViewport &&
+        window.visualViewport.width) {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    } else if (typeof window !== 'undefined' && window.innerWidth) {
+      w = window.innerWidth; h = window.innerHeight;
+    } else { w = 800; h = 600; }
+    return { w: w, h: h };
+  }
+
+  function resize() {
+    var s = viewSize();
+    W = s.w; H = s.h;
+    DPR = 1;
+    if (typeof window !== 'undefined' && window.devicePixelRatio) {
+      DPR = clamp(window.devicePixelRatio, 1, 2);
+    }
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    // Phone detection: physical screen size first (min dimension < 700),
+    // tall-aspect as the fallback signal only.
+    var smin = 100000;
+    if (typeof window !== 'undefined' && window.screen &&
+        window.screen.width && window.screen.height) {
+      smin = Math.min(window.screen.width, window.screen.height);
+    }
+    PHONE = (smin < 700) || (H > W * 1.15 && smin === 100000);
+  }
+
+  // ---- Interaction: tap reseeds ------------------------------------------
+  // A tap starts a fresh cycle at once: new seed, new wander path. The
+  // epoch and its anchored start time are the only state; every frame is
+  // still a pure function of (epoch, elapsed).
+  var epoch = 0;
+  var epochT0 = 0;               // anchored-clock time the epoch began
+
+  // ---- Draw ---------------------------------------------------------------
+  function draw(tAbs) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+    // The warm field, edge to edge.
+    ctx.fillStyle = FIELD;
+    ctx.globalAlpha = 1;
+    ctx.fillRect(0, 0, W, H);
+
+    // Vignette: flat layered border bands in the vignette tone, deepening
+    // toward the edges. No gradients anywhere in this piece.
+    var band = Math.max(2, Math.min(W, H) * 0.014);
+    ctx.strokeStyle = VIG;
+    ctx.globalAlpha = 0.38;
+    ctx.lineWidth = band;
+    for (var v = 0; v < 6; v++) {
+      var inset = band * (v + 0.5);
+      ctx.strokeRect(inset, inset, W - inset * 2, H - inset * 2);
+    }
+    ctx.globalAlpha = 1;
+
+    // Cycle position from the epoch-anchored clock.
+    var t = tAbs - epochT0;
+    if (t < 0) t = 0;
+    var cycleIdx = epoch * 100000 + Math.floor(t / T_CYCLE);
+    var lt = t - Math.floor(t / T_CYCLE) * T_CYCLE;
+    if (cache.key !== cycleIdx) buildCycle(cycleIdx);
+
+    // Clear envelope: full through the hold, then a gentle fade.
+    var clearA = 1;
+    if (lt > T_HOLD_END) clearA = 1 - smooth((lt - T_HOLD_END) / (T_CYCLE - T_HOLD_END));
+    if (clearA <= 0) return;
+
+    var S = Math.min(W, H);
+    var baseLen = S * (PHONE ? 0.024 : 0.02);
+    var baseWid = Math.max(0.8, S * 0.0026);
+
+    // Batch strokes by tone and by quantised alpha (per-blink fade-in),
+    // so the whole field costs a handful of fills, not thousands.
+    var NB = 16;                 // alpha buckets
+    var paths = {};              // key tone*NB+bucket -> path point list
+    var blinks = cache.blinks;
+    for (var i = 0; i < blinks.length; i++) {
+      var b = blinks[i];
+      if (b.t > lt) break;       // schedule is time-sorted
+      var fade = clamp((lt - b.t) / 0.35, 0, 1);   // the kiss lands softly
+      var a = fade * clearA;
+      if (a <= 0.01) continue;
+      var bucket = Math.round(a * (NB - 1));
+      var key = (b.soft ? 1 : 0) * NB + bucket;
+      var arr = paths[key];
+      if (!arr) { arr = []; paths[key] = arr; }
+      var ox = b.x * W + b.jx * S, oy = b.y * H + b.jy * S;
+      for (var k = 0; k < b.strokes.length; k++) {
+        var st = b.strokes[k];
+        var ang = b.base + st.da;
+        var len = st.ln * baseLen;
+        var dx = Math.cos(ang), dy = Math.sin(ang);
+        var px = -dy * baseWid * 0.5, py = dx * baseWid * 0.5;
+        // One tapered stroke: a thin triangle, base at the origin,
+        // point at the tip.
+        arr.push(ox + px, oy + py, ox + dx * len, oy + dy * len, ox - px, oy - py);
+      }
+    }
+    for (var key2 in paths) {
+      var kk = parseInt(key2, 10);
+      var softTone = kk >= NB;
+      var bk = softTone ? kk - NB : kk;
+      if (bk === 0) continue;    // alpha 0: fully faded, skip the fill
+      ctx.fillStyle = softTone ? SOFT : MARK;
+      ctx.globalAlpha = (bk / (NB - 1)) * (softTone ? 1 : 0.9);
+      var pts = paths[key2];
+      ctx.beginPath();
+      for (var j = 0; j < pts.length; j += 6) {
+        ctx.moveTo(pts[j], pts[j + 1]);
+        ctx.lineTo(pts[j + 2], pts[j + 3]);
+        ctx.lineTo(pts[j + 4], pts[j + 5]);
+        ctx.closePath();
+      }
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---- Clock, pointer, boot ----------------------------------------------
+  var startStamp = -1;
+  function nowSec() {
+    if (FORCE_T >= 0) return FORCE_T;
+    if (typeof performance !== 'undefined' && performance.now) {
+      if (startStamp < 0) startStamp = performance.now();
+      return (performance.now() - startStamp) / 1000;
+    }
+    return 0;
+  }
+
+  function onTap() {
+    epoch++;
+    epochT0 = nowSec();
+    draw(nowSec());
+  }
+
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onTap);
+  }
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('resize', function () { resize(); draw(nowSec()); });
+  }
+  if (typeof window !== 'undefined' && window.visualViewport &&
+      window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () {
+      resize(); draw(nowSec());
+    });
+  }
+
+  resize();
+  draw(0); // frame one: the synchronous draw at t = 0, the empty warm field
+
+  if (FORCE_T >= 0) {
+    draw(FORCE_T);
+  } else if (typeof requestAnimationFrame === 'function') {
+    var tick = function () {
+      draw(nowSec());
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }
+})();
+</script>
+</body>
+</html>

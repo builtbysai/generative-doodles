@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Hair Mop</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #23211D;
+    overflow: hidden;
+    height: 100%;
+  }
+  canvas {
+    display: block;
+    touch-action: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ---------- seeded RNG (mulberry32) ----------
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- palette (strict) ----------
+  var COL_FLOOR = '#23211D';   // the gallery floor
+  var COL_DYE = '#0A0A0A';     // the dye itself, near black
+  var COL_SHEEN = '#1E1C18';   // wet gloss on fresh strokes
+  var COL_STRAND = '#1A120B';  // the strands of the mop
+  var COL_RESIDUE = '#171512'; // old dried residue in the floor
+
+  // ---------- constants ----------
+  var BASE_SEED = 71387;
+  var HOME = { x: 0.5, y: 0.58 };       // strand bundle home, normalized
+  var SEG_CAP = 4000;                    // live dye segments kept
+  var BAKE_BATCH = 1200;                 // oldest segments baked per overflow
+  var GRID = 48;                         // coverage / bake grid, GRID x GRID
+  var FADE_TAU = 120;                    // base dye fade time constant, seconds
+  var RINSE_LEN = 5;                     // rinse window, seconds
+  var RINSE_MULT = 3;                    // fade speed multiplier while rinsing
+  var BACKOUT_AT = 0.40;                 // dyed fraction where backing-out starts
+
+  // ---------- state ----------
+  var W = 0, H = 0;
+  var isPhone = false;
+  var strands = [];        // per-strand seeded variation
+  var mottling = [];       // seeded static floor residue spots, normalized
+  var handleSegs = [];     // spring segments for the invisible handle {t0,fx,fy,tx,ty}
+  var dyeSegs = [];        // live dye segments {x1,y1,x2,y2,t} normalized
+  var rinses = [];         // rinse event times
+  var bakeGrid = null;     // GRID*GRID {v, t} baked dye per cell
+  var coverGrid = null;    // GRID*GRID {v, t} all dye ever laid, per cell
+  var isDown = false;
+  var downT = 0, downX = 0, downY = 0, maxExcursion = 0;
+  var lastTips = null;     // last recorded strand tips (px) while dragging
+
+  var bootTime = (typeof performance !== 'undefined' && performance.now)
+    ? performance.now() : 0;
+
+  function elapsed() {
+    if (typeof performance !== 'undefined' && performance.now) {
+      return (performance.now() - bootTime) / 1000;
+    }
+    return 0;
+  }
+
+  // ---------- fade model ----------
+  // Dye laid at time a has strength fade(a, t) at time t: a slow exponential
+  // base fade, running RINSE_MULT times faster during each rinse window.
+  // A pure function of the recorded rinse events.
+  function fade(a, t) {
+    if (t <= a) return 1;
+    var amount = (t - a) / FADE_TAU;
+    for (var i = 0; i < rinses.length; i++) {
+      var r0 = Math.max(a, rinses[i]);
+      var r1 = Math.min(t, rinses[i] + RINSE_LEN);
+      if (r1 > r0) amount += (RINSE_MULT - 1) * (r1 - r0) / FADE_TAU;
+    }
+    return Math.exp(-amount);
+  }
+
+  // ---------- layout ----------
+  function fit() {
+    var vv = window.visualViewport;
+    W = vv ? vv.width : window.innerWidth;
+    H = vv ? vv.height : window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+    var sw = 0, sh = 0;
+    if (window.screen) { sw = window.screen.width || 0; sh = window.screen.height || 0; }
+    isPhone = (Math.min(sw, sh) > 0 && Math.min(sw, sh) < 700) || (H > W * 1.15);
+  }
+
+  function newGrid() {
+    var g = new Array(GRID * GRID);
+    for (var i = 0; i < g.length; i++) g[i] = { v: 0, t: 0 };
+    return g;
+  }
+
+  // ---------- strands ----------
+  // Each strand: a seeded fan direction (mostly downward, like a mop head
+  // resting on the floor), a length, a spring lag, a sway phase, and a gloss
+  // flag. Everything is a fraction or a time, so resizes never re-roll.
+  function buildStrands() {
+    var rnd = mulberry32(BASE_SEED);
+    var count = isPhone ? 40 : 52;
+    strands = [];
+    for (var i = 0; i < count; i++) {
+      var spread = (i / (count - 1)) * 2 - 1;      // -1 .. 1 across the fan
+      var ang = Math.PI / 2 + spread * 1.05 + (rnd() - 0.5) * 0.35;
+      strands.push({
+        fx: Math.cos(ang),
+        fy: Math.sin(ang),
+        len: 0.11 + rnd() * 0.075 + Math.abs(spread) * -0.02, // fraction of min(W,H)
+        lag: 0.04 + rnd() * 0.38,
+        phase: rnd() * Math.PI * 2,
+        swayAmp: 0.04 + rnd() * 0.05,
+        gloss: rnd() < 0.3
+      });
+    }
+    // Static residue mottling: faint dried patches that were always there.
+    mottling = [];
+    for (var j = 0; j < 240; j++) {
+      mottling.push({
+        x: rnd(), y: rnd(),
+        r: 0.012 + rnd() * 0.05,
+        a: 0.03 + rnd() * 0.07,
+        sheen: rnd() < 0.18
+      });
+    }
+  }
+
+  // ---------- the invisible handle ----------
+  // The handle follows the pointer through a chain of underdamped spring
+  // segments in closed form (position-only response, as in No.709). Each
+  // recorded pointer sample starts a new segment from wherever the handle
+  // is at that instant. With no samples the handle rests at HOME, so the
+  // handle position at any time is a pure function of the recorded samples.
+  var SPRING_W = Math.PI * 2 / 0.6;   // ~0.6 s swing
+  var SPRING_Z = 0.30;
+
+  function handleAt(t) {
+    var seg = null;
+    for (var i = handleSegs.length - 1; i >= 0; i--) {
+      if (handleSegs[i].t0 <= t) { seg = handleSegs[i]; break; }
+    }
+    if (!seg) return { x: HOME.x, y: HOME.y };
+    var tau = t - seg.t0;
+    if (tau <= 0) return { x: seg.fx, y: seg.fy };
+    var wd = SPRING_W * Math.sqrt(1 - SPRING_Z * SPRING_Z);
+    var decay = Math.exp(-SPRING_Z * SPRING_W * tau);
+    var k = (Math.cos(wd * tau) + (SPRING_Z * SPRING_W / wd) * Math.sin(wd * tau)) * decay;
+    return {
+      x: seg.tx + (seg.fx - seg.tx) * k,
+      y: seg.ty + (seg.fy - seg.ty) * k
+    };
+  }
+
+  function startHandleSegment(t, tx, ty) {
+    var cur = handleAt(t);
+    handleSegs.push({ t0: t, fx: cur.x, fy: cur.y, tx: tx, ty: ty });
+    if (handleSegs.length > 400) {
+      // Keep the recent history (strand lags reach back < 0.5 s) plus one
+      // anchor segment so handleAt stays defined for earlier times.
+      var cut = handleSegs.length - 200;
+      handleSegs = [handleSegs[cut - 1]].concat(handleSegs.slice(cut));
+    }
+  }
+
+  // ---------- strand tips ----------
+  // Tip of strand s at time t: the handle position lagged by s.lag, plus the
+  // strand's fan vector (slowly swaying) scaled by its length. At rest the
+  // handle is HOME, so the bundle fans out from home and sways gently.
+  function tipAt(s, t, out) {
+    var h = handleAt(t - s.lag);
+    var sway = s.swayAmp * Math.sin(t * 0.55 + s.phase);
+    var cs = Math.cos(sway), sn = Math.sin(sway);
+    var rx = s.fx * cs - s.fy * sn;
+    var ry = s.fx * sn + s.fy * cs;
+    var m = Math.min(W, H);
+    out.x = h.x * W + rx * s.len * m;
+    out.y = h.y * H + ry * s.len * m;
+    return out;
+  }
+
+  function midAt(s, t, out) {
+    var h = handleAt(t - s.lag * 0.55);
+    var sway = s.swayAmp * Math.sin(t * 0.55 + s.phase);
+    var cs = Math.cos(sway), sn = Math.sin(sway);
+    var rx = s.fx * cs - s.fy * sn;
+    var ry = s.fx * sn + s.fy * cs;
+    var m = Math.min(W, H);
+    out.x = h.x * W + rx * s.len * m * 0.45;
+    out.y = h.y * H + ry * s.len * m * 0.45;
+    return out;
+  }
+
+  // ---------- dye bookkeeping ----------
+  function cellIndex(x, y) {
+    var cx = Math.floor(x * GRID), cy = Math.floor(y * GRID);
+    if (cx < 0) cx = 0; if (cx >= GRID) cx = GRID - 1;
+    if (cy < 0) cy = 0; if (cy >= GRID) cy = GRID - 1;
+    return cy * GRID + cx;
+  }
+
+  // Add dye to a grid cell at time t: decay the stored value to t first,
+  // then accumulate (capped), so every cell carries its own fade anchor.
+  function gridAdd(grid, x, y, amount, t) {
+    var c = grid[cellIndex(x, y)];
+    c.v = Math.min(6, c.v * fade(c.t, t) + amount);
+    c.t = t;
+  }
+
+  function recordSegment(x1, y1, x2, y2, t) {
+    dyeSegs.push({ x1: x1, y1: y1, x2: x2, y2: y2, t: t });
+    // Coverage follows the segment: a few samples along its length.
+    var steps = 3;
+    for (var i = 0; i <= steps; i++) {
+      var f = i / steps;
+      gridAdd(coverGrid, x1 + (x2 - x1) * f, y1 + (y2 - y1) * f, 0.55, t);
+    }
+    if (dyeSegs.length > SEG_CAP) bakeOldest(t);
+  }
+
+  // Baking: the oldest live segments leave the segment list and their dye
+  // moves into the coarse bake grid, drawn as flat cell rects. Their
+  // coverage contribution stays in coverGrid (it was added at record time).
+  function bakeOldest(t) {
+    var n = Math.min(BAKE_BATCH, dyeSegs.length);
+    for (var i = 0; i < n; i++) {
+      var s = dyeSegs[i];
+      var steps = 3;
+      for (var j = 0; j <= steps; j++) {
+        var f = j / steps;
+        gridAdd(bakeGrid, s.x1 + (s.x2 - s.x1) * f, s.y1 + (s.y2 - s.y1) * f, 0.55, t);
+      }
+    }
+    dyeSegs.splice(0, n);
+  }
+
+  // ---------- coverage and the backing-out drift ----------
+  // The dyed fraction and centroid come from coverGrid, each cell's value
+  // decayed to time t. Past ~40% dyed, the whole floor content drifts a
+  // few pixels away from the dyed centroid: the room backing out.
+  function contentOffset(t) {
+    var total = GRID * GRID;
+    var dyed = 0, wx = 0, wy = 0, wsum = 0;
+    for (var i = 0; i < total; i++) {
+      var c = coverGrid[i];
+      if (!c.v) continue;
+      var eff = c.v * fade(c.t, t);
+      if (eff > 0.35) {
+        dyed++;
+        var cx = (i % GRID + 0.5) / GRID, cy = (Math.floor(i / GRID) + 0.5) / GRID;
+        wx += cx * eff; wy += cy * eff; wsum += eff;
+      }
+    }
+    var frac = dyed / total;
+    if (frac <= BACKOUT_AT || wsum <= 0) return { x: 0, y: 0 };
+    var gx = wx / wsum, gy = wy / wsum;
+    var dx = 0.5 - gx, dy = 0.5 - gy;
+    var d = Math.sqrt(dx * dx + dy * dy);
+    if (d < 0.01) { dx = 0; dy = -1; d = 1; }
+    var mag = Math.min(1, (frac - BACKOUT_AT) / 0.35) * Math.min(W, H) * 0.02;
+    return { x: (dx / d) * mag, y: (dy / d) * mag };
+  }
+
+  // ---------- painting while dragging ----------
+  // On each frame while the pointer is down, strand tips that have moved
+  // lay a dye segment from their last recorded position. Tips are pure
+  // functions of the recorded samples, so the painted layer is too.
+  var tmpTip = { x: 0, y: 0 };
+  function paintStep(t) {
+    if (!isDown) { lastTips = null; return; }
+    var i, s;
+    if (!lastTips) {
+      lastTips = [];
+      for (i = 0; i < strands.length; i++) {
+        tipAt(strands[i], t, tmpTip);
+        lastTips.push({ x: tmpTip.x, y: tmpTip.y });
+      }
+      return;
+    }
+    var minMove = Math.min(W, H) * 0.0022;
+    for (i = 0; i < strands.length; i++) {
+      s = strands[i];
+      tipAt(s, t, tmpTip);
+      var lx = lastTips[i].x, ly = lastTips[i].y;
+      var dx = tmpTip.x - lx, dy = tmpTip.y - ly;
+      if (dx * dx + dy * dy > minMove * minMove) {
+        recordSegment(lx / W, ly / H, tmpTip.x / W, tmpTip.y / H, t);
+        lastTips[i].x = tmpTip.x;
+        lastTips[i].y = tmpTip.y;
+      }
+    }
+  }
+
+  // ---------- draw ----------
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+
+    ctx.fillStyle = COL_FLOOR;
+    ctx.fillRect(0, 0, W, H);
+
+    paintStep(t);
+    var off = contentOffset(t);
+
+    ctx.save();
+    ctx.translate(off.x, off.y);
+
+    var i, j, c, eff;
+
+    // Dried residue that was always in the floor.
+    for (i = 0; i < mottling.length; i++) {
+      var mo = mottling[i];
+      ctx.fillStyle = mo.sheen ? COL_SHEEN : COL_RESIDUE;
+      ctx.globalAlpha = mo.a;
+      ctx.beginPath();
+      ctx.arc(mo.x * W, mo.y * H, mo.r * Math.min(W, H), 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // Baked dye: coarse cells as flat rects, alpha by decayed strength.
+    ctx.fillStyle = COL_DYE;
+    var cw = W / GRID, ch = H / GRID;
+    for (j = 0; j < GRID; j++) {
+      for (i = 0; i < GRID; i++) {
+        c = bakeGrid[j * GRID + i];
+        if (!c.v) continue;
+        eff = c.v * fade(c.t, t);
+        if (eff < 0.04) continue;
+        ctx.globalAlpha = Math.min(0.55, 0.14 * eff);
+        ctx.fillRect(i * cw - 0.5, j * ch - 0.5, cw + 1, ch + 1);
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    // Live dye segments: near-black strokes at low alpha; overlaps deepen.
+    if (dyeSegs.length) {
+      ctx.strokeStyle = COL_DYE;
+      ctx.lineCap = 'round';
+      ctx.lineWidth = Math.max(1.6, Math.min(W, H) * 0.0048);
+      for (i = 0; i < dyeSegs.length; i++) {
+        var sg = dyeSegs[i];
+        var a = 0.14 * fade(sg.t, t);
+        if (a < 0.004) continue;
+        ctx.globalAlpha = a;
+        ctx.beginPath();
+        ctx.moveTo(sg.x1 * W, sg.y1 * H);
+        ctx.lineTo(sg.x2 * W, sg.y2 * H);
+        ctx.stroke();
+      }
+      // Wet sheen: the freshest strokes catch a gloss pass, thinner and
+      // in the sheen tone, fading over their first second.
+      ctx.strokeStyle = COL_SHEEN;
+      ctx.lineWidth = Math.max(1, Math.min(W, H) * 0.0022);
+      for (i = 0; i < dyeSegs.length; i++) {
+        var sf = dyeSegs[i];
+        var age = t - sf.t;
+        if (age < 0 || age > 1) continue;
+        ctx.globalAlpha = 0.22 * (1 - age) * fade(sf.t, t);
+        ctx.beginPath();
+        ctx.moveTo(sf.x1 * W, sf.y1 * H);
+        ctx.lineTo(sf.x2 * W, sf.y2 * H);
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    // The strands themselves: hair-fine curves from the handle point
+    // through a lagged mid to the lagged tip. Gloss strands get a second,
+    // offset sheen pass.
+    var root = handleAt(t);
+    var rx = root.x * W, ry = root.y * H;
+    var mid = { x: 0, y: 0 }, tip = { x: 0, y: 0 };
+    ctx.lineCap = 'round';
+    for (i = 0; i < strands.length; i++) {
+      var st = strands[i];
+      midAt(st, t, mid);
+      tipAt(st, t, tip);
+      ctx.strokeStyle = COL_STRAND;
+      ctx.globalAlpha = 0.88;
+      ctx.lineWidth = Math.max(1, Math.min(W, H) * 0.0016);
+      ctx.beginPath();
+      ctx.moveTo(rx, ry);
+      ctx.quadraticCurveTo(mid.x, mid.y, tip.x, tip.y);
+      ctx.stroke();
+      if (st.gloss) {
+        ctx.strokeStyle = COL_SHEEN;
+        ctx.globalAlpha = 0.35;
+        ctx.beginPath();
+        ctx.moveTo(rx + 0.8, ry);
+        ctx.quadraticCurveTo(mid.x + 0.8, mid.y, tip.x + 0.8, tip.y);
+        ctx.stroke();
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    ctx.restore();
+  }
+
+  // ---------- pointer events ----------
+  function evtPos(e) {
+    return { x: e.clientX / W, y: e.clientY / H };
+  }
+
+  canvas.addEventListener('pointerdown', function (e) {
+    var p = evtPos(e);
+    var t = elapsed();
+    isDown = true;
+    downT = t; downX = p.x; downY = p.y; maxExcursion = 0;
+    lastTips = null; // first drag frame re-anchors tips; no streaks
+    startHandleSegment(t, p.x, p.y);
+  });
+
+  canvas.addEventListener('pointermove', function (e) {
+    if (!isDown) return;
+    var p = evtPos(e);
+    var t = elapsed();
+    var dx = p.x - downX, dy = p.y - downY;
+    var exc = Math.sqrt(dx * dx + dy * dy);
+    if (exc > maxExcursion) maxExcursion = exc;
+    // Start a new spring segment only when the target has actually moved,
+    // so the segment chain stays short.
+    var last = handleSegs[handleSegs.length - 1];
+    if (!last || Math.abs(p.x - last.tx) > 0.002 || Math.abs(p.y - last.ty) > 0.002) {
+      startHandleSegment(t, p.x, p.y);
+    }
+  });
+
+  function endPointer() {
+    if (!isDown) return;
+    var t = elapsed();
+    isDown = false;
+    lastTips = null;
+    var quick = t - downT < 0.3;
+    var still = maxExcursion < 8 / Math.min(W, H);
+    if (quick && still) {
+      // TAP = rinse: record the rinse (dye fades at 3x speed for a few
+      // seconds, a pure function of this event) and send the strands home.
+      rinses.push(t);
+      startHandleSegment(t, HOME.x, HOME.y);
+    }
+    // Otherwise the handle simply stays where the drag left it; the
+    // strands settle around it. No reload, ever.
+  }
+
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', endPointer);
+  canvas.addEventListener('pointerleave', function () {
+    if (isDown) endPointer();
+  });
+
+  // ---------- boot ----------
+  function onResize() {
+    fit();
+    draw(elapsed());
+  }
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', onResize);
+  }
+  window.addEventListener('resize', onResize);
+
+  fit();
+  bakeGrid = newGrid();
+  coverGrid = newGrid();
+  buildStrands();
+  draw(0); // frame one: synchronous, bare floor, bundle resting at home
+
+  if (typeof requestAnimationFrame === 'function') {
+    var loop = function () {
+      draw(elapsed());
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
