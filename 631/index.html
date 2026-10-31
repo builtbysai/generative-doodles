@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hold Your Line</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #232323; overflow: hidden; height: 100%; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="piece"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- Seeded RNG: mulberry32 ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(631076);
+
+  // ---------- Palette ----------
+  var GROUND = '#232323';
+  var PLAQUE = '#2E2E2E';
+  var GOLD = '#E8B93B';
+  var GRAY_BASE = [107, 107, 107]; // #6B6B6B
+  var INKS = ['#1E4D8C', '#E2725B', '#6A9A5B', '#7A4E8C', '#C9862E', '#F5F1E8', '#E87B9C'];
+  // Order: 0 thinker, 1 singer, 2 runner, 3 builder, 4 dreamer, 5 dancer, 6 writer
+
+  // ---------- Canvas / viewport ----------
+  var canvas = document.getElementById('piece');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0, DPR = 1;
+
+  function isPhone() {
+    var sw = 9999, sh = 9999;
+    if (typeof window !== 'undefined' && window.screen) {
+      sw = window.screen.width || 9999;
+      sh = window.screen.height || 9999;
+    }
+    if (Math.min(sw, sh) < 700) return true;
+    return H > W * 1.15;
+  }
+
+  function resize() {
+    var w = 0, h = 0;
+    if (typeof window !== 'undefined' && window.visualViewport) {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    }
+    if (!w || !h) { w = window.innerWidth; h = window.innerHeight; }
+    DPR = (typeof window !== 'undefined' && window.devicePixelRatio) ? window.devicePixelRatio : 1;
+    W = w; H = h;
+    canvas.width = Math.round(w * DPR);
+    canvas.height = Math.round(h * DPR);
+  }
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', function () { resize(); draw(currentT); });
+    }
+    window.addEventListener('resize', function () { resize(); draw(currentT); });
+  }
+
+  // ---------- Storm particles (seeded starts; position is a pure function of t) ----------
+  var N_PART = 300;
+  var parts = [];
+  (function buildParticles() {
+    var r = mulberry32(90210);
+    for (var i = 0; i < N_PART; i++) {
+      parts.push({
+        x0: r(),                 // start x in [0,1] of extended track
+        y0: 0.03 + r() * 0.94,   // lane height fraction
+        speed: 0.055 + r() * 0.11, // fraction of track per second
+        len: 0.012 + r() * 0.035,  // streak length (fraction of W)
+        arrow: r() < 0.4,          // arrowhead or plain streak
+        strength: 0.45 + r() * 0.75, // gray strength multiplier
+        turbAmp: 0.004 + r() * 0.014, // vertical turbulence amplitude (fraction of H)
+        turbFreq: 0.5 + r() * 1.6,
+        turbPhase: r() * Math.PI * 2,
+        thick: 1 + r() * 1.6
+      });
+    }
+  })();
+
+  function partPos(p, t, w, h) {
+    var track = 1.25; // extended so particles wrap off both edges
+    var fx = ((p.x0 + p.speed * t) % track) - 0.125;
+    var x = fx * w;
+    var y = p.y0 * h + Math.sin(t * p.turbFreq + p.turbPhase + fx * 5.0) * p.turbAmp * h;
+    return { x: x, y: y };
+  }
+
+  // Shield deflection: push a point radially out of the shield disc.
+  // Returns the displaced point; pure function of inputs.
+  function deflect(x, y, sh) {
+    if (!sh || sh.strength <= 0.001) return { x: x, y: y };
+    var dx = x - sh.x, dy = y - sh.y;
+    var d2 = dx * dx + dy * dy;
+    var r = sh.r * (0.35 + 0.65 * sh.strength);
+    if (d2 >= r * r) return { x: x, y: y };
+    var d = Math.sqrt(d2);
+    if (d < 0.001) { dx = 1; dy = 0; d = 1; }
+    var push = (r - d) * 1.15 * sh.strength;
+    return { x: x + (dx / d) * push, y: y + (dy / d) * push };
+  }
+
+  function insideShield(x, y, sh) {
+    if (!sh || sh.strength <= 0.35) return false;
+    var dx = x - sh.x, dy = y - sh.y;
+    return (dx * dx + dy * dy) < sh.r * sh.r;
+  }
+
+  // ---------- Portraits ----------
+  function portraitCenters(w, h) {
+    var cy = h * 0.52;
+    var out = [];
+    for (var i = 0; i < 7; i++) out.push({ x: (i + 0.5) * w / 7, y: cy });
+    return out;
+  }
+  function portraitUnit(w, h) {
+    // figure scale unit; smaller on phones but still seven across
+    return Math.min(w / 7, h * 0.62) * 0.30;
+  }
+
+  // Flicker model: local storm density at portrait i, analytic and seeded.
+  // density in [0,1]; alpha in [0.45, 0.97] so a portrait is never erased.
+  var flickSeed = [];
+  (function () { var r = mulberry32(4711); for (var i = 0; i < 7; i++) flickSeed.push(r() * 100); })();
+  function stormDensity(i, t) {
+    var s = flickSeed[i];
+    var d = 0.5
+      + 0.28 * Math.sin(t * 1.7 + s)
+      + 0.22 * Math.sin(t * 3.9 + s * 1.7)
+      + 0.14 * Math.sin(t * 8.3 + s * 0.6);
+    if (d < 0) d = 0; if (d > 1) d = 1;
+    return d;
+  }
+  function flickerAlpha(i, t) {
+    var d = stormDensity(i, t);
+    return 0.97 - 0.52 * d; // 0.45 .. 0.97
+  }
+
+  // ----- Figure drawing helpers (local coords, unit u; figure spans about -1.6u..1.9u vertically) -----
+  function line(x1, y1, x2, y2, wdt) {
+    ctx.lineWidth = wdt; ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+  }
+  function circle(x, y, r) { ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill(); }
+  function ellipse(x, y, rx, ry) { ctx.beginPath(); ctx.ellipse(x, y, rx, ry, 0, 0, Math.PI * 2); ctx.fill(); }
+  function body(u) { // shared torso: rounded trapezoid blob
+    ctx.beginPath();
+    ctx.moveTo(-0.52 * u, 1.55 * u);
+    ctx.quadraticCurveTo(-0.55 * u, 0.55 * u, -0.30 * u, 0.28 * u);
+    ctx.lineTo(0.30 * u, 0.28 * u);
+    ctx.quadraticCurveTo(0.55 * u, 0.55 * u, 0.52 * u, 1.55 * u);
+    ctx.closePath(); ctx.fill();
+  }
+
+  var FIGURES = [
+    function thinker(u) { // big head, hand to chin
+      circle(0, -0.55 * u, 0.78 * u);
+      body(u);
+      ctx.strokeStyle = ctx.fillStyle;
+      line(0.30 * u, 1.0 * u, 0.62 * u, 0.30 * u, 0.30 * u);   // forearm up
+      line(0.62 * u, 0.30 * u, 0.18 * u, -0.08 * u, 0.28 * u); // hand to chin
+      circle(0.18 * u, -0.08 * u, 0.17 * u);
+    },
+    function singer(u) { // head with open oval mouth
+      circle(0, -0.62 * u, 0.62 * u);
+      body(u);
+      ctx.save();
+      ctx.fillStyle = PLAQUE;
+      ellipse(0.05 * u, -0.42 * u, 0.16 * u, 0.24 * u); // the open mouth (unfilled note)
+      ctx.restore();
+      line(-0.45 * u, 0.9 * u, -0.85 * u, 0.25 * u, 0.26 * u); // arm raised
+    },
+    function runner(u) { // mid-stride diagonal limbs
+      circle(0.28 * u, -0.78 * u, 0.5 * u);
+      ctx.save(); ctx.rotate(-0.18);
+      body(u);
+      ctx.restore();
+      ctx.strokeStyle = ctx.fillStyle;
+      line(0.05 * u, 1.35 * u, 0.95 * u, 1.75 * u, 0.30 * u);  // front leg extended
+      line(0.0 * u, 1.35 * u, -0.75 * u, 1.95 * u, 0.30 * u); // back leg trailing
+      line(-0.3 * u, 0.6 * u, -0.95 * u, 1.05 * u, 0.26 * u); // arm back
+      line(0.3 * u, 0.6 * u, 0.9 * u, 0.15 * u, 0.26 * u);    // arm forward
+    },
+    function builder(u) { // holding a horizontal beam
+      circle(0, -0.40 * u, 0.55 * u);
+      body(u);
+      ctx.fillRect(-1.05 * u, -1.50 * u, 2.1 * u, 0.30 * u); // the beam
+      ctx.strokeStyle = ctx.fillStyle;
+      line(-0.35 * u, 0.7 * u, -0.72 * u, -1.28 * u, 0.26 * u);
+      line(0.35 * u, 0.7 * u, 0.72 * u, -1.28 * u, 0.26 * u);
+    },
+    function dreamer(u) { // tilted head, closed-eye arcs
+      ctx.save(); ctx.translate(0.08 * u, -0.55 * u); ctx.rotate(0.28);
+      circle(0, 0, 0.60 * u);
+      ctx.strokeStyle = PLAQUE; ctx.lineWidth = 0.09 * u;
+      ctx.beginPath(); ctx.arc(-0.22 * u, -0.02 * u, 0.13 * u, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke();
+      ctx.beginPath(); ctx.arc(0.24 * u, -0.02 * u, 0.13 * u, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke();
+      ctx.restore();
+      body(u);
+    },
+    function dancer(u) { // one arm up, skirt triangle
+      circle(0, -0.72 * u, 0.5 * u);
+      ctx.strokeStyle = ctx.fillStyle;
+      line(-0.25 * u, 0.15 * u, -0.75 * u, -0.85 * u, 0.26 * u); // arm up
+      line(0.25 * u, 0.15 * u, 0.7 * u, 0.55 * u, 0.26 * u);     // arm out
+      ctx.beginPath(); // skirt
+      ctx.moveTo(0, 0.05 * u); ctx.lineTo(-0.78 * u, 1.25 * u); ctx.lineTo(0.78 * u, 1.25 * u);
+      ctx.closePath(); ctx.fill();
+      line(0.1 * u, 1.25 * u, 0.3 * u, 1.95 * u, 0.26 * u);  // leg
+      line(-0.15 * u, 1.25 * u, -0.5 * u, 1.9 * u, 0.26 * u);
+    },
+    function writer(u) { // holding a pen diagonal
+      circle(0, -0.6 * u, 0.56 * u);
+      body(u);
+      ctx.strokeStyle = ctx.fillStyle;
+      line(0.3 * u, 0.85 * u, 0.72 * u, 0.45 * u, 0.26 * u); // forearm
+      ctx.save(); ctx.translate(0.72 * u, 0.45 * u); ctx.rotate(-0.7);
+      ctx.beginPath(); // pen: long tapering triangle
+      ctx.moveTo(0, -0.09 * u); ctx.lineTo(0.95 * u, 0); ctx.lineTo(0, 0.09 * u);
+      ctx.closePath(); ctx.fill();
+      ctx.restore();
+    }
+  ];
+
+  // ---------- Interaction state ----------
+  var shield = { x: 0, y: 0, r: 0, strength: 0, active: false };
+  var pointerDown = false;
+  var defianceUntil = -1; // anchored-time end of the defiance breath
+  var lastTapT = -10, lastTapX = 0, lastTapY = 0;
+
+  // QA hooks (used only by throwaway forced-state renders; inert in normal use)
+  var QA_FORCE = (typeof location !== 'undefined' && location.search) ? location.search : '';
+
+  function nowA() { return currentT; }
+
+  function onDown(x, y, t) {
+    pointerDown = true;
+    shield.x = x; shield.y = y; shield.active = true;
+    // double-tap detection: second quick tap near the first
+    if (t - lastTapT < 0.35 && Math.abs(x - lastTapX) < 60 && Math.abs(y - lastTapY) < 60) {
+      defianceUntil = t + 2.5;
+      lastTapT = -10;
+    } else {
+      lastTapT = t; lastTapX = x; lastTapY = y;
+    }
+  }
+  function onMove(x, y) {
+    if (pointerDown) { shield.x = x; shield.y = y; shield.active = true; }
+  }
+  function onUp() { pointerDown = false; shield.active = false; }
+
+  function evPos(e) {
+    var r = { left: 0, top: 0 };
+    if (canvas.getBoundingClientRect) r = canvas.getBoundingClientRect();
+    var cx = (e.clientX !== undefined) ? e.clientX : (e.touches && e.touches[0] ? e.touches[0].clientX : 0);
+    var cy = (e.clientY !== undefined) ? e.clientY : (e.touches && e.touches[0] ? e.touches[0].clientY : 0);
+    return { x: cx - r.left, y: cy - r.top };
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', function (e) { var p = evPos(e); onDown(p.x, p.y, nowA()); });
+    canvas.addEventListener('pointermove', function (e) { var p = evPos(e); onMove(p.x, p.y); });
+    canvas.addEventListener('pointerup', function () { onUp(); });
+    canvas.addEventListener('pointerleave', function () { onUp(); });
+    canvas.addEventListener('touchstart', function (e) { var p = evPos(e); onDown(p.x, p.y, nowA()); if (e.preventDefault) e.preventDefault(); }, { passive: false });
+    canvas.addEventListener('touchmove', function (e) { var p = evPos(e); onMove(p.x, p.y); if (e.preventDefault) e.preventDefault(); }, { passive: false });
+    canvas.addEventListener('touchend', function () { onUp(); });
+    canvas.addEventListener('mousedown', function (e) { var p = evPos(e); onDown(p.x, p.y, nowA()); });
+    canvas.addEventListener('mousemove', function (e) { var p = evPos(e); onMove(p.x, p.y); });
+    canvas.addEventListener('mouseup', function () { onUp(); });
+  }
+
+  // ---------- Draw ----------
+  var currentT = 0;
+
+  function draw(t) {
+    currentT = t;
+    if (!W || !H) resize();
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+
+    // ground
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = GROUND;
+    ctx.fillRect(0, 0, W, H);
+
+    var centers = portraitCenters(W, H);
+    var u = portraitUnit(W, H);
+    var phone = isPhone();
+    shield.r = W * 0.15;
+
+    // shield strength envelope: fast in while held, ~1 s dissolve on release
+    // (dt-free approximation driven by the anchored clock is handled in the loop;
+    //  here strength moves toward its target by a fixed step per frame call)
+    var target = shield.active ? 1 : 0;
+    if (shield.strength < target) shield.strength = Math.min(1, shield.strength + 0.08);
+    else if (shield.strength > target) shield.strength = Math.max(0, shield.strength - 0.03);
+
+    // QA forced state: shield parked over portrait index 3 at full strength
+    var sh = null;
+    if (QA_FORCE.indexOf('shield') >= 0) {
+      sh = { x: centers[3].x, y: centers[3].y, r: shield.r, strength: 1 };
+    } else if (shield.strength > 0.001) {
+      sh = { x: shield.x, y: shield.y, r: shield.r, strength: shield.strength };
+    }
+
+    var defiant = t < defianceUntil;
+    if (QA_FORCE.indexOf('defy') >= 0) defiant = true;
+
+    // which single portrait is protected: the one whose center lies inside the
+    // shield disc and nearest the shield center (the disc is wider than the
+    // portrait spacing, so two centers can fall inside; nearest wins, one only)
+    var protectedIdx = -1;
+    if (sh && sh.strength > 0.35) {
+      var bestD2 = Infinity;
+      for (var i = 0; i < 7; i++) {
+        if (insideShield(centers[i].x, centers[i].y, sh)) {
+          var ddx = centers[i].x - sh.x, ddy = centers[i].y - sh.y;
+          var dd2 = ddx * ddx + ddy * ddy;
+          if (dd2 < bestD2) { bestD2 = dd2; protectedIdx = i; }
+        }
+      }
+    }
+
+    // ---- shield glow (layered alpha, under the thread, over the ground) ----
+    if (sh) {
+      var layers = 6;
+      for (var L = layers; L >= 1; L--) {
+        ctx.globalAlpha = 0.05 * sh.strength;
+        ctx.fillStyle = GOLD;
+        ctx.beginPath();
+        ctx.arc(sh.x, sh.y, sh.r * (L / layers) * 1.25, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    // ---- golden thread: protected portrait down to the bottom edge ----
+    if (protectedIdx >= 0) {
+      var pc = centers[protectedIdx];
+      ctx.globalAlpha = 0.55 * sh.strength;
+      ctx.strokeStyle = GOLD;
+      ctx.lineWidth = Math.max(1.2, u * 0.07);
+      ctx.beginPath();
+      ctx.moveTo(pc.x, pc.y + u * 1.7);
+      ctx.bezierCurveTo(pc.x - u * 0.9, pc.y + (H - pc.y) * 0.45,
+                        pc.x + u * 0.6, H - (H - pc.y) * 0.30,
+                        pc.x, H);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+
+    // ---- plaques + portraits ----
+    var pw = Math.min(W / 7 * 0.86, H * 0.66);
+    var ph = pw * 1.18;
+    for (var j = 0; j < 7; j++) {
+      var c = centers[j];
+      // plaque
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = PLAQUE;
+      var px = c.x - pw / 2, py = c.y - ph / 2;
+      var rad = Math.min(10, pw * 0.08);
+      ctx.beginPath();
+      ctx.moveTo(px + rad, py);
+      ctx.lineTo(px + pw - rad, py); ctx.quadraticCurveTo(px + pw, py, px + pw, py + rad);
+      ctx.lineTo(px + pw, py + ph - rad); ctx.quadraticCurveTo(px + pw, py + ph, px + pw - rad, py + ph);
+      ctx.lineTo(px + rad, py + ph); ctx.quadraticCurveTo(px, py + ph, px, py + ph - rad);
+      ctx.lineTo(px, py + rad); ctx.quadraticCurveTo(px, py, px + rad, py);
+      ctx.closePath(); ctx.fill();
+
+      // figure alpha: protected or defiant = full and still; else flicker
+      var a;
+      if (defiant || j === protectedIdx) a = 1;
+      else if (t === 0) a = 0.75; // fixed mid-flicker first frame
+      else a = flickerAlpha(j, t);
+      ctx.save();
+      ctx.translate(c.x, c.y - u * 0.15);
+      ctx.globalAlpha = a;
+      ctx.fillStyle = INKS[j];
+      ctx.strokeStyle = INKS[j];
+      ctx.lineCap = 'round';
+      FIGURES[j](u);
+      ctx.restore();
+    }
+    ctx.globalAlpha = 1;
+
+    // ---- storm (drawn last so it crosses over the portraits) ----
+    for (var k = 0; k < N_PART; k++) {
+      var p = parts[k];
+      var pos = partPos(p, t, W, H);
+      // the storm parts around the shield: a particle whose head falls inside
+      // the shield disc is not drawn at all; near the rim it is pushed out
+      if (sh && sh.strength > 0.05) {
+        var sdx = pos.x - sh.x, sdy = pos.y - sh.y;
+        var sr = sh.r * (0.35 + 0.65 * sh.strength);
+        if (sdx * sdx + sdy * sdy < sr * sr) continue;
+      }
+      var dp = deflect(pos.x, pos.y, sh);
+      var lenPx = p.len * W * (phone ? 0.8 : 1);
+      var g = Math.round(107 * p.strength);
+      if (g < 30) g = 30; if (g > 190) g = 190;
+      ctx.strokeStyle = 'rgb(' + g + ',' + g + ',' + g + ')';
+      ctx.globalAlpha = 0.85;
+      ctx.lineWidth = p.thick * (phone ? 0.85 : 1);
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(dp.x - lenPx, dp.y);
+      ctx.lineTo(dp.x, dp.y);
+      if (p.arrow) { // small arrowhead pointing right (direction of the blow)
+        ctx.lineTo(dp.x - lenPx * 0.35, dp.y - lenPx * 0.22);
+        ctx.moveTo(dp.x, dp.y);
+        ctx.lineTo(dp.x - lenPx * 0.35, dp.y + lenPx * 0.22);
+      }
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- Boot: synchronous fixed-phase first frame, then anchored loop ----------
+  resize();
+  draw(0);
+  var startStamp = null;
+  function frame(ts) {
+    if (startStamp === null) startStamp = ts;
+    draw((ts - startStamp) / 1000);
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+  }
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
