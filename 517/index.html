@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Balloon Belly</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #F7F2E4; overflow: hidden; }
+  canvas { display: block; touch-action: none; cursor: grab; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // Palette (flat fills only, no gradients anywhere)
+  var CREAM = '#F7F2E4', OLIVE = '#7A7A2E', PINK = '#F0608E',
+      ORANGE = '#E8722A', TEAL = '#2AA6A0';
+  var HATCH_TONES = ['#75752C', '#838340', '#6B6B25', '#8B8B46', '#70702A'];
+  var GRAIN_TONES = ['#E85A88', '#F279A5', '#E0527E'];
+  var CREAM_GRAIN = '#E9E1C6';
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+
+  var BASE_SEED = 517010;
+  var seed = BASE_SEED;
+  var cfg = null;
+
+  function buildConfig(s) {
+    var rng = mulberry32(s);
+    var d = 0.365 + rng() * 0.075;              // balloon diameter, ~0.40 of stage
+    var rx = d / 2, ry = rx * 1.05;             // belly: a touch taller than wide
+    var cx = 0.285 + rng() * 0.075;
+    var cy = 0.555 + rng() * 0.06;
+    if (cx + rx > 0.498) cx = 0.498 - rx;       // balloon stays on the cream side
+    if (cx - rx < 0.03) cx = 0.03 + rx;
+    if (cy + ry > 0.80) cy = 0.80 - ry;
+    if (cy - ry < 0.30) cy = 0.30 + ry;
+    var faceR = 0.335 + rng() * 0.07;
+    var faceX = 1.03 + rng() * 0.09;            // centre off-stage: always cropped
+    var faceY = 0.33 + rng() * 0.10;
+    return {
+      d: d, rx: rx, ry: ry, cx: cx, cy: cy,
+      faceR: faceR, faceX: faceX, faceY: faceY,
+      motherH: d / 6,                           // mother is 1/6 of the balloon
+      feetY: 0.815
+    };
+  }
+  cfg = buildConfig(seed);
+
+  // ---- precomputed crayon texture (seeded arrays, drawn directly) ----
+  var hatch = [], creamGrain = [], balloonGrain = [];
+  (function buildTexture() {
+    var rng = mulberry32(977331);
+    var i, r;
+    for (i = 0; i < 560; i++) {                 // heavy hatch on the olive block
+      hatch.push({
+        x: 0.5 + rng() * 0.5, y: rng(),
+        len: 0.008 + rng() * 0.013,
+        ang: -0.55 + (rng() - 0.5) * 0.55,
+        tone: HATCH_TONES[Math.floor(rng() * HATCH_TONES.length)]
+      });
+    }
+    for (i = 0; i < 110; i++) {                 // faint grain on the cream side
+      creamGrain.push({
+        x: rng() * 0.5, y: rng(),
+        len: 0.006 + rng() * 0.010,
+        ang: -0.4 + (rng() - 0.5) * 0.6
+      });
+    }
+    var rng2 = mulberry32(517999);
+    for (i = 0; i < 150; i++) {                 // grain inside the balloon (unit disc)
+      do { r = { u: rng2() * 2 - 1, v: rng2() * 2 - 1 }; }
+      while (r.u * r.u + r.v * r.v > 0.92);
+      r.tone = GRAIN_TONES[Math.floor(rng2() * GRAIN_TONES.length)];
+      r.r = 0.010 + rng2() * 0.010;
+      balloonGrain.push(r);
+    }
+  })();
+
+  // ---- interaction / physics state ----
+  var off = { x: 0, y: 0 }, vel = { x: 0, y: 0 };
+  var dragging = false, downOnBalloon = false, dragMoved = false;
+  var downPX = 0, downPY = 0, downTime = 0, offStart = { x: 0, y: 0 };
+  var dragTarget = { x: 0, y: 0 };
+  var stretchDev = 0, stretchVel = 0, ang = 0;
+  var KNOT_A = 2.27;                            // knot sits lower-left on the balloon
+
+  var W = 0, H = 0, S = 0, OX = 0, OY = 0;
+  var simT = 0;
+
+  function resize() {
+    var vv = window.visualViewport;
+    W = vv ? vv.width : window.innerWidth;
+    H = vv ? vv.height : window.innerHeight;
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.round(W * dpr);
+    canvas.height = Math.round(H * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    S = Math.min(W, H);
+    OX = (W - S) / 2; OY = (H - S) / 2;
+    draw(simT);
+  }
+
+  function isPhone() {
+    var sw = window.screen ? Math.min(window.screen.width, window.screen.height) : 9999;
+    if (sw < 700) return true;
+    return H > W * 1.15;
+  }
+
+  function circle(x, y, r, fill) {
+    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2);
+    if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+  }
+  function line(x1, y1, x2, y2, col, lw) {
+    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2);
+    ctx.strokeStyle = col; ctx.lineWidth = lw; ctx.lineCap = 'round'; ctx.stroke();
+  }
+
+  function motherGeom() {
+    var mH = cfg.motherH;
+    var mx = cfg.cx - cfg.rx - 0.04;
+    var headR = mH * 0.19;
+    var headCY = cfg.feetY - mH + headR;
+    return {
+      mx: mx, mH: mH, headR: headR, headCY: headCY,
+      neckY: cfg.feetY - mH + headR * 1.5,
+      hemY: cfg.feetY - mH * 0.14,
+      handX: mx + mH * 0.52, handY: cfg.feetY - mH * 0.60
+    };
+  }
+
+  function balloonState(t) {
+    var bob = dragging ? 0 : Math.sin(t * 1.15) * 0.0055;
+    var m = 1 + stretchDev;
+    return {
+      bx: cfg.cx + off.x,
+      by: cfg.cy + off.y + bob,
+      arx: cfg.rx * m,
+      ary: cfg.ry / Math.sqrt(m),
+      ang: ang
+    };
+  }
+
+  function knotWorld(bs) {
+    var lx = Math.cos(KNOT_A) * bs.arx, ly = Math.sin(KNOT_A) * bs.ary;
+    var ca = Math.cos(bs.ang), sa = Math.sin(bs.ang);
+    return { x: bs.bx + lx * ca - ly * sa, y: bs.by + lx * sa + ly * ca };
+  }
+
+  function blinkScale(t) {
+    var p = t % 4.4;                            // slow blink, open at t = 0
+    if (p < 4.02 || p > 4.28) return 1;
+    var k = (p - 4.02) / 0.26;                  // 0..1 across the blink
+    var tri = k < 0.5 ? k * 2 : 2 - k * 2;
+    return 1 - 0.92 * tri;
+  }
+
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    var lwUnit = isPhone() ? 1.25 : 1;
+    ctx.fillStyle = CREAM;
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.save();
+    ctx.translate(OX, OY);
+    ctx.scale(S, S);
+
+    // right half: olive crayon block, hard edge at 50%
+    ctx.fillStyle = OLIVE;
+    ctx.fillRect(0.5, 0, 0.5, 1);
+    ctx.save();
+    ctx.beginPath(); ctx.rect(0.5, 0, 0.5, 1); ctx.clip();
+    ctx.globalAlpha = 0.55;
+    ctx.lineWidth = 0.0028 * lwUnit;
+    ctx.lineCap = 'round';
+    for (var i = 0; i < hatch.length; i++) {
+      var hs = hatch[i];
+      ctx.strokeStyle = hs.tone;
+      ctx.beginPath();
+      ctx.moveTo(hs.x, hs.y);
+      ctx.lineTo(hs.x + Math.cos(hs.ang) * hs.len, hs.y + Math.sin(hs.ang) * hs.len);
+      ctx.stroke();
+    }
+    ctx.restore();
+
+    // faint crayon grain on the cream side
+    ctx.save();
+    ctx.beginPath(); ctx.rect(0, 0, 0.5, 1); ctx.clip();
+    ctx.globalAlpha = 0.8;
+    ctx.strokeStyle = CREAM_GRAIN;
+    ctx.lineWidth = 0.0022 * lwUnit;
+    ctx.lineCap = 'round';
+    for (i = 0; i < creamGrain.length; i++) {
+      var cg = creamGrain[i];
+      ctx.beginPath();
+      ctx.moveTo(cg.x, cg.y);
+      ctx.lineTo(cg.x + Math.cos(cg.ang) * cg.len, cg.y + Math.sin(cg.ang) * cg.len);
+      ctx.stroke();
+    }
+    ctx.restore();
+    ctx.globalAlpha = 1;
+
+    // giant orange profile face, entering from the right edge, always cropped
+    var fR = cfg.faceR, fX = cfg.faceX, fY = cfg.faceY;
+    circle(fX, fY, fR, ORANGE);
+    circle(fX - fR * 0.99, fY + fR * 0.10, fR * 0.13, ORANGE);   // nose bump
+    var eyeR = fR * 0.045;
+    ctx.beginPath();
+    ctx.ellipse(fX - fR * 0.40, fY - fR * 0.15, eyeR, eyeR * blinkScale(t), 0, 0, Math.PI * 2);
+    ctx.fillStyle = CREAM; ctx.fill();
+    ctx.beginPath();                                            // smile
+    ctx.arc(fX - fR * 0.60, fY + fR * 0.26, fR * 0.16, Math.PI * 0.15, Math.PI * 0.85);
+    ctx.strokeStyle = CREAM; ctx.lineWidth = 0.0055 * lwUnit; ctx.lineCap = 'round'; ctx.stroke();
+
+    // ---- tiny mother ----
+    var g = motherGeom();
+    // legs and shoes
+    line(g.mx - 0.0055, g.hemY, g.mx - 0.006, cfg.feetY - 0.002, OLIVE, 0.0038 * lwUnit);
+    line(g.mx + 0.0055, g.hemY, g.mx + 0.006, cfg.feetY - 0.002, OLIVE, 0.0038 * lwUnit);
+    ctx.beginPath(); ctx.ellipse(g.mx - 0.0075, cfg.feetY, 0.006, 0.0028, 0, 0, Math.PI * 2);
+    ctx.fillStyle = OLIVE; ctx.fill();
+    ctx.beginPath(); ctx.ellipse(g.mx + 0.0075, cfg.feetY, 0.006, 0.0028, 0, 0, Math.PI * 2);
+    ctx.fillStyle = OLIVE; ctx.fill();
+    // back arm
+    line(g.mx - 0.008, g.neckY + 0.006, g.mx - 0.017, g.hemY - 0.008, TEAL, 0.005 * lwUnit);
+    // dress
+    ctx.beginPath();
+    ctx.moveTo(g.mx - 0.009, g.neckY);
+    ctx.lineTo(g.mx + 0.009, g.neckY);
+    ctx.lineTo(g.mx + 0.017, g.hemY);
+    ctx.lineTo(g.mx - 0.017, g.hemY);
+    ctx.closePath();
+    ctx.fillStyle = TEAL; ctx.fill();
+    // front arm, reaching up to the string
+    line(g.mx + 0.008, g.neckY + 0.006, g.handX, g.handY, TEAL, 0.005 * lwUnit);
+    // head: cream disc, thin olive outline, two-dot face, pink hair cap and bun
+    circle(g.mx, g.headCY, g.headR, CREAM);
+    ctx.beginPath(); ctx.arc(g.mx, g.headCY, g.headR, 0, Math.PI * 2);
+    ctx.strokeStyle = OLIVE; ctx.lineWidth = 0.0016 * lwUnit; ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(g.mx, g.headCY, g.headR, Math.PI * 1.02, Math.PI * 1.98);
+    ctx.closePath();
+    ctx.fillStyle = PINK; ctx.fill();
+    circle(g.mx + g.headR * 0.62, g.headCY - g.headR * 0.78, g.headR * 0.40, PINK);
+    circle(g.mx - g.headR * 0.36, g.headCY + g.headR * 0.08, g.headR * 0.13, OLIVE);
+    circle(g.mx + g.headR * 0.36, g.headCY + g.headR * 0.08, g.headR * 0.13, OLIVE);
+    ctx.beginPath();
+    ctx.arc(g.mx, g.headCY + g.headR * 0.18, g.headR * 0.34, Math.PI * 0.2, Math.PI * 0.8);
+    ctx.strokeStyle = OLIVE; ctx.lineWidth = g.headR * 0.10; ctx.lineCap = 'round'; ctx.stroke();
+
+    // ---- the balloon (her belly) ----
+    var bs = balloonState(t);
+    ctx.save();
+    ctx.translate(bs.bx, bs.by);
+    ctx.rotate(bs.ang);
+    ctx.scale(bs.arx, bs.ary);
+    ctx.beginPath(); ctx.arc(0, 0, 1, 0, Math.PI * 2);
+    ctx.fillStyle = PINK; ctx.fill();
+    ctx.clip();
+    for (i = 0; i < balloonGrain.length; i++) {
+      var bg = balloonGrain[i];
+      circle(bg.u, bg.v, bg.r, bg.tone);
+    }
+    ctx.restore();
+    // knot, pointing out at the lower left of the balloon
+    ctx.save();
+    ctx.translate(bs.bx, bs.by);
+    ctx.rotate(bs.ang);
+    ctx.scale(bs.arx, bs.ary);
+    var kx = Math.cos(KNOT_A), ky = Math.sin(KNOT_A);
+    var px = -ky, py = kx;
+    ctx.beginPath();
+    ctx.moveTo(kx * 1.10, ky * 1.10);
+    ctx.lineTo(kx * 0.96 + px * 0.10, ky * 0.96 + py * 0.10);
+    ctx.lineTo(kx * 0.96 - px * 0.10, ky * 0.96 - py * 0.10);
+    ctx.closePath();
+    ctx.fillStyle = '#E0527E'; ctx.fill();
+    ctx.restore();
+
+    // string from the knot down to her hand, then her hand on top of it
+    var kw = knotWorld(bs);
+    var tipX = bs.bx + (kw.x - bs.bx) * 1.06, tipY = bs.by + (kw.y - bs.by) * 1.06;
+    ctx.beginPath();
+    ctx.moveTo(tipX, tipY);
+    ctx.quadraticCurveTo(
+      (tipX + g.handX) / 2, Math.max(tipY, g.handY) + 0.020,
+      g.handX, g.handY);
+    ctx.strokeStyle = OLIVE; ctx.lineWidth = 0.0022 * lwUnit; ctx.lineCap = 'round'; ctx.stroke();
+    circle(g.handX, g.handY, 0.0042, CREAM);
+    ctx.beginPath(); ctx.arc(g.handX, g.handY, 0.0042, 0, Math.PI * 2);
+    ctx.strokeStyle = OLIVE; ctx.lineWidth = 0.0012 * lwUnit; ctx.stroke();
+
+    ctx.restore();
+
+    // hint
+    ctx.globalAlpha = 0.55;
+    ctx.fillStyle = OLIVE;
+    ctx.font = '600 ' + Math.max(11, Math.round(S * 0.022)) + 'px system-ui, sans-serif';
+    ctx.fillText('drag', OX + S * 0.024, OY + S - S * 0.032);
+    ctx.globalAlpha = 1;
+  }
+
+  function stepPhysics(dt) {
+    if (dragging) {
+      var k = 1 - Math.exp(-18 * dt);
+      off.x += (dragTarget.x - off.x) * k;
+      off.y += (dragTarget.y - off.y) * k;
+      vel.x = 0; vel.y = 0;
+      var dist = Math.sqrt(off.x * off.x + off.y * off.y);
+      var target = Math.min(0.38, dist * 1.7);
+      stretchVel += ((target - stretchDev) * 150 - stretchVel * 16) * dt;
+      stretchDev += stretchVel * dt;
+      if (dist > 0.004) {
+        var want = Math.atan2(off.y, off.x);
+        var diff = want - ang;
+        while (diff > Math.PI) diff -= Math.PI * 2;
+        while (diff < -Math.PI) diff += Math.PI * 2;
+        ang += diff * (1 - Math.exp(-10 * dt));
+      }
+    } else {
+      // spring home, underdamped so the release wobbles
+      vel.x += (-off.x * 85 - vel.x * 10.5) * dt;
+      vel.y += (-off.y * 85 - vel.y * 10.5) * dt;
+      off.x += vel.x * dt;
+      off.y += vel.y * dt;
+      stretchVel += (-stretchDev * 130 - stretchVel * 7.5) * dt;
+      stretchDev += stretchVel * dt;
+      ang *= Math.exp(-5 * dt);
+    }
+  }
+
+  var startStamp = null, lastNow = 0;
+  function frame(now) {
+    if (startStamp === null) { startStamp = now; lastNow = now; }
+    var dt = Math.min(0.033, Math.max(0, (now - lastNow) / 1000));
+    lastNow = now;
+    simT = (now - startStamp) / 1000;
+    stepPhysics(dt);
+    draw(simT);
+    if (typeof window.requestAnimationFrame === 'function') {
+      window.requestAnimationFrame(frame);
+    }
+  }
+
+  function toStage(e) {
+    var rect = canvas.getBoundingClientRect();
+    return {
+      x: (e.clientX - rect.left - OX) / S,
+      y: (e.clientY - rect.top - OY) / S
+    };
+  }
+
+  function reseed() {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+    cfg = buildConfig(seed);
+    off.x = 0; off.y = 0; vel.x = 0; vel.y = 0;
+    stretchDev = 0; stretchVel = 0; ang = 0;
+    draw(simT);
+  }
+
+  function onDown(e) {
+    var p = toStage(e);
+    var bs = balloonState(simT);
+    var dx = (p.x - bs.bx) / (bs.arx * 1.15), dy = (p.y - bs.by) / (bs.ary * 1.15);
+    downOnBalloon = (dx * dx + dy * dy) <= 1;
+    dragging = false; dragMoved = false;
+    downPX = p.x; downPY = p.y; downTime = e.timeStamp || 0;
+    offStart.x = off.x; offStart.y = off.y;
+    dragTarget.x = off.x; dragTarget.y = off.y;
+  }
+  function onMove(e) {
+    if (!downOnBalloon) return;
+    var p = toStage(e);
+    var mdx = p.x - downPX, mdy = p.y - downPY;
+    if (!dragMoved && Math.sqrt(mdx * mdx + mdy * mdy) > 0.008) dragMoved = true;
+    if (dragMoved) {
+      dragging = true;
+      var nx = offStart.x + mdx, ny = offStart.y + mdy;
+      var len = Math.sqrt(nx * nx + ny * ny);
+      if (len > 0.20) { nx = nx / len * 0.20; ny = ny / len * 0.20; }
+      dragTarget.x = nx; dragTarget.y = ny;
+    }
+  }
+  function onUp(e) {
+    var wasDrag = dragging;
+    dragging = false; downOnBalloon = false;
+    if (!wasDrag && (e.timeStamp || 0) - downTime < 400) reseed();
+  }
+
+  canvas.addEventListener('pointerdown', onDown);
+  canvas.addEventListener('pointermove', onMove);
+  canvas.addEventListener('pointerup', onUp);
+  canvas.addEventListener('pointercancel', onUp);
+  canvas.addEventListener('touchstart', function (e) { e.preventDefault(); }, { passive: false });
+  canvas.addEventListener('touchmove', function (e) { e.preventDefault(); }, { passive: false });
+
+  function onResize() { resize(); }
+  window.addEventListener('resize', onResize);
+  if (window.visualViewport) window.visualViewport.addEventListener('resize', onResize);
+
+  resize();          // sets size and draws frame one via draw(simT = 0)
+  draw(0);           // frame one: synchronous, at rest, eyes open
+  if (typeof window.requestAnimationFrame === 'function') {
+    window.requestAnimationFrame(frame);
+  }
+})();
+</script>
+</body>
+</html>
