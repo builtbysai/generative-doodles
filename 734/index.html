@@ -1,0 +1,646 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Taylor Square</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0B1026; height: 100%; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- palette (strict) ----------
+  var NIGHT = '#0B1026';   // night ground, streets, doors, unlit windows
+  var HOUSE = '#1A2340';   // house bodies
+  var LIT = '#F0D878';     // lit windows (houses holding keys)
+  var GRASS = '#1E4D3B';   // park grass
+  var BRASS = '#C9A227';   // bench, flagpole, keys
+  var FENCE = '#2A3358';   // fence, gate, roofs
+  var GLOW = '#7BA05B';    // gate-open glow
+  var FIGURE = '#F5F5F0';  // walker silhouettes
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  var viewW = 0, viewH = 0, isPhone = false;
+  var currentT = 0;
+
+  // ---------- inert QA hook: ?seed=tNN forces the draw time ----------
+  var forcedT = -1;
+  (function () {
+    try {
+      var m = /[?&]seed=t(\d+(?:\.\d+)?)/.exec(location.search || '');
+      if (m) forcedT = parseFloat(m[1]);
+    } catch (e) { /* inert hook, QA only */ }
+  })();
+
+  // ---------- seeded RNG ----------
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function clamp(x, a, b) { return x < a ? a : (x > b ? b : x); }
+  function smoothstep(a, b, x) {
+    var s = clamp((x - a) / (b - a), 0, 1);
+    return s * s * (3 - 2 * s);
+  }
+  function lerp(a, b, s) { return a + (b - a) * s; }
+
+  // ---------- world: grid, park, houses, ring ----------
+  var N = 9;               // grid size (9 desktop, 7 phone)
+  var houses = [];         // {idx, cx, cy}
+  var houseByCell = {};    // "cx,cy" -> idx
+  var ring = [];           // house indices in the ring around the park
+  var parkC0 = 3;          // park starts at cell (parkC0, parkC0), spans 3x3
+
+  function cellKey(cx, cy) { return cx + ',' + cy; }
+  function isParkCell(cx, cy) {
+    return cx >= parkC0 && cx < parkC0 + 3 && cy >= parkC0 && cy < parkC0 + 3;
+  }
+  function neighborsOf(idx) {
+    var h = houses[idx], out = [];
+    var dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+    for (var i = 0; i < 4; i++) {
+      var k = cellKey(h.cx + dirs[i][0], h.cy + dirs[i][1]);
+      if (houseByCell.hasOwnProperty(k)) out.push(houseByCell[k]);
+    }
+    return out;
+  }
+
+  // ---------- the spread schedule (per epoch, fully precomputed) ----------
+  // A key identity is a 5-bit mask: bits 0-3 = tooth present at four slots
+  // along the shaft, bit 4 = teeth run long. A copy flips exactly one bit
+  // about half the time: a notch moved, a tooth shortened.
+  var schedule = [];       // {from (-1 = the park mailing), to, start, arr, mask} in epoch-relative seconds
+  var gateRel = Infinity;  // epoch-relative time the ring completes
+
+  function buildSchedule(seed) {
+    var rng = mulberry32(seed);
+    schedule = [];
+    var keyedAt = {}, maskOf = {}, keyedList = [];
+    // the mailing: keys fly from the park to the five nearest ring houses
+    var pc = parkC0 + 1; // park center cell coordinate
+    var sorted = ring.slice().sort(function (a, b) {
+      var ha = houses[a], hb = houses[b];
+      var da = (ha.cx - pc) * (ha.cx - pc) + (ha.cy - pc) * (ha.cy - pc);
+      var db = (hb.cx - pc) * (hb.cx - pc) + (hb.cy - pc) * (hb.cy - pc);
+      return da - db;
+    });
+    var mail = sorted.slice(0, 5);
+    for (var i = 0; i < mail.length; i++) {
+      var mask = 1 + Math.floor(rng() * 31);
+      var st = 0.15 + i * 0.13;
+      schedule.push({ from: -1, to: mail[i], start: st, arr: st + 0.95, mask: mask });
+      keyedAt[mail[i]] = st + 0.95; maskOf[mail[i]] = mask; keyedList.push(mail[i]);
+    }
+    // the sharing: each keyed house copies its key to a neighbour, on a
+    // seeded timetable, until every house holds one
+    var cursor = 1.7, guard = 0;
+    while (keyedList.length < houses.length && guard++ < 600) {
+      var cand = [];
+      for (var j = 0; j < keyedList.length; j++) {
+        var nbs = neighborsOf(keyedList[j]);
+        for (var k = 0; k < nbs.length; k++) {
+          if (!keyedAt.hasOwnProperty(nbs[k])) { cand.push(keyedList[j]); break; }
+        }
+      }
+      if (!cand.length) break;
+      var from = cand[Math.floor(rng() * cand.length)];
+      var free = [];
+      var fn = neighborsOf(from);
+      for (var q = 0; q < fn.length; q++) if (!keyedAt.hasOwnProperty(fn[q])) free.push(fn[q]);
+      var to = free[Math.floor(rng() * free.length)];
+      cursor += 0.55 + rng() * 1.15;
+      var m2 = maskOf[from];
+      if (rng() < 0.55) {
+        var bit = Math.floor(rng() * 5);
+        var flipped = m2 ^ (1 << bit);
+        if (flipped !== 0) m2 = flipped;
+      }
+      schedule.push({ from: from, to: to, start: cursor, arr: cursor + 0.8, mask: m2 });
+      keyedAt[to] = cursor + 0.8; maskOf[to] = m2; keyedList.push(to);
+    }
+    gateRel = 0;
+    for (var r = 0; r < ring.length; r++) {
+      if (!keyedAt.hasOwnProperty(ring[r])) { gateRel = Infinity; break; }
+      if (keyedAt[ring[r]] > gateRel) gateRel = keyedAt[ring[r]];
+    }
+  }
+
+  function buildWorld() {
+    parkC0 = (N - 3) / 2;
+    houses = []; houseByCell = {}; ring = [];
+    for (var cy = 0; cy < N; cy++) for (var cx = 0; cx < N; cx++) {
+      if (isParkCell(cx, cy)) continue;
+      var idx = houses.length;
+      houses.push({ idx: idx, cx: cx, cy: cy });
+      houseByCell[cellKey(cx, cy)] = idx;
+    }
+    for (var i = 0; i < houses.length; i++) {
+      var h = houses[i];
+      if (h.cx >= parkC0 - 1 && h.cx <= parkC0 + 3 && h.cy >= parkC0 - 1 && h.cy <= parkC0 + 3) {
+        ring.push(i);
+      }
+    }
+    buildSchedule(0x734000 + epochIndex * 7919);
+  }
+
+  // ---------- epoch state (runtime) ----------
+  var epochIndex = 0;
+  var started = false;     // has the mailing been sent this epoch?
+  var startT = 0;          // absolute time the mailing began
+  var eventsAbs = [];      // schedule events in absolute time + visitor bursts
+  var burstRng = mulberry32(0xB01257);
+
+  function armEpoch(t0) {
+    started = true;
+    startT = t0;
+    eventsAbs = [];
+    for (var i = 0; i < schedule.length; i++) {
+      var e = schedule[i];
+      eventsAbs.push({ from: e.from, to: e.to, start: e.start + t0, arr: e.arr + t0, mask: e.mask });
+    }
+  }
+
+  // earliest arrival event per house, from all events (schedule + bursts)
+  function earliestEvent(idx) {
+    var best = null;
+    for (var i = 0; i < eventsAbs.length; i++) {
+      var e = eventsAbs[i];
+      if (e.to === idx && (best === null || e.arr < best.arr)) best = e;
+    }
+    return best;
+  }
+  function keyedAt(idx) {
+    var e = earliestEvent(idx);
+    return e ? e.arr : Infinity;
+  }
+  function gateTimeAbs() {
+    if (!started) return Infinity;
+    var g = 0;
+    for (var i = 0; i < ring.length; i++) {
+      var ka = keyedAt(ring[i]);
+      if (ka === Infinity) return Infinity;
+      if (ka > g) g = ka;
+    }
+    return g;
+  }
+  function gateSwing(t) { // 0 locked .. 1 fully open
+    var gt = gateTimeAbs();
+    if (gt === Infinity) return 0;
+    return smoothstep(gt, gt + 2.6, t);
+  }
+
+  // ---------- figures: five walkers on the south street ----------
+  var figures = [];
+  (function () {
+    var rng = mulberry32(0xF16605);
+    for (var i = 0; i < 5; i++) {
+      figures.push({
+        fa: 0.10 + rng() * 0.80,          // street point, fraction across the park front
+        ff: 0.08 + rng() * 0.84,          // fence crossing point, fraction across
+        fb: 0.15 + rng() * 0.70,          // inside point, fractions within the park
+        fb2: 0.25 + rng() * 0.60,
+        period: 24 + rng() * 14,
+        phase: rng()
+      });
+    }
+  })();
+
+  function figurePos(f, t, g) {
+    // park geometry in grid units
+    var pl = parkC0, pr = parkC0 + 3, pt = parkC0, pb = parkC0 + 3;
+    var A = { x: pl + f.fa * 3, y: pb + 0.22 };
+    var B = { x: pl + f.fb * 3, y: pt + 0.45 + f.fb2 * 1.9 };
+    var fencePt = { x: pl + f.ff * 3, y: pb };
+    var gatePt = { x: pl + 1.5, y: pb };
+    var C = { x: lerp(fencePt.x, gatePt.x, g), y: pb };
+    var ph = ((t / f.period) + f.phase) % 1;
+    var s = ph < 0.5 ? ph * 2 : 2 - ph * 2;   // ping-pong along A -> C -> B
+    var SC = 0.35, x, y;
+    if (s < SC) { var u1 = s / SC; x = lerp(A.x, C.x, u1); y = lerp(A.y, C.y, u1); }
+    else { var u2 = (s - SC) / (1 - SC); x = lerp(C.x, B.x, u2); y = lerp(C.y, B.y, u2); }
+    // the fence hop: a little lift at the crossing while the gate is shut
+    var d = Math.abs(s - SC);
+    if (d < 0.08 && g < 1) {
+      y -= Math.sin((1 - d / 0.08) * Math.PI / 2) * 0.15 * (1 - g);
+    }
+    y += Math.sin(t * 7 + f.phase * 40) * 0.008;
+    return { x: x, y: y };
+  }
+
+  // ---------- layout ----------
+  var L = null;
+  function layout() {
+    var side = Math.min(viewW, viewH) - 24;
+    var gx = (viewW - side) / 2, gy = (viewH - side) / 2;
+    var cell = side / N;
+    L = {
+      gx: gx, gy: gy, cell: cell, side: side,
+      parkX: gx + parkC0 * cell, parkY: gy + parkC0 * cell,
+      parkW: cell * 3, parkH: cell * 3,
+      figS: clamp(cell / 52, 0.7, 1.2)
+    };
+  }
+  function gridPx(u) { return { x: L.gx + u.x * L.cell, y: L.gy + u.y * L.cell }; }
+  function houseCenterPx(idx) {
+    var h = houses[idx];
+    return { x: L.gx + (h.cx + 0.5) * L.cell, y: L.gy + (h.cy + 0.5) * L.cell };
+  }
+  function parkCenterPx() {
+    return { x: L.parkX + L.parkW / 2, y: L.parkY + L.parkH / 2 };
+  }
+
+  // ---------- drawing helpers ----------
+  function drawKey(x, y, s, angle, mask) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(angle || 0);
+    ctx.strokeStyle = BRASS;
+    ctx.fillStyle = BRASS;
+    ctx.lineCap = 'round';
+    ctx.lineWidth = 3 * s;
+    ctx.beginPath(); ctx.arc(-8 * s, 0, 4.4 * s, 0, Math.PI * 2); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(-3.6 * s, 0); ctx.lineTo(12 * s, 0); ctx.stroke();
+    // teeth: bits 0-3 place teeth at four slots; bit 4 runs them long
+    var toothLen = (mask & 16) ? 7 * s : 4.6 * s;
+    ctx.lineWidth = 2.4 * s;
+    for (var i = 0; i < 4; i++) {
+      if (mask & (1 << i)) {
+        var tx = (3 + i * 3) * s;
+        ctx.beginPath(); ctx.moveTo(tx, 1 * s); ctx.lineTo(tx, 1 * s + toothLen); ctx.stroke();
+      }
+    }
+    ctx.restore();
+  }
+
+  function drawFigure(x, y, s) {
+    ctx.fillStyle = FIGURE;
+    ctx.beginPath(); ctx.arc(x, y - 9 * s, 4.6 * s, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(x - 5.6 * s, y + 10 * s);
+    ctx.quadraticCurveTo(x - 5.8 * s, y - 3 * s, x, y - 3.4 * s);
+    ctx.quadraticCurveTo(x + 5.8 * s, y - 3 * s, x + 5.6 * s, y + 10 * s);
+    ctx.closePath(); ctx.fill();
+  }
+
+  // ---------- the draw ----------
+  function draw(t) {
+    currentT = t;
+    if (!viewW || !viewH || !L) return;
+    canvas.style.width = viewW + 'px';
+    canvas.style.height = viewH + 'px';
+    ctx.fillStyle = NIGHT;
+    ctx.fillRect(0, 0, viewW, viewH);
+
+    var cell = L.cell, i, h, hx, hy, hw, hh;
+
+    // earliest delivery per house, computed once per frame
+    var earl = null;
+    if (started) {
+      earl = [];
+      for (i = 0; i < houses.length; i++) earl.push(earliestEvent(i));
+    }
+
+    // houses
+    for (i = 0; i < houses.length; i++) {
+      h = houses[i];
+      hx = L.gx + h.cx * cell + cell * 0.11;
+      hy = L.gy + h.cy * cell + cell * 0.18;
+      hw = cell * 0.78; hh = cell * 0.66;
+      // roof
+      ctx.fillStyle = FENCE;
+      ctx.beginPath();
+      ctx.moveTo(hx - cell * 0.03, hy + cell * 0.02);
+      ctx.lineTo(hx + hw / 2, hy - cell * 0.13);
+      ctx.lineTo(hx + hw + cell * 0.03, hy + cell * 0.02);
+      ctx.closePath(); ctx.fill();
+      // body
+      ctx.fillStyle = HOUSE;
+      ctx.fillRect(hx, hy, hw, hh);
+      // door
+      ctx.fillStyle = NIGHT;
+      var dw = cell * 0.14, dh = cell * 0.24;
+      ctx.fillRect(hx + hw / 2 - dw / 2, hy + hh - dh, dw, dh);
+      // windows: dark until the house holds a key, then warm
+      var ka = earl && earl[i] ? earl[i].arr : Infinity;
+      var litA = ka <= t ? clamp((t - ka) / 0.5, 0, 1) : 0;
+      var winS = cell * 0.13;
+      var wy = hy + cell * 0.14;
+      for (var wI = 0; wI < 2; wI++) {
+        var wx = hx + cell * (0.14 + wI * 0.42);
+        if (litA > 0) {
+          ctx.globalAlpha = litA;
+          ctx.fillStyle = LIT;
+          ctx.fillRect(wx, wy, winS, winS);
+          ctx.globalAlpha = 1;
+        } else {
+          ctx.fillStyle = NIGHT;
+          ctx.fillRect(wx, wy, winS, winS);
+        }
+      }
+      // the house's own key, hung by the door, teeth and all
+      if (litA > 0) {
+        var ev = earl ? earl[i] : null;
+        ctx.globalAlpha = litA;
+        drawKey(hx + hw / 2 + dw / 2 + cell * 0.17, hy + hh - dh * 0.45, cell / 240, 0.45, ev ? ev.mask : 15);
+        ctx.globalAlpha = 1;
+      }
+    }
+
+    // park grass (with quiet mowing stripes)
+    ctx.fillStyle = GRASS;
+    ctx.fillRect(L.parkX + 2, L.parkY + 2, L.parkW - 4, L.parkH - 4);
+    ctx.fillStyle = NIGHT;
+    ctx.globalAlpha = 0.10;
+    for (i = 0; i < 3; i += 2) {
+      ctx.fillRect(L.parkX + i * cell + 2, L.parkY + 2, cell - 4, L.parkH - 4);
+    }
+    ctx.globalAlpha = 1;
+
+    // bench (brass slats) and flagpole (brass, small flag)
+    var bx = L.parkX + cell * 0.45, by = L.parkY + cell * 1.72;
+    ctx.fillStyle = BRASS;
+    ctx.fillRect(bx, by, cell * 0.85, cell * 0.07);
+    ctx.fillRect(bx, by - cell * 0.22, cell * 0.85, cell * 0.06);
+    ctx.fillRect(bx + cell * 0.06, by + cell * 0.07, cell * 0.07, cell * 0.16);
+    ctx.fillRect(bx + cell * 0.72, by + cell * 0.07, cell * 0.07, cell * 0.16);
+    var poleX = L.parkX + cell * 2.05;
+    var poleTop = L.parkY + cell * 0.38, poleBot = L.parkY + cell * 1.95;
+    ctx.strokeStyle = BRASS;
+    ctx.lineWidth = Math.max(2, cell * 0.035);
+    ctx.beginPath(); ctx.moveTo(poleX, poleBot); ctx.lineTo(poleX, poleTop); ctx.stroke();
+    var flutter = Math.sin(t * 2.2) * cell * 0.02;
+    ctx.fillStyle = BRASS;
+    ctx.beginPath();
+    ctx.moveTo(poleX, poleTop);
+    ctx.lineTo(poleX + cell * 0.36, poleTop + cell * 0.10 + flutter);
+    ctx.lineTo(poleX, poleTop + cell * 0.20);
+    ctx.closePath(); ctx.fill();
+
+    var g = gateSwing(t);
+    var parkB = L.parkY + L.parkH;
+    var gateW = cell * 0.95;
+    var gateL = L.parkX + L.parkW / 2 - gateW / 2;
+    var gateR = gateL + gateW;
+
+    // the gate-open glow on the ground inside the gate
+    if (g > 0) {
+      ctx.fillStyle = GLOW;
+      ctx.globalAlpha = 0.13 * g;
+      ctx.beginPath();
+      ctx.ellipse(L.parkX + L.parkW / 2, parkB - cell * 0.30, gateW * 0.85, cell * 0.34, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 0.10 * g;
+      ctx.beginPath();
+      ctx.ellipse(L.parkX + L.parkW / 2, parkB - cell * 0.26, gateW * 0.55, cell * 0.22, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    // fence: posts and two rails, south side split by the gate gap
+    ctx.strokeStyle = FENCE;
+    ctx.fillStyle = FENCE;
+    ctx.lineWidth = Math.max(2, cell * 0.045);
+    var fx0 = L.parkX + 3, fy0 = L.parkY + 3, fx1 = L.parkX + L.parkW - 3, fy1 = parkB - 3;
+    function rail(x0, y0, x1, y1) {
+      ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+    }
+    var railOff = cell * 0.10;
+    rail(fx0, fy0 + railOff, fx1, fy0 + railOff);            // north rails
+    rail(fx0, fy0 + railOff * 2.1, fx1, fy0 + railOff * 2.1);
+    rail(fx0 + railOff, fy0, fx0 + railOff, fy1);            // west rails
+    rail(fx0 + railOff * 2.1, fy0, fx0 + railOff * 2.1, fy1);
+    rail(fx1 - railOff, fy0, fx1 - railOff, fy1);            // east rails
+    rail(fx1 - railOff * 2.1, fy0, fx1 - railOff * 2.1, fy1);
+    rail(fx0, fy1 - railOff, gateL, fy1 - railOff);          // south rails, west of gate
+    rail(fx0, fy1 - railOff * 2.1, gateL, fy1 - railOff * 2.1);
+    rail(gateR, fy1 - railOff, fx1, fy1 - railOff);          // south rails, east of gate
+    rail(gateR, fy1 - railOff * 2.1, fx1, fy1 - railOff * 2.1);
+    // posts
+    var postS = Math.max(3, cell * 0.07);
+    function post(x, y) { ctx.fillRect(x - postS / 2, y - postS / 2, postS, postS); }
+    for (i = 0; i <= 6; i++) {
+      post(fx0 + (fx1 - fx0) * i / 6, fy0);
+      post(fx0, fy0 + (fy1 - fy0) * i / 6);
+      post(fx1, fy0 + (fy1 - fy0) * i / 6);
+    }
+    for (i = 0; i <= 6; i++) {
+      var px = fx0 + (fx1 - fx0) * i / 6;
+      if (px < gateL - 2 || px > gateR + 2) post(px, fy1);
+    }
+    post(gateL, fy1); post(gateR, fy1);
+
+    // the gate itself, hinged at its west jamb, swinging into the park
+    ctx.save();
+    ctx.translate(gateL, fy1 - railOff * 1.05);
+    ctx.rotate(-g * 1.85);
+    ctx.strokeStyle = FENCE;
+    ctx.lineWidth = Math.max(2, cell * 0.045);
+    ctx.beginPath(); ctx.moveTo(0, -railOff); ctx.lineTo(gateW, -railOff); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0, railOff * 0.6); ctx.lineTo(gateW, railOff * 0.6); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0, -railOff); ctx.lineTo(0, railOff * 0.6); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(gateW, -railOff); ctx.lineTo(gateW, railOff * 0.6); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(gateW * 0.5, -railOff); ctx.lineTo(gateW * 0.5, railOff * 0.6); ctx.stroke();
+    ctx.restore();
+    // padlock while shut
+    if (g < 0.1) {
+      var lockX = gateL + gateW / 2, lockY = fy1 - railOff * 1.05;
+      ctx.strokeStyle = BRASS;
+      ctx.lineWidth = Math.max(1.6, cell * 0.03);
+      ctx.beginPath(); ctx.arc(lockX, lockY - cell * 0.05, cell * 0.055, Math.PI, Math.PI * 2); ctx.stroke();
+      ctx.fillStyle = BRASS;
+      var lw = cell * 0.15, lh = cell * 0.12;
+      ctx.fillRect(lockX - lw / 2, lockY - cell * 0.05, lw, lh);
+    }
+
+    // the mailing flourish: a small fountain of keys at the flagpole
+    if (started && t - startT >= 0 && t - startT < 0.8) {
+      var fp = (t - startT) / 0.8;
+      var pc2 = parkCenterPx();
+      ctx.globalAlpha = 1 - fp;
+      for (i = 0; i < 8; i++) {
+        var ang = i / 8 * Math.PI * 2 + 0.4;
+        var rr = fp * cell * 0.55;
+        drawKey(pc2.x + Math.cos(ang) * rr, pc2.y + Math.sin(ang) * rr * 0.7 - fp * cell * 0.2,
+                cell / 260, ang, 15);
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    // keys in flight (only the flight that actually delivers each house's key)
+    if (started) {
+      for (i = 0; i < eventsAbs.length; i++) {
+        var e = eventsAbs[i];
+        var u = (t - e.start) / (e.arr - e.start);
+        var target = houseCenterPx(e.to);
+        if (u >= 0 && u < 1 && earl[e.to] === e) {
+          var src = e.from < 0 ? parkCenterPx() : houseCenterPx(e.from);
+          var mxp = (src.x + target.x) / 2, myp = (src.y + target.y) / 2 - cell * 0.55;
+          var w0 = (1 - u) * (1 - u), w1 = 2 * (1 - u) * u, w2 = u * u;
+          var kx = w0 * src.x + w1 * mxp + w2 * target.x;
+          var ky = w0 * src.y + w1 * myp + w2 * target.y;
+          drawKey(kx, ky, (e.from < 0 ? cell / 105 : cell / 120), 0.3 + Math.sin(u * Math.PI * 2) * 0.45, e.mask);
+        }
+        // arrival ring, just after delivery
+        if (earl[e.to] === e && t - e.arr >= 0 && t - e.arr < 0.45) {
+          var ap = (t - e.arr) / 0.45;
+          ctx.globalAlpha = 1 - ap;
+          ctx.strokeStyle = BRASS;
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.arc(target.x, target.y, 6 + ap * cell * 0.42, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.globalAlpha = 1;
+        }
+      }
+    }
+
+    // figures: fence-climbers until the gate opens, gate users after
+    for (i = 0; i < figures.length; i++) {
+      var gp = gridPx(figurePos(figures[i], t, g));
+      drawFigure(gp.x, gp.y, L.figS);
+    }
+  }
+
+  // ---------- interaction ----------
+  var downInfo = null; // {x, y, kind: 'park'|'gate'|'house', idx}
+
+  function evtPos(e) {
+    var x, y;
+    if (typeof e.offsetX === 'number') { x = e.offsetX; y = e.offsetY; }
+    else {
+      var rect = canvas.getBoundingClientRect();
+      x = e.clientX - rect.left; y = e.clientY - rect.top;
+    }
+    return { x: x, y: y };
+  }
+
+  function classify(p) {
+    var cell = L.cell;
+    var gateCx = L.parkX + L.parkW / 2, parkB = L.parkY + L.parkH;
+    if (Math.abs(p.x - gateCx) < cell * 0.62 && Math.abs(p.y - parkB) < cell * 0.5) {
+      return { kind: 'gate', idx: -1 };
+    }
+    if (p.x >= L.parkX && p.x <= L.parkX + L.parkW && p.y >= L.parkY && p.y <= parkB) {
+      return { kind: 'park', idx: -1 };
+    }
+    var cx = Math.floor((p.x - L.gx) / cell), cy = Math.floor((p.y - L.gy) / cell);
+    var k = cellKey(cx, cy);
+    if (houseByCell.hasOwnProperty(k)) return { kind: 'house', idx: houseByCell[k] };
+    return { kind: 'none', idx: -1 };
+  }
+
+  canvas.addEventListener('pointerdown', function (e) {
+    if (!L) return;
+    var p = evtPos(e);
+    var c = classify(p);
+    downInfo = { x: p.x, y: p.y, kind: c.kind, idx: c.idx };
+  });
+
+  canvas.addEventListener('pointerup', function (e) {
+    if (!downInfo) return;
+    var p = evtPos(e);
+    var moved = Math.hypot(p.x - downInfo.x, p.y - downInfo.y);
+    var info = downInfo;
+    downInfo = null;
+    if (moved >= 8) return;
+    var t = currentT;
+    if (info.kind === 'park') {
+      if (!started) armEpoch(t);
+    } else if (info.kind === 'gate') {
+      // re-lock and restart the spread, with a fresh set of keys
+      if (started && gateTimeAbs() !== Infinity && t >= gateTimeAbs()) {
+        epochIndex++;
+        buildSchedule(0x734000 + epochIndex * 7919);
+        armEpoch(t);
+      }
+    } else if (info.kind === 'house') {
+      // force a copy burst from a house that already holds a key
+      if (started && keyedAt(info.idx) <= t) {
+        var srcEv = earliestEvent(info.idx);
+        var srcMask = srcEv ? srcEv.mask : 15;
+        var nbs = neighborsOf(info.idx);
+        var targets = [];
+        for (var i = 0; i < nbs.length; i++) {
+          if (keyedAt(nbs[i]) > t + 0.85) targets.push(nbs[i]);
+        }
+        // seeded shuffle, take up to two
+        for (var j = targets.length - 1; j > 0; j--) {
+          var r = Math.floor(burstRng() * (j + 1));
+          var tmp = targets[j]; targets[j] = targets[r]; targets[r] = tmp;
+        }
+        targets = targets.slice(0, 2);
+        for (var q = 0; q < targets.length; q++) {
+          var m2 = srcMask;
+          if (burstRng() < 0.55) {
+            var flipped = m2 ^ (1 << Math.floor(burstRng() * 5));
+            if (flipped !== 0) m2 = flipped;
+          }
+          eventsAbs.push({ from: info.idx, to: targets[q], start: t + q * 0.1, arr: t + q * 0.1 + 0.85, mask: m2 });
+        }
+      }
+    }
+  });
+  canvas.addEventListener('pointercancel', function () { downInfo = null; });
+
+  // ---------- sizing ----------
+  function resize() {
+    var vv = window.visualViewport;
+    var w = vv ? vv.width : window.innerWidth;
+    var h = vv ? vv.height : window.innerHeight;
+    viewW = Math.max(1, Math.floor(w));
+    viewH = Math.max(1, Math.floor(h));
+    canvas.width = viewW;
+    canvas.height = viewH;
+    var sw = (window.screen && window.screen.width) || 9999;
+    var sh = (window.screen && window.screen.height) || 9999;
+    isPhone = Math.min(sw, sh) < 700 || viewH > viewW * 1.15;
+    var newN = isPhone ? 7 : 9;
+    if (newN !== N) {
+      N = newN;
+      buildWorld();
+      if (started) armEpoch(startT); // rebuild for the new grid; bursts are dropped
+    }
+    layout();
+    draw(forcedT >= 0 ? forcedT : currentT);
+  }
+
+  // ---------- boot + loop ----------
+  var startStamp = null;
+  function frame(ts) {
+    if (startStamp === null) startStamp = ts;
+    var t = (ts - startStamp) / 1000;
+    draw(t);
+    requestAnimationFrame(frame);
+  }
+
+  function onResize() { resize(); }
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', onResize);
+  }
+  window.addEventListener('resize', onResize);
+
+  buildWorld();
+  if (forcedT >= 0) armEpoch(0); // QA only: forced renders show the spread under way
+  resize();
+  draw(forcedT >= 0 ? forcedT : 0); // frame one: synchronous, t = 0, never clock-derived
+
+  if (forcedT < 0 && typeof requestAnimationFrame === 'function') {
+    requestAnimationFrame(frame);
+  }
+})();
+</script>
+</body>
+</html>
