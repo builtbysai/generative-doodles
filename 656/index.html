@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Hanan Pacha</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #0A0A0B; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // Palette (strict, four tones, no more)
+  var GROUND = '#0A0A0B';
+  var BAND = '#14161A';
+  var PAPER = '#F2EDE4';
+  var GOLD = '#D9A441';
+
+  var BASE_SEED = 656001;
+
+  // Seeded RNG (mulberry32)
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  var W = 0, H = 0, isPhone = false;
+
+  // Layout in px, rebuilt on resize.
+  var bandTop = 0, bandBot = 0;
+
+  // ------------------------------------------------------------------
+  // The six birds. Three condors (broad flat wings, long body) and
+  // three aguilas (smaller, wings swept back), species order seeded.
+  //
+  // Rail model: a soaring bird in a flat band rides a thermal street:
+  // it runs down the band on a shallow S-curve, eases into a banked
+  // turn at the end, and rides back. The rail is
+  //   theta(t) = dir * 2*pi*t/period + phase
+  //   x = cx + ax*sin(theta)
+  //   y = cy + flip * ay * g(theta),  g = (sin^3 + 0.45 sin^5) / 1.45
+  // Both velocity components carry the same cos(theta) factor, so
+  // the heading stays within about 25 degrees of horizontal all the
+  // way through the turn: the bird slows at the ends of its run
+  // instead of whipping through a vertical dive (a closed ellipse or
+  // Lissajous rail does whip, and the birds stopped reading as
+  // birds). A slow seeded bob of the rail center keeps the street
+  // from looking machined. Position and heading are pure functions
+  // of the anchored elapsed clock.
+  //
+  // Bank is the signed heading rate,
+  //   bank = clamp(G * (vx*ayy - vy*axx) / (vx^2 + vy^2)),
+  // near zero along the straights and saturating in the turns. In a
+  // flat silhouette, roll is rendered as wing foreshortening (tips
+  // scaled by cos(bank)), a slight tip sweep-back (sin(bank)), and a
+  // small lean toward the turn. Wings never flap: the triangle
+  // geometry is rigid, only its projection changes.
+  // ------------------------------------------------------------------
+  var CENTERS = [
+    [0.27, 0.24], [0.52, 0.38], [0.71, 0.22],
+    [0.31, 0.48], [0.58, 0.52], [0.76, 0.42]
+  ];
+  var birds = [];
+
+  function buildBirds() {
+    var rng = mulberry32(BASE_SEED);
+    var species = ['condor', 'condor', 'condor', 'aguila', 'aguila', 'aguila'];
+    for (var i = species.length - 1; i > 0; i--) {
+      var j = Math.floor(rng() * (i + 1));
+      var tmp = species[i]; species[i] = species[j]; species[j] = tmp;
+    }
+    birds = [];
+    for (var k = 0; k < 6; k++) {
+      var condor = species[k] === 'condor';
+      birds.push({
+        species: species[k],
+        cxf: CENTERS[k][0] + (rng() - 0.5) * 0.05,
+        cyf: CENTERS[k][1] + (rng() - 0.5) * 0.04,
+        axf: (condor ? 0.125 : 0.105) + rng() * 0.03,   // rail reach, x (frac of W)
+        ayf: 0.020 + rng() * 0.011,                    // rail reach, y (frac of H)
+        flip: rng() < 0.5 ? 1 : -1,                    // S-curve mirrored or not
+        bobP: rng() * Math.PI * 2,                     // rail-center bob phase
+        period: 46 + rng() * 30,                       // seconds per run out and back
+        phase: rng() * Math.PI * 2,
+        dir: (k % 2 === 0) ? 1 : -1,
+        depth: 0.72 + rng() * 0.40                     // 0.72 far .. 1.12 near
+      });
+    }
+    // Far birds draw first.
+    birds.sort(function (a, b) { return a.depth - b.depth; });
+  }
+
+  // Bird silhouettes in local units (half-span = 1, heading = +x).
+  // One rigid quad per wing (front, shoulder, tip, back: a tapered
+  // wing, not a sail), a body diamond, a tail fan triangle that
+  // overlaps the body's rear so the silhouette never notches.
+  var GEO = {
+    condor: {
+      span: 0.122,                       // half-span as frac of min(W,H)
+      front: [0.16, 0.07], shoulder: [0.15, 0.46], tip: [0.02, 0.90], back: [-0.40, 0.12],
+      body: [[0.52, 0], [0.05, 0.17], [-0.58, 0], [0.05, -0.17]],
+      tail: [[-0.40, 0], [-0.78, 0.23], [-0.78, -0.23]]
+    },
+    aguila: {
+      span: 0.100,
+      front: [0.13, 0.06], shoulder: [0.02, 0.36], tip: [-0.20, 0.70], back: [-0.36, 0.10],
+      body: [[0.46, 0], [0.04, 0.14], [-0.52, 0], [0.04, -0.14]],
+      tail: [[-0.36, 0], [-0.66, 0.18], [-0.66, -0.18]]
+    }
+  };
+
+  // The rail's S-curve and its first two derivatives (per unit theta).
+  function gRail(th) {
+    var s = Math.sin(th), s2 = s * s;
+    return (s * s2 + 0.45 * s * s2 * s2) / 1.45;
+  }
+  function gRail1(th) {
+    var s = Math.sin(th), s2 = s * s;
+    return Math.cos(th) * (3 * s2 + 2.25 * s2 * s2) / 1.45;
+  }
+  function gRail2(th) {
+    var s = Math.sin(th), c = Math.cos(th), s2 = s * s;
+    return s * (-3 * s2 - 2.25 * s2 * s2 + 6 * c * c + 9 * s2 * c * c) / 1.45;
+  }
+
+  // Thermal marker: a thin gold ring drifting slowly along the band.
+  // Pure function of the clock; frame one puts it left of center.
+  function ringPos(t) {
+    return [
+      W * (0.34 + 0.16 * Math.sin(2 * Math.PI * t / 170)),
+      (bandTop + bandBot) / 2 + H * 0.02 * Math.sin(2 * Math.PI * t / 97 + 1.3)
+    ];
+  }
+
+  // Wind state. While dragging, wind leans toward the drag
+  // displacement; on release it decays with a ~1.8 s time constant,
+  // so the sky is calm again after about six seconds. Wind is zero
+  // at frame one and only ever comes from recorded drags.
+  var windX = 0, windY = 0;
+  var dragging = false, dragSX = 0, dragSY = 0, dragCX = 0, dragCY = 0;
+
+  function birdPose(b, t, ring) {
+    var cx = b.cxf * W;
+    var cy = b.cyf * H + H * 0.010 * Math.sin(2 * Math.PI * t / 131 + b.bobP);
+    var ax = b.axf * W, ay = b.ayf * H;
+    var om = b.dir * 2 * Math.PI / b.period;      // signed angular rate
+    var th = om * t + b.phase;
+    var x = cx + ax * Math.sin(th);
+    var y = cy + b.flip * ay * gRail(th);
+    // Heading from the rail tangent; bank from the signed heading
+    // rate, using the rail's first and second derivatives.
+    var vx = ax * Math.cos(th) * om;
+    var vy = b.flip * ay * gRail1(th) * om;
+    var axx = -ax * Math.sin(th) * om * om;
+    var ayy = b.flip * ay * gRail2(th) * om * om;
+    var heading = Math.atan2(vy, vx);
+    var bank = 1.15 * (vx * ayy - vy * axx) / (vx * vx + vy * vy);
+    if (bank > 0.62) bank = 0.62;
+    if (bank < -0.62) bank = -0.62;
+    // Thermal lift: rails passing near the gold ring ride higher.
+    var dx = cx - ring[0], dy = cy - ring[1];
+    var d2 = dx * dx + dy * dy;
+    var sig = 0.17 * W;
+    var lift = 0.045 * H * Math.exp(-d2 / (2 * sig * sig));
+    y -= lift;
+    // Wind bends every flight path leeward, nearer birds more.
+    var wf = 0.45 + 0.55 * ((b.depth - 0.72) / 0.40);
+    x += windX * wf;
+    y += windY * wf;
+    return { x: x, y: y, heading: heading, bank: bank };
+  }
+
+  function drawBird(b, pose) {
+    var g = GEO[b.species];
+    var unit = Math.min(W, H) * g.span * b.depth * (isPhone ? 1.12 : 1);
+    var alpha = 0.60 + 0.40 * ((b.depth - 0.72) / 0.40);
+    var ab = Math.abs(pose.bank);
+    var cosB = Math.cos(ab), sinB = Math.sin(ab);
+    ctx.save();
+    ctx.translate(pose.x, pose.y);
+    ctx.rotate(pose.heading + pose.bank * 0.12);
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = PAPER;
+    for (var side = -1; side <= 1; side += 2) {
+      var tipX = (g.tip[0] - sinB * 0.30) * unit;
+      var tipY = side * g.tip[1] * cosB * unit;
+      var shX = (g.shoulder[0] - sinB * 0.18) * unit;
+      var shY = side * g.shoulder[1] * cosB * unit;
+      ctx.beginPath();
+      ctx.moveTo(g.front[0] * unit, side * g.front[1] * unit);
+      ctx.lineTo(shX, shY);
+      ctx.lineTo(tipX, tipY);
+      ctx.lineTo(g.back[0] * unit, side * g.back[1] * unit);
+      ctx.closePath();
+      ctx.fill();
+    }
+    ctx.beginPath();
+    ctx.moveTo(g.tail[0][0] * unit, g.tail[0][1] * unit);
+    ctx.lineTo(g.tail[1][0] * unit, g.tail[1][1] * unit);
+    ctx.lineTo(g.tail[2][0] * unit, g.tail[2][1] * unit);
+    ctx.closePath();
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(g.body[0][0] * unit, g.body[0][1] * unit);
+    for (var i = 1; i < g.body.length; i++) ctx.lineTo(g.body[i][0] * unit, g.body[i][1] * unit);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+
+    ctx.fillStyle = GROUND;
+    ctx.fillRect(0, 0, W, H);
+
+    // The celestial band: one flat, barely-lighter dark tone across
+    // the upper two-thirds. Hard edges, no gradient.
+    ctx.fillStyle = BAND;
+    ctx.fillRect(0, bandTop, W, bandBot - bandTop);
+
+    var ring = ringPos(t);
+
+    // Thermal marker: one thin gold ring.
+    ctx.strokeStyle = GOLD;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(ring[0], ring[1], Math.max(10, Math.min(W, H) * 0.052), 0, Math.PI * 2);
+    ctx.stroke();
+
+    for (var i = 0; i < birds.length; i++) {
+      drawBird(birds[i], birdPose(birds[i], t, ring));
+    }
+  }
+
+  function resize() {
+    var vv = window.visualViewport;
+    W = vv ? vv.width : window.innerWidth;
+    H = vv ? vv.height : window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+    var sw = window.screen ? Math.min(window.screen.width, window.screen.height) : 9999;
+    isPhone = sw < 700 || (sw >= 9999 && H > W * 1.15);
+    bandTop = H * 0.045;
+    bandBot = H * 0.685;
+  }
+
+  // Anchored elapsed clock from rAF timestamps: offset plus elapsed
+  // since load. Frame one is drawn synchronously at t = 0.
+  var t0 = null, lastTs = null, lastT = 0;
+
+  function frame(ts) {
+    if (t0 === null) t0 = ts;
+    var t = (ts - t0) / 1000;
+    var dt = Math.min(0.1, t - lastT);
+    lastT = t;
+    if (dragging) {
+      var maxW = Math.min(W, H) * 0.14;
+      var tx = dragCX - dragSX, ty = dragCY - dragSY;
+      var m = Math.sqrt(tx * tx + ty * ty);
+      if (m > maxW) { tx = tx / m * maxW; ty = ty / m * maxW; }
+      var k = 1 - Math.exp(-dt * 8);
+      windX += (tx - windX) * k;
+      windY += (ty - windY) * k;
+    } else if (windX !== 0 || windY !== 0) {
+      var d = Math.exp(-dt / 1.8);
+      windX *= d; windY *= d;
+      if (Math.abs(windX) < 0.05 && Math.abs(windY) < 0.05) { windX = 0; windY = 0; }
+    }
+    draw(t);
+    lastTs = ts;
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+  }
+
+  function redraw() {
+    draw(lastTs !== null && t0 !== null ? (lastTs - t0) / 1000 : 0);
+  }
+
+  function pointerPos(ev) {
+    var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    return [ev.clientX - r.left, ev.clientY - r.top];
+  }
+
+  canvas.addEventListener('pointerdown', function (ev) {
+    var p = pointerPos(ev);
+    dragging = true;
+    dragSX = dragCX = p[0];
+    dragSY = dragCY = p[1];
+    if (canvas.setPointerCapture && ev.pointerId !== undefined) {
+      try { canvas.setPointerCapture(ev.pointerId); } catch (e) {}
+    }
+  });
+  canvas.addEventListener('pointermove', function (ev) {
+    if (!dragging) return;
+    var p = pointerPos(ev);
+    dragCX = p[0]; dragCY = p[1];
+  });
+  function endDrag() { dragging = false; }
+  canvas.addEventListener('pointerup', endDrag);
+  canvas.addEventListener('pointercancel', endDrag);
+
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { resize(); redraw(); });
+  }
+  window.addEventListener('resize', function () { resize(); redraw(); });
+
+  buildBirds();
+  resize();
+
+  // QA hook: ?seed=wind draws frame one with a preset leeward wind so
+  // the bend can be checked headlessly. Inert in normal viewing.
+  var qaWind = false;
+  if (typeof location !== 'undefined' && location.search && /seed=wind/.test(location.search)) qaWind = true;
+  if (qaWind) windX = W * 0.10, windY = H * 0.03;
+
+  draw(0); // frame one: six birds mid-run, ring left of center, calm
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
