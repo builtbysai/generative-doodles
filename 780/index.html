@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rotational Horizon</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #6E97C4; height: 100%; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---- Palette (strict; every drawn color is one of these or an alpha of one) ----
+  var DOME_CENTER = [143, 179, 217]; // #8FB3D9
+  var DOME_EDGE   = [110, 151, 196]; // #6E97C4
+  var FLOOR       = [232, 238, 244]; // #E8EEF4
+  var LED_WARM    = [255, 217, 160]; // #FFD9A0
+  var LED_COOL    = [160, 200, 255]; // #A0C8FF
+  var LED_ROSE    = [255, 179, 179]; // #FFB3B3
+  var FIGURE      = [26, 29, 34];    // #1A1D22
+
+  var LED_COUNT = 140;        // ring points, prompt range 120-160
+  var LED_CYCLE = 48;         // seconds for one full color cycle per point
+  var GLIDE_K = 1.8;          // release glide decay rate (1/s)
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  var W = 0, H = 0, DPR = 1, isPhone = false;
+
+  function resize() {
+    var vv = window.visualViewport;
+    var w = vv ? vv.width : window.innerWidth;
+    var h = vv ? vv.height : window.innerHeight;
+    DPR = window.devicePixelRatio || 1;
+    W = w; H = h;
+    canvas.width = Math.round(w * DPR);
+    canvas.height = Math.round(h * DPR);
+    var sw = window.screen ? Math.min(window.screen.width, window.screen.height) : 9999;
+    isPhone = (sw < 700) || (h > w * 1.15);
+  }
+  if (window.visualViewport) window.visualViewport.addEventListener('resize', resize);
+  window.addEventListener('resize', resize);
+  resize();
+
+  // ---- Orbit state: closed-form in (recorded drag samples, t) ----
+  // orbit is measured in full turns. At rest it is a constant.
+  // While dragging: orbit = oStart + (xCur - xStart) / W.
+  // After release: orbit(t) = o0 + (v0 / K) * (1 - exp(-K * (t - t0))).
+  var committedOrbit = 0;
+  var drag = null;   // {xStart, oStart, xCur, samples:[{t, o}]}
+  var glide = null;  // {t0, o0, v0}
+
+  function orbitAt(t) {
+    if (drag) return drag.oStart + (drag.xCur - drag.xStart) / (W || 1);
+    if (glide) {
+      var dt = t - glide.t0;
+      if (dt <= 0) return glide.o0;
+      return glide.o0 + (glide.v0 / GLIDE_K) * (1 - Math.exp(-GLIDE_K * dt));
+    }
+    return committedOrbit;
+  }
+
+  var startStamp = null;
+  function elapsed() {
+    if (typeof performance !== 'undefined' && performance.now) {
+      var n = performance.now();
+      if (startStamp === null) startStamp = n;
+      return (n - startStamp) / 1000;
+    }
+    return 0;
+  }
+
+  function onDown(x) {
+    var t = elapsed();
+    committedOrbit = orbitAt(t);
+    glide = null;
+    drag = { xStart: x, oStart: committedOrbit, xCur: x, samples: [{ t: t, o: committedOrbit }] };
+  }
+  function onMove(x) {
+    if (!drag) return;
+    drag.xCur = x;
+    drag.samples.push({ t: elapsed(), o: drag.oStart + (x - drag.xStart) / (W || 1) });
+    if (drag.samples.length > 24) drag.samples.shift();
+  }
+  function onUp() {
+    if (!drag) return;
+    var t = elapsed();
+    var o = orbitAt(t);
+    var v = 0;
+    var s = drag.samples;
+    if (s.length >= 2) {
+      var a = s[s.length - 2], b = s[s.length - 1];
+      if (b.t > a.t) v = (b.o - a.o) / (b.t - a.t);
+    }
+    // Clamp release velocity to a stately turn: at most half a turn per second.
+    if (v > 0.5) v = 0.5; else if (v < -0.5) v = -0.5;
+    drag = null;
+    glide = { t0: t, o0: o, v0: v };
+    committedOrbit = o;
+  }
+  canvas.addEventListener('pointerdown', function (e) { onDown(e.clientX); });
+  canvas.addEventListener('pointermove', function (e) { onMove(e.clientX); });
+  canvas.addEventListener('pointerup', onUp);
+  canvas.addEventListener('pointercancel', onUp);
+
+  // ---- Helpers ----
+  function rgba(c, a) { return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a + ')'; }
+  function lerpC(a, b, f) {
+    return [Math.round(a[0] + (b[0] - a[0]) * f),
+            Math.round(a[1] + (b[1] - a[1]) * f),
+            Math.round(a[2] + (b[2] - a[2]) * f)];
+  }
+  function frac(x) { return x - Math.floor(x); }
+
+  // LED color cycle: warm -> cool -> rose -> warm, p in [0,1).
+  function ledColor(p) {
+    if (p < 1 / 3) return lerpC(LED_WARM, LED_COOL, p * 3);
+    if (p < 2 / 3) return lerpC(LED_COOL, LED_ROSE, (p - 1 / 3) * 3);
+    return lerpC(LED_ROSE, LED_WARM, (p - 2 / 3) * 3);
+  }
+
+  // Convex floor horizon: highest (smallest y) at center, sagging at the edges.
+  function horizonY(x) {
+    var u = (x / W) * 2 - 1;               // -1 .. 1
+    var yC = H * 0.70;                      // horizon at the lower third
+    var sag = H * 0.045;
+    return yC + sag * u * u;
+  }
+
+  function drawFigure(cx, feetY, fh) {
+    ctx.fillStyle = rgba(FIGURE, 1);
+    // head
+    var hr = fh * 0.13;
+    var headCY = feetY - fh + hr;
+    ctx.beginPath(); ctx.arc(cx, headCY, hr, 0, Math.PI * 2); ctx.fill();
+    // body: one tapered silhouette from shoulders to feet
+    var shY = feetY - fh * 0.80;            // shoulder line
+    var shW = fh * 0.16;                    // half shoulder width
+    var hipY = feetY - fh * 0.45;
+    var hipW = fh * 0.11;
+    var ftW = fh * 0.13;                    // half stance width at feet
+    ctx.beginPath();
+    ctx.moveTo(cx - shW, shY);
+    ctx.quadraticCurveTo(cx - shW * 1.05, hipY, cx - hipW, hipY);
+    ctx.lineTo(cx - ftW, feetY);
+    ctx.lineTo(cx - fh * 0.03, feetY);
+    ctx.lineTo(cx, hipY + fh * 0.04);
+    ctx.lineTo(cx + fh * 0.03, feetY);
+    ctx.lineTo(cx + ftW, feetY);
+    ctx.lineTo(cx + hipW, hipY);
+    ctx.quadraticCurveTo(cx + shW * 1.05, hipY, cx + shW, shY);
+    ctx.quadraticCurveTo(cx, shY - fh * 0.05, cx - shW, shY);
+    ctx.closePath(); ctx.fill();
+  }
+
+  function draw(t) {
+    // Pin the canvas CSS size every frame (house rule for high-DPR phones).
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+    var orbit = orbitAt(t);
+
+    // ---- Dome: layered concentric ellipse bands, edge blue to center blue ----
+    ctx.fillStyle = rgba(DOME_EDGE, 1);
+    ctx.fillRect(0, 0, W, H);
+    var dcx = W / 2, dcy = H * 0.40;
+    var BANDS = 14;
+    for (var i = BANDS - 1; i >= 1; i--) {
+      var f = i / BANDS;                    // 1 at rim, 0 at center
+      var col = lerpC(DOME_CENTER, DOME_EDGE, Math.pow(f, 1.25));
+      ctx.fillStyle = rgba(col, 1);
+      ctx.beginPath();
+      ctx.ellipse(dcx, dcy, W * 0.78 * f + 1, H * 0.72 * f + 1, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    // Shading lobe: the dome's light center, tiled with period W so the
+    // orbit wraparound is continuous. Drawn at cx-W, cx, cx+W.
+    var lobeCX = W * frac(0.5 - orbit);
+    var lobeR = W * 0.85;
+    for (var k = -1; k <= 1; k++) {
+      var lx = lobeCX + k * W;
+      for (var j = 5; j >= 1; j--) {
+        var lf = j / 5;
+        ctx.fillStyle = rgba(DOME_CENTER, 0.05 * (1 - lf) + 0.012);
+        ctx.beginPath();
+        ctx.ellipse(lx, dcy, lobeR * lf, H * 0.62 * lf, 0, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    // ---- Floor: pale band under the convex horizon curve (anchored) ----
+    ctx.fillStyle = rgba(FLOOR, 1);
+    ctx.beginPath();
+    ctx.moveTo(0, horizonY(0));
+    var STEPS = 48;
+    for (var s = 1; s <= STEPS; s++) {
+      var x = (s / STEPS) * W;
+      ctx.lineTo(x, horizonY(x));
+    }
+    ctx.lineTo(W, H);
+    ctx.lineTo(0, H);
+    ctx.closePath(); ctx.fill();
+    // Gentle depth wash on the floor, edge blue at low alpha.
+    ctx.fillStyle = rgba(DOME_EDGE, 0.10);
+    ctx.fillRect(0, H * 0.90, W, H * 0.10);
+
+    // ---- LED ring: dots on the horizon curve, positions wrap with orbit ----
+    var minDim = Math.min(W, H);
+    var dotR = Math.max(1.6, minDim * 0.0038);
+    if (isPhone) dotR = Math.max(1.8, minDim * 0.0045);
+    for (var n = 0; n < LED_COUNT; n++) {
+      var u = n / LED_COUNT;                          // ring parameter 0..1
+      var sx = frac(u + orbit) * W;                   // wrapped screen x
+      var sy = horizonY(sx);
+      // Traveling wave: one full wave around the ring, advancing with t.
+      // At t=0 the phase equals u, so the ring grades warm (left) through
+      // cool (center) to rose (right).
+      var p = frac(u - t / LED_CYCLE);
+      var col = ledColor(p);
+      ctx.fillStyle = rgba(col, 0.28);
+      ctx.beginPath(); ctx.arc(sx, sy, dotR * 2.6, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = rgba(col, 1);
+      ctx.beginPath(); ctx.arc(sx, sy, dotR, 0, Math.PI * 2); ctx.fill();
+    }
+
+    // ---- Figure: small, anchored at the floor's high point (never orbits) ----
+    var fh = H * (isPhone ? 0.10 : 0.085);
+    drawFigure(W / 2, horizonY(W / 2), fh);
+  }
+
+  // Frame one: synchronous draw at t=0 (determinism gate).
+  draw(0);
+
+  if (typeof requestAnimationFrame === 'function') {
+    var rafStart = null;
+    var loop = function (ts) {
+      if (rafStart === null) rafStart = ts;
+      draw((ts - rafStart) / 1000);
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>

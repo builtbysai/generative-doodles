@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aperture</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #1C2A44; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // Palette (strict)
+  var CORRIDOR = [28, 42, 68];     // #1C2A44
+  var FLOOR    = [20, 30, 51];     // #141E33
+  var PURE     = [255, 255, 255];  // #FFFFFF threshold
+  var AURA     = [220, 232, 255];  // #DCE8FF
+  var FOG      = [246, 243, 236];  // #F6F3EC
+  var DAWN     = [253, 246, 239];  // #FDF6EF
+  var DUSK     = [246, 233, 216];  // #F6E9D8
+
+  function rgb(c, a) {
+    return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a + ')';
+  }
+  function lerp(a, b, t) { return a + (b - a) * t; }
+  function mix(c1, c2, t) {
+    return [lerp(c1[0], c2[0], t), lerp(c1[1], c2[1], t), lerp(c1[2], c2[2], t)];
+  }
+  function clamp(x, lo, hi) { return x < lo ? lo : (x > hi ? hi : x); }
+  function smooth(a, b, x) {
+    var p = clamp((x - a) / (b - a), 0, 1);
+    return p * p * (3 - 2 * p);
+  }
+  function smoother(p) { return p * p * p * (p * (p * 6 - 15) + 10); }
+
+  // mulberry32 seeded RNG
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // Precomputed fog grain, normalized frame coordinates.
+  var GRAIN = [];
+  (function buildGrain() {
+    var rnd = mulberry32(779101);
+    var n = 2400;
+    for (var i = 0; i < n; i++) {
+      GRAIN.push({
+        x: rnd(), y: rnd(),
+        r: 0.6 + rnd() * 1.3,
+        a: 0.3 + rnd() * 0.7,
+        warm: rnd() < 0.55   // dusk-toned fleck vs dawn-toned fleck
+      });
+    }
+  })();
+
+  // ---- Crossing state machine -------------------------------------------
+  // taps: recorded tap times (seconds since load). The scene is a pure
+  // function of (taps, t). u in 0..1 is "fogness": 0 = corridor,
+  // 1 = fog room. Each tap starts a 3 s segment from the current u
+  // toward the opposite end.
+  var taps = [];
+
+  function segU(seg, t) {
+    var p = clamp((t - seg.t0) / 3, 0, 1);
+    return seg.u0 + (seg.target - seg.u0) * smoother(p);
+  }
+
+  function fogU(t) {
+    var seg = { t0: 0, u0: 0, target: 0 };
+    for (var i = 0; i < taps.length; i++) {
+      var tt = taps[i];
+      if (tt > t) break;
+      var uu = segU(seg, tt);
+      seg = { t0: tt, u0: uu, target: seg.target === 1 ? 0 : 1 };
+    }
+    return segU(seg, t);
+  }
+
+  // Fog-room temperature: 96 s cosine cycle dawn -> noon -> dusk -> dawn.
+  function tempColor(t) {
+    var keys = [DAWN, FOG, DUSK, DAWN];
+    var ph = ((t % 96) + 96) % 96;
+    var idx = Math.floor(ph / 32);
+    var f = (ph - idx * 32) / 32;
+    var e = (1 - Math.cos(Math.PI * f)) / 2;
+    return mix(keys[idx], keys[idx + 1], e);
+  }
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  function viewSize() {
+    var vv = window.visualViewport;
+    if (vv && vv.width && vv.height) return { w: vv.width, h: vv.height };
+    return { w: window.innerWidth || 800, h: window.innerHeight || 600 };
+  }
+
+  function isPhone(w, h) {
+    var sw = (window.screen && window.screen.width) || w;
+    var sh = (window.screen && window.screen.height) || h;
+    if (Math.min(sw, sh) < 700) return true;
+    return h > w * 1.15;
+  }
+
+  function quad(x1, y1, x2, y2, x3, y3, x4, y4) {
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.lineTo(x3, y3);
+    ctx.lineTo(x4, y4);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  function drawFog(t, w, h, alpha) {
+    if (alpha <= 0.003) return;
+    var temp = tempColor(t);
+    // Base field
+    ctx.fillStyle = rgb(temp, alpha);
+    ctx.fillRect(0, 0, w, h);
+    // Layered horizontal bands: the field is lightest through the
+    // middle and settles a breath deeper toward top and bottom, built
+    // from flat bands of the dawn/dusk drift tones.
+    var NB = 26;
+    for (var i = 0; i < NB; i++) {
+      var v = (i + 0.5) / NB;
+      var edge = Math.pow(Math.abs(2 * v - 1), 1.6);   // 0 center, 1 edges
+      var mid = 1 - edge;
+      ctx.fillStyle = rgb(DAWN, alpha * 0.16 * mid);
+      ctx.fillRect(0, (i / NB) * h, w, h / NB + 1);
+      ctx.fillStyle = rgb(DUSK, alpha * 0.20 * edge);
+      ctx.fillRect(0, (i / NB) * h, w, h / NB + 1);
+    }
+    // Central luminosity: layered flat ellipses of dawn light.
+    var cx = w / 2, cy = h * 0.47;
+    var glowLayers = [
+      { rx: 0.62, ry: 0.40, a: 0.05 },
+      { rx: 0.46, ry: 0.30, a: 0.06 },
+      { rx: 0.32, ry: 0.21, a: 0.07 },
+      { rx: 0.20, ry: 0.13, a: 0.08 }
+    ];
+    for (var g = 0; g < glowLayers.length; g++) {
+      var GL = glowLayers[g];
+      ctx.fillStyle = rgb(DAWN, alpha * GL.a);
+      ctx.beginPath();
+      ctx.ellipse(cx, cy, w * GL.rx, h * GL.ry, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    // Fine grain so the field reads as lit air, not a flat fill.
+    for (var j = 0; j < GRAIN.length; j++) {
+      var pt = GRAIN[j];
+      ctx.fillStyle = rgb(pt.warm ? DUSK : DAWN, alpha * pt.a * 0.055);
+      ctx.fillRect(pt.x * w, pt.y * h, pt.r, pt.r);
+    }
+  }
+
+  function draw(t) {
+    var s = viewSize();
+    var w = Math.max(50, Math.round(s.w));
+    var h = Math.max(50, Math.round(s.h));
+    if (canvas.width !== w) canvas.width = w;
+    if (canvas.height !== h) canvas.height = h;
+    canvas.style.width = w + 'px';
+    canvas.style.height = h + 'px';
+
+    var u = fogU(t);
+
+    // ---- Corridor ------------------------------------------------------
+    var cx = w / 2;
+    var cy = h * 0.47;
+
+    // Doorway geometry: rest height 30% of frame height, scaled about
+    // the vanishing point as the crossing pushes in.
+    var dh0 = h * 0.30;
+    var dw0 = dh0 * 0.62;
+    var push = smoother(clamp(u, 0, 1));
+    var scale = 1 + 3.7 * push;
+    var dw = dw0 * scale;
+    var dh = dh0 * scale;
+    var dx = cx - dw / 2;
+    var dy = cy - dh / 2;
+
+    // Room base
+    ctx.fillStyle = rgb(CORRIDOR, 1);
+    ctx.fillRect(0, 0, w, h);
+
+    // Ceiling and side walls: converging quads in flat mixes of the
+    // corridor and floor tones, so the perspective reads by tone.
+    ctx.fillStyle = rgb(mix(CORRIDOR, FLOOR, 0.45), 1);
+    quad(0, 0, w, 0, dx + dw, dy, dx, dy);                              // ceiling
+    ctx.fillStyle = rgb(mix(CORRIDOR, FLOOR, 0.18), 1);
+    quad(0, 0, dx, dy, dx, dy + dh, 0, h);                              // left wall
+    ctx.fillStyle = rgb(mix(CORRIDOR, FLOOR, 0.30), 1);
+    quad(w, 0, w, h, dx + dw, dy + dh, dx + dw, dy);                    // right wall
+    ctx.fillStyle = rgb(FLOOR, 1);
+    quad(0, h, dx, dy + dh, dx + dw, dy + dh, w, h);                    // floor
+
+    // Receding wall-segment lines: interpolated rectangles between the
+    // frame and the doorway, faint, so the corridor has measured depth.
+    var segF = [0.38, 0.66];
+    for (var si = 0; si < segF.length; si++) {
+      var f = segF[si];
+      var rx = lerp(0, dx, f), ry = lerp(0, dy, f);
+      var rw = lerp(w, dw, f), rh = lerp(h, dh, f);
+      ctx.strokeStyle = rgb(FLOOR, 0.5);
+      ctx.lineWidth = Math.max(1, h * 0.0022);
+      ctx.strokeRect(rx, ry, rw, rh);
+    }
+
+    // The doorway's light spilling onto the floor.
+    ctx.fillStyle = rgb(AURA, 0.10 + 0.05 * push);
+    quad(dx + dw * 0.08, dy + dh, dx + dw * 0.92, dy + dh,
+         dx + dw * 1.25, h, dx - dw * 0.25, h);
+
+    // Aura: a wide soft ellipse field plus layered expanded rectangles
+    // of aura tone around the opening. It breathes faintly at rest.
+    var breath = 1 + 0.07 * Math.sin((Math.PI * 2 * t) / 6.5);
+    ctx.fillStyle = rgb(AURA, 0.04 * breath);
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, dw * 2.35, dh * 1.42, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = rgb(AURA, 0.06 * breath);
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, dw * 1.55, dh * 0.95, 0, 0, Math.PI * 2);
+    ctx.fill();
+    var auraSteps = [
+      { grow: 0.42, a: 0.07 },
+      { grow: 0.26, a: 0.10 },
+      { grow: 0.15, a: 0.14 },
+      { grow: 0.07, a: 0.20 }
+    ];
+    for (var ai = 0; ai < auraSteps.length; ai++) {
+      var AS = auraSteps[ai];
+      var gw = dw * AS.grow, gh = dh * AS.grow;
+      ctx.fillStyle = rgb(AURA, AS.a * breath);
+      ctx.fillRect(dx - gw / 2, dy - gh / 2, dw + gw, dh + gh);
+    }
+
+    // The threshold itself: pure white, inset aura steps giving the
+    // light a shallow depth, brightest at the core. No frame, no edge.
+    ctx.fillStyle = rgb(PURE, 1);
+    ctx.fillRect(dx, dy, dw, dh);
+    var insetSteps = [0.16, 0.30];
+    for (var ii = 0; ii < insetSteps.length; ii++) {
+      var fr = insetSteps[ii];
+      ctx.fillStyle = rgb(AURA, 0.16);
+      ctx.fillRect(dx + dw * fr / 2, dy + dh * fr / 2, dw * (1 - fr), dh * (1 - fr));
+      ctx.fillStyle = rgb(PURE, 0.55);
+      ctx.fillRect(dx + dw * fr / 2, dy + dh * fr / 2, dw * (1 - fr), dh * (1 - fr));
+    }
+
+    // ---- Crossing bloom -------------------------------------------------
+    // As u passes the middle, an expanding white bloom takes the frame:
+    // the white-out of the crossing. The fog room then fades up out of
+    // it. On the way back the same function runs in reverse.
+    var bloom = smooth(0.45, 0.85, u);
+    if (bloom > 0.003) {
+      var bl = [
+        { rx: 0.30, ry: 0.24, a: 0.35 },
+        { rx: 0.20, ry: 0.16, a: 0.45 },
+        { rx: 0.12, ry: 0.10, a: 0.55 }
+      ];
+      for (var bi = 0; bi < bl.length; bi++) {
+        var BL = bl[bi];
+        ctx.fillStyle = rgb(PURE, bloom * BL.a);
+        ctx.beginPath();
+        ctx.ellipse(cx, cy, w * BL.rx * (0.4 + bloom), h * BL.ry * (0.4 + bloom), 0, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.fillStyle = rgb(PURE, bloom * bloom * 0.9);
+      ctx.fillRect(0, 0, w, h);
+    }
+
+    // ---- Fog room --------------------------------------------------------
+    var fogA = smooth(0.72, 1.0, u);
+    drawFog(t, w, h, fogA);
+  }
+
+  // Frame one: synchronous draw at t = 0, corridor at rest, the
+  // doorway glowing at the end of it.
+  draw(0);
+
+  var startStamp = null;
+  var lastT = 0;
+  function frame(now) {
+    if (startStamp === null) startStamp = now;
+    lastT = (now - startStamp) / 1000;
+    draw(lastT);
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(frame);
+    }
+  }
+  if (typeof requestAnimationFrame === 'function') {
+    requestAnimationFrame(frame);
+  }
+
+  function onResize() { draw(lastT); }
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', onResize);
+  }
+  window.addEventListener('resize', onResize);
+
+  // Tap = the threshold ritual. In the corridor it crosses; in the fog
+  // room it crosses back. Recorded, never a reload.
+  function tap() {
+    taps.push(lastT);
+    draw(lastT);
+  }
+  canvas.addEventListener('pointerdown', tap);
+  canvas.addEventListener('mousedown', tap);
+  canvas.addEventListener('touchstart', tap, { passive: true });
+})();
+</script>
+</body>
+</html>
