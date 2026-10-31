@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Río Bajo el Río</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #0A0A0B; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // Palette (strict, no more): ground, mountain mass, strata lines,
+  // water at alpha, three minerals, under-river gold.
+  var GROUND = '#0A0A0B';
+  var MASS = '#3A3A3D';
+  var STRATA = '#6B6B6E';
+
+  var WATER = [127, 179, 200];   // #7FB3C8
+  var RUST = [138, 74, 43];      // #8A4A2B
+  var COPPER = [62, 122, 107];   // #3E7A6B
+  var GRAYM = [154, 154, 156];   // #9A9A9C
+  var GOLD = [217, 164, 65];     // #D9A441
+  var MINERALS = [RUST, COPPER, GRAYM];
+
+  var BASE_SEED = 660001;
+
+  // Seeded RNG (mulberry32)
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function mix(a, b, t) {
+    return [
+      Math.round(a[0] + (b[0] - a[0]) * t),
+      Math.round(a[1] + (b[1] - a[1]) * t),
+      Math.round(a[2] + (b[2] - a[2]) * t)
+    ];
+  }
+  function rgb(c) { return 'rgb(' + c[0] + ',' + c[1] + ',' + c[2] + ')'; }
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  var W = 0, H = 0, isPhone = false;
+
+  // ------------------------------------------------------------------
+  // Layout, in fractions of the frame so the whole watershed refits
+  // any viewport without touching the simulation.
+  //   ridge mass:        y 0 .. ~0.15 (irregular lower edge)
+  //   rust band:         y 0.300 .. 0.375
+  //   copper band:       y 0.465 .. 0.540
+  //   granite band:      y 0.615 .. 0.690
+  //   surface line:      y 0.80 (basin below: the bottom fifth)
+  // ------------------------------------------------------------------
+  var SURF = 0.80;
+  var BANDS = [
+    { top: 0.300, bot: 0.375, mineral: 0 },
+    { top: 0.465, bot: 0.540, mineral: 1 },
+    { top: 0.615, bot: 0.690, mineral: 2 }
+  ];
+
+  // Ridge lower edge: seeded smoothed noise, precomputed once.
+  var ridgeCtrl = [];
+  function buildRidge() {
+    var rng = mulberry32(BASE_SEED + 11);
+    var raw = [];
+    for (var i = 0; i < 97; i++) raw.push(rng());
+    for (var p = 0; p < 2; p++) {
+      var sm = [];
+      for (var j = 0; j < 97; j++) {
+        var a = raw[(j + 96) % 97], b = raw[j], c = raw[(j + 1) % 97];
+        sm.push((a + b * 2 + c) / 4);
+      }
+      raw = sm;
+    }
+    ridgeCtrl = raw;
+  }
+  function ridgeEdge(xf) {
+    var u = xf * 96;
+    var i = Math.floor(u);
+    if (i > 95) i = 95;
+    var f = u - i;
+    return 0.15 + (ridgeCtrl[i] * (1 - f) + ridgeCtrl[i + 1] * f - 0.5) * 0.044;
+  }
+
+  // Spring columns the ribbons pour from (seeded), mixed with
+  // uniform spawns so the descent covers the frame.
+  var springs = [];
+  function buildSprings() {
+    var rng = mulberry32(BASE_SEED + 23);
+    springs = [];
+    for (var i = 0; i < 5; i++) springs.push(0.10 + rng() * 0.80);
+  }
+
+  // ------------------------------------------------------------------
+  // Simulation. Fixed dt = 1/60 on an anchored clock. Every particle
+  // is a ribbon: a head advected downslope plus a short trail of its
+  // recent positions, drawn as overlapping flat dashes. The state is
+  // a pure function of the number of steps run from the seeds, so
+  // frame one (after the fixed pre-run) is identical on every load.
+  // ------------------------------------------------------------------
+  var DT = 1 / 60;
+  var PRERUN_STEPS = 600;              // 10 s of flow baked into frame one
+  var BASE_N = 150;                    // standing ribbons
+  var TRAIL = 30;                      // positions kept per ribbon
+  var MAX_GRAINS = 2600;
+
+  var spawnRng = mulberry32(BASE_SEED + 47);
+  var particles = [];
+  var grains = [];                     // {x, y, c:[r,g,b], born}
+  var simT = 0;
+  var stepsRun = 0;
+  var pendingSurge = 0;
+  var surgeClock = 0;
+
+  // Stir state: pointer-driven only, zero at frame one.
+  var stir = { active: false, x: 0, y: 0, vx: 0, vy: 0 };
+
+  function spawnX() {
+    if (spawnRng() < 0.6) {
+      var s = springs[Math.floor(spawnRng() * springs.length)];
+      var g = (spawnRng() + spawnRng() + spawnRng()) / 3 - 0.5;
+      return Math.min(0.97, Math.max(0.03, s + g * 0.16));
+    }
+    return 0.03 + spawnRng() * 0.94;
+  }
+
+  function makeParticle(temp) {
+    var fx = spawnX();
+    return {
+      x: fx,
+      y: ridgeEdge(fx) + 0.004,
+      vx: 0,
+      vy: 0,
+      speed: 0.72 + spawnRng() * 0.60,
+      phase: spawnRng() * Math.PI * 2,
+      drift: 0.7 + spawnRng() * 0.6,
+      wf: 0.85 + spawnRng() * 0.35,   // width factor, scaled to frame at draw
+      mineral: -1,          // index into MINERALS, -1 = untinted
+      sinceCross: 99,
+      strength: 0,          // 0 = pure water, up to ~0.82 deep stain
+      wait: 0,              // respawn hold: decorrelates the cohorts
+      trail: [],
+      temp: !!temp
+    };
+  }
+
+  function bandAt(y) {
+    for (var i = 0; i < BANDS.length; i++) {
+      if (y >= BANDS[i].top && y <= BANDS[i].bot) return i;
+    }
+    return -1;
+  }
+
+  function deposit(p) {
+    var c;
+    if (p.mineral >= 0) c = mix(WATER, MINERALS[p.mineral], Math.max(p.strength, 0.65));
+    else c = mix(WATER, GRAYM, 0.7);
+    // Sediment settles deep in the basin: y skewed toward the floor.
+    var gy = SURF + 0.006 + 0.184 * (1 - Math.pow(spawnRng(), 2.2));
+    grains.push({
+      x: Math.min(0.995, Math.max(0.005, p.x + (spawnRng() - 0.5) * 0.012)),
+      y: gy,
+      c: c,
+      born: simT
+    });
+    if (grains.length > MAX_GRAINS) grains.splice(0, grains.length - MAX_GRAINS);
+  }
+
+  function step(dt) {
+    simT += dt;
+    stepsRun++;
+
+    // Standing population and tap surges.
+    var standing = 0, i, p;
+    for (i = 0; i < particles.length; i++) if (!particles[i].temp) standing++;
+    if (standing < BASE_N) particles.push(makeParticle(false));
+    if (pendingSurge > 0) {
+      surgeClock += dt;
+      while (pendingSurge > 0 && surgeClock >= 0.05) {
+        surgeClock -= 0.05;
+        particles.push(makeParticle(true));
+        pendingSurge--;
+      }
+    }
+
+    var stirR = 0.085;
+    for (i = particles.length - 1; i >= 0; i--) {
+      p = particles[i];
+
+      // Respawn hold: a landed ribbon waits a seeded beat before
+      // pouring again, so the population never travels as one
+      // convoy that leaves the lower river dry.
+      if (p.wait > 0) { p.wait -= dt; continue; }
+
+      // Flow field: downslope fall plus a seeded meander that varies
+      // with depth, so ribbons wander like water finding its way.
+      var fall = 0.30 * p.speed;
+      var meander = 0.055 * p.drift * Math.sin(p.y * 21 + p.phase + 1.7 * Math.sin(p.x * 9 + p.phase * 2.0));
+      var tvx = meander, tvy = fall;
+
+      // Drag eddies: deflect around the fingertip, with a swirl.
+      if (stir.active) {
+        var dx = p.x - stir.x, dy = (p.y - stir.y) * (H / Math.max(W, 1));
+        var d2 = dx * dx + dy * dy;
+        if (d2 < stirR * stirR && d2 > 1e-6) {
+          var d = Math.sqrt(d2);
+          var push = (1 - d / stirR) * 0.55;
+          tvx += (dx / d) * push + (-dy / d) * push * 0.7 + stir.vx * 0.25 * push;
+          tvy += (dy / d) * push + (dx / d) * push * 0.7 + stir.vy * 0.25 * push;
+          // Mineral plume: dashes near the stir stain harder.
+          if (p.mineral < 0) {
+            var nb = -1;
+            for (var b = 0; b < BANDS.length; b++) if (BANDS[b].top > p.y) { nb = b; break; }
+            p.mineral = nb >= 0 ? BANDS[nb].mineral : 2;
+            p.sinceCross = 0;
+          }
+          p.strength = Math.min(0.95, p.strength + dt * 2.5);
+        }
+      }
+
+      p.vx += (tvx - p.vx) * Math.min(1, dt * 6);
+      p.vy += (tvy - p.vy) * Math.min(1, dt * 6);
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      if (p.x < 0.015) { p.x = 0.015; p.vx = Math.abs(p.vx) * 0.5; }
+      if (p.x > 0.985) { p.x = 0.985; p.vx = -Math.abs(p.vx) * 0.5; }
+
+      // Mineral pickup: crossing into a strata band stains the
+      // water toward that band's mineral. The stain deepens for a
+      // moment after the crossing, then fades partly back as the
+      // ribbon descends, until the next band re-stains it.
+      var bi = bandAt(p.y);
+      if (bi >= 0 && p.mineral !== BANDS[bi].mineral) {
+        p.mineral = BANDS[bi].mineral;
+        p.sinceCross = 0;
+      }
+      p.sinceCross += dt;
+      if (p.sinceCross < 0.7) {
+        p.strength += (0.82 - p.strength) * Math.min(1, dt * 3.5);
+      } else if (p.mineral >= 0) {
+        p.strength += (0.30 - p.strength) * Math.min(1, dt * 0.35);
+      }
+
+      p.trail.push([p.x, p.y]);
+      if (p.trail.length > TRAIL) p.trail.shift();
+
+      // Landing: deposit a sediment grain and recycle.
+      if (p.y >= SURF) {
+        deposit(p);
+        if (p.temp) {
+          particles.splice(i, 1);
+        } else {
+          var fx = spawnX();
+          p.x = fx; p.y = ridgeEdge(fx) + 0.004;
+          p.vx = 0; p.vy = 0;
+          p.speed = 0.72 + spawnRng() * 0.60;
+          p.phase = spawnRng() * Math.PI * 2;
+          p.mineral = -1; p.sinceCross = 99; p.strength = 0;
+          p.wait = spawnRng() * 1.4;
+          p.trail.length = 0;
+        }
+      }
+    }
+
+    // Sediment fades at 1%/s; prune what has effectively vanished.
+    if (stepsRun % 30 === 0) {
+      grains = grains.filter(function (g) { return Math.pow(0.99, simT - g.born) > 0.04; });
+    }
+  }
+
+  function dashColor(p) {
+    if (p.mineral < 0 || p.strength <= 0.01) return WATER;
+    return mix(WATER, MINERALS[p.mineral], p.strength);
+  }
+
+  function drawRibbon(p, ghost) {
+    var n = p.trail.length;
+    if (n < 2) return;
+    ctx.lineCap = 'butt';
+    var col = ghost ? GOLD : dashColor(p);
+    ctx.strokeStyle = rgb(col);
+    // Stream width: about 3.1 px at reference scale, scaled to the
+    // frame, per-ribbon factor, tapering from tail to head so each
+    // trail reads as one continuous thread of water, not a hairline.
+    var unit = Math.max(0.8, Math.min(W, H) / 800);
+    var base = 3.1 * unit * p.wf * (isPhone ? 1.15 : 1);
+    for (var i = 0; i < n - 1; i++) {
+      var a = p.trail[i], b = p.trail[i + 1];
+      var ay = a[1], by = b[1];
+      if (ghost) {
+        ay = SURF + (SURF - ay) * 0.6;
+        by = SURF + (SURF - by) * 0.6;
+        if (ay > 0.998 || by > 0.998) continue;
+      }
+      var f = i / (n - 1);
+      var alpha;
+      if (ghost) {
+        alpha = 0.40 * (0.45 + 0.55 * f);
+      } else {
+        alpha = 0.30 + 0.62 * f;
+        // Spring glow: water just out of the ridge, still above the
+        // first strata band, runs brighter, so the upper descent
+        // shines where the springs pour.
+        var my = (ay + by) / 2;
+        if (my < BANDS[0].top) {
+          alpha = Math.min(0.97, alpha * (1 + 0.55 * (1 - my / BANDS[0].top)));
+        }
+      }
+      ctx.globalAlpha = alpha;
+      ctx.lineWidth = base * (0.72 + 0.40 * f) * (ghost ? 0.9 : 1);
+      ctx.beginPath();
+      ctx.moveTo(a[0] * W, ay * H);
+      ctx.lineTo(b[0] * W, by * H);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // Hand-drawn-feeling strata lines: seeded wavy paths, one fixed
+  // wave per line index so the shape is identical on every frame.
+  // Never a ruler-straight rule.
+  var strataWaves = [];
+  (function buildStrataWaves() {
+    var rng = mulberry32(BASE_SEED + 31);
+    for (var i = 0; i < 9; i++) {
+      strataWaves.push({
+        p1: rng() * Math.PI * 2, f1: 2 + rng() * 3,
+        p2: rng() * Math.PI * 2, f2: 6 + rng() * 7,
+        amp: 0.0016 + rng() * 0.0016
+      });
+    }
+  })();
+  function strataLine(yf, alpha, lw, idx) {
+    var w = strataWaves[idx % strataWaves.length];
+    ctx.globalAlpha = alpha;
+    ctx.lineWidth = lw;
+    ctx.beginPath();
+    var steps = 48;
+    for (var i = 0; i <= steps; i++) {
+      var xf = 0.008 + 0.984 * (i / steps);
+      var y = yf + w.amp * (Math.sin(xf * Math.PI * 2 * w.f1 + w.p1) * 0.7 +
+                            Math.sin(xf * Math.PI * 2 * w.f2 + w.p2) * 0.3);
+      if (i === 0) ctx.moveTo(xf * W, y * H); else ctx.lineTo(xf * W, y * H);
+    }
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  function draw() {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+
+    ctx.fillStyle = GROUND;
+    ctx.fillRect(0, 0, W, H);
+
+    // Ridge mass with its irregular lower edge.
+    ctx.fillStyle = MASS;
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.lineTo(W, 0);
+    for (var x = W; x >= 0; x -= 8) ctx.lineTo(x, ridgeEdge(x / W) * H);
+    ctx.closePath();
+    ctx.fill();
+
+    // Strata lines: inside the ridge mass, and at the three band
+    // boundaries only (a main line plus a lighter echo at each).
+    // No other horizontal lines anywhere in the frame.
+    ctx.strokeStyle = STRATA;
+    var li;
+    var ridgeLines = [0.045, 0.085, 0.12];
+    for (li = 0; li < ridgeLines.length; li++) {
+      strataLine(ridgeLines[li], 0.5, 1, li);
+    }
+    for (li = 0; li < BANDS.length; li++) {
+      strataLine(BANDS[li].top, 0.55, 1.4, 3 + li);
+      strataLine(BANDS[li].top + 0.006, 0.32, 0.7, 6 + li);
+    }
+
+    // The under-river: each ribbon's path mirrored below the
+    // surface line (compressed to fit the basin), in pale gold.
+    for (var gi = 0; gi < particles.length; gi++) drawRibbon(particles[gi], true);
+
+    // Sediment record: deposited grains, fading at 1%/s.
+    var gs = Math.max(1.6, Math.min(W, H) * 0.0028);
+    for (var qi = 0; qi < grains.length; qi++) {
+      var g = grains[qi];
+      ctx.globalAlpha = 0.9 * Math.pow(0.99, simT - g.born);
+      ctx.fillStyle = rgb(g.c);
+      ctx.fillRect(g.x * W - gs / 2, g.y * H - gs / 2, gs, gs);
+    }
+    ctx.globalAlpha = 1;
+
+    // Surface line.
+    ctx.strokeStyle = STRATA;
+    ctx.globalAlpha = 0.7;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(0, SURF * H);
+    ctx.lineTo(W, SURF * H);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    // The visible river.
+    for (var pi = 0; pi < particles.length; pi++) drawRibbon(particles[pi], false);
+  }
+
+  function resize() {
+    var vv = window.visualViewport;
+    W = vv ? vv.width : window.innerWidth;
+    H = vv ? vv.height : window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+    var sw = window.screen ? Math.min(window.screen.width, window.screen.height) : 9999;
+    isPhone = sw < 700 || (sw >= 9999 && H > W * 1.15);
+  }
+
+  // Anchored elapsed clock from rAF timestamps: offset plus elapsed
+  // since load. Frame one is drawn synchronously after the pre-run.
+  var t0 = null, lastT = 0;
+
+  function frame(ts) {
+    if (t0 === null) t0 = ts;
+    var t = (ts - t0) / 1000;
+    lastT = t;
+    var target = PRERUN_STEPS * DT + t;
+    var guard = 0;
+    while (simT < target - 1e-9 && guard < 240) { step(DT); guard++; }
+    draw();
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+  }
+
+  function redraw() { draw(); }
+
+  function pointerPos(ev) {
+    var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    return [ev.clientX - r.left, ev.clientY - r.top];
+  }
+
+  var pDown = null;   // {x, y, t, dragged}
+  canvas.addEventListener('pointerdown', function (ev) {
+    var p = pointerPos(ev);
+    pDown = { x: p[0], y: p[1], t: lastT, dragged: false };
+    stir.active = true;
+    stir.x = p[0] / Math.max(W, 1); stir.y = p[1] / Math.max(H, 1);
+    stir.vx = 0; stir.vy = 0;
+    if (canvas.setPointerCapture && ev.pointerId !== undefined) {
+      try { canvas.setPointerCapture(ev.pointerId); } catch (e) {}
+    }
+  });
+  canvas.addEventListener('pointermove', function (ev) {
+    if (!pDown) return;
+    var p = pointerPos(ev);
+    var nx = p[0] / Math.max(W, 1), ny = p[1] / Math.max(H, 1);
+    stir.vx = nx - stir.x; stir.vy = ny - stir.y;
+    stir.x = nx; stir.y = ny;
+    if (Math.abs(p[0] - pDown.x) > 8 || Math.abs(p[1] - pDown.y) > 8) pDown.dragged = true;
+  });
+  function endPointer(ev) {
+    if (pDown && !pDown.dragged && lastT - pDown.t < 0.4) {
+      // Tap: a surge of new ribbons from the ridge.
+      pendingSurge += 30;
+    }
+    pDown = null;
+    stir.active = false;
+    stir.vx = 0; stir.vy = 0;
+  }
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', endPointer);
+
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { resize(); redraw(); });
+  }
+  window.addEventListener('resize', function () { resize(); redraw(); });
+
+  buildRidge();
+  buildSprings();
+  resize();
+
+  // Pre-run: 600 fixed steps (10 s of flow) so frame one already
+  // shows ribbons mid-descent, tinted below the strata crossings,
+  // with a first sediment sprinkle laid in the basin. Ten seconds
+  // is long enough for the wide speed spread and the seeded
+  // respawn holds to mix the population down the whole descent.
+  for (var s = 0; s < PRERUN_STEPS; s++) step(DT);
+
+  draw(); // frame one
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
