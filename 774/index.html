@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Night Torch</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #060607; height: 100%; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---- Palette (strict) ----
+  var SKY = '#060607';         // night sky margin / page ground
+  var GROUND = '#0B0B0D';      // night ground below the wall
+  var WALLC = '#161614';       // the exterior wall, barely there
+  var BAND = '#FFF9EC';        // activated band light
+  var FLARE = '#F4E0B8';       // band edge flare / warm spill
+  var CORE = '#FFFFFF';        // torch white core
+
+  // ---- Seeded RNG: mulberry32 ----
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ---- Layout in unit space ----
+  // Wall spans the full width; four bands tile it with small gaps.
+  var BAND_X0 = [0.03, 0.27, 0.51, 0.75];   // band left edges (width units)
+  var BAND_W = 0.22;                        // band width (width units)
+  var BAND_CX = [0.14, 0.38, 0.62, 0.86];   // band centres
+  var REST_I = 1;                           // torch rests over the second band
+
+  // ---- Microsphere grain: precomputed seeded data, inside the bands ----
+  var N_GRAIN = 2000;
+  var grain = [];
+  (function buildGrain() {
+    var rnd = mulberry32(77400137);
+    for (var i = 0; i < N_GRAIN; i++) {
+      var b = i % 4;
+      grain.push({
+        u: BAND_X0[b] + rnd() * BAND_W,   // width units
+        v: rnd(),                         // wall-height units
+        size: 1 + rnd() * 1.6,            // 1..2.6 px at reference scale
+        thr: rnd() * 0.55,                // per-point light threshold
+        warm: rnd()                       // flare-tinted tendency
+      });
+    }
+  })();
+
+  // ---- Viewport sizing (Visual Viewport API) ----
+  var W = 0, H = 0;
+  function measure() {
+    var vv = (typeof window !== 'undefined' && window.visualViewport) ? window.visualViewport : null;
+    var w = vv ? vv.width : (window.innerWidth || 0);
+    var h = vv ? vv.height : (window.innerHeight || 0);
+    if (w > 0 && h > 0 && (w !== W || h !== H)) {
+      W = w; H = h;
+      canvas.width = W; canvas.height = H;
+    }
+  }
+  function isPhone() {
+    var sw = 0, sh = 0;
+    if (typeof window !== 'undefined' && window.screen) {
+      sw = window.screen.width || 0; sh = window.screen.height || 0;
+    }
+    var mn = Math.min(sw, sh);
+    if (mn > 0) return mn < 700;
+    return H > W * 1.15;
+  }
+  function wallGeom() {
+    var top = (isPhone() ? 0.12 : 0.15) * H;
+    var bot = (isPhone() ? 0.86 : 0.84) * H;
+    return { top: top, bot: bot, h: bot - top };
+  }
+
+  // ---- Idle torch path: closed form, 40 s cycle ----
+  // Rest over the second band for 32 s, one slow sweep out to the first
+  // band (4 s), then back (4 s), arriving home exactly at the cycle seam.
+  // Defined for negative t too, so the pre-load history is analytic.
+  function smooth(u) { return u * u * (3 - 2 * u); }
+  function idlePos(t) {
+    var g = wallGeom();
+    var tau = ((t % 40) + 40) % 40;
+    var x1 = BAND_CX[0] * W, x2 = BAND_CX[REST_I] * W;
+    var x, lift = 0, u;
+    if (tau < 32) {
+      x = x2;
+    } else if (tau < 36) {
+      u = (tau - 32) / 4;
+      x = x2 + (x1 - x2) * smooth(u);
+      lift = Math.sin(Math.PI * u);
+    } else {
+      u = (tau - 36) / 4;
+      x = x1 + (x2 - x1) * smooth(u);
+      lift = Math.sin(Math.PI * u);
+    }
+    return { x: x, y: g.top + (0.5 - 0.05 * lift) * g.h };
+  }
+
+  // ---- Drag state (recorded events; offsets decay in closed form) ----
+  var dragging = false;
+  var dragX = 0, dragY = 0;
+  var grabDX = 0, grabDY = 0;
+  var relT = -1, relOX = 0, relOY = 0;
+
+  function torchPos(t) {
+    if (dragging) {
+      var g = wallGeom();
+      var x = dragX + grabDX, y = dragY + grabDY;
+      if (x < 0) x = 0; if (x > W) x = W;
+      if (y < g.top - 0.04 * H) y = g.top - 0.04 * H;
+      if (y > g.bot + 0.04 * H) y = g.bot + 0.04 * H;
+      return { x: x, y: y };
+    }
+    var p = idlePos(t);
+    if (relT >= 0) {
+      var k = Math.exp(-(t - relT) / 2.2); // ease back onto the idle path
+      if (k > 0.002) return { x: p.x + relOX * k, y: p.y + relOY * k };
+    }
+    return p;
+  }
+
+  // ---- Recorded path history (sample buffer) ----
+  // The torch's effective positions are logged as it moves. Brightness is
+  // always computed from this log plus the analytic idle path for times
+  // before load; nothing accumulates frame by frame.
+  var pathBuf = [];
+  function recordSample(t, x, y) {
+    var n = pathBuf.length;
+    if (n === 0 || t - pathBuf[n - 1].t >= 0.04) {
+      pathBuf.push({ t: t, x: x, y: y });
+    } else if (t > pathBuf[n - 1].t) {
+      pathBuf[n - 1].x = x; pathBuf[n - 1].y = y;
+    }
+    while (pathBuf.length > 2 && pathBuf[1].t < t - 9) pathBuf.shift();
+  }
+  function posAt(s) {
+    if (s <= 0 || pathBuf.length === 0) return idlePos(s);
+    var n = pathBuf.length;
+    if (s <= pathBuf[0].t) return { x: pathBuf[0].x, y: pathBuf[0].y };
+    if (s >= pathBuf[n - 1].t) return { x: pathBuf[n - 1].x, y: pathBuf[n - 1].y };
+    var lo = 0, hi = n - 1;
+    while (hi - lo > 1) {
+      var mid = (lo + hi) >> 1;
+      if (pathBuf[mid].t <= s) lo = mid; else hi = mid;
+    }
+    var a = pathBuf[lo], b = pathBuf[hi];
+    var f = (b.t - a.t) > 0 ? (s - a.t) / (b.t - a.t) : 0;
+    return { x: a.x + (b.x - a.x) * f, y: a.y + (b.y - a.y) * f };
+  }
+
+  // ---- Light model: instantaneous falloff + path-history afterglow ----
+  var GHOST_DT = 0.2, GHOST_N = 25, TAU = 1.5, AFTER_GAIN = 1.0;
+  var WSUM = 0;
+  for (var wi = 1; wi <= GHOST_N; wi++) WSUM += Math.exp(-GHOST_DT * wi / TAU);
+
+  var Rnow = 100;
+  function falloff(x, y, px, py) {
+    var dx = x - px, dy = y - py;
+    var d = Math.sqrt(dx * dx + dy * dy);
+    var f = 1 - d / Rnow;
+    return f > 0 ? Math.pow(f, 1.7) : 0;
+  }
+  // ghosts: [{x, y, w}] sampled from the recorded path, oldest last built.
+  function lightAt(x, y, cur, ghosts) {
+    var b = falloff(x, y, cur.x, cur.y);
+    var acc = 0;
+    for (var k = 0; k < ghosts.length; k++) {
+      acc += ghosts[k].w * falloff(x, y, ghosts[k].x, ghosts[k].y);
+    }
+    b += AFTER_GAIN * acc / WSUM;
+    return b > 1.3 ? 1.3 : b;
+  }
+
+  // ---- Pointer handling ----
+  var nowT = 0;
+  function pointerPos(e) {
+    var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    var cx = (e.clientX !== undefined) ? e.clientX : (e.touches && e.touches[0] ? e.touches[0].clientX : 0);
+    var cy = (e.clientY !== undefined) ? e.clientY : (e.touches && e.touches[0] ? e.touches[0].clientY : 0);
+    return { x: cx - r.left, y: cy - r.top };
+  }
+  function onDown(e) {
+    var p = pointerPos(e);
+    var tp = torchPos(nowT);
+    dragging = true;
+    dragX = p.x; dragY = p.y;
+    grabDX = tp.x - p.x; grabDY = tp.y - p.y;
+    if (e.preventDefault) e.preventDefault();
+  }
+  function onMove(e) {
+    if (!dragging) return;
+    var p = pointerPos(e);
+    dragX = p.x; dragY = p.y;
+  }
+  function onUp() {
+    if (!dragging) return;
+    dragging = false;
+    var tp = torchPos(nowT), ip = idlePos(nowT);
+    relOX = tp.x - ip.x; relOY = tp.y - ip.y; relT = nowT;
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+    canvas.addEventListener('mousedown', onDown);
+    canvas.addEventListener('mousemove', onMove);
+    canvas.addEventListener('mouseup', onUp);
+  }
+
+  // ---- Draw one frame at time t (seconds). Frame one is draw(0). ----
+  function draw(t) {
+    measure();
+    if (W <= 0 || H <= 0) return;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+
+    var g = wallGeom();
+    var M = Math.min(W, H);
+    Rnow = Math.min(0.44 * g.h, 0.30 * W);
+
+    // Torch now, and its recorded recent path (the afterglow source).
+    var cur = torchPos(t);
+    recordSample(t, cur.x, cur.y);
+    var ghosts = [];
+    for (var k = GHOST_N; k >= 1; k--) {
+      var age = GHOST_DT * k;
+      var gp = posAt(t - age);
+      ghosts.push({ x: gp.x, y: gp.y, w: Math.exp(-age / TAU), age: age });
+    }
+
+    // Sky and ground margins, then the wall.
+    ctx.fillStyle = SKY;
+    ctx.fillRect(0, 0, W, g.top);
+    ctx.fillStyle = GROUND;
+    ctx.fillRect(0, g.bot, W, H - g.bot);
+    ctx.fillStyle = WALLC;
+    ctx.fillRect(0, g.top, W, g.h);
+
+    // Warm spill on the ground where the torch has passed: flat ellipses
+    // at the recorded positions, alpha decaying with the sample age.
+    function spill(px, alpha, rx, ry, col) {
+      if (alpha <= 0.002) return;
+      ctx.save();
+      ctx.translate(px, g.bot + 0.02 * H);
+      ctx.scale(1, ry / rx);
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = col;
+      ctx.beginPath();
+      ctx.arc(0, 0, rx, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+    for (var si = 0; si < ghosts.length; si += 2) {
+      spill(ghosts[si].x, 0.030 * ghosts[si].w, Rnow * 0.75, 0.030 * H, FLARE);
+    }
+    spill(cur.x, 0.055, Rnow * 0.75, 0.030 * H, FLARE);
+    spill(cur.x, 0.035, Rnow * 0.38, 0.020 * H, BAND);
+
+    // Bands: near-invisible at rest, filling as their centre excites.
+    var excite = [];
+    for (var bi = 0; bi < 4; bi++) {
+      excite[bi] = lightAt(BAND_CX[bi] * W, g.top + 0.5 * g.h, cur, ghosts);
+    }
+    for (bi = 0; bi < 4; bi++) {
+      var bx = BAND_X0[bi] * W, bw = BAND_W * W;
+      var e = Math.min(1, excite[bi]);
+      ctx.globalAlpha = 0.035 + 0.11 * e;
+      ctx.fillStyle = BAND;
+      ctx.fillRect(bx, g.top, bw, g.h);
+    }
+    ctx.globalAlpha = 1;
+
+    // Faint pool on the bare wall (gaps included), current position only.
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, g.top, W, g.h);
+    ctx.clip();
+    var li, lr;
+    for (li = 23; li >= 0; li--) {
+      lr = Rnow * Math.pow((li + 1) / 24, 1.15);
+      ctx.globalAlpha = 0.0055;
+      ctx.fillStyle = (li < 4) ? CORE : (li < 13 ? BAND : FLARE);
+      ctx.beginPath();
+      ctx.arc(cur.x, cur.y, lr, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+    ctx.globalAlpha = 1;
+
+    // The light inside the bands: ghost pools oldest to newest, then the
+    // live pool. Clipped to the union of the four bands, so the bands are
+    // what ignite.
+    ctx.save();
+    ctx.beginPath();
+    for (bi = 0; bi < 4; bi++) ctx.rect(BAND_X0[bi] * W, g.top, BAND_W * W, g.h);
+    ctx.clip();
+    var gi, gh;
+    for (gi = 0; gi < ghosts.length; gi++) {
+      gh = ghosts[gi];
+      for (li = 5; li >= 0; li--) {
+        lr = Rnow * Math.pow((li + 1) / 6, 1.2);
+        ctx.globalAlpha = 0.013 * gh.w;
+        ctx.fillStyle = (li < 2) ? BAND : FLARE;
+        ctx.beginPath();
+        ctx.arc(gh.x, gh.y, lr, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    for (li = 23; li >= 0; li--) {
+      lr = Rnow * Math.pow((li + 1) / 24, 1.15);
+      ctx.globalAlpha = 0.0135;
+      ctx.fillStyle = (li < 4) ? CORE : (li < 13 ? BAND : FLARE);
+      ctx.beginPath();
+      ctx.arc(cur.x, cur.y, lr, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    for (li = 4; li >= 0; li--) {
+      lr = Rnow * 0.13 * (li + 1) / 5;
+      ctx.globalAlpha = 0.035;
+      ctx.fillStyle = CORE;
+      ctx.beginPath();
+      ctx.arc(cur.x, cur.y, lr, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+    ctx.globalAlpha = 1;
+
+    // Microsphere grain: beads appear only in the light.
+    var scale = Math.max(0.6, M / 720);
+    for (var i = 0; i < N_GRAIN; i++) {
+      var gr = grain[i];
+      var x = gr.u * W;
+      var y = g.top + gr.v * g.h;
+      var b = lightAt(x, y, cur, ghosts);
+      var a = (b - gr.thr) / Math.max(0.2, 1 - gr.thr);
+      if (a <= 0.02) continue;
+      if (a > 1) a = 1;
+      var s = Math.max(1, gr.size * scale);
+      ctx.globalAlpha = a * 0.8;
+      ctx.fillStyle = (gr.warm > 0.6) ? FLARE : BAND;
+      ctx.fillRect(x - s / 2, y - s / 2, s, s);
+    }
+    ctx.globalAlpha = 1;
+
+    // Band edges flare with their excitation.
+    ctx.lineWidth = Math.max(1, 0.0025 * M);
+    for (bi = 0; bi < 4; bi++) {
+      ctx.globalAlpha = 0.05 + 0.45 * Math.min(1, excite[bi]);
+      ctx.strokeStyle = FLARE;
+      ctx.strokeRect(BAND_X0[bi] * W, g.top, BAND_W * W, g.h);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---- Run: synchronous first frame at t = 0, then rAF if available ----
+  draw(0);
+  if (typeof requestAnimationFrame === 'function') {
+    var t0 = null;
+    var loop = function (ts) {
+      if (t0 === null) t0 = ts;
+      nowT = (ts - t0) / 1000;
+      draw(nowT);
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+  function onResize() { draw(nowT); }
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', onResize);
+  }
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('resize', onResize);
+  }
+})();
+</script>
+</body>
+</html>
