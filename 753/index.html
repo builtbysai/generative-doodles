@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dot Field</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: #F4F2EC;
+    overflow: hidden;
+  }
+  canvas {
+    display: block;
+    touch-action: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="field"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  var canvas = document.getElementById('field');
+  var ctx = canvas.getContext('2d');
+
+  // Strict palette. Nothing else is ever drawn.
+  var PAPER = [244, 242, 236];   // canvas      #F4F2EC
+  var GREEN = [107, 142, 107];   // dot green   #6B8E6B
+  var RED = [192, 85, 69];       // dot red     #C05545
+  var SHADOW = [232, 228, 216];  // dot shadow  #E8E4D8
+
+  var BASE_SEED = 753197;        // arrangement 0 stream
+  var Z_REST = 0.10;             // legibility at rest: sub-threshold
+  var Z_MAX = 1.0;
+  var RESEED_SPAN = 3.0;         // seconds: blank, then settle
+
+  // QA hook: ?seed=z1 forces full legibility for the state-forced render.
+  var qs = '';
+  try { qs = String((window.location && window.location.search) || (typeof location !== 'undefined' ? location.search : '') || ''); } catch (e) { qs = ''; }
+  var FORCE_Z = /seed=z1/.test(qs);
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function smooth(u) {
+    if (u <= 0) return 0;
+    if (u >= 1) return 1;
+    return u * u * (3 - 2 * u);
+  }
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function rgbString(c, a) {
+    return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a + ')';
+  }
+
+  // ---- Dot arrangement -------------------------------------------------
+  // Poisson-ish placement: seeded random sequential adsorption with a
+  // spatial hash. Minimum distance shrinks slightly toward the center and
+  // a radial acceptance weight thins the edges, so the field is denser in
+  // the middle and dispersed at the rim. Never a lattice: every candidate
+  // position is a fresh draw from the seeded stream.
+  function buildArrangement(index) {
+    var rnd = mulberry32(BASE_SEED + index * 7919);
+    var dots = [];
+    var cell = 0.026;
+    var hash = {};
+    function key(cx, cy) { return cx + ':' + cy; }
+    function clear(x, y, d) {
+      var cx = Math.floor(x / cell), cy = Math.floor(y / cell);
+      var r = Math.ceil(d / cell);
+      for (var i = cx - r; i <= cx + r; i++) {
+        for (var j = cy - r; j <= cy + r; j++) {
+          var arr = hash[key(i, j)];
+          if (!arr) continue;
+          for (var k = 0; k < arr.length; k++) {
+            var dx = arr[k].x - x, dy = arr[k].y - y;
+            if (dx * dx + dy * dy < d * d) return false;
+          }
+        }
+      }
+      return true;
+    }
+    var tries = 0;
+    while (dots.length < 760 && tries < 60000) {
+      tries++;
+      var x = rnd(), y = rnd();
+      var dx = x - 0.5, dy = y - 0.5;
+      var rn = Math.sqrt(dx * dx + dy * dy) / 0.7071;   // 0 center, 1 corner
+      if (rnd() > 1 - 0.52 * rn * rn) continue;          // thin the edges
+      var dmin = 0.027 * (0.78 + 0.5 * rn);              // tighter at center
+      if (!clear(x, y, dmin)) continue;
+      var dot = {
+        x: x, y: y,
+        red: rnd() < 0.46,
+        p1: rnd() * 6.2831853,
+        p2: rnd() * 6.2831853,
+        p3: rnd() * 6.2831853,
+        s: 0.8 + rnd() * 0.45                          // per-dot size jitter
+      };
+      dots.push(dot);
+      var cx = Math.floor(x / cell), cy = Math.floor(y / cell);
+      var k = key(cx, cy);
+      if (!hash[k]) hash[k] = [];
+      hash[k].push(dot);
+    }
+    return dots;
+  }
+
+  var arrangementIndex = 0;
+  var curDots = buildArrangement(0);
+  var prevDots = null;
+  var reseedAt = -10;              // animation-clock time of last reseed
+
+  // ---- State ------------------------------------------------------------
+  var Z = FORCE_Z ? Z_MAX : Z_REST;  // legibility / proximity parameter
+  var zTarget = Z;
+  var wake = [];                     // recorded pointer trail {x,y,t}
+  var pointers = {};
+  var pinchDist = 0;
+  var lastTapT = -10, lastTapX = 0, lastTapY = 0;
+  var downX = 0, downY = 0, downT = 0, dragging = false;
+
+  var W = 0, H = 0, DPR = 1, PHONE = false;
+
+  function resize() {
+    var vv = window.visualViewport;
+    var w = vv ? vv.width : window.innerWidth;
+    var h = vv ? vv.height : window.innerHeight;
+    DPR = window.devicePixelRatio || 1;
+    W = w; H = h;
+    canvas.width = Math.round(w * DPR);
+    canvas.height = Math.round(h * DPR);
+    var sw = window.screen ? window.screen.width : w;
+    var sh = window.screen ? window.screen.height : h;
+    PHONE = Math.min(sw, sh) < 700 || h > w * 1.15;
+  }
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', resize);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // ---- Interaction (recorded events only; state stays a closed form) ---
+  function clockNow() { return lastT; }
+  var lastT = 0;
+
+  function ptrPos(e) {
+    var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  }
+  function addWake(x, y) {
+    wake.push({ x: x / W, y: y / H, t: clockNow() });
+    if (wake.length > 260) wake.splice(0, wake.length - 260);
+  }
+
+  canvas.addEventListener('pointerdown', function (e) {
+    var p = ptrPos(e);
+    pointers[e.pointerId] = p;
+    var ids = Object.keys(pointers);
+    if (ids.length === 2) {
+      var a = pointers[ids[0]], b = pointers[ids[1]];
+      pinchDist = Math.sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y));
+    }
+    downX = p.x; downY = p.y; downT = clockNow(); dragging = true;
+    addWake(p.x, p.y);
+    if (canvas.setPointerCapture) { try { canvas.setPointerCapture(e.pointerId); } catch (err) {} }
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (!pointers[e.pointerId]) return;
+    var p = ptrPos(e);
+    pointers[e.pointerId] = p;
+    var ids = Object.keys(pointers);
+    if (ids.length === 2) {
+      var a = pointers[ids[0]], b = pointers[ids[1]];
+      var d = Math.sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y));
+      if (pinchDist > 0) {
+        zTarget = clamp(zTarget + (d - pinchDist) / Math.max(W, H) * 1.6, Z_REST, Z_MAX);
+      }
+      pinchDist = d;
+      return;
+    }
+    if (dragging) addWake(p.x, p.y);
+  });
+  function endPointer(e) {
+    var p = pointers[e.pointerId] || { x: downX, y: downY };
+    delete pointers[e.pointerId];
+    if (Object.keys(pointers).length < 2) pinchDist = 0;
+    if (!dragging) return;
+    dragging = false;
+    var moved = Math.sqrt((p.x - downX) * (p.x - downX) + (p.y - downY) * (p.y - downY));
+    var now = clockNow();
+    if (moved < 12 && now - downT < 0.4) {
+      // a tap: check for the double-tap reseed
+      if (now - lastTapT < 0.38 &&
+          Math.sqrt((p.x - lastTapX) * (p.x - lastTapX) + (p.y - lastTapY) * (p.y - lastTapY)) < 48) {
+        arrangementIndex++;
+        prevDots = curDots;
+        curDots = buildArrangement(arrangementIndex);
+        reseedAt = now;
+        lastTapT = -10;
+      } else {
+        lastTapT = now; lastTapX = p.x; lastTapY = p.y;
+      }
+    }
+  }
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', endPointer);
+  canvas.addEventListener('wheel', function (e) {
+    if (e.preventDefault) e.preventDefault();
+    var d = (typeof e.deltaY === 'number') ? e.deltaY : 0;
+    zTarget = clamp(zTarget - d * 0.0009, Z_REST, Z_MAX);
+  }, { passive: false });
+
+  // ---- Drawing ----------------------------------------------------------
+  function draw(t) {
+    lastT = t;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+    // Legibility eases back toward rest when no one is leaning in.
+    if (!FORCE_Z) {
+      zTarget += (Z_REST - zTarget) * 0.0016;          // slow release home
+      Z += (zTarget - Z) * 0.06;
+    }
+
+    ctx.fillStyle = rgbString(PAPER, 1);
+    ctx.fillRect(0, 0, W, H);
+
+    var minDim = Math.min(W, H);
+    var scale = minDim / 720;                          // sizes keyed to 720
+    var ze = smooth(clamp((Z - 0.04) / 0.96, 0, 1));   // eased legibility
+    var baseAlpha = 0.055 + 0.80 * ze;
+    var baseR = (0.55 + 2.1 * Math.pow(ze, 1.4)) * scale;
+    // Idle breathing: sub-pixel jitter on a 20 s cycle, below threshold.
+    var breath = 0.35 * scale;
+    var danceAmp = breath + (3.4 * scale - breath) * ze;
+
+    // Reseed envelope: blank fast, then the new arrangement settles in.
+    var p = (t - reseedAt) / RESEED_SPAN;
+    var oldEnv = 1, newEnv = 1;
+    if (p >= 0 && p < 1) {
+      oldEnv = 1 - smooth(clamp(p / 0.18, 0, 1));
+      newEnv = smooth(clamp((p - 0.12) / 0.88, 0, 1));
+    }
+
+    // Prune the wake: influence settles over ~10 s.
+    while (wake.length && t - wake[0].t > 11) wake.shift();
+
+    function drawField(dots, env) {
+      if (env <= 0.003) return;
+      for (var i = 0; i < dots.length; i++) {
+        var d = dots[i];
+        var bx = d.x * W, by = d.y * H;
+        // Idle breathing plus Z-driven dance (closed form of phase + t).
+        var ox = danceAmp * (Math.sin(0.31 * t + d.p1) * 0.7 + Math.sin(0.117 * t + d.p2) * 0.5);
+        var oy = danceAmp * (Math.cos(0.27 * t + d.p2) * 0.7 + Math.sin(0.131 * t + d.p3) * 0.5);
+        // Wake: nearby trail points lift the dot and make it visible.
+        var wz = 0, wx = 0, wy = 0;
+        for (var j = 0; j < wake.length; j++) {
+          var wp = wake[j];
+          var wdx = d.x - wp.x, wdy = d.y - wp.y;
+          var rr = (wdx * wdx * W * W + wdy * wdy * H * H) / (minDim * minDim);
+          var g = Math.exp(-rr / 0.012) * Math.exp(-(t - wp.t) / 3.3);
+          if (g < 0.01) continue;
+          var dist = Math.sqrt(rr) + 0.0001;
+          wz += g;
+          wx += (wdx * W / minDim) / dist * g;
+          wy += (wdy * H / minDim) / dist * g;
+        }
+        var lift = clamp(wz, 0, 1);
+        var zi = clamp(ze + 0.85 * lift, 0, 1);
+        var alpha = (0.055 + 0.80 * zi) * env;
+        var r = (0.55 + 2.1 * Math.pow(zi, 1.4)) * scale * d.s;
+        var x = bx + ox + wx * 7 * scale * Math.sin(0.9 * t + d.p3);
+        var y = by + oy + wy * 7 * scale * Math.cos(0.8 * t + d.p1);
+        alpha *= 0.86 + 0.14 * Math.sin(0.9 * t + d.p2) * zi;
+        if (alpha < 0.004) continue;
+        ctx.fillStyle = rgbString(SHADOW, alpha * 0.85);
+        ctx.beginPath();
+        ctx.arc(x + r * 0.4, y + r * 0.55, r, 0, 6.2831853);
+        ctx.fill();
+        ctx.fillStyle = rgbString(d.red ? RED : GREEN, alpha);
+        ctx.beginPath();
+        ctx.arc(x, y, r, 0, 6.2831853);
+        ctx.fill();
+      }
+    }
+
+    if (prevDots && p >= 0 && p < 1) drawField(prevDots, oldEnv);
+    drawField(curDots, newEnv);
+    if (p >= 1) prevDots = null;
+  }
+
+  draw(0);
+
+  var startStamp = null;
+  function loop(ts) {
+    if (startStamp === null) startStamp = ts;
+    draw((ts - startStamp) / 1000);
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(loop);
+    }
+  }
+  if (typeof requestAnimationFrame === 'function') {
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>

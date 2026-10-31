@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fluorescent Fold</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: #101014;
+    overflow: hidden;
+  }
+  canvas {
+    display: block;
+    touch-action: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="field"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  var canvas = document.getElementById('field');
+  var ctx = canvas.getContext('2d');
+
+  // Strict palette. Nothing else is ever drawn.
+  var GROUND = [16, 16, 20];        // #101014
+  var TUBE_WHITE = [245, 245, 240]; // #F5F5F0
+  var GELS = [
+    [138, 90, 224],                 // violet #8A5AE0
+    [74, 216, 200],                 // teal   #4AD8C8
+    [240, 168, 64],                 // amber  #F0A840
+    [224, 106, 138]                 // rose   #E06A8A
+  ];
+  var TICK_BLACK = [26, 26, 26];    // #1A1A1A
+  var TICK_WHITE = [255, 255, 255]; // #FFFFFF
+
+  var DRIFT_PERIOD = 300;  // 5-minute gel modulation cycle, in seconds
+  var DRIFT_MAX = 15;      // degrees of hue drift at full swing
+
+  function cl(v) { return Math.max(0, Math.min(255, Math.round(v))); }
+
+  function rgbString(c, a) {
+    if (typeof a === 'number') {
+      return 'rgba(' + cl(c[0]) + ',' + cl(c[1]) + ',' + cl(c[2]) + ',' + a + ')';
+    }
+    return 'rgb(' + cl(c[0]) + ',' + cl(c[1]) + ',' + cl(c[2]) + ')';
+  }
+
+  // RGB -> HSL (h in degrees, s and l in 0..1).
+  function rgbToHsl(c) {
+    var r = c[0] / 255, g = c[1] / 255, b = c[2] / 255;
+    var mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+    var h = 0, s = 0, l = (mx + mn) / 2;
+    if (mx !== mn) {
+      var d = mx - mn;
+      s = l > 0.5 ? d / (2 - mx - mn) : d / (mx + mn);
+      if (mx === r) h = (g - b) / d + (g < b ? 6 : 0);
+      else if (mx === g) h = (b - r) / d + 2;
+      else h = (r - g) / d + 4;
+      h *= 60;
+    }
+    return [h, s, l];
+  }
+
+  // HSL -> RGB (h in degrees, s and l in 0..1), returns float triple.
+  function hslToRgb(h, s, l) {
+    h = ((h % 360) + 360) % 360;
+    var c = (1 - Math.abs(2 * l - 1)) * s;
+    var x = c * (1 - Math.abs(((h / 60) % 2) - 1));
+    var m = l - c / 2;
+    var r, g, b;
+    if (h < 60) { r = c; g = x; b = 0; }
+    else if (h < 120) { r = x; g = c; b = 0; }
+    else if (h < 180) { r = 0; g = c; b = x; }
+    else if (h < 240) { r = 0; g = x; b = c; }
+    else if (h < 300) { r = x; g = 0; b = c; }
+    else { r = c; g = 0; b = x; }
+    return [(r + m) * 255, (g + m) * 255, (b + m) * 255];
+  }
+
+  // Gel anchors in HSL, computed once. Hue drift rotates h by at most
+  // DRIFT_MAX degrees around the anchor, so a band never leaves its family.
+  var GEL_HSL = [];
+  for (var gi = 0; gi < GELS.length; gi++) GEL_HSL.push(rgbToHsl(GELS[gi]));
+
+  // Seeded RNG (mulberry32). All layout comes from seeded streams, never
+  // from Math.random, so frame one is reproducible byte for byte.
+  function mulberry32(seed) {
+    var s = seed >>> 0;
+    return function () {
+      s = (s + 0x6D2B79F5) >>> 0;
+      var z = s;
+      z = Math.imul(z ^ (z >>> 15), z | 1);
+      z ^= z + Math.imul(z ^ (z >>> 7), z | 61);
+      return ((z ^ (z >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // One field of tubes, in abstract unit space:
+  //   u: tube center across the span, in [-0.58, 0.58] of the span width
+  //   hw: tube half width, as a fraction of the frame's smaller dimension
+  //   drift: this tube's signed drift factor in [-1, 1]; at loop t the hue
+  //          offset is drift * DRIFT_MAX * sin(2 pi t / DRIFT_PERIOD),
+  //          which is exactly 0 at t = 0 for every tube (drift phase 0)
+  //   segs: partition of v in [-0.58, 0.58] (of the field extent) into
+  //          bands; type -1 = bare tube white, 0..3 = gel anchor index
+  //   ticks: tape ticks at v positions, black or white
+  // Spacing is a seeded random walk, never a lattice.
+  function buildField(seed) {
+    var rnd = mulberry32(seed);
+    var tubes = [];
+    var u = -0.58 + rnd() * 0.03;
+    while (u < 0.58) {
+      var tube = {
+        u: u,
+        hw: 0.0038 + rnd() * 0.0068,
+        drift: rnd() * 2 - 1,
+        segs: [],
+        ticks: []
+      };
+      var v = -0.58;
+      while (v < 0.58) {
+        var len = 0.10 + rnd() * 0.22;
+        var r = rnd();
+        var type = -1;
+        if (r >= 0.42) type = Math.floor(rnd() * 4);
+        tube.segs.push({ v0: v, v1: Math.min(0.58, v + len), type: type });
+        v += len;
+      }
+      var nTicks = 2 + Math.floor(rnd() * 4);
+      for (var k = 0; k < nTicks; k++) {
+        tube.ticks.push({
+          v: -0.52 + rnd() * 1.04,
+          h: 0.006 + rnd() * 0.007,
+          black: rnd() < 0.55
+        });
+      }
+      tubes.push(tube);
+      u += 0.020 + rnd() * 0.038;
+    }
+    return tubes;
+  }
+
+  var FIELD_A = buildField(756101);
+  var FIELD_B = buildField(756202);
+
+  var W = 0, H = 0, DPR = 1;
+
+  function isPhone() {
+    var sw = (window.screen && window.screen.width) || 0;
+    var sh = (window.screen && window.screen.height) || 0;
+    var mn = Math.min(sw, sh);
+    if (mn > 0 && mn < 700) return true;
+    return H > W * 1.15;
+  }
+
+  function resize() {
+    var vv = window.visualViewport;
+    W = vv ? vv.width : window.innerWidth;
+    H = vv ? vv.height : window.innerHeight;
+    DPR = window.devicePixelRatio || 1;
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+  }
+
+  // ---- Drag warp -------------------------------------------------------
+  // Recorded drag samples drive the warp; the warp at time t is a closed
+  // form of those samples. While dragging, horizontal travel sets the
+  // amplitude (signed) and vertical travel sets the phase. On release the
+  // amplitude decays exponentially with a 1.1 s time constant and the
+  // phase freezes. Offset at height fraction p: amp * sin(p * 3 pi + phase).
+  var nowSec = 0;
+  var drag = {
+    active: false,
+    x0: 0, y0: 0,
+    amp: 0, phase: 0,
+    relT: 0, relAmp: 0, relPhase: 0
+  };
+
+  function warpAt(t) {
+    if (drag.active) return { amp: drag.amp, phase: drag.phase };
+    if (drag.relAmp !== 0) {
+      var a = drag.relAmp * Math.exp(-(t - drag.relT) / 1.1);
+      if (Math.abs(a) < 0.05) { drag.relAmp = 0; return { amp: 0, phase: drag.relPhase }; }
+      return { amp: a, phase: drag.relPhase };
+    }
+    return { amp: 0, phase: 0 };
+  }
+
+  function onDown(e) {
+    drag.active = true;
+    drag.x0 = e.clientX; drag.y0 = e.clientY;
+    drag.amp = 0; drag.phase = 0; drag.relAmp = 0;
+  }
+  function onMove(e) {
+    if (!drag.active || W === 0 || H === 0) return;
+    var dx = (e.clientX - drag.x0) / W;
+    if (dx > 1) dx = 1; if (dx < -1) dx = -1;
+    drag.amp = dx * Math.min(W, H) * 0.055;
+    drag.phase = ((e.clientY - drag.y0) / H) * Math.PI;
+  }
+  function onUp() {
+    if (!drag.active) return;
+    drag.active = false;
+    drag.relT = nowSec;
+    drag.relAmp = drag.amp;
+    drag.relPhase = drag.phase;
+  }
+
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('touchstart', onDown, { passive: true });
+  }
+  if (window.addEventListener) {
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('touchmove', function (e) {
+      if (e.touches && e.touches[0]) onMove(e.touches[0]);
+    }, { passive: true });
+    window.addEventListener('touchend', onUp);
+  }
+
+  // ---- Drawing ---------------------------------------------------------
+  // A tube segment as a warped ribbon: the left and right edges are sampled
+  // along the warp curve so the whole field bends as one sheet of light.
+  var STEPS = 6;
+  function ribbonPath(cx, hw, y0, y1, warp, extent) {
+    var i, p, y, off;
+    ctx.beginPath();
+    for (i = 0; i <= STEPS; i++) {
+      p = i / STEPS;
+      y = y0 + (y1 - y0) * p;
+      off = warp.amp * Math.sin((y / extent + 0.5) * Math.PI * 3 + warp.phase);
+      if (i === 0) ctx.moveTo(cx + off - hw, y);
+      else ctx.lineTo(cx + off - hw, y);
+    }
+    for (i = STEPS; i >= 0; i--) {
+      p = i / STEPS;
+      y = y0 + (y1 - y0) * p;
+      off = warp.amp * Math.sin((y / extent + 0.5) * Math.PI * 3 + warp.phase);
+      ctx.lineTo(cx + off + hw, y);
+    }
+    ctx.closePath();
+  }
+
+  // Draw one field in local coordinates: tubes run vertically, centers at
+  // tube.u * span, segments spanning tube v * extent, centered on origin.
+  // Light passes use 'lighter' so crossings add; tape ticks are drawn after
+  // with 'source-over' so the black ticks can actually cut the light.
+  function drawField(tubes, span, extent, minDim, t, warp, fieldAlpha, widthBoost) {
+    var swing = Math.sin(2 * Math.PI * t / DRIFT_PERIOD);
+    var layers = [
+      [2.5, 0.075],
+      [1.55, 0.15],
+      [1.0, 0.92]
+    ];
+    var li, ti, si, tube, seg, col, hwPx;
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = fieldAlpha;
+    for (li = 0; li < layers.length; li++) {
+      for (ti = 0; ti < tubes.length; ti++) {
+        tube = tubes[ti];
+        hwPx = tube.hw * minDim * widthBoost * layers[li][0];
+        for (si = 0; si < tube.segs.length; si++) {
+          seg = tube.segs[si];
+          if (seg.type < 0) {
+            col = TUBE_WHITE;
+          } else {
+            var hsl = GEL_HSL[seg.type];
+            col = hslToRgb(hsl[0] + tube.drift * DRIFT_MAX * swing, hsl[1], hsl[2]);
+          }
+          ribbonPath(tube.u * span, hwPx, seg.v0 * extent, seg.v1 * extent, warp, extent);
+          ctx.fillStyle = rgbString(col, layers[li][1]);
+          ctx.fill();
+        }
+      }
+    }
+    // Tape ticks: short dashes across the tube, following the warp.
+    ctx.globalCompositeOperation = 'source-over';
+    for (ti = 0; ti < tubes.length; ti++) {
+      tube = tubes[ti];
+      hwPx = tube.hw * minDim * widthBoost * 1.18;
+      for (var k = 0; k < tube.ticks.length; k++) {
+        var tick = tube.ticks[k];
+        var y = tick.v * extent;
+        var off = warp.amp * Math.sin((y / extent + 0.5) * Math.PI * 3 + warp.phase);
+        var cx = tube.u * span + off;
+        ctx.fillStyle = rgbString(tick.black ? TICK_BLACK : TICK_WHITE, tick.black ? 0.85 : 0.9);
+        ctx.fillRect(cx - hwPx, y - tick.h * extent / 2, hwPx * 2, tick.h * extent);
+      }
+    }
+    ctx.restore();
+  }
+
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+    ctx.fillStyle = rgbString(GROUND);
+    ctx.fillRect(0, 0, W, H);
+
+    var warp = warpAt(t);
+    var minDim = Math.min(W, H);
+    var boost = isPhone() ? 1.3 : 1.0;
+    var diag = Math.sqrt(W * W + H * H);
+
+    // Field B: the same kind of field, rotated 30 degrees, drawn behind at
+    // half alpha. Its local span is the frame diagonal so the rotated
+    // tubes still cross every corner.
+    ctx.save();
+    ctx.translate(W / 2, H / 2);
+    ctx.rotate(Math.PI / 6);
+    drawField(FIELD_B, diag * 1.06, diag * 1.06, minDim, t, warp, 0.5, boost);
+    ctx.restore();
+
+    // Field A: vertical, full strength.
+    ctx.save();
+    ctx.translate(W / 2, H / 2);
+    drawField(FIELD_A, W * 1.04, H * 1.04, minDim, t, warp, 1.0, boost);
+    ctx.restore();
+
+    if (document.body && document.body.style) document.body.style.background = rgbString(GROUND);
+  }
+
+  // Inert QA hook (house convention): ?seed=tNN draws frame one at loop
+  // time NN seconds. Without the parameter the piece starts at t = 0.
+  var startT = 0;
+  var searchStr = (window.location && window.location.search) ||
+    (typeof location !== 'undefined' ? location.search : '') || '';
+  var m = /[?&]seed=t(\d+(?:\.\d+)?)/.exec(searchStr);
+  if (m) startT = parseFloat(m[1]);
+
+  resize();
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { resize(); draw(startT); });
+  }
+  window.addEventListener('resize', function () { resize(); draw(startT); });
+
+  // Frame one: the synchronous draw at t = 0 (drift phase 0, no warp).
+  nowSec = startT;
+  draw(startT);
+
+  if (typeof requestAnimationFrame === 'function') {
+    var t0 = null;
+    var frame = function (ts) {
+      if (t0 === null) t0 = ts;
+      nowSec = startT + (ts - t0) / 1000;
+      draw(nowSec);
+      requestAnimationFrame(frame);
+    };
+    requestAnimationFrame(frame);
+  }
+})();
+</script>
+</body>
+</html>
