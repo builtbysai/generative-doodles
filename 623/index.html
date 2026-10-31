@@ -1,0 +1,749 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Draw a Card, Read the Forest</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #1E2B22; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ================= palette (strict) =================
+  var FLOOR = '#1E2B22';   // forest floor at night
+  var BACKG = '#2A3B2E';   // card back green
+  var GOLD  = '#C9A227';
+  var PAPER = '#EFE3C8';   // aged paper faces
+  var CPAL  = ['#E87B9C', '#F2C14E', '#6A9A5B', '#1E4D8C', '#E2725B']; // her garden palette
+  var BASE_SEED = 623075;
+  var TYPES = ['fox', 'owl', 'shroom', 'deer', 'snake', 'moth'];
+  var CARD_RATIO = 1.45;   // height / width
+
+  // ================= timing (seconds, piece clock) =================
+  var DRAW_DUR = 1.7, REST_DUR = 4.5, GATHER_DUR = 2.6, REDEAL_DUR = 1.8;
+
+  // ================= seeded rng =================
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ================= canvas / viewport =================
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 300, H = 300;
+
+  function viewSize() {
+    var w, h;
+    if (typeof window !== 'undefined' && window.visualViewport &&
+        typeof window.visualViewport.width === 'number') {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    } else if (typeof window !== 'undefined' && typeof window.innerWidth === 'number') {
+      w = window.innerWidth; h = window.innerHeight;
+    } else { w = W; h = H; }
+    return { w: Math.max(50, Math.floor(w)), h: Math.max(50, Math.floor(h)) };
+  }
+
+  function isPhone() {
+    var sw = 9999, sh = 9999;
+    if (typeof window !== 'undefined' && window.screen) {
+      sw = window.screen.width || 9999; sh = window.screen.height || 9999;
+    }
+    if (Math.min(sw, sh) < 700) return true;
+    return H > W * 1.15; // aspect fallback only
+  }
+
+  function resize() {
+    var s = viewSize();
+    W = s.w; H = s.h;
+    canvas.width = W; canvas.height = H;
+    snapTargets();
+    draw(tNow);
+  }
+
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', resize);
+    }
+    if (window.addEventListener) window.addEventListener('resize', resize);
+  }
+
+  // ================= layout =================
+  function metrics() {
+    var unit = Math.min(W, H);
+    var phone = isPhone();
+    return {
+      unit: unit,
+      phone: phone,
+      deckW: unit * (phone ? 0.155 : 0.15),
+      arcY: H * (phone ? 0.80 : 0.815),
+      arcLift: unit * 0.05,
+      rowY: H * (phone ? 0.30 : 0.315)
+    };
+  }
+
+  function rowW(n) {
+    var m = metrics();
+    return Math.min(m.unit * (m.phone ? 0.19 : 0.165), (W * 0.94 / Math.max(1, n)) * 0.9);
+  }
+
+  function arcPos(i, n) {
+    var m = metrics();
+    var mid = (n - 1) / 2;
+    var step = 0;
+    if (n > 1) step = Math.min(m.deckW * 0.94, (W * (m.phone ? 0.94 : 0.9) - m.deckW) / (n - 1));
+    var u = mid > 0 ? (i - mid) / mid : 0;
+    return {
+      x: W / 2 + (i - mid) * step * fan,
+      y: m.arcY - m.arcLift * (1 - u * u),
+      rot: (i - mid) * (m.phone ? 0.07 : 0.05) * fan,
+      w: m.deckW
+    };
+  }
+
+  function rowPos(i, n) {
+    var m = metrics();
+    var w = rowW(n);
+    var slot = Math.min(w * 1.12, (W * 0.94) / Math.max(1, n));
+    return { x: W / 2 + (i - (n - 1) / 2) * slot, y: m.rowY, rot: 0, w: w };
+  }
+
+  function stackPos(i) {
+    return {
+      x: W / 2 + ((i % 3) - 1) * 4,
+      y: H * 0.52 + Math.floor(i / 3) * 2.5,
+      rot: ((i % 5) - 2) * 0.03,
+      w: metrics().deckW * 0.9
+    };
+  }
+
+  // ================= deck model =================
+  // 12 cards: 6 creature types x 2 variants, shuffled by mulberry32
+  // (BASE_SEED + dealIndex). Draw order is fixed per deal. All backs are
+  // the same mandala, drawn by one function with no seed input.
+  var dealIndex = 0;
+  var deck = [];      // face-down cards, in arc order
+  var drawn = [];     // face-up cards, in draw order
+  var state = 'idle'; // idle | drawing | rest | gather | redeal
+  var stateT0 = 0;
+  var animCard = null;
+  var fan = 1, fanTarget = 1;
+
+  function makeCard(type, variant, rng) {
+    var ti = TYPES.indexOf(type);
+    var main = CPAL[(ti * 2 + variant) % CPAL.length];
+    var accent = CPAL[(ti * 2 + variant + 2) % CPAL.length];
+    return {
+      type: type, variant: variant,
+      cseed: Math.floor(rng() * 1000000000),
+      main: main, accent: accent,
+      px: 0, py: 0, pw: 10, prot: 0,
+      tx: 0, ty: 0, tw: 10, trot: 0,
+      animT0: -100, glowT0: -100
+    };
+  }
+
+  function buildDeal(idx) {
+    var rng = mulberry32(BASE_SEED + idx * 104729);
+    var combos = [];
+    for (var a = 0; a < TYPES.length; a++)
+      for (var b = 0; b < 2; b++) combos.push({ type: TYPES[a], variant: b });
+    for (var i = combos.length - 1; i > 0; i--) { // Fisher-Yates on the seeded stream
+      var j = Math.floor(rng() * (i + 1));
+      var tmp = combos[i]; combos[i] = combos[j]; combos[j] = tmp;
+    }
+    var cards = [];
+    for (var k = 0; k < combos.length; k++) cards.push(makeCard(combos[k].type, combos[k].variant, rng));
+    return cards;
+  }
+
+  function assignTargets() {
+    var i, p;
+    for (i = 0; i < deck.length; i++) {
+      p = arcPos(i, deck.length);
+      deck[i].tx = p.x; deck[i].ty = p.y; deck[i].tw = p.w; deck[i].trot = p.rot;
+    }
+    for (i = 0; i < drawn.length; i++) {
+      if (state === 'gather') p = stackPos(i);
+      else p = rowPos(i, drawn.length);
+      drawn[i].tx = p.x; drawn[i].ty = p.y; drawn[i].tw = p.w; drawn[i].trot = p.rot;
+    }
+  }
+
+  function snapTargets() {
+    assignTargets();
+    var all = deck.concat(drawn), i;
+    for (i = 0; i < all.length; i++) {
+      all[i].px = all[i].tx; all[i].py = all[i].ty;
+      all[i].pw = all[i].tw; all[i].prot = all[i].trot;
+    }
+  }
+
+  function approach(card, dt) {
+    var k = dt <= 0 ? 1 : Math.min(1, dt * 7);
+    card.px += (card.tx - card.px) * k;
+    card.py += (card.ty - card.py) * k;
+    card.pw += (card.tw - card.pw) * k;
+    card.prot += (card.trot - card.prot) * k;
+  }
+
+  // ================= ground texture (static, seeded once) =================
+  var specks = [];
+  (function () {
+    var rng = mulberry32(BASE_SEED ^ 0x51ab);
+    for (var i = 0; i < 46; i++) {
+      specks.push({ x: rng(), y: rng(), r: 0.0016 + rng() * 0.0028, a: 0.04 + rng() * 0.05 });
+    }
+  })();
+
+  // ================= drawing helpers =================
+  function rr(x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  function ellipse(x, y, rx, ry, rot) {
+    ctx.beginPath();
+    ctx.ellipse(x, y, Math.max(0.1, rx), Math.max(0.1, ry), rot || 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  function circle(x, y, r) { ellipse(x, y, r, r, 0); }
+
+  // The one and only card back: a symmetric gold mandala on deep green.
+  // No seed, no per-card variation: every back is identical.
+  function drawMandala(u) {
+    var k;
+    ctx.strokeStyle = GOLD; ctx.fillStyle = GOLD;
+    ctx.lineWidth = u * 0.016;
+    ctx.beginPath(); ctx.arc(0, 0, u * 0.36, 0, Math.PI * 2); ctx.stroke();
+    for (k = 0; k < 12; k++) { // petal ring
+      var a = (k / 12) * Math.PI * 2;
+      ctx.save();
+      ctx.rotate(a);
+      ctx.globalAlpha = 0.85;
+      ellipse(u * 0.265, 0, u * 0.052, u * 0.026, 0);
+      ctx.restore();
+    }
+    ctx.globalAlpha = 1;
+    for (k = 0; k < 12; k++) { // dot ring
+      var a2 = ((k + 0.5) / 12) * Math.PI * 2;
+      circle(Math.cos(a2) * u * 0.185, Math.sin(a2) * u * 0.185, u * 0.013);
+    }
+    ctx.lineWidth = u * 0.013;
+    ctx.beginPath(); ctx.arc(0, 0, u * 0.125, 0, Math.PI * 2); ctx.stroke();
+    for (k = 0; k < 4; k++) { // small cross petals
+      ctx.save();
+      ctx.rotate(k * Math.PI / 2 + Math.PI / 4);
+      ellipse(u * 0.075, 0, u * 0.04, u * 0.02, 0);
+      ctx.restore();
+    }
+    circle(0, 0, u * 0.03);
+  }
+
+  function drawBack(w) {
+    var h = w * CARD_RATIO;
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.28)';
+    rr(-w / 2 + w * 0.02, -h / 2 + h * 0.035, w, h, w * 0.07); ctx.fill();
+    ctx.fillStyle = BACKG;
+    rr(-w / 2, -h / 2, w, h, w * 0.07); ctx.fill();
+    ctx.strokeStyle = GOLD; ctx.lineWidth = Math.max(1, w * 0.018);
+    rr(-w / 2 + w * 0.055, -h / 2 + w * 0.055, w - w * 0.11, h - w * 0.11, w * 0.045); ctx.stroke();
+    drawMandala(w);
+    ctx.restore();
+  }
+
+  // ---- creatures, folk style, in a box of half-size s centred on 0,0 ----
+  function drawFox(s, card, t, anim) {
+    var flip = card.variant === 1 ? -1 : 1;
+    var blink = anim > 0 ? Math.max(0, 1 - Math.sin(Math.min(1, anim) * Math.PI) * 1.6) : 1;
+    ctx.save(); ctx.scale(flip, 1);
+    ctx.fillStyle = card.accent; // tail
+    ellipse(-s * 0.52, s * 0.18, s * 0.34, s * 0.17, -0.6);
+    ctx.fillStyle = PAPER;
+    ellipse(-s * 0.72, s * 0.02, s * 0.13, s * 0.075, -0.6);
+    ctx.fillStyle = card.main; // body
+    ellipse(-s * 0.05, s * 0.16, s * 0.46, s * 0.27, 0);
+    ctx.fillStyle = PAPER; // chest
+    ellipse(s * 0.22, s * 0.24, s * 0.2, s * 0.17, 0);
+    ctx.strokeStyle = card.main; ctx.lineWidth = s * 0.09; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(-s * 0.28, s * 0.38); ctx.lineTo(-s * 0.3, s * 0.62); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(s * 0.24, s * 0.38); ctx.lineTo(s * 0.28, s * 0.62); ctx.stroke();
+    ctx.fillStyle = card.main; // head
+    circle(s * 0.42, -s * 0.22, s * 0.27);
+    ctx.beginPath(); // ears
+    ctx.moveTo(s * 0.24, -s * 0.4); ctx.lineTo(s * 0.3, -s * 0.66); ctx.lineTo(s * 0.44, -s * 0.46); ctx.closePath(); ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(s * 0.48, -s * 0.44); ctx.lineTo(s * 0.62, -s * 0.62); ctx.lineTo(s * 0.64, -s * 0.34); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = PAPER; // snout
+    ellipse(s * 0.62, -s * 0.1, s * 0.15, s * 0.09, 0.25);
+    ctx.fillStyle = FLOOR;
+    circle(s * 0.72, -s * 0.13, s * 0.032);
+    ctx.save(); // eye (blinks on tap)
+    ctx.translate(s * 0.46, -s * 0.26); ctx.scale(1, Math.max(0.12, blink));
+    circle(0, 0, s * 0.038);
+    ctx.restore();
+    ctx.restore();
+  }
+
+  function drawOwl(s, card, t, anim) {
+    var tilt = anim > 0 ? Math.sin(Math.min(1, anim) * Math.PI) * 0.16 : 0;
+    ctx.fillStyle = card.main; // body
+    ellipse(0, s * 0.14, s * 0.4, s * 0.5, 0);
+    ctx.fillStyle = card.accent; // wings
+    ellipse(-s * 0.38, s * 0.18, s * 0.13, s * 0.34, 0.15);
+    ellipse(s * 0.38, s * 0.18, s * 0.13, s * 0.34, -0.15);
+    ctx.fillStyle = PAPER; // belly
+    ellipse(0, s * 0.3, s * 0.24, s * 0.3, 0);
+    ctx.fillStyle = card.accent;
+    var rng = mulberry32(card.cseed);
+    for (var i = 0; i < 5; i++) circle((rng() - 0.5) * s * 0.3, s * (0.12 + rng() * 0.34), s * 0.028);
+    ctx.save(); // head group tilts on tap
+    ctx.translate(0, -s * 0.3); ctx.rotate(tilt);
+    ctx.fillStyle = card.main;
+    circle(0, 0, s * 0.34);
+    ctx.beginPath(); // ear tufts
+    ctx.moveTo(-s * 0.3, -s * 0.14); ctx.lineTo(-s * 0.36, -s * 0.42); ctx.lineTo(-s * 0.12, -s * 0.28); ctx.closePath(); ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(s * 0.3, -s * 0.14); ctx.lineTo(s * 0.36, -s * 0.42); ctx.lineTo(s * 0.12, -s * 0.28); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = PAPER; // eyes
+    circle(-s * 0.13, -s * 0.04, s * 0.105);
+    circle(s * 0.13, -s * 0.04, s * 0.105);
+    ctx.fillStyle = FLOOR;
+    circle(-s * 0.13, -s * 0.04, s * 0.05);
+    circle(s * 0.13, -s * 0.04, s * 0.05);
+    ctx.fillStyle = GOLD; // beak
+    ctx.beginPath();
+    ctx.moveTo(-s * 0.05, s * 0.08); ctx.lineTo(s * 0.05, s * 0.08); ctx.lineTo(0, s * 0.18); ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+
+  function drawShroom(s, card, t, anim) {
+    var rng = mulberry32(card.cseed);
+    var spots = [];
+    var n = 5;
+    var i, a, mx, my, sc;
+    for (i = 0; i < n; i++) {
+      a = (i / n) * Math.PI * 2 + rng() * 0.4;
+      spots.push({ x: Math.cos(a) * s * 0.36, y: Math.sin(a) * s * 0.28 + s * 0.05, sc: 0.78 + rng() * 0.34 });
+    }
+    spots.push({ x: 0, y: s * 0.02, sc: 1.22 });
+    function mushroom(x, y, sc, col) {
+      ctx.fillStyle = PAPER;
+      ctx.fillRect(x - s * 0.065 * sc, y, s * 0.13 * sc, s * 0.3 * sc);
+      ctx.fillStyle = col;
+      ctx.beginPath();
+      ctx.arc(x, y, s * 0.26 * sc, Math.PI, 0);
+      ctx.closePath(); ctx.fill();
+      ctx.fillStyle = PAPER;
+      circle(x - s * 0.09 * sc, y - s * 0.12 * sc, s * 0.042 * sc);
+      circle(x + s * 0.08 * sc, y - s * 0.16 * sc, s * 0.034 * sc);
+    }
+    for (i = 0; i < spots.length; i++) {
+      mushroom(spots[i].x, spots[i].y, spots[i].sc, i % 2 ? card.main : card.accent);
+    }
+    if (anim > 0) { // spores drift on tap
+      ctx.fillStyle = GOLD;
+      var p = Math.min(1, anim);
+      for (i = 0; i < 9; i++) {
+        var sa = rng() * Math.PI * 2;
+        var sr = s * (0.25 + p * 0.55);
+        ctx.globalAlpha = (1 - p) * 0.8;
+        circle(Math.cos(sa) * sr, -p * s * 0.4 + Math.sin(sa) * sr * 0.4, s * 0.02);
+      }
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function drawDeer(s, card, t, anim) {
+    var flick = anim > 0 ? Math.sin(Math.min(1, anim) * Math.PI * 3) * 0.3 * (1 - anim) : 0;
+    ctx.fillStyle = card.main;
+    ctx.strokeStyle = card.main; ctx.lineCap = 'round';
+    ctx.lineWidth = s * 0.085; // legs
+    var lx = [-0.34, -0.18, 0.22, 0.38], i;
+    for (i = 0; i < 4; i++) {
+      ctx.beginPath(); ctx.moveTo(s * lx[i], s * 0.28); ctx.lineTo(s * lx[i], s * 0.64); ctx.stroke();
+    }
+    ellipse(0, s * 0.08, s * 0.52, s * 0.27, 0); // body
+    ctx.fillStyle = PAPER; // spots
+    circle(-s * 0.18, s * 0.0, s * 0.045);
+    circle(s * 0.06, s * 0.1, s * 0.038);
+    circle(-s * 0.02, -s * 0.08, s * 0.032);
+    ctx.fillStyle = card.main;
+    ctx.save(); // neck + head
+    ctx.translate(s * 0.44, -s * 0.05); ctx.rotate(0.5);
+    ctx.fillRect(-s * 0.09, -s * 0.42, s * 0.18, s * 0.46);
+    ctx.restore();
+    ctx.save();
+    ctx.translate(s * 0.6, -s * 0.42);
+    ellipse(0, 0, s * 0.2, s * 0.13, 0.35); // head
+    ctx.fillStyle = FLOOR;
+    circle(s * 0.05, -s * 0.03, s * 0.032); // eye
+    circle(s * 0.17, s * 0.05, s * 0.026);  // nose
+    ctx.strokeStyle = GOLD; ctx.lineWidth = s * 0.035; // antlers
+    ctx.beginPath();
+    ctx.moveTo(-s * 0.04, -s * 0.1); ctx.lineTo(-s * 0.12, -s * 0.3);
+    ctx.moveTo(-s * 0.09, -s * 0.22); ctx.lineTo(-s * 0.2, -s * 0.26);
+    ctx.moveTo(-s * 0.12, -s * 0.3); ctx.lineTo(-s * 0.1, -s * 0.4);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(s * 0.08, -s * 0.11); ctx.lineTo(s * 0.1, -s * 0.32);
+    ctx.moveTo(s * 0.1, -s * 0.24); ctx.lineTo(s * 0.2, -s * 0.3);
+    ctx.stroke();
+    ctx.fillStyle = card.main; // ear, flicks on tap
+    ctx.save();
+    ctx.translate(-s * 0.12, -s * 0.05); ctx.rotate(-0.5 + flick);
+    ellipse(-s * 0.07, 0, s * 0.09, s * 0.035, 0);
+    ctx.restore();
+    ctx.restore();
+    ctx.fillStyle = card.main; // tail
+    ellipse(-s * 0.52, -s * 0.05, s * 0.07, s * 0.12, 0.4);
+  }
+
+  function drawSnake(s, card, t, anim) {
+    var ph = t * 1.4 + (anim > 0 ? Math.min(1, anim) * Math.PI * 2 : 0);
+    var pts = [], i, x, y;
+    for (i = 0; i <= 24; i++) {
+      x = -s * 0.62 + (i / 24) * s * 1.15;
+      y = Math.sin(i * 0.62 + ph) * s * 0.22 + s * 0.1;
+      pts.push({ x: x, y: y });
+    }
+    ctx.strokeStyle = card.main; ctx.lineWidth = s * 0.17; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+    ctx.stroke();
+    ctx.fillStyle = PAPER; // pattern dots ride the body
+    for (i = 3; i < pts.length - 2; i += 4) circle(pts[i].x, pts[i].y, s * 0.032);
+    var hd = pts[pts.length - 1];
+    ctx.fillStyle = card.main;
+    circle(hd.x + s * 0.06, hd.y - s * 0.02, s * 0.13); // head
+    ctx.fillStyle = FLOOR;
+    circle(hd.x + s * 0.09, hd.y - s * 0.06, s * 0.03); // eye
+    ctx.strokeStyle = card.accent; ctx.lineWidth = s * 0.028; // tongue
+    ctx.beginPath();
+    ctx.moveTo(hd.x + s * 0.17, hd.y + s * 0.01);
+    ctx.lineTo(hd.x + s * 0.27, hd.y + s * 0.03);
+    ctx.moveTo(hd.x + s * 0.27, hd.y + s * 0.03);
+    ctx.lineTo(hd.x + s * 0.32, hd.y - s * 0.03);
+    ctx.moveTo(hd.x + s * 0.27, hd.y + s * 0.03);
+    ctx.lineTo(hd.x + s * 0.33, hd.y + s * 0.08);
+    ctx.stroke();
+    ctx.fillStyle = card.accent; // tail rattle dot
+    circle(pts[0].x - s * 0.03, pts[0].y, s * 0.05);
+  }
+
+  function drawMoth(s, card, t, anim) {
+    var flut = 1 + Math.sin(t * 2.2) * 0.05 +
+      (anim > 0 ? Math.sin(Math.min(1, anim) * Math.PI * 7) * 0.22 * (1 - anim) : 0);
+    ctx.fillStyle = GOLD; // small moon above
+    circle(s * 0.3, -s * 0.52, s * 0.09);
+    ctx.fillStyle = PAPER;
+    circle(s * 0.35, -s * 0.56, s * 0.075);
+    ctx.save();
+    ctx.scale(flut, 1);
+    ctx.fillStyle = card.main; // wings
+    ellipse(-s * 0.3, -s * 0.05, s * 0.32, s * 0.19, -0.55);
+    ellipse(s * 0.3, -s * 0.05, s * 0.32, s * 0.19, 0.55);
+    ctx.fillStyle = card.accent;
+    ellipse(-s * 0.24, s * 0.26, s * 0.2, s * 0.12, 0.5);
+    ellipse(s * 0.24, s * 0.26, s * 0.2, s * 0.12, -0.5);
+    ctx.fillStyle = GOLD; // wing moons
+    circle(-s * 0.32, -s * 0.1, s * 0.07);
+    circle(s * 0.32, -s * 0.1, s * 0.07);
+    ctx.fillStyle = card.main;
+    circle(-s * 0.28, -s * 0.13, s * 0.058);
+    circle(s * 0.36, -s * 0.13, s * 0.058);
+    ctx.restore();
+    ctx.fillStyle = FLOOR; // body
+    ellipse(0, s * 0.05, s * 0.085, s * 0.34, 0);
+    circle(0, -s * 0.32, s * 0.09);
+    ctx.strokeStyle = FLOOR; ctx.lineWidth = s * 0.03; ctx.lineCap = 'round'; // antennae
+    ctx.beginPath();
+    ctx.moveTo(-s * 0.04, -s * 0.38); ctx.quadraticCurveTo(-s * 0.2, -s * 0.55, -s * 0.3, -s * 0.5);
+    ctx.moveTo(s * 0.04, -s * 0.38); ctx.quadraticCurveTo(s * 0.2, -s * 0.55, s * 0.3, -s * 0.5);
+    ctx.stroke();
+  }
+
+  var CREATURE_DRAW = { fox: drawFox, owl: drawOwl, shroom: drawShroom, deer: drawDeer, snake: drawSnake, moth: drawMoth };
+
+  function drawFace(w, card, t) {
+    var h = w * CARD_RATIO;
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.28)';
+    rr(-w / 2 + w * 0.02, -h / 2 + h * 0.035, w, h, w * 0.07); ctx.fill();
+    ctx.fillStyle = PAPER;
+    rr(-w / 2, -h / 2, w, h, w * 0.07); ctx.fill();
+    ctx.strokeStyle = GOLD;
+    ctx.lineWidth = Math.max(1, w * 0.02);
+    rr(-w / 2 + w * 0.05, -h / 2 + w * 0.05, w - w * 0.1, h - w * 0.1, w * 0.045); ctx.stroke();
+    ctx.lineWidth = Math.max(0.75, w * 0.008);
+    rr(-w / 2 + w * 0.085, -h / 2 + w * 0.085, w - w * 0.17, h - w * 0.17, w * 0.03); ctx.stroke();
+    var anim = (t - card.animT0) / 1.4;
+    anim = (anim >= 0 && anim <= 1) ? anim : 0;
+    ctx.save();
+    ctx.translate(0, h * 0.02);
+    CREATURE_DRAW[card.type](w * 0.5, card, t, anim);
+    ctx.restore();
+    var glow = (t - card.glowT0) / 1.4;
+    if (glow >= 0 && glow <= 1) { // gold border brightens on tap
+      ctx.globalAlpha = Math.sin(glow * Math.PI) * 0.85;
+      ctx.strokeStyle = GOLD;
+      ctx.lineWidth = Math.max(1.5, w * 0.045);
+      rr(-w / 2 + w * 0.02, -h / 2 + w * 0.02, w - w * 0.04, h - w * 0.04, w * 0.055); ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+    ctx.restore();
+  }
+
+  // Draw one card centred at 0,0. side: 'back' | 'face'; sx: flip squash.
+  function drawCard(w, side, sx, card, t, shade) {
+    ctx.save();
+    ctx.scale(Math.max(0.02, sx), 1);
+    if (side === 'back') drawBack(w); else drawFace(w, card, t);
+    if (shade > 0.01) {
+      var h = w * CARD_RATIO;
+      ctx.fillStyle = 'rgba(8,10,6,' + shade.toFixed(3) + ')';
+      rr(-w / 2, -h / 2, w, h, w * 0.07); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function placeCard(x, y, rot, w, side, sx, card, t, shade) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(rot);
+    drawCard(w, side, sx, card, t, shade);
+    ctx.restore();
+  }
+
+  // ================= moon phase dots =================
+  function drawMoon(t) {
+    var unit = Math.min(W, H);
+    var filled = ((2 + Math.floor(t / 10) - 1) % 5) + 1; // 2 at t=0, cycles 2,3,4,5,1...
+    var r = Math.max(2, unit * 0.009);
+    var gap = unit * 0.042;
+    var y = H * 0.065;
+    for (var i = 0; i < 5; i++) {
+      var x = W / 2 + (i - 2) * gap;
+      if (i < filled) {
+        ctx.fillStyle = GOLD;
+        circle(x, y, r);
+      } else {
+        ctx.strokeStyle = GOLD; ctx.globalAlpha = 0.45; ctx.lineWidth = Math.max(1, r * 0.32);
+        ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.stroke();
+        ctx.globalAlpha = 1;
+      }
+    }
+  }
+
+  // ================= state machine =================
+  function startDraw() {
+    if (state !== 'idle' || !deck.length) return;
+    var midIdx = Math.floor(deck.length / 2);
+    var card = deck.splice(midIdx, 1)[0];
+    var target = rowPos(drawn.length, drawn.length + 1);
+    animCard = {
+      card: card, start: tNow,
+      x0: card.px, y0: card.py, r0: card.prot, w0: card.pw,
+      x1: target.x, y1: target.y, w1: target.w
+    };
+    state = 'drawing';
+  }
+
+  function easeInOut(u) { return u < 0.5 ? 4 * u * u * u : 1 - Math.pow(-2 * u + 2, 3) / 2; }
+
+  function updateState(t) {
+    if (state === 'drawing' && animCard) {
+      var u = (t - animCard.start) / DRAW_DUR;
+      if (u >= 1) {
+        var c = animCard.card;
+        c.px = animCard.x1; c.py = animCard.y1; c.pw = animCard.w1; c.prot = 0;
+        drawn.push(c);
+        animCard = null;
+        if (drawn.length >= 12) { state = 'rest'; stateT0 = t; }
+        else state = 'idle';
+      }
+    } else if (state === 'rest') {
+      if (t - stateT0 > REST_DUR) { state = 'gather'; stateT0 = t; }
+    } else if (state === 'gather') {
+      if (t - stateT0 > GATHER_DUR) {
+        dealIndex++;
+        deck = buildDeal(dealIndex);
+        var sp = stackPos(0), i;
+        for (i = 0; i < deck.length; i++) {
+          deck[i].px = sp.x; deck[i].py = sp.y; deck[i].pw = sp.w; deck[i].prot = 0;
+        }
+        drawn = [];
+        state = 'redeal'; stateT0 = t;
+      }
+    } else if (state === 'redeal') {
+      if (t - stateT0 > REDEAL_DUR) state = 'idle';
+    }
+  }
+
+  // ================= main draw (pure function of the piece clock) =================
+  var tNow = 0;
+  var lastT = 0;
+
+  function draw(t) {
+    var dt = Math.max(0, Math.min(0.05, t - lastT));
+    lastT = t;
+    updateState(t);
+    fan += (fanTarget - fan) * (dt <= 0 ? 1 : Math.min(1, dt * 6));
+    assignTargets();
+    var i;
+
+    for (i = 0; i < deck.length; i++) approach(deck[i], dt);
+    for (i = 0; i < drawn.length; i++) approach(drawn[i], dt);
+
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.fillStyle = FLOOR;
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.fillStyle = GOLD; // faint static specks on the forest floor
+    for (i = 0; i < specks.length; i++) {
+      ctx.globalAlpha = specks[i].a;
+      circle(specks[i].x * W, specks[i].y * H, specks[i].r * Math.min(W, H));
+    }
+    ctx.globalAlpha = 1;
+
+    drawMoon(t);
+
+    // gather flip: one shared flip value for the whole row
+    var gFlip = 0;
+    if (state === 'gather') {
+      gFlip = Math.max(0, Math.min(1, (t - stateT0 - 1.1) / 1.0));
+    }
+
+    for (i = 0; i < drawn.length; i++) { // face-up row
+      var c = drawn[i];
+      if (state === 'gather' && gFlip > 0) {
+        var sx = Math.abs(Math.cos(gFlip * Math.PI));
+        placeCard(c.px, c.py, c.prot, c.pw, gFlip < 0.5 ? 'face' : 'back', sx, c, t, Math.sin(gFlip * Math.PI) * 0.3);
+      } else {
+        placeCard(c.px, c.py, c.prot, c.pw, 'face', 1, c, t, 0);
+      }
+    }
+
+    for (i = 0; i < deck.length; i++) { // face-down arc, breathing subtly
+      var d = deck[i];
+      var breathe = 1 + 0.008 * Math.sin(t * 0.9 + i * 0.8);
+      placeCard(d.px, d.py, d.prot, d.pw * breathe, 'back', 1, d, t, 0);
+    }
+
+    if (state === 'drawing' && animCard) { // the card in flight
+      var u = Math.max(0, Math.min(1, (t - animCard.start) / DRAW_DUR));
+      var e = easeInOut(u);
+      var x = animCard.x0 + (animCard.x1 - animCard.x0) * e;
+      var y = animCard.y0 + (animCard.y1 - animCard.y0) * e - Math.sin(u * Math.PI) * Math.min(W, H) * 0.06;
+      var w = animCard.w0 + (animCard.w1 - animCard.w0) * e;
+      var rot = animCard.r0 * (1 - e);
+      var fp = Math.max(0, Math.min(1, (u - 0.25) / 0.5));
+      fp = Math.round(fp * 8) / 8; // stepped paper turn
+      var fsx = Math.abs(Math.cos(fp * Math.PI));
+      placeCard(x, y, rot, w, fp < 0.5 ? 'back' : 'face', fsx, animCard.card, t, Math.sin(fp * Math.PI) * 0.32);
+    }
+  }
+
+  // ================= interaction =================
+  var dragging = false, dragX0 = 0, lastStamp = -10000;
+
+  function evPos(e) {
+    var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    return { x: (e.clientX || 0) - r.left, y: (e.clientY || 0) - r.top };
+  }
+
+  canvas.addEventListener('pointerdown', function (e) {
+    var p = evPos(e);
+    var i, c;
+    for (i = drawn.length - 1; i >= 0; i--) { // tap a face-up card: glow + creature beat
+      c = drawn[i];
+      if (Math.abs(p.x - c.px) <= c.pw / 2 && Math.abs(p.y - c.py) <= c.pw * CARD_RATIO / 2) {
+        c.animT0 = tNow; c.glowT0 = tNow;
+        lastStamp = -10000;
+        dragging = false;
+        return;
+      }
+    }
+    var stamp = (typeof e.timeStamp === 'number') ? e.timeStamp : tNow * 1000;
+    if (stamp - lastStamp < 380) { // double-tap draws the next card
+      startDraw();
+      lastStamp = -10000;
+      dragging = false;
+      return;
+    }
+    lastStamp = stamp;
+    dragging = true;
+    dragX0 = p.x;
+  });
+
+  canvas.addEventListener('pointermove', function (e) {
+    if (!dragging) return;
+    var p = evPos(e);
+    var unit = Math.min(W, H);
+    fanTarget = 1 + Math.min(0.55, Math.abs(p.x - dragX0) / (unit * 0.5) * 0.55);
+  });
+
+  function endDrag() { dragging = false; fanTarget = 1; }
+  canvas.addEventListener('pointerup', endDrag);
+  canvas.addEventListener('pointercancel', endDrag);
+  canvas.addEventListener('pointerleave', endDrag);
+
+  // ================= QA hook =================
+  // render-piece.js passes its seed argument as location.search
+  // ('?seed=drawn3'): pre-place that many cards face up, instantly and
+  // deterministically, so a drawn face can be verified in a still render.
+  // Production loads carry no query string and are unaffected.
+  function applyForcedDrawn() {
+    var search = '';
+    if (typeof location !== 'undefined' && location.search) search = location.search;
+    var dm = /drawn(\d+)/.exec(search);
+    if (!dm) return;
+    var cnt = Math.min(12, parseInt(dm[1], 10));
+    for (var k = 0; k < cnt; k++) {
+      var midIdx = Math.floor(deck.length / 2);
+      drawn.push(deck.splice(midIdx, 1)[0]);
+    }
+    if (drawn.length >= 12) state = 'rest';
+  }
+
+  // ================= boot =================
+  deck = buildDeal(0);
+  var s0 = viewSize();
+  W = s0.w; H = s0.h;
+  canvas.width = W; canvas.height = H;
+  applyForcedDrawn();
+  snapTargets();
+  draw(0); // synchronous first frame: the undealt arc, moon at 2 filled dots
+
+  var startTs = null;
+  function frame(ts) {
+    if (startTs === null) startTs = ts;
+    tNow = (ts - startTs) / 1000;
+    draw(tNow);
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+  }
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
