@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meeting Roof</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #3A3B3E; height: 100%; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  "use strict";
+
+  // Palette: strict. Anchors only; everything else is an interpolation
+  // between anchors or a low-alpha layer of an anchor.
+  var CONCRETE = [58, 59, 62];     // #3A3B3E ceiling concrete
+  var EDGE     = [42, 43, 46];     // #2A2B2E broken edge
+  var NIGHT    = [35, 44, 62];     // #232C3E night sky anchor
+  var ROSE     = [232, 162, 168];  // #E8A2A8 sky dawn rose
+  var AMBER    = [242, 184, 128];  // #F2B880 sky amber
+  var PALE     = [175, 200, 232];  // #AFC8E8 pale sky
+  var NOON     = [127, 168, 216];  // #7FA8D8 noon blue
+  var W_ROSE   = [232, 138, 160];  // #E88AA0 LED wash rose
+  var W_TEAL   = [74, 216, 200];   // #4AD8C8 LED wash teal
+  var W_AMBER  = [240, 168, 64];   // #F0A840 LED wash amber
+  var LAT_RAD = 40 * Math.PI / 180; // fixed latitude for the solar model
+
+  var canvas = document.getElementById("c");
+  var ctx = canvas.getContext("2d");
+
+  var W = 0, H = 0, DPR = 1;
+
+  function isPhone() {
+    try {
+      var sw = window.screen ? window.screen.width : 0;
+      var sh = window.screen ? window.screen.height : 0;
+      var mn = Math.min(sw, sh);
+      if (mn > 0 && mn < 700) return true;
+    } catch (e) {}
+    return H > W * 1.15;
+  }
+
+  function resize() {
+    var vv = window.visualViewport;
+    var w = vv ? vv.width : window.innerWidth;
+    var h = vv ? vv.height : window.innerHeight;
+    DPR = window.devicePixelRatio || 1;
+    W = w; H = h;
+    canvas.width = Math.round(w * DPR);
+    canvas.height = Math.round(h * DPR);
+  }
+  if (window.visualViewport) window.visualViewport.addEventListener("resize", resize);
+  window.addEventListener("resize", resize);
+  resize();
+
+  // mulberry32 seeded streams: texture and broken edge are fixed by seed,
+  // rebuilt identically on every draw.
+  function makeRng(seed) {
+    var s = seed | 0;
+    return function () {
+      s = (s + 0x6D2B79F5) | 0;
+      var t = Math.imul(s ^ (s >>> 15), 1 | s);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // QA hook only: ?seed=tH:MM forces the program minute (inert otherwise).
+  function minuteOverride() {
+    try {
+      var search = "";
+      try { search = window.location.search || ""; } catch (e1) {}
+      if (!search) { try { search = location.search || ""; } catch (e2) {} }
+      var m = /[?&]seed=([^&]*)/.exec(search);
+      if (!m) return -1;
+      var t = /^t(\d{1,2}):(\d{2})$/.exec(decodeURIComponent(m[1]));
+      if (!t) return -1;
+      return (parseInt(t[1], 10) * 60 + parseInt(t[2], 10)) % 1440;
+    } catch (e) { return -1; }
+  }
+  var OVERRIDE = minuteOverride();
+
+  // The program clock: local date + local minute-of-day, nothing finer.
+  // Date is read only at (year, month, day, hour, minute) resolution, so
+  // the frame is constant inside any minute and back-to-back renders agree.
+  function programClock() {
+    var now = new Date();
+    var minute = now.getHours() * 60 + now.getMinutes();
+    if (OVERRIDE >= 0) minute = OVERRIDE;
+    return {
+      year: now.getFullYear(), month: now.getMonth(), day: now.getDate(),
+      minute: minute
+    };
+  }
+
+  // Simple solar model (same as the sibling Skyspace piece): declination
+  // from day-of-year, hour angle at fixed 40 degree latitude, solar noon
+  // at 12:00 local. Returns sunrise/sunset in minutes of day.
+  function sunMinutes(year, month, day) {
+    var start = Date.UTC(year, 0, 0);
+    var doy = Math.floor((Date.UTC(year, month, day) - start) / 86400000);
+    var decl = -23.44 * Math.PI / 180 * Math.cos(2 * Math.PI * (doy + 10) / 365);
+    var cosH = -Math.tan(LAT_RAD) * Math.tan(decl);
+    if (cosH < -1) cosH = -1;
+    if (cosH > 1) cosH = 1;
+    var half = Math.acos(cosH) * 180 / Math.PI / 15 * 60;
+    return { rise: 720 - half, set: 720 + half };
+  }
+
+  function mix(a, b, t) {
+    return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+  }
+  function css(c, a) {
+    return "rgba(" + Math.round(c[0]) + "," + Math.round(c[1]) + "," + Math.round(c[2]) + "," + a + ")";
+  }
+  function clamp01(v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
+  function smooth(t) { t = clamp01(t); return t * t * (3 - 2 * t); }
+
+  // Dawn/dusk progress for a minute: { dawn: 0..1 or -1, dusk: 0..1 or -1 }.
+  // Each window is 60 minutes centered on sunrise/sunset.
+  function dayProgress(clock) {
+    var sun = sunMinutes(clock.year, clock.month, clock.day);
+    var m = clock.minute;
+    var dawn = -1, dusk = -1;
+    if (m >= sun.rise - 30 && m < sun.rise + 30) dawn = (m - (sun.rise - 30)) / 60;
+    if (m >= sun.set - 30 && m < sun.set + 30) dusk = (m - (sun.set - 30)) / 60;
+    return { dawn: dawn, dusk: dusk, sun: sun };
+  }
+
+  // Sky keyframes as [bottom, top] tone pairs.
+  var KF_NIGHT = [NIGHT, NIGHT];
+  var KF_ROSE  = [ROSE, ROSE];
+  var KF_MID   = [AMBER, ROSE];
+  var KF_DAY   = [PALE, NOON];
+  function lerpKF(a, b, t) { return [mix(a[0], b[0], t), mix(a[1], b[1], t)]; }
+  // Sequence in progress p (0 night, 1 full day):
+  // night -> uniform rose -> amber low / rose high -> pale low / noon high.
+  function sequenceKF(p) {
+    if (p < 0.30) return lerpKF(KF_NIGHT, KF_ROSE, smooth(p / 0.30));
+    if (p < 0.55) return lerpKF(KF_ROSE, KF_MID, smooth((p - 0.30) / 0.25));
+    return lerpKF(KF_MID, KF_DAY, smooth((p - 0.55) / 0.45));
+  }
+  function skyState(clock, prog) {
+    if (prog.dawn >= 0) return sequenceKF(prog.dawn);
+    if (prog.dusk >= 0) return sequenceKF(1 - prog.dusk);
+    var m = clock.minute;
+    if (m > prog.sun.rise && m < prog.sun.set) return KF_DAY;
+    return KF_NIGHT;
+  }
+
+  // LED wash state: { color, alpha }. In a dawn/dusk window the wash runs
+  // rose -> teal -> amber while its strength swells and falls on a sine
+  // envelope; outside the windows it rests at a faint neutral.
+  function washState(prog) {
+    var p = -1;
+    if (prog.dawn >= 0) p = prog.dawn;
+    else if (prog.dusk >= 0) p = prog.dusk;
+    if (p < 0) return { color: CONCRETE, alpha: 0.05 };
+    var col;
+    if (p < 0.5) col = mix(W_ROSE, W_TEAL, smooth(p * 2));
+    else col = mix(W_TEAL, W_AMBER, smooth((p - 0.5) * 2));
+    var a = 0.05 + 0.34 * Math.pow(Math.sin(Math.PI * clamp01(p)), 1.15);
+    return { color: col, alpha: a };
+  }
+
+  // Concrete texture, fixed by seed in unit space: broad trowel patches
+  // (brightness-scaled concrete tones only) plus fine speckle.
+  var patches = [];
+  var speckles = [];
+  (function buildConcrete() {
+    var rng = makeRng(75031101);
+    var i;
+    for (i = 0; i < 30; i++) {
+      patches.push({
+        x: rng(), y: rng(),
+        rx: 0.10 + rng() * 0.30, ry: 0.06 + rng() * 0.20,
+        f: 0.90 + rng() * 0.22, a: 0.05 + rng() * 0.07
+      });
+    }
+    for (i = 0; i < 2400; i++) {
+      speckles.push({
+        x: rng(), y: rng(), r: 0.5 + rng() * 1.3,
+        dark: rng() < 0.62, a: 0.04 + rng() * 0.09
+      });
+    }
+  })();
+
+  // Broken edge: seeded offsets at knots around the aperture perimeter.
+  // Positive offset bites inward. A minority of knots are deep chips.
+  var KNOTS = 168;
+  var knotOff = [];
+  (function buildEdge() {
+    var rng = makeRng(75090777);
+    var raw = [];
+    var i, v;
+    for (i = 0; i < KNOTS; i++) {
+      v = (rng() - 0.5) * 2;
+      if (rng() < 0.075) v += 0.9 + rng() * 1.5; // deep chip bite
+      raw.push(v);
+    }
+    // Light smoothing so the rim reads as fractured concrete, not noise,
+    // while keeping the deep bites.
+    for (i = 0; i < KNOTS; i++) {
+      var a = raw[(i + KNOTS - 1) % KNOTS], b = raw[i], c = raw[(i + 1) % KNOTS];
+      knotOff.push(a * 0.22 + b * 0.56 + c * 0.22);
+    }
+  })();
+
+  // Hairline cracks running outward from the rim, fixed by seed.
+  var cracks = [];
+  (function buildCracks() {
+    var rng = makeRng(75055013);
+    for (var i = 0; i < 9; i++) {
+      cracks.push({
+        s: rng(),                       // perimeter parameter
+        len: 0.25 + rng() * 0.9,        // fraction of max crack length
+        bend: (rng() - 0.5) * 0.9,      // sideways drift of the tip
+        mid: 0.35 + rng() * 0.3         // where the bend happens
+      });
+    }
+  })();
+
+  // One point on the aperture perimeter at parameter s (0..1, clockwise
+  // from top-left), inset by off pixels along the inward normal.
+  function rimPoint(cx, cy, half, s, off) {
+    var per = 8 * half;
+    var d = ((s % 1) + 1) % 1 * per;
+    var side = Math.floor(d / (2 * half));
+    var u = (d - side * 2 * half) / (2 * half); // 0..1 along the side
+    var x, y, nx, ny;
+    if (side === 0)      { x = cx - half + u * 2 * half; y = cy - half; nx = 0; ny = 1; }
+    else if (side === 1) { x = cx + half; y = cy - half + u * 2 * half; nx = -1; ny = 0; }
+    else if (side === 2) { x = cx + half - u * 2 * half; y = cy + half; nx = 0; ny = -1; }
+    else                 { x = cx - half; y = cy + half - u * 2 * half; nx = 1; ny = 0; }
+    return { x: x + nx * off, y: y + ny * off, nx: nx, ny: ny };
+  }
+
+  function rimPath(cx, cy, half, baseOff, amp) {
+    ctx.beginPath();
+    for (var i = 0; i <= KNOTS; i++) {
+      var k = i % KNOTS;
+      var p = rimPoint(cx, cy, half, i / KNOTS, baseOff + knotOff[k] * amp);
+      if (i === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+    }
+    ctx.closePath();
+  }
+
+  // Drifting sky noise bands, as in the sibling piece: closed-form in the
+  // program minute, very low alpha, cloud texture suppressed.
+  var bands = [];
+  (function buildBands() {
+    var rng = makeRng(75020441);
+    for (var i = 0; i < 2; i++) {
+      bands.push({
+        baseV: 0.25 + rng() * 0.5,
+        thick: 0.10 + rng() * 0.10,
+        period: 120 + Math.floor(rng() * 120),
+        phase: rng() * Math.PI * 2,
+        alpha: 0.02 + rng() * 0.02,
+        seg: 5 + Math.floor(rng() * 3)
+      });
+    }
+  })();
+
+  function draw() {
+    if (W <= 0 || H <= 0) return;
+    canvas.style.width = W + "px";
+    canvas.style.height = H + "px";
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+    var clock = programClock();
+    var prog = dayProgress(clock);
+    var kf = skyState(clock, prog);
+    var bottom = kf[0], top = kf[1];
+    var wash = washState(prog);
+    var phone = isPhone();
+    var i, j;
+
+    // Concrete ceiling fills the frame.
+    ctx.fillStyle = css(CONCRETE, 1);
+    ctx.fillRect(0, 0, W, H);
+    for (i = 0; i < patches.length; i++) {
+      var pt = patches[i];
+      var tone = [CONCRETE[0] * pt.f, CONCRETE[1] * pt.f, CONCRETE[2] * pt.f];
+      ctx.fillStyle = css(tone, pt.a);
+      ctx.beginPath();
+      ctx.ellipse(pt.x * W, pt.y * H, pt.rx * W, pt.ry * H, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    // Faint formwork seams.
+    ctx.fillStyle = css(EDGE, 0.30);
+    ctx.fillRect(W * 0.335, 0, 1, H);
+    ctx.fillRect(0, H * 0.66, W, 1);
+    // Speckle.
+    for (i = 0; i < speckles.length; i++) {
+      var sp = speckles[i];
+      ctx.fillStyle = sp.dark ? css(EDGE, sp.a) : css([96, 98, 102], sp.a * 0.8);
+      ctx.fillRect(sp.x * W, sp.y * H, sp.r, sp.r);
+    }
+
+    // Aperture geometry: centered square, about 60% of the smaller frame
+    // dimension (a little larger share on phones), proportion always square.
+    var sideLen = Math.min(W, H) * (phone ? 0.66 : 0.60);
+    var half = sideLen / 2;
+    var cx = W / 2, cy = H / 2;
+    var jagAmp = Math.max(2.5, sideLen * 0.016);
+    var lip = Math.max(4, sideLen * 0.020);
+
+    // LED wash: layered low-alpha rounded shapes expanding from the rim,
+    // strongest at the rim and falling off outward, so the artificial
+    // color floods the concrete near the opening and dies into the room.
+    var LAYERS = 16;
+    for (i = LAYERS - 1; i >= 0; i--) {
+      var f = i / (LAYERS - 1);              // 0 at rim, 1 farthest
+      var grow = sideLen * 0.55 * f;
+      var a = wash.alpha * Math.pow(1 - f, 1.7) * 0.31;
+      if (a <= 0.003) continue;
+      ctx.fillStyle = css(wash.color, a);
+      ctx.beginPath();
+      ctx.roundRect(cx - half - grow, cy - half - grow,
+                    sideLen + grow * 2, sideLen + grow * 2,
+                    sideLen * 0.16 * (0.3 + f));
+      ctx.fill();
+    }
+
+    // Broken edge band: the jagged rim drawn as a dark fractured lip
+    // between an outer jagged loop and the inner sky opening.
+    rimPath(cx, cy, half, -lip * 0.4, jagAmp);
+    ctx.fillStyle = css(EDGE, 1);
+    ctx.fill();
+    // Hairline cracks from the rim into the concrete.
+    ctx.strokeStyle = css(EDGE, 0.55);
+    ctx.lineWidth = 1;
+    for (i = 0; i < cracks.length; i++) {
+      var ck = cracks[i];
+      var base = rimPoint(cx, cy, half, ck.s, -lip * 0.4);
+      var maxLen = sideLen * 0.16 * ck.len;
+      var mx = base.x - base.nx * maxLen * ck.mid + (-base.ny) * ck.bend * maxLen * 0.4;
+      var my = base.y - base.ny * maxLen * ck.mid + (base.nx) * ck.bend * maxLen * 0.4;
+      var tx = base.x - base.nx * maxLen + (-base.ny) * ck.bend * maxLen;
+      var ty = base.y - base.ny * maxLen + (base.nx) * ck.bend * maxLen;
+      ctx.beginPath();
+      ctx.moveTo(base.x, base.y);
+      ctx.lineTo(mx, my);
+      ctx.lineTo(tx, ty);
+      ctx.stroke();
+    }
+
+    // Sky inside the aperture, clipped to the inner jagged loop.
+    ctx.save();
+    rimPath(cx, cy, half, lip * 0.55, jagAmp);
+    ctx.clip();
+    var x0 = cx - half - jagAmp * 2, x1 = cx + half + jagAmp * 2;
+    var y0 = cy - half - jagAmp * 2, y1 = cy + half + jagAmp * 2;
+    // Stepped flat bands in place of a gradient: 48 horizontal strips.
+    var STRIPS = 48;
+    for (i = 0; i < STRIPS; i++) {
+      var t = i / (STRIPS - 1);
+      var sy0 = y0 + (y1 - y0) * (i / STRIPS) - 1;
+      var sy1 = y0 + (y1 - y0) * ((i + 1) / STRIPS) + 1;
+      ctx.fillStyle = css(mix(top, bottom, t), 1);
+      ctx.fillRect(x0, sy0, x1 - x0, sy1 - sy0);
+    }
+    // Drifting noise bands inside the sky, closed-form in the minute.
+    for (var b = 0; b < bands.length; b++) {
+      var bd = bands[b];
+      var vc = bd.baseV + 0.05 * Math.sin(2 * Math.PI * (clock.minute / bd.period) + bd.phase);
+      var halfT = bd.thick / 2;
+      var ROWS = 10;
+      for (var r = 0; r < ROWS; r++) {
+        var v = vc - halfT + bd.thick * (r + 0.5) / ROWS;
+        var d = Math.abs(v - vc) / halfT;
+        if (d >= 1) continue;
+        var prof = Math.cos(d * Math.PI / 2);
+        var ry = y0 + (y1 - y0) * (vc - halfT + bd.thick * r / ROWS) - 1;
+        var rh = (y1 - y0) * bd.thick / ROWS + 2;
+        var segW = (x1 - x0) / bd.seg;
+        var drift = ((clock.minute * (b + 1)) % bd.seg) / bd.seg;
+        for (j = -1; j < bd.seg + 1; j++) {
+          var jitter = 0.75 + 0.25 * Math.sin(j * 12.9898 + b * 78.233);
+          ctx.fillStyle = css(PALE, bd.alpha * prof * jitter);
+          ctx.fillRect(x0 + (j + drift) * segW - 1, ry, segW + 2, rh);
+        }
+      }
+    }
+    // Wash spilling just inside the rim: the two color systems meet here.
+    for (i = 2; i >= 0; i--) {
+      var shrink = lip * (0.8 + i * 1.6);
+      ctx.strokeStyle = css(wash.color, wash.alpha * (0.20 - i * 0.055));
+      ctx.lineWidth = lip * (1.1 - i * 0.3);
+      ctx.strokeRect(cx - half + shrink, cy - half + shrink,
+                     sideLen - shrink * 2, sideLen - shrink * 2);
+    }
+    ctx.restore();
+
+    // Inner shadow lip on the sky opening, then a faint top catch of light
+    // on the rim so the fracture reads as depth, not a printed outline.
+    rimPath(cx, cy, half, lip * 0.55, jagAmp);
+    ctx.strokeStyle = "rgba(0,0,0,0.38)";
+    ctx.lineWidth = Math.max(2, lip * 0.5);
+    ctx.stroke();
+    rimPath(cx, cy, half, -lip * 0.15, jagAmp);
+    ctx.strokeStyle = css([150, 152, 156], 0.10);
+    ctx.lineWidth = 1.2;
+    ctx.stroke();
+  }
+
+  draw();
+
+  if (typeof requestAnimationFrame === "function") {
+    var loop = function () { draw(); requestAnimationFrame(loop); };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
