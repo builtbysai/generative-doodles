@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Inner Band</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #EFEFED; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // Palette (strict)
+  var FIELD = [245, 244, 240];   // #F5F4F0
+  var BAND  = [216, 212, 204];   // #D8D4CC
+  var FLARE = [255, 253, 246];   // #FFFDF6
+  var SHADOW = [138, 138, 136];  // #8A8A88
+  var WALL  = [239, 239, 237];   // #EFEFED
+  var FLOOR = [218, 215, 210];   // #DAD7D2
+
+  function rgb(c, a) {
+    return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a + ')';
+  }
+  function lerp(a, b, t) { return a + (b - a) * t; }
+  function mix(c1, c2, t) {
+    return [lerp(c1[0], c2[0], t), lerp(c1[1], c2[1], t), lerp(c1[2], c2[2], t)];
+  }
+  function clamp(x, lo, hi) { return x < lo ? lo : (x > hi ? hi : x); }
+
+  // mulberry32 seeded RNG
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // Precomputed fine horizontal-stroke texture for the band.
+  // Coordinates are normalized to the band rect (u across, v down).
+  var STROKES = [];
+  (function buildStrokes() {
+    var rnd = mulberry32(768001);
+    var n = 900;
+    for (var i = 0; i < n; i++) {
+      STROKES.push({
+        u: rnd(),
+        v: rnd(),
+        len: 0.03 + rnd() * 0.16,       // fraction of band width
+        w: 0.6 + rnd() * 1.1,           // px weight at reference scale
+        tone: rnd(),                    // 0 = shadow-ish, 1 = flare-ish
+        a: 0.25 + rnd() * 0.75
+      });
+    }
+  })();
+
+  // Presence lobe: smooth closed-form function of viewer position v.
+  // Peaks (1.0) at v = 0.35, falls to the 0.03 floor near v = 0 and v = 0.75+.
+  function presence(v) {
+    var d = v - 0.35;
+    var g = Math.exp(-(d * d) / (2 * 0.14 * 0.14));
+    return 0.03 + 0.97 * g;
+  }
+
+  // Idle sway: 20 s cycle, v = 0.35 at t = 0, ranging roughly 0.03..0.67.
+  function swayV(t) {
+    return 0.35 + 0.32 * Math.sin((Math.PI * 2 * t) / 20);
+  }
+
+  // Interaction state. v(t) is a closed-form function of recorded samples.
+  var drag = null;      // {x0, v0} while dragging
+  var dragV = 0.35;     // current v while dragging
+  var release = null;   // {t, v} at last release
+
+  function viewerV(t) {
+    if (drag) return dragV;
+    var base = swayV(t);
+    if (release) {
+      var dt = t - release.t;
+      var k = Math.exp(-dt / 1.4);
+      if (k < 0.001) { release = null; return base; }
+      // sway value at release time anchors the blend so there is no jump.
+      return base + (release.v - swayV(release.t)) * k;
+    }
+    return base;
+  }
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  function viewSize() {
+    var vv = window.visualViewport;
+    if (vv && vv.width && vv.height) return { w: vv.width, h: vv.height };
+    return { w: window.innerWidth || 800, h: window.innerHeight || 600 };
+  }
+
+  function isPhone(w, h) {
+    var sw = (window.screen && window.screen.width) || w;
+    var sh = (window.screen && window.screen.height) || h;
+    if (Math.min(sw, sh) < 700) return true;
+    return h > w * 1.15;
+  }
+
+  function draw(t) {
+    var s = viewSize();
+    var w = Math.max(50, Math.round(s.w));
+    var h = Math.max(50, Math.round(s.h));
+    if (canvas.width !== w) canvas.width = w;
+    if (canvas.height !== h) canvas.height = h;
+    canvas.style.width = w + 'px';
+    canvas.style.height = h + 'px';
+
+    var phone = isPhone(w, h);
+
+    // Wall and floor strip
+    ctx.fillStyle = rgb(WALL, 1);
+    ctx.fillRect(0, 0, w, h);
+    var floorH = Math.max(10, h * 0.055);
+    ctx.fillStyle = rgb(FLOOR, 1);
+    ctx.fillRect(0, h - floorH, w, floorH);
+    // faint wall/floor junction line
+    ctx.fillStyle = rgb(SHADOW, 0.10);
+    ctx.fillRect(0, h - floorH - 1, w, 1);
+
+    var v = clamp(viewerV(t), 0, 1);
+    var p = presence(v);
+
+    // Panel geometry: square, ~70% of frame height, centered (slightly high).
+    var side = Math.min(h * 0.70, w * (phone ? 0.86 : 0.80));
+    var px = (w - side) / 2;
+    var py = (h - floorH - side) / 2 + h * 0.01;
+    if (py < 4) py = 4;
+
+    // Hover drop shadow: layered alpha shapes, offset shifts subtly with v.
+    var shX = 6 + (v - 0.35) * 12;
+    var shY = 8 + (0.35 - Math.abs(v - 0.35)) * 4;
+    var layers = [
+      { grow: 10, a: 0.035 },
+      { grow: 6,  a: 0.045 },
+      { grow: 2,  a: 0.050 }
+    ];
+    for (var li = 0; li < layers.length; li++) {
+      var L = layers[li];
+      ctx.fillStyle = rgb(SHADOW, L.a);
+      ctx.fillRect(px + shX - L.grow / 2, py + shY - L.grow / 2, side + L.grow, side + L.grow);
+    }
+
+    // Panel field
+    ctx.fillStyle = rgb(FIELD, 1);
+    ctx.fillRect(px, py, side, side);
+
+    // Center band: drawn in vertical slices so its edges feather smoothly.
+    var bandW = side * 0.34;
+    var bandX = px + (side - bandW) / 2;
+    // Band tone: taupe deepened by presence, warmed toward flare at peak.
+    var bandCol = mix(FIELD, mix(BAND, FLARE, 0.38 * p), p);
+    var SLICES = 48;
+    for (var i = 0; i < SLICES; i++) {
+      var u = (i + 0.5) / SLICES;                 // 0..1 across band
+      var edge = Math.sin(Math.PI * clamp(u, 0, 1)); // 0 at edges, 1 center
+      edge = Math.pow(edge, 0.55);
+      var sx = bandX + (i / SLICES) * bandW;
+      var swd = bandW / SLICES + 1;
+      ctx.fillStyle = rgb(bandCol, 0.16 + 0.84 * edge);
+      ctx.fillRect(sx, py, swd, side);
+    }
+    // Soft flare wash at band center when presence is high, drawn in
+    // slices with a smooth profile so it has no hard vertical edges.
+    if (p > 0.55) {
+      var fa = (p - 0.55) / 0.45 * 0.34;
+      var FSLICES = 32;
+      for (var fi = 0; fi < FSLICES; fi++) {
+        var fu = (fi + 0.5) / FSLICES;
+        var fprof = Math.pow(Math.sin(Math.PI * clamp(fu, 0, 1)), 1.6);
+        ctx.fillStyle = rgb(FLARE, fa * fprof);
+        ctx.fillRect(bandX + (fi / FSLICES) * bandW, py, bandW / FSLICES + 1, side);
+      }
+    }
+
+    // Stroke texture inside the band; visibility multiplies with presence.
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(bandX, py, bandW, side);
+    ctx.clip();
+    var strokeScale = side / 700;
+    for (var j = 0; j < STROKES.length; j++) {
+      var st = STROKES[j];
+      var col = st.tone > 0.5 ? FLARE : SHADOW;
+      var a = st.a * p * 0.16;
+      if (a < 0.004) continue;
+      ctx.strokeStyle = rgb(col, a);
+      ctx.lineWidth = Math.max(0.5, st.w * strokeScale);
+      var sxp = bandX + st.u * bandW;
+      var syp = py + st.v * side;
+      var sl = st.len * bandW;
+      ctx.beginPath();
+      ctx.moveTo(sxp, syp);
+      ctx.lineTo(sxp + sl, syp);
+      ctx.stroke();
+    }
+    ctx.restore();
+
+    // Bevel: thin inner shadow on right and bottom edges of the panel.
+    ctx.fillStyle = rgb(SHADOW, 0.28);
+    ctx.fillRect(px + side - 3, py, 3, side);
+    ctx.fillRect(px, py + side - 3, side, 3);
+    ctx.fillStyle = rgb(SHADOW, 0.12);
+    ctx.fillRect(px + side - 6, py, 3, side);
+    ctx.fillRect(px, py + side - 6, side, 3);
+    // faint light catch on top/left inner edge
+    ctx.fillStyle = rgb(FLARE, 0.5);
+    ctx.fillRect(px, py, side, 1);
+    ctx.fillRect(px, py, 1, side);
+  }
+
+  // Frame one: synchronous draw at t = 0 (v = 0.35, band at full presence).
+  draw(0);
+
+  var startStamp = null;
+  var lastT = 0;
+  function frame(now) {
+    if (startStamp === null) startStamp = now;
+    lastT = (now - startStamp) / 1000;
+    draw(lastT);
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(frame);
+    }
+  }
+  if (typeof requestAnimationFrame === 'function') {
+    requestAnimationFrame(frame);
+  }
+
+  function onResize() { draw(0); }
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', onResize);
+  }
+  window.addEventListener('resize', onResize);
+
+  // Drag horizontally = walking past the painting.
+  var dragging = false;
+  function evtX(e) {
+    if (e.touches && e.touches.length) return e.touches[0].clientX;
+    return e.clientX;
+  }
+  function down(e) {
+    dragging = true;
+    var s = viewSize();
+    drag = { x0: evtX(e), v0: viewerV(lastT), w: s.w };
+    dragV = drag.v0;
+    release = null;
+  }
+  function move(e) {
+    if (!dragging || !drag) return;
+    var dx = evtX(e) - drag.x0;
+    dragV = clamp(drag.v0 + dx / Math.max(1, drag.w), 0, 1);
+    draw(0);
+  }
+  function up() {
+    if (!dragging) return;
+    dragging = false;
+    // Record the release sample; v(t) then eases back into the sway in
+    // closed form from this sample.
+    release = { t: lastT, v: dragV };
+    drag = null;
+  }
+  canvas.addEventListener('pointerdown', down);
+  canvas.addEventListener('pointermove', move);
+  canvas.addEventListener('pointerup', up);
+  canvas.addEventListener('pointercancel', up);
+  canvas.addEventListener('mousedown', down);
+  canvas.addEventListener('mousemove', move);
+  canvas.addEventListener('mouseup', up);
+  canvas.addEventListener('touchstart', down, { passive: true });
+  canvas.addEventListener('touchmove', move, { passive: true });
+  canvas.addEventListener('touchend', up);
+})();
+</script>
+</body>
+</html>
