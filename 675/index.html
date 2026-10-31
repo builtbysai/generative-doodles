@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Huaco Silbador</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #14100D; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // Palette (strict): burnished clay, engobe cream, water, ground, mist.
+  var CLAY = '#8A4A2B';
+  var ENGOBE = '#E4D3B8';
+  var WATER = '#2E5F6B';
+  var GROUND = '#14100D';
+  var MIST = '#CFE4E4';
+
+  var BASE_SEED = 675001;
+  var FORCE_T = -1; // QA hook: -1 = live clock, else fixed elapsed seconds
+
+  // QA seed hook: ?seed=tNN pins the elapsed time (headless renderer).
+  try {
+    if (typeof location !== 'undefined' && location.search) {
+      var qm = /[?&]seed=t([0-9]+(?:\.[0-9]+)?)/.exec(location.search);
+      if (qm) FORCE_T = parseFloat(qm[1]);
+    }
+  } catch (e) { /* live mode */ }
+
+  // Seeded RNG (mulberry32). Used for mist jitter only.
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+  // ------------------------------------------------------------------
+  // Simulation. Fixed-step (dt = 1/120) state on an anchored clock.
+  // Pointer gestures are recorded as events with anchored times and
+  // consumed by the step loop, so the state at any elapsed time is a
+  // pure function of the event timeline. Frame one is the rest state.
+  //
+  // Two-reservoir model: the body holds two chambers, A (left) and B
+  // (right, under the whistle riser). Levels are fractions of chamber
+  // capacity and sum to TOTAL (volume conserved). tilt drives the
+  // equilibrium difference diff = levelB - levelA; diff chases its
+  // target through a second-order slosh (stiffness + damping), so the
+  // water overshoots a little and settles. Airflow out of the whistle
+  // is |d(levelB)/dt|: water entering chamber B has nowhere to push
+  // the air but out through the whistle mouth.
+  // ------------------------------------------------------------------
+  var DT = 1 / 120;
+  var REST = 0.575;            // resting level in each chamber
+  var TOTAL = REST * 2;        // conserved volume (sum of the levels)
+  var MAX_TILT = 0.61;         // about 35 degrees
+  var FLOW_ON = 0.055;         // airflow threshold for tone onset
+  var FLOW_OFF = 0.030;
+
+  var simTime = 0;
+  var state = {
+    tilt: 0, tiltVel: 0, tiltTarget: 0,
+    diff: 0, diffVel: 0,
+    levelA: REST, levelB: REST,
+    flowing: false, flowHold: 0, puffCount: 0,
+    dragging: false, dragX: 0, dragY: 0, dragTilt: 0
+  };
+  var events = [];   // {t, type, x, y}
+  var mists = [];    // {x, y, vx, vy, r, age, life}
+
+  // Whistle mouth in vessel-local space (y up, base pivot at origin).
+  var MOUTH = { x: 0.352, y: 1.212 };
+  var MOUTH_DIR = { x: 0.55, y: 0.835 };
+
+  function applyEvent(ev) {
+    if (ev.type === 'down') {
+      state.dragging = true;
+      state.dragX = ev.x; state.dragY = ev.y;
+      state.dragTilt = state.tiltTarget;
+    } else if (ev.type === 'move') {
+      if (state.dragging) {
+        var dx = ev.x - state.dragX;
+        var dy = ev.y - state.dragY;
+        state.tiltTarget = clamp(state.dragTilt + (dx - dy * 0.35) * 0.0038, -MAX_TILT, MAX_TILT);
+      }
+    } else if (ev.type === 'up') {
+      state.dragging = false;
+      state.tiltTarget = 0;
+    }
+  }
+
+  function spawnPuff() {
+    // Mist discs are spawned in world space at the whistle mouth.
+    var rng = mulberry32(BASE_SEED + state.puffCount * 131);
+    state.puffCount++;
+    var m = localToWorld(MOUTH.x, MOUTH.y);
+    var tip = localToWorld(MOUTH.x + MOUTH_DIR.x, MOUTH.y + MOUTH_DIR.y);
+    var dx = tip.x - m.x, dy = tip.y - m.y;
+    var dl = Math.sqrt(dx * dx + dy * dy) || 1;
+    dx /= dl; dy /= dl;
+    var n = 5;
+    for (var i = 0; i < n; i++) {
+      var sp = (0.16 + rng() * 0.30) * layout.scale;
+      mists.push({
+        x: m.x + dx * i * layout.scale * 0.018 + (rng() - 0.5) * layout.scale * 0.02,
+        y: m.y + dy * i * layout.scale * 0.018 + (rng() - 0.5) * layout.scale * 0.02,
+        vx: dx * sp + (rng() - 0.5) * layout.scale * 0.05,
+        vy: dy * sp - layout.scale * 0.03,
+        r: layout.scale * (0.020 + rng() * 0.026),
+        age: -i * 0.07,
+        life: 0.9 + rng() * 0.5
+      });
+    }
+    if (mists.length > 60) mists.splice(0, mists.length - 60);
+  }
+
+  function stepSim() {
+    // Tilt: a weighty spring toward the target. On release the target
+    // is 0 and the same spring settles the vessel home in about 1.5 s.
+    var tAcc = (state.tiltTarget - state.tilt) * 34 - state.tiltVel * 10;
+    state.tiltVel += tAcc * DT;
+    state.tilt = clamp(state.tilt + state.tiltVel * DT, -0.64, 0.64);
+
+    // Reservoirs: equilibrium difference from tilt, chased with slosh.
+    var diffT = clamp(2.0 * state.tilt, -0.79, 0.79);
+    var dAcc = (diffT - state.diff) * 16 - state.diffVel * 5.0;
+    state.diffVel += dAcc * DT;
+    state.diff = clamp(state.diff + state.diffVel * DT, -0.82, 0.82);
+    state.levelB = clamp((TOTAL + state.diff) / 2, 0.04, 0.97);
+    state.levelA = TOTAL - state.levelB;
+
+    // Tone onsets: airflow crossing the threshold breathes a puff.
+    var flow = Math.abs(state.diffVel) / 2;
+    if (flow > FLOW_ON && !state.flowing) {
+      state.flowing = true;
+      state.flowHold = 0;
+      spawnPuff();
+    } else if (state.flowing) {
+      state.flowHold += DT;
+      if (flow < FLOW_OFF) state.flowing = false;
+      else if (state.flowHold > 1.6) { state.flowHold = 0; spawnPuff(); }
+    }
+
+    // Mist drift.
+    for (var i = mists.length - 1; i >= 0; i--) {
+      var p = mists[i];
+      p.age += DT;
+      if (p.age > p.life) { mists.splice(i, 1); continue; }
+      if (p.age > 0) {
+        p.x += p.vx * DT; p.y += p.vy * DT;
+        p.vx *= (1 - 0.7 * DT); p.vy *= (1 - 0.7 * DT);
+        p.r += layout.scale * 0.028 * DT;
+      }
+    }
+    simTime += DT;
+  }
+
+  function advanceSim(target) {
+    var guard = 0;
+    while (simTime < target - 1e-9 && guard < 1200) {
+      while (events.length && events[0].t <= simTime + DT) applyEvent(events.shift());
+      stepSim();
+      guard++;
+    }
+    if (guard >= 1200) simTime = target; // never spiral; snap
+    while (events.length && events[0].t <= simTime) applyEvent(events.shift());
+  }
+
+  function flowNow() { return Math.abs(state.diffVel) / 2; }
+  function dispNow() { return clamp(Math.abs(state.levelB - REST) / (1 - REST), 0, 1); }
+
+  // ------------------------------------------------------------------
+  // Audio. Created LAZILY inside the first pointer press, and only
+  // there: nothing is constructed at load, nothing ever plays on its
+  // own. A persistent breathy voice (sine + band-passed noise) whose
+  // gain follows the airflow and whose pitch follows the displaced
+  // air volume, 300 Hz at rest rising to 700 Hz as the pour completes,
+  // with a slosh vibrato. Without WebAudio the piece stays silent and
+  // the gesture still tilts, pours and puffs.
+  // ------------------------------------------------------------------
+  var actx = null, aOsc = null, aOscGain = null, aNoiseGain = null, aBp = null;
+
+  function ensureAudio() {
+    if (actx) {
+      if (actx.state === 'suspended' && actx.resume) { try { actx.resume(); } catch (e) {} }
+      return true;
+    }
+    var AC = null;
+    if (typeof AudioContext !== 'undefined') AC = AudioContext;
+    else if (typeof window !== 'undefined' && window && window.webkitAudioContext) AC = window.webkitAudioContext;
+    if (!AC) return false;
+    try {
+      actx = new AC();
+      var master = actx.createGain();
+      master.gain.value = 0.85;
+      master.connect(actx.destination);
+      aOsc = actx.createOscillator();
+      aOsc.type = 'sine';
+      aOsc.frequency.value = 320;
+      aOscGain = actx.createGain();
+      aOscGain.gain.value = 0;
+      aOsc.connect(aOscGain); aOscGain.connect(master);
+      aOsc.start();
+      var len = Math.floor(actx.sampleRate * 1.5);
+      var buf = actx.createBuffer(1, len, actx.sampleRate);
+      var data = buf.getChannelData(0);
+      var nrng = mulberry32(675777);
+      for (var i = 0; i < len; i++) data[i] = nrng() * 2 - 1;
+      var src = actx.createBufferSource();
+      src.buffer = buf; src.loop = true;
+      aBp = actx.createBiquadFilter();
+      aBp.type = 'bandpass'; aBp.frequency.value = 640; aBp.Q.value = 1.6;
+      aNoiseGain = actx.createGain();
+      aNoiseGain.gain.value = 0;
+      src.connect(aBp); aBp.connect(aNoiseGain); aNoiseGain.connect(master);
+      src.start();
+    } catch (e) {
+      actx = null; aOsc = null; aOscGain = null; aNoiseGain = null; aBp = null;
+      return false;
+    }
+    return true;
+  }
+
+  function updateAudio() {
+    if (!actx || !aOsc) return;
+    try {
+      var t = actx.currentTime;
+      var flow = flowNow();
+      var g = flow > 0.02 ? clamp(0.10 + flow * 0.9, 0, 0.5) : 0;
+      var freq = 300 + 400 * dispNow();
+      var vib = 1 + 0.012 * Math.sin(simTime * 24) * clamp(Math.abs(state.diffVel) * 1.5, 0, 1);
+      aOsc.frequency.setTargetAtTime(freq * vib, t, 0.03);
+      aOscGain.gain.setTargetAtTime(g * 0.55, t, 0.05);
+      aBp.frequency.setTargetAtTime(freq * 1.8, t, 0.05);
+      aNoiseGain.gain.setTargetAtTime(g * 0.5, t, 0.05);
+    } catch (e) { /* audio is the instrument's voice; visuals carry on */ }
+  }
+
+  // ------------------------------------------------------------------
+  // Interaction. DRAG tilts the vessel: the drag vector maps to a
+  // tilt angle (horizontal dominant), clamped to about +/-35 degrees,
+  // pivoting at the base. Release and the vessel settles home.
+  // ------------------------------------------------------------------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var lastElapsed = 0;
+
+  function evtPos(e) {
+    var x = 0, y = 0;
+    if (e) {
+      if (typeof e.clientX === 'number') { x = e.clientX; y = e.clientY; }
+      else if (e.touches && e.touches[0]) { x = e.touches[0].clientX; y = e.touches[0].clientY; }
+      if (canvas.getBoundingClientRect) {
+        var rect = canvas.getBoundingClientRect();
+        x -= rect.left; y -= rect.top;
+      }
+    }
+    return { x: x, y: y };
+  }
+
+  function onDown(e) {
+    ensureAudio(); // the one place audio may be born: inside the gesture
+    var p = evtPos(e);
+    events.push({ t: lastElapsed, type: 'down', x: p.x, y: p.y });
+  }
+  function onMove(e) {
+    var p = evtPos(e);
+    events.push({ t: lastElapsed, type: 'move', x: p.x, y: p.y });
+  }
+  function onUp() {
+    events.push({ t: lastElapsed, type: 'up', x: 0, y: 0 });
+  }
+
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('touchstart', function (e) { if (!window.PointerEvent) onDown(e); }, { passive: true });
+    canvas.addEventListener('touchmove', function (e) { if (!window.PointerEvent) onMove(e); }, { passive: true });
+    canvas.addEventListener('touchend', function (e) { if (!window.PointerEvent) onUp(); }, { passive: true });
+  }
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
+  }
+
+  // ------------------------------------------------------------------
+  // Layout and drawing. Local vessel space: y up, origin at the base
+  // pivot. The canvas transform is translate(pivot), rotate(tilt),
+  // scale(s, -s); localToWorld mirrors that math for the mist.
+  // ------------------------------------------------------------------
+  var layout = { W: 0, H: 0, scale: 1, px: 0, py: 0, isPhone: false };
+
+  function localToWorld(x, y) {
+    var s = layout.scale;
+    var X = s * x, Y = -s * y;
+    var c = Math.cos(state.tilt), sn = Math.sin(state.tilt);
+    return { x: layout.px + X * c - Y * sn, y: layout.py + X * sn + Y * c };
+  }
+
+  // Body profile: right-half [halfWidth, y] points, base to shoulder.
+  var PROFILE = [
+    [0.320, 0.000], [0.345, 0.030], [0.420, 0.085], [0.490, 0.200],
+    [0.520, 0.340], [0.505, 0.480], [0.455, 0.610], [0.380, 0.720],
+    [0.290, 0.800], [0.205, 0.845]
+  ];
+
+  function smoothThrough(pts) {
+    for (var i = 1; i < pts.length - 1; i++) {
+      var mx = (pts[i][0] + pts[i + 1][0]) / 2;
+      var my = (pts[i][1] + pts[i + 1][1]) / 2;
+      ctx.quadraticCurveTo(pts[i][0], pts[i][1], mx, my);
+    }
+    var last = pts[pts.length - 1];
+    ctx.lineTo(last[0], last[1]);
+  }
+
+  function traceBody() {
+    ctx.beginPath();
+    ctx.moveTo(-PROFILE[0][0], 0);
+    ctx.lineTo(PROFILE[0][0], 0);
+    smoothThrough(PROFILE);
+    // Shoulder saddle between the riser bases.
+    ctx.quadraticCurveTo(0, 0.795, -PROFILE[PROFILE.length - 1][0], PROFILE[PROFILE.length - 1][1]);
+    var left = [];
+    for (var i = PROFILE.length - 1; i >= 0; i--) left.push([-PROFILE[i][0], PROFILE[i][1]]);
+    smoothThrough(left);
+    ctx.closePath();
+  }
+
+  function traceStirrup() {
+    ctx.beginPath();
+    ctx.moveTo(-0.245, 0.78);
+    ctx.lineTo(-0.245, 1.155);
+    ctx.quadraticCurveTo(-0.245, 1.225, -0.175, 1.225);
+    ctx.lineTo(0.175, 1.225);
+    ctx.quadraticCurveTo(0.245, 1.225, 0.245, 1.155);
+    ctx.lineTo(0.245, 0.78);
+    ctx.lineTo(0.135, 0.78);
+    ctx.lineTo(0.135, 1.13);
+    ctx.lineTo(-0.135, 1.13);
+    ctx.lineTo(-0.135, 0.78);
+    ctx.closePath();
+  }
+
+  function drawBands() {
+    // Engobe bands, clipped to the body: cream bands carrying clay
+    // motifs. Band A: rising triangles. Band B: vertical ticks.
+    // Band C: diamonds. Plus a thin cream foot line.
+    ctx.fillStyle = ENGOBE;
+    ctx.fillRect(-0.55, 0.615, 1.10, 0.090);
+    ctx.fillRect(-0.55, 0.405, 1.10, 0.090);
+    ctx.fillRect(-0.55, 0.155, 1.10, 0.080);
+    ctx.fillRect(-0.55, 0.042, 1.10, 0.012);
+    ctx.fillStyle = CLAY;
+    var x, i;
+    for (x = -0.512, i = 0; x < 0.50; x += 0.0625, i++) {
+      ctx.beginPath();
+      ctx.moveTo(x, 0.622);
+      ctx.lineTo(x + 0.045, 0.622);
+      ctx.lineTo(x + 0.0225, 0.698);
+      ctx.closePath();
+      ctx.fill();
+    }
+    for (x = -0.512; x < 0.50; x += 0.05) ctx.fillRect(x, 0.405, 0.016, 0.090);
+    for (x = -0.50; x < 0.52; x += 0.07) {
+      ctx.beginPath();
+      ctx.moveTo(x, 0.170);
+      ctx.lineTo(x + 0.017, 0.195);
+      ctx.lineTo(x, 0.220);
+      ctx.lineTo(x - 0.017, 0.195);
+      ctx.closePath();
+      ctx.fill();
+    }
+  }
+
+  function drawGauge(x0, level) {
+    // One cutaway window: dark interior, water below the level line,
+    // a cream meniscus tick at the surface.
+    var x1 = x0 + 0.120, y0 = 0.100, y1 = 0.600;
+    ctx.beginPath();
+    ctx.rect(x0, y0, x1 - x0, y1 - y0);
+    ctx.fillStyle = GROUND;
+    ctx.fill();
+    var wy = y0 + 0.012 + level * ((y1 - y0) - 0.024);
+    ctx.beginPath();
+    ctx.rect(x0 + 0.010, y0 + 0.012, (x1 - x0) - 0.020, wy - (y0 + 0.012));
+    ctx.fillStyle = WATER;
+    ctx.fill();
+    ctx.strokeStyle = ENGOBE;
+    ctx.lineWidth = 0.013;
+    ctx.beginPath();
+    ctx.moveTo(x0 + 0.006, wy);
+    ctx.lineTo(x1 - 0.006, wy);
+    ctx.stroke();
+    ctx.lineWidth = 0.014;
+    ctx.beginPath();
+    ctx.rect(x0, y0, x1 - x0, y1 - y0);
+    ctx.stroke();
+  }
+
+  function drawVessel() {
+    ctx.save();
+    ctx.translate(layout.px, layout.py);
+    ctx.rotate(state.tilt);
+    ctx.scale(layout.scale, -layout.scale);
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+
+    // Body: clay fill, soft shade and burnish, engobe bands, outline.
+    traceBody();
+    ctx.fillStyle = CLAY;
+    ctx.fill();
+    ctx.save();
+    traceBody();
+    ctx.clip();
+    ctx.globalAlpha = 0.15;
+    ctx.fillStyle = GROUND;
+    ctx.beginPath();
+    ctx.ellipse(0.22, 0.16, 0.36, 0.30, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 0.07;
+    ctx.fillStyle = ENGOBE;
+    ctx.beginPath();
+    ctx.ellipse(-0.18, 0.56, 0.30, 0.42, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    drawBands();
+    ctx.restore();
+    traceBody();
+    ctx.strokeStyle = ENGOBE;
+    ctx.lineWidth = 0.016;
+    ctx.stroke();
+
+    // Stirrup: two risers and the bridge, one clay form, cream banding.
+    traceStirrup();
+    ctx.fillStyle = CLAY;
+    ctx.fill();
+    ctx.save();
+    traceStirrup();
+    ctx.clip();
+    ctx.fillStyle = ENGOBE;
+    ctx.fillRect(-0.245, 0.945, 0.110, 0.026);
+    ctx.fillRect(0.135, 0.945, 0.110, 0.026);
+    ctx.fillRect(-0.245, 1.168, 0.490, 0.020);
+    ctx.restore();
+    traceStirrup();
+    ctx.strokeStyle = ENGOBE;
+    ctx.lineWidth = 0.015;
+    ctx.stroke();
+
+    // Whistle horn at the right riser's top, mouth facing upper right.
+    ctx.strokeStyle = ENGOBE;
+    ctx.lineWidth = 0.096;
+    ctx.beginPath();
+    ctx.moveTo(0.245, 1.10);
+    ctx.lineTo(0.335, 1.20);
+    ctx.stroke();
+    ctx.strokeStyle = CLAY;
+    ctx.lineWidth = 0.072;
+    ctx.beginPath();
+    ctx.moveTo(0.245, 1.10);
+    ctx.lineTo(0.335, 1.20);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.ellipse(MOUTH.x, MOUTH.y, 0.056, 0.033, -0.68, 0, Math.PI * 2);
+    ctx.fillStyle = GROUND;
+    ctx.fill();
+    ctx.strokeStyle = ENGOBE;
+    ctx.lineWidth = 0.013;
+    ctx.stroke();
+
+    // Cutaway gauges: left window reads chamber A, right reads B, so
+    // the pour itself is legible in the body.
+    drawGauge(-0.365, state.levelA);
+    drawGauge(0.245, state.levelB);
+
+    ctx.restore();
+  }
+
+  function drawMist() {
+    for (var i = 0; i < mists.length; i++) {
+      var p = mists[i];
+      if (p.age < 0) continue;
+      var u = p.age / p.life;
+      var fade = (1 - u) * clamp(u / 0.15, 0, 1);
+      ctx.fillStyle = MIST;
+      ctx.globalAlpha = 0.05 * fade;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r * 1.9, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = 0.09 * fade;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r * 1.35, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = 0.14 * fade;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function draw() {
+    canvas.style.width = layout.W + 'px';
+    canvas.style.height = layout.H + 'px';
+    ctx.fillStyle = GROUND;
+    ctx.fillRect(0, 0, layout.W, layout.H);
+    // A damp patch and a faint ground line under the vessel.
+    ctx.globalAlpha = 0.05;
+    ctx.fillStyle = WATER;
+    ctx.beginPath();
+    ctx.ellipse(layout.px, layout.py + layout.scale * 0.012, layout.scale * 0.78, layout.scale * 0.035, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 0.14;
+    ctx.strokeStyle = ENGOBE;
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.moveTo(layout.px - layout.scale * 0.95, layout.py + layout.scale * 0.012);
+    ctx.lineTo(layout.px + layout.scale * 0.95, layout.py + layout.scale * 0.012);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    drawVessel();
+    drawMist();
+  }
+
+  function resize() {
+    var vv = window.visualViewport;
+    layout.W = vv ? vv.width : window.innerWidth;
+    layout.H = vv ? vv.height : window.innerHeight;
+    canvas.width = layout.W;
+    canvas.height = layout.H;
+    canvas.style.width = layout.W + 'px';
+    canvas.style.height = layout.H + 'px';
+    if (window.screen) {
+      layout.isPhone = Math.min(window.screen.width, window.screen.height) < 700;
+    } else {
+      layout.isPhone = layout.H > layout.W * 1.15;
+    }
+    var S = Math.min(layout.W, layout.H);
+    var bodyW = layout.isPhone ? layout.W * 0.82 : Math.min(S * 0.60, layout.W * 0.5);
+    layout.scale = bodyW / 1.04;
+    layout.px = layout.W * 0.5;
+    layout.py = layout.H * 0.86;
+    draw();
+  }
+
+  resize();
+  if (FORCE_T > 0) advanceSim(FORCE_T);
+  draw();
+
+  if (typeof window.requestAnimationFrame === 'function') {
+    var t0 = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+    var raf = function () {
+      var now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : t0;
+      var elapsed = FORCE_T >= 0 ? FORCE_T : (now - t0) / 1000;
+      lastElapsed = elapsed;
+      advanceSim(elapsed);
+      draw();
+      updateAudio();
+      window.requestAnimationFrame(raf);
+    };
+    window.requestAnimationFrame(raf);
+  }
+
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', resize);
+  }
+  if (window.addEventListener) window.addEventListener('resize', resize);
+})();
+</script>
+</body>
+</html>

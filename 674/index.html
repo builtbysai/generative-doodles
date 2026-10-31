@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Cáusticas</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #0C161D; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // Palette (strict): deep water, bell clay, burnish highlight,
+  // caustic light, shadow. Nothing else.
+  var WATER = '#0C161D';
+  var CLAY = '#A4552F';
+  var BURNISH = '#C97B4A';
+  var CAUSTIC = '#F5E9C8';
+  var SHADOW = '#241A12';
+
+  var BASE_SEED = 674001;
+  var LOOP_S = 30;          // seamless caustic loop, seconds
+  var FORCE_T = -1;         // QA hook: -1 = live clock, else fixed elapsed seconds
+  var FORCE_AGIT = false;   // QA hook: pin agitation high to verify the disturbed state
+
+  // QA seed hook: ?seed=tNN pins the elapsed time (used by the headless
+  // renderer); &ag=1 additionally pins the water agitation high.
+  try {
+    if (typeof location !== 'undefined' && location.search) {
+      var qm = /[?&]seed=t([0-9]+(?:\.[0-9]+)?)/.exec(location.search);
+      if (qm) FORCE_T = parseFloat(qm[1]);
+      if (/[?&]ag=1/.test(location.search)) FORCE_AGIT = true;
+    }
+  } catch (e) { /* live mode */ }
+
+  // Seeded RNG (mulberry32). Used for caustic sample placement and
+  // ripple scheduling only; the frame itself is a pure function of time.
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+  function lerp(a, b, u) { return a + (b - a) * u; }
+
+  // ------------------------------------------------------------------
+  // The bell: a lathe profile in bell-local units. v runs 0 at the
+  // crown to 1 at the mouth rim; halfW is the profile half-width as a
+  // fraction of the bell height, so the mouth spans 1.32 bell heights.
+  // ------------------------------------------------------------------
+  var PROFILE = [
+    [0.00, 0.055], [0.04, 0.205], [0.10, 0.305], [0.20, 0.378],
+    [0.35, 0.428], [0.50, 0.462], [0.65, 0.492], [0.78, 0.528],
+    [0.88, 0.568], [0.95, 0.618], [1.00, 0.660]
+  ];
+
+  function halfW(v) {
+    if (v <= 0) return PROFILE[0][1];
+    for (var i = 1; i < PROFILE.length; i++) {
+      if (v <= PROFILE[i][0]) {
+        var u = (v - PROFILE[i - 1][0]) / (PROFILE[i][0] - PROFILE[i - 1][0]);
+        return lerp(PROFILE[i - 1][1], PROFILE[i][1], u);
+      }
+    }
+    return PROFILE[PROFILE.length - 1][1];
+  }
+
+  // Geometry, recomputed on resize. All in canvas pixels.
+  var G = null;
+  function computeGeometry() {
+    var waterY = H * 0.70;
+    var bellW = isPhone ? W * 0.92 : W * 0.60;
+    var maxBH = (waterY - H * 0.045) * 1.32;
+    if (bellW > maxBH) bellW = maxBH;
+    var BH = bellW / 1.32;
+    G = {
+      cx: W / 2,
+      top: waterY - BH,
+      waterY: waterY,
+      BH: BH,
+      bellW: bellW,
+      rimRX: 0.660 * BH,
+      rimRY: 0.070 * BH
+    };
+  }
+
+  function bellPath(scaleY, yBase) {
+    // Profile path. With (scaleY = 1, yBase = top) this is the bell
+    // itself; with a negative squash around the waterline it becomes
+    // the reflection.
+    var i, v, hw;
+    ctx.beginPath();
+    for (i = 0; i < PROFILE.length; i++) {
+      v = PROFILE[i][0]; hw = PROFILE[i][1] * G.BH;
+      var xr = G.cx + hw, yr = yBase + v * G.BH * scaleY;
+      if (i === 0) ctx.moveTo(xr, yr); else ctx.lineTo(xr, yr);
+    }
+    for (i = PROFILE.length - 1; i >= 0; i--) {
+      v = PROFILE[i][0]; hw = PROFILE[i][1] * G.BH;
+      ctx.lineTo(G.cx - hw, yBase + v * G.BH * scaleY);
+    }
+    ctx.closePath();
+  }
+
+  // ------------------------------------------------------------------
+  // Caustic samples: seeded points inside the bell silhouette, in
+  // bell-local units (gx across, gy down the profile). Each frame the
+  // interference field is evaluated at every sample; points sitting on
+  // a bright ridge of the field get a short pale stroke oriented along
+  // the ridge (perpendicular to the field gradient), plus a fainter
+  // echo stroke offset along the gradient. Broken, webby lines: the
+  // brightness comes from line density, never from blur or glow.
+  // ------------------------------------------------------------------
+  var SAMPLES = [];
+  (function buildSamples() {
+    var rng = mulberry32(BASE_SEED);
+    var tries = 0;
+    while (SAMPLES.length < 3600 && tries < 40000) {
+      tries++;
+      var gx = (rng() * 2 - 1) * 0.66;
+      var gy = Math.pow(rng(), 0.92);
+      if (Math.abs(gx) < halfW(gy) * 0.97) {
+        SAMPLES.push({ gx: gx, gy: gy, j: rng() * Math.PI * 2 });
+      }
+    }
+  })();
+
+  // The interference field: four drifting sine waves summed. All phase
+  // speeds are whole cycles per 30 s loop, so the calm state is
+  // seamless. A local agitation A raises the spatial frequency and
+  // injects a fast scatter phase, which is what tears the web apart
+  // where the water has been disturbed.
+  function field(x, y, loopT, t, A) {
+    var fm = 1 + 0.55 * A;
+    var ph1 = (loopT / LOOP_S) * Math.PI * 4;
+    var ph2 = (loopT / LOOP_S) * Math.PI * 6;
+    var ph3 = (loopT / LOOP_S) * Math.PI * 2;
+    var ph4 = (loopT / LOOP_S) * Math.PI * 8;
+    var scat = A * 1.9 * Math.sin(y * 6.3 + t * 2.6) + A * 1.4 * Math.sin(x * 5.1 - t * 2.1);
+    var X = x * fm + scat, Y = y * fm - scat * 0.7;
+    return Math.sin(X * 1.9 + ph1 + 1.3 * Math.sin(Y * 0.9 + ph2)) +
+           Math.sin(Y * 2.3 - ph2 + 1.1 * Math.sin(X * 0.8 - ph1)) +
+           Math.sin((X + Y) * 1.5 + ph3) +
+           Math.sin(Math.sqrt(X * X + Y * Y) * 2.6 - ph4);
+  }
+
+  // ------------------------------------------------------------------
+  // Agitation. The calm water breathes on the loop (whole cycles per
+  // 30 s, so it too is seamless). A drag throws samples into a list;
+  // each contributes a local, decaying bump of agitation for about
+  // five seconds around the dragged path. Frame one has no samples:
+  // the water is at its calm phase-0 breathing point, deterministically.
+  // ------------------------------------------------------------------
+  var drags = []; // {x, y, t} in canvas px and anchored elapsed seconds
+
+  function baseAgitation(loopT) {
+    return 0.34 + 0.17 * Math.sin((loopT / LOOP_S) * Math.PI * 2) +
+                  0.09 * Math.sin((loopT / LOOP_S) * Math.PI * 4 + 1.7);
+  }
+
+  function localAgitation(px, py, t) {
+    var a = 0;
+    for (var i = 0; i < drags.length; i++) {
+      var age = t - drags[i].t;
+      if (age < 0 || age > 6) continue;
+      var dx = px - drags[i].x, dy = py - drags[i].y;
+      var r = 0.30 * S;
+      a += Math.exp(-(age / 1.9)) * Math.exp(-(dx * dx + dy * dy) / (r * r));
+    }
+    return a;
+  }
+
+  function globalAgitation(loopT, t) {
+    var a = baseAgitation(loopT);
+    // The disturbance also lifts the whole surface a little, strongest
+    // near the most recent drag.
+    for (var i = 0; i < drags.length; i++) {
+      var age = t - drags[i].t;
+      if (age >= 0 && age < 6) a += 0.55 * Math.exp(-(age / 1.9));
+    }
+    if (FORCE_AGIT) a += 1.15;
+    return clamp(a, 0, 1.9);
+  }
+
+  // ------------------------------------------------------------------
+  // Interaction: drag only. Dragging through the water records the
+  // path; the draw step turns the recent path into agitation. No taps,
+  // no clicks, nothing reloads.
+  // ------------------------------------------------------------------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0, S = 0, isPhone = false;
+  var lastElapsed = 0;
+  var dragging = false;
+
+  function recordDrag(e) {
+    var x = 0, y = 0, got = false;
+    if (e) {
+      if (typeof e.clientX === 'number') { x = e.clientX; y = e.clientY; got = true; }
+      else if (e.touches && e.touches[0]) { x = e.touches[0].clientX; y = e.touches[0].clientY; got = true; }
+      else if (e.changedTouches && e.changedTouches[0]) { x = e.changedTouches[0].clientX; y = e.changedTouches[0].clientY; got = true; }
+      if (got && canvas.getBoundingClientRect) {
+        var rect = canvas.getBoundingClientRect();
+        x -= rect.left; y -= rect.top;
+      }
+    }
+    if (!got) return;
+    drags.push({ x: x, y: y, t: lastElapsed });
+    if (drags.length > 260) drags.splice(0, drags.length - 260);
+  }
+
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', function (e) { dragging = true; recordDrag(e); });
+    canvas.addEventListener('pointermove', function (e) { if (dragging) recordDrag(e); });
+    canvas.addEventListener('pointerup', function () { dragging = false; });
+    canvas.addEventListener('pointercancel', function () { dragging = false; });
+    canvas.addEventListener('touchstart', function (e) { if (!window.PointerEvent) { dragging = true; recordDrag(e); } }, { passive: true });
+    canvas.addEventListener('touchmove', function (e) { if (!window.PointerEvent && dragging) recordDrag(e); }, { passive: true });
+    canvas.addEventListener('touchend', function () { dragging = false; });
+  }
+
+  // ------------------------------------------------------------------
+  // Drawing.
+  // ------------------------------------------------------------------
+  function drawBellBody() {
+    // Matte clay with flat burnish steps: no gradients anywhere.
+    bellPath(1, G.top);
+    ctx.fillStyle = CLAY;
+    ctx.fill();
+    ctx.save();
+    bellPath(1, G.top);
+    ctx.clip();
+    ctx.fillStyle = BURNISH;
+    ctx.globalAlpha = 0.30;
+    ctx.fillRect(G.cx - G.rimRX, G.top + G.BH * 0.05, G.rimRX * 2, G.BH * 0.26);
+    ctx.fillStyle = SHADOW;
+    ctx.globalAlpha = 0.16;
+    ctx.fillRect(G.cx - G.rimRX, G.top + G.BH * 0.55, G.rimRX * 2, G.BH * 0.18);
+    ctx.globalAlpha = 0.32;
+    ctx.fillRect(G.cx - G.rimRX, G.top + G.BH * 0.86, G.rimRX * 2, G.BH * 0.14);
+    // A soft vertical shade on the right flank, still a flat step.
+    ctx.fillStyle = SHADOW;
+    ctx.globalAlpha = 0.13;
+    ctx.fillRect(G.cx + G.rimRX * 0.45, G.top, G.rimRX * 0.55, G.BH);
+    ctx.restore();
+    ctx.globalAlpha = 1;
+    // Contour.
+    bellPath(1, G.top);
+    ctx.strokeStyle = SHADOW;
+    ctx.globalAlpha = 0.55;
+    ctx.lineWidth = Math.max(1.4, S * 0.0022);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  function drawMouth() {
+    // The bell mouth breaking the waterline: a dark opening ellipse.
+    ctx.beginPath();
+    ctx.ellipse(G.cx, G.waterY, G.rimRX, G.rimRY, 0, 0, Math.PI * 2);
+    ctx.fillStyle = SHADOW;
+    ctx.globalAlpha = 0.88;
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.beginPath();
+    ctx.ellipse(G.cx, G.waterY, G.rimRX, G.rimRY, 0, 0, Math.PI * 2);
+    ctx.strokeStyle = BURNISH;
+    ctx.globalAlpha = 0.7;
+    ctx.lineWidth = Math.max(1.2, S * 0.002);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  function drawCaustics(loopT, t) {
+    var K = 5.8; // bell-local units to field units (isotropic: 1 gy unit = 1 gx unit = BH px)
+    var thr = 1.30;
+    ctx.strokeStyle = CAUSTIC;
+    ctx.lineCap = 'round';
+    for (var i = 0; i < SAMPLES.length; i++) {
+      var sm = SAMPLES[i];
+      var wx = G.cx + sm.gx * G.BH;
+      var wy = G.top + sm.gy * G.BH;
+      var A = baseAgitation(loopT) + localAgitation(wx, wy, t) + (FORCE_AGIT ? 1.15 : 0);
+      A = clamp(A, 0, 1.9);
+      var fx = sm.gx * K, fy = sm.gy * K;
+      var f0 = field(fx, fy, loopT, t, A);
+      var localThr = thr - 0.35 * A;
+      if (f0 < localThr) continue;
+      var u = clamp((f0 - localThr) / (4 - localThr), 0, 1);
+      // Gradient, for ridge direction and echo offset.
+      var e = 0.055;
+      var gx1 = field(fx + e, fy, loopT, t, A) - f0;
+      var gy1 = field(fx, fy + e, loopT, t, A) - f0;
+      var gl = Math.sqrt(gx1 * gx1 + gy1 * gy1);
+      if (gl < 0.0001) continue;
+      var dxn = gx1 / gl, dyn = gy1 / gl;      // gradient direction
+      var tx = -dyn, ty = dxn;                 // ridge direction
+      var len = (S * 0.0105 + S * 0.016 * u) * (1 + 0.25 * A);
+      var alpha = 0.15 + 0.63 * u;
+      ctx.globalAlpha = alpha;
+      ctx.lineWidth = Math.max(0.8, S * 0.0016 + S * 0.0012 * u);
+      ctx.beginPath();
+      ctx.moveTo(wx - tx * len / 2, wy - ty * len / 2);
+      ctx.lineTo(wx + tx * len / 2, wy + ty * len / 2);
+      ctx.stroke();
+      // Echo: a fainter twin offset along the gradient.
+      var eo = S * 0.0042;
+      ctx.globalAlpha = alpha * 0.42;
+      ctx.beginPath();
+      ctx.moveTo(wx + dxn * eo - tx * len * 0.4, wy + dyn * eo - ty * len * 0.4);
+      ctx.lineTo(wx + dxn * eo + tx * len * 0.4, wy + dyn * eo + ty * len * 0.4);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawReflection(loopT) {
+    var squash = 0.46;
+    // The reflected profile, built point by point: each bell point is
+    // mirrored across the waterline and squashed vertically.
+    ctx.save();
+    ctx.beginPath();
+    var i, v, hw;
+    for (i = 0; i < PROFILE.length; i++) {
+      v = PROFILE[i][0]; hw = PROFILE[i][1] * G.BH;
+      var yr = G.waterY + v * G.BH * squash;
+      if (i === 0) ctx.moveTo(G.cx + hw, yr); else ctx.lineTo(G.cx + hw, yr);
+    }
+    for (i = PROFILE.length - 1; i >= 0; i--) {
+      v = PROFILE[i][0]; hw = PROFILE[i][1] * G.BH;
+      ctx.lineTo(G.cx - hw, G.waterY + v * G.BH * squash);
+    }
+    ctx.closePath();
+    ctx.clip();
+    ctx.fillStyle = CLAY;
+    ctx.globalAlpha = 0.26;
+    ctx.fillRect(G.cx - G.rimRX, G.waterY, G.rimRX * 2, G.BH * squash);
+    // Horizontal jitter breaks: seeded dark slashes across the smear.
+    var rng = mulberry32(BASE_SEED + 77);
+    ctx.strokeStyle = WATER;
+    for (var k = 0; k < 46; k++) {
+      var yy = G.waterY + rng() * G.BH * squash;
+      var xx = G.cx - G.rimRX + rng() * G.rimRX * 1.4;
+      var ww = G.rimRX * (0.25 + rng() * 0.65);
+      ctx.globalAlpha = 0.25 + rng() * 0.4;
+      ctx.lineWidth = 1 + rng() * (S * 0.004);
+      ctx.beginPath();
+      ctx.moveTo(xx, yy);
+      ctx.lineTo(xx + ww, yy + (rng() - 0.5) * 2);
+      ctx.stroke();
+    }
+    // A few drowned caustic ticks inside the reflection.
+    ctx.strokeStyle = CAUSTIC;
+    var rng2 = mulberry32(BASE_SEED + 131);
+    for (var m = 0; m < 60; m++) {
+      var px = G.cx + (rng2() * 2 - 1) * G.rimRX * 0.9;
+      var py = G.waterY + 4 + rng2() * G.BH * squash * 0.8;
+      var ph = 0.5 + 0.5 * Math.sin((loopT / LOOP_S) * Math.PI * 4 + rng2() * 6.28);
+      ctx.globalAlpha = 0.05 + 0.09 * ph;
+      ctx.lineWidth = Math.max(0.8, S * 0.0014);
+      var ln = S * (0.008 + rng2() * 0.014);
+      ctx.beginPath();
+      ctx.moveTo(px - ln / 2, py);
+      ctx.lineTo(px + ln / 2, py);
+      ctx.stroke();
+    }
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
+  function waterYAt(x, loopT, t) {
+    var A = globalAgitation(loopT, t);
+    var amp = S * 0.0016 + S * 0.006 * A;
+    return G.waterY +
+      Math.sin(x * 0.016 + (loopT / LOOP_S) * Math.PI * 4) * amp +
+      Math.sin(x * 0.041 - (loopT / LOOP_S) * Math.PI * 6 + 1.3) * amp * 0.55;
+  }
+
+  function drawWaterline(loopT, t) {
+    ctx.strokeStyle = CAUSTIC;
+    ctx.lineCap = 'round';
+    var step = Math.max(9, S * 0.016);
+    for (var x = -step; x < W + step; x += step) {
+      var y0 = waterYAt(x, loopT, t);
+      var y1 = waterYAt(x + step * 0.62, loopT, t);
+      // Brighter where the line crosses the bell rim.
+      var nearBell = Math.abs(x + step * 0.3 - G.cx) < G.rimRX * 1.06;
+      ctx.globalAlpha = nearBell ? 0.62 : 0.30;
+      ctx.lineWidth = Math.max(1, S * (nearBell ? 0.0022 : 0.0016));
+      ctx.beginPath();
+      ctx.moveTo(x, y0);
+      ctx.lineTo(x + step * 0.62, y1);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // Occasional ripples radiating from the bell's waterline contact
+  // points. Spawn times are seeded and periodic in the loop.
+  var RIPPLES = [];
+  (function buildRipples() {
+    var rng = mulberry32(BASE_SEED + 913);
+    for (var k = 0; k < 7; k++) {
+      RIPPLES.push({
+        at: rng() * LOOP_S,
+        side: k % 3, // 0 left rim, 1 right rim, 2 mouth center
+        life: 2.4 + rng() * 0.9
+      });
+    }
+  })();
+
+  function drawRipples(loopT, t) {
+    var A = globalAgitation(loopT, t);
+    ctx.strokeStyle = CAUSTIC;
+    for (var i = 0; i < RIPPLES.length; i++) {
+      var rp = RIPPLES[i];
+      var age = (loopT - rp.at + LOOP_S) % LOOP_S;
+      if (age > rp.life) continue;
+      var u = age / rp.life;
+      var cxp = rp.side === 0 ? G.cx - G.rimRX : (rp.side === 1 ? G.cx + G.rimRX : G.cx);
+      var rx = (6 + age * S * 0.052) * (0.8 + 0.45 * A);
+      ctx.globalAlpha = 0.34 * (1 - u) * (0.65 + 0.5 * A);
+      ctx.lineWidth = Math.max(0.9, S * 0.0016);
+      ctx.beginPath();
+      ctx.ellipse(cxp, G.waterY + 1, rx, rx * 0.16, 0, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function draw(elapsed) {
+    lastElapsed = elapsed;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    var loopT = ((elapsed % LOOP_S) + LOOP_S) % LOOP_S;
+    // Prune stale drag samples.
+    for (var i = drags.length - 1; i >= 0; i--) {
+      if (elapsed - drags[i].t > 6.5) drags.splice(i, 1);
+    }
+    ctx.fillStyle = WATER;
+    ctx.fillRect(0, 0, W, H);
+    drawReflection(loopT);
+    drawBellBody();
+    drawCaustics(loopT, elapsed);
+    drawMouth();
+    drawWaterline(loopT, elapsed);
+    drawRipples(loopT, elapsed);
+  }
+
+  function resize() {
+    var vv = window.visualViewport;
+    W = vv ? vv.width : window.innerWidth;
+    H = vv ? vv.height : window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    S = Math.min(W, H);
+    if (window.screen) {
+      isPhone = Math.min(window.screen.width, window.screen.height) < 700;
+    } else {
+      isPhone = H > W * 1.15;
+    }
+    computeGeometry();
+    draw(lastElapsed);
+  }
+
+  resize();
+  draw(FORCE_T >= 0 ? FORCE_T : 0);
+
+  if (typeof window.requestAnimationFrame === 'function') {
+    var t0 = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+    var raf = function () {
+      var now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : t0;
+      draw(FORCE_T >= 0 ? FORCE_T : (now - t0) / 1000);
+      window.requestAnimationFrame(raf);
+    };
+    window.requestAnimationFrame(raf);
+  }
+
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', resize);
+  }
+  if (window.addEventListener) window.addEventListener('resize', resize);
+})();
+</script>
+</body>
+</html>

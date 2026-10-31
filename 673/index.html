@@ -1,0 +1,634 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Diez Campanas</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0E1B22; height: 100%; overflow: hidden; }
+  canvas { display: block; touch-action: none; cursor: grab; }
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- palette (strict) ----------
+  var WATER   = '#0E1B22'; // night water, page ground
+  var CLAY    = '#A4552F'; // bell clay
+  var SHADOW  = '#5E2F1B'; // bell shadow, mouth dark
+  var STONE   = '#8A8378'; // river stones
+  var CAUSTIC = '#F5E9C8'; // caustic light
+  var TEXT    = '#E4D3B8'; // engobe line, mountain names
+
+  // ---------- seeded RNG ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('cv');
+  var ctx = canvas.getContext('2d');
+  var W = 300, H = 300, DPR = 1, isPhone = false;
+
+  function computeSize() {
+    var vw = (window.visualViewport && window.visualViewport.width) || window.innerWidth || 300;
+    var vh = (window.visualViewport && window.visualViewport.height) || window.innerHeight || 300;
+    W = vw; H = vh;
+    DPR = window.devicePixelRatio || 1;
+    if (window.screen && window.screen.width) {
+      isPhone = Math.min(window.screen.width, window.screen.height) < 700;
+    } else {
+      isPhone = H > W * 1.15;
+    }
+  }
+  function resize() {
+    computeSize();
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    layout();
+    draw(state.t);
+  }
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', resize);
+  }
+  window.addEventListener('resize', resize);
+
+  // ---------- the ten bells ----------
+  var NAMES = ['Manquehue', 'El Plomo', 'San Jose', 'Tupungato', 'Castillo',
+               'Marmolejo', 'Planchon', 'Descabezado', 'San Fernando', 'Altomaipo'];
+  // lathe profile: [depth fraction, half-width fraction] crown to mouth
+  var PROFILE = [
+    [0.00, 0.14], [0.05, 0.26], [0.12, 0.38], [0.24, 0.465], [0.42, 0.52],
+    [0.62, 0.545], [0.80, 0.60], [0.90, 0.72], [0.965, 0.86], [1.00, 0.97]
+  ];
+
+  var bells = [];
+  (function buildBells() {
+    var rng = mulberry32(673101);
+    for (var i = 0; i < 10; i++) {
+      var scale = 0.86 + rng() * 0.20;
+      if (i === 1) scale = 1.24;        // El Plomo, the big one
+      if (i === 3) scale = 1.13;        // Tupungato
+      var flecks = [];
+      for (var f = 0; f < 7; f++) {
+        flecks.push({
+          u: -0.68 + rng() * 1.36,
+          v: 0.16 + rng() * 0.78,
+          len: 3 + rng() * 7,
+          ph: rng() * Math.PI * 2
+        });
+      }
+      bells.push({
+        name: NAMES[i],
+        scale: scale,
+        mouthF: 0.44 + rng() * 0.12,    // rest mouth height, fraction of H (desktop row)
+        phase: rng() * Math.PI * 2,
+        baseFreq: Math.max(105, Math.min(212, 208 - (scale - 0.8) * 165)),
+        flecks: flecks,
+        // dynamic state
+        s: 0, vs: 0, prevS: 0, cool: -1, hitDepth: 0.4,
+        // layout (px, filled by layout())
+        cx: 0, topY: 0, bw: 0, bh: 0, halfW: 0, mouthY: 0, descent: 0, sWater: 0.5
+      });
+    }
+  })();
+
+  // ---------- pool caustic flecks (seeded, drift with the current) ----------
+  var flecks = [];
+  (function buildFlecks() {
+    var rng = mulberry32(673202);
+    for (var i = 0; i < 46; i++) {
+      flecks.push({
+        x: rng(), y: 0.03 + rng() * 0.93,
+        len: 5 + rng() * 12,
+        sp: 0.004 + rng() * 0.011,
+        a: 0.05 + rng() * 0.11,
+        ph: rng() * Math.PI * 2
+      });
+    }
+  })();
+
+  // ---------- river stones (the only controllers) ----------
+  var stones = [];
+  (function buildStones() {
+    var rng = mulberry32(673303);
+    for (var i = 0; i < 6; i++) {
+      stones.push({
+        fx: (i + 0.5) / 6 + (rng() - 0.5) * 0.05,
+        rxF: 0.020 + rng() * 0.012,
+        ryF: 0.55 + rng() * 0.2,        // ry as fraction of rx
+        tilt: (rng() - 0.5) * 0.3,
+        // dynamic state (px)
+        x: 0, y: 0, tx: 0, ty: 0, vx: 0, vy: 0,
+        grabbed: false, falling: false, home: true
+      });
+    }
+  })();
+
+  // ---------- state ----------
+  var state = {
+    t: 0,
+    simT: 0,
+    events: [],
+    dragStone: -1,
+    grabDX: 0,
+    grabDY: 0,
+    ripples: []
+  };
+
+  function poolY() { return H * (isPhone ? 0.70 : 0.667); }
+
+  // one anchored clock for the loop, the physics and every recorded event
+  var startStamp = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+
+  // ---------- layout ----------
+  function layout() {
+    var py = poolY();
+    var i, b, s;
+    if (isPhone) {
+      // two rows of five: the single row gets cramped at phone width
+      for (i = 0; i < 10; i++) {
+        b = bells[i];
+        var row = i < 5 ? 0 : 1;
+        var col = i % 5;
+        var slotW = W / 5;
+        b.bw = slotW * 0.80 * b.scale;
+        b.bh = b.bw * 1.42;
+        b.halfW = b.bw / 2;
+        b.cx = (col + 0.5) * slotW;
+        var mouthRest = H * (row === 0 ? 0.295 : 0.545) + (b.mouthF - 0.5) * H * 0.03;
+        b.topY = mouthRest - b.bh;
+        b.mouthY = mouthRest;
+        b.descent = (py + H * 0.055) - mouthRest;
+        b.sWater = (py - mouthRest) / b.descent;
+      }
+    } else {
+      var slotW2 = W / 10;
+      for (i = 0; i < 10; i++) {
+        b = bells[i];
+        b.bw = slotW2 * 0.74 * b.scale;
+        b.bh = b.bw * 1.42;
+        b.halfW = b.bw / 2;
+        b.cx = (i + 0.5) * slotW2;
+        var mouthRest2 = b.mouthF * H;
+        b.topY = mouthRest2 - b.bh;
+        b.mouthY = mouthRest2;
+        b.descent = (py + H * 0.06) - mouthRest2;
+        b.sWater = (py - mouthRest2) / b.descent;
+      }
+    }
+    var bankY = H - 10;
+    for (i = 0; i < stones.length; i++) {
+      s = stones[i];
+      s.rx = Math.max(11, s.rxF * W * (isPhone ? 1.5 : 1));
+      s.ry = s.rx * s.ryF;
+      s.bankY = bankY - s.ry;
+      if (s.home) { s.x = s.fx * W; s.y = s.bankY; s.tx = s.x; s.ty = s.y; }
+      s.y = Math.min(s.y, s.bankY);
+    }
+  }
+
+  // ---------- audio: lazy, guarded, only ever from the pointer path ----------
+  var AC = null, master = null, noiseBuf = null;
+  function ensureAudio() {
+    if (AC) {
+      if (AC.state === 'suspended' && AC.resume) AC.resume();
+      return;
+    }
+    try {
+      var Ctor = null;
+      if (typeof window !== 'undefined') Ctor = window.AudioContext || window.webkitAudioContext;
+      if (!Ctor) return;
+      AC = new Ctor();
+      master = AC.createGain();
+      master.gain.value = 0.5;
+      master.connect(AC.destination);
+      var len = Math.floor(AC.sampleRate * 0.12);
+      noiseBuf = AC.createBuffer(1, len, AC.sampleRate);
+      var d = noiseBuf.getChannelData(0);
+      var rng = mulberry32(673404);
+      for (var i = 0; i < len; i++) d[i] = rng() * 2 - 1;
+    } catch (e) {
+      AC = null; master = null;
+    }
+  }
+
+  // Submersion tone model: at water entry the bell sounds with the depth the
+  // strike is carrying (hitDepth, set from the stone's speed at contact).
+  // Deeper means lower and fuller: frequency falls by up to 35 percent, the
+  // lowpass closes down, the decay lengthens, and a short wet noise attack
+  // marks the mouth breaking the surface.
+  function playTone(bell, depth) {
+    if (!AC || !master) return;
+    try {
+      var t0 = AC.currentTime;
+      var f = bell.baseFreq * (1 - 0.35 * depth);
+      var lp = AC.createBiquadFilter();
+      lp.type = 'lowpass';
+      lp.frequency.value = 2800 - 1800 * depth;
+      lp.Q.value = 0.4;
+      lp.connect(master);
+      var partials = [1, 2.02, 2.74, 3.76];
+      var gains = [0.55, 0.26, 0.15, 0.07];
+      for (var i = 0; i < partials.length; i++) {
+        var o = AC.createOscillator();
+        o.type = 'sine';
+        o.frequency.value = f * partials[i] * (i === 0 ? 1 : 1.003);
+        var g = AC.createGain();
+        var peak = gains[i] * (0.5 + 0.6 * depth);
+        var dur = (2.0 + 2.4 * depth) / (1 + i * 0.55);
+        g.gain.setValueAtTime(0.0001, t0);
+        g.gain.linearRampToValueAtTime(peak, t0 + 0.005);
+        g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+        o.connect(g); g.connect(lp);
+        o.start(t0); o.stop(t0 + dur + 0.1);
+      }
+      // wet percussive attack at water entry
+      if (noiseBuf) {
+        var src = AC.createBufferSource();
+        src.buffer = noiseBuf;
+        var bp = AC.createBiquadFilter();
+        bp.type = 'bandpass';
+        bp.frequency.value = 850 + 650 * depth;
+        bp.Q.value = 0.9;
+        var ng = AC.createGain();
+        ng.gain.setValueAtTime(0.22 * (0.4 + 0.6 * depth), t0);
+        ng.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.09);
+        src.connect(bp); bp.connect(ng); ng.connect(master);
+        src.start(t0); src.stop(t0 + 0.12);
+      }
+    } catch (e) { /* audio is garnish; never let it break the piece */ }
+  }
+
+  // ---------- simulation: fixed-step, events consumed in time order ----------
+  var STEP = 1 / 240;
+
+  function applyEvent(ev) {
+    var i, s;
+    if (ev.type === 'down') {
+      for (i = stones.length - 1; i >= 0; i--) {
+        s = stones[i];
+        var dx = (ev.x - s.x) / (s.rx * 1.35), dy = (ev.y - s.y) / (s.ry * 1.9);
+        if (dx * dx + dy * dy <= 1) {
+          state.dragStone = i;
+          state.grabDX = s.x - ev.x;
+          state.grabDY = s.y - ev.y;
+          s.grabbed = true; s.falling = false; s.home = false;
+          s.tx = s.x; s.ty = s.y; s.vx = 0; s.vy = 0;
+          return;
+        }
+      }
+    } else if (ev.type === 'move') {
+      if (state.dragStone >= 0) {
+        s = stones[state.dragStone];
+        s.tx = ev.x + state.grabDX;
+        s.ty = ev.y + state.grabDY;
+        s.vx = ev.vx; s.vy = ev.vy;
+      }
+    } else if (ev.type === 'up') {
+      if (state.dragStone >= 0) {
+        s = stones[state.dragStone];
+        s.grabbed = false;
+        s.falling = true;
+        s.vy = Math.max(-60, Math.min(240, ev.vy || 0));
+        s.vx = 0;
+        state.dragStone = -1;
+      }
+    }
+  }
+
+  function stepSim(dt) {
+    var now = state.simT;
+    // consume due pointer events in the order they were recorded
+    while (state.events.length && state.events[0].t <= now + dt) {
+      applyEvent(state.events.shift());
+    }
+    var i, b, s;
+    // stones
+    for (i = 0; i < stones.length; i++) {
+      s = stones[i];
+      if (s.grabbed) {
+        s.x = s.tx; s.y = s.ty;
+        // contact: the stone is the mallet; striking a bell mouth drives it down
+        for (var j = 0; j < bells.length; j++) {
+          b = bells[j];
+          var my = b.mouthY + b.s * b.descent;
+          var ddx = (s.x - b.cx) / (b.halfW + s.rx * 0.4);
+          var ddy = (s.y - my) / (b.bh * 0.24 + s.ry);
+          if (ddx * ddx + ddy * ddy < 1 && now > b.cool) {
+            var speed = Math.sqrt(s.vx * s.vx + s.vy * s.vy);
+            b.vs += 2.6 + Math.min(1.8, speed / 1100);
+            b.hitDepth = Math.max(0.25, Math.min(1, 0.25 + speed / 1700));
+            b.cool = now + 0.4;
+          }
+        }
+      } else if (s.falling) {
+        s.vy += 2600 * dt;
+        s.y += s.vy * dt;
+        if (s.y >= s.bankY) { s.y = s.bankY; s.vy = 0; s.falling = false; }
+        s.x = Math.max(s.rx, Math.min(W - s.rx, s.x));
+      }
+    }
+    // bells: damped spring back to rest; water entry sounds
+    for (i = 0; i < bells.length; i++) {
+      b = bells[i];
+      b.prevS = b.s;
+      b.vs += (-11 * b.s - 1.5 * b.vs) * dt;
+      b.s += b.vs * dt;
+      if (b.s < 0) { b.s = 0; if (b.vs < 0) b.vs *= -0.3; }
+      if (b.s > 1.05) { b.s = 1.05; if (b.vs > 0) b.vs *= -0.3; }
+      if (b.prevS < b.sWater && b.s >= b.sWater && b.vs > 0) {
+        state.ripples.push({ x: b.cx, t0: now, str: b.hitDepth });
+        playTone(b, b.hitDepth);
+      } else if (b.prevS >= b.sWater && b.s < b.sWater) {
+        state.ripples.push({ x: b.cx, t0: now, str: b.hitDepth * 0.45 });
+      }
+    }
+    // prune old ripples
+    while (state.ripples.length && now - state.ripples[0].t0 > 2.6) state.ripples.shift();
+    state.simT = now + dt;
+  }
+
+  function advanceTo(t) {
+    var guard = 0;
+    while (state.simT < t - 1e-9 && guard < 4000) {
+      stepSim(Math.min(STEP, t - state.simT));
+      guard++;
+    }
+    state.t = state.simT;
+  }
+
+  // ---------- drawing ----------
+  function bellPath(b, dy, rot) {
+    ctx.save();
+    ctx.translate(b.cx, b.topY + dy);
+    ctx.rotate(rot);
+    ctx.translate(-b.cx, -(b.topY + dy));
+    ctx.beginPath();
+    var top = b.topY + dy, hw = b.halfW, i, px, py2;
+    ctx.moveTo(b.cx - PROFILE[0][1] * hw, top);
+    // right side, smoothed through profile points
+    var pts = [];
+    for (i = 0; i < PROFILE.length; i++) pts.push([b.cx + PROFILE[i][1] * hw, top + PROFILE[i][0] * b.bh]);
+    ctx.lineTo(pts[0][0], pts[0][1]);
+    for (i = 1; i < pts.length - 1; i++) {
+      px = (pts[i][0] + pts[i + 1][0]) / 2;
+      py2 = (pts[i][1] + pts[i + 1][1]) / 2;
+      ctx.quadraticCurveTo(pts[i][0], pts[i][1], px, py2);
+    }
+    ctx.lineTo(pts[pts.length - 1][0], pts[pts.length - 1][1]);
+    // mouth rim: a shallow downward arc from right rim to left rim
+    ctx.quadraticCurveTo(b.cx, top + b.bh + b.bh * 0.07, b.cx - PROFILE[PROFILE.length - 1][1] * hw, top + b.bh);
+    // left side, back up
+    var lpts = [];
+    for (i = PROFILE.length - 1; i >= 0; i--) lpts.push([b.cx - PROFILE[i][1] * hw, top + PROFILE[i][0] * b.bh]);
+    ctx.lineTo(lpts[0][0], lpts[0][1]);
+    for (i = 1; i < lpts.length - 1; i++) {
+      px = (lpts[i][0] + lpts[i + 1][0]) / 2;
+      py2 = (lpts[i][1] + lpts[i + 1][1]) / 2;
+      ctx.quadraticCurveTo(lpts[i][0], lpts[i][1], px, py2);
+    }
+    ctx.lineTo(lpts[lpts.length - 1][0], lpts[lpts.length - 1][1]);
+    ctx.closePath();
+  }
+
+  function drawCord(b) {
+    ctx.strokeStyle = SHADOW;
+    ctx.globalAlpha = 0.65;
+    ctx.lineWidth = Math.max(1.2, b.bw * 0.02);
+    ctx.beginPath();
+    ctx.moveTo(b.cx, 0);
+    ctx.lineTo(b.cx, b.topY + b.s * b.descent + 2);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  function drawBell(b, t) {
+    var dy = b.s * b.descent;
+    var rot = 0.010 * Math.sin(t * 0.45 + b.phase);
+    var top = b.topY + dy;
+    // body
+    bellPath(b, dy, rot);
+    ctx.fillStyle = CLAY;
+    ctx.fill();
+    // shadow side and mouth-end shading, clipped to the body
+    ctx.save();
+    ctx.clip();
+    ctx.fillStyle = SHADOW;
+    ctx.globalAlpha = 0.42;
+    ctx.fillRect(b.cx + b.halfW * 0.10, top, b.halfW * 0.95, b.bh * 1.05);
+    ctx.globalAlpha = 0.22;
+    ctx.fillRect(b.cx + b.halfW * 0.48, top, b.halfW * 0.6, b.bh * 1.05);
+    ctx.globalAlpha = 0.20;
+    ctx.fillRect(b.cx - b.halfW, top + b.bh * 0.86, b.bw, b.bh * 0.2);
+    ctx.globalAlpha = 1;
+    // engobe banding lines
+    ctx.strokeStyle = TEXT;
+    ctx.lineWidth = Math.max(1, b.bw * 0.016);
+    var bands = [0.34, 0.52, 0.70];
+    for (var i = 0; i < bands.length; i++) {
+      var by = top + bands[i] * b.bh;
+      ctx.globalAlpha = i === 2 ? 0.34 : 0.5;
+      ctx.beginPath();
+      ctx.moveTo(b.cx - b.halfW * 1.02, by);
+      ctx.quadraticCurveTo(b.cx, by + b.bh * 0.035, b.cx + b.halfW * 1.02, by);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+    // caustic shimmer on the body, driven by submersion
+    if (b.s > 0.02) {
+      ctx.strokeStyle = CAUSTIC;
+      ctx.lineCap = 'round';
+      for (var f = 0; f < b.flecks.length; f++) {
+        var fl = b.flecks[f];
+        var fx = b.cx + fl.u * b.halfW + b.halfW * 0.10;
+        var fy = top + fl.v * b.bh;
+        var flick = 0.6 + 0.4 * Math.sin(t * 2.4 + fl.ph);
+        ctx.globalAlpha = Math.min(0.85, b.s * 0.8) * flick;
+        ctx.lineWidth = Math.max(1, b.bw * 0.014);
+        ctx.beginPath();
+        ctx.moveTo(fx, fy);
+        ctx.lineTo(fx + fl.len, fy + fl.len * 0.25);
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+    }
+    ctx.restore();
+    ctx.restore(); // un-rotate
+    // mouth opening
+    ctx.beginPath();
+    ctx.ellipse(b.cx, top + b.bh, b.halfW * 0.80, Math.max(2, b.halfW * 0.13), 0, 0, Math.PI * 2);
+    ctx.fillStyle = SHADOW;
+    ctx.fill();
+    ctx.beginPath();
+    ctx.ellipse(b.cx, top + b.bh, b.halfW * 0.52, Math.max(1.4, b.halfW * 0.08), 0, 0, Math.PI * 2);
+    ctx.fillStyle = WATER;
+    ctx.globalAlpha = 0.6;
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    // name beneath the bell (fixed at its rest position)
+    ctx.fillStyle = TEXT;
+    ctx.globalAlpha = 0.92;
+    var fs = isPhone ? Math.max(8.5, W * 0.024) : Math.max(10, W * 0.0115);
+    ctx.font = '500 ' + fs + 'px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
+    ctx.fillText(b.name, b.cx, b.mouthY + Math.max(13, H * 0.018));
+    ctx.globalAlpha = 1;
+  }
+
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    var py = poolY();
+    var i;
+    // night water ground
+    ctx.fillStyle = WATER;
+    ctx.fillRect(0, 0, W, H);
+    // pool band: darker riverbed
+    ctx.fillStyle = SHADOW;
+    ctx.globalAlpha = 0.16;
+    ctx.fillRect(0, py, W, H - py);
+    ctx.globalAlpha = 1;
+    // faint bell reflections in the pool
+    for (i = 0; i < bells.length; i++) {
+      var b = bells[i];
+      ctx.beginPath();
+      ctx.ellipse(b.cx, py + 11 + (b.phase % 1) * 7 + b.s * 22, b.halfW * 0.9, 8 + b.s * 7, 0, 0, Math.PI * 2);
+      ctx.fillStyle = CLAY;
+      ctx.globalAlpha = 0.055 + b.s * 0.10;
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    // waterline sheen
+    ctx.strokeStyle = CAUSTIC;
+    ctx.globalAlpha = 0.20;
+    ctx.lineWidth = 1.4;
+    ctx.beginPath();
+    ctx.moveTo(0, py + 0.5);
+    ctx.lineTo(W, py + 0.5);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    // ripple rings from bell mouths
+    for (i = 0; i < state.ripples.length; i++) {
+      var r = state.ripples[i];
+      for (var k = 0; k < 2; k++) {
+        var age = (t - r.t0) - k * 0.28;
+        if (age < 0) continue;
+        var rr = (6 + age * 52) * (0.7 + 0.6 * r.str);
+        ctx.beginPath();
+        ctx.ellipse(r.x, py + 2, rr, rr * 0.30, 0, 0, Math.PI * 2);
+        ctx.strokeStyle = CAUSTIC;
+        ctx.globalAlpha = Math.max(0, (1 - age / 2.3)) * 0.5 * (0.4 + 0.6 * r.str);
+        ctx.lineWidth = 1.4;
+        ctx.stroke();
+      }
+    }
+    ctx.globalAlpha = 1;
+    // current flecks drifting through the pool
+    ctx.strokeStyle = CAUSTIC;
+    ctx.lineCap = 'round';
+    for (i = 0; i < flecks.length; i++) {
+      var f = flecks[i];
+      var fx = (((f.x + t * f.sp) % 1.05) - 0.025) * W;
+      var fy = py + f.y * (H - py);
+      ctx.globalAlpha = f.a * (0.7 + 0.3 * Math.sin(t * 0.9 + f.ph));
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(fx, fy);
+      ctx.lineTo(fx + f.len, fy + 1);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+    // cords first (so a back row's cords never cross a front bell), then bells
+    for (i = 0; i < bells.length; i++) drawCord(bells[i]);
+    for (i = 0; i < bells.length; i++) drawBell(bells[i], t);
+    // stones on the bank
+    for (i = 0; i < stones.length; i++) {
+      var s = stones[i];
+      ctx.save();
+      ctx.translate(s.x, s.y);
+      ctx.rotate(s.tilt);
+      ctx.beginPath();
+      ctx.ellipse(2.5, s.ry * 0.45, s.rx * 0.96, s.ry * 0.8, 0, 0, Math.PI * 2);
+      ctx.fillStyle = SHADOW;
+      ctx.globalAlpha = 0.35;
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      ctx.beginPath();
+      ctx.ellipse(0, 0, s.rx, s.ry, 0, 0, Math.PI * 2);
+      ctx.fillStyle = STONE;
+      ctx.fill();
+      // highlight tick
+      ctx.beginPath();
+      ctx.ellipse(0, 0, s.rx * 0.62, s.ry * 0.6, 0, Math.PI * 1.15, Math.PI * 1.55);
+      ctx.strokeStyle = CAUSTIC;
+      ctx.globalAlpha = 0.5;
+      ctx.lineWidth = 1.6;
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+      ctx.restore();
+    }
+  }
+
+  // ---------- pointer input: recorded with anchored times ----------
+  function nowAnchored() {
+    return (typeof performance !== 'undefined' && performance.now) ? (performance.now() - startStamp) / 1000 : state.t;
+  }
+  var lastSample = null;
+  function pushEvent(type, e) {
+    var tt = nowAnchored();
+    var vx = 0, vy = 0;
+    if (lastSample && tt > lastSample.t) {
+      vx = (e.clientX - lastSample.x) / (tt - lastSample.t);
+      vy = (e.clientY - lastSample.y) / (tt - lastSample.t);
+    }
+    lastSample = { t: tt, x: e.clientX, y: e.clientY };
+    state.events.push({ t: tt, type: type, x: e.clientX, y: e.clientY, vx: vx, vy: vy });
+  }
+  canvas.addEventListener('pointerdown', function (e) {
+    ensureAudio(); // the context is born inside the gesture, never on load
+    pushEvent('down', e);
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (!lastSample) return; // only while the pointer is down
+    pushEvent('move', e);
+  });
+  function endPointer(e) {
+    pushEvent('up', e);
+    lastSample = null;
+  }
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', endPointer);
+  canvas.addEventListener('pointerleave', function (e) {
+    if (state.dragStone >= 0) endPointer(e);
+  });
+
+  // ---------- run ----------
+  resize();
+  state.simT = 0;
+  state.t = 0;
+  draw(0); // frame one: synchronous, bells at rest, no sound
+
+  function tick() {
+    var t = (((typeof performance !== 'undefined' && performance.now) ? performance.now() : startStamp) - startStamp) / 1000;
+    advanceTo(t);
+    draw(state.t);
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(tick);
+  }
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(tick);
+})();
+</script>
+</body>
+</html>
