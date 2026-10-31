@@ -1,0 +1,658 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ROOTS</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0A0A0A; height: 100%; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  "use strict";
+
+  var TAU = Math.PI * 2;
+  var COL = {
+    black: "#0A0A0A",
+    ember: "#B33A1E",
+    red:   "#FF2200",
+    green: "#33FF66",
+    quiet: "#0E3A1E"
+  };
+
+  var DT = 1 / 120;            // fixed sim timestep
+  var PRE_T = 10.0;            // deterministic pre-roll so frame one is developed
+  var NB = 300;                // body particles
+  var NF = 120;                // machine filaments
+  var GW = 26, GH = 26;        // machine energy grid
+  var TRAIL = 34;              // filament trail points (pushed every 2nd step)
+  var TAP_DELAY = 0.30;        // single-tap deferral (double-tap window)
+  var SLOW_V = 0.50;           // drag speed (units of height / s) below = butoh
+  var STRIKE_V = 1.05;         // drag speed above = flamenco strikes
+
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById("c");
+  var ctx = canvas.getContext("2d");
+  var W = 0, H = 0, PHONE = false;
+
+  function detectPhone(w, h) {
+    var sw = 0, sh = 0;
+    if (typeof window !== "undefined" && window.screen) {
+      sw = window.screen.width || 0;
+      sh = window.screen.height || 0;
+    }
+    if (sw > 0 && sh > 0) return Math.min(sw, sh) < 700;
+    return h > w * 1.15; // aspect fallback only when screen size is unavailable
+  }
+
+  function resize() {
+    var w = 0, h = 0;
+    if (typeof window !== "undefined" && window.visualViewport) {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    }
+    if (!w || !h) {
+      w = (typeof window !== "undefined" && window.innerWidth) || 300;
+      h = (typeof window !== "undefined" && window.innerHeight) || 300;
+    }
+    W = w; H = h;
+    PHONE = detectPhone(w, h);
+    var dpr = 1;
+    if (typeof window !== "undefined" && window.devicePixelRatio) {
+      dpr = clamp(window.devicePixelRatio, 1, 2);
+    }
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    draw();
+  }
+
+  // ---------- clock (display time; frame one is t = 0, drawn synchronously) ----------
+  var startStamp = null;
+  function nowSec() {
+    if (typeof performance !== "undefined" && performance && typeof performance.now === "function") {
+      var n = performance.now() / 1000;
+      if (startStamp === null) startStamp = n;
+      return n - startStamp;
+    }
+    return 0;
+  }
+
+  // ======================================================================
+  // SIMULATION. Everything below is a fixed-timestep deterministic sim in
+  // normalized coordinates (x: 0..1 of width, y: 0..1 of height, y down).
+  // No RNG calls inside steps; all randomness is drawn at init.
+  // ======================================================================
+  var sim = {
+    t: 0,
+    body: [],          // {hx,hy,x,y,vx,vy,ph,jit,la,lb}
+    fils: [],          // {x,y,hd,ef,trail:[]}
+    grid: null,        // Float32Array GW*GH machine energy deposits
+    meanCell: 0,
+    mLevel: 0.5,       // machine amplitude (smoothed): drives body brightness + audio
+    strikeEnv: 0,      // body strike energy envelope: drives machine gain + audio
+    gM: 1.0,           // machine gain (from strikeEnv)
+    strikes: [],       // active {x,y,t0,e}
+    pending: [],       // scheduled strikes {x,y,t0,e}
+    ripples: [],       // {x,y,t0,e}
+    cx: 0.5, cy: 0.72, // body centroid (machine filaments bend around it)
+    corpse: false,
+    drag: null,        // {x,y,vx,vy,speed,down}
+    stepCount: 0
+  };
+
+  // Divergence-free flow from a stream function psi (three modes): velocity
+  // is the perpendicular gradient of psi, so the field has no sources or
+  // sinks and filaments keep covering the whole frame instead of braiding
+  // into accumulation lines. Only the heading is used; speed is separate.
+  function flowVel(x, y, t) {
+    var a = TAU * (x + 0.13 * t), b = TAU * y - 0.09 * t;
+    var c = TAU * (2 * y + 0.31) + 0.07 * t, d = TAU * (x - 0.47);
+    var e = TAU * (x + y + 0.62) - 0.11 * t, f = TAU * (2 * x - y + 0.2);
+    var dpsiDy = 0.55 * Math.sin(a) * (-Math.sin(b)) * TAU
+               + 0.40 * Math.cos(c) * 2 * TAU * Math.cos(d)
+               + 0.30 * TAU * Math.cos(e - f);
+    var dpsiDx = 0.55 * Math.cos(a) * TAU * Math.cos(b)
+               + 0.40 * Math.sin(c) * (-Math.sin(d)) * TAU
+               + 0.30 * TAU * (Math.cos(e) * Math.cos(f) - 2 * Math.sin(e) * Math.sin(f));
+    return [dpsiDy, -dpsiDx];
+  }
+  function flowAngle(x, y, t, ph) {
+    var v = flowVel(x, y, t);
+    // A whisper of per-filament phase so neighbours do not fly in lockstep.
+    return Math.atan2(v[1], v[0]) + 0.12 * Math.sin(ph + 0.05 * t);
+  }
+
+  function initSim() {
+    var rng = mulberry32(875036);
+    var i, j;
+    // Body homes: clustered mass in the lower two-thirds, denser toward the ground.
+    for (i = 0; i < NB; i++) {
+      var gx = 0.5 + (rng() + rng() + rng() - 1.5) * 0.30;      // bell around centre
+      var gy = 0.43 + Math.pow(rng(), 0.75) * 0.545;            // 0.43 .. 0.975
+      sim.body.push({
+        hx: clamp(gx, 0.06, 0.94), hy: clamp(gy, 0.38, 0.975),
+        x: 0, y: 0, vx: 0, vy: 0,
+        ph: rng() * TAU, jit: 0.70 + rng() * 0.65,
+        la: (i + 1) % NB, lb: Math.floor(rng() * NB)
+      });
+    }
+    for (i = 0; i < NB; i++) {
+      var p = sim.body[i];
+      p.x = p.hx + (rng() - 0.5) * 0.05;
+      p.y = p.hy + (rng() - 0.5) * 0.05;
+    }
+    // Machine filaments: seeded all over the frame with developed headings.
+    for (i = 0; i < NF; i++) {
+      var fx = rng(), fy = rng();
+      var fph = rng() * TAU;
+      sim.fils.push({
+        x: fx, y: fy, hd: flowAngle(fx, fy, 0, fph) + (rng() - 0.5) * 0.8,
+        ef: 0, trail: [], ph: fph
+      });
+    }
+    sim.grid = new Float32Array(GW * GH);
+    sim.t = 0;
+    // One seeded strike just before frame one: its impulse lands during the
+    // pre-roll and frame one carries the faint afterglow.
+    sim.pending.push({ x: 0.44, y: 0.68, t0: PRE_T - 0.9, e: 0.9 });
+    // Pre-roll: fixed steps only, no events. Frame one = state at PRE_T.
+    var steps = Math.round(PRE_T / DT);
+    for (j = 0; j < steps; j++) stepSim();
+  }
+
+  function cellAt(x, y) {
+    var cx = clamp(Math.floor(x * GW), 0, GW - 1);
+    var cy = clamp(Math.floor(y * GH), 0, GH - 1);
+    return cy * GW + cx;
+  }
+
+  function spawnStrike(x, y, e) {
+    sim.strikes.push({ x: x, y: y, t0: sim.t, e: e });
+    sim.strikeEnv = clamp(sim.strikeEnv + e * 0.5, 0, 1.25);
+    var i, p, dx, dy, d2, d, f;
+    for (i = 0; i < NB; i++) {
+      p = sim.body[i];
+      dx = p.x - x; dy = (p.y - y) * 1.0;
+      d2 = dx * dx + dy * dy;
+      if (d2 < 0.0144) { // r = 0.12
+        d = Math.sqrt(d2) || 0.001;
+        f = (1 - d / 0.12) * e * 0.55;
+        p.vx += (dx / d) * f; p.vy += (dy / d) * f;
+      }
+    }
+    audioStrike(e);
+  }
+
+  function spawnRipple(x, y, e) {
+    sim.ripples.push({ x: x, y: y, t0: sim.t, e: e });
+    // The machine catches the strike: a local deposit bloom in the grid.
+    var cx = clamp(Math.floor(x * GW), 0, GW - 1);
+    var cy = clamp(Math.floor(y * GH), 0, GH - 1);
+    for (var gy = -1; gy <= 1; gy++) for (var gx = -1; gx <= 1; gx++) {
+      var xx = cx + gx, yy = cy + gy;
+      if (xx >= 0 && xx < GW && yy >= 0 && yy < GH) {
+        sim.grid[yy * GW + xx] += 0.35 * e * (gx === 0 && gy === 0 ? 1 : 0.5);
+      }
+    }
+  }
+
+  function stepSim() {
+    var t = sim.t;
+    var i, p, f;
+    var aspect = (H > 0 && W > 0) ? W / H : 1;
+
+    // Scheduled strikes fire when the sim reaches them (pre-roll seed strike).
+    for (i = sim.pending.length - 1; i >= 0; i--) {
+      if (t >= sim.pending[i].t0) {
+        var ps = sim.pending[i];
+        sim.pending.splice(i, 1);
+        spawnStrike(ps.x, ps.y, ps.e);
+      }
+    }
+
+    // ---- coupling values -------------------------------------------------
+    sim.strikeEnv *= Math.exp(-DT / 1.1);
+    sim.gM = 0.8 + 1.15 * (clamp(sim.strikeEnv, 0, 1.2) / 1.2);
+    var activity = clamp(sim.meanCell * 2.6, 0, 1);
+    var mTarget = clamp(0.30 + 0.45 * activity + 0.18 * clamp(sim.strikeEnv, 0, 1)
+                        + 0.12 * Math.sin(t * TAU / 26 + 1.3), 0.05, 1);
+    sim.mLevel += (mTarget - sim.mLevel) * (1 - Math.exp(-DT / 1.8));
+
+    // ---- body ------------------------------------------------------------
+    var drag = sim.drag;
+    var dragging = !!(drag && drag.down);
+    var fast = dragging && drag.speed > SLOW_V;
+    var damp = sim.corpse ? 3.4 : (dragging ? (fast ? 0.9 : 2.6) : 1.6);
+    var dampF = Math.exp(-DT * damp);
+    var homeK = sim.corpse ? 5.0 : 2.2;
+    var cxSum = 0, cySum = 0;
+    for (i = 0; i < NB; i++) {
+      p = sim.body[i];
+      var fx = (p.hx - p.x) * homeK;
+      var fy = (p.hy - p.y) * homeK;
+      var q = sim.body[p.la];
+      fx += (q.x - p.x) * 1.15; fy += (q.y - p.y) * 1.15;
+      q = sim.body[p.lb];
+      fx += (q.x - p.x) * 0.55; fy += (q.y - p.y) * 0.55;
+      if (!sim.corpse) { // butoh ambient drift: heavy, slow, ground-hugging
+        fx += 0.16 * Math.sin(t * 0.23 + p.ph) + 0.07 * Math.sin(t * 0.071 + p.ph * 2.3);
+        fy += 0.10 * Math.cos(t * 0.19 + p.ph * 1.7);
+      }
+      if (dragging) {
+        var dx = p.x - drag.x, dy = p.y - drag.y;
+        var d2 = dx * dx + dy * dy;
+        if (d2 < 0.1156) { // r = 0.34
+          var d = Math.sqrt(d2) || 0.001;
+          var fall = 1 - d / 0.34;
+          // The drag pushes the mass along its own motion, with a mild pull-in.
+          fx += drag.vx * fall * (fast ? 2.6 : 1.5) - dx * fall * 0.5;
+          fy += drag.vy * fall * (fast ? 2.6 : 1.5) - dy * fall * 0.5;
+          if (fast) { // flamenco jitter, analytic (no RNG in steps)
+            fx += 2.2 * fall * Math.sin(t * 41 + p.ph * 5.0);
+            fy += 2.2 * fall * Math.cos(t * 37 + p.ph * 3.0);
+          }
+        }
+      }
+      p.vx = (p.vx + fx * DT) * dampF;
+      p.vy = (p.vy + fy * DT) * dampF;
+      p.x += p.vx * DT; p.y += p.vy * DT;
+      if (p.y > 0.985) { p.y = 0.985; p.vy *= -0.3; }
+      if (p.y < 0.30) { p.y = 0.30; p.vy *= -0.3; }
+      if (p.x < 0.012) { p.x = 0.012; p.vx *= -0.3; }
+      if (p.x > 0.988) { p.x = 0.988; p.vx *= -0.3; }
+      cxSum += p.x; cySum += p.y;
+    }
+    sim.cx = cxSum / NB; sim.cy = cySum / NB;
+
+    // ---- machine energy grid: decay + mean -------------------------------
+    var decayF = Math.exp(-DT / 5.5);
+    var sum = 0;
+    for (i = 0; i < sim.grid.length; i++) {
+      sim.grid[i] *= decayF;
+      sum += sim.grid[i];
+    }
+    sim.meanCell = sum / sim.grid.length;
+
+    // ---- machine filaments ----------------------------------------------
+    var push = (sim.stepCount % 2 === 0);
+    for (i = 0; i < NF; i++) {
+      f = sim.fils[i];
+      var ci = cellAt(f.x, f.y);
+      var e = clamp(sim.grid[ci], 0, 1.2);
+      f.ef += (e - f.ef) * (1 - Math.exp(-DT / 0.4));
+      var want = flowAngle(f.x, f.y, t, f.ph);
+      // Bend around the body mass: tangential deflection near the centroid.
+      var bx = (f.x - sim.cx) * aspect, by = f.y - sim.cy;
+      var bd = Math.sqrt(bx * bx + by * by);
+      if (bd < 0.24 && bd > 0.0001) {
+        var tang = Math.atan2(by, bx) + Math.PI / 2; // swirl around the mass
+        var bend = (1 - bd / 0.24) * 2.0;
+        var tx = Math.cos(want) + Math.cos(tang) * bend;
+        var ty = Math.sin(want) + Math.sin(tang) * bend;
+        want = Math.atan2(ty, tx);
+        f.vxOut = (bx / bd) * (1 - bd / 0.24) * 0.05; // slight outward skirt
+        f.vyOut = (by / bd) * (1 - bd / 0.24) * 0.05;
+      } else { f.vxOut = 0; f.vyOut = 0; }
+      var dh = want - f.hd;
+      while (dh > Math.PI) dh -= TAU;
+      while (dh < -Math.PI) dh += TAU;
+      f.hd += dh * (1 - Math.exp(-DT / 0.55));
+      var sp = (0.085 + 0.13 * f.ef) * (0.65 + 0.55 * sim.gM);
+      f.x += (Math.cos(f.hd) * sp / aspect + f.vxOut) * DT;
+      f.y += (Math.sin(f.hd) * sp + f.vyOut) * DT;
+      // The field feeds itself: passing filaments deposit energy.
+      sim.grid[ci] += 0.34 * sim.gM * DT;
+      var wrapped = false;
+      if (f.x < -0.02) { f.x += 1.04; wrapped = true; }
+      if (f.x > 1.02) { f.x -= 1.04; wrapped = true; }
+      if (f.y < -0.02) { f.y += 1.04; wrapped = true; }
+      if (f.y > 1.02) { f.y -= 1.04; wrapped = true; }
+      if (wrapped) f.trail.length = 0;
+      if (push) {
+        f.trail.push(f.x, f.y);
+        if (f.trail.length > TRAIL * 2) f.trail.splice(0, f.trail.length - TRAIL * 2);
+      }
+    }
+
+    // ---- age out strikes / ripples ---------------------------------------
+    for (i = sim.strikes.length - 1; i >= 0; i--) {
+      if (t - sim.strikes[i].t0 > 1.4) sim.strikes.splice(i, 1);
+    }
+    for (i = sim.ripples.length - 1; i >= 0; i--) {
+      if (t - sim.ripples[i].t0 > 1.7) sim.ripples.splice(i, 1);
+    }
+    // Deferred single tap (heel-drop) fires here so double-tap can cancel it.
+    if (pendingTap && t >= pendingTap.t0) {
+      var pt = pendingTap; pendingTap = null;
+      spawnStrike(pt.x, pt.y, 0.9);
+      spawnRipple(pt.x, pt.y, 0.9);
+    }
+
+    sim.t += DT;
+    sim.stepCount++;
+  }
+
+  // ======================================================================
+  // DRAW
+  // ======================================================================
+  function draw() {
+    if (!W || !H) return;
+    canvas.style.width = W + "px";
+    canvas.style.height = H + "px";
+    var S = Math.min(W, H);
+    var i, j, p, f;
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = COL.black;
+    ctx.fillRect(0, 0, W, H);
+
+    // ---- machine filaments (whole frame, beneath and through the body) ---
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    // Quiet base pass: the machine's dim state, always present.
+    ctx.strokeStyle = COL.quiet;
+    ctx.lineWidth = Math.max(1, S * 0.0016);
+    for (i = 0; i < sim.fils.length; i++) {
+      f = sim.fils[i];
+      var n = f.trail.length / 2;
+      if (n < 2) continue;
+      ctx.globalAlpha = 0.8;
+      ctx.beginPath();
+      ctx.moveTo(f.trail[0] * W, f.trail[1] * H);
+      for (j = 1; j < n; j++) ctx.lineTo(f.trail[j * 2] * W, f.trail[j * 2 + 1] * H);
+      ctx.stroke();
+    }
+    // Active pass: brightness follows the energy the filament is reading.
+    ctx.strokeStyle = COL.green;
+    for (i = 0; i < sim.fils.length; i++) {
+      f = sim.fils[i];
+      var n2 = f.trail.length / 2;
+      if (n2 < 2) continue;
+      var a = clamp(0.16 + 0.72 * f.ef, 0, 0.92);
+      ctx.globalAlpha = a;
+      ctx.lineWidth = Math.max(1, S * 0.0019);
+      ctx.beginPath();
+      ctx.moveTo(f.trail[0] * W, f.trail[1] * H);
+      for (j = 1; j < n2; j++) ctx.lineTo(f.trail[j * 2] * W, f.trail[j * 2 + 1] * H);
+      ctx.stroke();
+      // Head dot; on a machine flare the tip swells (shimmer, kept in-family).
+      var hr = Math.max(1.1, S * 0.0022) * (sim.gM > 1.5 ? 1.8 : 1.0);
+      ctx.globalAlpha = clamp(0.25 + 0.75 * f.ef, 0, 1);
+      ctx.fillStyle = COL.green;
+      ctx.beginPath();
+      ctx.arc(f.x * W, f.y * H, hr, 0, TAU);
+      ctx.fill();
+    }
+
+    // ---- ripples: the machine recirculating a heel-drop, twice ------------
+    for (i = 0; i < sim.ripples.length; i++) {
+      var r = sim.ripples[i];
+      var age = sim.t - r.t0;
+      for (j = 0; j < 3; j++) {
+        var ra = age - j * 0.45; // the strike, then two decaying replays
+        if (ra < 0) continue;
+        var rr = (0.02 + ra * 0.16) * S;
+        ctx.globalAlpha = clamp((1 - ra / 1.05), 0, 1) * 0.5 * r.e / (j + 1);
+        ctx.strokeStyle = COL.green;
+        ctx.lineWidth = Math.max(1, S * 0.002);
+        ctx.beginPath();
+        ctx.arc(r.x * W, r.y * H, rr, 0, TAU);
+        ctx.stroke();
+      }
+    }
+
+    // ---- body mass ---------------------------------------------------------
+    // Coupling: machine amplitude scales the body's brightness.
+    var bright = (0.42 + 0.85 * sim.mLevel) * (sim.corpse ? 0.42 : 1);
+    var pr = Math.max(1.4, S * (PHONE ? 0.0036 : 0.0033));
+    ctx.fillStyle = COL.ember;
+    for (i = 0; i < sim.body.length; i++) {
+      p = sim.body[i];
+      var sp2 = Math.sqrt(p.vx * p.vx + p.vy * p.vy);
+      ctx.globalAlpha = clamp(bright * p.jit * (0.75 + clamp(sp2 * 1.4, 0, 0.7)), 0.08, 1);
+      if (sp2 > 0.22) { // moving fast: a short streak, not a dot
+        ctx.strokeStyle = COL.ember;
+        ctx.lineWidth = pr * 1.15;
+        ctx.beginPath();
+        ctx.moveTo((p.x - p.vx * 0.035) * W, (p.y - p.vy * 0.035) * H);
+        ctx.lineTo(p.x * W, p.y * H);
+        ctx.stroke();
+      } else {
+        ctx.beginPath();
+        ctx.arc(p.x * W, p.y * H, pr * (0.8 + p.jit * 0.35), 0, TAU);
+        ctx.fill();
+      }
+    }
+
+    // ---- strikes: flamenco flashes + ember afterglow -----------------------
+    for (i = 0; i < sim.strikes.length; i++) {
+      var s = sim.strikes[i];
+      var sa = sim.t - s.t0;
+      if (sa < 0) continue;
+      var fade = 1 - sa / 1.4;
+      ctx.globalAlpha = clamp(fade, 0, 1) * 0.62 * s.e;
+      ctx.strokeStyle = COL.red;
+      ctx.lineWidth = Math.max(1.2, S * 0.0032);
+      ctx.beginPath();
+      ctx.arc(s.x * W, s.y * H, (0.012 + sa * 0.075) * S, 0, TAU);
+      ctx.stroke();
+      ctx.globalAlpha = clamp(1 - sa / 0.4, 0, 1) * 0.9 * s.e;
+      ctx.fillStyle = COL.red;
+      ctx.beginPath();
+      ctx.arc(s.x * W, s.y * H, Math.max(1.5, S * 0.008), 0, TAU);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ======================================================================
+  // AUDIO. One graph, two chains, one coupling bus. Lazy: built on the
+  // first pointer gesture only, fully guarded. Visuals never read audio.
+  // ======================================================================
+  var AC = null, aMaster = null, aBodyFilter = null, aBodyGain = null,
+      aWet = null, aFb = null, aNoiseBuf = null, aStarted = false;
+
+  function audioInit() {
+    if (aStarted) return;
+    aStarted = true;
+    try {
+      if (typeof window === "undefined") return;
+      var Ctor = window.AudioContext || window.webkitAudioContext;
+      if (typeof Ctor !== "function") return;
+      AC = new Ctor();
+      if (!AC) return;
+      var comp = AC.createDynamicsCompressor();
+      comp.threshold.value = -18; comp.ratio.value = 8;
+      aMaster = AC.createGain(); aMaster.gain.value = 0.5;
+      aMaster.connect(comp); comp.connect(AC.destination);
+
+      // Shared noise buffer.
+      var len = AC.sampleRate * 2;
+      aNoiseBuf = AC.createBuffer(1, len, AC.sampleRate);
+      var data = aNoiseBuf.getChannelData(0);
+      var lr = mulberry32(87511);
+      for (var i = 0; i < len; i++) data[i] = lr() * 2 - 1;
+
+      // Machine chain: noise -> bandpass -> gain -> delay <-> feedback -> wet.
+      var mSrc = AC.createBufferSource(); mSrc.buffer = aNoiseBuf; mSrc.loop = true;
+      var mBp = AC.createBiquadFilter(); mBp.type = "bandpass";
+      mBp.frequency.value = 1050; mBp.Q.value = 1.1;
+      var mIn = AC.createGain(); mIn.gain.value = 0.16;
+      var delay = AC.createDelay(1.0); delay.delayTime.value = 0.27;
+      aFb = AC.createGain(); aFb.gain.value = 0.38;      // self-feeding loop gain
+      aWet = AC.createGain(); aWet.gain.value = 0.10;
+      mSrc.connect(mBp); mBp.connect(mIn); mIn.connect(delay);
+      delay.connect(aFb); aFb.connect(delay);
+      delay.connect(aWet); aWet.connect(aMaster);
+      mSrc.start();
+
+      // Body chain: low drone through a lowpass the machine breathes on.
+      var o1 = AC.createOscillator(); o1.type = "sine"; o1.frequency.value = 54;
+      var o2 = AC.createOscillator(); o2.type = "triangle"; o2.frequency.value = 81.4;
+      var o2g = AC.createGain(); o2g.gain.value = 0.4;
+      aBodyFilter = AC.createBiquadFilter(); aBodyFilter.type = "lowpass";
+      aBodyFilter.frequency.value = 160;
+      aBodyGain = AC.createGain(); aBodyGain.gain.value = 0.05;
+      o1.connect(aBodyFilter); o2.connect(o2g); o2g.connect(aBodyFilter);
+      aBodyFilter.connect(aBodyGain); aBodyGain.connect(aMaster);
+      o1.start(); o2.start();
+
+      // Coupling bus: ~10 Hz, reads the same sim values the visuals use.
+      if (typeof setInterval === "function") {
+        setInterval(function () {
+          if (!AC) return;
+          try {
+            var tc = AC.currentTime;
+            var se = clamp(sim.strikeEnv, 0, 1);
+            aBodyFilter.frequency.setTargetAtTime(140 + 760 * sim.mLevel, tc, 0.08);
+            aWet.gain.setTargetAtTime(0.08 + 0.17 * se, tc, 0.08);
+            aFb.gain.setTargetAtTime(0.34 + 0.24 * se, tc, 0.08);
+            aBodyGain.gain.setTargetAtTime(sim.corpse ? 0.018 : 0.05, tc, 0.12);
+          } catch (e) { /* bus is best-effort */ }
+        }, 100);
+      }
+    } catch (e) {
+      AC = null;
+    }
+  }
+
+  function audioStrike(e) {
+    if (!AC || !aNoiseBuf) return;
+    try {
+      var src = AC.createBufferSource(); src.buffer = aNoiseBuf;
+      src.playbackRate.value = 0.6;
+      var bp = AC.createBiquadFilter(); bp.type = "bandpass";
+      bp.frequency.value = 150 + 320 * e; bp.Q.value = 1.4;
+      var g = AC.createGain();
+      var t0 = AC.currentTime;
+      g.gain.setValueAtTime(0.22 * e, t0);
+      g.gain.exponentialRampToValueAtTime(0.001, t0 + 0.38);
+      src.connect(bp); bp.connect(g); g.connect(aMaster);
+      src.start(t0); src.stop(t0 + 0.45);
+    } catch (err) { /* strike sound is best-effort */ }
+  }
+
+  // ======================================================================
+  // INPUT. Drag = the body (speed-classified). Tap = heel-drop the machine
+  // catches. Double-tap = corpse-state. Any new drag wakes the body.
+  // ======================================================================
+  var pendingTap = null;        // {x,y,t0} sim-time deferred tap
+  var lastTapAt = -10, lastTapX = 0, lastTapY = 0;
+  var downInfo = null;          // {t, x, y, moved}
+  var dragState = { x: 0, y: 0, vx: 0, vy: 0, speed: 0, down: false };
+  var lastMove = null;          // {t, x, y}
+  var lastStrikeAt = -10;
+
+  function ptr(e) {
+    var r = { x: 0, y: 0 };
+    if (typeof e.clientX === "number" && W > 0) r.x = clamp(e.clientX / W, 0, 1);
+    if (typeof e.clientY === "number" && H > 0) r.y = clamp(e.clientY / H, 0, 1);
+    return r;
+  }
+
+  function onDown(e) {
+    audioInit();
+    if (AC && AC.state === "suspended" && typeof AC.resume === "function") {
+      try { AC.resume(); } catch (err) { /* ignore */ }
+    }
+    var p = ptr(e);
+    var t = sim.t;
+    dragState.down = true; dragState.x = p.x; dragState.y = p.y;
+    dragState.vx = 0; dragState.vy = 0; dragState.speed = 0;
+    sim.drag = dragState;
+    lastMove = { t: t, x: p.x, y: p.y };
+    downInfo = { t: t, x: p.x, y: p.y, moved: false };
+    // Double-tap?
+    if (t - lastTapAt < 0.34 && Math.abs(p.x - lastTapX) < 0.09 && Math.abs(p.y - lastTapY) < 0.09) {
+      pendingTap = null;               // cancel the deferred heel-drop
+      sim.corpse = true;               // release the body; the machine plays on
+      lastTapAt = -10;
+      downInfo.isDouble = true;
+    }
+  }
+
+  function onMove(e) {
+    if (!dragState.down) return;
+    var p = ptr(e);
+    var t = sim.t;
+    if (downInfo && (Math.abs(p.x - downInfo.x) > 0.012 || Math.abs(p.y - downInfo.y) > 0.012)) {
+      downInfo.moved = true;
+      if (sim.corpse) sim.corpse = false; // a real drag wakes the body
+    }
+    if (lastMove) {
+      var dt = Math.max(t - lastMove.t, 0.001);
+      var aspect = (H > 0 && W > 0) ? W / H : 1;
+      var dx = (p.x - lastMove.x) * aspect, dy = p.y - lastMove.y;
+      dragState.vx = dx / dt / aspect; dragState.vy = dy / dt;
+      dragState.speed = Math.sqrt(dx * dx + dy * dy) / dt;
+    }
+    dragState.x = p.x; dragState.y = p.y;
+    lastMove = { t: t, x: p.x, y: p.y };
+    // Flamenco: fast drags strike where they pass.
+    if (dragState.speed > STRIKE_V && t - lastStrikeAt > 0.085) {
+      lastStrikeAt = t;
+      spawnStrike(p.x, p.y, clamp(0.45 + dragState.speed * 0.3, 0.5, 1.1));
+    }
+  }
+
+  function onUp(e) {
+    if (!dragState.down) return;
+    dragState.down = false;
+    dragState.speed = 0; dragState.vx = 0; dragState.vy = 0;
+    var t = sim.t;
+    if (downInfo && !downInfo.moved && !downInfo.isDouble && t - downInfo.t < 0.30) {
+      // A tap: defer the heel-drop so a double-tap can still cancel it.
+      pendingTap = { x: downInfo.x, y: downInfo.y, t0: t + TAP_DELAY };
+      lastTapAt = t; lastTapX = downInfo.x; lastTapY = downInfo.y;
+    }
+    downInfo = null;
+  }
+
+  if (canvas.addEventListener) {
+    canvas.addEventListener("pointerdown", onDown);
+    canvas.addEventListener("pointermove", onMove);
+    canvas.addEventListener("pointerup", onUp);
+    canvas.addEventListener("pointercancel", onUp);
+  }
+  if (typeof window !== "undefined" && window.addEventListener) {
+    window.addEventListener("resize", resize);
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener("resize", resize);
+    }
+  }
+
+  // ---------- run: pre-roll, synchronous frame one, then the loop ----------
+  resize();          // sets W/H/PHONE (draws a blank frame; sim not ready yet)
+  initSim();         // deterministic pre-roll to PRE_T
+  draw();            // frame one: the developed coupling, synchronously
+
+  var lastShown = 0;
+  function loop() {
+    var t = nowSec();
+    var target = PRE_T + t;
+    var guard = 0;
+    while (sim.t < target && guard < 40) { stepSim(); guard++; }
+    if (sim.t < target) sim.t = target; // never spiral after a long stall
+    draw();
+    lastShown = t;
+    if (typeof requestAnimationFrame === "function") requestAnimationFrame(loop);
+  }
+  if (typeof requestAnimationFrame === "function") requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

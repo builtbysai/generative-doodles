@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Held Back</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0A0A0A; overflow: hidden; height: 100%; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded RNG (mulberry32) ----------
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- palette (strict) ----------
+  var COL_BG = '#0A0A0A';
+  var COL_RED = '#FF2200';
+  var COL_AMBER = '#FFB000';
+  var COL_GREY = '#8A8A86';
+
+  // ---------- pressure model ----------
+  // Pressure is a closed-form function of recorded event segments.
+  // Segment kinds:
+  //   const  : p holds at p0
+  //   drag   : p rises asymptotically toward CAP with rate r (never reaches 1)
+  //   decay  : p eases exponentially toward target with time constant tau
+  //            (release exhale -> REST, bleed -> FLOOR, re-coil -> REST)
+  var REST = 0.25;      // resting pressure
+  var CAP = 0.92;       // the never-release ceiling for drag build-up
+  var FLOOR = 0.05;     // double-tap bleed floor (not zero: the coil always re-forms)
+  var TAU_EXHALE = 3.0; // release bleed: mostly gone in ~8 s, a slow exhale
+  var TAU_BLEED = 0.35; // double-tap drain is quick
+  var TAU_RECOIL = 7.0; // re-coil: back near rest in ~20 s
+
+  var segments = [{ t0: 0, kind: 'const', p0: REST, r: 0, target: REST, tau: 1 }];
+
+  function segPressure(seg, dt) {
+    if (seg.kind === 'const') return seg.p0;
+    if (seg.kind === 'drag') return CAP - (CAP - seg.p0) * Math.exp(-seg.r * dt);
+    // decay toward target
+    return seg.target + (seg.p0 - seg.target) * Math.exp(-dt / seg.tau);
+  }
+
+  // Orbit phase: theta advances at rate w(p) = W0 + W1 * p.
+  // Integral of p over one segment, closed form per kind.
+  var W0 = 0.15, W1 = 0.5;
+  function segPhaseIntegral(seg, dt) {
+    var base;
+    if (seg.kind === 'const') {
+      base = seg.p0 * dt;
+    } else if (seg.kind === 'drag') {
+      base = CAP * dt - (CAP - seg.p0) * (1 - Math.exp(-seg.r * dt)) / seg.r;
+    } else {
+      base = seg.target * dt + (seg.p0 - seg.target) * seg.tau * (1 - Math.exp(-dt / seg.tau));
+    }
+    return W0 * dt + W1 * base;
+  }
+
+  function stateAt(t) {
+    // find active segment
+    var i = segments.length - 1;
+    while (i > 0 && segments[i].t0 > t) i--;
+    var seg = segments[i];
+    var phase = 0;
+    for (var j = 0; j < i; j++) {
+      phase += segPhaseIntegral(segments[j], segments[j + 1].t0 - segments[j].t0);
+    }
+    var dt = Math.max(0, t - seg.t0);
+    phase += segPhaseIntegral(seg, dt);
+    return { p: segPressure(seg, dt), phase: phase };
+  }
+
+  function pushSegment(t, kind, r, target, tau) {
+    var pNow = stateAt(t).p;
+    // drop any segments scheduled in the future (defensive)
+    while (segments.length && segments[segments.length - 1].t0 > t) segments.pop();
+    segments.push({ t0: t, kind: kind, p0: pNow, r: r || 0, target: target, tau: tau || 1 });
+    return segments.length - 1;
+  }
+
+  // ---------- coil particles ----------
+  var N = 600;
+  var rng = mulberry32(873034);
+  var parts = [];
+  var ARMS = 3;
+  for (var i = 0; i < N; i++) {
+    var arm = i % ARMS;
+    var rf = 0.06 + 0.94 * Math.pow(rng(), 0.72); // denser toward core
+    parts.push({
+      arm: arm,
+      a0: arm * (Math.PI * 2 / ARMS) + (rng() - 0.5) * 0.55,
+      rf: rf,
+      w: 1.25 - 0.75 * rf,                    // inner orbits turn faster
+      twist: 2.35,                            // spiral arm sweep
+      amber: rng(),                           // per-particle amber candidacy
+      bright: 0.7 + 0.6 * rng()
+    });
+  }
+
+  // ---------- ambient ghost motes (present at rest, frame one) ----------
+  var motes = [];
+  var rngM = mulberry32(555001);
+  for (var m = 0; m < 42; m++) {
+    motes.push({
+      ang: rngM() * Math.PI * 2,
+      period: 10 + rngM() * 9,
+      phase: rngM(),
+      r0: 0.185 + rngM() * 0.03,   // relative radius at birth (just outside coil)
+      drift: 0.10 + rngM() * 0.09, // relative radius travelled over its life
+      size: 0.8 + rngM() * 1.5
+    });
+  }
+
+  // ---------- exhale shimmer (recorded-event particles) ----------
+  // For each exhale/bleed segment we lazily derive a deterministic mote set
+  // seeded by the segment index. Motes are born across the first seconds of
+  // the exhale and drift outward, fading.
+  var exhaleCache = {};
+  function exhaleMotes(segIdx) {
+    if (exhaleCache[segIdx]) return exhaleCache[segIdx];
+    var r = mulberry32(90000 + segIdx * 7919);
+    var list = [];
+    for (var k = 0; k < 30; k++) {
+      list.push({
+        birth: k * 0.24 + r() * 0.15,
+        ang: r() * Math.PI * 2,
+        r0: 0.10 + r() * 0.09,
+        speed: 0.020 + r() * 0.045,
+        tang: (r() - 0.5) * 0.35,
+        life: 3.2 + r() * 1.6,
+        size: 0.8 + r() * 1.6
+      });
+    }
+    exhaleCache[segIdx] = list;
+    return list;
+  }
+
+  // ---------- tap flares (recorded events) ----------
+  var taps = []; // {t, x, y} in relative coords
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 720, H = 720, isPhone = false;
+
+  function resize() {
+    var vv = window.visualViewport;
+    var w = vv ? vv.width : window.innerWidth;
+    var h = vv ? vv.height : window.innerHeight;
+    W = Math.max(50, Math.round(w));
+    H = Math.max(50, Math.round(h));
+    canvas.width = W;
+    canvas.height = H;
+    var sw = (window.screen && window.screen.width) || W;
+    var sh = (window.screen && window.screen.height) || H;
+    isPhone = Math.min(sw, sh) < 700 || H > W * 1.15;
+  }
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', resize);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // ---------- audio (lazy, gesture-started, hard-capped) ----------
+  var AC = null, noiseGain = null, noiseFilter = null, subGain = null, master = null;
+  function initAudio() {
+    if (AC) { if (AC.resume) AC.resume(); return; }
+    var Ctor = (typeof window !== 'undefined') && (window.AudioContext || window.webkitAudioContext);
+    if (!Ctor) return;
+    try {
+      AC = new Ctor();
+      // noise buffer
+      var len = AC.sampleRate * 2;
+      var buf = AC.createBuffer(1, len, AC.sampleRate);
+      var d = buf.getChannelData(0);
+      var ar = mulberry32(4242);
+      for (var i = 0; i < len; i++) d[i] = ar() * 2 - 1;
+      var src = AC.createBufferSource();
+      src.buffer = buf; src.loop = true;
+      noiseFilter = AC.createBiquadFilter();
+      noiseFilter.type = 'lowpass'; noiseFilter.frequency.value = 300; noiseFilter.Q.value = 0.6;
+      noiseGain = AC.createGain(); noiseGain.gain.value = 0.0;
+      src.connect(noiseFilter); noiseFilter.connect(noiseGain);
+      // sub oscillator
+      var sub = AC.createOscillator();
+      sub.type = 'sine'; sub.frequency.value = 36;
+      subGain = AC.createGain(); subGain.gain.value = 0.0;
+      sub.connect(subGain);
+      // hard ceiling: waveshaper saturation into a hard compressor
+      var shaper = AC.createWaveShaper();
+      var curve = new Float32Array(256);
+      for (var j = 0; j < 256; j++) {
+        var x = j / 127.5 - 1;
+        curve[j] = Math.tanh(1.6 * x) / Math.tanh(1.6);
+      }
+      shaper.curve = curve;
+      var comp = AC.createDynamicsCompressor();
+      comp.threshold.value = -16; comp.knee.value = 0; comp.ratio.value = 20;
+      comp.attack.value = 0.002; comp.release.value = 0.18;
+      master = AC.createGain(); master.gain.value = 0.42; // absolute ceiling trim
+      noiseGain.connect(shaper); subGain.connect(shaper);
+      shaper.connect(comp); comp.connect(master); master.connect(AC.destination);
+      src.start(); sub.start();
+    } catch (e) { AC = null; }
+  }
+  function updateAudio(p) {
+    if (!AC || !noiseGain) return;
+    var t = AC.currentTime;
+    // pre-limiter drive follows pressure; the ceiling chain caps the output
+    var drive = 0.04 + 0.85 * Math.pow(p, 1.6);
+    noiseGain.gain.setTargetAtTime(drive * 0.5, t, 0.08);
+    noiseFilter.frequency.setTargetAtTime(180 + 2600 * p * p, t, 0.08);
+    subGain.gain.setTargetAtTime(0.05 + 0.30 * p, t, 0.08);
+  }
+
+  // ---------- interaction ----------
+  var startMs = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+  function nowT() {
+    return (((typeof performance !== 'undefined' && performance.now) ? performance.now() : 0) - startMs) / 1000;
+  }
+  var dragging = false, dragStartT = 0, dragMoved = 0, lastX = 0, lastY = 0, lastMoveT = 0, lastTapT = -10, downX = 0, downY = 0;
+
+  function rel(x, y) { return { x: x / W, y: y / H }; }
+
+  function onDown(e) {
+    initAudio();
+    dragging = true; dragMoved = 0;
+    dragStartT = nowT(); lastMoveT = dragStartT;
+    lastX = downX = e.clientX; lastY = downY = e.clientY;
+  }
+  function onMove(e) {
+    if (!dragging) return;
+    var t = nowT();
+    var dx = e.clientX - lastX, dy = e.clientY - lastY;
+    var dist = Math.sqrt(dx * dx + dy * dy);
+    dragMoved += dist;
+    var dt = Math.max(0.016, t - lastMoveT);
+    var speed = dist / dt; // px per second
+    if (dragMoved > 14) {
+      // (re)start a drag segment whose build rate scales with drag speed
+      var r = 0.25 + Math.min(1.6, speed / 500);
+      var active = segments[segments.length - 1];
+      if (!active || active.kind !== 'drag' || Math.abs(active.r - r) > 0.35) {
+        pushSegment(t, 'drag', r, CAP, 1);
+      }
+    }
+    lastX = e.clientX; lastY = e.clientY; lastMoveT = t;
+  }
+  function onUp(e) {
+    if (!dragging) return;
+    dragging = false;
+    var t = nowT();
+    var active = segments[segments.length - 1];
+    if (active && active.kind === 'drag') {
+      // release: the slow exhale, pressure bleeds toward rest
+      pushSegment(t, 'decay', 0, REST, TAU_EXHALE);
+    } else if (t - dragStartT < 0.35 && dragMoved < 10) {
+      // a tap
+      if (t - lastTapT < 0.35) {
+        // double-tap: bleed to near-black, then slow re-coil
+        pushSegment(t, 'decay', 0, FLOOR, TAU_BLEED);
+        segments.push({ t0: t + 1.1, kind: 'decay', p0: FLOOR, r: 0, target: REST, tau: TAU_RECOIL });
+        lastTapT = -10;
+      } else {
+        var rp = rel(downX, downY);
+        taps.push({ t: t, x: rp.x, y: rp.y });
+        if (taps.length > 12) taps.shift();
+        lastTapT = t;
+      }
+    }
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+  }
+
+  // ---------- draw ----------
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.fillStyle = COL_BG;
+    ctx.fillRect(0, 0, W, H);
+
+    var st = stateAt(t);
+    var p = st.p;
+    var S = Math.min(W, H);
+    var cx = W / 2, cy = H / 2;
+    var maxR = S * 0.185 * (isPhone ? 1.0 : 1.0); // coil occupies the middle third
+    var tighten = 1 - 0.42 * p;                    // filaments pull in under pressure
+    var tremble = Math.pow(p, 3) * S * 0.0035;     // high-pressure jitter
+    var redAlpha = 0.16 + 0.62 * ((p - 0.05) / 0.87);
+    if (redAlpha < 0.08) redAlpha = 0.08;
+    if (redAlpha > 0.92) redAlpha = 0.92;
+    var amberMix = Math.max(0, Math.min(1, (p - 0.72) / 0.20));
+
+    // tap flare lookup helper
+    function flareAt(rx, ry) {
+      var f = 0;
+      for (var k = 0; k < taps.length; k++) {
+        var age = t - taps[k].t;
+        if (age < 0 || age > 0.9) continue;
+        var dx = rx - taps[k].x, dy = ry - taps[k].y;
+        var dd = Math.sqrt(dx * dx + dy * dy);
+        if (dd < 0.16) f += (1 - dd / 0.16) * Math.exp(-age / 0.28);
+      }
+      return f > 1 ? 1 : f;
+    }
+
+    // ambient ghost motes
+    ctx.fillStyle = COL_GREY;
+    for (var mi = 0; mi < motes.length; mi++) {
+      var mo = motes[mi];
+      var frac = ((t / mo.period + mo.phase) % 1 + 1) % 1;
+      var rr = (mo.r0 + mo.drift * frac) * S;
+      var aa = mo.ang + frac * 0.5;
+      ctx.globalAlpha = 0.30 * Math.sin(Math.PI * frac);
+      ctx.beginPath();
+      ctx.arc(cx + Math.cos(aa) * rr, cy + Math.sin(aa) * rr, mo.size, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // exhale shimmer motes from decay segments
+    for (var si = 0; si < segments.length; si++) {
+      var sg = segments[si];
+      if (sg.kind !== 'decay') continue;
+      var list = exhaleMotes(si);
+      for (var q = 0; q < list.length; q++) {
+        var em = list[q];
+        var age = t - sg.t0 - em.birth;
+        if (age < 0 || age > em.life) continue;
+        var rad = (em.r0 + em.speed * age) * S;
+        var ang = em.ang + em.tang * age;
+        ctx.globalAlpha = 0.45 * Math.sin(Math.PI * (age / em.life)) * Math.min(1, sg.p0);
+        ctx.beginPath();
+        ctx.arc(cx + Math.cos(ang) * rad, cy + Math.sin(ang) * rad, em.size, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    // the coil: filament segments along spiral orbits
+    ctx.lineCap = 'round';
+    for (var i = 0; i < N; i++) {
+      var pt = parts[i];
+      var th = pt.a0 + pt.twist * pt.rf + st.phase * pt.w;
+      var rad = maxR * pt.rf * tighten + S * 0.006;
+      var jx = tremble ? Math.sin(t * 47 + i * 2.39) * tremble : 0;
+      var jy = tremble ? Math.cos(t * 43 + i * 1.71) * tremble : 0;
+      var x = cx + Math.cos(th) * rad + jx;
+      var y = cy + Math.sin(th) * rad + jy;
+      // tangent direction (derivative of the spiral, approx by orbit tangent)
+      var tx = -Math.sin(th), ty = Math.cos(th);
+      var segLen = rad * 0.10 + 1.6;
+      var rx = x / W, ry = y / H;
+      var fl = flareAt(rx, ry);
+      var a = redAlpha * pt.bright * (0.55 + 0.45 * pt.rf) + fl * 0.5;
+      if (a > 1) a = 1;
+      var useAmber = amberMix > 0 && pt.amber > 0.86;
+      ctx.strokeStyle = useAmber ? COL_AMBER : COL_RED;
+      ctx.globalAlpha = useAmber ? a * amberMix : a;
+      ctx.lineWidth = (isPhone ? 1.5 : 1.3) + pt.rf * 0.7;
+      ctx.beginPath();
+      ctx.moveTo(x - tx * segLen, y - ty * segLen);
+      ctx.lineTo(x + tx * segLen, y + ty * segLen);
+      ctx.stroke();
+      // dense head dot
+      ctx.fillStyle = useAmber ? COL_AMBER : COL_RED;
+      ctx.beginPath();
+      ctx.arc(x, y, 1.1 + pt.rf * 0.8, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    updateAudio(p);
+  }
+
+  draw(0);
+
+  if (typeof requestAnimationFrame === 'function') {
+    var loop = function () {
+      draw(nowT());
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,679 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Somewhere in Taipei</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #141310; height: 100%; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  "use strict";
+
+  var COL = {
+    concrete: "#141310",  // concrete black, the field
+    sodium:   "#FFB000",  // sodium light pools
+    edge:     "#3A372E",  // pillar edge, vault lines
+    glyph:    "#33FF66",  // phosphor green edition glyphs
+    flash:    "#E8E8E0"   // CRT white strike flash
+  };
+  var DBL_SEC = 0.35;       // double-tap window, seconds on the piece clock
+  var GIG_SECONDS = 180;    // ~3 minutes of accumulated play ends the gig
+  var FADE_SECONDS = 10;    // the police-tolerance fade-out
+  var RECOVER_SECONDS = 20; // dim reboot back to full
+  var ARCHIVE_CAP = 14;     // glyphs visible on the left wall
+  var BASE_EDITION = 44;    // first edition this session can archive
+  // editions already archived on the wall before this session (ghosts)
+  var SEED_ARCHIVE = [31, 33, 36, 38, 40, 43];
+  // edition glyphs pinned to pillars: {side, depth, edition}
+  var PILLAR_GLYPHS = [
+    { side: -1, depth: 4, edition: 4 },
+    { side:  1, depth: 2, edition: 9 },
+    { side: -1, depth: 1, edition: 25 },
+    { side:  1, depth: 5, edition: 41 }
+  ];
+  // resonant frequency per depth (0 = nearest), Hz; right side detuned x1.03
+  var DEPTH_FREQ = [42, 52, 63, 75, 88, 100, 112];
+
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+  function lerp(a, b, f) { return a + (b - a) * f; }
+  function smooth(f) { return f * f * (3 - 2 * f); }
+
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById("c");
+  var ctx = canvas.getContext("2d");
+  var W = 0, H = 0, U = 1, PHONE = false;
+
+  function detectPhone(w, h) {
+    var sw = 0, sh = 0;
+    if (typeof window !== "undefined" && window.screen) {
+      sw = window.screen.width || 0;
+      sh = window.screen.height || 0;
+    }
+    if (sw > 0 && sh > 0) return Math.min(sw, sh) < 700;
+    return h > w * 1.15; // aspect fallback only when screen size is unavailable
+  }
+
+  function resize() {
+    var w = 0, h = 0;
+    if (typeof window !== "undefined" && window.visualViewport) {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    }
+    if (!w || !h) {
+      w = (typeof window !== "undefined" && window.innerWidth) || 300;
+      h = (typeof window !== "undefined" && window.innerHeight) || 300;
+    }
+    W = w; H = h; U = Math.min(w, h);
+    PHONE = detectPhone(w, h);
+    var dpr = 1;
+    if (typeof window !== "undefined" && window.devicePixelRatio) {
+      dpr = clamp(window.devicePixelRatio, 1, 2);
+    }
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    draw(nowSec());
+  }
+
+  // ---------- clock (elapsed seconds; frame one is t = 0, drawn synchronously) ----------
+  var startStamp = null;
+  function nowSec() {
+    if (typeof performance !== "undefined" && performance && typeof performance.now === "function") {
+      var n = performance.now() / 1000;
+      if (startStamp === null) startStamp = n;
+      return n - startStamp;
+    }
+    return 0;
+  }
+
+  // ---------- vault geometry ----------
+  // Pillars are indexed side (-1 left, +1 right) x depth (0 nearest .. 6 farthest).
+  // Depth scale s shrinks exponentially toward the vanishing point.
+  function depthScale(depth) { return Math.pow(0.16, depth / 6); }
+  function pillarGeom(side, depth) {
+    var vpx = W * 0.5, vpy = H * 0.47;
+    var s = depthScale(depth);
+    return {
+      side: side, depth: depth, s: s,
+      cx: vpx + side * 0.435 * W * s,
+      top: vpy - 0.435 * H * s,
+      bot: vpy + 0.505 * H * s,
+      w: Math.max(2, 0.085 * W * s)
+    };
+  }
+  function pillarId(side, depth) { return (side < 0 ? "L" : "R") + depth; }
+  var PILLARS = [];
+  (function buildPillars() {
+    for (var d = 0; d < 7; d++) { PILLARS.push({ side: -1, depth: d }); PILLARS.push({ side: 1, depth: d }); }
+  })();
+
+  // ---------- recorded events (everything drawn is a function of these + t) ----------
+  var strikes = [];      // {side, depth, t0, strength, tau}
+  var drags = [];        // closed drag intervals {a, b}
+  var openDrag = null;   // {a} while the pointer is down
+  var resets = [];       // times of double-tap fresh editions (gig clock reset)
+  var passArchives = []; // times a full 14-pillar pass completed a gig
+  var dblArchives = [];  // times a double-tap archived an edition
+  var gigFlashes = [];   // {t0} brief green bloom when a gig completes
+
+  // ---------- gig clock: a pure walk over the recorded drag intervals ----------
+  // Accumulates active play; at GIG_SECONDS the gig fades (FADE_SECONDS),
+  // archives its edition, and reboots dim, recovering over RECOVER_SECONDS.
+  // Accumulation pauses during a fade. Resets zero the accumulator.
+  function computeTimeline(t) {
+    var segs = [];
+    for (var i = 0; i < drags.length; i++) {
+      if (drags[i].a < t) segs.push([drags[i].a, Math.min(drags[i].b, t)]);
+    }
+    if (openDrag && openDrag.a < t) segs.push([openDrag.a, t]);
+    segs.sort(function (p, q) { return p[0] - q[0]; });
+    var rs = resets.filter(function (r) { return r <= t; }).sort(function (a, b) { return a - b; });
+
+    var acc = 0, fadeStart = -1, fadeEnd = -1, recEnd = -1;
+    var autos = [];
+    var ri = 0;
+
+    function advance(from, to) {
+      var cur = from, remain = to - from;
+      while (remain > 1e-9) {
+        if (fadeStart >= 0 && cur >= fadeStart && cur < fadeEnd) {
+          var skip = Math.min(remain, fadeEnd - cur);
+          cur += skip; remain -= skip;
+          continue;
+        }
+        var need = GIG_SECONDS - acc;
+        if (remain < need) { acc += remain; cur = to; remain = 0; }
+        else {
+          cur += need; remain -= need;
+          fadeStart = cur; fadeEnd = cur + FADE_SECONDS; recEnd = fadeEnd + RECOVER_SECONDS;
+          autos.push({ appear: fadeEnd, fadeStart: fadeStart });
+          acc = 0;
+        }
+      }
+    }
+
+    for (var sIdx = 0; sIdx < segs.length; sIdx++) {
+      var a = segs[sIdx][0], b = segs[sIdx][1];
+      // apply resets that fall inside this segment, in order
+      var cursor = a;
+      while (ri < rs.length && rs[ri] < a) { acc = 0; ri++; }
+      while (ri < rs.length && rs[ri] >= a && rs[ri] < b) {
+        advance(cursor, rs[ri]);
+        acc = 0;
+        cursor = rs[ri];
+        ri++;
+      }
+      advance(cursor, b);
+    }
+    while (ri < rs.length) { acc = 0; ri++; }
+
+    var brightness = 1;
+    if (fadeStart >= 0) {
+      if (t >= fadeStart && t < fadeEnd) {
+        brightness = 1 - 0.88 * smooth((t - fadeStart) / FADE_SECONDS);
+      } else if (t >= fadeEnd && t < recEnd) {
+        brightness = 0.35 + 0.65 * smooth((t - fadeEnd) / RECOVER_SECONDS);
+      } else if (t >= recEnd) {
+        brightness = 1;
+      }
+    }
+    return { brightness: brightness, autos: autos };
+  }
+
+  // All archived editions at time t, chronological, with appearance times.
+  function archiveList(t, timeline) {
+    var evts = [];
+    for (var i = 0; i < passArchives.length; i++) if (passArchives[i] <= t) evts.push({ appear: passArchives[i] });
+    for (var j = 0; j < dblArchives.length; j++) if (dblArchives[j] <= t) evts.push({ appear: dblArchives[j] });
+    for (var k = 0; k < timeline.autos.length; k++) evts.push({ appear: timeline.autos[k].appear });
+    evts.sort(function (p, q) { return p.appear - q.appear; });
+    var out = [];
+    for (var m = 0; m < SEED_ARCHIVE.length; m++) out.push({ edition: SEED_ARCHIVE[m], appear: -1e9 });
+    for (var n = 0; n < evts.length; n++) out.push({ edition: BASE_EDITION + n, appear: evts[n].appear });
+    return out;
+  }
+
+  // ---------- glyphs ----------
+  // An edition's glyph is a small abstract mark: a seeded polyline motif in a
+  // unit box, deterministic from the edition number. No numerals, ever.
+  function glyphMotif(edition) {
+    var rng = mulberry32(874000 + edition * 131);
+    var pts = [];
+    var gx = 0.5, gy = 0.5;
+    var steps = 3 + Math.floor(rng() * 3); // 3..5 segments
+    pts.push([gx, gy]);
+    for (var i = 0; i < steps; i++) {
+      gx = clamp(gx + (rng() - 0.5) * 0.9, 0.08, 0.92);
+      gy = clamp(gy + (rng() - 0.5) * 0.9, 0.08, 0.92);
+      pts.push([gx, gy]);
+    }
+    return { pts: pts, dot: rng() > 0.45, ring: rng() > 0.7 };
+  }
+  function drawGlyph(cx, cy, size, edition, alpha) {
+    if (alpha <= 0.003) return;
+    var mot = glyphMotif(edition);
+    ctx.globalAlpha = clamp(alpha, 0, 1);
+    ctx.strokeStyle = COL.glyph;
+    ctx.lineWidth = Math.max(1, size * 0.14);
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.beginPath();
+    for (var i = 0; i < mot.pts.length; i++) {
+      var px = cx + (mot.pts[i][0] - 0.5) * size;
+      var py = cy + (mot.pts[i][1] - 0.5) * size;
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.stroke();
+    if (mot.dot) {
+      var last = mot.pts[mot.pts.length - 1];
+      ctx.fillStyle = COL.glyph;
+      ctx.beginPath();
+      ctx.arc(cx + (last[0] - 0.5) * size, cy + (last[1] - 0.5) * size, Math.max(0.8, size * 0.1), 0, Math.PI * 2);
+      ctx.fill();
+    }
+    if (mot.ring) {
+      ctx.beginPath();
+      ctx.arc(cx, cy, size * 0.62, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- strike envelopes ----------
+  function strikeEnv(st, t) {
+    var age = t - st.t0;
+    if (age < 0) return 0;
+    return Math.exp(-age / st.tau);
+  }
+  function pillarStrikeSum(side, depth, t) {
+    var sum = 0;
+    for (var i = 0; i < strikes.length; i++) {
+      var st = strikes[i];
+      if (st.side === side && st.depth === depth) sum += st.strength * strikeEnv(st, t);
+    }
+    return sum;
+  }
+
+  // ---------- audio (lazy, gesture-armed, typeof-guarded) ----------
+  var AC = null, master = null, verb = null, noiseBuf = null;
+  function audioArmed() {
+    if (AC) return true;
+    if (typeof AudioContext === "undefined" && typeof webkitAudioContext === "undefined") return false;
+    try {
+      var Ctor = (typeof AudioContext !== "undefined") ? AudioContext : webkitAudioContext;
+      AC = new Ctor();
+      master = AC.createGain();
+      master.gain.value = 0.9;
+      master.connect(AC.destination);
+      // shared short noise buffer for the resonator bursts
+      var len = Math.floor(AC.sampleRate * 0.5);
+      noiseBuf = AC.createBuffer(1, len, AC.sampleRate);
+      var data = noiseBuf.getChannelData(0);
+      var rng = mulberry32(874555);
+      for (var i = 0; i < len; i++) data[i] = rng() * 2 - 1;
+      // dark concrete impulse: 2.5 s of lowpassed decaying noise, built in code
+      var irLen = Math.floor(AC.sampleRate * 2.5);
+      var ir = AC.createBuffer(2, irLen, AC.sampleRate);
+      for (var ch = 0; ch < 2; ch++) {
+        var d = ir.getChannelData(ch);
+        var r2 = mulberry32(874900 + ch * 17);
+        var lp = 0;
+        for (var j = 0; j < irLen; j++) {
+          var white = r2() * 2 - 1;
+          lp += 0.16 * (white - lp); // one-pole lowpass: poured concrete, not a hall
+          var f = j / irLen;
+          d[j] = lp * Math.pow(1 - f, 2.1) * 0.9;
+        }
+      }
+      verb = AC.createConvolver();
+      verb.buffer = ir;
+      var wet = AC.createGain();
+      wet.gain.value = 0.55;
+      verb.connect(wet);
+      wet.connect(master);
+    } catch (e) { AC = null; return false; }
+    return true;
+  }
+  function strikeSound(side, depth, strength, tau) {
+    if (!audioArmed()) return;
+    try {
+      var now = AC.currentTime;
+      var src = AC.createBufferSource();
+      src.buffer = noiseBuf;
+      src.playbackRate.value = lerp(0.7, 1.15, strength);
+      var bp = AC.createBiquadFilter();
+      bp.type = "bandpass";
+      bp.frequency.value = DEPTH_FREQ[depth] * (side > 0 ? 1.03 : 1.0);
+      bp.Q.value = lerp(9, 22, strength); // a hard fast hit rings tighter
+      var g = AC.createGain();
+      var peak = 0.10 + 0.5 * strength;
+      g.gain.setValueAtTime(peak, now);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + 0.4 + tau * 1.9);
+      src.connect(bp); bp.connect(g); g.connect(master); g.connect(verb);
+      src.start(now);
+      src.stop(now + 0.5 + tau * 2);
+    } catch (e) { /* silent in any failure */ }
+  }
+  var lastDuck = -1;
+  function audioDuck(brightness) {
+    if (!AC || !master) return;
+    var target = 0.9 * (0.12 + 0.88 * brightness);
+    if (Math.abs(target - lastDuck) < 0.02) return;
+    lastDuck = target;
+    try { master.gain.setTargetAtTime(target, AC.currentTime, 0.4); } catch (e) { /* ignore */ }
+  }
+
+  // ---------- drawing ----------
+  function draw(t) {
+    if (!W || !H) return;
+    canvas.style.width = W + "px";
+    canvas.style.height = H + "px";
+    var timeline = computeTimeline(t);
+    var B = timeline.brightness;
+    var vpx = W * 0.5, vpy = H * 0.47;
+
+    ctx.fillStyle = COL.concrete;
+    ctx.fillRect(0, 0, W, H);
+
+    // converging vault lines: corners and wall seams to the vanishing point
+    ctx.strokeStyle = COL.edge;
+    ctx.lineWidth = 1;
+    ctx.globalAlpha = 0.55;
+    ctx.beginPath();
+    var corners = [
+      [0.015 * W, 0.02 * H], [0.985 * W, 0.02 * H],
+      [0.015 * W, 0.98 * H], [0.985 * W, 0.98 * H],
+      [0.015 * W, 0.30 * H], [0.985 * W, 0.30 * H],
+      [0.015 * W, 0.68 * H], [0.985 * W, 0.68 * H]
+    ];
+    for (var c = 0; c < corners.length; c++) {
+      ctx.moveTo(corners[c][0], corners[c][1]);
+      ctx.lineTo(vpx, vpy);
+    }
+    // floor seams
+    for (var fk = -3; fk <= 3; fk++) {
+      if (fk === 0) continue;
+      ctx.moveTo(vpx + fk * 0.16 * W, H);
+      ctx.lineTo(vpx, vpy);
+    }
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    // arch rings, far to near
+    for (var rd = 6; rd >= 0; rd--) {
+      var s = depthScale(rd);
+      var bx = 0.475 * W * s;
+      var baseY = vpy + 0.505 * H * s;
+      var springY = vpy - 0.30 * H * s;
+      var apexY = vpy - 0.50 * H * s;
+      ctx.globalAlpha = 0.28 + 0.4 * s;
+      ctx.strokeStyle = COL.edge;
+      ctx.lineWidth = Math.max(1, 2.2 * s);
+      ctx.beginPath();
+      ctx.moveTo(vpx - bx, baseY);
+      ctx.lineTo(vpx - bx, springY);
+      ctx.quadraticCurveTo(vpx, 2 * apexY - springY, vpx + bx, springY);
+      ctx.lineTo(vpx + bx, baseY);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+
+    // pillars, far to near, with their pools, lamps, glyphs, flashes
+    for (var pd = 6; pd >= 0; pd--) {
+      for (var ps = 0; ps < 2; ps++) {
+        var side = ps === 0 ? -1 : 1;
+        var g = pillarGeom(side, pd);
+        var midY = (g.top + g.bot) / 2;
+        var hit = pillarStrikeSum(side, pd, t);
+        var flashA = clamp(hit, 0, 1);
+
+        // sodium pool on the floor at the pillar base
+        var breathe = 0.85 + 0.15 * Math.sin(t * 0.7 + pd * 1.3 + (side > 0 ? 0.6 : 0));
+        var poolA = (0.10 + 0.05 * g.s) * breathe * B * (1 + 1.5 * flashA);
+        ctx.globalAlpha = clamp(poolA, 0, 0.6);
+        ctx.fillStyle = COL.sodium;
+        ctx.beginPath();
+        ctx.ellipse(g.cx - side * 0.03 * W * g.s, g.bot - 0.012 * H * g.s,
+                    Math.max(2, 0.115 * W * g.s), Math.max(1, 0.020 * H * g.s + 1), 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.globalAlpha = clamp(poolA * 0.55, 0, 0.4);
+        ctx.beginPath();
+        ctx.ellipse(g.cx - side * 0.03 * W * g.s, g.bot - 0.012 * H * g.s,
+                    Math.max(1.2, 0.06 * W * g.s), Math.max(0.8, 0.011 * H * g.s + 0.5), 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.globalAlpha = 1;
+
+        // pillar body
+        ctx.globalAlpha = 0.30 + 0.14 * g.s;
+        ctx.fillStyle = COL.edge;
+        ctx.fillRect(g.cx - g.w / 2, g.top, g.w, g.bot - g.top);
+        ctx.globalAlpha = 0.85;
+        ctx.strokeStyle = COL.edge;
+        ctx.lineWidth = Math.max(1, 1.6 * g.s);
+        ctx.strokeRect(g.cx - g.w / 2, g.top, g.w, g.bot - g.top);
+        // capital and base bands
+        ctx.globalAlpha = 0.6;
+        ctx.beginPath();
+        ctx.moveTo(g.cx - g.w / 2, g.top + 0.10 * (g.bot - g.top));
+        ctx.lineTo(g.cx + g.w / 2, g.top + 0.10 * (g.bot - g.top));
+        ctx.moveTo(g.cx - g.w / 2, g.bot - 0.07 * (g.bot - g.top));
+        ctx.lineTo(g.cx + g.w / 2, g.bot - 0.07 * (g.bot - g.top));
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+
+        // sodium lamp glow on the pillar face
+        var lampY = g.top + 0.24 * (g.bot - g.top);
+        ctx.globalAlpha = clamp(0.13 * B * breathe * (1 + 1.2 * flashA), 0, 0.5);
+        ctx.fillStyle = COL.sodium;
+        ctx.beginPath();
+        ctx.ellipse(g.cx, lampY, Math.max(1.5, g.w * 1.05), Math.max(1, g.w * 0.42), 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.globalAlpha = clamp(0.55 * B, 0, 0.8);
+        ctx.beginPath();
+        ctx.arc(g.cx, lampY, Math.max(0.8, 0.005 * U * g.s + 0.6), 0, Math.PI * 2);
+        ctx.fill();
+        ctx.globalAlpha = 1;
+
+        // strike flash and resonance ring
+        if (flashA > 0.01) {
+          ctx.globalAlpha = clamp(0.5 * flashA * B, 0, 0.6);
+          ctx.fillStyle = COL.flash;
+          ctx.fillRect(g.cx - g.w / 2, g.top, g.w, g.bot - g.top);
+          ctx.globalAlpha = 1;
+          for (var si = strikes.length - 1; si >= 0; si--) {
+            var st2 = strikes[si];
+            if (st2.side !== side || st2.depth !== pd) continue;
+            var age = t - st2.t0;
+            if (age < 0 || age > st2.tau * 3.2) continue;
+            var rr = g.w * (0.55 + 1.9 * (age / (st2.tau * 3.2)));
+            ctx.globalAlpha = clamp(0.55 * st2.strength * strikeEnv(st2, t) * B, 0, 0.7);
+            ctx.strokeStyle = COL.flash;
+            ctx.lineWidth = Math.max(1, 1.4 * g.s);
+            ctx.beginPath();
+            ctx.ellipse(g.cx, midY, rr, rr * 1.6, 0, 0, Math.PI * 2);
+            ctx.stroke();
+          }
+          ctx.globalAlpha = 1;
+        }
+
+        // edition glyph pinned to this pillar, if any
+        for (var pg = 0; pg < PILLAR_GLYPHS.length; pg++) {
+          var spec = PILLAR_GLYPHS[pg];
+          if (spec.side === side && spec.depth === pd) {
+            var pulse = 0.30 + 0.22 * Math.sin(t * 0.9 + spec.edition * 1.7);
+            var ga = pulse * B * (1 + 0.8 * flashA);
+            drawGlyph(g.cx, g.top + 0.52 * (g.bot - g.top), Math.max(5, 0.030 * U * g.s + 2), spec.edition, ga);
+          }
+        }
+      }
+    }
+
+    // gig-complete bloom: a green ring breathing out of the vanishing point
+    for (var gf = gigFlashes.length - 1; gf >= 0; gf--) {
+      var gAge = t - gigFlashes[gf].t0;
+      if (gAge < 0) continue;
+      if (gAge > 1.4) { gigFlashes.splice(gf, 1); continue; }
+      var gfr = gAge / 1.4;
+      ctx.globalAlpha = clamp(0.4 * (1 - gfr) * B, 0, 0.4);
+      ctx.strokeStyle = COL.glyph;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.ellipse(vpx, vpy, (0.02 + 0.30 * gfr) * W, (0.02 + 0.30 * gfr) * H, 0, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+
+    // the archive: glyphs stacked up the left wall, newest lowest,
+    // oldest fading first once the wall is full
+    var arch = archiveList(t, timeline);
+    var total = arch.length;
+    var firstVisible = Math.max(0, total - ARCHIVE_CAP);
+    var ax = W * 0.052;
+    var sizeA = Math.max(6, 0.020 * U);
+    for (var ai = firstVisible; ai < total; ai++) {
+      var rec = arch[ai];
+      var slot = ai - firstVisible;
+      var ay = H * 0.335 + slot * (H * 0.0475);
+      var aAlpha = 0.62;
+      if (total > ARCHIVE_CAP) {
+        if (slot === 0) aAlpha = 0.22;
+        else if (slot === 1) aAlpha = 0.42;
+      }
+      var appearAge = t - rec.appear;
+      if (appearAge < 1.5) aAlpha *= clamp(appearAge / 1.5, 0, 1) * (0.8 + 0.2 * Math.sin(t * 6));
+      drawGlyph(ax, ay, sizeA, rec.edition, aAlpha * B);
+    }
+
+    audioDuck(B);
+  }
+
+  // ---------- interaction ----------
+  var downInfo = null;   // {x, y, t, moved, swallowed, struckAtDown}
+  var lastTap = { t: -10, x: 0, y: 0 };
+  var passSet = {};      // pillars struck during the current drag
+  var insideSet = {};    // pillars the pointer is currently inside (per drag)
+  var lastMove = null;   // {x, y, t} for drag speed
+
+  function evtPos(e) {
+    var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  }
+
+  function fireStrike(side, depth, t, strength, tau, countInPass) {
+    strikes.push({ side: side, depth: depth, t0: t, strength: strength, tau: tau });
+    if (strikes.length > 90) strikes.splice(0, strikes.length - 90);
+    strikeSound(side, depth, strength, tau);
+    if (countInPass) {
+      passSet[pillarId(side, depth)] = true;
+      if (Object.keys(passSet).length >= 14) {
+        passArchives.push(t);
+        gigFlashes.push({ t0: t });
+        passSet = {};
+      }
+    }
+  }
+
+  function zoneHit(px, py) {
+    var best = null, bestD = Infinity;
+    for (var i = 0; i < PILLARS.length; i++) {
+      var p = PILLARS[i];
+      var g = pillarGeom(p.side, p.depth);
+      var hw = Math.max(g.w * 0.75, 11);
+      if (Math.abs(px - g.cx) < hw && py > g.top - 10 && py < g.bot + 10) {
+        var d = Math.abs(px - g.cx);
+        if (d < bestD) { bestD = d; best = p; }
+      }
+    }
+    return best;
+  }
+  function insideZone(p, px, py) {
+    var g = pillarGeom(p.side, p.depth);
+    var hw = Math.max(g.w * 0.75, 11);
+    return Math.abs(px - g.cx) < hw && py > g.top - 10 && py < g.bot + 10;
+  }
+  function nearestPillar(px, py) {
+    var best = null, bestD = Infinity;
+    for (var i = 0; i < PILLARS.length; i++) {
+      var p = PILLARS[i];
+      var g = pillarGeom(p.side, p.depth);
+      var d = Math.hypot(px - g.cx, py - (g.top + g.bot) / 2);
+      if (d < bestD) { bestD = d; best = p; }
+    }
+    return best;
+  }
+
+  function onDown(e) {
+    var t = nowSec();
+    var p = evtPos(e);
+    audioArmed();
+    if (AC && AC.resume) { try { AC.resume(); } catch (err) { /* ignore */ } }
+    // double-tap: archive this edition and start a fresh one immediately
+    if (t - lastTap.t <= DBL_SEC && Math.hypot(p.x - lastTap.x, p.y - lastTap.y) < 0.09 * U) {
+      dblArchives.push(t);
+      resets.push(t);
+      gigFlashes.push({ t0: t });
+      passSet = {};
+      lastTap = { t: -10, x: 0, y: 0 };
+      downInfo = { x: p.x, y: p.y, t: t, moved: true, swallowed: true, struckAtDown: true };
+      openDrag = { a: t };
+      lastMove = { x: p.x, y: p.y, t: t };
+      draw(t);
+      return;
+    }
+    downInfo = { x: p.x, y: p.y, t: t, moved: false, swallowed: false, struckAtDown: false };
+    openDrag = { a: t };
+    passSet = {};
+    insideSet = {};
+    lastMove = { x: p.x, y: p.y, t: t };
+    var hit = zoneHit(p.x, p.y);
+    if (hit) {
+      fireStrike(hit.side, hit.depth, t, 0.55, 0.65, true);
+      insideSet[pillarId(hit.side, hit.depth)] = true;
+      downInfo.struckAtDown = true;
+    }
+    draw(t);
+  }
+
+  function onMove(e) {
+    if (!downInfo || downInfo.swallowed) return;
+    var t = nowSec();
+    var p = evtPos(e);
+    if (Math.hypot(p.x - downInfo.x, p.y - downInfo.y) > 0.02 * U) downInfo.moved = true;
+    var dt = Math.max(0.008, t - lastMove.t);
+    var spd = Math.hypot(p.x - lastMove.x, p.y - lastMove.y) / U / dt; // field units per second
+    lastMove = { x: p.x, y: p.y, t: t };
+    for (var i = 0; i < PILLARS.length; i++) {
+      var pl = PILLARS[i];
+      var id = pillarId(pl.side, pl.depth);
+      var inside = insideZone(pl, p.x, p.y);
+      if (inside && !insideSet[id]) {
+        // crossing into a pillar: faster is brighter and shorter,
+        // slower is dimmer on the face but dwells and booms deeper
+        var strength = clamp(0.35 + spd * 0.35, 0.35, 1);
+        var tau = lerp(1.1, 0.3, clamp((strength - 0.35) / 0.65, 0, 1));
+        fireStrike(pl.side, pl.depth, t, strength, tau, true);
+      }
+      if (inside) insideSet[id] = true; else delete insideSet[id];
+    }
+    draw(t);
+  }
+
+  function onUp(e) {
+    var t = nowSec();
+    if (openDrag) { drags.push({ a: openDrag.a, b: t }); openDrag = null; }
+    if (!downInfo) { draw(t); return; }
+    var p = evtPos(e);
+    var dur = t - downInfo.t;
+    var isTap = !downInfo.swallowed && !downInfo.moved && dur <= 0.4;
+    if (isTap) {
+      if (!downInfo.struckAtDown) {
+        var near = nearestPillar(p.x, p.y);
+        if (near) fireStrike(near.side, near.depth, t, 0.5, 0.7, false); // test tone
+      }
+      lastTap = { t: t, x: downInfo.x, y: downInfo.y };
+    }
+    downInfo = null;
+    insideSet = {};
+    draw(t);
+  }
+
+  if (canvas.addEventListener) {
+    canvas.addEventListener("pointerdown", onDown);
+    canvas.addEventListener("pointermove", onMove);
+    canvas.addEventListener("pointerup", onUp);
+    canvas.addEventListener("pointercancel", onUp);
+  }
+  if (typeof window !== "undefined" && window.addEventListener) {
+    window.addEventListener("resize", resize);
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener("resize", resize);
+    }
+  }
+
+  // ---------- run ----------
+  resize();
+  draw(0); // frame one: the vault at rest, synchronously at t = 0
+  function loop() {
+    draw(nowSec());
+    if (typeof requestAnimationFrame === "function") requestAnimationFrame(loop);
+  }
+  if (typeof requestAnimationFrame === "function") requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
