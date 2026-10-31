@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Whose Space-Time</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #020203; height: 100%; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- palette (strict) ----------
+  var BG = '#020203';                    // shared black
+  var PRISONER = [46, 58, 68];           // cold iron    #2E3A44
+  var DRIFTER  = [232, 160, 32];         // temple gold  #E8A020
+  var DREAMER  = [92, 77, 110];          // dusk violet  #5C4D6E
+  // Neutral (released) tone: Dreamer dimmed toward black, no new hue.
+  var NEUTRAL  = [Math.round(DREAMER[0] * 0.46), Math.round(DREAMER[1] * 0.48), Math.round(DREAMER[2] * 0.44)];
+
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function clamp01(v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
+  function wrap1(v) { v = v % 1; return v < 0 ? v + 1 : v; }
+  function smootherstep(u) { return u * u * u * (u * (u * 6 - 15) + 10); }
+  // integral of smootherstep from 0 to u: u^6 - 3u^5 + 2.5u^4
+  function smootherInt(u) { var u2 = u * u; return u2 * u2 * (u * u - 3 * u + 2.5); }
+
+  // ---------- seeded RNG (mulberry32) ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ---------- layout ----------
+  var W = 0, H = 0, DPR = 1, S = 1, isPhone = false;
+
+  function viewSize() {
+    var vv = window.visualViewport;
+    if (vv && vv.width) return { w: vv.width, h: vv.height };
+    return { w: window.innerWidth || 0, h: window.innerHeight || 0 };
+  }
+
+  function layout() {
+    var s = viewSize();
+    W = s.w; H = s.h;
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    var sw = (window.screen && window.screen.width) ? Math.min(window.screen.width, window.screen.height) : 9999;
+    isPhone = sw < 700 || H > W * 1.15;
+    S = Math.min(W, H) || 1;
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+  }
+
+  // ---------- the three space-times (plus released neutral) ----------
+  // State is a weight vector over [neutral, prisoner, drifter, dreamer].
+  // Every tunable is the weighted sum of per-state constants, so a state
+  // change cross-dissolves the whole world at once, never cuts.
+  var ST_NEUTRAL = 0, ST_PRISONER = 1, ST_DRIFTER = 2, ST_DREAMER = 3;
+  var PARAMS = [
+    { col: NEUTRAL,  speed: 0.008, density: 0.35, alpha: 0.35, dart: 0.00, breath: 0.40 },
+    { col: PRISONER, speed: 0.020, density: 1.00, alpha: 0.95, dart: 0.00, breath: 0.00 },
+    { col: DRIFTER,  speed: 0.110, density: 0.45, alpha: 0.90, dart: 1.00, breath: 0.00 },
+    { col: DREAMER,  speed: 0.025, density: 0.62, alpha: 0.50, dart: 0.15, breath: 1.00 }
+  ];
+  var BLEND = 4;   // seconds per cross-dissolve
+
+  // The piece opens inside the Prisoner (a choice, recorded in process.md).
+  var INIT_W = [0, 1, 0, 0];
+  var events = [];   // {t0, from:[4], to:[4]} recorded enter/release events
+
+  function weightsAt(t) {
+    var w = INIT_W.slice();
+    for (var i = 0; i < events.length; i++) {
+      var ev = events[i];
+      if (ev.t0 > t) break;
+      var e = smootherstep(clamp01((t - ev.t0) / BLEND));
+      for (var k = 0; k < 4; k++) w[k] = ev.from[k] + (ev.to[k] - ev.from[k]) * e;
+    }
+    return w;
+  }
+
+  // Analytic integral of each weight component from 0 to t, so mark drift
+  // is a closed-form function of the whole state history (no accumulation).
+  function weightsIntegral(t) {
+    var pts = [0];
+    var i, j;
+    for (i = 0; i < events.length; i++) { pts.push(events[i].t0, events[i].t0 + BLEND); }
+    pts.push(t);
+    pts = pts.filter(function (p) { return p <= t; }).sort(function (a, b) { return a - b; });
+    var acc = [0, 0, 0, 0];
+    for (i = 0; i + 1 < pts.length; i++) {
+      var a = pts[i], b = pts[i + 1];
+      if (b - a <= 0) continue;
+      var ev = null;
+      for (j = events.length - 1; j >= 0; j--) { if (events[j].t0 <= a) { ev = events[j]; break; } }
+      var k;
+      if (ev && a < ev.t0 + BLEND) {
+        var ua = clamp01((a - ev.t0) / BLEND), ub = clamp01((b - ev.t0) / BLEND);
+        var span = BLEND * (smootherInt(ub) - smootherInt(ua));
+        for (k = 0; k < 4; k++) acc[k] += (b - a) * ev.from[k] + (ev.to[k] - ev.from[k]) * span;
+      } else {
+        var wa = weightsAt(a);
+        for (k = 0; k < 4; k++) acc[k] += (b - a) * wa[k];
+      }
+    }
+    return acc;
+  }
+
+  function stateAt(t) {
+    var w = weightsAt(t);
+    var st = { w: w, col: [0, 0, 0], speed: 0, density: 0, alpha: 0, dart: 0, breath: 0 };
+    for (var k = 0; k < 4; k++) {
+      var p = PARAMS[k];
+      st.col[0] += w[k] * p.col[0]; st.col[1] += w[k] * p.col[1]; st.col[2] += w[k] * p.col[2];
+      st.speed += w[k] * p.speed; st.density += w[k] * p.density;
+      st.alpha += w[k] * p.alpha; st.dart += w[k] * p.dart; st.breath += w[k] * p.breath;
+    }
+    return st;
+  }
+
+  // drift distance by time t: integral of the blended speed over history
+  function driftDist(t) {
+    var wi = weightsIntegral(t);
+    var d = 0;
+    for (var k = 0; k < 4; k++) d += PARAMS[k].speed * wi[k];
+    return d;
+  }
+
+  function enterState(idx, t) {
+    var to = [0, 0, 0, 0];
+    to[idx] = 1;
+    events.push({ t0: t, from: weightsAt(t), to: to });
+    if (events.length > 24) events.shift();
+  }
+
+  // ---------- marks ----------
+  var NMARKS = 400;
+  var marks = [];
+  (function buildMarks() {
+    var rng = mulberry32(870031);
+    var centres = [];
+    for (var c = 0; c < 6; c++) centres.push({ x: rng(), y: rng(), r: 0.10 + rng() * 0.14 });
+    var wind = rng() * Math.PI * 2;
+    for (var i = 0; i < NMARKS; i++) {
+      var bx, by;
+      if (rng() < 0.5) {   // gathered into slow currents
+        var cc = centres[Math.floor(rng() * centres.length)];
+        bx = cc.x + ((rng() + rng() + rng()) / 3 - 0.5) * 2 * cc.r * 1.8;
+        by = cc.y + ((rng() + rng() + rng()) / 3 - 0.5) * 2 * cc.r * 1.8;
+      } else { bx = rng(); by = rng(); }
+      var ang = wind + (rng() - 0.5) * 1.9;
+      marks.push({
+        bx: wrap1(bx), by: wrap1(by),
+        dx: Math.cos(ang), dy: Math.sin(ang),
+        spd: 0.5 + rng() * 0.9,
+        theta: rng(),
+        wf: 0.05 + rng() * 0.11, wp: rng() * Math.PI * 2,
+        dartK: 40 + rng() * 50, dartPh: rng() * Math.PI * 2, dartAmp: 0.6 + rng() * 0.7,
+        bf: 0.7 + rng() * 0.6, bp: rng() * Math.PI * 2,
+        type: rng() < 0.55 ? 0 : 1,
+        size: 1.7 + rng() * 2.1,
+        len: 2.4 + rng() * 3.4
+      });
+    }
+  })();
+
+  // ---------- sigils (quiet marks along the bottom edge, not buttons) ----------
+  function sigilPos(i) {
+    return { x: W * (0.5 + (i - 1) * 0.17), y: H - Math.max(26, S * 0.052) };
+  }
+  var SIGIL_STATE = [ST_PRISONER, ST_DRIFTER, ST_DREAMER];
+
+  function drawSigils(st) {
+    var sz = S * 0.017 * (isPhone ? 1.25 : 1);
+    ctx.lineWidth = Math.max(1.4, S * 0.0024);
+    ctx.lineCap = 'round';
+    for (var i = 0; i < 3; i++) {
+      var p = PARAMS[SIGIL_STATE[i]];
+      var wgt = st.w[SIGIL_STATE[i]];
+      var pos = sigilPos(i);
+      var sc = sz * (1 + 0.3 * wgt);
+      ctx.globalAlpha = 0.30 + 0.70 * wgt;
+      ctx.strokeStyle = 'rgb(' + p.col[0] + ',' + p.col[1] + ',' + p.col[2] + ')';
+      ctx.beginPath();
+      if (i === 0) {          // bar (Prisoner)
+        ctx.moveTo(pos.x - sc, pos.y - sc * 0.28);
+        ctx.lineTo(pos.x + sc, pos.y - sc * 0.28);
+        ctx.moveTo(pos.x - sc, pos.y + sc * 0.28);
+        ctx.lineTo(pos.x + sc, pos.y + sc * 0.28);
+      } else if (i === 1) {   // zigzag (Drifter)
+        ctx.moveTo(pos.x - sc, pos.y + sc * 0.45);
+        ctx.lineTo(pos.x - sc / 3, pos.y - sc * 0.55);
+        ctx.lineTo(pos.x + sc / 3, pos.y + sc * 0.55);
+        ctx.lineTo(pos.x + sc, pos.y - sc * 0.45);
+      } else {                // circle (Dreamer)
+        ctx.arc(pos.x, pos.y, sc * 0.78, 0, Math.PI * 2);
+      }
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- interaction (recorded samples) ----------
+  var drags = [];   // {x, y, vx, vy, t} pointer samples, px space
+
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = BG;
+    ctx.fillRect(0, 0, W, H);
+
+    var st = stateAt(t);
+    var D = driftDist(t);
+    var col = 'rgb(' + (st.col[0] | 0) + ',' + (st.col[1] | 0) + ',' + (st.col[2] | 0) + ')';
+    var sizeMul = (S / 700) * (isPhone ? 1.35 : 1);
+    var sig = 0.15 * S;
+    var wP = st.w[ST_PRISONER], wD = st.w[ST_DRIFTER], wM = st.w[ST_DREAMER];
+    var i, j, m;
+
+    for (i = 0; i < marks.length; i++) {
+      m = marks[i];
+      var adv = m.spd * D;
+      var ux = m.bx + m.dx * adv + 0.0035 * Math.sin(m.wf * t + m.wp);
+      var uy = m.by + m.dy * adv + 0.0035 * Math.cos(m.wf * 0.83 * t + m.wp * 1.7);
+      // Drifter dart: perpendicular wiggle whose phase runs on travelled distance
+      var dartOff = st.dart * m.dartAmp * 0.011 * Math.sin(m.dartK * D + m.dartPh);
+      ux += -m.dy * dartOff;
+      uy += m.dx * dartOff;
+      var px = wrap1(ux) * W, py = wrap1(uy) * H;
+
+      var vis = clamp01((st.density + 0.08 - m.theta) / 0.16);
+      if (vis <= 0.004) continue;
+      var alpha = st.alpha * vis;
+      // Dreamer breathing: marks fade in and out as they drift
+      alpha *= 1 - st.breath * 0.55 * (0.5 - 0.5 * Math.cos(0.35 * m.bf * t + m.bp));
+
+      var ox = 0, oy = 0, wake = 0;
+      for (j = 0; j < drags.length; j++) {
+        var s = drags[j];
+        var age = t - s.t;
+        if (age < 0 || age > 6) continue;
+        var gx = px - s.x, gy = py - s.y;
+        var d2 = gx * gx + gy * gy;
+        if (d2 > 9 * sig * sig) continue;
+        var fall = Math.exp(-d2 / (2 * sig * sig));
+        var dist = Math.sqrt(d2) || 1;
+        // Prisoner: heavy carry, long memory, the field lags behind the hand
+        ox += s.vx * fall * Math.exp(-age / 3.5) * 0.42 * wP;
+        oy += s.vy * fall * Math.exp(-age / 3.5) * 0.42 * wP;
+        // Drifter: skittish radial scatter, gone in half a second
+        var sc = fall * Math.exp(-age / 0.55) * 0.055 * S * wD;
+        ox += (gx / dist) * sc; oy += (gy / dist) * sc;
+        // Dreamer: a dissolving wake along the path, faint drift with it
+        wake += fall * Math.exp(-age / 3) * wM;
+        ox += s.vx * fall * Math.exp(-age / 3) * 0.10 * wM;
+        oy += s.vy * fall * Math.exp(-age / 3) * 0.10 * wM;
+      }
+      var om = Math.sqrt(ox * ox + oy * oy), omax = 0.085 * S;
+      if (om > omax) { ox = ox / om * omax; oy = oy / om * omax; }
+      px += ox; py += oy;
+      alpha = clamp01(alpha + wake * 0.55);
+      if (alpha <= 0.004) continue;
+
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = col;
+      var sz = Math.max(1.1, m.size * sizeMul);
+      if (m.type === 0) {
+        ctx.fillRect(px - sz / 2, py - sz / 2, sz, sz);
+      } else {
+        var aa = Math.atan2(m.dy, m.dx) + dartOff * 22 + 0.5 * Math.sin(t * 0.3 + m.wp);
+        var ln = m.len * sizeMul * 1.35;
+        ctx.strokeStyle = col;
+        ctx.lineWidth = Math.max(1, sz * 0.8);
+        ctx.beginPath();
+        ctx.moveTo(px, py);
+        ctx.lineTo(px + Math.cos(aa) * ln, py + Math.sin(aa) * ln);
+        ctx.stroke();
+      }
+    }
+    ctx.globalAlpha = 1;
+    drawSigils(st);
+  }
+
+  // ---------- audio (lazy, guarded; one register per space-time) ----------
+  var AC = null, master = null, audioOK = false;
+  var droneOsc = [], droneGain = null, nextPing = 2.5, nextTone = 4;
+  var aRng = mulberry32(1379);
+  var TONE_FREQS = [220, 261.63, 329.63, 392];
+
+  function ensureAudio() {
+    if (audioOK) return;
+    audioOK = true;   // try once
+    try {
+      var Ctor = window.AudioContext || window.webkitAudioContext;
+      if (typeof Ctor !== 'function') return;
+      AC = new Ctor();
+      master = AC.createGain();
+      master.gain.value = 0.5;
+      master.connect(AC.destination);
+      // Prisoner drone: two low sines, gain follows the prisoner weight
+      droneGain = AC.createGain();
+      droneGain.gain.value = 0;
+      droneGain.connect(master);
+      [55, 82.41].forEach(function (f) {
+        var o = AC.createOscillator();
+        o.type = 'sine';
+        o.frequency.value = f;
+        o.connect(droneGain);
+        o.start();
+        droneOsc.push(o);
+      });
+    } catch (e) { AC = null; }
+  }
+
+  function ping(wgt) {
+    if (!AC || wgt <= 0.03) return;
+    try {
+      var t0 = AC.currentTime;
+      var o = AC.createOscillator();
+      o.type = 'triangle';
+      o.frequency.value = 1200 + aRng() * 1200;
+      var gn = AC.createGain();
+      gn.gain.setValueAtTime(0.09 * wgt, t0);
+      gn.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.28);
+      o.connect(gn); gn.connect(master);
+      o.start(t0); o.stop(t0 + 0.32);
+    } catch (e) { /* silent */ }
+  }
+
+  function tone(wgt) {
+    if (!AC || wgt <= 0.03) return;
+    try {
+      var t0 = AC.currentTime;
+      var o = AC.createOscillator();
+      o.type = 'sine';
+      o.frequency.value = TONE_FREQS[Math.floor(aRng() * TONE_FREQS.length)];
+      var gn = AC.createGain();
+      gn.gain.setValueAtTime(0, t0);
+      gn.gain.linearRampToValueAtTime(0.07 * wgt, t0 + 2);
+      gn.gain.exponentialRampToValueAtTime(0.0001, t0 + 6);
+      o.connect(gn); gn.connect(master);
+      o.start(t0); o.stop(t0 + 6.2);
+    } catch (e) { /* silent */ }
+  }
+
+  function audioFrame(t, st) {
+    if (!AC || !droneGain) return;
+    try {
+      droneGain.gain.setTargetAtTime(0.055 * st.w[ST_PRISONER], AC.currentTime, 0.4);
+      if (t >= nextPing) { ping(st.w[ST_DRIFTER]); nextPing = t + (1.4 + aRng() * 3) / Math.max(0.25, st.w[ST_DRIFTER] + 0.25); }
+      if (t >= nextTone) { tone(st.w[ST_DREAMER]); nextTone = t + 4 + aRng() * 5; }
+    } catch (e) { /* silent */ }
+  }
+
+  // ---------- time ----------
+  var T0 = 0;
+  function nowS() { return performance.now() / 1000 - T0; }
+
+  // ---------- pointer ----------
+  var downAt = null, downT = 0, dragging = false, lastTapT = -10;
+  var lastDragT = -1, lastDragX = 0, lastDragY = 0;
+
+  function evtPos(e) {
+    var rect = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    return { x: (e.clientX || 0) - rect.left, y: (e.clientY || 0) - rect.top };
+  }
+
+  function sigilAt(p) {
+    var hitR = Math.max(0.05 * S, 30);
+    for (var i = 0; i < 3; i++) {
+      var pos = sigilPos(i);
+      var dx = p.x - pos.x, dy = p.y - pos.y;
+      if (dx * dx + dy * dy < hitR * hitR) return i;
+    }
+    return -1;
+  }
+
+  function onDown(e) {
+    ensureAudio();
+    if (AC && AC.resume) { try { AC.resume(); } catch (err) { /* ignore */ } }
+    var p = evtPos(e);
+    downAt = p; downT = nowS(); dragging = false; lastDragT = -1;
+    if (e.preventDefault) e.preventDefault();
+  }
+
+  function onMove(e) {
+    if (!downAt) return;
+    var p = evtPos(e);
+    var t = nowS();
+    var dx = p.x - downAt.x, dy = p.y - downAt.y;
+    if (!dragging && dx * dx + dy * dy > 36) dragging = true;
+    if (dragging) {
+      var dt = t - lastDragT;
+      var moved = Math.abs(p.x - lastDragX) + Math.abs(p.y - lastDragY);
+      if (lastDragT < 0 || (dt > 0.045 && moved > 6)) {
+        var vx = 0, vy = 0;
+        if (lastDragT > 0 && dt > 0.001) {
+          vx = clamp((p.x - lastDragX) / dt, -900, 900) / 60;
+          vy = clamp((p.y - lastDragY) / dt, -900, 900) / 60;
+        }
+        drags.push({ x: p.x, y: p.y, vx: vx, vy: vy, t: t });
+        if (drags.length > 90) drags.shift();
+        lastDragT = t; lastDragX = p.x; lastDragY = p.y;
+      }
+    }
+    if (e.preventDefault) e.preventDefault();
+  }
+
+  function onUp(e) {
+    if (!downAt) return;
+    var t = nowS();
+    var wasDrag = dragging;
+    var p = evtPos(e);
+    downAt = null; dragging = false;
+    if (wasDrag || t - downT > 0.45) return;   // drags and long presses are not taps
+    var si = sigilAt(p);
+    if (si >= 0) {                    // tap a sigil: enter that space-time
+      enterState(SIGIL_STATE[si], t);
+      lastTapT = -10;                 // sigil taps never read as a release double-tap
+      return;
+    }
+    if (t - lastTapT < 0.35) {        // double-tap the field: release to neutral
+      enterState(ST_NEUTRAL, t);
+      lastTapT = -10;
+      return;
+    }
+    lastTapT = t;
+    if (e.preventDefault) e.preventDefault();
+  }
+
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', function () { downAt = null; dragging = false; });
+  }
+
+  // ---------- main ----------
+  T0 = performance.now() / 1000;
+  layout();
+  draw(0);
+
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { layout(); draw(nowS()); });
+  }
+  window.addEventListener('resize', function () { layout(); draw(nowS()); });
+
+  if (typeof requestAnimationFrame === 'function') {
+    var frame = function () {
+      var t = nowS();
+      var st = stateAt(t);
+      audioFrame(t, st);
+      while (drags.length && t - drags[0].t > 6.5) drags.shift();
+      draw(t);
+      requestAnimationFrame(frame);
+    };
+    requestAnimationFrame(frame);
+  }
+})();
+</script>
+</body>
+</html>

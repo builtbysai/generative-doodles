@@ -1,0 +1,529 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>No Computer in the Mix</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #020203; height: 100%; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  "use strict";
+
+  var COL = {
+    black: "#020203",
+    live: "#E8A020",     // live line, temple gold
+    sustain: "#8A6A2E",  // sustaining lines, dimming gold
+    shimmer: "#4D7A99",  // harmonic shimmer at crossings
+    crimson: "#B03030"   // the loudest line only
+  };
+  var DECAY = 20;          // seconds a released line sustains before it is gone
+  var MAX_STROKES = 10;    // visual cap (oldest faded voices drop out)
+  var MAX_OSC = 8;         // audio cap: one oscillator per active stroke
+  var DBL_SEC = 0.35;      // double-tap window, seconds on the piece clock
+  var CRIMSON_MIN = 3.4;   // loudness-energy threshold: crimson only when a stroke is truly loud
+
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+  function lerp(a, b, f) { return a + (b - a) * f; }
+
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function hexRGB(hex) {
+    return [parseInt(hex.slice(1, 3), 16), parseInt(hex.slice(3, 5), 16), parseInt(hex.slice(5, 7), 16)];
+  }
+  var LIVE_RGB = hexRGB(COL.live), SUS_RGB = hexRGB(COL.sustain);
+  function mixGold(f) { // f: 0 = live gold, 1 = sustaining umber
+    return "rgb(" + Math.round(lerp(LIVE_RGB[0], SUS_RGB[0], f)) + "," +
+                    Math.round(lerp(LIVE_RGB[1], SUS_RGB[1], f)) + "," +
+                    Math.round(lerp(LIVE_RGB[2], SUS_RGB[2], f)) + ")";
+  }
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById("c");
+  var ctx = canvas.getContext("2d");
+  var W = 0, H = 0, U = 1, PHONE = false;
+
+  function detectPhone(w, h) {
+    var sw = 0, sh = 0;
+    if (typeof window !== "undefined" && window.screen) {
+      sw = window.screen.width || 0;
+      sh = window.screen.height || 0;
+    }
+    if (sw > 0 && sh > 0) return Math.min(sw, sh) < 700;
+    return h > w * 1.15; // aspect fallback only when screen size is unavailable
+  }
+
+  function resize() {
+    var w = 0, h = 0;
+    if (typeof window !== "undefined" && window.visualViewport) {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    }
+    if (!w || !h) {
+      w = (typeof window !== "undefined" && window.innerWidth) || 300;
+      h = (typeof window !== "undefined" && window.innerHeight) || 300;
+    }
+    W = w; H = h; U = Math.min(w, h);
+    PHONE = detectPhone(w, h);
+    var dpr = 1;
+    if (typeof window !== "undefined" && window.devicePixelRatio) {
+      dpr = clamp(window.devicePixelRatio, 1, 2);
+    }
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ensureGhost();
+    draw(nowSec());
+  }
+
+  // ---------- clock (elapsed seconds; frame one is t = 0, drawn synchronously) ----------
+  var startStamp = null;
+  function nowSec() {
+    if (typeof performance !== "undefined" && performance && typeof performance.now === "function") {
+      var n = performance.now() / 1000;
+      if (startStamp === null) startStamp = n;
+      return n - startStamp;
+    }
+    return 0;
+  }
+
+  // ---------- strokes ----------
+  // A stroke is a recorded polyline: points {x, y, t, w, s} in field units
+  // (1 unit = min(viewport w, h)); x,y are offsets from the top-left in those
+  // units, t is the piece-clock second the point was drawn, w its width, s
+  // its drawing speed. Everything drawn is a pure function of the recorded
+  // strokes, the gong list, and t. No state is integrated frame to frame.
+  var strokes = [];   // {pts, endT (null while live), ghost, energy}
+  var liveStroke = null;
+  var gongs = [];     // {x, y, t0, freq}
+  var nextId = 1;
+
+  function makeGhost(fw, fh) {
+    // One seeded trace drawn "just before load": stroke time runs from
+    // t = -9.2 to t = -7.6, so at frame one it is a voice 7.6 s into its
+    // 20 s decay, fully dimmed to umber, crossing the middle of the field.
+    var rng = mulberry32(869030);
+    var N = 46;
+    var ctrl = [];
+    for (var c = 0; c < 7; c++) ctrl.push((rng() - 0.5) * 0.16);
+    var pts = [];
+    var drawDur = 1.6, tStart = -9.2;
+    var prev = null, cum = 0;
+    var raw = [];
+    for (var i = 0; i < N; i++) {
+      var f = i / (N - 1);
+      var x = lerp(0.07, 0.93, f) * fw;
+      var seg = f * (ctrl.length - 1);
+      var ci = Math.floor(seg), cf = seg - ci;
+      var smooth = ctrl[ci] + (ctrl[Math.min(ci + 1, ctrl.length - 1)] - ctrl[ci]) * (0.5 - 0.5 * Math.cos(cf * Math.PI));
+      var y = (0.52 + 0.07 * Math.sin(f * Math.PI * 1.15 - 0.4) + smooth) * fh;
+      raw.push({ x: x, y: y, w: 0.0058 + 0.0016 * Math.sin(f * Math.PI) });
+    }
+    for (var j = 0; j < N; j++) {
+      if (prev) cum += Math.hypot(raw[j].x - prev.x, raw[j].y - prev.y);
+      var speed = 0.62; // field units per second while it was drawn
+      pts.push({ x: raw[j].x, y: raw[j].y, t: tStart + cum / speed, w: raw[j].w, s: speed });
+      prev = raw[j];
+    }
+    void drawDur;
+    return { pts: pts, endT: tStart + cum / 0.62, ghost: true, energy: 0, id: 0 };
+  }
+
+  var ghostBuilt = false;
+  function ensureGhost() {
+    if (ghostBuilt || !W || !H) return;
+    ghostBuilt = true;
+    strokes.push(makeGhost(W / U, H / U));
+  }
+
+  function strokeAlpha(st, t) {
+    if (st === liveStroke) return 1;
+    if (st.endT === null) return 1;
+    var age = t - st.endT;
+    if (age < 0) return 1;
+    var f = clamp(1 - age / DECAY, 0, 1);
+    return Math.pow(f, 1.25);
+  }
+  function sustainMix(st, t) { // 0 live gold -> 1 umber over the first 5 s after release
+    if (st === liveStroke || st.endT === null) return 0;
+    return clamp((t - st.endT) / 5, 0, 1);
+  }
+
+  function loudestStroke(t) {
+    var best = null, bestE = CRIMSON_MIN;
+    for (var i = 0; i < strokes.length; i++) {
+      var st = strokes[i];
+      if (st.ghost) continue;                 // the seeded trace is not a voice
+      if (strokeAlpha(st, t) <= 0.05) continue;
+      if (st.energy > bestE) { bestE = st.energy; best = st; }
+    }
+    return best;
+  }
+
+  // ---------- crossings (harmonic shimmer) ----------
+  // Intersections are geometric constants once both strokes exist, so they
+  // are recomputed only when the stroke set changes (plus, each frame, for
+  // the still-growing live stroke against the finished ones).
+  var cachedCross = [];
+  function segHit(ax, ay, bx, by, cx, cy, dx, dy) {
+    var r1x = bx - ax, r1y = by - ay, r2x = dx - cx, r2y = dy - cy;
+    var den = r1x * r2y - r1y * r2x;
+    if (Math.abs(den) < 1e-12) return null;
+    var t = ((cx - ax) * r2y - (cy - ay) * r2x) / den;
+    var u = ((cx - ax) * r1y - (cy - ay) * r1x) / den;
+    if (t <= 0.001 || t >= 0.999 || u <= 0.001 || u >= 0.999) return null;
+    return { x: ax + t * r1x, y: ay + t * r1y };
+  }
+  function crossBetween(a, b, out) {
+    var pa = a.pts, pb = b.pts;
+    for (var i = 1; i < pa.length; i++) {
+      for (var j = 1; j < pb.length; j++) {
+        var h = segHit(pa[i - 1].x, pa[i - 1].y, pa[i].x, pa[i].y,
+                       pb[j - 1].x, pb[j - 1].y, pb[j].x, pb[j].y);
+        if (h) { h.a = a; h.b = b; out.push(h); }
+      }
+    }
+  }
+  function recomputeCross() {
+    cachedCross = [];
+    var done = [];
+    for (var i = 0; i < strokes.length; i++) if (strokes[i] !== liveStroke) done.push(strokes[i]);
+    for (var a = 0; a < done.length; a++)
+      for (var b = a + 1; b < done.length; b++) crossBetween(done[a], done[b], cachedCross);
+  }
+
+  // ---------- audio (lazy, gesture-armed, typeof-guarded) ----------
+  var AC = null, master = null, voices = {}; // stroke id -> {osc, gain}
+  function audioArmed() {
+    if (AC) return true;
+    if (typeof AudioContext === "undefined" && typeof webkitAudioContext === "undefined") return false;
+    try {
+      var Ctor = (typeof AudioContext !== "undefined") ? AudioContext : webkitAudioContext;
+      AC = new Ctor();
+      master = AC.createGain();
+      master.gain.value = 0.9;
+      master.connect(AC.destination);
+    } catch (e) { AC = null; return false; }
+    return true;
+  }
+  function voiceStart(st) {
+    if (!audioArmed()) return;
+    if (Object.keys(voices).length >= MAX_OSC) {
+      // retire the oldest sustained voice to stay under the cap
+      var oldestId = null, oldestEnd = Infinity;
+      for (var k in voices) {
+        var s = strokeById(+k);
+        if (s && s !== liveStroke && s.endT !== null && s.endT < oldestEnd) { oldestEnd = s.endT; oldestId = k; }
+      }
+      if (oldestId !== null) voiceStop(+oldestId, 0.15); else return;
+    }
+    try {
+      var osc = AC.createOscillator(), g = AC.createGain();
+      osc.type = "sine";
+      osc.frequency.value = 140;
+      g.gain.value = 0;
+      osc.connect(g); g.connect(master);
+      osc.start();
+      voices[st.id] = { osc: osc, gain: g };
+    } catch (e) { /* silent in any failure */ }
+  }
+  function voiceTone(st, freq, bright) {
+    var v = voices[st.id];
+    if (!v || !AC) return;
+    try {
+      v.osc.frequency.setTargetAtTime(freq, AC.currentTime, 0.03);
+      v.gain.gain.setTargetAtTime(0.02 + 0.20 * clamp(bright, 0, 1), AC.currentTime, 0.03);
+    } catch (e) { /* ignore */ }
+  }
+  function voiceRelease(st) {
+    var v = voices[st.id];
+    if (!v || !AC) return;
+    try {
+      var now = AC.currentTime;
+      v.gain.gain.cancelScheduledValues(now);
+      v.gain.gain.setTargetAtTime(0, now, DECAY / 3.5);
+      v.osc.stop(now + DECAY + 1);
+      var id = st.id;
+      v.osc.onended = function () { delete voices[id]; };
+    } catch (e) { delete voices[st.id]; }
+  }
+  function voiceStop(id, fade) {
+    var v = voices[id];
+    if (!v || !AC) { delete voices[id]; return; }
+    try {
+      var now = AC.currentTime;
+      v.gain.gain.cancelScheduledValues(now);
+      v.gain.gain.setTargetAtTime(0, now, Math.max(0.03, fade / 3));
+      v.osc.stop(now + fade + 0.2);
+      v.osc.onended = function () { delete voices[id]; };
+    } catch (e) { delete voices[id]; }
+  }
+  function strokeById(id) {
+    for (var i = 0; i < strokes.length; i++) if (strokes[i].id === id) return strokes[i];
+    return null;
+  }
+  function gongSound(freq) {
+    if (!audioArmed()) return;
+    try {
+      var now = AC.currentTime;
+      [[1, 0.20], [2.76, 0.06]].forEach(function (part) {
+        var osc = AC.createOscillator(), g = AC.createGain();
+        osc.type = "sine";
+        osc.frequency.value = freq * part[0];
+        g.gain.setValueAtTime(part[1], now);
+        g.gain.exponentialRampToValueAtTime(0.0001, now + 2.4);
+        osc.connect(g); g.connect(master);
+        osc.start(now); osc.stop(now + 2.5);
+      });
+    } catch (e) { /* ignore */ }
+  }
+
+  // pitch from curvature: local turn rate (radians per field unit), mapped
+  // exponentially so a straight drag hums low and a tight scribble sings high.
+  function freqFromCurv(k) {
+    return 80 * Math.pow(7.5, clamp(k / 9, 0, 1)); // 80 .. 600 Hz, no snapping anywhere
+  }
+  function pointCurvature(pts, i) {
+    if (i < 2) return 0;
+    var a = pts[i - 2], b = pts[i - 1], c = pts[i];
+    var v1x = b.x - a.x, v1y = b.y - a.y, v2x = c.x - b.x, v2y = c.y - b.y;
+    var l1 = Math.hypot(v1x, v1y), l2 = Math.hypot(v2x, v2y);
+    if (l1 < 1e-6 || l2 < 1e-6) return 0;
+    var dot = clamp((v1x * v2x + v1y * v2y) / (l1 * l2), -1, 1);
+    return Math.acos(dot) / ((l1 + l2) / 2);
+  }
+
+  // ---------- drawing ----------
+  function drawStrokePath(st, t, loudest) {
+    var pts = st.pts;
+    if (pts.length < 2) return;
+    var alpha = strokeAlpha(st, t);
+    if (alpha <= 0.003) return;
+    var crimson = (st === loudest);
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    for (var i = 1; i < pts.length; i++) {
+      var p = pts[i], q = pts[i - 1];
+      if (p.t > t) break;                    // not drawn yet at this clock time
+      var segA = alpha;
+      if (st === liveStroke) segA = 1;
+      else if (p.t > st.endT) segA = alpha;  // after release the whole line shares the decay
+      ctx.globalAlpha = clamp(segA, 0, 1);
+      ctx.strokeStyle = crimson ? COL.crimson : mixGold(sustainMix(st, t));
+      ctx.lineWidth = Math.max(0.8, p.w * U * (PHONE ? 1.3 : 1));
+      ctx.beginPath();
+      ctx.moveTo(q.x * U, q.y * U);
+      ctx.lineTo(p.x * U, p.y * U);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function draw(t) {
+    if (!W || !H) return;
+    canvas.style.width = W + "px";
+    canvas.style.height = H + "px";
+    ctx.fillStyle = COL.black;
+    ctx.fillRect(0, 0, W, H);
+
+    // retire fully decayed strokes (keeps crossing cost bounded)
+    for (var i = strokes.length - 1; i >= 0; i--) {
+      var st = strokes[i];
+      if (st !== liveStroke && st.endT !== null && t - st.endT > DECAY + 0.5) {
+        strokes.splice(i, 1);
+        recomputeCross();
+      }
+    }
+
+    var loud = loudestStroke(t);
+    for (var s = 0; s < strokes.length; s++) drawStrokePath(strokes[s], t, loud);
+
+    // crossings: cached pairs + the live stroke against finished ones
+    var cross = cachedCross.slice();
+    if (liveStroke) {
+      for (var f = 0; f < strokes.length; f++) {
+        if (strokes[f] !== liveStroke) crossBetween(liveStroke, strokes[f], cross);
+      }
+    }
+    for (var c = 0; c < cross.length; c++) {
+      var h = cross[c];
+      var aA = strokeAlpha(h.a, t), aB = strokeAlpha(h.b, t);
+      var m = Math.min(aA, aB);
+      if (m <= 0.02) continue;
+      var pulse = 0.75 + 0.25 * Math.sin(t * 3 + (h.x * 12.9 + h.y * 7.7));
+      var r = 0.006 * U * pulse + 1.2;
+      ctx.globalAlpha = clamp(0.85 * m * pulse, 0, 1);
+      ctx.fillStyle = COL.shimmer;
+      ctx.beginPath();
+      ctx.moveTo(h.x * U, h.y * U - r);
+      ctx.lineTo(h.x * U + r, h.y * U);
+      ctx.lineTo(h.x * U, h.y * U + r);
+      ctx.lineTo(h.x * U - r, h.y * U);
+      ctx.closePath();
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // gong blooms
+    for (var g = gongs.length - 1; g >= 0; g--) {
+      var gn = gongs[g];
+      var age = t - gn.t0;
+      if (age < 0) continue;
+      if (age > 2.2) { gongs.splice(g, 1); continue; }
+      var fr = age / 1.6;
+      var rad = (0.012 + 0.16 * (1 - Math.pow(1 - Math.min(fr, 1), 2))) * U;
+      ctx.globalAlpha = clamp(0.9 * (1 - age / 2.2), 0, 1);
+      ctx.strokeStyle = COL.live;
+      ctx.lineWidth = Math.max(1, 0.0035 * U * (1 - fr * 0.6));
+      ctx.beginPath();
+      ctx.arc(gn.x * U, gn.y * U, rad, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.globalAlpha = clamp(0.9 * (1 - age / 1.4), 0, 1);
+      ctx.fillStyle = COL.live;
+      ctx.beginPath();
+      ctx.arc(gn.x * U, gn.y * U, Math.max(1.2, 0.006 * U * (1 - age / 2)), 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- interaction ----------
+  var downInfo = null;   // {x, y, t, moved}
+  var lastTap = { t: -10, x: 0, y: 0 };
+  var kSmooth = 0;
+
+  function evtPos(e) {
+    var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    var px = (e.clientX - r.left), py = (e.clientY - r.top);
+    return { x: px / U, y: py / U, pressure: (typeof e.pressure === "number") ? e.pressure : 0 };
+  }
+
+  function clearField() {
+    for (var k in voices) voiceStop(+k, 0.12);
+    strokes = [];
+    gongs = [];
+    ghostBuilt = false; // a fresh take: no ghost returns until the next load
+    liveStroke = null;
+    cachedCross = [];
+  }
+
+  function onDown(e) {
+    var t = nowSec();
+    var p = evtPos(e);
+    // double-tap: clear the field (the only erasure)
+    if (t - lastTap.t <= DBL_SEC && Math.hypot(p.x - lastTap.x, p.y - lastTap.y) < 0.09) {
+      clearField();
+      lastTap = { t: -10, x: 0, y: 0 };
+      downInfo = { x: p.x, y: p.y, t: t, moved: true, swallowed: true };
+      draw(t);
+      return;
+    }
+    downInfo = { x: p.x, y: p.y, t: t, moved: false, swallowed: false };
+    liveStroke = { pts: [{ x: p.x, y: p.y, t: t, w: 0.007, s: 0 }], endT: null, ghost: false, energy: 0, id: nextId++ };
+    kSmooth = 0;
+    if (strokes.length >= MAX_STROKES) {
+      // drop the oldest non-live stroke to bound the field
+      for (var i = 0; i < strokes.length; i++) {
+        if (strokes[i] !== liveStroke && strokes[i].endT !== null) {
+          if (voices[strokes[i].id]) voiceStop(strokes[i].id, 0.15);
+          strokes.splice(i, 1);
+          break;
+        }
+      }
+    }
+    strokes.push(liveStroke);
+    voiceStart(liveStroke);
+    draw(t);
+  }
+
+  function onMove(e) {
+    if (!downInfo || downInfo.swallowed || !liveStroke) return;
+    var t = nowSec();
+    var p = evtPos(e);
+    var pts = liveStroke.pts;
+    var last = pts[pts.length - 1];
+    var d = Math.hypot(p.x - last.x, p.y - last.y);
+    if (d < 0.004) return;
+    downInfo.moved = true;
+    var dt = Math.max(0.008, t - last.t);
+    var speed = d / dt;                                  // field units per second
+    var w = clamp(0.0105 - speed * 0.0030, 0.0032, 0.011);
+    if (p.pressure > 0) w *= (0.7 + 0.6 * p.pressure);   // pressure proxy where the device offers it
+    pts.push({ x: p.x, y: p.y, t: t, w: w, s: speed });
+    // loudness energy: speed x width, the stroke's peak is its voice
+    var e2 = speed * w * 900;
+    if (e2 > liveStroke.energy) liveStroke.energy = e2;
+    // pitch follows the recent curvature, raw and unsnapped
+    var k = pointCurvature(pts, pts.length - 1);
+    kSmooth = 0.65 * kSmooth + 0.35 * k;
+    var bright = clamp(0.25 + speed * 0.35, 0, 1);
+    voiceTone(liveStroke, freqFromCurv(kSmooth), bright);
+    draw(t);
+  }
+
+  function onUp(e) {
+    var t = nowSec();
+    if (!downInfo) { liveStroke = null; draw(t); return; }
+    var wasSwallowed = downInfo.swallowed;
+    var p = evtPos(e);
+    var dur = t - downInfo.t;
+    var isTap = !wasSwallowed && !downInfo.moved && dur <= 0.4 && liveStroke && liveStroke.pts.length <= 2;
+    if (liveStroke) {
+      var st = liveStroke;
+      liveStroke = null;
+      if (isTap) {
+        // a tap is not a stroke: remove it, strike a gong instead
+        var idx = strokes.indexOf(st);
+        if (idx >= 0) strokes.splice(idx, 1);
+        voiceStop(st.id, 0.05);
+        var freq = lerp(320, 90, clamp(p.y / (H / U), 0, 1)); // higher tap, higher ring
+        gongs.push({ x: downInfo.x, y: downInfo.y, t0: t, freq: freq });
+        gongSound(freq);
+        lastTap = { t: t, x: downInfo.x, y: downInfo.y };
+      } else {
+        st.endT = t;
+        voiceRelease(st);
+        recomputeCross();
+      }
+    }
+    downInfo = null;
+    draw(t);
+  }
+
+  if (canvas.addEventListener) {
+    canvas.addEventListener("pointerdown", onDown);
+    canvas.addEventListener("pointermove", onMove);
+    canvas.addEventListener("pointerup", onUp);
+    canvas.addEventListener("pointercancel", onUp);
+  }
+  if (typeof window !== "undefined" && window.addEventListener) {
+    window.addEventListener("resize", resize);
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener("resize", resize);
+    }
+  }
+
+  // ---------- run ----------
+  resize();
+  draw(0); // frame one: the ghost trace mid-decay, synchronously at t = 0
+  function loop() {
+    draw(nowSec());
+    if (typeof requestAnimationFrame === "function") requestAnimationFrame(loop);
+  }
+  if (typeof requestAnimationFrame === "function") requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
