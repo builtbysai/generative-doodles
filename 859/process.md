@@ -1,0 +1,31 @@
+# No.859 — Angle. Reflect. Release.
+
+Study #105 hsin-chien-huang, PP20 "Resonance Puzzles" (the Ekholux mechanic: launch sound spheres, shape the space with resonance).
+
+## Concept
+
+A dark void holds four concrete rails in an open triangle arrangement and one dark portal patch at the right side. Sound spheres launch from the bottom edge, arc under gentle gravity, and bounce off the rails. Every bounce releases an expanding resonance ring; where two rings overlap, the lens between them glows teal, the overlap made visible. The geometry is the instrument: flick to launch a sphere, tap to rotate the nearest rail 15 degrees and change the acoustics of the space, double-tap to reseed the rail arrangement. One sphere auto-launches on a slow seeded cadence so the space is never dead. No HUD, no score, no levels, no fanfare, and nothing to hit: the rails are fixed geometry, not targets.
+
+## Construction
+
+- Single self-contained `index.html`, canvas 2D only, no external assets. Strict palette: void #0A0A0C, rail concrete #6E6A63, sphere amber #E8A020, resonance ring #D8D2C4, overlap glow #7FD4C1 (overlap zones only), portal dark #120A08. No text anywhere except the `<title>`.
+- Sizing from the Visual Viewport API with resize listeners on both visualViewport and window; canvas CSS size is pinned in px inside `draw()` every frame. Phone detection via `window.screen` physical size (min dimension < 700 px) with the aspect fallback `h > w * 1.15`. No gradients, no shadowBlur, no ctx.filter, no offscreen canvas; the sphere halo and the ring-overlap glow are built from flat-alpha circles and a clip-path lens.
+- Physics model: fixed-timestep simulation at 120 Hz substeps accumulated from the rAF clock, so behavior is frame-rate independent. Spheres are points with radius under gentle gravity (0.22 * U px/s^2). Walls: left, right, and top bounce; the bottom edge is open (launch edge and exit). Rail collision is circle-vs-segment (capsule): closest point on the segment, reflect velocity about the contact normal with 0.985 restitution, push out to the surface, and spawn a ring at the contact point. Spheres live 14 s (fading over the last 1.5 s), pool capped at 12 (oldest evicted), and die early inside the portal rectangle or below the frame.
+- Ring model: a ring is a center plus a birth time. Radius grows at 150 px/s scaled by U/720; alpha decays linearly from 0.55 over a 2.6 s life. Overlap glow: for every pair of active rings whose circles properly intersect (distance less than r1 + r2, greater than |r1 - r2|), the second circle is filled teal at low alpha clipped to the first circle, producing the lens.
+- Interaction: pointer, mouse, and touch handlers are all registered. A drag that moves is a flick: on release a sphere launches from the bottom edge near the release x with the flick vector (clamped, always directed up into the space). A tap rotates the nearest rail by 15 degrees around its center (rail specs are normalized, so the nudge is applied to the live rail and persists until a resize relayout or reseed). Two taps within 0.35 s and 60 px reseed: epoch increments, rails rebuild from the new seeded stream, spheres and rings reset to the frame-one anchor state.
+- Seeding: mulberry32. Epoch seed is 859001 + epoch * 7919 and drives rail jitter, auto-launch positions and velocities, and sphere pitches (pentatonic-ish steps from a 220 Hz base). The same stream is consumed in the same order on every load, so the opening state is identical everywhere.
+- Frame-one anchor: `resetWorld()` pre-launches one sphere with birth time -1.15 s, placed mid-flight at (0.44 W, 0.52 H) with velocity (0.16 U, -0.20 U) px/s, and pre-seeds one ring born at -0.38 s on the low rail, so frame one already shows a sphere in flight and a fresh ring expanding from a rail bounce. Frame one is drawn synchronously at load from this seeded state; the simulation only advances inside the rAF loop.
+- Audio: an AudioContext is created lazily inside the first pointer gesture only, fully typeof-guarded, master gain 0.16. Each sphere carries a seeded pitch; each bounce plays one short sine blip at that pitch through a fast attack / 0.45 s decay envelope. Launches and rail nudges play a soft blip too. Auto-launches before the first gesture are silent because the context does not exist yet. No microphone.
+
+## QA log
+
+- Rendered with `node ~/workspace/tools/render-piece.js` at 1280x900 (qa-desktop.png), 390x844 (qa-mobile.png), and 720x720 (thumb.png). The QA harness has no rAF and no AudioContext; the piece rendered cleanly in silence at all three sizes, confirming the guards.
+- Determinism: thumb.png rendered twice and byte-compared with `cmp` — identical, before and after the portal fix. The duplicate render was deleted. Frame one contains no `Date.now()` dependence; the only clock is the rAF timestamp feeding the fixed-step accumulator.
+- Read-back, desktop and thumb: near-black void; four grey rails (two upper diagonals leaning in, one short near-vertical rail at left, one low cross rail) forming an open arrangement; one amber sphere with a flat-alpha halo mid-frame below the center gap; one pale resonance ring expanding behind the low rail; the deep-brown portal patch at the right side. Mobile: same composition in the tall frame, rails thinner via the U-scaled half-thickness, portal and sphere intact, nothing clipped.
+- Fix during QA: the portal initially bled off the right edge of the frame (x offset used 0.72 of its width). Moved fully in-frame with a 0.02 U margin; re-rendered all sizes and re-verified byte-identical thumbs.
+
+## Deviations
+
+- Rail nudges from taps are stored on the live rail objects rather than in the normalized specs, so a window resize (which relayouts from specs) resets nudged angles. This keeps the layout code single-path; recorded here rather than adding a second state layer for an edge case.
+- The portal swallows spheres on rectangle overlap instead of a rounded shape test; the visual corner radius is small relative to a sphere, so the difference is not perceptible in play.
+- Sphere pitch uses a seeded diatonic ladder rather than a per-sphere oscillator with its own gain envelope node graph; the audible result (one blip per bounce at the sphere's pitch) matches the brief with far less machinery.

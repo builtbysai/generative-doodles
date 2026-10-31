@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>One Platform</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #030304; height: 100%; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- palette (strict) ----------
+  var BG      = '#030304';   // void black
+  var NEON    = '#00E5FF';   // platform neon
+  var RIDER   = '#FFD23F';   // rider yellow
+  var TRAIL   = '#7A6A20';   // trail, faded yellow-brown
+  var GHOST   = '#1A3A40';   // completed-route ghost, deep teal
+
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+
+  // ---------- seeded RNG (mulberry32) ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ---------- layout ----------
+  var W = 0, H = 0, DPR = 1, S = 1, isPhone = false;
+
+  function viewSize() {
+    var vv = window.visualViewport;
+    if (vv && vv.width) return { w: vv.width, h: vv.height };
+    return { w: window.innerWidth || 0, h: window.innerHeight || 0 };
+  }
+
+  function layout() {
+    var s = viewSize();
+    var oldW = W, oldH = H;
+    W = s.w; H = s.h;
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    var sw = (window.screen && window.screen.width) ? Math.min(window.screen.width, window.screen.height) : 9999;
+    isPhone = sw < 700 || H > W * 1.15;
+    S = Math.min(W, H) || 1;
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    // keep the rider in the same relative spot across a resize
+    if (oldW > 0 && oldH > 0 && rider) {
+      rider.x *= W / oldW; rider.y *= H / oldH;
+      rider.vx *= W / oldW; rider.vy *= H / oldH;
+      trail.length = 0; path.length = 0; ghost = null;
+    }
+  }
+
+  // ---------- world ----------
+  var PLAT_LEN = 0.24;       // platform length, fraction of S
+  var MAX_PLAT = 24;
+  var GRID = 0.05;           // placement snap, fraction of W / H
+
+  var platforms = [];        // { cx, cy } fractions of W,H + { ang } radians
+  var rider = null;          // { x, y, vx, vy } in px, px/s
+  var trail = [];            // recent rider positions, oldest first
+  var path = [];             // positions since the last completed circuit
+  var ghost = null;          // last completed circuit, drawn in deep teal
+  var visited = {};          // platform indices touched on the current circuit
+  var lastTouch = 0;         // platform the rider last touched (respawn anchor)
+  var airTime = 0;           // seconds since the rider last touched anything
+  var stallTime = 0;
+  var tiltRng = null;
+
+  function platEnds(p) {
+    var cx = p.cx * W, cy = p.cy * H;
+    var hl = PLAT_LEN * S * 0.5;
+    var dx = Math.cos(p.ang) * hl, dy = Math.sin(p.ang) * hl;
+    return { ax: cx - dx, ay: cy - dy, bx: cx + dx, by: cy + dy, cx: cx, cy: cy };
+  }
+
+  function riderRadius() { return Math.max(4, S * 0.014); }
+
+  function resetWorld() {
+    tiltRng = mulberry32(860210);
+    platforms = [{ cx: 0.20, cy: 0.50, ang: -0.055 }];
+    visited = { 0: true };
+    lastTouch = 0;
+    airTime = 0; stallTime = 0;
+    ghost = null; path = [];
+    spawnRider(0, 0.64);
+  }
+
+  // Place the rider on platform i at fraction f along it, moving toward b.
+  function spawnRider(i, f) {
+    var e = platEnds(platforms[i]);
+    var r = riderRadius();
+    var tx = e.bx - e.ax, ty = e.by - e.ay;
+    var tl = Math.sqrt(tx * tx + ty * ty) || 1;
+    tx /= tl; ty /= tl;
+    var nx = -ty, ny = tx;                 // platform normal
+    if (ny > 0) { nx = -nx; ny = -ny; }    // normal points up
+    var px = e.ax + (e.bx - e.ax) * f + nx * (r + 0.5);
+    var py = e.ay + (e.by - e.ay) * f + ny * (r + 0.5);
+    var speed = S * 0.17;
+    rider = { x: px, y: py, vx: tx * speed, vy: ty * speed };
+    // a short trail already laid behind the rider along the platform
+    trail = [];
+    for (var k = 26; k >= 1; k--) {
+      var back = (speed * k / 60);
+      trail.push({ x: px - tx * back, y: py - ty * back });
+    }
+    path = trail.slice();
+  }
+
+  // ---------- audio (lazy, gesture-gated, typeof-guarded) ----------
+  var AC = null, oscNode = null, oscGain = null;
+  function initAudio() {
+    if (AC) { if (AC.resume) AC.resume(); return; }
+    var Ctor = (typeof AudioContext !== 'undefined') ? AudioContext
+             : (typeof webkitAudioContext !== 'undefined') ? webkitAudioContext : null;
+    if (!Ctor) return;
+    try {
+      AC = new Ctor();
+      oscGain = AC.createGain(); oscGain.gain.value = 0.0;
+      oscGain.connect(AC.destination);
+      oscNode = AC.createOscillator();
+      oscNode.type = 'triangle'; oscNode.frequency.value = 60;
+      oscNode.connect(oscGain); oscNode.start();
+    } catch (e) { AC = null; oscNode = null; oscGain = null; }
+  }
+  function tickSound(vol) {
+    if (!AC || !oscNode) return;
+    try {
+      var t = AC.currentTime;
+      var o = AC.createOscillator(), g = AC.createGain();
+      o.type = 'square'; o.frequency.value = 170;
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(Math.max(0.0002, vol), t + 0.006);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.07);
+      o.connect(g); g.connect(AC.destination);
+      o.start(t); o.stop(t + 0.09);
+    } catch (e) { /* silent */ }
+  }
+  function audioFrame(speed) {
+    if (!AC || !oscNode || !oscGain) return;
+    try {
+      var f = 50 + clamp(speed, 0, S * 1.4) / (S * 1.4) * 230;
+      oscNode.frequency.setTargetAtTime(f, AC.currentTime, 0.05);
+      oscGain.gain.setTargetAtTime(0.035, AC.currentTime, 0.08);
+    } catch (e) { /* silent */ }
+  }
+
+  // ---------- interaction ----------
+  var dragging = false, dragX = 0, dragY = 0;
+  var downT = 0, downX = 0, downY = 0, moved = false;
+  var pendingTap = null;     // { x, y, timer }
+  var lastTapT = -10;
+
+  function placePlatform(x, y) {
+    if (platforms.length >= MAX_PLAT) return;
+    var cx = clamp(Math.round((x / W) / GRID) * GRID, 0.06, 0.94);
+    var cy = clamp(Math.round((y / H) / GRID) * GRID, 0.06, 0.94);
+    var ang = (tiltRng() * 2 - 1) * 0.28;
+    platforms.push({ cx: cx, cy: cy, ang: ang });
+  }
+
+  function pointerPos(ev) {
+    var r = canvas.getBoundingClientRect();
+    return { x: ev.clientX - r.left, y: ev.clientY - r.top };
+  }
+
+  function onDown(ev) {
+    initAudio();
+    var p = pointerPos(ev);
+    downT = performance.now() / 1000; downX = p.x; downY = p.y; moved = false;
+    dragging = false; dragX = p.x; dragY = p.y;
+    if (ev.preventDefault) ev.preventDefault();
+  }
+  function onMove(ev) {
+    if (downT === 0) return;
+    var p = pointerPos(ev);
+    dragX = p.x; dragY = p.y;
+    if (Math.abs(p.x - downX) > 10 || Math.abs(p.y - downY) > 10) { moved = true; dragging = true; }
+  }
+  function onUp(ev) {
+    if (downT === 0) return;
+    var now = performance.now() / 1000;
+    var p = pointerPos(ev);
+    var wasDrag = moved;
+    dragging = false; downT = 0;
+    if (wasDrag) return;
+    if (now - lastTapT < 0.32) {
+      // double-tap: cancel any pending placement and reseed
+      if (pendingTap) { clearTimeout(pendingTap.timer); pendingTap = null; }
+      lastTapT = -10;
+      resetWorld();
+      return;
+    }
+    lastTapT = now;
+    var tap = { x: p.x, y: p.y, timer: null };
+    tap.timer = setTimeout(function () {
+      if (pendingTap === tap) { placePlatform(tap.x, tap.y); pendingTap = null; }
+    }, 290);
+    pendingTap = tap;
+  }
+
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', function () { dragging = false; downT = 0; });
+  }
+
+  // ---------- physics ----------
+  var GRAV = 0.95;           // x S, px/s^2
+
+  function step(dt) {
+    if (!rider) return;
+    var g = GRAV * S;
+    var gx = 0, gy = g;
+    if (dragging) {
+      // gravity bends toward the drag point: steer, not control
+      var dx = dragX - rider.x, dy = dragY - rider.y;
+      var dl = Math.sqrt(dx * dx + dy * dy);
+      if (dl > 1) {
+        var bend = 0.68;
+        gx = (dx / dl) * g * bend;
+        gy = g * (1 - bend) + (dy / dl) * g * bend;
+      }
+    }
+    rider.vx += gx * dt;
+    rider.vy += gy * dt;
+    rider.x += rider.vx * dt;
+    rider.y += rider.vy * dt;
+
+    var r = riderRadius();
+    var contact = false;
+    for (var i = 0; i < platforms.length; i++) {
+      var e = platEnds(platforms[i]);
+      var abx = e.bx - e.ax, aby = e.by - e.ay;
+      var len2 = abx * abx + aby * aby || 1;
+      var tt = clamp(((rider.x - e.ax) * abx + (rider.y - e.ay) * aby) / len2, 0, 1);
+      var cxp = e.ax + abx * tt, cyp = e.ay + aby * tt;
+      var ddx = rider.x - cxp, ddy = rider.y - cyp;
+      var d = Math.sqrt(ddx * ddx + ddy * ddy);
+      if (d < r) {
+        var nx, ny;
+        if (d > 0.001) { nx = ddx / d; ny = ddy / d; }
+        else { nx = -aby; ny = abx; var nl = Math.sqrt(nx * nx + ny * ny) || 1; nx /= nl; ny /= nl; if (ny > 0) { nx = -nx; ny = -ny; } }
+        rider.x = cxp + nx * r;
+        rider.y = cyp + ny * r;
+        var vn = rider.vx * nx + rider.vy * ny;
+        if (vn < 0) {
+          if (vn < -S * 0.10 && airTime > 0.12) tickSound(clamp(-vn / (S * 0.9), 0.05, 0.20));
+          rider.vx -= vn * nx;
+          rider.vy -= vn * ny;
+          // gentle rolling friction on the surface
+          rider.vx *= (1 - 0.25 * dt);
+          rider.vy *= (1 - 0.25 * dt);
+        }
+        contact = true;
+        if (lastTouch !== i || airTime > 0) {
+          lastTouch = i;
+          visited[i] = true;
+          maybeCompleteCircuit(i);
+        }
+      }
+    }
+
+    if (contact) { airTime = 0; } else { airTime += dt; }
+
+    // trail + circuit path
+    trail.push({ x: rider.x, y: rider.y });
+    if (trail.length > 110) trail.shift();
+    path.push({ x: rider.x, y: rider.y });
+    if (path.length > 3600) path.shift();
+
+    // loop-back rule: never fall forever, never stall forever
+    var speed = Math.sqrt(rider.vx * rider.vx + rider.vy * rider.vy);
+    if (speed < S * 0.012 && !dragging) stallTime += dt; else stallTime = 0;
+    if (rider.y > H + 50 || rider.x < -90 || rider.x > W + 90 || rider.y < -140 || stallTime > 2.2) {
+      spawnRider(lastTouch, 0.5);
+      visited = {}; visited[lastTouch] = true;
+      path = trail.slice();
+      stallTime = 0; airTime = 0;
+    }
+
+    audioFrame(speed);
+  }
+
+  function maybeCompleteCircuit(i) {
+    var others = 0;
+    for (var k in visited) { if (visited.hasOwnProperty(k) && +k !== 0) others++; }
+    var fullTour = platforms.length > 1 && others >= platforms.length - 1;
+    if (i === 0 && path.length > 150 && (others > 0 || airTime > 0.6 || fullTour)) {
+      ghost = path.slice();
+      path = [];
+      visited = { 0: true };
+    }
+  }
+
+  // ---------- draw ----------
+  function drawPlatform(e) {
+    ctx.strokeStyle = NEON;
+    ctx.lineCap = 'round';
+    ctx.globalAlpha = 0.16; ctx.lineWidth = Math.max(5, S * 0.012);
+    ctx.beginPath(); ctx.moveTo(e.ax, e.ay); ctx.lineTo(e.bx, e.by); ctx.stroke();
+    ctx.globalAlpha = 0.42; ctx.lineWidth = Math.max(2.5, S * 0.005);
+    ctx.beginPath(); ctx.moveTo(e.ax, e.ay); ctx.lineTo(e.bx, e.by); ctx.stroke();
+    ctx.globalAlpha = 1.0; ctx.lineWidth = Math.max(1.2, S * 0.0022);
+    ctx.beginPath(); ctx.moveTo(e.ax, e.ay); ctx.lineTo(e.bx, e.by); ctx.stroke();
+    ctx.globalAlpha = 1.0;
+  }
+
+  function drawPath(pts, color, alpha, width) {
+    if (!pts || pts.length < 2) return;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width;
+    ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    ctx.globalAlpha = alpha;
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (var i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+    ctx.stroke();
+    ctx.globalAlpha = 1.0;
+  }
+
+  function draw() {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = BG;
+    ctx.fillRect(0, 0, W, H);
+
+    if (ghost) drawPath(ghost, GHOST, 0.85, Math.max(1.2, S * 0.0022));
+
+    for (var i = 0; i < platforms.length; i++) drawPlatform(platEnds(platforms[i]));
+
+    // fading trail: oldest faintest
+    if (trail.length > 1) {
+      ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+      ctx.strokeStyle = TRAIL;
+      ctx.lineWidth = Math.max(1.4, S * 0.003);
+      for (var j = 1; j < trail.length; j++) {
+        ctx.globalAlpha = 0.55 * (j / trail.length);
+        ctx.beginPath();
+        ctx.moveTo(trail[j - 1].x, trail[j - 1].y);
+        ctx.lineTo(trail[j].x, trail[j].y);
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1.0;
+    }
+
+    if (rider) {
+      ctx.fillStyle = RIDER;
+      ctx.beginPath();
+      ctx.arc(rider.x, rider.y, riderRadius(), 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  // ---------- run ----------
+  layout();
+  resetWorld();
+  draw();
+
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { layout(); draw(); });
+  }
+  window.addEventListener('resize', function () { layout(); draw(); });
+
+  if (typeof requestAnimationFrame === 'function') {
+    var last = performance.now() / 1000, acc = 0;
+    var DT = 1 / 120;
+    var frame = function () {
+      var now = performance.now() / 1000;
+      var delta = Math.min(now - last, 0.06);
+      last = now;
+      acc += delta;
+      while (acc >= DT) { step(DT); acc -= DT; }
+      draw();
+      requestAnimationFrame(frame);
+    };
+    requestAnimationFrame(frame);
+  }
+})();
+</script>
+</body>
+</html>
