@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Mirage</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #8A8078;
+  }
+  canvas {
+    display: block;
+    position: fixed;
+    left: 0;
+    top: 0;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---- Palette (strict) ----
+  var AMBER = '#E8A33D';
+  var GLARE = '#F5F2EA';
+  var BLUE  = '#6FA8C8';
+  var GRAY  = '#8A8078';
+
+  function rgba(hex, a) {
+    var r = parseInt(hex.slice(1, 3), 16);
+    var g = parseInt(hex.slice(3, 5), 16);
+    var b = parseInt(hex.slice(5, 7), 16);
+    return 'rgba(' + r + ',' + g + ',' + b + ',' + a + ')';
+  }
+
+  // ---- Seeded RNG (mulberry32) ----
+  function mulberry32(seed) {
+    var s = seed >>> 0;
+    return function () {
+      s = (s + 0x6D2B79F5) >>> 0;
+      var t = s;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---- Precomputed grain (seeded, normalized coordinates) ----
+  var GRAIN_COUNT = 1600;
+  var grain = [];
+  (function buildGrain() {
+    var rnd = mulberry32(987123);
+    var tones = [GLARE, GRAY, AMBER, BLUE];
+    for (var i = 0; i < GRAIN_COUNT; i++) {
+      grain.push({
+        x: rnd(),
+        y: rnd(),
+        s: 0.6 + rnd() * 1.1,          // size in px at 1x scale
+        a: 0.03 + rnd() * 0.09,        // alpha
+        c: tones[Math.floor(rnd() * tones.length)]
+      });
+    }
+  })();
+
+  // ---- Mirage strips (seeded phases, fixed at load) ----
+  // Each strip: offset below horizon (fraction of H), thickness (fraction of H),
+  // color, base alpha, and two sine components with INTEGER spatial and
+  // temporal frequencies so the 18 s loop closes exactly.
+  var LOOP = 18; // seconds
+  var strips = [];
+  (function buildStrips() {
+    var rnd = mulberry32(424242);
+    var defs = [
+      // dist, thick, color, alpha  (strongest at the mirage line, dissolving outward)
+      { d: 0.004, th: 0.016, c: GLARE, a: 0.85 },
+      { d: 0.020, th: 0.026, c: AMBER, a: 0.62 },
+      { d: 0.046, th: 0.022, c: BLUE,  a: 0.55 },
+      { d: 0.068, th: 0.030, c: GLARE, a: 0.38 },
+      { d: 0.098, th: 0.024, c: AMBER, a: 0.30 },
+      { d: 0.122, th: 0.028, c: BLUE,  a: 0.24 },
+      { d: 0.150, th: 0.020, c: GLARE, a: 0.16 }
+    ];
+    var maxD = 0.150;
+    for (var i = 0; i < defs.length; i++) {
+      var def = defs[i];
+      // amplitude fades with distance from the mirage line
+      var fall = 1 - (def.d / (maxD * 1.25));
+      if (fall < 0.12) fall = 0.12;
+      strips.push({
+        d: def.d, th: def.th, c: def.c, a: def.a,
+        amp: 0.011 * fall, // fraction of H, max displacement
+        k1: 2, f1: 1, p1: rnd() * Math.PI * 2,
+        k2: 3, f2: 2, p2: rnd() * Math.PI * 2,
+        w1: 0.62, w2: 0.38,
+        breathP: rnd() * Math.PI * 2
+      });
+    }
+  })();
+
+  function stripDisp(st, xn, t) {
+    // xn: x normalized 0..1, t: seconds within loop.
+    // Sum of sines, integer spatial frequencies (k) and integer temporal
+    // cycles per loop (f): displacement is periodic in t with period LOOP.
+    var ph = (t / LOOP) * Math.PI * 2;
+    return st.amp * (
+      st.w1 * Math.sin(2 * Math.PI * st.k1 * xn - st.f1 * ph + st.p1) +
+      st.w2 * Math.sin(2 * Math.PI * st.k2 * xn + st.f2 * ph + st.p2)
+    );
+  }
+
+  // ---- Canvas / viewport ----
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0, DPR = 1;
+
+  function isPhone() {
+    var sw = (window.screen && window.screen.width) || 0;
+    var sh = (window.screen && window.screen.height) || 0;
+    var minDim = Math.min(sw, sh);
+    if (minDim > 0 && minDim < 700) return true;
+    // fallback only: aspect
+    return H > W * 1.15;
+  }
+
+  function fit() {
+    var vv = window.visualViewport;
+    var w = vv ? vv.width : window.innerWidth;
+    var h = vv ? vv.height : window.innerHeight;
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = w; H = h;
+    canvas.width = Math.round(w * DPR);
+    canvas.height = Math.round(h * DPR);
+  }
+
+  function bandRect(y0, y1, hex, a) {
+    ctx.fillStyle = rgba(hex, a);
+    ctx.fillRect(0, y0, W, y1 - y0);
+  }
+
+  function drawStrip(st, horizon, t) {
+    var baseY = horizon + st.d * H;
+    var thick = st.th * H;
+    // gentle alpha breathing, integer cycles per loop (2), stays subtle
+    var breath = 0.9 + 0.1 * Math.sin(2 * ((t / LOOP) * Math.PI * 2) + st.breathP);
+    ctx.fillStyle = rgba(st.c, st.a * breath);
+    var steps = 72;
+    ctx.beginPath();
+    var i, x, xn;
+    for (i = 0; i <= steps; i++) {
+      xn = i / steps;
+      x = xn * W;
+      var y = baseY + stripDisp(st, xn, t) * H;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    for (i = steps; i >= 0; i--) {
+      xn = i / steps;
+      x = xn * W;
+      // bottom edge: same field, slightly shifted phase via a small xn offset
+      var yb = baseY + thick + stripDisp(st, xn + 0.013, t) * H;
+      ctx.lineTo(x, yb);
+    }
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  function draw(t) {
+    // pin CSS size in px every frame
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+    var horizon = H / 3;
+
+    // ---- Sky: glare white warmed toward gray with layered washes ----
+    // Many thin low-alpha steps so the warming reads as haze, not strata.
+    ctx.fillStyle = GLARE;
+    ctx.fillRect(0, 0, W, H);
+    var skySteps = 14;
+    for (var si = 0; si < skySteps; si++) {
+      var sy0 = horizon * (si / skySteps);
+      var sy1 = horizon * ((si + 1) / skySteps);
+      // wash grows toward the horizon: 0.02 at top to ~0.06 at the line
+      bandRect(sy0, sy1, GRAY, 0.02 + 0.045 * (si / (skySteps - 1)));
+    }
+    bandRect(horizon * 0.86, horizon, GLARE, 0.25); // bright haze lip at horizon
+
+    // ---- Ground: warm gray, deepened by layered washes downward ----
+    bandRect(horizon, H, GRAY, 0.50);
+    var gSteps = 16;
+    var gSpan = H - horizon;
+    for (var gi = 0; gi < gSteps; gi++) {
+      var gy0 = horizon + gSpan * (gi / gSteps);
+      var gy1 = horizon + gSpan * ((gi + 1) / gSteps);
+      bandRect(gy0, gy1, GRAY, 0.045 + 0.02 * Math.sin((gi / (gSteps - 1)) * Math.PI * 0.5));
+    }
+    // faint warm reflection of the band shimmering on the ground
+    bandRect(horizon, horizon + H * 0.20, AMBER, 0.05);
+    bandRect(horizon, horizon + H * 0.12, BLUE, 0.04);
+
+    // ---- Mirage line: the bright seam just below the horizon ----
+    bandRect(horizon, horizon + Math.max(1.5, H * 0.0035), GLARE, 0.75);
+
+    // ---- Mirage band: stacked film strips, strongest at the line ----
+    ctx.globalCompositeOperation = 'source-over';
+    for (var i = strips.length - 1; i >= 0; i--) {
+      drawStrip(strips[i], horizon, t);
+    }
+    // a second pass of the two strongest strips at low alpha: overlap glow
+    ctx.globalCompositeOperation = 'lighter';
+    var s0 = strips[0], s1 = strips[1];
+    ctx.save();
+    ctx.globalAlpha = 0.35;
+    drawStrip(s0, horizon, t);
+    ctx.restore();
+    ctx.save();
+    ctx.globalAlpha = 0.22;
+    drawStrip(s1, horizon, t);
+    ctx.restore();
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+
+    // ---- Grain pass (precomputed, seeded) ----
+    var gs = Math.max(1, H / 720);
+    for (var g = 0; g < grain.length; g++) {
+      var p = grain[g];
+      ctx.fillStyle = rgba(p.c, p.a);
+      var sz = p.s * gs;
+      ctx.fillRect(p.x * W, p.y * H, sz, sz);
+    }
+  }
+
+  fit();
+  draw(0); // frame one: synchronous draw at loop t=0, no clock involved
+
+  function onResize() {
+    fit();
+    draw(lastT);
+  }
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', onResize);
+  }
+  window.addEventListener('resize', onResize);
+
+  var lastT = 0;
+  var startTs = null;
+  function frame(ts) {
+    if (startTs === null) startTs = ts;
+    var t = ((ts - startTs) / 1000) % LOOP;
+    lastT = t;
+    draw(t);
+    window.requestAnimationFrame(frame);
+  }
+  if (typeof window.requestAnimationFrame === 'function') {
+    window.requestAnimationFrame(frame);
+  }
+})();
+</script>
+</body>
+</html>
