@@ -1,0 +1,509 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Between the Strings</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #EFE6D4; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+  // ---------- seeded RNG (mulberry32) ----------
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a = (a + 0x6D2B79F5) >>> 0;
+      var t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- palette (strict) ----------
+  var IVORY = '#EFE6D4';    // piano ivory ground
+  var STRING = '#1A1A1A';   // string black
+  var METAL = '#8A8F94';    // clip metal
+  var GOLD = '#C9A227';     // ring gold
+  var EMBER = '#C9562E';    // perturbation ember
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ---------- strings: unit-space layout (resize invariant) ----------
+  var NSTR = 9;
+  var V0 = 0.13, V1 = 0.87;                 // first / last string, unit v
+  var FALL_SPEED = 0.16;                    // unit v per second (slow rain)
+  var CAP = 24;                             // max active clips
+  function stringV(i) { return V0 + (V1 - V0) * i / (NSTR - 1); }
+
+  // ---------- clip model ----------
+  // A clip is a record {fallStart, landT, vFrom, si, u, dir}. Everything
+  // drawn is a closed-form function of these records plus the recorded
+  // sweep times: falling position, perched ride, kink travel, shimmer,
+  // and the sweep-hand clear are all evaluated from (record, t), never
+  // accumulated frame by frame.
+  // A sweep at time s clears a clip when its left-to-right front reaches
+  // the clip's u: clearT = s + 0.6 * u (front crosses the frame in 0.6 s).
+  // The earliest sweep whose front arrives at or after the clip starts
+  // existing governs; the clip then lifts and fades over 0.3 s.
+  var drops = [];        // materialised clips
+  var sweeps = [];       // recorded sweep times (double-tap)
+
+  function clearTime(drop) {
+    var ct = Infinity;
+    for (var i = 0; i < sweeps.length; i++) {
+      var f = sweeps[i] + 0.6 * drop.u;
+      if (f >= drop.fallStart && f < ct) ct = f;
+    }
+    return ct;
+  }
+  // status: {mode, v (unit), alpha, liftP}
+  function clipStatus(drop, t) {
+    var ct = clearTime(drop);
+    if (t >= ct + 0.3) return { mode: 'gone' };
+    var liftP = 0, alpha = 1;
+    if (t >= ct) { liftP = (t - ct) / 0.3; alpha = 1 - liftP; }
+    if (t < drop.fallStart) return { mode: 'pre' };
+    if (t < drop.landT) {
+      var p = (t - drop.fallStart) / Math.max(1e-6, drop.landT - drop.fallStart);
+      var v = drop.vFrom + (stringV(drop.si) - drop.vFrom) * p * p;
+      return { mode: 'falling', v: v, alpha: alpha, liftP: liftP, p: p };
+    }
+    return { mode: 'perched', v: stringV(drop.si), alpha: alpha, liftP: liftP };
+  }
+  // how strongly a clip perturbs its string at time t (0 once cleared)
+  function soundWeight(drop, t) {
+    if (t < drop.landT) return 0;
+    var ct = clearTime(drop);
+    if (t < ct) return 1;
+    if (t < ct + 0.3) return 1 - (t - ct) / 0.3;
+    return 0;
+  }
+
+  // two seeded clips already landed before frame one
+  drops.push({ fallStart: -3.19, landT: -1.1, vFrom: -0.02, si: 2, u: 0.34, dir: 1 });
+  drops.push({ fallStart: -6.05, landT: -3.4, vFrom: -0.02, si: 5, u: 0.68, dir: -1 });
+
+  // seeded rain schedule: sparse falls on the piece's own clock
+  var rainPending = [];
+  (function buildRain() {
+    var rnd = mulberry32(835835);
+    var t = 6.5;
+    while (t < 7200) {
+      var si = Math.floor(rnd() * NSTR);
+      var u = 0.06 + rnd() * 0.88;
+      rainPending.push({
+        fallStart: t, si: si, u: u,
+        dir: rnd() < 0.5 ? -1 : 1,
+        vFrom: -0.02,
+        landT: t + (stringV(si) + 0.02) / FALL_SPEED
+      });
+      t += 5 + rnd() * 7;
+    }
+  })();
+
+  function activeCount(t) {
+    var n = 0;
+    for (var i = 0; i < drops.length; i++) {
+      var st = clipStatus(drops[i], t);
+      if (st.mode === 'falling' || st.mode === 'perched') n++;
+    }
+    return n;
+  }
+  // materialise due rain events; skip a fall if the cap is reached
+  function activateRain(t) {
+    while (rainPending.length && rainPending[0].fallStart <= t) {
+      var ev = rainPending.shift();
+      if (activeCount(t) < CAP) drops.push(ev);
+    }
+  }
+
+  // ---------- viewport sizing (Visual Viewport API) ----------
+  function viewSize() {
+    var w, h;
+    if (window.visualViewport) {
+      w = window.visualViewport.width;
+      h = window.visualViewport.height;
+    } else {
+      w = window.innerWidth;
+      h = window.innerHeight;
+    }
+    return { w: w, h: h };
+  }
+  function isPhone(w, h) {
+    var sw = 9999;
+    if (window.screen) sw = Math.min(window.screen.width, window.screen.height);
+    return sw < 700 || h > w * 1.15;
+  }
+
+  var W = 0, H = 0, DPR = 1, PHONE = false;
+  var GEO = null;
+  function resize() {
+    var s = viewSize();
+    W = Math.max(1, Math.round(s.w));
+    H = Math.max(1, Math.round(s.h));
+    DPR = window.devicePixelRatio || 1;
+    PHONE = isPhone(W, H);
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    buildScene();
+  }
+  function buildScene() {
+    var minD = Math.min(W, H);
+    var spacingPx = (V1 - V0) * H / (NSTR - 1);
+    GEO = {
+      minD: minD,
+      spacingPx: spacingPx,
+      amp: Math.min(spacingPx * 0.16, 11),       // base string vibration
+      lineW: Math.max(1.1, minD * 0.0022),
+      clipR: clamp(minD * 0.009, 4.5, 8),       // paperclip half-width
+      kinkAmp: minD * 0.014
+    };
+    GEO.clipL = GEO.clipR * 2.1;                // paperclip half-height
+  }
+
+  // ---------- string shape ----------
+  // One pitch class for every string: a shared fundamental phase with a
+  // small per-string phase offset (a phase-locked family). Clips add two
+  // closed-form perturbations: a local high-frequency shimmer around the
+  // clip that builds in after landing, and a travelling kink launched at
+  // landing: a derivative-of-Gaussian step that runs along the string,
+  // decaying as it goes, dead by 2.4 s.
+  var OMEGA = Math.PI * 2 * 0.9;
+  function stringY(si, x, t) {
+    var baseY = stringV(si) * H;
+    var u = x / W;
+    var ph = si * 0.55;
+    var y = baseY
+      + GEO.amp * Math.sin(Math.PI * 2 * (x / (W * 1.3)) - OMEGA * t + ph)
+      + GEO.amp * 0.35 * Math.sin(Math.PI * 2 * (x / (W * 0.65)) - 2 * OMEGA * t + ph * 1.7);
+    for (var i = 0; i < drops.length; i++) {
+      var d = drops[i];
+      if (d.si !== si) continue;
+      var wgt = soundWeight(d, t);
+      if (wgt <= 0) continue;
+      var age = t - d.landT;
+      // shimmer: metallic ripple localised at the clip
+      var build = Math.min(1, age / 0.8);
+      var steady = 0.45 + 0.55 * Math.exp(-age / 2.5);
+      var g = Math.exp(-Math.pow((u - d.u) / 0.030, 2));
+      y += wgt * build * steady * g * GEO.amp * 0.55
+        * Math.sin(Math.PI * 2 * (x / (W * 0.018)) - Math.PI * 2 * 7 * age);
+      // travelling kink
+      if (age < 2.4) {
+        var uk = d.u + d.dir * 0.34 * age;
+        if (uk > -0.05 && uk < 1.05) {
+          var sig = 0.012 + 0.010 * age;
+          var z = (u - uk) / sig;
+          var s = Math.exp(-age / 1.4);
+          y += wgt * s * GEO.kinkAmp * (-z) * Math.exp(-z * z);
+        }
+      }
+    }
+    return y;
+  }
+  function strokeStringPath(si, t, x0, x1) {
+    var step = Math.max(2, W / 320);
+    ctx.beginPath();
+    for (var x = x0; x <= x1; x += step) {
+      var y = stringY(si, x, t);
+      if (x === x0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.lineTo(x1, stringY(si, x1, t));
+  }
+
+  // ---------- paperclip glyph ----------
+  function drawClip(cx, cy, rot, alpha) {
+    var r = GEO.clipR, L = GEO.clipL;
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(rot);
+    ctx.globalAlpha = alpha;
+    ctx.strokeStyle = METAL;
+    ctx.lineWidth = Math.max(1.3, r * 0.34);
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    // outer wire
+    ctx.moveTo(-r, L * 0.9);
+    ctx.lineTo(-r, -L + r);
+    ctx.arc(0, -L + r, r, Math.PI, Math.PI * 2);
+    ctx.lineTo(r, L * 0.35);
+    // inner wire
+    var cy1 = -L * 0.45 + r * 0.5;
+    ctx.moveTo(r * 0.5, L);
+    ctx.lineTo(r * 0.5, cy1);
+    ctx.arc(0, cy1, r * 0.5, 0, -Math.PI, true);
+    ctx.lineTo(-r * 0.5, L * 0.55);
+    ctx.stroke();
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- audio: prepared-piano plucks, never autoplay ----------
+  // Lazily created inside the first pointer gesture, typeof-guarded: the
+  // QA renderer has no AudioContext and the piece runs silently there.
+  // Every string is one pitch class (A, 220 Hz); a clip's position only
+  // moves the bandpass, so clips change timbre, never the note.
+  var AC = null;
+  if (typeof AudioContext !== 'undefined') AC = AudioContext;
+  else if (typeof window !== 'undefined' && typeof window.webkitAudioContext !== 'undefined') AC = window.webkitAudioContext;
+
+  var actx = null, master = null, audioOn = false;
+  function startAudio() {
+    if (audioOn || !AC) return;
+    try {
+      actx = new AC();
+      var comp = actx.createDynamicsCompressor();
+      comp.threshold.value = -16;
+      comp.ratio.value = 12;
+      master = actx.createGain();
+      master.gain.value = 0.55;
+      master.connect(comp);
+      comp.connect(actx.destination);
+      audioOn = true;
+    } catch (err) {
+      actx = null; audioOn = false;
+    }
+    if (actx && actx.state === 'suspended' && actx.resume) actx.resume();
+  }
+  function pluck(u) {
+    if (!audioOn || !actx) return;
+    try {
+      var t0 = actx.currentTime;
+      var bp = actx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.value = 700 + u * 1800;
+      bp.Q.value = 0.9;
+      var out = actx.createGain();
+      out.gain.value = 0.5;
+      bp.connect(out);
+      out.connect(master);
+      var parts = [
+        [220, 'triangle', 0.20, 0.9],
+        [440, 'sine', 0.12, 0.6],
+        [660.5, 'sine', 0.07, 0.4],
+        [1108, 'sine', 0.035, 0.22]
+      ];
+      for (var i = 0; i < parts.length; i++) {
+        var o = actx.createOscillator();
+        o.type = parts[i][1];
+        o.frequency.value = parts[i][0];
+        var g = actx.createGain();
+        g.gain.setValueAtTime(parts[i][2], t0);
+        g.gain.exponentialRampToValueAtTime(0.0001, t0 + parts[i][3]);
+        o.connect(g);
+        g.connect(bp);
+        o.start(t0);
+        o.stop(t0 + parts[i][3] + 0.05);
+      }
+    } catch (err) {}
+  }
+  function thunk() {
+    if (!audioOn || !actx) return;
+    try {
+      var t0 = actx.currentTime;
+      var o = actx.createOscillator();
+      o.type = 'sine';
+      o.frequency.setValueAtTime(130, t0);
+      o.frequency.exponentialRampToValueAtTime(55, t0 + 0.18);
+      var g = actx.createGain();
+      g.gain.setValueAtTime(0.22, t0);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.3);
+      o.connect(g);
+      g.connect(master);
+      o.start(t0);
+      o.stop(t0 + 0.35);
+    } catch (err) {}
+  }
+
+  // ---------- drawing ----------
+  function draw(t) {
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+
+    ctx.fillStyle = IVORY;
+    ctx.fillRect(0, 0, W, H);
+
+    var i, d, st;
+
+    // strings
+    ctx.strokeStyle = STRING;
+    ctx.lineWidth = GEO.lineW;
+    ctx.globalAlpha = 0.92;
+    for (i = 0; i < NSTR; i++) {
+      strokeStringPath(i, t, 0, W);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+
+    // perturbations: gold shimmer beds, ember kink fronts, ring flashes
+    for (i = 0; i < drops.length; i++) {
+      d = drops[i];
+      var wgt = soundWeight(d, t);
+      if (wgt <= 0) continue;
+      var age = t - d.landT;
+      var cxp = d.u * W;
+      // shimmer bed: a faint gold trace of the string near the clip
+      var half = W * 0.055;
+      ctx.strokeStyle = GOLD;
+      ctx.lineWidth = GEO.lineW + 0.7;
+      ctx.globalAlpha = 0.13 * wgt;
+      strokeStringPath(d.si, t, Math.max(0, cxp - half), Math.min(W, cxp + half));
+      ctx.stroke();
+      // kink front: a short ember segment riding the string
+      if (age < 2.4) {
+        var uk = d.u + d.dir * 0.34 * age;
+        if (uk > -0.05 && uk < 1.05) {
+          var sig = 0.012 + 0.010 * age;
+          var kx = uk * W, kw = sig * 2.2 * W;
+          ctx.strokeStyle = EMBER;
+          ctx.lineWidth = GEO.lineW + 0.8;
+          ctx.globalAlpha = 0.55 * Math.exp(-age / 1.4) * wgt;
+          strokeStringPath(d.si, t, Math.max(0, kx - kw), Math.min(W, kx + kw));
+          ctx.stroke();
+        }
+      }
+      // landing ring: a gold circle blooming and fading in 0.7 s
+      if (age >= 0 && age < 0.7) {
+        ctx.strokeStyle = GOLD;
+        ctx.lineWidth = 1.2;
+        ctx.globalAlpha = 0.45 * (1 - age / 0.7) * wgt;
+        ctx.beginPath();
+        ctx.arc(cxp, stringY(d.si, cxp, t), 3 + age * GEO.minD * 0.05, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    // sweep-hand fronts
+    for (i = 0; i < sweeps.length; i++) {
+      var sa = t - sweeps[i];
+      if (sa >= 0 && sa < 0.6) {
+        var fx = (sa / 0.6) * W;
+        ctx.fillStyle = GOLD;
+        ctx.globalAlpha = 0.05;
+        ctx.fillRect(fx - GEO.minD * 0.012, 0, GEO.minD * 0.024, H);
+        ctx.globalAlpha = 0.22;
+        ctx.fillRect(fx, 0, 1.2, H);
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    // clips themselves
+    for (i = 0; i < drops.length; i++) {
+      d = drops[i];
+      st = clipStatus(d, t);
+      if (st.mode === 'pre' || st.mode === 'gone') continue;
+      var gx = d.u * W;
+      var gy, rot = 0;
+      if (st.mode === 'falling') {
+        gy = st.v * H;
+        rot = Math.sin(st.p * Math.PI) * 0.22 * d.dir;
+      } else {
+        gy = stringY(d.si, gx, t) - GEO.clipL * 0.35;
+        rot = Math.sin(Math.PI * 2 * (gx / (W * 1.3)) - OMEGA * t + d.si * 0.55) * 0.05;
+      }
+      if (st.liftP > 0) { gy -= st.liftP * 30; rot += st.liftP * 0.5 * (d.u < 0.5 ? -1 : 1); }
+      drawClip(gx, gy, rot, st.alpha);
+    }
+  }
+
+  // ---------- interaction ----------
+  // First pointer gesture ever: starts the audio (the unlock).
+  // DRAG across a string band: drops one clip on that string at the
+  // pointer's x, at most one per band entry and throttled to 0.22 s.
+  // DOUBLE-TAP: the sweep hand clears every clip as its front passes.
+  function nowSec() { return performance.now() / 1000; }
+  var startTime = nowSec();
+  function pieceT() { return nowSec() - startTime; }
+  function evPos(e) {
+    var r = canvas.getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  }
+
+  var dragDir = mulberry32(4242);
+  var pDown = null;        // {band, lastDropT, sweepGesture}
+  var lastDownT = -10;
+
+  function bandOf(v) {
+    var sp = (V1 - V0) / (NSTR - 1);
+    for (var i = 0; i < NSTR; i++) {
+      if (Math.abs(v - stringV(i)) <= sp / 2) return i;
+    }
+    return -1;
+  }
+  function tryDrop(t, p, st) {
+    var v = p.y / H, u = clamp(p.x / W, 0.03, 0.97);
+    var si = bandOf(v);
+    if (si < 0 || si === st.band) return;
+    st.band = si;
+    if (t - st.lastDropT < 0.22) return;
+    if (activeCount(t) >= CAP) return;
+    var vi = stringV(si);
+    var vFrom = v < vi ? v : vi - 0.03;
+    drops.push({
+      fallStart: t, vFrom: vFrom, si: si, u: u,
+      dir: dragDir() < 0.5 ? -1 : 1,
+      landT: t + (vi - vFrom) / FALL_SPEED
+    });
+    st.lastDropT = t;
+  }
+
+  canvas.addEventListener('pointerdown', function (e) {
+    startAudio();                        // the gesture that unlocks sound
+    var t = pieceT();
+    var isDouble = (t - lastDownT) <= 0.33;
+    lastDownT = t;
+    pDown = { band: -1, lastDropT: -10, sweepGesture: isDouble };
+    if (isDouble) {
+      sweeps.push(t);
+      thunk();
+    }
+    if (canvas.setPointerCapture) { try { canvas.setPointerCapture(e.pointerId); } catch (err) {} }
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (!pDown || pDown.sweepGesture) return;
+    tryDrop(pieceT(), evPos(e), pDown);
+  });
+  function endPointer() { pDown = null; }
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', endPointer);
+
+  // ---------- run ----------
+  resize();
+  if (window.visualViewport) window.visualViewport.addEventListener('resize', resize);
+  window.addEventListener('resize', resize);
+
+  draw(0); // frame one: two seeded clips perched, one kink mid-travel
+
+  if (typeof requestAnimationFrame === 'function') {
+    var prevT = 0;
+    var loop = function () {
+      var t = pieceT();
+      activateRain(t);
+      // pluck any clip that landed since the last frame
+      for (var i = 0; i < drops.length; i++) {
+        var lt = drops[i].landT;
+        if (lt > prevT && lt <= t) pluck(drops[i].u);
+      }
+      prevT = t;
+      draw(t);
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>

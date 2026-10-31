@@ -1,0 +1,24 @@
+# No.832 — Three-String Drone
+
+EXPANSION #102 john-cale, PP1 "The Filed Bridge". Title shipped is the prompt's title suggestion, "Three-String Drone".
+
+## Concept
+
+Cale's master mechanism: a viola whose bridge was filed down until the bow hit three strings at once, turning one melodic voice into a chordal drone generator. The piece is that widening, playable. A single horizontal beam spans a black field. At rest there is one thin white line on the beam and a small pickup glyph riding it. Dragging down files the bridge: the one line separates into three detuned voice-lines (white, smoke, amber) that beat against each other, their interference brightening and dimming along the beam. Dragging up raises the bridge and collapses the chord back to a single line. A mono readout at the bottom reports bridge height like a luthier's caliper: 12.0 MM with the bridge high, 4.0 MM fully filed. Double-tap reseeds the three pitches. Sound, three oscillators through a limiter, starts only on the first tap; the visual runs silently until then.
+
+## Construction
+
+- **Bridge parameter.** `b` in [0, 1] is a recorded piecewise-linear function of the piece clock: every drag appends timestamped points, and `bAt(t)` interpolates them. Untouched, `b` holds its last value; opening value is `b = 0`. Readout maps `mm = 12 - 8*b`.
+- **Pitches.** Each pitch epoch (seeded by mulberry32; base seed 832102) picks a root from a low viola-register set, voice offsets of 0 / +14..35 / −14..35 cents that apply in full at `b = 1` and vanish at `b = 0`, and per-voice drift of at most ±3 cents on slow seeded sines (periods ~40–125 s). Double-tap starts a new epoch whose base phases are the old epoch's phases at the tap instant, so the drone never jumps.
+- **Phase (closed form).** Voice phase in cycles is the integral of frequency, with the exponential linearised (`f ≈ root · (1 + K · cents)`, error under 0.03% at 38 cents): it splits into `offs · ∫b dt` (trapezoid integral over the recorded bridge points) plus the exact integral of each drift sine. No `Date.now()` anywhere; the clock is `performance.now()` elapsed, and frame one is drawn synchronously at `t = 0`.
+- **Interference (computed, not decorated).** Each frame, the three voice waveforms are sampled along the beam as travelling waves (`sin(2π(phase − (f/110)·x/120))`). Each line is drawn as its own waveform, vertically offset by `(offset/35) · maxSep · b`, and every segment's alpha comes from the summed waveform at that x, `(|sum|/3)^1.4` — segments brighten where the voices reinforce and thin where they cancel. Voices two and three also fade in with their physical separation, so at `b = 0` only the single white line exists. The pickup glyph's alpha follows the mean |sum| across the beam, with a white core that appears at high amplitude.
+- **Audio.** Created lazily inside the first pointer gesture, `typeof`-guarded (`AudioContext` / `webkitAudioContext`), and silently absent where unavailable. Per voice: a sine plus a low-gain sawtooth into a voice gain, all voices into a master gain (0.14) and a DynamicsCompressor acting as limiter. Oscillator frequencies are set every frame from the same computed pitch state that draws the lines.
+- **House rules.** Canvas sized from the Visual Viewport API with resize listeners on both `visualViewport` and `window`; canvas CSS size pinned in px inside `draw()`; phone detection via `window.screen` min dimension < 700px with the `h > w*1.15` aspect fallback only when screen is unavailable. Strict palette: #0A0A0A, #EDEDED, #9A9A9A, #D98E2B, #6B6B6B. No gradients, shadowBlur, filters, or offscreen canvas; rAF `typeof`-guarded; the only visible text is the specced bridge readout.
+
+## QA log
+
+- Rendered with `render-piece.js` (no rAF, no AudioContext in the harness — the piece rendered cleanly in silence at all sizes): qa-desktop.png 1280×900, qa-mobile.png 390×844, thumb.png 720×720.
+- Determinism: thumb.png rendered twice, `cmp` byte-identical; the duplicate was deleted.
+- Frame one read-back (all three sizes): black field, one bright wavy white line on the beam at mid-height, small grey pickup glyph on the line at ~63% width, "BRIDGE 12.0 MM" in mono at bottom center. Mobile keeps the full beam width and legible readout; nothing clipped.
+- Throwaway check at b = 1 (patched copy, deleted after inspection): three separated lines, amber above, white on the beam, smoke below, each with patchy computed interference brightness along its length, readout "BRIDGE 4.0 MM". The widening and the interference both read as intended.
+- Deviations: none from the brief. Two recorded choices: the frequency integral uses the first-order linearisation above (inaudible and invisible at these cent ranges, and it keeps the phase a true closed form of the recorded drag segments); at the opening, frame one sits at `b = 0` with readout 12.0 MM per the brief's instruction that the piece opens as one line.

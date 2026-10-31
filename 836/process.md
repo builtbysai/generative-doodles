@@ -1,0 +1,26 @@
+# No.836 — The Producer's Piano
+
+EXPANSION #102 john-cale, PP5 "One-Note Piano" (title suggestion: "The Producer's Piano").
+
+## Concept
+
+The corrected fact as a piece: Cale's one-note piano through The Stooges' 1969 debut ("I Wanna Be Your Dog"), a single pitch hammered through an entire song, imposed on someone else's record. A dark studio room; at its center one vertical pulse column, struck again and again on a rock-steady beat, each strike flashing the column amber and throwing a ripple across the floor. Around it, a tangle of dark riff-lines (the band) dances and orbits, but never touches the column. The pulse is immutable; the band is chaotic; the piece is the imposition.
+
+## Construction
+
+**Metronome model.** One closed-form clock drives everything: beat phase = t / 0.6 s exactly (100 BPM, the "I Wanna Be Your Dog" lope). The phase is computed from the piece clock (anchored at load), never accumulated from frame counts, so the tempo cannot drift. The column's flash is exp(-phase * 3.2), exactly 1 on each beat; t = 0 is a beat, so frame one catches the flash peak. Each beat also births a ripple ellipse at the column's base on the floor plane; ripples expand over 2.4 s (four beats) and fade, clipped to the floor region. Because the pulse never stops, beats before t = 0 count too: frame one shows the newborn ring (with a small amber inner ring while it is younger than one beat) plus three earlier rings mid-travel. Audio, when started, schedules plucks off the same beat integers, so sound and image share the one metronome. The note is a fixed 220 Hz piano-ish pluck (triangle fundamental plus sine partials at 2x and 3.01x through a lowpass, fast attack, ~0.9 s decay), the same pitch every beat, modest gain through a compressor. Pitch and tempo have no code path that can change them.
+
+**Riff-lines and the distance rule.** Six slate curves, each a closed-form parametric wanderer: a point travels an angular sweep around the room's center with a seeded radius, slow orbital drift, and a gentle seeded radial wobble (Lissajous family). Lines are stratified by construction, one per angular sector and radius band, so the tangle reads as distinct orbits. The distance rule is enforced per sample on the horizontal distance to the column axis: any sample closer than the keep-out distance (8.5% of the frame's smaller dimension) falls in a gap band. The stroke ends at the band's edge and resumes on exit, and a segment that would cross the axis is broken, so no line ever touches or crosses the column; the column itself is drawn after the lines, on top. Dragging pushes the band without breaking the rule: horizontal drag distance becomes a pressure value stored as recorded control events (holds while dragging, an exponential release with tau = 1.1 s). Evaluated closed-form at any t, the pressure scales each point's horizontal offset from the axis (up to ±38%) and widens or narrows the keep-out band with it, always floored at 4.5% of the smaller dimension. Double-tap reseeds the tangle (generation counter into the mulberry32 seed); the pulse is not affected.
+
+**House mechanics.** Canvas sized from the Visual Viewport API with resize listeners on visualViewport and window; canvas style pinned in px inside draw() every frame. Phone detection via window.screen (min dimension < 700), aspect fallback. Frame one is the synchronous draw(0); no Date.now anywhere in drawn state. No gradients, shadowBlur, ctx.filter, or offscreen canvas: the column's glow is stacked flat-alpha rectangles, the floor pool is flat-alpha ellipses. rAF is typeof-guarded (the QA renderer runs the single synchronous frame). AudioContext is created lazily inside the first pointer gesture, typeof-guarded, and the piece renders and animates silently where no AudioContext exists.
+
+## QA log
+
+- Rendered with render-piece.js at 1280x900, 390x844, 720x720. Thumb rendered twice and cmp-compared byte-identical (deterministic), verified after every fix round.
+- Round 1 read-back: column, floor, and ripples correct, but the riff-lines formed one spiky scribble (wobble too hot, lines unstratified) and clamped samples drew straight chords across the column. Fixed: lines stratified per sector and radius band, wobble softened, and the path broken wherever a segment would cross the axis.
+- Round 2 read-back: chords gone, but clamped runs traced small vertical ticks along the keep-out boundary. Fixed: keep-out samples are now a true gap; the stroke ends at the band edge and resumes on exit.
+- Round 3 read-back (final): amber column at flash peak, center-frame, full height; four ripple rings on the floor at staggered ages with the newborn amber ring at the base; six slate riff-lines wandering on both sides of the column, all stopping at the keep-out band; mobile holds the column centered with lines and ripples intact, nothing clipped. Audio path cannot run in the QA renderer (no AudioContext); it is guarded and the visual piece is complete in silence.
+
+## Deviations
+
+- None from the prompt's substance. Construction choices: the single pitch is fixed at 220 Hz; audio opens on the first pointer gesture (pointerdown), so a first drag as well as a first tap starts the pluck schedule — the gate is "visitor gesture, never autoplay" either way; ripples from beats before t = 0 are shown because the prompt's pulse has no beginning.

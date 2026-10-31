@@ -1,0 +1,489 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>All Strings to One Note</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #141210; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+  function sstep(x) { x = clamp(x, 0, 1); return x * x * (3 - 2 * x); }
+  function mixHex(a, b, f) {
+    var ar = parseInt(a.slice(1, 3), 16), ag = parseInt(a.slice(3, 5), 16), ab = parseInt(a.slice(5, 7), 16);
+    var br = parseInt(b.slice(1, 3), 16), bg = parseInt(b.slice(3, 5), 16), bb = parseInt(b.slice(5, 7), 16);
+    var r = Math.round(ar + (br - ar) * f), g = Math.round(ag + (bg - ag) * f), bl = Math.round(ab + (bb - ab) * f);
+    return 'rgb(' + r + ',' + g + ',' + bl + ')';
+  }
+  // mulberry32 seeded rng
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a = (a + 0x6D2B79F5) >>> 0;
+      var t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- palette (strict) ----------
+  var FIELD = '#141210';   // field dark
+  var SILVER = '#CFCFCF';  // string silver
+  var GOLD = '#C9A227';    // gold (interference band / bank drop)
+  var EMBER = '#E0682B';   // slip marker ember
+  var BROWN = '#6B4F35';   // AM-radio brown: pegs, rails
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ---------- viewport sizing (Visual Viewport API) ----------
+  function viewSize() {
+    var w, h;
+    if (window.visualViewport) {
+      w = window.visualViewport.width;
+      h = window.visualViewport.height;
+    } else {
+      w = window.innerWidth;
+      h = window.innerHeight;
+    }
+    return { w: w, h: h };
+  }
+  function isPhone(w, h) {
+    var sw = 9999;
+    if (window.screen) sw = Math.min(window.screen.width, window.screen.height);
+    return sw < 700 || h > w * 1.15;
+  }
+
+  var W = 0, H = 0, DPR = 1, PHONE = false;
+  var GEO = null;
+  function resize() {
+    var s = viewSize();
+    W = Math.max(1, Math.round(s.w));
+    H = Math.max(1, Math.round(s.h));
+    DPR = window.devicePixelRatio || 1;
+    PHONE = isPhone(W, H);
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    buildScene();
+  }
+  var NSTR = 48;
+  function buildScene() {
+    var mx = W * 0.045;
+    var y0 = H * 0.055;          // peg rail underside: strings start here
+    var y1 = H * 0.945;          // bridge top: strings end here
+    GEO = {
+      mx: mx,
+      y0: y0,
+      y1: y1,
+      len: y1 - y0,
+      spacing: (W - mx * 2) / (NSTR - 1),
+      amp: Math.max(1.8, (W - mx * 2) / (NSTR - 1) * 0.5),
+      pegW: Math.max(3, W * 0.005),
+      pegH: Math.max(6, H * 0.011),
+      railH: Math.max(3, H * 0.006),
+      lineW: PHONE ? 1.1 : 1.5
+    };
+  }
+  function stringX(i) { return GEO.mx + GEO.spacing * i; }
+
+  // ---------- time ----------
+  // Frame one is drawn at t = 0 synchronously; the interaction clock only
+  // runs afterwards. No drawn state ever reads Date.now().
+  var startStamp = null;
+  function stamp() {
+    if (typeof performance !== 'undefined' && performance && typeof performance.now === 'function') return performance.now();
+    return Date.now();
+  }
+  function nowT() {
+    if (startStamp === null) startStamp = stamp();
+    return (stamp() - startStamp) / 1000;
+  }
+
+  // ---------- pitch / phase model (all closed-form) ----------
+  var FVIS = 1.15;             // visual vibration rate, Hz, at bank 0
+  var PHASE0 = 0.9;            // frame one sits mid-oscillation
+  var BASE_HZ = 196;           // audio unison pitch (G3)
+  var KC = Math.LN2 / 1200;    // cents -> ratio exponent
+
+  // bank drops: events {t, count}; count cycles 0,1,2,3,4 then wraps to 0
+  var bankEvents = [];
+  function bankCountAt(t) {
+    var c = 0;
+    for (var i = 0; i < bankEvents.length; i++) if (bankEvents[i].t <= t) c = bankEvents[i].count;
+    return c;
+  }
+  function bankMult(count) { return Math.pow(2, -count / 12); }
+  // common phase: PHASE0 + 2pi*FVIS * integral of bankMult over [0, t]
+  function commonPhase(t) {
+    var acc = 0, prev = 0, count = 0;
+    for (var i = 0; i < bankEvents.length; i++) {
+      var ev = bankEvents[i];
+      if (ev.t > t) break;
+      acc += bankMult(count) * (ev.t - prev);
+      prev = ev.t; count = ev.count;
+    }
+    acc += bankMult(count) * (t - prev);
+    return PHASE0 + 2 * Math.PI * FVIS * acc;
+  }
+
+  // integral over a segment where cents move linearly c0 -> c1 across d sec
+  // of (2^(c/1200) - 1) dt
+  function centsIntegral(c0, c1, d) {
+    if (d <= 0) return 0;
+    if (Math.abs(c1 - c0) < 1e-9) return d * (Math.exp(KC * c0) - 1);
+    var m = (c1 - c0) / d;
+    return (Math.exp(KC * c1) - Math.exp(KC * c0)) / (KC * m) - d;
+  }
+
+  // ---------- scheduled slips (seeded) ----------
+  // Slip profile: linear ramp 0 -> +20 cents over 2 s, hold 3 s,
+  // linear fall over 2.5 s (profile length 7.5 s), then a 1.6 s settle
+  // in which the accumulated phase offset eases to the nearest 2*pi.
+  var SLIP_PEAK = 20, SLIP_LEN = 7.5, SETTLE = 1.6;
+  function slipCents(u) {
+    if (u <= 0 || u >= SLIP_LEN) return 0;
+    if (u < 2) return SLIP_PEAK * (u / 2);
+    if (u < 5) return SLIP_PEAK;
+    return SLIP_PEAK * (1 - (u - 5) / 2.5);
+  }
+  function slipPhase(u) {
+    // phase offset accumulated up to profile time u (u may exceed SLIP_LEN)
+    var uu = clamp(u, 0, SLIP_LEN);
+    var integ = 0;
+    var b1 = Math.min(uu, 2), b2 = Math.min(uu, 5);
+    if (b1 > 0) integ += centsIntegral(0, SLIP_PEAK * (b1 / 2), b1);
+    if (b2 > 2) integ += centsIntegral(SLIP_PEAK, SLIP_PEAK, b2 - 2);
+    if (uu > 5) integ += centsIntegral(SLIP_PEAK, SLIP_PEAK * (1 - (uu - 5) / 2.5), uu - 5);
+    var phi = 2 * Math.PI * FVIS * integ;
+    if (u > SLIP_LEN) {
+      var target = Math.round(phi / (2 * Math.PI)) * 2 * Math.PI;
+      phi = phi + (target - phi) * sstep((u - SLIP_LEN) / SETTLE);
+    }
+    return phi;
+  }
+
+  var slipRng = mulberry32(834001);
+  var slips = [];        // {start, idx}
+  var slipCursor = -0.6; // first slip is just beginning at frame one
+  var prevSlipIdx = -1;
+  function genSlips(upto) {
+    while (slips.length === 0 || slips[slips.length - 1].start < upto + 30) {
+      var idx;
+      if (slips.length === 0) {
+        idx = 15; // first slip: a string near the left third
+      } else {
+        do { idx = 3 + Math.floor(slipRng() * 42); } while (idx === prevSlipIdx);
+      }
+      prevSlipIdx = idx;
+      slips.push({ start: slipCursor, idx: idx });
+      slipCursor += SLIP_LEN + SETTLE + 4 + slipRng() * 5;
+    }
+  }
+
+  // ---------- manual drag sessions ----------
+  // session: {string, tStart, samples:[{t, cents}], tRel, centsRel, phiRel, settleEnd, truncated}
+  var sessions = [];
+  function sessionAt(t) {
+    var found = null;
+    for (var i = 0; i < sessions.length; i++) {
+      var s = sessions[i];
+      if (t >= s.tStart && t <= s.settleEnd) found = s; // latest wins
+    }
+    return found;
+  }
+  function manualCents(s, t) {
+    if (t <= s.tStart) return s.samples.length ? s.samples[0].cents : 0;
+    if (s.tRel !== null && t >= s.tRel) {
+      var f = clamp((t - s.tRel) / SETTLE, 0, 1);
+      return s.centsRel * (1 - f);
+    }
+    var sm = s.samples, c = sm[sm.length - 1].cents;
+    for (var i = 1; i < sm.length; i++) {
+      if (t <= sm[i].t) {
+        var a = sm[i - 1], b = sm[i];
+        var f2 = b.t > a.t ? (t - a.t) / (b.t - a.t) : 0;
+        return a.cents + (b.cents - a.cents) * f2;
+      }
+    }
+    return c;
+  }
+  function manualPhi(s, t) {
+    // integral of the recorded cents curve up to release, then settle ease
+    var end = (s.tRel !== null) ? Math.min(t, s.tRel) : t;
+    var sm = s.samples, integ = 0;
+    for (var i = 1; i < sm.length; i++) {
+      var a = sm[i - 1], b = sm[i];
+      if (end <= a.t) break;
+      var tt = Math.min(end, b.t);
+      var cc = a.cents + (b.cents - a.cents) * ((tt - a.t) / Math.max(1e-6, b.t - a.t));
+      integ += centsIntegral(a.cents, cc, tt - a.t);
+      if (end <= b.t) break;
+    }
+    var phi = 2 * Math.PI * FVIS * integ;
+    if (s.tRel !== null && t > s.tRel) {
+      var target = Math.round(phi / (2 * Math.PI)) * 2 * Math.PI;
+      phi = phi + (target - phi) * sstep((t - s.tRel) / SETTLE);
+    }
+    return phi;
+  }
+  function slipCancelled(slip) {
+    var a = slip.start, b = slip.start + SLIP_LEN + SETTLE;
+    for (var i = 0; i < sessions.length; i++) {
+      var s = sessions[i];
+      if (s.tStart < b && s.settleEnd > a) return true;
+    }
+    return false;
+  }
+
+  // the one detuned string at time t, or null. Manual supersedes schedule.
+  function activeDetune(t) {
+    var s = sessionAt(t);
+    if (s) return { idx: s.string, cents: manualCents(s, t), phi: manualPhi(s, t), manual: true };
+    genSlips(t);
+    for (var i = 0; i < slips.length; i++) {
+      var sl = slips[i];
+      var u = t - sl.start;
+      if (u >= 0 && u <= SLIP_LEN + SETTLE && !slipCancelled(sl)) {
+        return { idx: sl.idx, cents: slipCents(u), phi: slipPhase(u), manual: false };
+      }
+    }
+    return null;
+  }
+
+  // ---------- string displacement ----------
+  function disp(u, phase) {
+    // standing wave: fundamental + a breath of second harmonic
+    return Math.sin(Math.PI * u) * Math.sin(phase) + 0.35 * Math.sin(2 * Math.PI * u) * Math.sin(2 * phase + 0.7);
+  }
+
+  // ---------- audio (first tap only; guarded, lazy) ----------
+  var AC = null, oscs = [], slipOsc = null, masterGain = null, audioOn = false;
+  function initAudio() {
+    if (audioOn) return;
+    try {
+      var Ctor = (typeof AudioContext !== 'undefined') ? AudioContext :
+        ((typeof window !== 'undefined' && window.webkitAudioContext) ? window.webkitAudioContext : null);
+      if (!Ctor) return;
+      AC = new Ctor();
+      var comp = AC.createDynamicsCompressor();
+      comp.threshold.value = -18; comp.knee.value = 18; comp.ratio.value = 12;
+      masterGain = AC.createGain(); masterGain.gain.value = 0.9;
+      masterGain.connect(comp); comp.connect(AC.destination);
+      oscs = [];
+      for (var i = 0; i < 4; i++) {
+        var o = AC.createOscillator(), g = AC.createGain();
+        o.type = 'sine'; o.frequency.value = BASE_HZ;
+        g.gain.value = 0.035;
+        o.connect(g); g.connect(masterGain); o.start();
+        oscs.push(o);
+      }
+      slipOsc = AC.createOscillator();
+      var sg = AC.createGain(); sg.gain.value = 0.05;
+      slipOsc.type = 'sine'; slipOsc.frequency.value = BASE_HZ;
+      slipOsc.connect(sg); sg.connect(masterGain); slipOsc.start();
+      if (AC.resume) AC.resume();
+      audioOn = true;
+    } catch (e) { AC = null; audioOn = false; }
+  }
+  function updateAudio(t, det) {
+    if (!audioOn || !AC) return;
+    try {
+      var mult = bankMult(bankCountAt(t));
+      var f = BASE_HZ * mult;
+      for (var i = 0; i < oscs.length; i++) oscs[i].frequency.value = f;
+      var cents = det ? det.cents : 0;
+      slipOsc.frequency.value = f * Math.pow(2, cents / 1200);
+    } catch (e) { /* audio is garnish; never break the drawing */ }
+  }
+
+  // ---------- draw ----------
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = FIELD;
+    ctx.fillRect(0, 0, W, H);
+
+    var g = GEO;
+    var phase = commonPhase(t);
+    var det = activeDetune(t);
+    var count = bankCountAt(t);
+
+    // interference band: a soft field of cells, each cell's brightness the
+    // actual locally weighted sum of the strings' displacement there
+    var rows = 44, bandTop = 0.10, bandBot = 0.90;
+    var goldMix = clamp(0.12 + count * 0.15 + (det ? 0.13 : 0), 0, 0.85);
+    var bandCol = mixHex(SILVER, GOLD, goldMix);
+    var phases = [];
+    for (var i = 0; i < NSTR; i++) phases.push(phase + ((det && det.idx === i) ? det.phi : 0));
+    var bh = (bandBot - bandTop) * g.len / rows;
+    ctx.fillStyle = bandCol;
+    for (var r = 0; r < rows; r++) {
+      var u = bandTop + (bandBot - bandTop) * (r + 0.5) / rows;
+      var y = g.y0 + u * g.len;
+      for (var c = 0; c < NSTR; c++) {
+        var wsum = 0, dsum = 0;
+        for (var j = Math.max(0, c - 2); j <= Math.min(NSTR - 1, c + 2); j++) {
+          var wgt = 1 - Math.abs(j - c) / 3;
+          dsum += wgt * disp(u, phases[j]);
+          wsum += wgt;
+        }
+        var e = clamp(Math.abs(dsum / wsum) / 1.35, 0, 1); // 1.35 = max |disp|
+        var feather = Math.pow(Math.sin(Math.PI * (c + 0.5) / NSTR), 0.3);
+        var vwin = Math.pow(Math.sin(Math.PI * (r + 0.5) / rows), 0.6);
+        ctx.globalAlpha = (0.010 + 0.28 * e) * feather * vwin;
+        ctx.fillRect(stringX(c) - g.spacing * 0.75, y - bh, g.spacing * 1.5, bh * 2);
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    // slip smear: local interference smear around the detuned string
+    if (det) {
+      var sx = stringX(det.idx);
+      var smearA = 0.04 + 0.10 * clamp(det.cents / SLIP_PEAK, 0, 1);
+      ctx.globalAlpha = smearA;
+      ctx.fillStyle = EMBER;
+      ctx.fillRect(sx - g.spacing * 2.6, g.y0, g.spacing * 5.2, g.len);
+      ctx.globalAlpha = 1;
+    }
+
+    // rails: peg rail (top) and bridge (bottom), AM-radio brown
+    ctx.fillStyle = BROWN;
+    ctx.fillRect(g.mx * 0.4, g.y0 - g.railH - g.pegH * 0.4, W - g.mx * 0.8, g.railH);
+    ctx.fillRect(g.mx * 0.4, g.y1 + g.pegH * 0.4, W - g.mx * 0.8, g.railH);
+
+    // strings
+    var SEG = 56;
+    ctx.lineWidth = g.lineW;
+    ctx.lineCap = 'round';
+    for (var s2 = 0; s2 < NSTR; s2++) {
+      var x0 = stringX(s2);
+      var isDet = det && det.idx === s2;
+      ctx.strokeStyle = isDet ? mixHex(SILVER, EMBER, clamp(det.cents / 40, 0, 0.45)) : SILVER;
+      ctx.globalAlpha = isDet ? 0.98 : 0.88;
+      ctx.beginPath();
+      for (var k = 0; k <= SEG; k++) {
+        var uu = k / SEG;
+        var xx = x0 + disp(uu, phases[s2]) * g.amp;
+        var yy = g.y0 + uu * g.len;
+        if (k === 0) ctx.moveTo(xx, yy); else ctx.lineTo(xx, yy);
+      }
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+
+    // pegs
+    ctx.fillStyle = BROWN;
+    for (var p = 0; p < NSTR; p++) {
+      var px = stringX(p);
+      ctx.fillRect(px - g.pegW / 2, g.y0 - g.pegH, g.pegW, g.pegH);
+      ctx.fillRect(px - g.pegW / 2, g.y1, g.pegW, g.pegH * 0.7);
+    }
+
+    // ember dot on the slipping string's top peg
+    if (det) {
+      var ex = stringX(det.idx);
+      var ey = g.y0 - g.pegH / 2;
+      var ea = clamp(det.cents / 8, 0.15, 1);
+      ctx.globalAlpha = 0.25 * ea;
+      ctx.fillStyle = EMBER;
+      ctx.beginPath(); ctx.arc(ex, ey, Math.max(5, g.pegW * 1.5), 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = ea;
+      ctx.beginPath(); ctx.arc(ex, ey, Math.max(3, g.pegW * 0.78), 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    updateAudio(t, det);
+  }
+
+  // ---------- interaction ----------
+  var dragSess = null;
+  var lastTap = { t: -10, x: 0, y: 0 };
+  function evPos(e) {
+    var r = { x: 0, y: 0 };
+    if (e && typeof e.clientX === 'number') { r.x = e.clientX; r.y = e.clientY; }
+    return r;
+  }
+  function nearestString(x) {
+    var i = Math.round((x - GEO.mx) / GEO.spacing);
+    return clamp(i, 0, NSTR - 1);
+  }
+  function onDown(e) {
+    initAudio();
+    var t = nowT();
+    var p = evPos(e);
+    // double-tap: bank drop (drop a semitone, wrap after 4 back to base)
+    if (t - lastTap.t < 0.32 && Math.abs(p.x - lastTap.x) < 44 && Math.abs(p.y - lastTap.y) < 44) {
+      var c = (bankCountAt(t) + 1) % 5;
+      bankEvents.push({ t: t, count: c });
+      lastTap = { t: -10, x: 0, y: 0 };
+    } else {
+      lastTap = { t: t, x: p.x, y: p.y };
+    }
+    // begin a manual detune session on the nearest string
+    if (dragSess) { dragSess.settleEnd = Math.min(dragSess.settleEnd, t); dragSess = null; }
+    var sess = {
+      string: nearestString(p.x), tStart: t,
+      samples: [{ t: t, cents: 0 }],
+      tRel: null, centsRel: 0, settleEnd: Infinity,
+      gx: p.x, gy: p.y
+    };
+    sessions.push(sess);
+    dragSess = sess;
+  }
+  function onMove(e) {
+    if (!dragSess) return;
+    var t = nowT();
+    var p = evPos(e);
+    var dx = p.x - dragSess.gx, dy = p.y - dragSess.gy;
+    var dist = Math.sqrt(dx * dx + dy * dy);
+    var cents = clamp(dist / 5, 0, 32);
+    var sm = dragSess.samples;
+    if (t > sm[sm.length - 1].t) sm.push({ t: t, cents: cents });
+    else sm[sm.length - 1].cents = cents;
+  }
+  function onUp() {
+    if (!dragSess) return;
+    var t = nowT();
+    var sm = dragSess.samples;
+    dragSess.tRel = t;
+    dragSess.centsRel = sm[sm.length - 1].cents;
+    dragSess.settleEnd = t + SETTLE;
+    dragSess = null;
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+  }
+  function onResize() {
+    resize();
+    draw(nowT());
+  }
+  if (window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', onResize);
+  if (window.addEventListener) window.addEventListener('resize', onResize);
+
+  // ---------- run ----------
+  resize();
+  draw(0); // frame one: synchronous, t = 0, no wall clock
+  if (typeof requestAnimationFrame === 'function') {
+    var loop = function () {
+      draw(nowT());
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
