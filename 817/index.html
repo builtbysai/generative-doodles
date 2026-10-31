@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dots (Don't Tell)</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #08080A; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+
+// ---- seeded RNG: mulberry32 ----
+function mulberry32(seed) {
+  var a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// ---- palette (strict; mixes recorded in process.md) ----
+var COL = {
+  bg: '#08080A',
+  board: '#241A10',
+  dots: '#E8E0CC',
+  rings: '#EAC887',
+  stringCol: '#695C4B', // dots/board mix, ~35% dots over board
+  fretCol: '#90826F',   // dots/board mix, ~55% dots over board
+  boardEdge: '#171008'  // board darkened toward bg
+};
+
+// ---- nodes: 7th, 12th, 15th, 19th at string-length fractions ----
+// partials per node: the struck node blooms one ring per partial;
+// ring radius is proportional to 1/partial, alpha to 1/partial^2.
+var NODES = [
+  { name: '7th',  frac: 1 / 2, partials: [2, 3] },
+  { name: '12th', frac: 2 / 3, partials: [2, 3, 5, 7], dot: true },
+  { name: '15th', frac: 3 / 4, partials: [3, 5, 7], dot: true },
+  { name: '19th', frac: 4 / 5, partials: [2, 3, 5] }
+];
+// fret wire fractions along the played length (visual only, no numbers)
+var FRETS = [0.18, 0.30, 0.40, 0.46, 0.50, 0.56, 0.61, 2 / 3, 0.71, 0.75, 0.775, 0.80, 0.85, 0.90];
+
+var BLOOM = 2.5;          // seconds a strike's rings live
+var RIFF_CYCLE = 9.6;     // seconds per riff cycle (0.8 s grid, 12 steps)
+var RIFF_PHASE = 0.35;    // first strike sits at t = -0.35 so frame one catches the bloom open
+
+// ---- riff: deterministic strikes generated per (seed, cycle) ----
+// Returns list of {off, node} with off in [0, RIFF_CYCLE).
+function riffStrikes(seed, cycle) {
+  var rng = mulberry32((seed * 7919 + cycle * 104729 + 13) >>> 0);
+  var strikes = [];
+  if (cycle === 0) {
+    strikes.push({ off: 0, node: 1 }); // the 12th node opens the piece
+  }
+  var steps = 12, stepLen = RIFF_CYCLE / steps;
+  for (var s = 0; s < steps; s++) {
+    var r = rng();
+    if (cycle === 0 && s === 0) continue;       // opening strike already placed
+    if (r < 0.42) {
+      var node = Math.floor(rng() * NODES.length);
+      strikes.push({ off: s * stepLen, node: node });
+    }
+  }
+  return strikes;
+}
+
+// ---- recorded interaction state ----
+// riffSegments: [{start, seed}] the riff restarts on double-tap with a new seed.
+// dragStrikes: [{t, node}] strikes caused by scrubbing the play-head onto a node.
+var RIFF_SEED0 = 817;
+var riffSegments = [{ start: -RIFF_PHASE, seed: RIFF_SEED0 }];
+var dragStrikes = [];
+var playhead = null; // {frac, t} latest scrub position
+
+function nowT() {
+  // piece-local clock in seconds; frame one is drawn synchronously at t = 0
+  if (typeof performance !== 'undefined' && performance.now) {
+    return (performance.now() - T0) / 1000;
+  }
+  return 0;
+}
+var T0 = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+
+// all strikes (from riff segments and drags) whose bloom is live at time t
+function liveStrikes(t) {
+  var out = [];
+  for (var i = 0; i < riffSegments.length; i++) {
+    var seg = riffSegments[i];
+    var segEnd = (i + 1 < riffSegments.length) ? riffSegments[i + 1].start : Infinity;
+    var local = t - seg.start;
+    if (local < -BLOOM) continue;
+    var cyc = Math.floor(local / RIFF_CYCLE);
+    for (var c = Math.max(0, cyc - 1); c <= cyc; c++) {
+      var list = riffStrikes(seg.seed, c);
+      for (var j = 0; j < list.length; j++) {
+        var et = seg.start + c * RIFF_CYCLE + list[j].off;
+        if (et >= segEnd) continue;
+        var age = t - et;
+        if (age >= 0 && age < BLOOM) out.push({ node: list[j].node, age: age });
+      }
+    }
+  }
+  for (var k = 0; k < dragStrikes.length; k++) {
+    var dAge = t - dragStrikes[k].t;
+    if (dAge >= 0 && dAge < BLOOM) out.push({ node: dragStrikes[k].node, age: dAge });
+  }
+  return out;
+}
+
+// last strike age per node (for dot glow pulse), or Infinity
+function nodeGlowAge(t, idx) {
+  var best = Infinity;
+  var s = liveStrikes(t);
+  for (var i = 0; i < s.length; i++) if (s[i].node === idx && s[i].age < best) best = s[i].age;
+  return best;
+}
+
+// ---- canvas / viewport ----
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var W = 0, H = 0;
+
+function resize() {
+  var vv = (typeof window !== 'undefined' && window.visualViewport) ? window.visualViewport : null;
+  var w = vv ? vv.width : window.innerWidth;
+  var h = vv ? vv.height : window.innerHeight;
+  canvas.width = Math.round(w);
+  canvas.height = Math.round(h);
+  draw(nowT());
+}
+
+function isPhone() {
+  var sw = (window.screen && window.screen.width) || W;
+  var sh = (window.screen && window.screen.height) || H;
+  if (Math.min(sw, sh) < 700) return true;
+  return H > W * 1.15;
+}
+
+// ---- geometry: neck diagonal, lower-left (nut) to upper-right (body) ----
+function geom() {
+  var m = Math.min(W, H);
+  var ax = W * 0.13, ay = H * 0.85;   // nut end
+  var bx = W * 0.87, by = H * 0.15;   // body end
+  var dx = bx - ax, dy = by - ay;
+  var len = Math.sqrt(dx * dx + dy * dy);
+  var ux = dx / len, uy = dy / len;
+  var px = -uy, py = ux;              // perpendicular
+  var halfW = m * (isPhone() ? 0.105 : 0.085);
+  // played length runs from frac 0.06 (just past nut) to 0.98 along the axis
+  function point(frac) {
+    var f = 0.06 + frac * 0.92;
+    return { x: ax + dx * f, y: ay + dy * f };
+  }
+  return { ax: ax, ay: ay, bx: bx, by: by, ux: ux, uy: uy, px: px, py: py, halfW: halfW, point: point, m: m };
+}
+
+function hexA(hex, a) {
+  var r = parseInt(hex.slice(1, 3), 16), g = parseInt(hex.slice(3, 5), 16), b = parseInt(hex.slice(5, 7), 16);
+  return 'rgba(' + r + ',' + g + ',' + b + ',' + a + ')';
+}
+
+function draw(t) {
+  var w = canvas.width, h = canvas.height;
+  if (!w || !h) return;
+  W = w; H = h;
+  canvas.style.width = w + 'px';
+  canvas.style.height = h + 'px';
+  var g = geom();
+
+  ctx.fillStyle = COL.bg;
+  ctx.fillRect(0, 0, w, h);
+
+  // ---- fretboard band ----
+  var c0 = g.point(-0.045), c1 = g.point(1.03);
+  ctx.beginPath();
+  ctx.moveTo(c0.x + g.px * g.halfW, c0.y + g.py * g.halfW);
+  ctx.lineTo(c1.x + g.px * g.halfW, c1.y + g.py * g.halfW);
+  ctx.lineTo(c1.x - g.px * g.halfW, c1.y - g.py * g.halfW);
+  ctx.lineTo(c0.x - g.px * g.halfW, c0.y - g.py * g.halfW);
+  ctx.closePath();
+  ctx.fillStyle = COL.board;
+  ctx.fill();
+  ctx.strokeStyle = COL.boardEdge;
+  ctx.lineWidth = Math.max(1.5, g.m * 0.004);
+  ctx.stroke();
+
+  // ---- fret wires ----
+  ctx.strokeStyle = COL.fretCol;
+  for (var i = 0; i < FRETS.length; i++) {
+    var fp = g.point(FRETS[i]);
+    ctx.globalAlpha = 0.5;
+    ctx.lineWidth = Math.max(1, g.m * 0.0022);
+    ctx.beginPath();
+    ctx.moveTo(fp.x + g.px * g.halfW * 0.98, fp.y + g.py * g.halfW * 0.98);
+    ctx.lineTo(fp.x - g.px * g.halfW * 0.98, fp.y - g.py * g.halfW * 0.98);
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+
+  // ---- strings (six, along the board) ----
+  ctx.strokeStyle = COL.stringCol;
+  for (var sIdx = 0; sIdx < 6; sIdx++) {
+    var off = (sIdx / 5 - 0.5) * 2 * g.halfW * 0.78;
+    ctx.globalAlpha = 0.55;
+    ctx.lineWidth = Math.max(0.7, g.m * 0.0013);
+    ctx.beginPath();
+    ctx.moveTo(c0.x + g.px * off, c0.y + g.py * off);
+    ctx.lineTo(c1.x + g.px * off, c1.y + g.py * off);
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+
+  // ---- play-head (only while scrubbing / just after) ----
+  if (playhead && t - playhead.t < 1.2) {
+    var hp = g.point(playhead.frac);
+    var fade = 1 - (t - playhead.t) / 1.2;
+    ctx.strokeStyle = hexA(COL.rings, 0.35 * fade);
+    ctx.lineWidth = Math.max(1.2, g.m * 0.003);
+    ctx.beginPath();
+    ctx.moveTo(hp.x + g.px * g.halfW, hp.y + g.py * g.halfW);
+    ctx.lineTo(hp.x - g.px * g.halfW, hp.y - g.py * g.halfW);
+    ctx.stroke();
+  }
+
+  var strikes = liveStrikes(t);
+
+  // ---- inlay dots at the 12th and 15th, with soft glow ----
+  for (var n = 0; n < NODES.length; n++) {
+    if (!NODES[n].dot) continue;
+    var dp = g.point(NODES[n].frac);
+    var pulse = 0;
+    for (var q = 0; q < strikes.length; q++) {
+      if (strikes[q].node === n) pulse = Math.max(pulse, 1 - strikes[q].age / BLOOM);
+    }
+    var dotR = g.m * 0.016;
+    // layered soft glow (no shadowBlur, no gradient)
+    var glowR = dotR * (3.2 + pulse * 1.6);
+    ctx.fillStyle = hexA(COL.dots, 0.05 + pulse * 0.05);
+    ctx.beginPath(); ctx.arc(dp.x, dp.y, glowR, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = hexA(COL.dots, 0.09 + pulse * 0.08);
+    ctx.beginPath(); ctx.arc(dp.x, dp.y, glowR * 0.6, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = hexA(COL.dots, 0.92);
+    ctx.beginPath(); ctx.arc(dp.x, dp.y, dotR, 0, Math.PI * 2); ctx.fill();
+  }
+
+  // (The 7th and 19th nodes carry no marks of their own: the dots are the
+  // only marks on the board. Those nodes announce themselves only when
+  // struck, by their rings.)
+
+  // ---- harmonic rings: closed-form in (strike time, t) ----
+  var maxR = g.m * 0.34;
+  for (var si = 0; si < strikes.length; si++) {
+    var st = strikes[si];
+    var node = NODES[st.node];
+    var cp = g.point(node.frac);
+    var u = st.age / BLOOM;                    // 0..1 bloom progress
+    var ease = 1 - Math.pow(1 - u, 3);         // easeOutCubic expansion
+    var env = u < 0.12 ? (u / 0.12) : 1 - (u - 0.12) / 0.88;
+    for (var pi = 0; pi < node.partials.length; pi++) {
+      var p = node.partials[pi];
+      var r = maxR * (2 / p) * ease;
+      if (r < 0.6) continue;
+      var a = 0.85 * (4 / (p * p)) * env;
+      if (a > 0.9) a = 0.9;
+      if (a <= 0.004) continue;
+      ctx.strokeStyle = hexA(COL.rings, a);
+      ctx.lineWidth = Math.max(1, g.m * 0.0028);
+      ctx.beginPath(); ctx.arc(cp.x, cp.y, r, 0, Math.PI * 2); ctx.stroke();
+    }
+    // bright core flash at the struck node
+    var coreA = 0.55 * env;
+    ctx.fillStyle = hexA(COL.rings, coreA);
+    ctx.beginPath(); ctx.arc(cp.x, cp.y, Math.max(1.6, g.m * 0.006), 0, Math.PI * 2); ctx.fill();
+  }
+}
+
+// ---- interaction: drag scrubs the play-head; node arrival strikes ----
+var dragging = false;
+var lastNode = -1;
+var lastTapT = -10, lastTapX = 0, lastTapY = 0;
+var reseedCount = 0;
+
+function fracFromEvent(e) {
+  var g = geom();
+  var x = (e.clientX != null ? e.clientX : 0), y = (e.clientY != null ? e.clientY : 0);
+  var vx = x - g.ax, vy = y - g.ay;
+  var along = vx * g.ux + vy * g.uy;
+  var total = Math.sqrt(Math.pow(g.bx - g.ax, 2) + Math.pow(g.by - g.ay, 2));
+  var f = along / total;
+  // invert played-length mapping point(): played f = 0.06 + frac*0.92 of axis
+  return (f - 0.06) / 0.92;
+}
+
+function nearestNode(frac) {
+  var best = -1, bestD = 0.045;
+  for (var i = 0; i < NODES.length; i++) {
+    var d = Math.abs(NODES[i].frac - frac);
+    if (d < bestD) { bestD = d; best = i; }
+  }
+  return best;
+}
+
+function onDown(e) {
+  var t = nowT();
+  var x = (e.clientX != null ? e.clientX : 0), y = (e.clientY != null ? e.clientY : 0);
+  if (t - lastTapT < 0.32 && Math.abs(x - lastTapX) < 40 && Math.abs(y - lastTapY) < 40) {
+    // double-tap: reseed the riff (the prompt's own mechanic)
+    reseedCount++;
+    riffSegments.push({ start: t, seed: (RIFF_SEED0 + reseedCount * 131) >>> 0 });
+    lastTapT = -10;
+    dragging = false;
+    draw(t);
+    return;
+  }
+  lastTapT = t; lastTapX = x; lastTapY = y;
+  dragging = true;
+  lastNode = -1;
+  onMove(e);
+}
+function onMove(e) {
+  if (!dragging) return;
+  var t = nowT();
+  var frac = fracFromEvent(e);
+  if (frac < -0.05 || frac > 1.05) return;
+  playhead = { frac: Math.max(0, Math.min(1, frac)), t: t };
+  var node = nearestNode(frac);
+  if (node >= 0 && node !== lastNode) {
+    dragStrikes.push({ t: t, node: node });
+    lastNode = node;
+  } else if (node < 0) {
+    lastNode = -1;
+  }
+  draw(t);
+}
+function onUp() { dragging = false; }
+
+if (canvas && canvas.addEventListener) {
+  canvas.addEventListener('pointerdown', onDown);
+  canvas.addEventListener('pointermove', onMove);
+  canvas.addEventListener('pointerup', onUp);
+  canvas.addEventListener('pointercancel', onUp);
+}
+
+if (typeof window !== 'undefined' && window.addEventListener) {
+  window.addEventListener('resize', resize);
+}
+if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.addEventListener) {
+  window.visualViewport.addEventListener('resize', resize);
+}
+
+// frame one: synchronous draw at t = 0 (riff phase places a fresh 12th-node bloom here)
+resize();
+draw(0);
+
+if (typeof requestAnimationFrame === 'function') {
+  var loop = function () {
+    draw(nowT());
+    requestAnimationFrame(loop);
+  };
+  requestAnimationFrame(loop);
+}
+</script>
+</body>
+</html>

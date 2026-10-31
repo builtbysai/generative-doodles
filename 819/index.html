@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Antiphonal Compass</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0B1020; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded RNG (mulberry32) ----------
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- palette (strict) ----------
+  var GROUND = '#0B1020';   // deep blue ground
+  var TICK = '#C9A227';     // brass compass ticks / node metal
+  var PULSE = '#C8102E';    // crimson motif pulse
+  var VOID = '#05060C';     // center audience void
+
+  function hexRgb(h) {
+    return [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
+  }
+  // mix(a, b, f): f of the way from a to b. Recorded mixes used below:
+  //   NODE_FILL  = mix(TICK, GROUND, 0.45)  brass body grounded in the blue
+  //   NODE_RING  = mix(TICK, GROUND, 0.25)  brighter brass rim
+  //   ORBIT_LINE = mix(TICK, GROUND, 0.72)  dim brass orbit circle
+  //   VOID_LIFT  = mix(VOID, TICK, 0.22)    center glow at orbit completion
+  function mix(a, b, f) {
+    var A = hexRgb(a), B = hexRgb(b);
+    return 'rgb(' + Math.round(A[0] + (B[0] - A[0]) * f) + ',' +
+                    Math.round(A[1] + (B[1] - A[1]) * f) + ',' +
+                    Math.round(A[2] + (B[2] - A[2]) * f) + ')';
+  }
+  var NODE_FILL = mix(TICK, GROUND, 0.45);
+  var NODE_RING = mix(TICK, GROUND, 0.25);
+  var ORBIT_LINE = mix(TICK, GROUND, 0.72);
+  var VOID_LIFT = mix(VOID, TICK, 0.22);
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ---------- viewport sizing (Visual Viewport API) ----------
+  function viewSize() {
+    var w, h;
+    if (window.visualViewport) {
+      w = window.visualViewport.width;
+      h = window.visualViewport.height;
+    } else {
+      w = window.innerWidth;
+      h = window.innerHeight;
+    }
+    return { w: w, h: h };
+  }
+  function isPhone(w, h) {
+    var sw = 9999;
+    if (window.screen) sw = Math.min(window.screen.width, window.screen.height);
+    return sw < 700 || h > w * 1.15;
+  }
+
+  var W = 0, H = 0, DPR = 1, PHONE = false;
+  var GEO = null;
+  function resize() {
+    var s = viewSize();
+    W = Math.max(1, Math.round(s.w));
+    H = Math.max(1, Math.round(s.h));
+    DPR = window.devicePixelRatio || 1;
+    PHONE = isPhone(W, H);
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    buildScene();
+  }
+
+  // ---------- static scene geometry (seeded, rebuilt on resize) ----------
+  var NODE_COUNT = 8;
+  var STEP = Math.PI / 4;              // one node spacing, radians
+  var A0 = -Math.PI / 2;               // node 0 (N) at the top
+  function buildScene() {
+    var rng = mulberry32(819137);
+    var minD = Math.min(W, H);
+    var nodes = [];
+    for (var k = 0; k < NODE_COUNT; k++) {
+      var a = A0 + k * STEP;
+      nodes.push({
+        angle: a,
+        x: W / 2 + Math.cos(a) * minD * 0.40,
+        y: H / 2 + Math.sin(a) * minD * 0.40,
+        r: minD * 0.027 * (0.92 + rng() * 0.16)   // seeded size jitter
+      });
+    }
+    var ticks = [];
+    for (var i = 0; i < 72; i++) {
+      var ta = (i / 72) * Math.PI * 2;
+      var major = (i % 9 === 0);                   // tick at each node angle
+      ticks.push({
+        angle: ta,
+        len: minD * (major ? 0.034 : 0.017) * (0.9 + rng() * 0.2),
+        major: major
+      });
+    }
+    GEO = {
+      cx: W / 2, cy: H / 2, minD: minD,
+      R: minD * 0.40,
+      tickIn: minD * 0.40 + minD * 0.040,
+      voidR: minD * 0.145,
+      flareMax: minD * 0.088,
+      tokenL: minD * 0.056,
+      tokenW: minD * 0.030,
+      nodes: nodes,
+      ticks: ticks
+    };
+  }
+
+  // ---------- orbit model: piecewise segments, closed-form ----------
+  // Rest orbit: one node handoff every 4 s.
+  var W_REST = STEP / 4;               // pi/16 rad per second
+  var TAU = 7;                         // velocity decay time constant, seconds
+  var FLARE_LIFE = 1.6;                // seconds
+
+  // Segment kinds:
+  //   free: {kind, t0, th0, w0}  th(t) = th0 + W_REST*(t-t0) + (w0-W_REST)*TAU*(1-exp(-(t-t0)/TAU))
+  //   drag: {kind, t0, th0, samples:[{t, th}]}  th(t) = piecewise-linear over samples
+  var segments = [
+    { kind: 'free', t0: -0.5, th0: A0 + STEP, w0: W_REST }  // pulse handed off at node 1 at t=-0.5
+  ];
+  // Handoff event log: {t, node}. Seeded with the virtual handoff at t=-0.5
+  // so frame one (t=0) catches that flare mid-expansion.
+  var handoffs = [{ t: -0.5, node: 1 }];
+
+  function segAt(t) {
+    for (var i = segments.length - 1; i >= 0; i--) {
+      if (segments[i].t0 <= t) return segments[i];
+    }
+    return segments[0];
+  }
+  function angleAt(t) {
+    var s = segAt(t);
+    if (s.kind === 'free') {
+      var dt = t - s.t0;
+      return s.th0 + W_REST * dt + (s.w0 - W_REST) * TAU * (1 - Math.exp(-dt / TAU));
+    }
+    var sm = s.samples;
+    if (t <= sm[0].t) return sm[0].th;
+    for (var i = 1; i < sm.length; i++) {
+      if (t <= sm[i].t) {
+        var span = sm[i].t - sm[i - 1].t;
+        var f = span > 0 ? (t - sm[i - 1].t) / span : 0;
+        return sm[i - 1].th + (sm[i].th - sm[i - 1].th) * f;
+      }
+    }
+    return sm[sm.length - 1].th;
+  }
+  function omegaAt(t) {
+    var s = segAt(t);
+    if (s.kind === 'free') {
+      return W_REST + (s.w0 - W_REST) * Math.exp(-(t - s.t0) / TAU);
+    }
+    var sm = s.samples;
+    if (sm.length < 2) return W_REST;
+    var a = sm[Math.max(0, sm.length - 3)], b = sm[sm.length - 1];
+    var dt = b.t - a.t;
+    return dt > 0.01 ? (b.th - a.th) / dt : W_REST;
+  }
+
+  // ---------- motif shapes (seeded variants, double-tap cycles) ----------
+  var SHAPES = ['shard', 'diamond', 'teardrop'];
+  var shapeIdx = 0;                    // frame one flies the shard
+  function traceShape(L, Wd) {
+    var kind = SHAPES[shapeIdx];
+    ctx.beginPath();
+    if (kind === 'shard') {
+      ctx.moveTo(L * 0.55, 0);
+      ctx.lineTo(-L * 0.26, Wd * 0.52);
+      ctx.lineTo(-L * 0.55, 0);
+      ctx.lineTo(-L * 0.26, -Wd * 0.52);
+      ctx.closePath();
+    } else if (kind === 'diamond') {
+      ctx.moveTo(L * 0.52, 0);
+      ctx.lineTo(0, Wd * 0.52);
+      ctx.lineTo(-L * 0.52, 0);
+      ctx.lineTo(0, -Wd * 0.52);
+      ctx.closePath();
+    } else { // teardrop: blunt tail, round head
+      ctx.moveTo(L * 0.58, 0);
+      ctx.quadraticCurveTo(L * 0.10, Wd * 0.60, -L * 0.40, Wd * 0.20);
+      ctx.quadraticCurveTo(-L * 0.58, 0, -L * 0.40, -Wd * 0.20);
+      ctx.quadraticCurveTo(L * 0.10, -Wd * 0.60, L * 0.58, 0);
+    }
+  }
+  function drawToken(x, y, rot, scale, alpha) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(rot);
+    ctx.scale(scale, scale);
+    traceShape(GEO.tokenL, GEO.tokenW);
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = PULSE;
+    ctx.fill();
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- draw ----------
+  function draw(t) {
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+
+    ctx.fillStyle = GROUND;
+    ctx.fillRect(0, 0, W, H);
+    var g = GEO, cx = g.cx, cy = g.cy;
+
+    var th = angleAt(t);
+    var om = omegaAt(t);
+
+    // --- center void, with a pulse on each completed orbit ---
+    // revolutions of the unwrapped angle measured from node 0's angle
+    var rev = (th - A0) / (Math.PI * 2);
+    var dd = rev - Math.floor(rev);                    // 0 just after passing N
+    var lift = Math.exp(-Math.pow(dd / 0.045, 2));     // sharp completion flash, in revs
+    ctx.beginPath();
+    ctx.arc(cx, cy, g.voidR, 0, Math.PI * 2);
+    ctx.fillStyle = VOID;
+    ctx.fill();
+    if (lift > 0.01) {
+      ctx.globalAlpha = lift;
+      ctx.fillStyle = VOID_LIFT;
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+    // faint expanding ring travelling out from the center after each orbit
+    ctx.beginPath();
+    ctx.arc(cx, cy, g.voidR * (0.30 + 0.70 * dd), 0, Math.PI * 2);
+    ctx.globalAlpha = 0.20 * Math.pow(1 - dd, 2);
+    ctx.strokeStyle = TICK;
+    ctx.lineWidth = Math.max(1, g.minD * 0.0022);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    // void rim
+    ctx.beginPath();
+    ctx.arc(cx, cy, g.voidR, 0, Math.PI * 2);
+    ctx.globalAlpha = 0.35;
+    ctx.strokeStyle = TICK;
+    ctx.lineWidth = Math.max(1, g.minD * 0.0018);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    // --- orbit circle ---
+    ctx.beginPath();
+    ctx.arc(cx, cy, g.R, 0, Math.PI * 2);
+    ctx.globalAlpha = 0.55;
+    ctx.strokeStyle = ORBIT_LINE;
+    ctx.lineWidth = Math.max(1, g.minD * 0.0022);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    // --- brass ticks (no letters, ever) ---
+    for (var i = 0; i < g.ticks.length; i++) {
+      var tk = g.ticks[i];
+      var c = Math.cos(tk.angle), s = Math.sin(tk.angle);
+      ctx.beginPath();
+      ctx.moveTo(cx + c * g.tickIn, cy + s * g.tickIn);
+      ctx.lineTo(cx + c * (g.tickIn + tk.len), cy + s * (g.tickIn + tk.len));
+      ctx.globalAlpha = tk.major ? 0.85 : 0.38;
+      ctx.strokeStyle = TICK;
+      ctx.lineWidth = Math.max(1, g.minD * (tk.major ? 0.0032 : 0.0020));
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+
+    // --- handoff flares (closed-form in event age) ---
+    var flash = [0, 0, 0, 0, 0, 0, 0, 0];
+    for (var hi = handoffs.length - 1; hi >= 0; hi--) {
+      var age = t - handoffs[hi].t;
+      if (age < 0 || age > FLARE_LIFE) continue;
+      var node = g.nodes[handoffs[hi].node];
+      var p = age / FLARE_LIFE;
+      var rr = g.flareMax * (1 - Math.pow(1 - p, 3));
+      ctx.beginPath();
+      ctx.arc(node.x, node.y, Math.max(0.5, rr), 0, Math.PI * 2);
+      ctx.globalAlpha = 0.85 * Math.pow(1 - p, 1.5);
+      ctx.strokeStyle = PULSE;
+      ctx.lineWidth = Math.max(1, g.minD * 0.004 * (1 - p) + 0.6);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+      var fl = Math.exp(-age * 3.2);
+      if (fl > flash[handoffs[hi].node]) flash[handoffs[hi].node] = fl;
+    }
+
+    // --- nodes ---
+    for (var k = 0; k < NODE_COUNT; k++) {
+      var nd = g.nodes[k];
+      ctx.beginPath();
+      ctx.arc(nd.x, nd.y, nd.r, 0, Math.PI * 2);
+      ctx.fillStyle = NODE_FILL;
+      ctx.fill();
+      ctx.globalAlpha = 0.9;
+      ctx.strokeStyle = flash[k] > 0.03 ? PULSE : NODE_RING;
+      ctx.lineWidth = Math.max(1, g.minD * 0.0026);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+      if (flash[k] > 0.03) {           // crimson core flash on the receiving node
+        ctx.beginPath();
+        ctx.arc(nd.x, nd.y, nd.r * 0.45, 0, Math.PI * 2);
+        ctx.globalAlpha = flash[k] * 0.9;
+        ctx.fillStyle = PULSE;
+        ctx.fill();
+        ctx.globalAlpha = 1;
+      }
+    }
+
+    // --- trail: the token at past times, closed-form via angleAt ---
+    var heading = th + (om >= 0 ? Math.PI / 2 : -Math.PI / 2);
+    for (var j = 14; j >= 1; j--) {
+      var tj = t - j * 0.16;
+      if (tj < -0.5) continue;   // before the seeded handoff: no trail yet
+      var thj = angleAt(tj);
+      var xj = cx + Math.cos(thj) * g.R;
+      var yj = cy + Math.sin(thj) * g.R;
+      var hj = thj + (omegaAt(tj) >= 0 ? Math.PI / 2 : -Math.PI / 2);
+      drawToken(xj, yj, hj, 1 - j * 0.042, 0.40 * (1 - j / 15));
+    }
+
+    // --- the pulse token, with a layered-alpha glow (no gradients) ---
+    var px = cx + Math.cos(th) * g.R;
+    var py = cy + Math.sin(th) * g.R;
+    var glowR = [2.3, 1.55, 1.05], glowA = [0.10, 0.16, 0.24];
+    for (var gi = 0; gi < 3; gi++) {
+      ctx.beginPath();
+      ctx.arc(px, py, g.tokenL * 0.5 * glowR[gi], 0, Math.PI * 2);
+      ctx.globalAlpha = glowA[gi];
+      ctx.fillStyle = PULSE;
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    drawToken(px, py, heading, 1, 0.97);
+  }
+
+  // ---------- handoff detection (event log, from the rAF loop) ----------
+  var prevTh = null, prevT = 0;
+  function detectHandoffs(t) {
+    var thNow = angleAt(t);
+    if (prevTh === null) { prevTh = thNow; prevT = t; return; }
+    if (thNow !== prevTh) {
+      var sPrev = Math.floor((prevTh - A0) / STEP);
+      var sNow = Math.floor((thNow - A0) / STEP);
+      if (sNow !== sPrev) {
+        var lo = Math.min(sPrev, sNow), hiB = Math.max(sPrev, sNow);
+        for (var b = lo + 1; b <= hiB; b++) {
+          var bAngle = A0 + b * STEP;
+          var frac = (bAngle - prevTh) / (thNow - prevTh);
+          var nodeIdx = ((b % NODE_COUNT) + NODE_COUNT) % NODE_COUNT;
+          handoffs.push({ t: prevT + frac * (t - prevT), node: nodeIdx });
+        }
+      }
+    }
+    // prune dead flares, keep the log short
+    while (handoffs.length > 0 && t - handoffs[0].t > FLARE_LIFE + 1) handoffs.shift();
+    if (handoffs.length > 24) handoffs.splice(0, handoffs.length - 24);
+    prevTh = thNow; prevT = t;
+  }
+
+  // ---------- interaction ----------
+  function nowSec() { return performance.now() / 1000; }
+  var startTime = nowSec();
+  function pieceT() { return nowSec() - startTime; }
+  function evPos(e) {
+    var r = canvas.getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  }
+  function wrapPi(a) {
+    while (a > Math.PI) a -= Math.PI * 2;
+    while (a < -Math.PI) a += Math.PI * 2;
+    return a;
+  }
+
+  var pDown = null;        // {t, x, y, moved}
+  var dragSeg = null;      // active drag segment
+  var grabPointer = 0;     // pointer angle at grab
+  var lastPointer = 0;     // last unwrapped-tracked pointer angle
+  var cumDelta = 0;        // accumulated pointer angle delta since grab
+  var grabTh = 0;          // pulse angle at grab
+  var lastTapUp = -10;
+
+  canvas.addEventListener('pointerdown', function (e) {
+    var p = evPos(e);
+    var t = pieceT();
+    pDown = { t: t, x: p.x, y: p.y, moved: false };
+    dragSeg = null;
+    grabPointer = Math.atan2(p.y - GEO.cy, p.x - GEO.cx);
+    lastPointer = grabPointer;
+    cumDelta = 0;
+    grabTh = angleAt(t);
+    if (canvas.setPointerCapture) { try { canvas.setPointerCapture(e.pointerId); } catch (err) {} }
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (!pDown) return;
+    var p = evPos(e);
+    var dx = p.x - pDown.x, dy = p.y - pDown.y;
+    if (!pDown.moved && Math.sqrt(dx * dx + dy * dy) > 7) pDown.moved = true;
+    if (!pDown.moved) return;
+    var t = pieceT();
+    var pa = Math.atan2(p.y - GEO.cy, p.x - GEO.cx);
+    cumDelta += wrapPi(pa - lastPointer);
+    lastPointer = pa;
+    if (!dragSeg) {
+      dragSeg = { kind: 'drag', t0: pDown.t, samples: [{ t: pDown.t, th: grabTh }] };
+      segments.push(dragSeg);
+    }
+    dragSeg.samples.push({ t: t, th: grabTh + cumDelta });
+  });
+  function endPointer(e) {
+    if (!pDown) return;
+    var t = pieceT();
+    if (dragSeg) {
+      // release: angular velocity from the last stretch of the drag
+      var sm = dragSeg.samples;
+      var w0 = W_REST;
+      var last = sm[sm.length - 1];
+      var j = sm.length - 1;
+      while (j > 0 && last.t - sm[j - 1].t < 0.18) j--;
+      var dt = last.t - sm[j].t;
+      if (dt > 0.03) w0 = (last.th - sm[j].th) / dt;
+      if (w0 > 4.5) w0 = 4.5;
+      if (w0 < -4.5) w0 = -4.5;
+      segments.push({ kind: 'free', t0: t, th0: last.th, w0: w0 });
+      dragSeg = null;
+      if (segments.length > 24) segments.splice(1, segments.length - 24);
+    } else if (t - pDown.t < 0.3) {
+      // a tap: a second tap inside 0.35 s reseeds the motif shape
+      if (t - lastTapUp < 0.35) {
+        shapeIdx = (shapeIdx + 1) % SHAPES.length;
+        lastTapUp = -10;
+      } else {
+        lastTapUp = t;
+      }
+    }
+    pDown = null;
+  }
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', endPointer);
+
+  // ---------- run ----------
+  resize();
+  if (window.visualViewport) window.visualViewport.addEventListener('resize', resize);
+  window.addEventListener('resize', resize);
+
+  draw(0); // frame one: synchronous, orbit phase 0 at the resting velocity
+
+  if (typeof requestAnimationFrame === 'function') {
+    var loop = function () {
+      var t = pieceT();
+      detectHandoffs(t);
+      draw(t);
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
