@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Center Light</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #0B0C0E;
+  }
+  canvas {
+    display: block;
+    margin: 0;
+    padding: 0;
+    touch-action: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="field"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  var canvas = document.getElementById('field');
+  var ctx = canvas.getContext('2d');
+
+  // Palette (strict and complete): ground, core, inner aura, outer aura.
+  var GROUND = '#0B0C0E';
+  var CORE = [255, 255, 255];   // #FFFFFF
+  var INNER = [220, 232, 255];  // #DCE8FF
+  var OUTER = [58, 74, 99];     // #3A4A63
+
+  // Layer time constants (seconds) for the exponential approach each
+  // layer makes toward the drag target. Core answers first, inner
+  // aura trails, outer aura trails further, like disturbed water.
+  var TAU_CORE = 0.9;
+  var TAU_INNER = 1.7;
+  var TAU_OUTER = 2.8;
+
+  // How far back the closed-form integration looks. After 40 s any
+  // layer is within a few parts per million of the target it was
+  // chasing, so restarting the integral at the target value that far
+  // back changes nothing visible and keeps long drags cheap.
+  var WINDOW = 40;
+
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var r = Math.imul(a ^ (a >>> 15), 1 | a);
+      r = (r + Math.imul(r ^ (r >>> 7), 61 | r)) ^ r;
+      return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // Grain: seeded specks in a disc around the glow center, stored as
+  // unit offsets so they ride with the outer aura. Alpha is a
+  // closed-form shimmer of t, about 1 percent: a breath of air in
+  // the light. Positions never move relative to the glow.
+  var GRAIN_COUNT = 700;
+  var grain = [];
+  (function buildGrain() {
+    var rnd = mulberry32(782001);
+    for (var i = 0; i < GRAIN_COUNT; i++) {
+      var ang = rnd() * Math.PI * 2;
+      var rad = Math.sqrt(rnd()) * 0.34; // fraction of min dimension
+      grain.push({
+        dx: Math.cos(ang) * rad,
+        dy: Math.sin(ang) * rad,
+        phase: rnd() * Math.PI * 2,
+        speed: 0.2 + rnd() * 0.5,
+        pale: rnd() < 0.55
+      });
+    }
+  })();
+
+  var viewW = 0;
+  var viewH = 0;
+  var isPhone = false;
+
+  function measure() {
+    var vv = window.visualViewport;
+    viewW = vv ? vv.width : window.innerWidth;
+    viewH = vv ? vv.height : window.innerHeight;
+    var sw = window.screen ? window.screen.width : viewW;
+    var sh = window.screen ? window.screen.height : viewH;
+    isPhone = Math.min(sw, sh) < 700 || viewH > viewW * 1.15;
+    var dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.round(viewW * dpr);
+    canvas.height = Math.round(viewH * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  // ---- Drag target timeline -------------------------------------
+  // The target (where the light is being asked to be) is recorded as
+  // spans: on [ta, tb] the target lerps from pa to pb. A final tail
+  // span runs to infinity: at rest it is the frame center; while
+  // dragging it holds the latest pointer position. Layer positions
+  // are then a pure function of these spans and t, integrated in
+  // closed form span by span. Nothing is frame-integrated state.
+  var spans = [];
+  var tail = null;       // {ta, pa:{x,y}} target holds at pa from ta on
+  var pending = null;    // last pointer sample {t, p} while dragging
+  var dragging = false;
+
+  function center() {
+    return { x: viewW * 0.5, y: viewH * 0.5 };
+  }
+
+  function resetTimeline() {
+    spans = [];
+    tail = { ta: 0, pa: center() };
+    pending = null;
+    dragging = false;
+  }
+  resetTimeline();
+
+  // The core must never touch the frame edges: pointer targets are
+  // clamped so the core center stays at least one core radius from
+  // every edge.
+  function clampTarget(x, y) {
+    var s = Math.min(viewW, viewH);
+    var m = 0.075 * s;
+    return {
+      x: Math.max(m, Math.min(viewW - m, x)),
+      y: Math.max(m, Math.min(viewH - m, y))
+    };
+  }
+
+  // Exact solution of dx/dt = (T - x)/tau over one span segment,
+  // where the target moves linearly: T(u) = a + b*u, u in [0, d].
+  function lagStep(x, a, b, d, tau) {
+    if (d <= 0) return x;
+    var c = x - a + b * tau;
+    return a + b * d - b * tau + c * Math.exp(-d / tau);
+  }
+
+  // Position of one layer at time t, integrated in closed form over
+  // the recorded spans. Starts WINDOW seconds back (or at 0) from
+  // the target's value there; the decay since then makes the
+  // restart error invisible.
+  function layerAt(t, tau) {
+    var t0 = Math.max(0, t - WINDOW);
+    // Walk the recorded spans to find the one containing t0.
+    var list = spans;
+    var i = 0;
+    var acc = null;
+    for (i = 0; i < list.length; i++) {
+      var sp = list[i];
+      if (t0 < sp.tb) { acc = sp; break; }
+    }
+    var first;
+    if (acc) {
+      first = acc;
+    } else {
+      first = { ta: tail.ta, tb: Infinity, pa: tail.pa, pb: tail.pa };
+    }
+    // Initial value: the target's position at t0 within that span.
+    function targetIn(sp, s) {
+      if (!isFinite(sp.tb) || sp.tb === sp.ta) return sp.pb;
+      var u = (s - sp.ta) / (sp.tb - sp.ta);
+      return {
+        x: sp.pa.x + (sp.pb.x - sp.pa.x) * u,
+        y: sp.pa.y + (sp.pb.y - sp.pa.y) * u
+      };
+    }
+    var pos = targetIn(first, t0);
+    var cur = t0;
+    var idx = acc ? list.indexOf(acc) : list.length;
+    var chain = [];
+    for (i = idx; i < list.length; i++) chain.push(list[i]);
+    chain.push({ ta: tail.ta, tb: Infinity, pa: tail.pa, pb: tail.pa });
+    for (i = 0; i < chain.length; i++) {
+      var s2 = chain[i];
+      var segStart = Math.max(cur, s2.ta);
+      var segEnd = Math.min(t, s2.tb);
+      if (segEnd <= segStart) { if (s2.tb <= t) continue; else break; }
+      var dur = s2.tb - s2.ta;
+      var bx = dur > 0 ? (s2.pb.x - s2.pa.x) / dur : 0;
+      var by = dur > 0 ? (s2.pb.y - s2.pa.y) / dur : 0;
+      // Target value at segStart, as the linear function's offset.
+      var off = segStart - s2.ta;
+      var ax = s2.pa.x + bx * off;
+      var ay = s2.pa.y + by * off;
+      var d = segEnd - segStart;
+      pos = {
+        x: lagStep(pos.x, ax, bx, d, tau),
+        y: lagStep(pos.y, ay, by, d, tau)
+      };
+      cur = segEnd;
+      if (cur >= t) break;
+    }
+    return pos;
+  }
+
+  // ---- Pointer ---------------------------------------------------
+  var hasPerf = (typeof performance !== 'undefined') && typeof performance.now === 'function';
+  var startMs = hasPerf ? performance.now() : null;
+  var lastT = 0;
+
+  function eventT(e) {
+    if (hasPerf) return (performance.now() - startMs) / 1000;
+    if (e && typeof e.timeStamp === 'number' && startMs !== null) {
+      return (e.timeStamp - startMs) / 1000;
+    }
+    return lastT;
+  }
+
+  function pointerPos(e) {
+    var x = 0, y = 0;
+    if (typeof canvas.getBoundingClientRect === 'function') {
+      var r = canvas.getBoundingClientRect();
+      x = e.clientX - r.left;
+      y = e.clientY - r.top;
+    } else {
+      x = e.clientX; y = e.clientY;
+    }
+    return clampTarget(x, y);
+  }
+
+  function onDown(e) {
+    var t = eventT(e);
+    var p = pointerPos(e);
+    // Close the current tail at t: hold its value until t.
+    spans.push({ ta: tail.ta, tb: t, pa: tail.pa, pb: tail.pa });
+    tail = { ta: t, pa: p };
+    pending = { t: t, p: p };
+    dragging = true;
+    if (e && e.preventDefault) e.preventDefault();
+  }
+
+  function onMove(e) {
+    if (!dragging) return;
+    var t = eventT(e);
+    var p = pointerPos(e);
+    // Thin the samples: keep the timeline lean without losing shape.
+    var dt = t - pending.t;
+    var dx = p.x - pending.p.x;
+    var dy = p.y - pending.p.y;
+    if (dt < 0.03 && (dx * dx + dy * dy) < 16) return;
+    spans.push({ ta: pending.t, tb: t, pa: pending.p, pb: p });
+    pending = { t: t, p: p };
+    tail = { ta: t, pa: p };
+    if (e && e.preventDefault) e.preventDefault();
+  }
+
+  function onUp(e) {
+    if (!dragging) return;
+    var t = eventT(e);
+    // Hold the last pointer position until release, then the target
+    // becomes the frame center: the light drifts home.
+    spans.push({ ta: pending.t, tb: t, pa: pending.p, pb: pending.p });
+    pending = null;
+    dragging = false;
+    tail = { ta: t, pa: center() };
+  }
+
+  if (typeof canvas.addEventListener === 'function') {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+  }
+
+  // ---- Drawing ---------------------------------------------------
+  // One glow layer: many concentric flat discs added with 'lighter'.
+  // A point at radius r is covered by every disc wider than r, so
+  // equal-alpha discs stack into a smooth triangular falloff peaking
+  // at the center. No gradients anywhere.
+  function glowLayer(cx, cy, radius, color, peak, discs) {
+    var a = peak / discs;
+    ctx.fillStyle = 'rgba(' + color[0] + ',' + color[1] + ',' + color[2] + ',' + a.toFixed(4) + ')';
+    for (var i = 0; i < discs; i++) {
+      var r = radius * (i + 1) / discs;
+      ctx.beginPath();
+      ctx.ellipse(cx, cy, r, r, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  function draw(t) {
+    var w = viewW;
+    var h = viewH;
+    if (!w || !h) return;
+    canvas.style.width = w + 'px';
+    canvas.style.height = h + 'px';
+
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.fillStyle = GROUND;
+    ctx.fillRect(0, 0, w, h);
+
+    var s = Math.min(w, h);
+    var pOuter = layerAt(t, TAU_OUTER);
+    var pInner = layerAt(t, TAU_INNER);
+    var pCore = layerAt(t, TAU_CORE);
+
+    ctx.globalCompositeOperation = 'lighter';
+    // Outer aura: deep blue-gray, out to about 60 percent of frame.
+    glowLayer(pOuter.x, pOuter.y, 0.30 * s, OUTER, 0.55, 46);
+    // Grain riding in the aura, about 1 percent, shimmering.
+    var gsize = isPhone ? 1 : 1.4;
+    for (var g = 0; g < GRAIN_COUNT; g++) {
+      var gp = grain[g];
+      var ga = 0.006 + 0.007 * (0.5 + 0.5 * Math.sin(t * gp.speed + gp.phase));
+      var gc = gp.pale ? INNER : CORE;
+      ctx.fillStyle = 'rgba(' + gc[0] + ',' + gc[1] + ',' + gc[2] + ',' + ga.toFixed(4) + ')';
+      ctx.fillRect(pOuter.x + gp.dx * s, pOuter.y + gp.dy * s, gsize, gsize);
+    }
+    // Inner aura: blue-white.
+    glowLayer(pInner.x, pInner.y, 0.17 * s, INNER, 0.8, 38);
+    // Core: white-hot, about 15 percent of frame across.
+    glowLayer(pCore.x, pCore.y, 0.075 * s, CORE, 1.0, 30);
+    // A small solid heart so the very center reads white-hot.
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.beginPath();
+    ctx.ellipse(pCore.x, pCore.y, 0.026 * s, 0.026 * s, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  function resize() {
+    measure();
+    resetTimeline();
+    draw(lastT);
+  }
+
+  measure();
+  resetTimeline(); // re-anchor the rest target at the measured center
+  draw(0);
+
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', resize);
+  }
+  window.addEventListener('resize', resize);
+
+  if (typeof window.requestAnimationFrame === 'function') {
+    var frame = function (ts) {
+      if (startMs === null) startMs = ts;
+      lastT = (ts - startMs) / 1000;
+      if (lastT < 0) lastT = 0;
+      draw(lastT);
+      window.requestAnimationFrame(frame);
+    };
+    window.requestAnimationFrame(frame);
+  }
+})();
+</script>
+</body>
+</html>

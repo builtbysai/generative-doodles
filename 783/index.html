@@ -1,0 +1,623 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Desert Draft</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #F4EFE6;
+  }
+  canvas {
+    display: block;
+    margin: 0;
+    padding: 0;
+  }
+</style>
+</head>
+<body>
+<canvas id="sheet"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  var canvas = document.getElementById('sheet');
+  var ctx = canvas.getContext('2d');
+
+  // Palette (strict): warm paper, redline, faint grid, annotation ink.
+  var PAPER = '#F4EFE6'; // paper
+  var RED = '#C0392B';   // redline
+  var GRID = '#D9CFBF';  // faint grid
+  var INK = '#3A3630';   // annotation ink
+
+  var ASPECT = 1.24;   // design sheet width / height
+  var CYCLE = 48;      // seconds per study: 32 draw + 10 hold + 6 fade
+  var DRAW_END = 32;
+  var HOLD_END = 42;
+  var SEED0 = 783001;  // the first study, fixed forever
+
+  // Seeded RNG (mulberry32). All geometry comes from seeded streams;
+  // nothing is ever rolled at draw time.
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var r = Math.imul(a ^ (a >>> 15), 1 | a);
+      r = (r + Math.imul(r ^ (r >>> 7), 61 | r)) ^ r;
+      return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // Deterministic seed chain: each new study steps the LCG once.
+  function stepSeed(s, n) {
+    for (var i = 0; i < n; i++) {
+      s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+    }
+    return s;
+  }
+
+  // ---------- stroke construction (design space: x, y in 0..1) ----------
+
+  // A hand-drawn straight: subdivided, with slight perpendicular
+  // jitter. Endpoints stay exact so joints meet.
+  function linePts(rnd, x0, y0, x1, y1, jit) {
+    var dx = x1 - x0, dy = y1 - y0;
+    var len = Math.sqrt(dx * dx + dy * dy);
+    if (len < 1e-6) return [[x0, y0], [x1, y1]];
+    var n = Math.max(1, Math.round(len / 0.013));
+    var px = -dy / len, py = dx / len;
+    var pts = [];
+    for (var i = 0; i <= n; i++) {
+      var u = i / n;
+      var j = (i === 0 || i === n) ? 0 : (rnd() * 2 - 1) * jit;
+      pts.push([x0 + dx * u + px * j, y0 + dy * u + py * j]);
+    }
+    return pts;
+  }
+
+  function arcPts(cx, cy, r, a0, a1, steps) {
+    var pts = [];
+    for (var i = 0; i <= steps; i++) {
+      var a = a0 + (a1 - a0) * (i / steps);
+      pts.push([cx + r * Math.cos(a), cy + r * Math.sin(a)]);
+    }
+    return pts;
+  }
+
+  function circlePts(cx, cy, r, steps) {
+    var pts = [];
+    for (var i = 0; i <= steps; i++) {
+      var a = (i / steps) * Math.PI * 2;
+      pts.push([cx + r * Math.cos(a), cy + r * Math.sin(a)]);
+    }
+    return pts;
+  }
+
+  function appendPts(arr, pts) {
+    for (var i = arr.length ? 1 : 0; i < pts.length; i++) arr.push(pts[i]);
+  }
+
+  function rectPts(rnd, x, y, w, h, jit) {
+    var pts = [];
+    appendPts(pts, linePts(rnd, x, y, x + w, y, jit));
+    appendPts(pts, linePts(rnd, x + w, y, x + w, y + h, jit));
+    appendPts(pts, linePts(rnd, x + w, y + h, x, y + h, jit));
+    appendPts(pts, linePts(rnd, x, y + h, x, y, jit));
+    return pts;
+  }
+
+  // A handwriting-shaped mark that is not writing: two sine waves and
+  // jitter, no letterforms anywhere.
+  function squiggle(rnd, x, y, len, amp) {
+    var n = 9 + Math.floor(rnd() * 4);
+    var phase = rnd() * Math.PI * 2;
+    var pts = [];
+    for (var i = 0; i < n; i++) {
+      var u = i / (n - 1);
+      pts.push([
+        x + len * u,
+        y + Math.sin(u * 5.2 + phase) * amp * 0.5 + (rnd() * 2 - 1) * amp * 0.55
+      ]);
+    }
+    return pts;
+  }
+
+  // A leader line with a small arrowhead at the target end.
+  function leaderStrokes(rnd, x0, y0, x1, y1) {
+    var out = [];
+    out.push(stroke(linePts(rnd, x0, y0, x1, y1, 0.0007), 'ink', 2));
+    var ang = Math.atan2(y1 - y0, x1 - x0);
+    var bl = 0.007;
+    out.push(stroke(linePts(rnd, x1, y1,
+      x1 - bl * Math.cos(ang - 0.42), y1 - bl * Math.sin(ang - 0.42), 0.0003), 'ink', 2));
+    out.push(stroke(linePts(rnd, x1, y1,
+      x1 - bl * Math.cos(ang + 0.42), y1 - bl * Math.sin(ang + 0.42), 0.0003), 'ink', 2));
+    return out;
+  }
+
+  // Stroke: pts in design space, color key, width key
+  // (0 = main red, 1 = thin red, 2 = ink). Lengths precomputed.
+  function stroke(pts, color, w) {
+    var cum = [0], len = 0;
+    for (var i = 1; i < pts.length; i++) {
+      var dx = pts[i][0] - pts[i - 1][0];
+      var dy = pts[i][1] - pts[i - 1][1];
+      len += Math.sqrt(dx * dx + dy * dy);
+      cum.push(len);
+    }
+    return { pts: pts, color: color, w: w, cum: cum, len: len, t0: 0, t1: 0 };
+  }
+
+  // Give each stroke a reveal interval inside its view's window,
+  // proportional to length with a small per-stroke floor so the many
+  // tiny marks stream in one after another instead of all at once.
+  function assignWindow(strokes, w0, w1) {
+    var total = 0, i;
+    for (i = 0; i < strokes.length; i++) total += strokes[i].len + 0.004;
+    var cur = w0;
+    for (i = 0; i < strokes.length; i++) {
+      var dur = (strokes[i].len + 0.004) / total * (w1 - w0);
+      strokes[i].t0 = cur;
+      strokes[i].t1 = Math.min(w1, cur + Math.max(dur, 0.004));
+      cur += dur;
+    }
+  }
+
+  // ---------- the four views + cartouche, per study ----------
+
+  function planStrokes(rnd, P) {
+    var out = [];
+    var x = 0.045, y = 0.545, w = 0.31, h = 0.38;
+    var gapW = 0.10 * w;
+    var gapX = x + w * P.gx - gapW / 2;
+    // Chamber outline with an entrance gap in the bottom wall.
+    var pts = [];
+    appendPts(pts, linePts(rnd, gapX, y + h, x, y + h, 0.0011));
+    appendPts(pts, linePts(rnd, x, y + h, x, y, 0.0011));
+    appendPts(pts, linePts(rnd, x, y, x + w, y, 0.0011));
+    appendPts(pts, linePts(rnd, x + w, y, x + w, y + h, 0.0011));
+    appendPts(pts, linePts(rnd, x + w, y + h, gapX + gapW, y + h, 0.0011));
+    out.push(stroke(pts, 'red', 0));
+    // Threshold line just inside the entrance.
+    out.push(stroke(linePts(rnd, gapX, y + h - 0.012, gapX + gapW, y + h - 0.012, 0.0006), 'red', 1));
+    // Inner chamber line (the cove inset).
+    out.push(stroke(rectPts(rnd, x + 0.028, y + 0.030, w - 0.056, h - 0.060, 0.0009), 'red', 1));
+    // Pyramid grid: a plus mark per pyramid, row by row.
+    var ix = x + 0.028, iy = y + 0.030, iw = w - 0.056, ih = h - 0.060;
+    var R = P.rows;
+    var C = Math.max(6, Math.min(20, Math.round(R * (iw / ih) * P.aspect)));
+    var cw = iw / C, chh = ih / R;
+    var s = Math.min(cw, chh) * 0.17;
+    for (var r = 0; r < R; r++) {
+      var cy = iy + chh * (r + 0.5);
+      for (var c = 0; c < C; c++) {
+        var cx = ix + cw * (c + 0.5);
+        out.push(stroke([[cx - s, cy], [cx + s, cy]], 'red', 1));
+        out.push(stroke([[cx, cy - s], [cx, cy + s]], 'red', 1));
+      }
+    }
+    // Center marker diamond.
+    var dcx = ix + iw / 2, dcy = iy + ih / 2, ds = Math.min(cw, chh) * 0.42;
+    out.push(stroke([[dcx, dcy - ds], [dcx + ds, dcy], [dcx, dcy + ds], [dcx - ds, dcy], [dcx, dcy - ds]], 'red', 1));
+    // Annotation below the plan: leader + two notation squiggles.
+    var lead = leaderStrokes(rnd, x + w * 0.50, y + h + 0.004, x + w * 0.44, y + h + 0.024);
+    for (var i = 0; i < lead.length; i++) out.push(lead[i]);
+    out.push(stroke(squiggle(rnd, 0.055, 0.950, 0.130, 0.0035), 'ink', 2));
+    out.push(stroke(squiggle(rnd, 0.055, 0.966, 0.095, 0.0035), 'ink', 2));
+    return out;
+  }
+
+  function sideStrokes(rnd, P) {
+    var out = [];
+    var x = 0.045, y = 0.065, w = 0.31, h = 0.30;
+    var floorY = y + h * 0.84, topY = y + h * 0.16;
+    var l = x + w * 0.07, r = x + w * 0.93;
+    var ch = floorY - topY;
+    var cr = Math.min(ch * P.cove, (r - l) * 0.42);
+    // Coved profile: floor, wall, quarter-arc cove, flat ceiling,
+    // cove, wall, floor. ext extends the floor line past the walls.
+    function profile(l2, r2, t2, cr2, ext) {
+      var pts = [];
+      appendPts(pts, linePts(rnd, l2 - ext, floorY, l2, floorY, 0.001));
+      appendPts(pts, linePts(rnd, l2, floorY, l2, t2 + cr2, 0.0011));
+      appendPts(pts, arcPts(l2 + cr2, t2 + cr2, cr2, Math.PI, Math.PI * 1.5, 7));
+      appendPts(pts, linePts(rnd, l2 + cr2, t2, r2 - cr2, t2, 0.0011));
+      appendPts(pts, arcPts(r2 - cr2, t2 + cr2, cr2, Math.PI * 1.5, Math.PI * 2, 7));
+      appendPts(pts, linePts(rnd, r2, t2 + cr2, r2, floorY, 0.0011));
+      appendPts(pts, linePts(rnd, r2, floorY, r2 + ext, floorY, 0.001));
+      return pts;
+    }
+    out.push(stroke(profile(l, r, topY, cr, w * 0.045), 'red', 0));
+    // Floor slab line.
+    out.push(stroke(linePts(rnd, l - w * 0.045, floorY + h * 0.055, r + w * 0.045, floorY + h * 0.055, 0.0009), 'red', 1));
+    // Inner cove echo.
+    out.push(stroke(profile(l + 0.026, r - 0.026, topY + 0.024, cr * 0.76, 0), 'red', 1));
+    // The glowing end wall, seen edge-on near the right wall.
+    var gx2 = r - w * 0.085;
+    var pts2 = [];
+    appendPts(pts2, linePts(rnd, gx2, floorY - ch * 0.05, gx2, topY + ch * 0.16, 0.0008));
+    appendPts(pts2, linePts(rnd, gx2, topY + ch * 0.16, r, topY + ch * 0.16, 0.0008));
+    out.push(stroke(pts2, 'red', 1));
+    // Datum ticks under the slab.
+    for (var k = 0; k < 3; k++) {
+      var tx = l + (r - l) * (0.2 + 0.3 * k) + (rnd() - 0.5) * 0.01;
+      out.push(stroke(linePts(rnd, tx, floorY + h * 0.075, tx, floorY + h * 0.115, 0.0005), 'red', 1));
+    }
+    // Annotation in the gap to the right: leader off the cove.
+    var lead = leaderStrokes(rnd, l + cr * 0.29, topY + cr * 0.29, 0.386, 0.110);
+    for (var i = 0; i < lead.length; i++) out.push(lead[i]);
+    out.push(stroke(squiggle(rnd, 0.392, 0.104, 0.105, 0.0035), 'ink', 2));
+    out.push(stroke(squiggle(rnd, 0.392, 0.122, 0.078, 0.0035), 'ink', 2));
+    return out;
+  }
+
+  function frontStrokes(rnd, P) {
+    var out = [];
+    var x = 0.645, y = 0.065, w = 0.31, h = 0.30;
+    var wx = x + w * 0.10, ww = w * 0.80;
+    var wy = y + h * 0.10, wh = h * 0.74;
+    var floorY = wy + wh;
+    out.push(stroke(rectPts(rnd, wx, wy, ww, wh, 0.0011), 'red', 0));
+    // Floor line extending past the wall, then the slab line.
+    out.push(stroke(linePts(rnd, x + w * 0.02, floorY, x + w * 0.98, floorY, 0.001), 'red', 1));
+    out.push(stroke(linePts(rnd, wx - w * 0.05, floorY + h * 0.05, wx + ww + w * 0.05, floorY + h * 0.05, 0.0009), 'red', 1));
+    // The aperture: a rectangle of light in the wall, with its inset.
+    var aw2 = ww * P.aw, ah2 = wh * P.ah;
+    var ax = wx + (ww - aw2) / 2, ay = floorY - ah2;
+    out.push(stroke(rectPts(rnd, ax, ay, aw2, ah2, 0.001), 'red', 0));
+    out.push(stroke(rectPts(rnd, ax + 0.016, ay + 0.016, aw2 - 0.032, ah2 - 0.032, 0.0008), 'red', 1));
+    // Cove arcs tucked into the wall's top corners.
+    out.push(stroke(arcPts(wx + 0.030, wy + 0.030, 0.030, Math.PI, Math.PI * 1.5, 6), 'red', 1));
+    out.push(stroke(arcPts(wx + ww - 0.030, wy + 0.030, 0.030, Math.PI * 1.5, Math.PI * 2, 6), 'red', 1));
+    // Annotation below: leader off the aperture's lower corner.
+    var lead = leaderStrokes(rnd, ax + aw2, floorY, 0.700, 0.398);
+    for (var i = 0; i < lead.length; i++) out.push(lead[i]);
+    out.push(stroke(squiggle(rnd, 0.706, 0.394, 0.125, 0.0035), 'ink', 2));
+    out.push(stroke(squiggle(rnd, 0.706, 0.412, 0.088, 0.0035), 'ink', 2));
+    return out;
+  }
+
+  function aerialStrokes(rnd, P) {
+    var out = [];
+    var x = 0.415, y = 0.435, w = 0.54, h = 0.45;
+    var horizonY = y + h * 0.15;
+    var VPx = x + w * P.vx;
+    var bw = w * 0.30, bh = h * 0.15;
+    var bx = VPx - bw / 2, by = horizonY + h * 0.03 - bh;
+    var frontY = y + h * 0.965;
+    // Horizon line, broken by the far wall.
+    out.push(stroke(linePts(rnd, x + w * 0.03, horizonY, bx - 0.012, horizonY, 0.0007), 'red', 1));
+    out.push(stroke(linePts(rnd, bx + bw + 0.012, horizonY, x + w * 0.97, horizonY, 0.0007), 'red', 1));
+    // The far light wall and its glow inset.
+    out.push(stroke(rectPts(rnd, bx, by, bw, bh, 0.0009), 'red', 0));
+    out.push(stroke(rectPts(rnd, bx + 0.014, by + 0.012, bw - 0.028, bh - 0.024, 0.0007), 'red', 1));
+    // Field boundary lines converging from the front corners.
+    out.push(stroke(linePts(rnd, x + w * 0.015, frontY, bx - bw * 0.08, by + bh, 0.001), 'red', 1));
+    out.push(stroke(linePts(rnd, x + w * 0.985, frontY, bx + bw + bw * 0.08, by + bh, 0.001), 'red', 1));
+    // Pyramid rows, far to near. Rows bunch toward the horizon.
+    var topFieldY = horizonY + h * 0.045;
+    var R = P.arows;
+    var ys = [];
+    for (var i = 0; i < R; i++) {
+      var d = R === 1 ? 0 : i / (R - 1);
+      var sN = Math.pow(1 - d, 1.7);
+      ys.push({ sN: sN, yb: topFieldY + (frontY - topFieldY) * sN });
+    }
+    var frontHalf = w * 0.485, backHalf = bw * 0.55;
+    for (var ri = R - 1; ri >= 0; ri--) {
+      var sN2 = ys[ri].sN, yb = ys[ri].yb;
+      var gap = ri === 0 ? (ys[0].yb - ys[1].yb) : (ys[ri - 1].yb - yb);
+      var halfW = backHalf + (frontHalf - backHalf) * Math.pow(sN2, 0.85);
+      var n = Math.max(3, Math.round(3 + (P.colsF - 3) * Math.pow(sN2, 0.8)));
+      var cellW = 2 * halfW / n;
+      var sz = Math.min(cellW * 0.30, gap * 0.55);
+      if (sz < 0.0028) continue;
+      for (var j = 0; j < n; j++) {
+        var cx = VPx + (n === 1 ? 0 : (j / (n - 1) - 0.5)) * 2 * (halfW - sz * 0.7);
+        var yy = yb + (rnd() - 0.5) * 0.0012;
+        out.push(stroke([[cx - sz, yy], [cx, yy - sz * 0.85], [cx + sz, yy]], 'red', 1));
+      }
+    }
+    // Viewpoint marker and sight lines to the far wall's top corners.
+    var mx = VPx, my = y + h * 0.995;
+    out.push(stroke(circlePts(mx, my, 0.0062, 14), 'red', 1));
+    out.push(stroke(linePts(rnd, mx, my, bx, by, 0.0006), 'red', 1));
+    out.push(stroke(linePts(rnd, mx, my, bx + bw, by, 0.0006), 'red', 1));
+    // Annotation right of the far wall.
+    var lead = leaderStrokes(rnd, bx + bw, by + bh * 0.5, 0.852, by + bh * 0.30);
+    for (var li = 0; li < lead.length; li++) out.push(lead[li]);
+    out.push(stroke(squiggle(rnd, 0.856, by + 0.020, 0.070, 0.0032), 'ink', 2));
+    out.push(stroke(squiggle(rnd, 0.856, by + 0.038, 0.055, 0.0032), 'ink', 2));
+    return out;
+  }
+
+  function cartoucheStrokes(rnd, P) {
+    var out = [];
+    var x = 0.415, y = 0.905, w = 0.185, h = 0.057;
+    out.push(stroke(rectPts(rnd, x, y, w, h, 0.0008), 'red', 1));
+    out.push(stroke(rectPts(rnd, x + 0.011, y + 0.013, 0.026, 0.030, 0.0005), 'red', 1));
+    out.push(stroke(squiggle(rnd, x + 0.050, y + 0.016, 0.118, 0.0035), 'ink', 2));
+    out.push(stroke(squiggle(rnd, x + 0.050, y + 0.029, 0.096, 0.0035), 'ink', 2));
+    out.push(stroke(squiggle(rnd, x + 0.050, y + 0.042, 0.124, 0.0035), 'ink', 2));
+    out.push(stroke(linePts(rnd, x + 0.050, y + 0.0505, x + 0.075, y + 0.0505, 0.0004), 'red', 1));
+    return out;
+  }
+
+  function buildStudy(seed) {
+    var rnd = mulberry32(seed);
+    var P = {
+      rows: 8 + Math.floor(rnd() * 9),        // plan pyramid rows, 8-16
+      arows: 8 + Math.floor(rnd() * 9),       // aerial pyramid rows, 8-16
+      aspect: 0.75 + rnd() * 0.5,             // plan grid density factor
+      cove: 0.25 + rnd() * 0.45,              // cove radius fraction
+      aw: 0.34 + rnd() * 0.30,                // aperture width fraction
+      ah: 0.50 + rnd() * 0.30,                // aperture height fraction
+      gx: 0.35 + rnd() * 0.25,                // entrance position
+      vx: 0.44 + rnd() * 0.12,                // viewpoint position
+      colsF: 11 + Math.floor(rnd() * 5)       // aerial front-row count
+    };
+    var all = [];
+    var groups = [
+      { s: planStrokes(rnd, P), w0: 0, w1: 8 },
+      { s: sideStrokes(rnd, P), w0: 8, w1: 16 },
+      { s: frontStrokes(rnd, P), w0: 16, w1: 24 },
+      { s: aerialStrokes(rnd, P), w0: 24, w1: 32 },
+      { s: cartoucheStrokes(rnd, P), w0: 29.5, w1: 32 }
+    ];
+    for (var g = 0; g < groups.length; g++) {
+      assignWindow(groups[g].s, groups[g].w0, groups[g].w1);
+      for (var i = 0; i < groups[g].s.length; i++) all.push(groups[g].s[i]);
+    }
+    return all;
+  }
+
+  var studyCache = {};
+  var studyCacheKeys = [];
+  function getStudy(seed) {
+    if (studyCache[seed]) return studyCache[seed];
+    var st = buildStudy(seed);
+    studyCache[seed] = st;
+    studyCacheKeys.push(seed);
+    while (studyCacheKeys.length > 6) {
+      delete studyCache[studyCacheKeys.shift()];
+    }
+    return st;
+  }
+
+  // ---------- time: epochs, cycles, taps ----------
+
+  // Epoch 0 starts 4.5 s before t = 0, so frame one catches the plan
+  // already under way (outline down, grid filling) rather than a
+  // blank sheet. Every later cycle and every tap starts at phase 0.
+  var epochs = [{ start: -4.5, seed: SEED0 }];
+
+  function resolve(t) {
+    var ep = epochs[0];
+    for (var i = epochs.length - 1; i >= 0; i--) {
+      if (epochs[i].start <= t) { ep = epochs[i]; break; }
+    }
+    var lt = t - ep.start;
+    var cycles = Math.floor(lt / CYCLE);
+    return { lt: lt - cycles * CYCLE, seed: stepSeed(ep.seed, cycles) };
+  }
+
+  var currentT = 0;
+  var lastTapT = -10;
+  function onTap() {
+    var now = currentT;
+    if (now - lastTapT < 0.35) return; // one tap, one re-draft
+    lastTapT = now;
+    var st = resolve(now);
+    epochs.push({ start: now, seed: stepSeed(st.seed, 1) });
+    if (epochs.length > 40) epochs.splice(1, epochs.length - 40);
+  }
+
+  // QA hook, inert outside the renderer: render-piece.js passes
+  // ?seed=done (completed sheet, mid-hold) or ?seed=tN (cycle second
+  // N). Only consulted when there is no rAF, i.e. never in a browser.
+  var qaState = null;
+  if (typeof window.requestAnimationFrame !== 'function') {
+    var qs = '';
+    try { qs = (typeof location !== 'undefined' && location.search) || ''; } catch (e) { qs = ''; }
+    var qm = qs.match(/seed=([A-Za-z0-9]+)/);
+    if (qm) {
+      if (qm[1] === 'done') {
+        qaState = { lt: 36, seed: SEED0 };
+      } else if (qm[1].charAt(0) === 't') {
+        var qv = parseFloat(qm[1].slice(1));
+        if (isFinite(qv)) qaState = { lt: qv, seed: SEED0 };
+      }
+    }
+  }
+
+  // ---------- view ----------
+
+  var viewW = 0;
+  var viewH = 0;
+  var isPhone = false;
+
+  function measure() {
+    var vv = window.visualViewport;
+    viewW = vv ? vv.width : window.innerWidth;
+    viewH = vv ? vv.height : window.innerHeight;
+    var sw = window.screen ? window.screen.width : viewW;
+    var sh = window.screen ? window.screen.height : viewH;
+    isPhone = Math.min(sw, sh) < 700 || viewH > viewW * 1.15;
+    var dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.round(viewW * dpr);
+    canvas.height = Math.round(viewH * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  // Trace a stroke up to frac of its length; returns the pen tip in
+  // design coords, or null when nothing is drawn yet.
+  function traceStroke(s, frac, ox, oy, sw, sh) {
+    var target = frac * s.len;
+    var pts = s.pts;
+    ctx.beginPath();
+    ctx.moveTo(ox + pts[0][0] * sw, oy + pts[0][1] * sh);
+    var tip = pts[0];
+    for (var i = 1; i < pts.length; i++) {
+      var segStart = s.cum[i - 1], segEnd = s.cum[i];
+      if (target >= segEnd) {
+        ctx.lineTo(ox + pts[i][0] * sw, oy + pts[i][1] * sh);
+        tip = pts[i];
+      } else if (target > segStart) {
+        var u = (target - segStart) / ((segEnd - segStart) || 1);
+        var ex = pts[i - 1][0] + (pts[i][0] - pts[i - 1][0]) * u;
+        var ey = pts[i - 1][1] + (pts[i][1] - pts[i - 1][1]) * u;
+        ctx.lineTo(ox + ex * sw, oy + ey * sh);
+        tip = [ex, ey];
+        break;
+      } else {
+        break;
+      }
+    }
+    ctx.stroke();
+    return tip;
+  }
+
+  function draw(t) {
+    var w = viewW;
+    var h = viewH;
+    if (!w || !h) return;
+    canvas.style.width = w + 'px';
+    canvas.style.height = h + 'px';
+
+    // Paper, edge to edge; the sheet sits inside it.
+    ctx.fillStyle = PAPER;
+    ctx.fillRect(0, 0, w, h);
+
+    var sw = Math.min(w * 0.94, h * 0.94 * ASPECT);
+    var sh = sw / ASPECT;
+    var ox = (w - sw) / 2;
+    var oy = (h - sh) / 2;
+
+    // Faint grid over the sheet.
+    ctx.strokeStyle = GRID;
+    ctx.lineWidth = 1;
+    ctx.globalAlpha = 0.55;
+    ctx.beginPath();
+    var k;
+    for (k = 1; k < 24; k++) {
+      var gx = ox + sw * k / 24;
+      ctx.moveTo(gx, oy + sh * 0.012);
+      ctx.lineTo(gx, oy + sh * 0.988);
+    }
+    for (k = 1; k < 19; k++) {
+      var gy = oy + sh * k / 19;
+      ctx.moveTo(ox + sw * 0.012, gy);
+      ctx.lineTo(ox + sw * 0.988, gy);
+    }
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    // Sheet border.
+    ctx.strokeStyle = RED;
+    ctx.globalAlpha = 0.75;
+    ctx.lineWidth = Math.max(1, sw * 0.0011);
+    ctx.strokeRect(ox + sw * 0.012, oy + sh * 0.014, sw * 0.976, sh * 0.972);
+    ctx.globalAlpha = 1;
+
+    // Ink crop ticks at the sheet corners.
+    ctx.strokeStyle = INK;
+    ctx.globalAlpha = 0.7;
+    ctx.lineWidth = Math.max(0.8, sw * 0.001);
+    var tL = 0.022, tI = 0.030;
+    var corners = [
+      [tI, tI, 1, 1], [1 - tI, tI, -1, 1],
+      [tI, 1 - tI, 1, -1], [1 - tI, 1 - tI, -1, -1]
+    ];
+    ctx.beginPath();
+    for (k = 0; k < 4; k++) {
+      var cxp = ox + corners[k][0] * sw;
+      var cyp = oy + corners[k][1] * sh;
+      ctx.moveTo(cxp + corners[k][2] * tL * sw, cyp);
+      ctx.lineTo(cxp, cyp);
+      ctx.lineTo(cxp, cyp + corners[k][3] * tL * sh);
+    }
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    // Study state at this instant.
+    var st = qaState || resolve(t);
+    var lt = st.lt;
+    var alpha = 1;
+    if (lt >= HOLD_END) {
+      var fu = (lt - HOLD_END) / (CYCLE - HOLD_END);
+      alpha = 1 - fu * fu * (3 - 2 * fu);
+    }
+    var strokes = getStudy(st.seed);
+    var wScale = Math.max(0.72, Math.min(1.5, sw / 1150)) * (isPhone ? 1.05 : 1);
+    var widths = [1.6 * wScale, 1.05 * wScale, 1.15 * wScale];
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+
+    var penTip = null;
+    for (var i = 0; i < strokes.length; i++) {
+      var s = strokes[i];
+      var frac;
+      if (lt < DRAW_END) {
+        frac = (lt - s.t0) / (s.t1 - s.t0);
+        if (frac <= 0) continue;
+        if (frac > 1) frac = 1;
+      } else {
+        frac = 1;
+      }
+      ctx.strokeStyle = s.color === 'ink' ? INK : RED;
+      ctx.globalAlpha = alpha * (s.color === 'ink' ? 0.85 : 0.95);
+      ctx.lineWidth = widths[s.w];
+      var tip = traceStroke(s, frac, ox, oy, sw, sh);
+      if (frac > 0 && frac < 1 && tip) penTip = tip;
+    }
+    ctx.globalAlpha = 1;
+
+    // The pen itself: a small dot riding the stroke being drawn.
+    if (penTip && lt < DRAW_END) {
+      ctx.fillStyle = RED;
+      ctx.globalAlpha = 0.75 * alpha;
+      ctx.beginPath();
+      ctx.arc(ox + penTip[0] * sw, oy + penTip[1] * sh, Math.max(1.3, sw * 0.0016), 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function resize() {
+    measure();
+    draw(lastT);
+  }
+
+  var lastT = 0;
+  measure();
+  draw(0);
+
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', resize);
+  }
+  window.addEventListener('resize', resize);
+
+  canvas.addEventListener('pointerdown', onTap);
+  canvas.addEventListener('mousedown', onTap);
+  canvas.addEventListener('touchstart', onTap, { passive: true });
+
+  if (typeof window.requestAnimationFrame === 'function') {
+    var start = null;
+    var frame = function (ts) {
+      if (start === null) start = ts;
+      lastT = (ts - start) / 1000;
+      currentT = lastT;
+      draw(lastT);
+      window.requestAnimationFrame(frame);
+    };
+    window.requestAnimationFrame(frame);
+  }
+})();
+</script>
+</body>
+</html>
