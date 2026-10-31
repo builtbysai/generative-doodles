@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gesture Scrubs the Buffer</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0A0A0A; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  var BLACK = '#0A0A0A';    // stage black
+  var SPOT  = '#F5F2EA';    // spotlight white
+  var GRAPH = '#2A2A2C';    // tape-strip graphite
+  var CHALK = '#EDE8DC';    // waveform chalk
+  var AMBER = '#C98A2B';    // rosin amber
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // Seeded RNG (mulberry32).
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function hashText(s) {
+    var h = 2166136261;
+    for (var i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return h >>> 0;
+  }
+
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+
+  // ---- The recorded sentences (content is fixed; the user never edits it) ----
+  var SENTENCE_1 = 'I want to tell you a story about a story.';
+  var SENTENCE_2 = 'This is the picture of a man and a woman, talking.';
+  var POOL = [
+    'Here is a picture of the sky. The sky is also a picture.',
+    'He said: say something. So I said: something.',
+    'This is the sound of one hand. It is not clapping.',
+    'Once there was a man who collected Tuesdays.',
+    'The dog is dreaming. The dog is the only one who knows.'
+  ];
+
+  // ---- Speech envelope: seeded bumps per word/syllable + smooth value noise ----
+  function buildEnvelope(text, salt) {
+    var rng = mulberry32((hashText(text) ^ (salt * 2654435761)) >>> 0);
+    var words = text.split(' ');
+    var bumps = [];
+    var cursor = 0.028;
+    var usable = 0.95;
+    var total = text.length + words.length;
+    for (var wi = 0; wi < words.length; wi++) {
+      var word = words[wi];
+      var wfrac = (word.length + 1) / total * usable;
+      var syl = Math.max(1, Math.round(word.length / 3));
+      for (var si = 0; si < syl; si++) {
+        bumps.push({
+          c: cursor + wfrac * (si + 0.5) / syl,
+          w: 0.010 + rng() * 0.020,
+          h: 0.45 + rng() * 0.55
+        });
+      }
+      cursor += wfrac;
+    }
+    var noise = [];
+    for (var ni = 0; ni <= 128; ni++) noise.push(0.70 + rng() * 0.60);
+    return { bumps: bumps, noise: noise };
+  }
+
+  function envAt(env, u) {
+    if (u < 0 || u > 1) return 0;
+    var e = 0;
+    for (var i = 0; i < env.bumps.length; i++) {
+      var b = env.bumps[i];
+      var d = (u - b.c) / b.w;
+      e += b.h * Math.exp(-d * d);
+    }
+    var x = u * 128;
+    var i0 = Math.floor(x);
+    var fr = x - i0;
+    var n = env.noise[i0] * (1 - fr) + env.noise[Math.min(128, i0 + 1)] * fr;
+    return clamp(e, 0, 1) * n;
+  }
+
+  // ---- State ----
+  var sentence = SENTENCE_1;
+  var envelope = buildEnvelope(sentence, 0);
+  var generation = 0;
+
+  var playhead = 0.015;      // handle position along the strip, 0..1
+  var dragging = false;
+  var lastT = -1;            // time of last drag sample
+  var lastV = 0;             // smoothed drag velocity (strip widths / second)
+  var lastQ = 0;             // perpendicular offset at last sample, -1..1
+  var trail = [];            // recent {t, p} samples for the rosin trace
+  var downInfo = null;       // {t, x, y, moved}
+  var lastTapAt = -10;
+  var pendingToggle = null;
+
+  function setSentence(text) {
+    sentence = text;
+    generation++;
+    envelope = buildEnvelope(text, generation);
+  }
+
+  function toggleSentence() {
+    setSentence(sentence === SENTENCE_2 ? SENTENCE_1 : SENTENCE_2);
+  }
+
+  function reseedSentence() {
+    var rng = mulberry32(848900 + generation * 977);
+    var idx = Math.floor(rng() * POOL.length);
+    if (POOL[idx] === sentence) idx = (idx + 1) % POOL.length;
+    setSentence(POOL[idx]);
+  }
+
+  // Warp state at time t: closed-form from the recorded drag samples.
+  function warpAt(t) {
+    var v = 0, q = 0;
+    if (lastT >= 0) {
+      var dt = Math.max(0, t - lastT);
+      if (dragging) { v = lastV; q = lastQ; }
+      else {
+        v = lastV * Math.exp(-dt / 0.45);
+        q = lastQ * Math.exp(-dt / 0.60);
+      }
+    }
+    var stretch = clamp(1 + v * 1.6, 0.30, 3.20);
+    var pitch = clamp(1 + q * 0.9, 0.30, 2.20);
+    return { v: v, q: q, stretch: stretch, pitch: pitch };
+  }
+
+  // ---- Viewport / sizing ----
+  function viewport() {
+    var vv = window.visualViewport;
+    var w = vv && vv.width ? vv.width : window.innerWidth;
+    var h = vv && vv.height ? vv.height : window.innerHeight;
+    return { w: w, h: h };
+  }
+
+  function isPhone(w, h) {
+    var sw = window.screen ? window.screen.width : w;
+    var sh = window.screen ? window.screen.height : h;
+    if (Math.min(sw, sh) < 700) return true;
+    return h > w * 1.15;
+  }
+
+  function resize() {
+    var v = viewport();
+    canvas.width = v.w;
+    canvas.height = v.h;
+  }
+
+  function layout(w, h) {
+    var m = Math.min(w, h);
+    var phone = isPhone(w, h);
+    var x0 = w * (phone ? 0.035 : 0.05);
+    var x1 = w * (phone ? 0.965 : 0.95);
+    var cy = h * 0.46;
+    var stripH = m * 0.17;
+    return { m: m, phone: phone, x0: x0, x1: x1, cy: cy, stripH: stripH };
+  }
+
+  // ---- Drawing ----
+  function disc(x, y, r, fill, alpha) {
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = fill;
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  function draw(t) {
+    var v = viewport();
+    var w = v.w, h = v.h;
+    canvas.style.width = w + 'px';
+    canvas.style.height = h + 'px';
+    var L = layout(w, h);
+    var x0 = L.x0, x1 = L.x1, cy = L.cy, stripH = L.stripH;
+    var stripW = x1 - x0;
+    var half = stripH / 2;
+
+    ctx.fillStyle = BLACK;
+    ctx.fillRect(0, 0, w, h);
+
+    var warp = warpAt(t);
+    var p = playhead;
+    var hx = x0 + p * stripW;
+
+    // Tape strip.
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = GRAPH;
+    ctx.fillRect(x0, cy - half, stripW, stripH);
+    ctx.globalAlpha = 0.35;
+    ctx.fillStyle = CHALK;
+    ctx.fillRect(x0, cy - half, stripW, 1);
+    ctx.fillRect(x0, cy + half - 1, stripW, 1);
+    ctx.globalAlpha = 1;
+
+    // Read window: the span currently "sounding" around the playhead.
+    var winHalf = 0.030 + 0.055 * Math.min(1.4, Math.abs(warp.v));
+    var wx0 = x0 + clamp(p - winHalf, 0, 1) * stripW;
+    var wx1 = x0 + clamp(p + winHalf, 0, 1) * stripW;
+    ctx.globalAlpha = 0.10;
+    ctx.fillStyle = SPOT;
+    ctx.fillRect(wx0, cy - half, wx1 - wx0, stripH);
+    ctx.globalAlpha = 0.55;
+    ctx.fillStyle = AMBER;
+    ctx.fillRect(wx0, cy - half, 1.5, stripH);
+    ctx.fillRect(wx1 - 1.5, cy - half, 1.5, stripH);
+    ctx.globalAlpha = 1;
+
+    // Waveform glyph. Display columns sample the source through the warp:
+    // srcU = p + (dispU - p) / stretch, so a fast forward bow stretches
+    // the wave thin around the playhead and a reverse bow compresses it.
+    var cycles = 84 * warp.pitch;
+    var ampScale = (1 / Math.sqrt(warp.pitch)) * (warp.stretch > 1 ? 1 / Math.sqrt(warp.stretch) : 1);
+    var phase = t * 1.4; // idle tape shimmer, closed-form in t
+    var reversed = warp.v < -0.03;
+    var step = 2;
+    var dSrc = (step / stripW) / warp.stretch; // source span of one column
+    ctx.lineWidth = 1.4;
+    for (var x = x0; x <= x1; x += step) {
+      var dispU = (x - x0) / stripW;
+      var srcU = p + (dispU - p) / warp.stretch;
+      var e = envAt(envelope, srcU);
+      if (e <= 0.01) continue;
+      // Average the carrier across the column's source span so narrow
+      // displays do not alias into isolated full-height spikes.
+      var th = 2 * Math.PI * srcU * cycles + phase;
+      var th2 = 2 * Math.PI * (srcU + dSrc * 0.5) * cycles + phase;
+      var val = e * (Math.sin(th) + Math.sin(th2)) * 0.68;
+      if (reversed) val = -val;
+      var amp = val * half * 0.92 * ampScale;
+      var inWin = Math.abs(dispU - p) <= winHalf;
+      ctx.globalAlpha = inWin ? 0.35 + 0.65 * e : 0.16 + 0.55 * e;
+      ctx.strokeStyle = inWin ? SPOT : CHALK;
+      ctx.beginPath();
+      ctx.moveTo(x, cy - amp);
+      ctx.lineTo(x, cy + amp);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+
+    // Rosin trace: fading amber dots along the recent drag path.
+    for (var ti = 0; ti < trail.length; ti++) {
+      var age = t - trail[ti].t;
+      if (age < 0 || age > 0.6) continue;
+      disc(x0 + trail[ti].p * stripW, cy, 2.2, AMBER, 0.35 * (1 - age / 0.6));
+    }
+
+    // Bow-handle: slim vertical grip through the strip, contact node at cy.
+    var gripW = Math.max(7, L.m * 0.012);
+    var gripTop = cy - stripH * 1.18;
+    var gripBot = cy + stripH * 1.18;
+    ctx.globalAlpha = 0.28;
+    ctx.fillStyle = SPOT;
+    ctx.fillRect(hx - gripW / 2 - 2, gripTop, gripW + 4, gripBot - gripTop);
+    ctx.globalAlpha = 0.92;
+    ctx.fillStyle = SPOT;
+    ctx.fillRect(hx - gripW / 2, gripTop, gripW, gripBot - gripTop);
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = GRAPH;
+    ctx.fillRect(hx - 1, gripTop + 4, 2, gripBot - gripTop - 8);
+    disc(hx, gripTop, gripW * 0.62, SPOT, 0.92);
+    disc(hx, gripBot, gripW * 0.62, SPOT, 0.92);
+
+    // Contact glow: layered flat-alpha amber discs (no gradients).
+    var pulse = 1 + 0.07 * Math.sin(t * 0.8);
+    disc(hx, cy, 26 * pulse, AMBER, 0.05);
+    disc(hx, cy, 17 * pulse, AMBER, 0.10);
+    disc(hx, cy, 10.5 * pulse, AMBER, 0.20);
+    disc(hx, cy, 5, AMBER, 0.95);
+
+    // The sentence, in small chalk type under the strip.
+    var maxTextW = stripW * 0.98;
+    var size = L.m * (L.phone ? 0.040 : 0.034);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    for (;;) {
+      ctx.font = size + 'px "Courier New", monospace';
+      if (ctx.measureText(sentence).width <= maxTextW || size <= 9) break;
+      size -= 1;
+    }
+    ctx.globalAlpha = 0.88;
+    ctx.fillStyle = CHALK;
+    ctx.fillText(sentence, (x0 + x1) / 2, cy + half + size * 1.7);
+    ctx.globalAlpha = 1;
+  }
+
+  // ---- Pointer interaction: the gesture is playback control, never content ----
+  function nowSec() {
+    return (typeof performance !== 'undefined' && performance.now)
+      ? performance.now() / 1000 : 0;
+  }
+  var startStamp = nowSec();
+  function elapsed() { return Math.max(0, nowSec() - startStamp); }
+
+  function pointerU(e, w) {
+    var L = layout(viewport().w, viewport().h);
+    return clamp((e.clientX - L.x0) / (L.x1 - L.x0), 0, 1);
+  }
+  function pointerQ(e) {
+    var vv = viewport();
+    var L = layout(vv.w, vv.h);
+    return clamp((e.clientY - L.cy) / (L.stripH * 1.6), -1, 1);
+  }
+
+  function onDown(e) {
+    if (e.preventDefault) e.preventDefault();
+    dragging = true;
+    var t = elapsed();
+    playhead = pointerU(e);
+    lastQ = pointerQ(e);
+    lastV = 0;
+    lastT = t;
+    trail.push({ t: t, p: playhead });
+    downInfo = { t: t, x: e.clientX, y: e.clientY, moved: false };
+  }
+
+  function onMove(e) {
+    if (!dragging) return;
+    var t = elapsed();
+    var p = pointerU(e);
+    var dt = t - lastT;
+    if (dt > 0.004) {
+      var instV = (p - playhead) / dt;
+      lastV = 0.65 * lastV + 0.35 * instV;
+      lastT = t;
+    }
+    playhead = p;
+    lastQ = pointerQ(e);
+    trail.push({ t: t, p: p });
+    if (trail.length > 240) trail.splice(0, trail.length - 240);
+    if (downInfo && (Math.abs(e.clientX - downInfo.x) > 7 || Math.abs(e.clientY - downInfo.y) > 7)) {
+      downInfo.moved = true;
+    }
+  }
+
+  function onUp(e) {
+    if (!dragging) return;
+    dragging = false;
+    var t = elapsed();
+    if (downInfo && !downInfo.moved && t - downInfo.t < 0.30) {
+      // A tap. A second tap close behind makes it a double-tap (reseed).
+      if (t - lastTapAt < 0.35) {
+        if (pendingToggle !== null && typeof clearTimeout === 'function') clearTimeout(pendingToggle);
+        pendingToggle = null;
+        lastTapAt = -10;
+        reseedSentence();
+      } else {
+        lastTapAt = t;
+        if (typeof setTimeout === 'function') {
+          pendingToggle = setTimeout(function () { pendingToggle = null; toggleSentence(); }, 320);
+        } else {
+          toggleSentence();
+        }
+      }
+    }
+    downInfo = null;
+  }
+
+  canvas.addEventListener('pointerdown', onDown);
+  window.addEventListener('pointermove', onMove);
+  window.addEventListener('pointerup', onUp);
+  window.addEventListener('pointercancel', onUp);
+
+  // ---- Boot ----
+  resize();
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', resize);
+  }
+  window.addEventListener('resize', resize);
+
+  draw(0); // frame one: rest state, drawn synchronously
+
+  function frame(now) {
+    draw(Math.max(0, now / 1000 - startStamp));
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+  }
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
