@@ -1,0 +1,573 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>inky skies</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #C9C4BB; overflow: hidden; height: 100%; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded RNG (mulberry32) ----------
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a = (a + 0x6D2B79F5) >>> 0;
+      var t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ---------- palette (strict) ----------
+  var GROUND = '#C9C4BB';      // milky gray
+  var CLOUD = '#A8A39A';       // gray shadows
+  var RIB_DARK = '#1A0A0C';    // near-black ribbon
+  var RIB_RED = '#5A0F14';     // dark red ribbon (never bright)
+  var RIB_EDGE = '#8A4A42';    // bleed tone, thinnest ribbons
+
+  // ---------- sizing (Visual Viewport API) ----------
+  var W = 720, H = 720, S = 720;
+  var isPhone = false;
+
+  function detectPhone(w, h) {
+    var scr = (typeof window !== 'undefined') ? window.screen : null;
+    if (scr && typeof scr.width === 'number' && typeof scr.height === 'number' &&
+        (scr.width > 0 || scr.height > 0)) {
+      return Math.min(scr.width, scr.height) < 700;
+    }
+    // fallback only: aspect test
+    return h > w * 1.15;
+  }
+
+  function resize() {
+    var vv = (typeof window !== 'undefined') ? window.visualViewport : null;
+    var w, h;
+    if (vv && typeof vv.width === 'number') { w = vv.width; h = vv.height; }
+    else if (typeof window !== 'undefined' && typeof window.innerWidth === 'number') {
+      w = window.innerWidth; h = window.innerHeight;
+    } else { w = W; h = H; }
+    W = Math.max(50, Math.round(w));
+    H = Math.max(50, Math.round(h));
+    S = Math.min(W, H);
+    canvas.width = W;
+    canvas.height = H;
+    isPhone = detectPhone(W, H);
+    buildSim();
+  }
+
+  // ---------- value noise / fbm (deterministic, seeded by integer hash) ----------
+  function hash2(ix, iy) {
+    var n = Math.imul(ix, 374761393) + Math.imul(iy, 668265263);
+    n = Math.imul(n ^ (n >>> 13), 1274126177);
+    return ((n ^ (n >>> 16)) >>> 0) / 4294967296;
+  }
+  function vnoise(x, y) {
+    var ix = Math.floor(x), iy = Math.floor(y);
+    var fx = x - ix, fy = y - iy;
+    var sx = fx * fx * (3 - 2 * fx), sy = fy * fy * (3 - 2 * fy);
+    var a = hash2(ix, iy), b = hash2(ix + 1, iy);
+    var c = hash2(ix, iy + 1), d = hash2(ix + 1, iy + 1);
+    return a + (b - a) * sx + (c - a) * sy + (a - b - c + d) * sx * sy;
+  }
+  function fbm(x, y, oct) {
+    var v = 0, amp = 0.5, f = 1, tot = 0;
+    for (var i = 0; i < oct; i++) {
+      v += amp * vnoise(x * f, y * f);
+      tot += amp; amp *= 0.5; f *= 2.03;
+    }
+    return v / tot; // 0..1
+  }
+  // mix two hex colors, k=0 -> c1, k=1 -> c2 (flat LUT between palette anchors)
+  function mixHex(c1, c2, k) {
+    var r = Math.round(c1[0] + (c2[0] - c1[0]) * k);
+    var g = Math.round(c1[1] + (c2[1] - c1[1]) * k);
+    var b = Math.round(c1[2] + (c2[2] - c1[2]) * k);
+    return 'rgb(' + r + ',' + g + ',' + b + ')';
+  }
+  var GROUND_RGB = [201, 196, 187], CLOUD_RGB = [168, 163, 154];
+
+  // ---------- curl field: summed-sine stream function (seeded per build) ----------
+  var comps = [];
+  var FIELD_K = 0.024; // velocity scale: typical head speed ~0.06 * S per second
+
+  function fieldVel(x, y, t, out) {
+    var X = x / S, Y = y / S;
+    var dpsiY = 0, dpsiX = 0;
+    for (var i = 0; i < comps.length; i++) {
+      var c = comps[i];
+      var sx = Math.sin(c.fx * X + c.px + c.w * t);
+      var cx = Math.cos(c.fx * X + c.px + c.w * t);
+      var sy = Math.sin(c.fy * Y + c.py);
+      var cy = Math.cos(c.fy * Y + c.py);
+      dpsiY += c.a * sx * (-sy) * c.fy;
+      dpsiX += c.a * cx * c.fx * cy;
+    }
+    out.x = dpsiY * FIELD_K * S;
+    out.y = -dpsiX * FIELD_K * S;
+  }
+
+  // ---------- simulation state ----------
+  var STEP = 1 / 60;
+  var PREROLL = 300;             // fixed pre-roll steps (5 s of sim) before frame one
+  var simTime = 0, wallTime = 0;
+  var agents = [];
+  var impulses = [];             // drag repulsor impulses {x,y,t0,str}
+  var pendingTap = null;         // {x,y,commitWall} deferred for double-tap disambiguation
+  var freezeLeft = 0;            // wall seconds of "the still" remaining
+  var buildRng = null;
+
+  var AGENTS_DESKTOP = 40, AGENTS_PHONE = 26;
+  var HIST_EVERY = 2;            // record a trail point every 2 sim steps
+  var HIST_MAX = 190;            // trail points per ribbon (~6.3 s of path)
+  var HIST_MAX_ANCHOR = 380;     // anchor trail (~12.7 s of path)
+
+  function spawnAgent(x, y, isAnchor) {
+    var r = buildRng();
+    var col, baseW;
+    if (isAnchor) { col = RIB_DARK; baseW = 12; }
+    else if (r < 0.55) { col = RIB_DARK; baseW = 3.0 + buildRng() * 3.2; }
+    else if (r < 0.90) { col = RIB_RED; baseW = 2.8 + buildRng() * 3.0; }
+    else { col = RIB_EDGE; baseW = 1.8 + buildRng() * 1.4; }
+    var oa = buildRng() * Math.PI * 2;
+    var orad = buildRng() * 0.055 * S * (isAnchor ? 1.6 : 1);
+    return {
+      x: x, y: y,
+      homeX: x, homeY: y,   // weak mooring: keeps the school spread over the tray
+      hist: [{ x: x, y: y }],
+      col: col,
+      baseW: baseW * (S / 720),
+      anchor: !!isAnchor,
+      age: 2 + buildRng() * 4,   // pre-aged so frame one is fully faded in
+      rec: 0,
+      // per-agent field identity: each ribbon rides its own offset copy of
+      // the curl field, so the school spreads instead of stacking on one line
+      ox: Math.cos(oa) * orad,
+      oy: Math.sin(oa) * orad,
+      spd: 0.7 + buildRng() * 0.6,
+      wph: buildRng() * Math.PI * 2,
+      wfr: 0.3 + buildRng() * 0.6,
+      wam: 0.10 + buildRng() * 0.10
+    };
+  }
+
+  // Build a full trail for an agent by integrating BACKWARD along its own
+  // offset copy of the field from its head: a ribbon is born (and reborn)
+  // already wearing its whole history, never as a dot.
+  function buildTrail(ag) {
+    var cap = ag.anchor ? HIST_MAX_ANCHOR : HIST_MAX;
+    var dtb = STEP * HIST_EVERY;
+    var pts = [{ x: ag.x, y: ag.y }];
+    var px = ag.x, py = ag.y;
+    var vmin = 0.016 * S;
+    for (var k = 1; k < cap; k++) {
+      fieldVel(px + ag.ox, py + ag.oy, simTime - k * dtb, _v);
+      var bx = _v.x * ag.spd, by = _v.y * ag.spd;
+      var bs = Math.sqrt(bx * bx + by * by);
+      if (bs > 0.5 && bs < vmin) { var bsc = Math.min(3, vmin / bs); bx *= bsc; by *= bsc; }
+      px -= bx * dtb;
+      py -= by * dtb;
+      pts.push({ x: px, y: py });
+    }
+    pts.reverse(); // tail first, head last
+    ag.hist = pts;
+  }
+
+  function respawnAgent(ag) {
+    ag.x = ag.homeX + (buildRng() - 0.5) * 0.06 * S;
+    ag.y = ag.homeY + (buildRng() - 0.5) * 0.06 * S;
+    ag.age = 2 + buildRng() * 2;
+    buildTrail(ag);
+  }
+
+  function buildSim() {
+    buildRng = mulberry32(91071);
+    comps = [];
+    for (var i = 0; i < 9; i++) {
+      comps.push({
+        a: 0.35 + buildRng() * 0.5,
+        fx: 0.8 + buildRng() * 2.6,
+        fy: 0.8 + buildRng() * 2.6,
+        px: buildRng() * Math.PI * 2,
+        py: buildRng() * Math.PI * 2,
+        w: (buildRng() - 0.5) * 0.03
+      });
+    }
+    agents = [];
+    var n = isPhone ? AGENTS_PHONE : AGENTS_DESKTOP;
+    // the anchor: one large looping ribbon, seeded near the center
+    agents.push(spawnAgent(W * (0.38 + buildRng() * 0.2), H * (0.36 + buildRng() * 0.2), true));
+    // the school starts on a jittered grid, so the water is inhabited everywhere
+    var cols = Math.ceil(Math.sqrt(n * W / H));
+    var rows = Math.ceil(n / cols);
+    var cells = [];
+    for (var cy = 0; cy < rows; cy++) for (var cx = 0; cx < cols; cx++) cells.push([cx, cy]);
+    for (var s2 = cells.length - 1; s2 > 0; s2--) { // seeded shuffle
+      var sw = Math.floor(buildRng() * (s2 + 1));
+      var tmp = cells[s2]; cells[s2] = cells[sw]; cells[sw] = tmp;
+    }
+    for (var j = 0; j < n; j++) {
+      var cell = cells[j % cells.length];
+      var gx = (cell[0] + 0.5 + (buildRng() - 0.5) * 0.7) * (W / cols);
+      var gy = (cell[1] + 0.5 + (buildRng() - 0.5) * 0.7) * (H / rows);
+      agents.push(spawnAgent(gx, gy, false));
+    }
+    for (var b = 0; b < agents.length; b++) buildTrail(agents[b]);
+    impulses = [];
+    pendingTap = null;
+    freezeLeft = 0;
+    simTime = 0;
+    for (var s = 0; s < PREROLL; s++) stepSim(STEP);
+  }
+
+  var _v = { x: 0, y: 0 };
+
+  function stepSim(dt) {
+    simTime += dt;
+    // commit a deferred tap (drop) once the double-tap window has passed
+    if (pendingTap && wallTime >= pendingTap.commitWall) {
+      spawnDrop(pendingTap.x, pendingTap.y);
+      pendingTap = null;
+    }
+    var i, j, ag;
+    for (i = 0; i < agents.length; i++) {
+      ag = agents[i];
+      ag.age += dt;
+      fieldVel(ag.x + ag.ox, ag.y + ag.oy, simTime, _v);
+      var vx = _v.x * ag.spd, vy = _v.y * ag.spd;
+      // gentle per-agent wander, perpendicular to the flow: breaks any
+      // exact streamline locking between ribbons
+      var sp = Math.sqrt(vx * vx + vy * vy);
+      if (sp > 0.01) {
+        var wob = Math.sin(simTime * ag.wfr + ag.wph) * ag.wam * sp;
+        var px = -vy / sp, py = vx / sp;
+        vx += px * wob;
+        vy += py * wob;
+      }
+      // drag repulsor impulses: radial push, decaying with age
+      for (j = 0; j < impulses.length; j++) {
+        var im = impulses[j];
+        var age = simTime - im.t0;
+        if (age < 0 || age > 4) continue;
+        var dx = ag.x - im.x, dy = ag.y - im.y;
+        var d2 = dx * dx + dy * dy;
+        var rad = 0.20 * S;
+        if (d2 < rad * rad && d2 > 0.01) {
+          var d = Math.sqrt(d2);
+          var f = im.str * Math.exp(-age / 1.8) * Math.exp(-d / rad) * 2.4 * S;
+          vx += (dx / d) * f * dt * 60 / 60;
+          vy += (dy / d) * f * dt * 60 / 60;
+        }
+      }
+      // speed floor: no ribbon is allowed to stagnate into invisibility;
+      // direction stays the field's, only the pace is kept alive
+      var sp2 = Math.sqrt(vx * vx + vy * vy);
+      var vmin = 0.016 * S;
+      if (sp2 > 0.5 && sp2 < vmin) {
+        var sc = Math.min(3, vmin / sp2);
+        vx *= sc; vy *= sc;
+      }
+      // containment: a spring wall inside the margin. The water is a tray,
+      // not a torus: ribbons turn back at the edges instead of wrapping.
+      var m = 0.05 * S;
+      if (ag.x < m) vx += (m - ag.x) * 1.5;
+      if (ag.x > W - m) vx -= (ag.x - (W - m)) * 1.5;
+      if (ag.y < m) vy += (m - ag.y) * 1.5;
+      if (ag.y > H - m) vy -= (ag.y - (H - m)) * 1.5;
+
+      // final floor on the TOTAL base velocity: where the field and the
+      // wall cancel, a ribbon must slide along the wall, never pin to it
+      var spT = Math.sqrt(vx * vx + vy * vy);
+      if (spT < vmin) {
+        if (spT > 0.5) { var scT = vmin / spT; vx *= scT; vy *= scT; }
+        else {
+          var fs = Math.sqrt(_v.x * _v.x + _v.y * _v.y);
+          if (fs > 0.01) { vx = _v.x / fs * vmin; vy = _v.y / fs * vmin; }
+        }
+      }
+
+      ag.x += vx * dt;
+      ag.y += vy * dt;
+
+      ag.rec++;
+      if (ag.rec >= HIST_EVERY) {
+        ag.rec = 0;
+        ag.hist.push({ x: ag.x, y: ag.y });
+        var cap = ag.anchor ? HIST_MAX_ANCHOR : HIST_MAX;
+        while (ag.hist.length > cap) ag.hist.shift();
+      }
+      // a ribbon that escapes the tray despite the wall is reborn inside,
+      // already wearing a full backward-integrated trail
+      if (ag.x < -0.05 * S || ag.x > W + 0.05 * S || ag.y < -0.05 * S || ag.y > H + 0.05 * S) {
+        respawnAgent(ag);
+      }
+    }
+    // prune dead impulses
+    for (j = impulses.length - 1; j >= 0; j--) {
+      if (simTime - impulses[j].t0 > 4.5) impulses.splice(j, 1);
+    }
+  }
+
+  function spawnDrop(x, y) {
+    for (var k = 0; k < 3; k++) {
+      var ag = spawnAgent(x, y, false);
+      ag.age = 0;
+      // unfurl: pre-seed a short outward trail so the drop opens like ink
+      var ang = buildRng() * Math.PI * 2;
+      var r0 = 2 + buildRng() * 5;
+      ag.hist = [{ x: x + Math.cos(ang) * r0, y: y + Math.sin(ang) * r0 }, { x: x, y: y }];
+      agents.push(ag);
+    }
+    // keep the population bounded: retire the oldest plain ribbons
+    var cap = (isPhone ? AGENTS_PHONE : AGENTS_DESKTOP) + 13;
+    while (agents.length > cap + 1) {
+      for (var i = 1; i < agents.length; i++) {
+        if (!agents[i].anchor) { agents.splice(i, 1); break; }
+      }
+    }
+    plink();
+  }
+
+  // ---------- drawing ----------
+  function drawGround() {
+    var cell = Math.max(8, Math.min(14, S / 90));
+    var nx, ny;
+    ctx.fillStyle = GROUND;
+    ctx.fillRect(0, 0, W, H);
+    for (var y = 0; y < H; y += cell) {
+      ny = y / S;
+      for (var x = 0; x < W; x += cell) {
+        nx = x / S;
+        // domain-warped fbm: the ground itself is marbled, soft cloudy bands
+        var warp = fbm(nx * 1.4 + 4.7, ny * 1.4 + 9.2, 3);
+        var v = fbm(nx * 2.6 + 7.3 + (warp - 0.5) * 1.6, ny * 2.6 + 2.9 + (warp - 0.5) * 1.2, 4);
+        var band = Math.round(v * 16) / 16;
+        var k = 0.18 + band * 0.82;
+        if (k > 1) k = 1;
+        ctx.fillStyle = mixHex(CLOUD_RGB, GROUND_RGB, k);
+        ctx.fillRect(x, y, cell + 1, cell + 1);
+      }
+    }
+    // slow drift layer: a second, offset sampling of the same field, faint
+    var drift = simTime * 0.010;
+    ctx.fillStyle = CLOUD;
+    for (var y2 = 0; y2 < H; y2 += cell) {
+      ny = y2 / S;
+      for (var x2 = 0; x2 < W; x2 += cell) {
+        nx = x2 / S;
+        var v2 = fbm(nx * 1.7 + 3.1 + drift, ny * 1.7 + 8.4 - drift * 0.7, 3);
+        if (v2 > 0.62) {
+          ctx.globalAlpha = Math.min(0.16, (v2 - 0.62) * 0.55);
+          ctx.fillRect(x2, y2, cell + 1, cell + 1);
+        }
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawAgent(ag) {
+    var h = ag.hist;
+    if (h.length < 2) return;
+    var fadeIn = Math.min(1, ag.age / 1.5);
+    ctx.strokeStyle = ag.col;
+    ctx.globalAlpha = (ag.anchor ? 0.95 : 0.88) * fadeIn;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    var cap = ag.anchor ? HIST_MAX_ANCHOR : HIST_MAX;
+    for (var i = 1; i < h.length; i++) {
+      var p0 = h[i - 1], p1 = h[i];
+      var dx = p1.x - p0.x, dy = p1.y - p0.y;
+      var len = Math.sqrt(dx * dx + dy * dy);
+      if (len < 0.02 || len > 0.25 * S) continue; // skip degenerate / jump segments
+      // taper: full width at the head, fine point at the tail
+      var frac = i / (cap - 1);
+      if (frac > 1) frac = 1;
+      var taper = 0.12 + 0.88 * Math.pow(frac, 0.7);
+      // stretch: long segments are stretched thin; short bunched ones pool wide
+      var lref = 0.55 * (S / 720) + 0.35;
+      var wf = lref / Math.max(len, 0.08);
+      if (wf > 1.6) wf = 1.6;
+      if (wf < 0.32) wf = 0.32;
+      ctx.lineWidth = Math.max(0.4, ag.baseW * taper * wf);
+      ctx.beginPath();
+      ctx.moveTo(p0.x, p0.y);
+      ctx.lineTo(p1.x, p1.y);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function draw() {
+    // pin the canvas in px every frame (house rule)
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    drawGround();
+    // anchor first (it lies deepest), then the rest tail-to-head
+    if (agents.length) drawAgent(agents[0]);
+    for (var i = 1; i < agents.length; i++) drawAgent(agents[i]);
+  }
+
+  // ---------- audio (lazy, gesture-gated, typeof-guarded) ----------
+  var AC = (typeof window !== 'undefined') ? (window.AudioContext || window.webkitAudioContext) : null;
+  var audio = null;
+  var dragSpeedSmooth = 0;
+
+  function initAudio() {
+    if (!AC || audio) return;
+    try {
+      var ac = new AC();
+      var len = 2 * ac.sampleRate;
+      var buf = ac.createBuffer(1, len, ac.sampleRate);
+      var ch = buf.getChannelData(0);
+      var arng = mulberry32(4109);
+      var last = 0;
+      for (var i = 0; i < len; i++) { // pinkish noise for a watery wash
+        var white = arng() * 2 - 1;
+        last = last * 0.94 + white * 0.06;
+        ch[i] = last * 2.4;
+      }
+      var src = ac.createBufferSource();
+      src.buffer = buf; src.loop = true;
+      var lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 420; lp.Q.value = 0.4;
+      var peak = ac.createBiquadFilter(); peak.type = 'peaking'; peak.frequency.value = 500; peak.Q.value = 2.2; peak.gain.value = 0;
+      var g = ac.createGain(); g.gain.value = 0.0;
+      src.connect(lp); lp.connect(peak); peak.connect(g); g.connect(ac.destination);
+      src.start();
+      g.gain.setTargetAtTime(0.05, ac.currentTime, 1.2);
+      audio = { ac: ac, lp: lp, peak: peak, g: g };
+    } catch (err) { audio = null; }
+  }
+
+  function plink() {
+    if (!audio) return;
+    try {
+      var ac = audio.ac, t = ac.currentTime;
+      var o = ac.createOscillator(), og = ac.createGain();
+      o.type = 'sine';
+      o.frequency.setValueAtTime(640, t);
+      o.frequency.exponentialRampToValueAtTime(210, t + 0.18);
+      og.gain.setValueAtTime(0.0001, t);
+      og.gain.exponentialRampToValueAtTime(0.11, t + 0.012);
+      og.gain.exponentialRampToValueAtTime(0.0001, t + 0.22);
+      o.connect(og); og.connect(ac.destination);
+      o.start(t); o.stop(t + 0.25);
+    } catch (err) {}
+  }
+
+  function updateAudio() {
+    if (!audio) return;
+    try {
+      var t = audio.ac.currentTime;
+      audio.lp.frequency.setTargetAtTime(400 + 80 * Math.sin(simTime * 0.05), t, 0.4);
+      var target = 320 + Math.min(1600, dragSpeedSmooth * 1.6);
+      audio.peak.frequency.setTargetAtTime(target, t, 0.12);
+      audio.peak.gain.setTargetAtTime(Math.min(7, dragSpeedSmooth * 0.02), t, 0.12);
+    } catch (err) {}
+  }
+
+  // ---------- interaction ----------
+  function pos(e) {
+    var x = e.clientX, y = e.clientY;
+    if (typeof canvas.getBoundingClientRect === 'function') {
+      var r = canvas.getBoundingClientRect();
+      x -= r.left; y -= r.top;
+    }
+    return { x: x, y: y };
+  }
+
+  var downInfo = null;
+  var lastTapWall = -100, lastTapX = 0, lastTapY = 0;
+  var lastMoveX = 0, lastMoveY = 0, lastMoveWall = 0;
+
+  canvas.addEventListener('pointerdown', function (e) {
+    initAudio();
+    if (audio && audio.ac.state === 'suspended') { try { audio.ac.resume(); } catch (err) {} }
+    var p = pos(e);
+    downInfo = { x: p.x, y: p.y, wall: wallTime, moved: false };
+    lastMoveX = p.x; lastMoveY = p.y; lastMoveWall = wallTime;
+  });
+
+  canvas.addEventListener('pointermove', function (e) {
+    if (!downInfo) return;
+    var p = pos(e);
+    var dx = p.x - lastMoveX, dy = p.y - lastMoveY;
+    var dist = Math.sqrt(dx * dx + dy * dy);
+    if (Math.abs(p.x - downInfo.x) + Math.abs(p.y - downInfo.y) > 8) downInfo.moved = true;
+    if (downInfo.moved && dist > 0.5) {
+      var dw = Math.max(wallTime - lastMoveWall, 0.001);
+      var speed = dist / dw; // px per wall second
+      dragSpeedSmooth = dragSpeedSmooth * 0.6 + speed * 0.4;
+      impulses.push({ x: p.x, y: p.y, t0: simTime, str: 0.4 + Math.min(1.4, speed / (1.2 * S)) });
+      if (impulses.length > 42) impulses.shift();
+    }
+    lastMoveX = p.x; lastMoveY = p.y; lastMoveWall = wallTime;
+  });
+
+  function endPointer(e) {
+    if (!downInfo) return;
+    var p = pos(e);
+    var quick = (wallTime - downInfo.wall) < 0.35;
+    if (quick && !downInfo.moved) {
+      var isDouble = (wallTime - lastTapWall) < 0.35 &&
+        Math.abs(p.x - lastTapX) + Math.abs(p.y - lastTapY) < 44;
+      if (isDouble) {
+        pendingTap = null;              // the pending drop is cancelled
+        freezeLeft = 6;                 // the still: hold the print for 6 s
+        lastTapWall = -100;
+      } else {
+        pendingTap = { x: p.x, y: p.y, commitWall: wallTime + 0.35 };
+        lastTapWall = wallTime; lastTapX = p.x; lastTapY = p.y;
+      }
+    }
+    downInfo = null;
+  }
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', endPointer);
+
+  // ---------- boot ----------
+  resize();
+  if (typeof window !== 'undefined') {
+    window.addEventListener('resize', resize);
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', resize);
+    }
+  }
+  draw(); // frame one: synchronous, after the fixed pre-roll
+
+  // ---------- loop (fixed timestep; frame one never depends on the clock) ----------
+  var acc = 0, lastTs = -1;
+  function frame(ts) {
+    if (lastTs < 0) lastTs = ts;
+    var elapsed = (ts - lastTs) / 1000;
+    lastTs = ts;
+    if (elapsed > 0.25) elapsed = 0.25;
+    wallTime += elapsed;
+    dragSpeedSmooth *= Math.pow(0.4, elapsed);
+    if (freezeLeft > 0) {
+      freezeLeft -= elapsed;            // sim clock paused: the print holds
+    } else {
+      acc += elapsed;
+      while (acc >= STEP) { stepSim(STEP); acc -= STEP; }
+    }
+    draw();
+    updateAudio();
+    requestAnimationFrame(frame);
+  }
+  if (typeof requestAnimationFrame === 'function') {
+    requestAnimationFrame(frame);
+  }
+})();
+</script>
+</body>
+</html>
