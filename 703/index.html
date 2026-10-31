@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Fragmentos Floor</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #101010; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // Palette (strict): tile, dent, seam, fresh-strike highlight, ground.
+  // Nothing else.
+  var TILE = '#8C8C88';
+  var DENT = '#3A3A38';
+  var SEAM = '#1A1A1A';
+  var FLASH = '#C9C9C4';
+  var GROUND = '#101010';
+
+  var BASE_SEED = 703001;
+  var COLS = 10, ROWS = 8, NCELL = COLS * ROWS;
+  var SPACING = 1.7;           // seconds between scheduled placements
+  var LAY_END = 136;           // last scheduled tile is down by here
+  var PAUSE_END = 148;         // the finished floor rests until here
+  var CYCLE = 154;             // fade-out (lift) runs PAUSE_END..CYCLE
+  var FORCE_T = -1;            // QA hook: -1 = live clock, else fixed elapsed
+
+  // QA seed hook: ?seed=tNN pins the elapsed time (used by the headless
+  // renderer to inspect later phases). Inert in normal viewing.
+  try {
+    if (typeof location !== 'undefined' && location.search) {
+      var qm = /[?&]seed=t([0-9]+(?:\.[0-9]+)?)/.exec(location.search);
+      if (qm) FORCE_T = parseFloat(qm[1]);
+    }
+  } catch (e) { /* live mode */ }
+
+  // Seeded RNG (mulberry32). All floor content derives from the cycle
+  // stream, so every frame is reproducible.
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+  function smooth(a, b, x) {
+    var u = clamp((x - a) / (b - a), 0, 1);
+    return u * u * (3 - 2 * u);
+  }
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  var W = 0, H = 0, DPR = 1, PHONE = false;
+
+  function viewSize() {
+    var w, h;
+    if (typeof window !== 'undefined' && window.visualViewport &&
+        window.visualViewport.width) {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    } else if (typeof window !== 'undefined' && window.innerWidth) {
+      w = window.innerWidth; h = window.innerHeight;
+    } else { w = 800; h = 600; }
+    return { w: w, h: h };
+  }
+
+  function resize() {
+    var s = viewSize();
+    W = s.w; H = s.h;
+    DPR = 1;
+    if (typeof window !== 'undefined' && window.devicePixelRatio) {
+      DPR = clamp(window.devicePixelRatio, 1, 2);
+    }
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    // Phone detection: physical screen size first (min dimension < 700),
+    // tall-aspect as the fallback signal only.
+    var smin = 100000;
+    if (typeof window !== 'undefined' && window.screen &&
+        window.screen.width && window.screen.height) {
+      smin = Math.min(window.screen.width, window.screen.height);
+    }
+    PHONE = (smin < 700) || (H > W * 1.15 && smin === 100000);
+  }
+
+  // Grid geometry: the 10x8 field centred with a dark margin, refit to
+  // whatever frame the viewport gives it.
+  function layout() {
+    var m = Math.max(14, Math.min(W, H) * 0.055);
+    var cell = Math.min((W - 2 * m) / COLS, (H - 2 * m) / ROWS);
+    return {
+      x: (W - cell * COLS) / 2,
+      y: (H - cell * ROWS) / 2,
+      cell: cell
+    };
+  }
+
+  // Serpentine sweep order: row 0 left to right, row 1 right to left,
+  // and so on. Fixed for all cycles; only the timing jitter is seeded.
+  var SERP = [];
+  (function () {
+    for (var r = 0; r < ROWS; r++) {
+      var c;
+      if (r % 2 === 0) { for (c = 0; c < COLS; c++) SERP.push(r * COLS + c); }
+      else { for (c = COLS - 1; c >= 0; c--) SERP.push(r * COLS + c); }
+    }
+  })();
+
+  // ---- The floor ------------------------------------------------------
+  // Per cycle, each cell record holds: its scheduled placement time
+  // (serpentine slot times a seeded jitter), four corner jitters that
+  // make the tile slightly irregular, and a dent field of 2-5 seeded
+  // radial dents. Records derive from per-cell streams so recorded
+  // strikes never disturb the base field.
+  var cellCache = { key: -1, cells: [] };
+
+  function buildCells(cycle) {
+    if (cellCache.key === cycle) return cellCache.cells;
+    var cells = new Array(NCELL);
+    var rngJ = mulberry32(BASE_SEED + cycle * 7919 + 3);
+    var k, i;
+    for (k = 0; k < NCELL; k++) {
+      var cell = SERP[k];
+      var jitter = (rngJ() * 2 - 1) * 0.5;
+      cells[cell] = cells[cell] || {};
+      cells[cell].place = (k === 0) ? -0.4 : k * SPACING - 0.4 + jitter;
+    }
+    for (i = 0; i < NCELL; i++) {
+      var rng = mulberry32(BASE_SEED + cycle * 104729 + i * 131 + 7);
+      var rec = cells[i];
+      rec.corners = [];
+      for (k = 0; k < 4; k++) {
+        rec.corners.push({ dx: (rng() * 2 - 1) * 0.022, dy: (rng() * 2 - 1) * 0.022 });
+      }
+      rec.dents = [];
+      var nD = 2 + Math.floor(rng() * 4);
+      for (k = 0; k < nD; k++) {
+        rec.dents.push({
+          fx: 0.18 + rng() * 0.64,
+          fy: 0.18 + rng() * 0.64,
+          r: 0.10 + rng() * 0.20,
+          depth: 0.5 + rng() * 0.5
+        });
+      }
+    }
+    cellCache = { key: cycle, cells: cells };
+    return cells;
+  }
+
+  // Recorded interaction events, on the anchored clock. Strikes deepen
+  // a placed tile; a tap on an empty cell during laying places the tile
+  // there at once, with a strike.
+  var strikes = [];            // {cycle, cell, t} absolute seconds
+  var early = {};              // "cycle:cell" -> cycle-time of placement
+
+  function effPlace(cell, cycle, rec) {
+    var e = early[cycle + ':' + cell];
+    if (e !== undefined && e < rec.place) return e;
+    return rec.place;
+  }
+
+  function strikeCount(cycle, cell) {
+    var n = 0;
+    for (var i = 0; i < strikes.length; i++) {
+      if (strikes[i].cycle === cycle && strikes[i].cell === cell) n++;
+    }
+    return n;
+  }
+
+  function quadPath(x, y, w, h, corners, cx, cy, scale) {
+    var pts = [
+      { x: x + corners[0].dx * w, y: y + corners[0].dy * h },
+      { x: x + w + corners[1].dx * w, y: y + corners[1].dy * h },
+      { x: x + w + corners[2].dx * w, y: y + h + corners[2].dy * h },
+      { x: x + corners[3].dx * w, y: y + h + corners[3].dy * h }
+    ];
+    ctx.beginPath();
+    for (var i = 0; i < 4; i++) {
+      var px = cx + (pts[i].x - cx) * scale;
+      var py = cy + (pts[i].y - cy) * scale;
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.closePath();
+  }
+
+  function drawTile(rec, cellIdx, cycle, ct, L, fade) {
+    var col = cellIdx % COLS, row = Math.floor(cellIdx / COLS);
+    var cellX = L.x + col * L.cell, cellY = L.y + row * L.cell;
+    var inset = L.cell * 0.05;                    // tile is 90% of its cell
+    var tx = cellX + inset, ty = cellY + inset;
+    var tw = L.cell - 2 * inset, th = L.cell - 2 * inset;
+    var place = effPlace(cellIdx, cycle, rec);
+    var u = clamp((ct - place) / 0.35, 0, 1);     // settle-in over 0.35 s
+    if (u <= 0) return;
+    var cx = tx + tw / 2, cy = ty + th / 2;
+    var scale = 0.97 + 0.03 * u;
+    var yOff = (1 - u) * 3;
+    var alpha = u * fade;
+    var sc = strikeCount(cycle, cellIdx);
+    var depthScale = Math.min(2.0, 1 + 0.30 * sc);
+    var radiusScale = Math.min(1.4, 1 + 0.10 * sc);
+
+    // Seam shadow: the tile sits in a dark seam, dropped a shade down.
+    ctx.globalAlpha = 0.8 * alpha;
+    ctx.fillStyle = SEAM;
+    ctx.fillRect(tx + L.cell * 0.03, ty + L.cell * 0.045 + yOff, tw, th);
+
+    // Body: flat oxidized metal, slightly irregular corners.
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = TILE;
+    quadPath(tx, ty + yOff, tw, th, rec.corners, cx, cy + yOff, scale);
+    ctx.fill();
+
+    // Dent field: layered flat ellipses in the dent tone, deepening
+    // with each recorded strike.
+    ctx.fillStyle = DENT;
+    for (var i = 0; i < rec.dents.length; i++) {
+      var d = rec.dents[i];
+      var dxp = tx + d.fx * tw, dyp = ty + yOff + d.fy * th;
+      var rr = d.r * tw * radiusScale;
+      var rings = [1, 0.62, 0.34];
+      var alphas = [0.16, 0.30, 0.48];
+      for (var j = 0; j < 3; j++) {
+        ctx.globalAlpha = alpha * clamp(d.depth * depthScale * alphas[j], 0, 0.85);
+        ctx.beginPath();
+        ctx.ellipse(dxp, dyp, rr * rings[j], rr * rings[j] * 0.82, 0, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    // Strike feedback for this tile: a one-frame highlight flash, then
+    // a thin ring that expands and fades over about a second.
+    for (var s = 0; s < strikes.length; s++) {
+      var st = strikes[s];
+      if (st.cycle !== cycle || st.cell !== cellIdx) continue;
+      var age = ct - (st.t - cycle * CYCLE);
+      if (age < 0) continue;
+      if (age < 0.15) {
+        ctx.globalAlpha = alpha * 0.85 * (1 - age / 0.15);
+        ctx.fillStyle = FLASH;
+        quadPath(tx, ty + yOff, tw, th, rec.corners, cx, cy + yOff, scale);
+        ctx.fill();
+      }
+      if (age < 1) {
+        ctx.globalAlpha = alpha * 0.55 * (1 - age);
+        ctx.strokeStyle = FLASH;
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.arc(cx, cy + yOff, L.cell * (0.28 + 0.85 * age), 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = GROUND;
+    ctx.fillRect(0, 0, W, H);
+    var cycle = Math.floor(t / CYCLE);
+    var ct = t - cycle * CYCLE;
+    var cells = buildCells(cycle);
+    var L = layout();
+    // The lift: the finished floor fades away before the next laying.
+    var fade = 1 - smooth(PAUSE_END, CYCLE, ct);
+    if (fade <= 0.001) return;
+    for (var i = 0; i < NCELL; i++) drawTile(cells[i], i, cycle, ct, L, fade);
+  }
+
+  // ---- Clock, pointer, boot ---------------------------------------------
+  var startStamp = -1;
+  function nowSec() {
+    if (FORCE_T >= 0) return FORCE_T;
+    if (typeof performance !== 'undefined' && performance.now) {
+      if (startStamp < 0) startStamp = performance.now();
+      return (performance.now() - startStamp) / 1000;
+    }
+    return 0;
+  }
+
+  function evtPos(e) {
+    if (e && typeof e.clientX === 'number') return { x: e.clientX, y: e.clientY };
+    if (e && e.touches && e.touches.length) {
+      return { x: e.touches[0].clientX, y: e.touches[0].clientY };
+    }
+    return { x: W / 2, y: H / 2 };
+  }
+
+  function onTap(e) {
+    var p = evtPos(e);
+    var L = layout();
+    var col = Math.floor((p.x - L.x) / L.cell);
+    var row = Math.floor((p.y - L.y) / L.cell);
+    if (col < 0 || col >= COLS || row < 0 || row >= ROWS) return;
+    var t = nowSec();
+    var cycle = Math.floor(t / CYCLE);
+    var ct = t - cycle * CYCLE;
+    if (ct >= PAUSE_END) return;              // the floor is lifting
+    var cell = row * COLS + col;
+    var cells = buildCells(cycle);
+    var rec = cells[cell];
+    var place = effPlace(cell, cycle, rec);
+    if (place <= ct) {
+      strikes.push({ cycle: cycle, cell: cell, t: t });
+    } else if (ct < LAY_END) {
+      early[cycle + ':' + cell] = ct;         // placed here at once
+      strikes.push({ cycle: cycle, cell: cell, t: t });
+    }
+    draw(t);
+  }
+
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onTap);
+  }
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('resize', function () { resize(); draw(nowSec()); });
+  }
+  if (typeof window !== 'undefined' && window.visualViewport &&
+      window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () {
+      resize(); draw(nowSec());
+    });
+  }
+
+  resize();
+  draw(0); // frame one: the synchronous draw at t = 0
+
+  if (FORCE_T >= 0) {
+    draw(FORCE_T);
+  } else if (typeof requestAnimationFrame === 'function') {
+    var tick = function () {
+      draw(nowSec());
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }
+})();
+</script>
+</body>
+</html>

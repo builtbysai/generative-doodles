@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Petal Shroud</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #0D0C0B; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // Palette (strict): petal reds #7A1F1F..#A83232, vein #5C1616,
+  // thread #D8C9A8, ground #0D0C0B. Nothing else.
+  var PETAL_LO = [122, 31, 31];    // #7A1F1F
+  var PETAL_HI = [168, 50, 50];    // #A83232
+  var VEIN = '#5C1616';
+  var THREAD = '#D8C9A8';
+  var GROUND = '#0D0C0B';
+
+  var BASE_SEED = 701001;
+  var WAVE_PERIOD = 25;            // breathing wave period, seconds
+  var FORCE_T = -1;                // QA hook: -1 = live clock, else fixed elapsed
+
+  // QA seed hook: ?seed=tNN pins the elapsed time (used by the headless
+  // renderer to inspect later phases). Inert in normal viewing.
+  try {
+    if (typeof location !== 'undefined' && location.search) {
+      var qm = /[?&]seed=t([0-9]+(?:\.[0-9]+)?)/.exec(location.search);
+      if (qm) FORCE_T = parseFloat(qm[1]);
+    }
+  } catch (e) { /* live mode */ }
+
+  // Seeded RNG (mulberry32). The whole arrangement comes from the epoch
+  // stream, so every frame is reproducible.
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+  function lerp(a, b, u) { return a + (b - a) * u; }
+
+  // Precomputed flat petal shades between the two specced reds.
+  var SHADES = [];
+  for (var si = 0; si < 24; si++) {
+    var su = si / 23;
+    SHADES.push('rgb(' + Math.round(lerp(PETAL_LO[0], PETAL_HI[0], su)) + ',' +
+                Math.round(lerp(PETAL_LO[1], PETAL_HI[1], su)) + ',' +
+                Math.round(lerp(PETAL_LO[2], PETAL_HI[2], su)) + ')');
+  }
+  var DARKEST = SHADES[0];
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  var W = 0, H = 0, DPR = 1, PHONE = false;
+  var epoch = 0;
+
+  function viewSize() {
+    var w, h;
+    if (typeof window !== 'undefined' && window.visualViewport &&
+        window.visualViewport.width) {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    } else if (typeof window !== 'undefined' && window.innerWidth) {
+      w = window.innerWidth; h = window.innerHeight;
+    } else { w = 800; h = 600; }
+    return { w: w, h: h };
+  }
+
+  function resize() {
+    var s = viewSize();
+    W = s.w; H = s.h;
+    DPR = 1;
+    if (typeof window !== 'undefined' && window.devicePixelRatio) {
+      DPR = clamp(window.devicePixelRatio, 1, 2);
+    }
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    // Phone detection: physical screen size first (min dimension < 700),
+    // tall-aspect as the fallback signal only.
+    var smin = 100000;
+    if (typeof window !== 'undefined' && window.screen &&
+        window.screen.width && window.screen.height) {
+      smin = Math.min(window.screen.width, window.screen.height);
+    }
+    PHONE = (smin < 700) || (H > W * 1.15 && smin === 100000);
+    buildScene();
+  }
+
+  // ---- The shroud -------------------------------------------------------
+  // An irregular rounded rectangle (superellipse) whose boundary radius
+  // is modulated by three seeded low-frequency sines: the frayed edge.
+  // Petals sit on a loose jittered grid inside it, sorted back-to-front
+  // once per seed; a few loose petals lie just outside the edge.
+  var petals = [];        // built by buildScene, draw order fixed
+  var states = [];        // per-frame draw state, reused
+  var boundary = { p1: 0, p2: 0, p3: 0 };
+  var shroud = { cx: 0, cy: 0, hw: 0, hh: 0 };
+  var SN = 3.2;           // superellipse exponent (rounded rectangle)
+
+  function boundaryAt(theta) {
+    return 1 + 0.050 * Math.sin(3 * theta + boundary.p1) +
+               0.035 * Math.sin(7 * theta + boundary.p2) +
+               0.020 * Math.sin(11 * theta + boundary.p3);
+  }
+
+  // Superellipse norm of a local point (1 = on the ideal outline).
+  function superNorm(lx, ly) {
+    var ax = Math.abs(lx / shroud.hw), ay = Math.abs(ly / shroud.hh);
+    return Math.pow(Math.pow(ax, SN) + Math.pow(ay, SN), 1 / SN);
+  }
+
+  function buildScene() {
+    var rng = mulberry32(BASE_SEED + epoch * 100003);
+    var U = Math.min(W, H);
+    shroud.cx = W / 2;
+    shroud.cy = H / 2;
+    shroud.hw = (PHONE ? 0.45 : 0.335) * W;
+    shroud.hh = (PHONE ? 0.30 : 0.345) * H;
+    boundary.p1 = rng() * Math.PI * 2;
+    boundary.p2 = rng() * Math.PI * 2;
+    boundary.p3 = rng() * Math.PI * 2;
+    var flowPhase = rng() * Math.PI * 2;
+
+    // Petal size: nominal length tied to the smaller dimension so the
+    // count lands near the specced ~1,200 on a desktop frame and the
+    // petals stay in the specced 14-22 px band there.
+    var L = clamp(U * 0.022, 11, 22);
+    var pitch = L * 1.02;
+    var rowH = pitch * 0.90;
+
+    petals = [];
+    var grid = {};        // "i,j" -> petal, for stitch neighbours
+    var jMax = Math.ceil(shroud.hh / rowH) + 1;
+    var iMax = Math.ceil(shroud.hw / pitch) + 1;
+    for (var j = -jMax; j <= jMax; j++) {
+      for (var i = -iMax; i <= iMax; i++) {
+        var lx = i * pitch + (Math.abs(j) % 2 ? pitch / 2 : 0) +
+                 (rng() - 0.5) * 0.60 * pitch;
+        var ly = j * rowH + (rng() - 0.5) * 0.60 * rowH;
+        var r = superNorm(lx, ly);
+        var theta = Math.atan2(ly / shroud.hh, lx / shroud.hw);
+        var b = boundaryAt(theta);
+        if (r > b) continue;
+        if (rng() < 0.03) continue;              // hand-placed gaps
+        var nx = lx / shroud.hw, ny = ly / shroud.hh;
+        // Base orientation: a slow flow field over the cloth, then the
+        // specced +/-25 degree jitter. Edge petals get extra spread.
+        var base = 0.9 * Math.sin(2.3 * nx + 1.7 * ny + flowPhase) +
+                   0.5 * Math.sin(4.1 * ny - 1.3 * nx + flowPhase * 0.7);
+        var edgeSpread = r > b - 0.10 ? 0.30 : 0;
+        var rot = base + (rng() - 0.5) * 2 * (0.436 + edgeSpread);
+        var p = {
+          lx: lx, ly: ly, nx: nx, ny: ny,
+          rot: rot,
+          len: L * (0.74 + rng() * 0.40),
+          shade: Math.floor(rng() * SHADES.length),
+          tiltDir: rng() < 0.5 ? -1 : 1,
+          stitchR: rng() < 0.6, stitchD: rng() < 0.6,
+          right: null, down: null, loose: false
+        };
+        grid[i + ',' + j] = p;
+        p.gi = i; p.gj = j;
+        petals.push(p);
+      }
+    }
+    // Stitch neighbours along the grid seams.
+    var k, p2;
+    for (k = 0; k < petals.length; k++) {
+      p2 = petals[k];
+      p2.right = grid[(p2.gi + 1) + ',' + p2.gj] || null;
+      p2.down = grid[p2.gi + ',' + (p2.gj + 1)] || null;
+      if (!p2.right) p2.stitchR = false;
+      if (!p2.down) p2.stitchD = false;
+    }
+    // Loose fray petals just outside the edge.
+    var nLoose = 16;
+    for (k = 0; k < nLoose; k++) {
+      var th = rng() * Math.PI * 2;
+      var bb = boundaryAt(th) * (1.02 + rng() * 0.10);
+      // Point on the superellipse boundary in direction th, scaled out.
+      var ct = Math.cos(th), st = Math.sin(th);
+      var sEdge = 1 / Math.pow(Math.pow(Math.abs(ct) / shroud.hw, SN) +
+                               Math.pow(Math.abs(st) / shroud.hh, SN), 1 / SN);
+      var px = ct * sEdge * bb, py = st * sEdge * bb;
+      // Keep loose petals inside the frame (they fray, they do not clip).
+      px = clamp(px, 12 - shroud.cx, W - 12 - shroud.cx);
+      py = clamp(py, 12 - shroud.cy, H - 12 - shroud.cy);
+      petals.push({
+        lx: px, ly: py, nx: px / shroud.hw, ny: py / shroud.hh,
+        rot: rng() * Math.PI * 2,
+        len: L * (0.74 + rng() * 0.40),
+        shade: Math.floor(rng() * SHADES.length),
+        tiltDir: rng() < 0.5 ? -1 : 1,
+        stitchR: false, stitchD: false, right: null, down: null, loose: true
+      });
+    }
+    // Back-to-front once per seed: top rows first.
+    petals.sort(function (a, b2) { return (a.ly - b2.ly) || (a.lx - b2.lx); });
+    for (k = 0; k < petals.length; k++) petals[k].idx = k;
+    states = petals.map(function () {
+      return { x: 0, y: 0, sc: 1, rot: 0 };
+    });
+  }
+
+  // Pointer state, recorded on the anchored clock.
+  var ptr = { has: false, inside: false, x: 0, y: 0, lastT: -100,
+              down: false, downT: 0, downX: 0, downY: 0 };
+
+  function computeStates(t) {
+    // Travelling wavefront: a Gaussian bump in normalised x sweeping
+    // left to right once per period, entering just off the left edge at
+    // t = 0 so frame one has the first lift only at that edge.
+    var u = ((t % WAVE_PERIOD) / WAVE_PERIOD) * 1.3 - 0.15;
+    // Pointer envelope: full while the pointer is present, decaying
+    // after it leaves.
+    var pEnv = 0;
+    if (ptr.has) pEnv = ptr.inside ? 1 : Math.exp(-(t - ptr.lastT) / 0.45);
+    if (pEnv < 0.01) pEnv = 0;
+    for (var i = 0; i < petals.length; i++) {
+      var p = petals[i], s = states[i];
+      var x = shroud.cx + p.lx, y = shroud.cy + p.ly;
+      var dN = (p.nx * 0.5 + 0.5) - u;
+      var wl = Math.exp(-(dN * dN) / (2 * 0.10 * 0.10));
+      var sc = 1 + 0.12 * wl;
+      var ox = 0.6 * wl, oy = -2 * wl;
+      var rot = p.rot + wl * 0.05 * p.tiltDir;
+      if (pEnv > 0 && !p.loose) {
+        var dx = ptr.x - x, dy = ptr.y - y;
+        var dd = Math.sqrt(dx * dx + dy * dy);
+        if (dd < 60) {
+          var q = 1 - dd / 60;
+          q = q * q * (3 - 2 * q);
+          var pl = q * pEnv;
+          sc += 0.10 * pl;
+          if (dd > 0.01) { ox += (dx / dd) * 1.6 * pl; oy += (dy / dd) * 1.6 * pl; }
+          var tipA = rot - Math.PI / 2;
+          rot += pl * 0.18 * Math.sin(Math.atan2(dy, dx) - tipA);
+        }
+      }
+      s.x = x + ox; s.y = y + oy; s.sc = sc; s.rot = rot;
+    }
+  }
+
+  function drawUnderlay() {
+    // The cloth body under the petals: darkest petal red at low alpha,
+    // following the same frayed boundary.
+    ctx.beginPath();
+    var steps = 72;
+    for (var i = 0; i <= steps; i++) {
+      var th = (i / steps) * Math.PI * 2;
+      var ct = Math.cos(th), st = Math.sin(th);
+      var sEdge = 1 / Math.pow(Math.pow(Math.abs(ct) / shroud.hw, SN) +
+                               Math.pow(Math.abs(st) / shroud.hh, SN), 1 / SN);
+      var bb = boundaryAt(th);
+      var x = shroud.cx + ct * sEdge * bb;
+      var y = shroud.cy + st * sEdge * bb;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+    ctx.globalAlpha = 0.32;
+    ctx.fillStyle = DARKEST;
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  function drawStitches() {
+    // Three pale dashes along the middle of each kept seam.
+    ctx.strokeStyle = THREAD;
+    ctx.lineWidth = 1;
+    ctx.globalAlpha = 0.8;
+    for (var i = 0; i < petals.length; i++) {
+      var p = petals[i], s = states[i];
+      for (var which = 0; which < 2; which++) {
+        var nb = which === 0 ? p.right : p.down;
+        var on = which === 0 ? p.stitchR : p.stitchD;
+        if (!on || !nb) continue;
+        var ns = states[nb.idx];
+        for (var k = 0; k < 3; k++) {
+          var u0 = 0.30 + k * 0.16, u1 = u0 + 0.09;
+          ctx.beginPath();
+          ctx.moveTo(lerp(s.x, ns.x, u0), lerp(s.y, ns.y, u0));
+          ctx.lineTo(lerp(s.x, ns.x, u1), lerp(s.y, ns.y, u1));
+          ctx.stroke();
+        }
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawPetals() {
+    for (var i = 0; i < petals.length; i++) {
+      var p = petals[i], s = states[i];
+      ctx.save();
+      ctx.translate(s.x, s.y);
+      ctx.rotate(s.rot);
+      var k = s.sc * p.len;
+      ctx.scale(k, k);
+      // Unit petal: base at y +0.5, notched tip near y -0.46.
+      ctx.beginPath();
+      ctx.moveTo(0, 0.5);
+      ctx.bezierCurveTo(-0.34, 0.22, -0.35, -0.12, -0.10, -0.40);
+      ctx.lineTo(0, -0.31);
+      ctx.lineTo(0.10, -0.40);
+      ctx.bezierCurveTo(0.35, -0.12, 0.34, 0.22, 0, 0.5);
+      ctx.closePath();
+      ctx.fillStyle = SHADES[p.shade];
+      ctx.fill();
+      // One vein line.
+      ctx.beginPath();
+      ctx.moveTo(0, 0.36);
+      ctx.lineTo(0, -0.27);
+      ctx.strokeStyle = VEIN;
+      ctx.lineWidth = 1 / k;
+      ctx.globalAlpha = 0.9;
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+      ctx.restore();
+    }
+  }
+
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = GROUND;
+    ctx.fillRect(0, 0, W, H);
+    computeStates(t);
+    drawUnderlay();
+    drawPetals();
+    drawStitches();
+  }
+
+  // ---- Clock, pointer, boot ---------------------------------------------
+  var startStamp = -1;
+  function nowSec() {
+    if (FORCE_T >= 0) return FORCE_T;
+    if (typeof performance !== 'undefined' && performance.now) {
+      if (startStamp < 0) startStamp = performance.now();
+      return (performance.now() - startStamp) / 1000;
+    }
+    return 0;
+  }
+
+  function reseed() {
+    epoch++;
+    buildScene();
+    if (typeof performance !== 'undefined' && performance.now) {
+      startStamp = performance.now();
+    }
+    draw(0);
+  }
+
+  function evtPos(e) {
+    if (e && typeof e.clientX === 'number') return { x: e.clientX, y: e.clientY };
+    return { x: W / 2, y: H / 2 };
+  }
+  function recordPtr(e) {
+    var p = evtPos(e);
+    ptr.has = true; ptr.inside = true;
+    ptr.x = p.x; ptr.y = p.y; ptr.lastT = nowSec();
+  }
+  function onDown(e) {
+    recordPtr(e);
+    var p = evtPos(e);
+    ptr.down = true; ptr.downT = nowSec(); ptr.downX = p.x; ptr.downY = p.y;
+  }
+  function onUp(e) {
+    ptr.down = false;
+    ptr.lastT = nowSec();
+    // A tap (short, nearly still) reseeds the arrangement.
+    var p = evtPos(e);
+    var dt = nowSec() - ptr.downT;
+    var moved = Math.abs(p.x - ptr.downX) + Math.abs(p.y - ptr.downY);
+    if (dt < 0.3 && moved < 6) reseed();
+  }
+
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', recordPtr);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointerleave', function () {
+      ptr.inside = false; ptr.down = false; ptr.lastT = nowSec();
+    });
+  }
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('resize', function () { resize(); draw(nowSec()); });
+  }
+  if (typeof window !== 'undefined' && window.visualViewport &&
+      window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () {
+      resize(); draw(nowSec());
+    });
+  }
+
+  resize();
+  draw(0); // frame one: the synchronous draw at t = 0
+
+  if (FORCE_T >= 0) {
+    draw(FORCE_T);
+  } else if (typeof requestAnimationFrame === 'function') {
+    var tick = function () {
+      draw(nowSec());
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }
+})();
+</script>
+</body>
+</html>
