@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Every Tiny Grain</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #040405; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded RNG (mulberry32) ----------
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(888049);
+
+  // ---------- palette ----------
+  var GROUND = '#040405';
+  var VIOLET = [138, 92, 255];   // #8A5CFF
+  var WHITE  = [255, 255, 255];  // #FFFFFF
+  var PINK   = [255, 122, 184];  // #FF7AB8
+  var ICE    = [216, 246, 255];  // #D8F6FF
+  function rgba(c, a) {
+    return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a.toFixed(4) + ')';
+  }
+  function clamp(x, lo, hi) { return x < lo ? lo : (x > hi ? hi : x); }
+  function lerp(a, b, u) { return a + (b - a) * u; }
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 300, H = 300, PHONE = false;
+
+  function measure() {
+    var w, h;
+    if (typeof window !== 'undefined' && window.visualViewport) {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    } else {
+      w = window.innerWidth; h = window.innerHeight;
+    }
+    W = Math.max(50, Math.round(w));
+    H = Math.max(50, Math.round(h));
+    var sw = 100000, sh = 100000;
+    if (typeof window !== 'undefined' && window.screen) {
+      sw = window.screen.width || 100000;
+      sh = window.screen.height || 100000;
+    }
+    PHONE = Math.min(sw, sh) < 700 || (h > w * 1.15 && Math.min(w, h) < 700);
+    canvas.width = W;
+    canvas.height = H;
+  }
+  function onResize() { measure(); draw(currentT()); }
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', onResize);
+    }
+    if (window.addEventListener) window.addEventListener('resize', onResize);
+  }
+
+  // ---------- seeded static structure ----------
+  // morph phases for the column core displacement
+  var MP1 = rng() * Math.PI * 2, MP2 = rng() * Math.PI * 2, MP3 = rng() * Math.PI * 2;
+  var MW1 = 2.6 + rng() * 1.4, MW2 = 5.1 + rng() * 2.2, MW3 = 9.3 + rng() * 3.0;
+
+  // caustic sparkles: seeded relative positions inside the column
+  var SPARKS = [];
+  for (var si = 0; si < 60; si++) {
+    SPARKS.push({
+      v: 0.03 + rng() * 0.94,          // vertical position (0 top, 1 bottom)
+      u: (rng() * 2 - 1) * 0.78,       // horizontal position within half-width
+      driftPh: rng() * Math.PI * 2,
+      driftSp: 0.11 + rng() * 0.30,
+      twPh: rng() * Math.PI * 2,
+      twSp: 0.7 + rng() * 1.9,
+      r: 0.8 + rng() * 1.7
+    });
+  }
+
+  // ---------- event state (recorded gestures) ----------
+  var bendKeys = [];    // {t, target} bend target changes; folded with exp approach
+  var pulses = [];      // {t, a, tau} brightness pulses (tap strikes, drag flares)
+  var holds = [];       // {t0, t1, value} double-tap bloom holds (frozen brightness)
+  var bendTau = 0.55;
+
+  // ---------- closed-form state ----------
+  // breath: swelling at t=0, value ~0.62, period 18 s
+  function breath(t) {
+    return 0.62 + 0.30 * Math.sin((Math.PI * 2 * t) / 18.0)
+                 + 0.05 * Math.sin((Math.PI * 2 * t) / 7.3 + 1.7);
+  }
+  // bloom-dissolve loop: 40 s cycle; dissolve bump in the last stretch
+  function dissolveAmt(t) {
+    var p = ((t % 40) + 40) % 40 / 40;
+    if (p < 0.74) return 0;
+    var u = (p - 0.74) / 0.26;               // 0..1 across the dissolve window
+    return Math.sin(u * Math.PI);            // rises, falls; rebuild as it falls
+  }
+  function rawBrightness(t) {
+    var b = breath(t);
+    for (var i = 0; i < pulses.length; i++) {
+      var dt = t - pulses[i].t;
+      if (dt >= 0) b += pulses[i].a * Math.exp(-dt / pulses[i].tau);
+    }
+    return b;
+  }
+  function brightness(t) {
+    for (var i = 0; i < holds.length; i++) {
+      if (t >= holds[i].t0 && t <= holds[i].t1) return holds[i].value;
+    }
+    return clamp(rawBrightness(t), 0.05, 1.25);
+  }
+  // bend: fold the recorded target keys with exponential approach
+  function bendAt(t) {
+    var b = 0, tp = 0;
+    for (var i = 0; i < bendKeys.length; i++) {
+      var k = bendKeys[i];
+      if (k.t > t) break;
+      b = k.target + (b - k.target) * Math.exp(-(k.t - tp) / bendTau);
+      tp = k.t;
+    }
+    var last = bendKeys.length ? bendKeys[bendKeys.length - 1] : null;
+    if (last && t > last.t) {
+      b = last.target + (b - last.target) * Math.exp(-(t - last.t) / bendTau);
+    }
+    return b;
+  }
+
+  // column geometry helpers
+  function colShare() { return PHONE ? 0.58 : 0.40; }
+  function morphX(v, t) {
+    var w = Math.min(W, H);
+    return (Math.sin(v * MW1 + t * 0.21 + MP1) * 0.55 +
+            Math.sin(v * MW2 - t * 0.13 + MP2) * 0.30 +
+            Math.sin(v * MW3 + t * 0.07 + MP3) * 0.15) * w * 0.016;
+  }
+  function centerX(v, t, bend) {
+    // blade anchored near the base, leaning most at the top
+    var lean = Math.pow(1 - v, 1.25);
+    return W * 0.5 + morphX(v, t) + bend * W * 0.30 * lean + bend * W * 0.05;
+  }
+  function halfW(v, t, br) {
+    var base = W * colShare() * 0.5;
+    var shape = 0.86 + 0.14 * Math.sin(v * 3.4 + t * 0.17 + 0.6);   // gentle waist
+    var swell = 0.72 + 0.48 * clamp(br, 0, 1.2);
+    return base * shape * swell;
+  }
+
+  // ---------- drawing ----------
+  var ROWS = 260;
+  // nested soft-falloff passes: width factor + color + alpha (gradient via flat strips)
+  var PASSES = [
+    { f: 1.00, c: VIOLET, a: 0.050 },
+    { f: 0.82, c: VIOLET, a: 0.075 },
+    { f: 0.64, c: VIOLET, a: 0.110 },
+    { f: 0.47, c: VIOLET, a: 0.160 },
+    { f: 0.32, c: VIOLET, a: 0.230 },
+    { f: 0.21, c: WHITE,  a: 0.300 },
+    { f: 0.12, c: WHITE,  a: 0.480 },
+    { f: 0.055, c: WHITE, a: 0.750 }
+  ];
+
+  function drawBlade(t, br, bend, ghost) {
+    // ghost: {spread, alphaMul} for dissolve smear copies; null for the true blade
+    var D = dissolveAmt(t);
+    var alphaMul = ghost ? ghost.alphaMul : (1 - D * 0.82);
+    var spread = ghost ? ghost.spread : 1;
+    var fringe = clamp(0.34 + Math.abs(bend) * 1.5 + (br - 0.62) * 0.55, 0.14, 1.0);
+    var rowH = (H / ROWS) * 1.7;
+
+    // pass order: outer pink fringe, blade passes, inner pink fringe at the core edge
+    var seq = [{ f: 1.00, c: PINK, a: 0.16 * fringe, fringeOff: 2.0 + 3.0 * fringe }];
+    for (var q = 0; q < PASSES.length; q++) seq.push(PASSES[q]);
+    seq.push({ f: 0.15, c: PINK, a: 0.13 * fringe, fringeOff: 1.0 + 2.0 * fringe });
+
+    for (var pass = 0; pass < seq.length; pass++) {
+      var p = seq[pass];
+      var aBase = p.a * clamp(br, 0.08, 1.25) * alphaMul;
+      if (aBase <= 0.003) continue;
+      ctx.fillStyle = rgba(p.c, aBase);
+      var sides = p.fringeOff ? [-1, 1] : [0];
+      for (var s = 0; s < sides.length; s++) {
+        var offX = sides[s] * (p.fringeOff || 0) * spread;
+        for (var i = 0; i < ROWS; i++) {
+          var v = i / (ROWS - 1);
+          var cx = centerX(v, t, bend) + offX;
+          var hw = halfW(v, t, br) * p.f * spread;
+          ctx.fillRect(cx - hw, v * H - (rowH - H / ROWS) / 2, hw * 2, rowH);
+        }
+      }
+    }
+  }
+
+  function drawSparkles(t, br, bend) {
+    var D = dissolveAmt(t);
+    var baseA = (0.10 + 0.55 * clamp(br, 0, 1.2)) * (1 - D * 0.75);
+    if (baseA <= 0.01) return;
+    for (var i = 0; i < SPARKS.length; i++) {
+      var s = SPARKS[i];
+      var u = s.u + 0.07 * Math.sin(t * s.driftSp + s.driftPh);
+      var v = s.v + 0.012 * Math.sin(t * s.driftSp * 0.7 + s.driftPh * 1.3);
+      var x = centerX(v, t, bend) + u * halfW(v, t, br);
+      var y = v * H;
+      var tw = 0.5 + 0.5 * Math.sin(t * s.twSp + s.twPh);
+      var a = baseA * (0.25 + 0.75 * tw * tw);
+      var r = s.r * (0.7 + 0.6 * tw);
+      ctx.fillStyle = rgba(ICE, a);
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.fill();
+      // tiny cross glint on the brightest sparkles
+      if (tw > 0.86) {
+        ctx.fillStyle = rgba(ICE, a * 0.5);
+        var g = r * 3.2;
+        ctx.fillRect(x - g, y - 0.5, g * 2, 1);
+        ctx.fillRect(x - 0.5, y - g, 1, g * 2);
+      }
+    }
+  }
+
+  function drawMeter(br) {
+    var x0 = W * 0.08, x1 = W * 0.92, y = H - Math.max(8, H * 0.018), h = 3;
+    ctx.fillStyle = rgba(VIOLET, 0.20);
+    ctx.fillRect(x0, y, x1 - x0, h);
+    var f = clamp((br - 0.05) / 1.1, 0, 1);
+    ctx.fillStyle = rgba(WHITE, 0.55);
+    ctx.fillRect(x0, y, (x1 - x0) * f, h);
+    ctx.fillStyle = rgba(PINK, 0.35);
+    ctx.fillRect(x0, y + h + 2, (x1 - x0) * f, 1);
+  }
+
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.fillStyle = GROUND;
+    ctx.fillRect(0, 0, W, H);
+
+    var br = brightness(t);
+    var bend = bendAt(t);
+    var D = dissolveAmt(t);
+
+    // dissolve ghosts: analytic smear copies, stretched horizontally, fading
+    if (D > 0.01) {
+      for (var g = 4; g >= 1; g--) {
+        drawBlade(t, br, bend, {
+          spread: 1 + D * g * 0.85,
+          alphaMul: D * 0.16 * (1 - g / 5.5)
+        });
+      }
+    }
+    drawBlade(t, br, bend, null);
+    drawSparkles(t, br, bend);
+    drawMeter(br);
+  }
+
+  // ---------- clock ----------
+  var startStamp = null;
+  function nowSec() {
+    if (typeof performance !== 'undefined' && performance.now) {
+      return performance.now() / 1000;
+    }
+    return 0;
+  }
+  function currentT() {
+    if (startStamp === null) return 0;
+    return nowSec() - startStamp;
+  }
+
+  // ---------- audio (lazy, gesture-gated, guarded) ----------
+  var AC = null, droneGain = null, shimGain = null, audioOK = false;
+  function initAudio() {
+    if (audioOK) return;
+    audioOK = true;
+    try {
+      var Ctor = (typeof window !== 'undefined') &&
+        (window.AudioContext || window.webkitAudioContext);
+      if (!Ctor || typeof Ctor !== 'function') return;
+      AC = new Ctor();
+      var master = AC.createGain(); master.gain.value = 0.9;
+      var comp = null;
+      if (typeof AC.createDynamicsCompressor === 'function') {
+        comp = AC.createDynamicsCompressor();
+        master.connect(comp); comp.connect(AC.destination);
+      } else {
+        master.connect(AC.destination);
+      }
+      // deep low drone: two detuned sines through one gain (gain = brightness)
+      droneGain = AC.createGain(); droneGain.gain.value = 0;
+      var o1 = AC.createOscillator(); o1.type = 'sine'; o1.frequency.value = 46;
+      var o2 = AC.createOscillator(); o2.type = 'sine'; o2.frequency.value = 69.3;
+      var og2 = AC.createGain(); og2.gain.value = 0.45;
+      o1.connect(droneGain); o2.connect(og2); og2.connect(droneGain);
+      droneGain.connect(master);
+      o1.start(); o2.start();
+      // granular shimmer: looped noise through a bandpass, gain scales with brightness
+      var len = AC.sampleRate * 2;
+      var buf = AC.createBuffer(1, len, AC.sampleRate);
+      var data = buf.getChannelData(0);
+      var arng = mulberry32(4242);
+      for (var i = 0; i < len; i++) data[i] = arng() * 2 - 1;
+      var src = AC.createBufferSource(); src.buffer = buf; src.loop = true;
+      var bp = AC.createBiquadFilter(); bp.type = 'bandpass';
+      bp.frequency.value = 3400; bp.Q.value = 0.8;
+      shimGain = AC.createGain(); shimGain.gain.value = 0;
+      src.connect(bp); bp.connect(shimGain); shimGain.connect(master);
+      src.start();
+    } catch (e) {
+      AC = null;
+    }
+  }
+  function updateAudio(t) {
+    if (!AC) return;
+    try {
+      var br = brightness(t);
+      var ct = AC.currentTime;
+      if (droneGain) droneGain.gain.setTargetAtTime(0.02 + 0.13 * clamp(br, 0, 1.25), ct, 0.12);
+      if (shimGain) {
+        var tw = 0.6 + 0.4 * Math.sin(t * 2.3) * Math.sin(t * 0.77 + 1.1);
+        shimGain.gain.setTargetAtTime(0.045 * clamp(br, 0, 1.25) * tw, ct, 0.1);
+      }
+      if (AC.state === 'suspended' && typeof AC.resume === 'function') AC.resume();
+    } catch (e) { /* audio is decorative; visuals never depend on it */ }
+  }
+
+  // ---------- pointer interaction ----------
+  var dragging = false, dragMoved = false;
+  var downT = 0, downX = 0, downY = 0, lastX = 0, lastY = 0, lastMoveT = 0;
+  var lastTapT = -10, lastBendPush = -10, lastFlarePush = -10;
+
+  function normBend(x) { return clamp((x - W * 0.5) / (W * 0.5), -1, 1); }
+  function pushBend(t, target, force) {
+    if (force || t - lastBendPush > 0.09) {
+      bendKeys.push({ t: t, target: target });
+      lastBendPush = t;
+      if (bendKeys.length > 400) bendKeys.splice(0, bendKeys.length - 400);
+    }
+  }
+  function onDown(e) {
+    initAudio();
+    dragging = true; dragMoved = false;
+    var t = currentT();
+    downT = t; downX = lastX = e.clientX; downY = lastY = e.clientY; lastMoveT = t;
+    pushBend(t, normBend(e.clientX), true);
+  }
+  function onMove(e) {
+    if (!dragging) return;
+    var t = currentT();
+    var dx = e.clientX - lastX, dy = e.clientY - lastY;
+    var dist = Math.sqrt(dx * dx + dy * dy);
+    if (Math.abs(e.clientX - downX) + Math.abs(e.clientY - downY) > 7) dragMoved = true;
+    var dt = Math.max(0.016, t - lastMoveT);
+    var speed = dist / dt; // px per second
+    pushBend(t, normBend(e.clientX), false);
+    // fast drag = flare (brightness spike), throttled
+    if (speed > W * 1.1 && t - lastFlarePush > 0.22) {
+      pulses.push({ t: t, a: clamp((speed / W - 1.1) * 0.16, 0.05, 0.34), tau: 0.55 });
+      lastFlarePush = t;
+    }
+    lastX = e.clientX; lastY = e.clientY; lastMoveT = t;
+  }
+  function onUp(e) {
+    if (!dragging) return;
+    dragging = false;
+    var t = currentT();
+    pushBend(t, 0, true); // release: exhale back to vertical
+    if (!dragMoved && t - downT < 0.3) {
+      // tap: strike, or double-tap: hold the bloom
+      if (t - lastTapT < 0.38) {
+        var peak = clamp(rawBrightness(t), 0.05, 1.25);
+        holds.push({ t0: t, t1: t + 3, value: peak });
+        lastTapT = -10;
+      } else {
+        pulses.push({ t: t, a: 0.5, tau: 0.9 });
+        lastTapT = t;
+      }
+    }
+  }
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('pointerdown', onDown);
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
+  }
+
+  // ---------- run ----------
+  measure();
+  draw(0); // deterministic frame one, synchronous
+
+  if (typeof requestAnimationFrame === 'function') {
+    startStamp = nowSec();
+    var loop = function () {
+      var t = currentT();
+      draw(t);
+      updateAudio(t);
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>

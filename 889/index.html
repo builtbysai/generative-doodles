@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Chasing</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #050506; overflow: hidden; height: 100%; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+// No.889 "Chasing" (klsr.av PP50 "Cross-Flare").
+// One cross flare on near-black: a horizontal blade crossed by a vertical
+// beam, hot white center, breathing on a slow LFO. Drag steers the center
+// (blade length follows drag speed), tap strikes the center, double-tap
+// switches the GOLD / BLUE variant. All drawn state is a closed-form
+// function of the recorded event lists and t; frame one is draw(0).
+
+// ---------- seeded RNG (mulberry32) ----------
+function mulberry32(seed) {
+  var a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+var rng = mulberry32(889050);
+// Fixed seeded asymmetries so the flare feels photographed, not drawn.
+var ASYM_H = (rng() - 0.5) * 0.07;  // horizontal blade left/right imbalance
+var ASYM_V = (rng() - 0.5) * 0.05;  // vertical beam top/bottom imbalance
+
+// ---------- palette ----------
+var GROUND = '#050506';
+var BLADE_GOLD = '#F5E7C8';
+var BLADE_BLUE = '#5CA8FF';
+var BEAM = '#5C7CFF';
+var CENTER = '#FFFFFF';
+var HALO = '#8A8AB8';
+
+// ---------- canvas / viewport ----------
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var DPR = 1;
+try { DPR = Math.min(window.devicePixelRatio || 1, 2); } catch (e) { DPR = 1; }
+var VW = 720, VH = 720;
+
+function viewportSize() {
+  var w = 0, h = 0;
+  try {
+    if (window.visualViewport && window.visualViewport.width) {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    }
+  } catch (e) {}
+  if (!w) { w = window.innerWidth || 720; h = window.innerHeight || 720; }
+  return [w, h];
+}
+function resize() {
+  var s = viewportSize();
+  VW = s[0]; VH = s[1];
+  canvas.width = Math.round(VW * DPR);
+  canvas.height = Math.round(VH * DPR);
+}
+function isPhone(w, h) {
+  var sm = null;
+  try {
+    if (window.screen && window.screen.width) {
+      sm = Math.min(window.screen.width, window.screen.height);
+    }
+  } catch (e) {}
+  if (sm !== null && sm > 0) return sm < 700;
+  return h > w * 1.15;
+}
+
+// ---------- clock ----------
+// Elapsed piece time in seconds. Frame one is always draw(0); the clock
+// only advances the live loop, never the first frame.
+var T0 = null;
+function nowSec() {
+  var ms = 0;
+  if (typeof performance !== 'undefined' && performance.now) ms = performance.now();
+  if (T0 === null) T0 = ms;
+  return (ms - T0) / 1000;
+}
+
+// ---------- closed-form tracks ----------
+// A track is a constant plus a list of anchors {t0, from, to, tau}.
+// Value at t: the last anchor with t0 <= t gives
+//   to + (from - to) * exp(-(t - t0) / tau)
+// which is an exact exponential approach, evaluated analytically.
+function makeTrack(v0) { return { v0: v0, anchors: [] }; }
+function trackVal(tr, t) {
+  var a = null;
+  for (var i = 0; i < tr.anchors.length; i++) {
+    if (tr.anchors[i].t0 <= t) a = tr.anchors[i]; else break;
+  }
+  if (!a) return tr.v0;
+  return a.to + (a.from - a.to) * Math.exp(-(t - a.t0) / a.tau);
+}
+function trackPush(tr, t, to, tau) {
+  var from = trackVal(tr, t);
+  tr.anchors.push({ t0: t, from: from, to: to, tau: tau });
+}
+function trackPrune(tr, t) {
+  var idx = -1;
+  for (var i = 0; i < tr.anchors.length; i++) {
+    if (tr.anchors[i].t0 <= t) idx = i; else break;
+  }
+  if (idx > 0) tr.anchors.splice(0, idx);
+}
+
+var trackX = makeTrack(0.5);   // center x, fraction of width
+var trackY = makeTrack(0.5);   // center y, fraction of height
+var trackLen = makeTrack(1.0); // blade length factor
+
+// ---------- events ----------
+var strikes = [];   // strike times (center flash)
+var toggles = [];   // variant toggle times
+var lastTapT = -10;
+var pendingStrike = null; // {fireAt, at}
+
+function variantBlueAt(t) {
+  var n = 0;
+  for (var i = 0; i < toggles.length; i++) if (toggles[i] <= t) n++;
+  return (n % 2) === 1;
+}
+function flashAt(t) {
+  var f = 0;
+  for (var i = 0; i < strikes.length; i++) {
+    var d = t - strikes[i];
+    if (d >= 0 && d < 2.5) f += Math.exp(-d * 5.5);
+  }
+  return Math.min(f, 1.2);
+}
+
+// ---------- breath ----------
+var BREATH_PERIOD = 8.5;
+function breathB(t) {
+  return 0.82 + 0.18 * Math.sin((Math.PI * 2) * (t / BREATH_PERIOD));
+}
+function breathSize(t) {
+  return 1 + 0.045 * Math.sin((Math.PI * 2) * (t / BREATH_PERIOD) - 0.8);
+}
+var lastCenterBrightness = 0.82;
+
+// ---------- drawing ----------
+// Soft falloff without gradients: each blade is many thin ellipse steps
+// from a wide faint skirt to a narrow near-solid core. The per-step
+// alpha increments are small enough that no step edge reads as a band.
+var STEPS = 42;
+function halfEllipseH(cx, cy, rx, ry, rightSide) {
+  ctx.beginPath();
+  if (rightSide) ctx.ellipse(cx, cy, Math.max(rx, 0.1), Math.max(ry, 0.1), 0, -Math.PI / 2, Math.PI / 2);
+  else ctx.ellipse(cx, cy, Math.max(rx, 0.1), Math.max(ry, 0.1), 0, Math.PI / 2, Math.PI * 1.5);
+  ctx.closePath();
+  ctx.fill();
+}
+function halfEllipseV(cx, cy, rx, ry, topSide) {
+  ctx.beginPath();
+  if (topSide) ctx.ellipse(cx, cy, Math.max(rx, 0.1), Math.max(ry, 0.1), 0, Math.PI, Math.PI * 2);
+  else ctx.ellipse(cx, cy, Math.max(rx, 0.1), Math.max(ry, 0.1), 0, 0, Math.PI);
+  ctx.closePath();
+  ctx.fill();
+}
+// One blade. vertical=false: horizontal blade (long axis x).
+// vertical=true: beam (long axis y). asym splits the two halves.
+function drawBlade(cx, cy, halfLen, color, bright, unit, vertical, asym, fringeColor) {
+  var k, u, lenS, th, a;
+  // chromatic fringe: a few mid-profile steps redrawn offset to both
+  // sides of the blade, in the other blade's color, very faint
+  ctx.fillStyle = fringeColor;
+  for (k = 0; k < 8; k++) {
+    u = 0.35 + (k / 7) * 0.3;
+    lenS = 1 - 0.94 * Math.pow(u, 0.75);
+    th = (2.0 + 26 * Math.pow(1 - u, 1.6)) * unit * 1.12;
+    ctx.globalAlpha = 0.016 * bright;
+    if (vertical) {
+      halfEllipseV(cx - 2.2, cy, th, halfLen * lenS * (1 + asym), true);
+      halfEllipseV(cx - 2.2, cy, th, halfLen * lenS * (1 - asym), false);
+      halfEllipseV(cx + 2.2, cy, th, halfLen * lenS * (1 + asym), true);
+      halfEllipseV(cx + 2.2, cy, th, halfLen * lenS * (1 - asym), false);
+    } else {
+      halfEllipseH(cx, cy - 2.2, halfLen * lenS * (1 + asym), th, true);
+      halfEllipseH(cx, cy - 2.2, halfLen * lenS * (1 - asym), th, false);
+      halfEllipseH(cx, cy + 2.2, halfLen * lenS * (1 + asym), th, true);
+      halfEllipseH(cx, cy + 2.2, halfLen * lenS * (1 - asym), th, false);
+    }
+  }
+  ctx.fillStyle = color;
+  for (k = 0; k < STEPS; k++) {
+    u = k / (STEPS - 1); // 0 outer skirt .. 1 core
+    lenS = 1 - 0.94 * Math.pow(u, 0.75);
+    th = (2.0 + 26 * Math.pow(1 - u, 1.6)) * unit;
+    a = (0.0035 + 0.062 * Math.pow(u, 1.6)) * bright;
+    ctx.globalAlpha = Math.min(a, 1);
+    if (vertical) {
+      halfEllipseV(cx, cy, th, halfLen * lenS * (1 + asym), true);
+      halfEllipseV(cx, cy, th, halfLen * lenS * (1 - asym), false);
+    } else {
+      halfEllipseH(cx, cy, halfLen * lenS * (1 + asym), th, true);
+      halfEllipseH(cx, cy, halfLen * lenS * (1 - asym), th, false);
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+function draw(t) {
+  var W = VW, H = VH;
+  var minD = Math.min(W, H);
+  var unit = minD / 720;
+  var phone = isPhone(W, H);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+
+  ctx.fillStyle = GROUND;
+  ctx.fillRect(0, 0, W, H);
+
+  var b = breathB(t);
+  var flash = flashAt(t);
+  var cb = Math.min(b + 0.5 * flash, 1.3);
+  lastCenterBrightness = cb;
+  var bladeBright = (0.55 + 0.45 * b) * (1 + 0.25 * flash);
+  var sz = breathSize(t);
+  var lenF = trackVal(trackLen, t);
+  var cx = trackVal(trackX, t) * W;
+  var cy = trackVal(trackY, t) * H;
+
+  var blue = variantBlueAt(t);
+  var bladeColor = blue ? BLADE_BLUE : BLADE_GOLD;
+  var beamColor = BEAM;
+
+  // wide soft halo behind the whole cross, in nested steps so its
+  // edge dissolves instead of reading as a disc
+  ctx.fillStyle = HALO;
+  var haloSteps = [0.36, 0.29, 0.22, 0.15];
+  for (var hs = 0; hs < haloSteps.length; hs++) {
+    ctx.globalAlpha = 0.014 * b;
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, haloSteps[hs] * W, haloSteps[hs] * H, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // vertical beam first, horizontal blade crosses over it
+  drawBlade(cx, cy, 0.44 * H * lenF * sz, beamColor, bladeBright, unit, true, ASYM_V, bladeColor);
+  drawBlade(cx, cy, 0.47 * W * lenF * sz, bladeColor, bladeBright, unit, false, ASYM_H, beamColor);
+
+  // hot center: fine stepped glow, halo tint outside, white inside;
+  // alpha reaches near zero at the outer edge so no ring line forms
+  var ci, cu, cr;
+  ctx.fillStyle = HALO;
+  for (ci = 0; ci < 20; ci++) {
+    cu = ci / 19;
+    cr = minD * (0.24 * (1 - cu) + 0.05);
+    ctx.globalAlpha = Math.min(0.020 * cb * Math.pow(cu, 1.4), 1);
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, cr * (1 + 0.3 * flash), cr * (1 + 0.3 * flash), 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.fillStyle = CENTER;
+  for (ci = 0; ci < 36; ci++) {
+    cu = ci / 35;
+    cr = minD * (0.17 * (1 - cu) + 0.008);
+    ctx.globalAlpha = Math.min((0.002 + 0.052 * Math.pow(cu, 1.7)) * cb * (phone ? 1.05 : 1), 1);
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, cr * (1 + 0.3 * flash), cr * (1 + 0.3 * flash), 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = Math.min(0.95 * cb, 1);
+  ctx.beginPath();
+  ctx.ellipse(cx, cy, 0.0085 * minD, 0.0085 * minD, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.globalAlpha = 1;
+
+  // variant readout, the only text besides the title
+  ctx.fillStyle = HALO;
+  ctx.globalAlpha = 0.6;
+  ctx.font = (phone ? 10 : 11) + 'px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillText(blue ? 'BLUE' : 'GOLD', W / 2, H - 14);
+  ctx.globalAlpha = 1;
+}
+
+// ---------- audio (lazy, gesture-gated, guarded) ----------
+var AC = null, droneGain = null, droneFilter = null, master = null;
+function audioInit() {
+  if (AC) return;
+  var Ctx = null;
+  try { Ctx = window.AudioContext || window.webkitAudioContext; } catch (e) { Ctx = null; }
+  if (!Ctx) return;
+  try {
+    AC = new Ctx();
+    master = AC.createDynamicsCompressor();
+    master.threshold.value = -18; master.ratio.value = 6;
+    master.connect(AC.destination);
+    droneFilter = AC.createBiquadFilter();
+    droneFilter.type = 'lowpass'; droneFilter.frequency.value = 260; droneFilter.Q.value = 0.4;
+    droneGain = AC.createGain(); droneGain.gain.value = 0;
+    droneFilter.connect(droneGain); droneGain.connect(master);
+    var o1 = AC.createOscillator(); o1.type = 'sine'; o1.frequency.value = 52;
+    var g1 = AC.createGain(); g1.gain.value = 0.6;
+    var o2 = AC.createOscillator(); o2.type = 'sine'; o2.frequency.value = 52 * 1.007;
+    var g2 = AC.createGain(); g2.gain.value = 0.35;
+    var o3 = AC.createOscillator(); o3.type = 'triangle'; o3.frequency.value = 104.5;
+    var g3 = AC.createGain(); g3.gain.value = 0.10;
+    o1.connect(g1); g1.connect(droneFilter);
+    o2.connect(g2); g2.connect(droneFilter);
+    o3.connect(g3); g3.connect(droneFilter);
+    o1.start(); o2.start(); o3.start();
+  } catch (e) { AC = null; }
+}
+function audioUpdate() {
+  if (!AC || !droneGain) return;
+  try {
+    if (AC.state === 'suspended' && AC.resume) AC.resume();
+    var t = AC.currentTime;
+    // The drone's low-band gain is the center brightness: one shared value.
+    droneGain.gain.setTargetAtTime(0.03 + 0.15 * lastCenterBrightness, t, 0.12);
+    droneFilter.frequency.setTargetAtTime(170 + 300 * lastCenterBrightness, t, 0.12);
+  } catch (e) {}
+}
+function audioPing() {
+  if (!AC) return;
+  try {
+    var t0 = AC.currentTime;
+    var o = AC.createOscillator(); o.type = 'sine'; o.frequency.value = 1480;
+    var g = AC.createGain();
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(0.09, t0 + 0.012);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.5);
+    o.connect(g); g.connect(master);
+    o.start(t0); o.stop(t0 + 0.55);
+  } catch (e) {}
+}
+
+// ---------- interaction ----------
+var pDown = false, dragging = false;
+var downT = 0, downX = 0, downY = 0, lastMX = 0, lastMY = 0, lastMT = 0, lastAnchorT = -1;
+
+function ptrPos(e) {
+  var x = 0, y = 0;
+  if (typeof e.clientX === 'number') { x = e.clientX / (VW || 1); y = e.clientY / (VH || 1); }
+  return [x, y];
+}
+function startDrag(t, x, y) {
+  dragging = true;
+  trackPush(trackX, t, x, 0.12);
+  trackPush(trackY, t, y, 0.12);
+  trackPush(trackLen, t, 0.30, 0.20);
+  lastAnchorT = t;
+}
+function onDown(e) {
+  audioInit();
+  var t = nowSec();
+  var p = ptrPos(e);
+  pDown = true; dragging = false;
+  downT = t; downX = p[0]; downY = p[1];
+  lastMX = p[0]; lastMY = p[1]; lastMT = t;
+}
+function onMove(e) {
+  if (!pDown) return;
+  var t = nowSec();
+  var p = ptrPos(e);
+  var dist = Math.hypot(p[0] - downX, (p[1] - downY) * (VW / (VH || 1)));
+  if (!dragging && dist > 0.006) startDrag(t, p[0], p[1]);
+  if (dragging && t - lastAnchorT >= 0.05) {
+    var dt = Math.max(t - lastMT, 0.001);
+    var sp = Math.hypot(p[0] - lastMX, (p[1] - lastMY) * (VW / (VH || 1))) / dt; // widths per second
+    var lenTarget = 0.30 + 0.90 * Math.min(sp / 1.6, 1);
+    trackPush(trackX, t, p[0], 0.07);
+    trackPush(trackY, t, p[1], 0.07);
+    trackPush(trackLen, t, lenTarget, 0.16);
+    lastAnchorT = t;
+  }
+  lastMX = p[0]; lastMY = p[1]; lastMT = t;
+}
+function onUp(e) {
+  if (!pDown) return;
+  var t = nowSec();
+  pDown = false;
+  if (dragging) {
+    dragging = false;
+    // release: drift back to center over about 3 s, length back to neutral
+    trackPush(trackX, t, 0.5, 1.0);
+    trackPush(trackY, t, 0.5, 1.0);
+    trackPush(trackLen, t, 1.0, 0.9);
+  } else if (t - downT < 0.35) {
+    // tap (short, still): strike, deferred briefly so a double-tap can
+    // convert it into a variant switch instead
+    if (t - lastTapT < 0.38) {
+      toggles.push(t);
+      lastTapT = -10;
+      pendingStrike = null;
+    } else {
+      lastTapT = t;
+      pendingStrike = { fireAt: t + 0.30, at: t + 0.30 };
+    }
+  }
+}
+try {
+  window.addEventListener('pointerdown', onDown);
+  window.addEventListener('pointermove', onMove);
+  window.addEventListener('pointerup', onUp);
+  window.addEventListener('pointercancel', onUp);
+} catch (e) {}
+function onResize() { resize(); draw(nowSec()); }
+try {
+  window.addEventListener('resize', onResize);
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', onResize);
+  }
+} catch (e) {}
+
+// ---------- main loop ----------
+function tick() {
+  var t = nowSec();
+  // a held, motionless press becomes a slow drag (speed zero: contraction)
+  if (pDown && !dragging && t - downT > 0.15) startDrag(t, downX, downY);
+  if (pendingStrike && t >= pendingStrike.fireAt) {
+    strikes.push(pendingStrike.at);
+    pendingStrike = null;
+    audioPing();
+  }
+  trackPrune(trackX, t); trackPrune(trackY, t); trackPrune(trackLen, t);
+  draw(t);
+  audioUpdate();
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(tick);
+}
+resize();
+draw(0);
+if (typeof requestAnimationFrame === 'function') requestAnimationFrame(tick);
+</script>
+</body>
+</html>

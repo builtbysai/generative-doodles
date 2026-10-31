@@ -1,0 +1,638 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Slipstream</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #061214; overflow: hidden; height: 100%; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- palette (strict) ----------
+  var COL = {
+    bg: '#061214',            // ground, blue-black
+    teal: [46, 230, 168],     // #2EE6A8
+    green: [138, 255, 176],   // #8AFFB0
+    violet: [122, 92, 255],   // #7A5CFF
+    smoke: [26, 42, 48],      // #1A2A30
+    hot: [232, 255, 248]      // #E8FFF8
+  };
+
+  // ---------- seeded RNG ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function clamp01(v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function mixc(c1, c2, u) {
+    return [c1[0] + (c2[0] - c1[0]) * u,
+            c1[1] + (c2[1] - c1[1]) * u,
+            c1[2] + (c2[2] - c1[2]) * u];
+  }
+  function css(c) {
+    return 'rgb(' + Math.round(c[0]) + ',' + Math.round(c[1]) + ',' + Math.round(c[2]) + ')';
+  }
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 720, H = 720, DPR = 1, PHONE = false;
+
+  function viewSize() {
+    var w = 0, h = 0;
+    if (typeof window !== 'undefined') {
+      if (window.visualViewport && window.visualViewport.width) {
+        w = window.visualViewport.width; h = window.visualViewport.height;
+      } else if (window.innerWidth) { w = window.innerWidth; h = window.innerHeight; }
+    }
+    if (!w) { w = 720; h = 720; }
+    return { w: w, h: h };
+  }
+  function resize() {
+    var s = viewSize();
+    W = s.w; H = s.h;
+    DPR = (typeof window !== 'undefined' && window.devicePixelRatio) ? window.devicePixelRatio : 1;
+    if (DPR > 2) DPR = 2;
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    if (typeof window !== 'undefined' && window.screen && window.screen.width) {
+      PHONE = Math.min(window.screen.width, window.screen.height) < 700;
+    } else {
+      PHONE = H > W * 1.15;
+    }
+    buildSky();
+  }
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', resize);
+    }
+    if (window.addEventListener) window.addEventListener('resize', resize);
+  }
+
+  // ---------- analytic curl field (summed sines, divergence-free) ----------
+  // Stream function psi(x,y) = sum A_m sin(2pi(a_m x + p_m)) sin(2pi(b_m y + q_m)).
+  // Velocity is the curl: v = (dpsi/dy, -dpsi/dx). One global field, seeded once.
+  var TERMS = [];
+  (function buildField() {
+    var rng = mulberry32(890771);
+    var ab = [[1, 1], [2, 1], [1, 2]];
+    var amps = [1.0, 0.55, 0.38];
+    for (var i = 0; i < 3; i++) {
+      TERMS.push({ A: amps[i], a: ab[i][0], b: ab[i][1], p: rng(), q: rng() });
+    }
+  })();
+  function psi(x, y) {
+    var s = 0;
+    for (var i = 0; i < TERMS.length; i++) {
+      var T = TERMS[i];
+      s += T.A * Math.sin(2 * Math.PI * (T.a * x + T.p)) * Math.sin(2 * Math.PI * (T.b * y + T.q));
+    }
+    return s;
+  }
+  function fieldVel(x, y, out) {
+    var vx = 0, vy = 0;
+    for (var i = 0; i < TERMS.length; i++) {
+      var T = TERMS[i];
+      var sx = Math.sin(2 * Math.PI * (T.a * x + T.p));
+      var cx = Math.cos(2 * Math.PI * (T.a * x + T.p));
+      var sy = Math.sin(2 * Math.PI * (T.b * y + T.q));
+      var cy = Math.cos(2 * Math.PI * (T.b * y + T.q));
+      vx += T.A * sx * cy * 2 * Math.PI * T.b;   // dpsi/dy
+      vy -= T.A * cx * sy * 2 * Math.PI * T.a;   // -dpsi/dx
+    }
+    out[0] = vx; out[1] = vy;
+  }
+  // Extrema of psi on a coarse grid: streamline seeds live near them, because
+  // level sets around an extremum are closed loops.
+  function findExtrema() {
+    var G = 40, list = [], i, j, x, y, v;
+    var grid = [];
+    for (j = 0; j <= G; j++) {
+      grid.push([]);
+      for (i = 0; i <= G; i++) grid[j].push(psi(i / G, j / G));
+    }
+    for (j = 1; j < G; j++) {
+      for (i = 1; i < G; i++) {
+        v = grid[j][i];
+        var isMax = v > grid[j][i - 1] && v > grid[j][i + 1] && v > grid[j - 1][i] && v > grid[j + 1][i];
+        var isMin = v < grid[j][i - 1] && v < grid[j][i + 1] && v < grid[j - 1][i] && v < grid[j + 1][i];
+        if (isMax || isMin) list.push({ x: i / G, y: j / G, v: Math.abs(v) });
+      }
+    }
+    list.sort(function (p, q) { return q.v - p.v; });
+    var picked = [];
+    for (i = 0; i < list.length; i++) {
+      var ok = true;
+      for (j = 0; j < picked.length; j++) {
+        var dx = list[i].x - picked[j].x, dy = list[i].y - picked[j].y;
+        if (dx * dx + dy * dy < 0.09) { ok = false; break; }
+      }
+      if (ok) picked.push(list[i]);
+    }
+    return picked;
+  }
+
+  // ---------- streamline tables (built once at init, deterministic) ----------
+  // Integrate the level set through a seed point with fixed arc-length steps.
+  // If the curve returns near its start it is a closed loop; the final stretch
+  // is blended onto the start point so the table wraps seamlessly. If the
+  // integration stalls or escapes, fall back to a seeded Fourier oval.
+  var DS = 0.0035;
+  function integrateLoop(cx, cy, r, th, rng) {
+    var sx = cx + r * Math.cos(th), sy = cy + r * Math.sin(th);
+    var px = sx, py = sy, pts = [sx, sy], v = [0, 0], i, d;
+    var closed = false;
+    for (i = 0; i < 2600; i++) {
+      fieldVel(px, py, v);
+      var n = Math.sqrt(v[0] * v[0] + v[1] * v[1]);
+      if (n < 1e-7) break;
+      px += (v[0] / n) * DS; py += (v[1] / n) * DS;
+      if (px < -0.45 || px > 1.45 || py < -0.45 || py > 1.45) break;
+      pts.push(px, py);
+      if (i > 220) {
+        d = Math.sqrt((px - sx) * (px - sx) + (py - sy) * (py - sy));
+        if (d < DS * 1.7) { closed = true; break; }
+      }
+    }
+    var count = pts.length / 2;
+    if (count >= 120) {
+      var ex = pts[pts.length - 2], ey = pts[pts.length - 1];
+      d = Math.sqrt((ex - sx) * (ex - sx) + (ey - sy) * (ey - sy));
+      if (closed || d < 0.12) {
+        // blend the last stretch onto the start point for a seamless wrap
+        var K = Math.min(90, Math.floor(count / 4)), k, u, f;
+        for (k = 0; k < K; k++) {
+          u = (k + 1) / K; f = u * u * (3 - 2 * u);
+          var idx = (count - K + k) * 2;
+          pts[idx] = pts[idx] + (sx - pts[idx]) * f;
+          pts[idx + 1] = pts[idx + 1] + (sy - pts[idx + 1]) * f;
+        }
+        return pts;
+      }
+    }
+    // fallback: closed Fourier oval around the seed center
+    var out = [], M = 200, ph1 = rng() * Math.PI * 2, ph2 = rng() * Math.PI * 2;
+    var rot = rng() * Math.PI, cr = Math.cos(rot), sr = Math.sin(rot);
+    for (i = 0; i < M; i++) {
+      var a = (i / M) * Math.PI * 2;
+      var rad = r * (1 + 0.28 * Math.sin(2 * a + ph1) + 0.16 * Math.sin(3 * a + ph2));
+      var ox = Math.cos(a) * rad * 1.35, oy = Math.sin(a) * rad * 0.82;
+      out.push(cx + ox * cr - oy * sr, cy + ox * sr + oy * cr);
+    }
+    return out;
+  }
+
+  // ---------- filaments and smoke ----------
+  var POINTS = 24;
+  var filaments = [], puffs = [];
+  function rampColor(u, f) {
+    var uu = f.rev ? 1 - u : u;
+    uu = clamp01(uu * 0.94 + f.rampOff);
+    if (uu < 0.5) return mixc(COL.teal, COL.green, uu * 2);
+    return mixc(COL.green, COL.violet, (uu - 0.5) * 2);
+  }
+  function buildSky() {
+    var rng = mulberry32(890051);
+    var NF = PHONE ? 34 : 48;
+    var extrema = findExtrema();
+    filaments = [];
+    var made = 0, guard = 0;
+    while (made < NF && guard < NF * 6) {
+      guard++;
+      var ex = null;
+      if (extrema.length) {
+        ex = extrema[made % extrema.length];
+        if (ex.y > 0.60 && rng() < 0.85) continue; // bias the sky upward
+      }
+      var cx = ex ? ex.x + (rng() - 0.5) * 0.07 : 0.15 + rng() * 0.7;
+      var cy = ex ? ex.y + (rng() - 0.5) * 0.07 : 0.10 + rng() * 0.5;
+      var r = 0.09 + rng() * 0.19;
+      var th = rng() * Math.PI * 2;
+      var tab = integrateLoop(cx, cy, r, th, rng);
+      // true loop length, so the chain window is an arc, not a whole oval
+      var loopLen = 0;
+      for (var li = 0; li < tab.length / 2; li++) {
+        var lj = (li + 1) % (tab.length / 2);
+        var ldx = tab[lj * 2] - tab[li * 2], ldy = tab[lj * 2 + 1] - tab[li * 2 + 1];
+        loopLen += Math.sqrt(ldx * ldx + ldy * ldy);
+      }
+      var arc = 0.38 + rng() * 0.40;
+      var f = {
+        tab: tab, n: tab.length / 2,
+        cx: cx, cy: cy,
+        off0: rng() * 1000,
+        win: clamp(arc / Math.max(0.2, loopLen), 0.09, 0.36),
+        period: 650 + rng() * 900,             // seconds per full lap: glacial
+        alpha: 0.42 + rng() * 0.45,
+        lumT: 80 + rng() * 150, lumPh: rng() * Math.PI * 2,
+        wMul: 0.8 + rng() * 0.55,
+        rev: rng() < 0.25, rampOff: rng() * 0.07,
+        rotPh: rng() * Math.PI * 2, shimPh: rng() * Math.PI * 2,
+        driftPh1: rng() * Math.PI * 2, driftPh2: rng() * Math.PI * 2,
+        knot: null
+      };
+      filaments.push(f);
+      made++;
+    }
+    // hot knots: a few filaments carry one bright knot; the hero knot peaks at t=0
+    var knotCount = PHONE ? 4 : 6;
+    for (var k = 0; k < knotCount && k < filaments.length; k++) {
+      var fi = Math.floor((k + 0.5) * filaments.length / knotCount);
+      filaments[fi].knot = {
+        u: 0.25 + rng() * 0.5,
+        T: 26 + rng() * 30,
+        ph: (k === 0) ? Math.PI / 2 : rng() * Math.PI * 2
+      };
+    }
+    puffs = [];
+    var NP = 8;
+    for (var i = 0; i < NP; i++) {
+      puffs.push({
+        cx: rng() * 1.1 - 0.05, cy: 0.58 + rng() * 0.36,
+        rx: 0.24 + rng() * 0.30, ry: 0.05 + rng() * 0.075,
+        a: 0.10 + rng() * 0.13, ph: rng() * Math.PI * 2,
+        drift: 0.012 + rng() * 0.02
+      });
+    }
+  }
+
+  // ---------- motion clock: double-tap calm freezes it ----------
+  var calms = []; // {start} in real seconds; each freezes motion for 4 s
+  function motionTime(t) {
+    var frozen = 0;
+    for (var i = 0; i < calms.length; i++) {
+      var s = calms[i].start;
+      if (t <= s) break;
+      frozen += Math.min(t, s + 4) - s;
+    }
+    return t - frozen;
+  }
+
+  // ---------- recorded interaction ----------
+  var impulses = []; // wind: {x,y,vx,vy,te,str,rad,tau}
+  var strikes = [];  // taps: {x,y,te}
+  var pendingTap = null; // {x,y,realT}
+  var windLevel = 0;
+
+  function computeWindLevel(te) {
+    var s = 0;
+    for (var i = 0; i < impulses.length; i++) {
+      var age = te - impulses[i].te;
+      if (age > 0) s += impulses[i].str * Math.exp(-age / impulses[i].tau);
+    }
+    return clamp01(s / 2.6);
+  }
+
+  // offset of one point from the recorded wind field, in domain units
+  function windOffset(px, py, te, out) {
+    var ox = 0, oy = 0;
+    for (var i = 0; i < impulses.length; i++) {
+      var im = impulses[i];
+      var age = te - im.te;
+      if (age < 0 || age > 13) continue;
+      var infl = im.str * Math.exp(-age / im.tau);
+      if (infl < 0.004) continue;
+      var dx = px - im.x, dy = py - im.y;
+      var d2 = dx * dx + dy * dy;
+      var fall = Math.exp(-d2 / (im.rad * im.rad));
+      if (fall < 0.01) continue;
+      var d = Math.sqrt(d2) || 1e-5;
+      var push = infl * fall * 0.055;
+      ox += (dx / d) * push + im.vx * infl * fall * 0.020;
+      oy += (dy / d) * push + im.vy * infl * fall * 0.020;
+    }
+    var m = Math.sqrt(ox * ox + oy * oy);
+    if (m > 0.09) { ox = ox / m * 0.09; oy = oy / m * 0.09; }
+    out[0] = ox; out[1] = oy;
+  }
+  // luminosity ripple from recorded strikes, at one point
+  function strikeBoost(px, py, te) {
+    var b = 0;
+    for (var i = 0; i < strikes.length; i++) {
+      var age = te - strikes[i].te;
+      if (age < 0 || age > 4) continue;
+      var dx = px - strikes[i].x, dy = py - strikes[i].y;
+      var d = Math.sqrt(dx * dx + dy * dy);
+      var ring = (d - 0.55 * age) / 0.10;
+      b += Math.exp(-ring * ring) * Math.exp(-age / 1.8) * 1.15;
+    }
+    return b;
+  }
+
+  // ---------- filament point evaluation (closed form) ----------
+  var _off = [0, 0];
+  // base point on the streamline table at absolute table position s.
+  // Wind offsets are applied by the caller (they vary slowly, so the draw
+  // loop interpolates them between anchors while the base curve is sampled
+  // finely, which keeps the ribbons smooth).
+  function tablePoint(f, s, te, out) {
+    var sf = Math.floor(s), fr = s - sf;
+    var i0 = ((sf % f.n) + f.n) % f.n, i1 = (i0 + 1) % f.n;
+    var x0 = f.tab[i0 * 2], y0 = f.tab[i0 * 2 + 1];
+    var x1 = f.tab[i1 * 2], y1 = f.tab[i1 * 2 + 1];
+    var x = x0 + (x1 - x0) * fr, y = y0 + (y1 - y0) * fr;
+    // tiny perpendicular shimmer from the table tangent
+    var tx = x1 - x0, ty = y1 - y0, tl = Math.sqrt(tx * tx + ty * ty) || 1e-5;
+    var sh = 0.0016 * Math.sin(te * 0.13 + s * 0.10 + f.shimPh);
+    x += (-ty / tl) * sh; y += (tx / tl) * sh;
+    // very slow whole-loop morph: whisper rotation and drift around the seed
+    var ang = 0.030 * Math.sin(te * 0.013 + f.rotPh);
+    var ca = Math.cos(ang), sa = Math.sin(ang);
+    var rx = x - f.cx, ry = y - f.cy;
+    out[0] = f.cx + rx * ca - ry * sa + 0.012 * Math.sin(te * 0.007 + f.driftPh1);
+    out[1] = f.cy + rx * sa + ry * ca + 0.010 * Math.cos(te * 0.009 + f.driftPh2);
+  }
+
+  // ---------- drawing ----------
+  var _pa = [0, 0], _pb = [0, 0];
+  var SUB = 3; // sub-samples per anchor span: the ribbons draw silky, not faceted
+  function drawSmoke(te) {
+    ctx.fillStyle = css(COL.smoke);
+    for (var i = 0; i < puffs.length; i++) {
+      var p = puffs[i];
+      var cx = (p.cx + p.drift * Math.sin(te * 0.006 + p.ph)) * W;
+      var cy = (p.cy + 0.008 * Math.cos(te * 0.008 + p.ph * 1.7)) * H;
+      ctx.globalAlpha = p.a * 0.45;
+      ctx.beginPath(); ctx.ellipse(cx, cy, p.rx * W * 1.45, p.ry * H * 1.5, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = p.a * 0.8;
+      ctx.beginPath(); ctx.ellipse(cx, cy, p.rx * W, p.ry * H, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = p.a * 0.55;
+      ctx.beginPath(); ctx.ellipse(cx + p.rx * W * 0.18, cy - p.ry * H * 0.3, p.rx * W * 0.66, p.ry * H * 0.66, 0, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+  function drawFilaments(te) {
+    var i, j, q;
+    ctx.lineCap = 'butt'; ctx.lineJoin = 'round'; // butt caps: band joints must not double-paint
+    var SEG = (POINTS - 1) * SUB;
+    for (var pass = 0; pass < 2; pass++) {
+      for (i = 0; i < filaments.length; i++) {
+        var f = filaments[i];
+        var slide = f.off0 + te * f.n / f.period;
+        var winN = f.win * f.n;
+        // anchors: base position, wind offset, strike boost
+        var aox = [], aoy = [], ab = [];
+        for (j = 0; j < POINTS; j++) {
+          tablePoint(f, slide + (j / (POINTS - 1)) * winN, te, _pa);
+          windOffset(_pa[0], _pa[1], te, _off);
+          aox[j] = _off[0]; aoy[j] = _off[1];
+          ab[j] = strikeBoost(_pa[0] + _off[0], _pa[1] + _off[1], te);
+        }
+        var lum = 0.70 + 0.30 * Math.sin(te * 2 * Math.PI / f.lumT + f.lumPh);
+        var aF = f.alpha * lum * (1 + 0.25 * windLevel);
+        var wBase = (PHONE ? 1.8 : 1.7) * f.wMul;
+        ctx.lineWidth = (pass === 0) ? wBase * 3.1 : wBase;
+        // sample the whole chain once: positions and strike boosts
+        var xs = [], ys = [], bs = [];
+        for (q = 0; q <= SEG; q++) {
+          var u = q / SEG;
+          tablePoint(f, slide + u * winN, te, _pb);
+          var pos = u * (POINTS - 1);
+          var j0 = Math.min(POINTS - 2, Math.floor(pos)), fr = pos - j0;
+          xs[q] = (_pb[0] + aox[j0] + (aox[j0 + 1] - aox[j0]) * fr) * W;
+          ys[q] = (_pb[1] + aoy[j0] + (aoy[j0 + 1] - aoy[j0]) * fr) * H;
+          bs[q] = ab[j0] + (ab[j0 + 1] - ab[j0]) * fr;
+        }
+        // stroke as a few color bands (one polyline per band: no beaded joins)
+        var BANDS = 8;
+        for (var b = 0; b < BANDS; b++) {
+          var q0 = Math.floor(b * SEG / BANDS), q1 = Math.floor((b + 1) * SEG / BANDS);
+          var um = (b + 0.5) / BANDS;
+          var ef = 0.45 + 0.55 * Math.pow(Math.sin(Math.PI * clamp01(um)), 0.7);
+          var boost = 0, yMean = 0;
+          for (q = q0; q <= q1; q++) { boost += bs[q]; yMean += ys[q]; }
+          boost /= (q1 - q0 + 1);
+          yMean /= (q1 - q0 + 1) * H;
+          // ribbons belong to the upper sky: dips into the smoke zone dim out
+          var vfade = yMean <= 0.70 ? 1 : Math.max(0.45, 1 - 0.55 * (yMean - 0.70) / 0.32);
+          var uu = clamp01((f.rev ? 1 - um : um) * 0.94 + f.rampOff);
+          var vMix = clamp01((uu - 0.5) * 2); // violet reads dimmer: lift it
+          var a = aF * vfade * ef * (pass === 0 ? 0.15 : 0.92) * (1 + boost * 0.9) * (1 + 0.22 * vMix);
+          if (a < 0.004) continue;
+          var col = rampColor(um, f);
+          if (boost > 0.03) col = mixc(col, COL.hot, Math.min(0.65, boost * 0.55));
+          ctx.strokeStyle = css(col);
+          ctx.globalAlpha = Math.min(1, a);
+          ctx.beginPath();
+          ctx.moveTo(xs[q0], ys[q0]);
+          for (q = q0 + 1; q <= q1; q++) ctx.lineTo(xs[q], ys[q]);
+          ctx.stroke();
+        }
+      }
+    }
+    ctx.globalAlpha = 1;
+    // hot knots
+    for (i = 0; i < filaments.length; i++) {
+      var fk = filaments[i];
+      if (!fk.knot) continue;
+      var sK = fk.off0 + te * fk.n / fk.period + fk.knot.u * fk.win * fk.n;
+      tablePoint(fk, sK, te, _pa);
+      windOffset(_pa[0], _pa[1], te, _off);
+      var kx = (_pa[0] + _off[0]) * W;
+      var ky = (_pa[1] + _off[1]) * H;
+      var pulse = 0.5 + 0.5 * Math.sin(te * 2 * Math.PI / fk.knot.T + fk.knot.ph);
+      var kr = (1.6 + 2.4 * pulse) * (PHONE ? 1.15 : 1);
+      ctx.fillStyle = css(COL.hot);
+      ctx.globalAlpha = 0.16 + 0.30 * pulse;
+      ctx.beginPath(); ctx.arc(kx, ky, kr * 2.3, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = 0.30 + 0.70 * pulse * pulse;
+      ctx.beginPath(); ctx.arc(kx, ky, kr, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+  function drawStrikes(te) {
+    for (var i = 0; i < strikes.length; i++) {
+      var age = te - strikes[i].te;
+      if (age < 0 || age > 4) continue;
+      var x = strikes[i].x * W, y = strikes[i].y * H, S = Math.min(W, H);
+      var fade = Math.exp(-age / 1.6);
+      ctx.fillStyle = css(COL.hot);
+      ctx.globalAlpha = 0.34 * fade;
+      ctx.beginPath();
+      ctx.arc(x, y, (0.010 + 0.075 * (1 - Math.exp(-age * 1.4))) * S, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = css(COL.hot);
+      ctx.globalAlpha = 0.45 * fade;
+      ctx.lineWidth = 1.4;
+      ctx.beginPath();
+      ctx.arc(x, y, (0.02 + 0.55 * age) * S, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = COL.bg;
+    ctx.fillRect(0, 0, W, H);
+    var te = motionTime(t);
+    windLevel = computeWindLevel(te);
+    drawSmoke(te);
+    drawFilaments(te);
+    drawStrikes(te);
+  }
+
+  // ---------- clock ----------
+  var startTs = -1, lastT = 0;
+  function frame(ts) {
+    if (startTs < 0) startTs = ts;
+    lastT = (ts - startTs) / 1000;
+    if (pendingTap && lastT - pendingTap.realT > 0.34) {
+      strikes.push({ x: pendingTap.x, y: pendingTap.y, te: motionTime(pendingTap.realT + 0.34) });
+      if (strikes.length > 12) strikes.shift();
+      pendingTap = null;
+      ping();
+    }
+    draw(lastT);
+    audioTick();
+    if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(frame);
+  }
+
+  // ---------- audio: lazy, guarded; the pad is the weather ----------
+  var AC = null, aOn = false, aFilter = null, aPadGain = null;
+  function audioInit() {
+    if (aOn) return;
+    try {
+      var Ctor = (typeof AudioContext !== 'undefined') ? AudioContext :
+                 (typeof webkitAudioContext !== 'undefined' ? webkitAudioContext : null);
+      if (!Ctor) return;
+      AC = new Ctor();
+      var master = AC.createGain(); master.gain.value = 0.9;
+      var comp = AC.createDynamicsCompressor();
+      comp.threshold.value = -16; comp.ratio.value = 10; comp.knee.value = 8;
+      master.connect(comp); comp.connect(AC.destination);
+      aFilter = AC.createBiquadFilter(); aFilter.type = 'lowpass';
+      aFilter.frequency.value = 520; aFilter.Q.value = 0.4;
+      aPadGain = AC.createGain(); aPadGain.gain.value = 0.05;
+      aFilter.connect(aPadGain); aPadGain.connect(master);
+      var o1 = AC.createOscillator(); o1.type = 'sine'; o1.frequency.value = 110;
+      var o2 = AC.createOscillator(); o2.type = 'sine'; o2.frequency.value = 110 * 1.006;
+      var o3 = AC.createOscillator(); o3.type = 'sine'; o3.frequency.value = 55;
+      var g3 = AC.createGain(); g3.gain.value = 0.5;
+      o1.connect(aFilter); o2.connect(aFilter); o3.connect(g3); g3.connect(aFilter);
+      o1.start(); o2.start(); o3.start();
+      var len = AC.sampleRate * 2;
+      var buf = AC.createBuffer(1, len, AC.sampleRate);
+      var d = buf.getChannelData(0), r = mulberry32(51703), lp = 0;
+      for (var i = 0; i < len; i++) { var wn = r() * 2 - 1; lp += 0.04 * (wn - lp); d[i] = lp * 3.2; }
+      var noise = AC.createBufferSource(); noise.buffer = buf; noise.loop = true;
+      var ng = AC.createGain(); ng.gain.value = 0.5;
+      noise.connect(ng); ng.connect(aFilter);
+      noise.start();
+      AC._master = master;
+      aOn = true;
+    } catch (e) { AC = null; aOn = false; }
+  }
+  function ping() {
+    if (!aOn || !AC) return;
+    try {
+      var now = AC.currentTime;
+      var freqs = [1244, 1866], gains = [0.10, 0.045];
+      for (var i = 0; i < 2; i++) {
+        var o = AC.createOscillator(); o.type = 'sine'; o.frequency.value = freqs[i];
+        var g = AC.createGain();
+        g.gain.setValueAtTime(0.0001, now);
+        g.gain.exponentialRampToValueAtTime(gains[i], now + 0.012);
+        g.gain.exponentialRampToValueAtTime(0.0001, now + 1.15);
+        o.connect(g); g.connect(AC._master);
+        o.start(now); o.stop(now + 1.25);
+      }
+    } catch (e) { /* audio is an enhancement only */ }
+  }
+  function audioTick() {
+    if (!aOn || !AC) return;
+    try {
+      var now = AC.currentTime;
+      aFilter.frequency.setTargetAtTime(520 + 2500 * windLevel, now, 0.25);
+      aPadGain.gain.setTargetAtTime(0.05 + 0.022 * windLevel, now, 0.25);
+    } catch (e) { /* ignore */ }
+  }
+
+  // ---------- interaction: recorded events only ----------
+  var dragging = false, moved = false, downT = 0, downX = 0, downY = 0;
+  var lastMX = 0, lastMY = 0, lastMoveT = 0, lastImpulseT = -1;
+  var lastTapRealT = -10;
+
+  function evPos(e) {
+    var x = (e.clientX !== undefined) ? e.clientX : (e.touches && e.touches[0] ? e.touches[0].clientX : 0);
+    var y = (e.clientY !== undefined) ? e.clientY : (e.touches && e.touches[0] ? e.touches[0].clientY : 0);
+    return { x: x, y: y };
+  }
+  function onDown(e) {
+    audioInit();
+    if (AC && AC.resume) { try { AC.resume(); } catch (err) {} }
+    var p = evPos(e);
+    dragging = true; moved = false;
+    downT = lastT; downX = p.x; downY = p.y;
+    lastMX = p.x; lastMY = p.y; lastMoveT = lastT; lastImpulseT = -1;
+    if (e.preventDefault) e.preventDefault();
+  }
+  function onMove(e) {
+    if (!dragging) return;
+    var p = evPos(e);
+    if (Math.abs(p.x - downX) > 6 || Math.abs(p.y - downY) > 6) moved = true;
+    var dt = Math.max(0.001, lastT - lastMoveT);
+    var vx = (p.x - lastMX) / W / dt, vy = (p.y - lastMY) / H / dt;
+    var speed = Math.sqrt(vx * vx + vy * vy);
+    lastMX = p.x; lastMY = p.y; lastMoveT = lastT;
+    if (moved && lastT - lastImpulseT > 0.028) {
+      lastImpulseT = lastT;
+      var gust = speed > 0.85;
+      impulses.push({
+        x: p.x / W, y: p.y / H, vx: vx, vy: vy,
+        te: motionTime(lastT),
+        str: gust ? 1.6 : 0.8,
+        rad: gust ? 0.30 : 0.20,
+        tau: gust ? 4.6 : 3.2
+      });
+      if (impulses.length > 140) impulses.splice(0, impulses.length - 140);
+    }
+  }
+  function onUp(e) {
+    if (!dragging) return;
+    dragging = false;
+    var quick = (lastT - downT) < 0.35;
+    if (!moved && quick) {
+      var p = evPos(e);
+      var px = (p.x || downX) / W, py = (p.y || downY) / H;
+      if (pendingTap && lastT - lastTapRealT < 0.35) {
+        // double-tap: cancel the pending strike, hold the sky calm for 4 s
+        pendingTap = null;
+        calms.push({ start: lastT });
+        lastTapRealT = -10;
+      } else {
+        pendingTap = { x: px, y: py, realT: lastT };
+        lastTapRealT = lastT;
+      }
+    }
+  }
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('pointerdown', onDown);
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
+  }
+
+  // ---------- go ----------
+  resize();
+  draw(0); // frame one: synchronous, fixed phase, the field mid-drift
+  if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

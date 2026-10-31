@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>No Star Is Lost</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #EDE8E2; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // Palette (strict)
+  var GROUND = [237, 232, 226];   // #EDE8E2
+  var MAGENTA = [200, 30, 143];   // #C81E8F
+  var PURPLE = [106, 31, 160];    // #6A1FA0
+  var TEAL = [30, 158, 138];      // #1E9E8A
+  var SMOKE = [26, 26, 26];       // #1A1A1A
+  var EDGE = [245, 240, 234];     // #F5F0EA
+
+  function rgba(c, a) { return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a + ')'; }
+  function mix(c1, c2, k) {
+    return [Math.round(c1[0] + (c2[0] - c1[0]) * k),
+            Math.round(c1[1] + (c2[1] - c1[1]) * k),
+            Math.round(c1[2] + (c2[2] - c1[2]) * k)];
+  }
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function mulberry32(seed) {
+    var s = seed >>> 0;
+    return function () {
+      s = (s + 0x6D2B79F5) >>> 0;
+      var t = s;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // Viewport
+  var W = 720, H = 720, S = 720, isPhone = false;
+  function measure() {
+    var vv = (typeof window !== 'undefined' && window.visualViewport) ? window.visualViewport : null;
+    W = vv ? vv.width : (window.innerWidth || 720);
+    H = vv ? vv.height : (window.innerHeight || 720);
+    S = Math.min(W, H);
+    canvas.width = W;
+    canvas.height = H;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    var scr = window.screen || {};
+    var minScr = Math.min(scr.width || 9999, scr.height || 9999);
+    isPhone = (minScr < 700) || (H > W * 1.15 && S < 700);
+  }
+  measure();
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { measure(); draw(nowT()); });
+  }
+  window.addEventListener('resize', function () { measure(); draw(nowT()); });
+
+  // ---------- Bloom model ----------
+  // A seed owns a fixed particle set laid out on seeded, noise-curled petal
+  // paths. Growth g(seed,t) is closed-form: an analytic rise/decline curve
+  // plus decaying boosts from recorded feed events. Frame one is the main
+  // seed evaluated at age 48 s (a fixed analytic pre-growth segment).
+
+  var MAX_SEEDS = 5;
+  var seeds = [];
+  var feedEvents = [];   // {t, seed, amt, reach}
+  var pushEvents = [];   // {t, x, y, str} in px
+  var epoch = 0;
+  var washT = -10;
+
+  function makeParticles(rng, count, micro) {
+    var petals = micro ? 6 : 9;
+    var petalAngle = [], petalReach = [], petalCurl = [];
+    for (var p = 0; p < petals; p++) {
+      petalAngle.push((p / petals) * Math.PI * 2 + (rng() - 0.5) * 0.5);
+      petalReach.push(0.7 + rng() * 0.55);
+      petalCurl.push((rng() - 0.5) * 1.3);
+    }
+    var parts = [];
+    for (var i = 0; i < count; i++) {
+      var petal = Math.floor(rng() * petals);
+      var f = Math.pow(rng(), 0.72);                    // radial fraction along path
+      var jitter = (rng() + rng() - 1) * 0.34;
+      var roll = rng();
+      var col = roll < 0.15 ? TEAL : (roll < 0.47 ? PURPLE : MAGENTA);
+      if (petal % 3 === 2 && roll >= 0.15 && roll < 0.75) col = PURPLE;
+      parts.push({
+        petal: petal,
+        f: f,
+        jitter: jitter,
+        curl: petalCurl[petal] * (0.6 + rng() * 0.7),
+        reach: petalReach[petal] * (0.85 + rng() * 0.4),
+        size: 0.0075 + rng() * 0.02,
+        phase: rng() * Math.PI * 2,
+        phase2: rng() * Math.PI * 2,
+        col: col
+      });
+    }
+    return { parts: parts, petalAngle: petalAngle };
+  }
+
+  function makeSeed(fx, fy, birth, micro) {
+    var idx = seeds.length;
+    var rng = mulberry32(89253 + epoch * 131 + idx * 7919);
+    var count = micro ? 90 : (isPhone ? 300 : 400);
+    var data = makeParticles(rng, count, micro);
+    var fils = [];
+    var nFil = micro ? 6 : 18;
+    for (var j = 0; j < nFil; j++) {
+      fils.push({
+        off: (rng() * 2 - 1),
+        speed: 0.014 + rng() * 0.02,
+        cyc: rng(),
+        wig: 1 + rng() * 2.2,
+        wph: rng() * Math.PI * 2,
+        drift: (rng() - 0.5) * 0.3
+      });
+    }
+    return { fx: fx, fy: fy, birth: birth, micro: micro, parts: data.parts, petalAngle: data.petalAngle, fils: fils };
+  }
+
+  function reset(t, birthOverride) {
+    seeds = [makeSeed(0.5, 0.52, (birthOverride !== undefined ? birthOverride : t), false)];
+    feedEvents = [];
+    pushEvents = [];
+  }
+  reset(0, -48); // main seed pre-grown: age 48 s at t=0 gives g = 0.54
+
+  function feedTotals(seedIdx, t) {
+    var amt = 0, boost = 0, reach = 0;
+    for (var i = 0; i < feedEvents.length; i++) {
+      var e = feedEvents[i];
+      if (e.seed !== seedIdx || e.t > t) continue;
+      amt += e.amt;
+      boost += e.amt * Math.exp(-(t - e.t) / 100);
+      reach += e.reach * Math.exp(-(t - e.t) / 45);
+    }
+    return { amt: amt, boost: boost, reach: reach };
+  }
+
+  function growthOf(seed, idx, t) {
+    var u = t - seed.birth;
+    if (u <= 0) return { g: 0, sp: 0, reachMul: 1 };
+    var ft = feedTotals(idx, t);
+    var rise = 0.92 * (1 - Math.exp(-u / 55));
+    var declineStart = 170 + 160 * Math.min(ft.amt, 1.2);
+    var decline = u > declineStart ? Math.exp(-(u - declineStart) / 150) : 1;
+    var g = clamp(rise * decline + ft.boost, 0, 1);
+    var sp = 0;
+    if (u > declineStart) {
+      sp = clamp((u - declineStart) / 110, 0, 1) * (1 - clamp(ft.boost * 1.4, 0, 0.75));
+    }
+    return { g: g, sp: sp, reachMul: clamp(1 + ft.reach, 1, 1.9) };
+  }
+
+  function stateWord(t) {
+    var st = growthOf(seeds[0], 0, t);
+    if (st.sp >= 0.5) return 'SPENT';
+    if (st.g < 0.25) return 'SEED';
+    return 'BLOOM';
+  }
+
+  // ---------- Audio (lazy, gesture-gated, guarded) ----------
+  var AC = null, audioNodes = null, audioLast = 0;
+  function ensureAudio() {
+    if (AC || typeof window === 'undefined') return;
+    var Ctor = window.AudioContext || window.webkitAudioContext;
+    if (typeof Ctor !== 'function') return;
+    try {
+      AC = new Ctor();
+      var len = AC.sampleRate * 2;
+      var buf = AC.createBuffer(1, len, AC.sampleRate);
+      var d = buf.getChannelData(0);
+      var r = mulberry32(4242);
+      for (var i = 0; i < len; i++) d[i] = r() * 2 - 1;
+      var src = AC.createBufferSource();
+      src.buffer = buf; src.loop = true;
+      var lp = AC.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 480; lp.Q.value = 0.4;
+      var washGain = AC.createGain(); washGain.gain.value = 0;
+      src.connect(lp); lp.connect(washGain); washGain.connect(AC.destination);
+      src.start();
+      var o1 = AC.createOscillator(); o1.type = 'sine'; o1.frequency.value = 110;
+      var o2 = AC.createOscillator(); o2.type = 'sine'; o2.frequency.value = 164.81;
+      var toneGain = AC.createGain(); toneGain.gain.value = 0;
+      o1.connect(toneGain); o2.connect(toneGain); toneGain.connect(AC.destination);
+      o1.start(); o2.start();
+      audioNodes = { wash: washGain, tone: toneGain, lp: lp };
+    } catch (e) { AC = null; audioNodes = null; }
+  }
+  function updateAudio(t) {
+    if (!AC || !audioNodes) return;
+    if (t - audioLast < 0.15) return;
+    audioLast = t;
+    var st = growthOf(seeds[0], 0, t);
+    var life = st.g * (1 - st.sp * 0.85);
+    try {
+      audioNodes.wash.gain.setTargetAtTime(0.012 + 0.085 * life, AC.currentTime, 0.25);
+      audioNodes.tone.gain.setTargetAtTime(0.028 * life * life, AC.currentTime, 0.25);
+      audioNodes.lp.frequency.setTargetAtTime(320 + 700 * life, AC.currentTime, 0.25);
+    } catch (e) {}
+  }
+
+  // ---------- Interaction ----------
+  var startPerf = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+  function nowT() {
+    if (typeof performance !== 'undefined' && performance.now) {
+      return (performance.now() - startPerf) / 1000;
+    }
+    return 0;
+  }
+
+  var dragging = false, downT = 0, downX = 0, downY = 0, lastX = 0, lastY = 0, lastMoveT = 0, travelAcc = 0, moved = 0;
+  var pendingTap = null;       // {x, y, commitT}
+  var lastTapT = -10, lastTapX = 0, lastTapY = 0;
+
+  function nearestSeed(x, y) {
+    var best = 0, bestD = Infinity;
+    for (var i = 0; i < seeds.length; i++) {
+      var dx = seeds[i].fx * W - x, dy = seeds[i].fy * H - y;
+      var d = dx * dx + dy * dy;
+      if (d < bestD) { bestD = d; best = i; }
+    }
+    return best;
+  }
+
+  function doWash(t) {
+    epoch++;
+    reset(t);
+    washT = t;
+    pendingTap = null;
+  }
+
+  function pointerPos(e) {
+    if (e.touches && e.touches.length) return { x: e.touches[0].clientX, y: e.touches[0].clientY };
+    return { x: e.clientX, y: e.clientY };
+  }
+
+  function onDown(e) {
+    ensureAudio();
+    if (AC && AC.state === 'suspended' && AC.resume) { try { AC.resume(); } catch (err) {} }
+    var p = pointerPos(e);
+    var t = nowT();
+    dragging = true; moved = 0; travelAcc = 0;
+    downT = t; downX = p.x; downY = p.y; lastX = p.x; lastY = p.y; lastMoveT = t;
+    if (e.preventDefault) e.preventDefault();
+  }
+
+  function onMove(e) {
+    if (!dragging) return;
+    var p = pointerPos(e);
+    var t = nowT();
+    var dx = p.x - lastX, dy = p.y - lastY;
+    var dist = Math.sqrt(dx * dx + dy * dy);
+    var dt = Math.max(t - lastMoveT, 0.001);
+    moved += dist;
+    travelAcc += dist;
+    if (travelAcc > 26 && dist > 0) {
+      var speed = dist / dt; // px per second
+      var si = nearestSeed(p.x, p.y);
+      feedEvents.push({
+        t: t, seed: si, amt: 0.035,
+        reach: clamp(speed / (1.2 * S), 0.08, 0.55)
+      });
+      pushEvents.push({ t: t, x: p.x, y: p.y, str: clamp(0.4 + speed / (2 * S), 0.4, 1.3) });
+      if (pushEvents.length > 40) pushEvents.shift();
+      if (feedEvents.length > 400) feedEvents.shift();
+      travelAcc = 0;
+    }
+    lastX = p.x; lastY = p.y; lastMoveT = t;
+    if (e.preventDefault) e.preventDefault();
+  }
+
+  function onUp(e) {
+    if (!dragging) return;
+    dragging = false;
+    var t = nowT();
+    var quick = (t - downT) < 0.3 && moved < 12;
+    if (!quick) return;
+    var dx = downX - lastTapX, dy = downY - lastTapY;
+    if ((t - lastTapT) < 0.35 && Math.sqrt(dx * dx + dy * dy) < 40) {
+      lastTapT = -10;
+      doWash(t);
+      return;
+    }
+    lastTapT = t; lastTapX = downX; lastTapY = downY;
+    pendingTap = { x: downX, y: downY, commitT: t + 0.33 };
+  }
+
+  canvas.addEventListener('pointerdown', onDown);
+  canvas.addEventListener('pointermove', onMove);
+  canvas.addEventListener('pointerup', onUp);
+  canvas.addEventListener('pointercancel', function () { dragging = false; });
+  canvas.addEventListener('touchstart', onDown, { passive: false });
+  canvas.addEventListener('touchmove', onMove, { passive: false });
+  canvas.addEventListener('touchend', onUp);
+
+  function commitPendingTap(t) {
+    if (pendingTap && t >= pendingTap.commitT) {
+      if (seeds.length < MAX_SEEDS) {
+        seeds.push(makeSeed(clamp(pendingTap.x / W, 0.05, 0.95), clamp(pendingTap.y / H, 0.05, 0.95), t, true));
+      }
+      pendingTap = null;
+    }
+  }
+
+  // ---------- Draw ----------
+  function disc(x, y, r, col, a) {
+    if (r <= 0 || a <= 0.003) return;
+    ctx.globalAlpha = a;
+    ctx.fillStyle = rgba(col, 1);
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  function drawBloom(seed, idx, t) {
+    var st = growthOf(seed, idx, t);
+    if (st.g <= 0.01) return st;
+    var cx = seed.fx * W, cy = seed.fy * H;
+    var maxReach = (seed.micro ? 0.13 : 0.3) * S;
+    var desat = st.sp * 0.78;
+    var fade = 1 - st.sp * 0.45;
+    var i, p, act, ang, rad, x, y, k;
+
+    // feather rims first (bloom edge tone at low alpha)
+    for (i = 0; i < seed.parts.length; i++) {
+      p = seed.parts[i];
+      act = clamp((st.g - p.f * 0.78) / 0.22, 0, 1);
+      if (act <= 0) continue;
+      ang = seed.petalAngle[p.petal] + p.jitter + p.curl * p.f + 0.04 * Math.sin(t * 0.11 + p.phase) * p.f;
+      rad = maxReach * p.reach * p.f * (0.5 + 0.5 * act) * st.reachMul;
+      rad *= 1 + 0.045 * Math.sin(t * 0.07 + p.phase2);
+      x = cx + Math.cos(ang) * rad;
+      y = cy + Math.sin(ang) * rad * 0.94;
+      for (k = 0; k < pushEvents.length; k++) {
+        var pe = pushEvents[k];
+        var age = t - pe.t;
+        if (age < 0 || age > 1.4) continue;
+        var pdx = x - pe.x, pdy = y - pe.y;
+        var pd = Math.sqrt(pdx * pdx + pdy * pdy) + 0.001;
+        var fall = Math.exp(-pd / (0.16 * S)) * Math.exp(-age / 0.5) * pe.str * 0.028 * S;
+        x += (pdx / pd) * fall;
+        y += (pdy / pd) * fall;
+      }
+      p._x = x; p._y = y; p._act = act;
+      disc(x, y, p.size * S * 1.55, EDGE, 0.16 * act * fade);
+    }
+    // ink bodies: layered flat discs
+    for (i = 0; i < seed.parts.length; i++) {
+      p = seed.parts[i];
+      if (!p._act) continue;
+      var col = desat > 0 ? mix(p.col, GROUND, desat) : p.col;
+      var r = p.size * S * (0.55 + 0.65 * p.f);
+      disc(p._x, p._y, r, col, 0.10 * p._act * fade);
+      disc(p._x, p._y, r * 0.68, col, 0.15 * p._act * fade);
+      disc(p._x, p._y, r * 0.42, col, 0.2 * p._act * fade);
+      p._act = 0;
+    }
+    // black smoke filaments threading upward
+    var bloomR = maxReach * st.reachMul;
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = rgba(SMOKE, 1);
+    ctx.lineCap = 'round';
+    for (var j = 0; j < seed.fils.length; j++) {
+      var fl = seed.fils[j];
+      var cyc = (t * fl.speed + fl.cyc) % 1;
+      var fx = cx + fl.off * bloomR * 0.45 + Math.sin(t * 0.05 + fl.wph) * 0.01 * S;
+      var yTop = cy + bloomR * 0.5 - cyc * bloomR * 1.05;
+      var segLen = 0.011 * S;
+      var aFil = 0.26 * (1 - cyc * 0.4) * clamp(st.g * 2.2, 0, 1) * fade;
+      if (aFil <= 0.01) continue;
+      ctx.globalAlpha = aFil;
+      ctx.lineWidth = Math.max(1, 0.0022 * S);
+      ctx.beginPath();
+      for (var sgm = 0; sgm <= 5; sgm++) {
+        var yy = yTop + sgm * segLen;
+        var xx = fx + Math.sin(yy * 0.02 + fl.wph + t * 0.1) * fl.wig * 0.004 * S + fl.drift * sgm * 0.004 * S;
+        if (sgm === 0) ctx.moveTo(xx, yy); else ctx.lineTo(xx, yy);
+      }
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+    return st;
+  }
+
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = rgba(GROUND, 1);
+    ctx.fillRect(0, 0, W, H);
+
+    commitPendingTap(t);
+    for (var i = 0; i < seeds.length; i++) drawBloom(seeds[i], i, t);
+
+    // spent wash: pale flood that rises as the main creature fades
+    var main = growthOf(seeds[0], 0, t);
+    if (main.sp > 0.03) {
+      ctx.globalAlpha = main.sp * 0.3;
+      ctx.fillStyle = rgba(EDGE, 1);
+      ctx.fillRect(0, 0, W, H);
+      ctx.globalAlpha = 1;
+    }
+    // double-tap wash flash
+    var wAge = t - washT;
+    if (wAge >= 0 && wAge < 1.2) {
+      ctx.globalAlpha = 0.55 * Math.exp(-wAge / 0.35);
+      ctx.fillStyle = rgba(EDGE, 1);
+      ctx.fillRect(0, 0, W, H);
+      ctx.globalAlpha = 1;
+    }
+
+    // state word
+    var word = stateWord(t);
+    ctx.globalAlpha = 0.55;
+    ctx.fillStyle = rgba(SMOKE, 1);
+    ctx.font = '600 ' + Math.max(11, Math.round(S * 0.017)) + 'px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillText(word.split('').join(' '), W / 2, H - Math.max(12, S * 0.02));
+    ctx.globalAlpha = 1;
+
+    updateAudio(t);
+  }
+
+  draw(0);
+  if (typeof requestAnimationFrame === 'function') {
+    var loop = function () {
+      draw(nowT());
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
