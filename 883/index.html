@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Noisy Nebula</title>
+<style>
+  html, body { margin:0; padding:0; background:#050508; overflow:hidden; height:100%; }
+  canvas { display:block; touch-action:none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function(){
+'use strict';
+// ---------- seeded RNG ----------
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;var t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+var rng = mulberry32(88344);
+
+// ---------- canvas / viewport ----------
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var W = 720, H = 720, DPR = 1;
+function isPhone(){
+  var sw = 9999, sh = 9999;
+  if (typeof window !== 'undefined' && window.screen){ sw = window.screen.width||9999; sh = window.screen.height||9999; }
+  if (Math.min(sw,sh) < 700) return true;
+  return H > W*1.15;
+}
+function resize(){
+  var w = 0, h = 0;
+  if (typeof window !== 'undefined' && window.visualViewport){ w = window.visualViewport.width; h = window.visualViewport.height; }
+  if (!w && typeof window !== 'undefined'){ w = window.innerWidth; h = window.innerHeight; }
+  if (!w){ w = 720; h = 720; }
+  W = w; H = h;
+  DPR = 1;
+  if (typeof window !== 'undefined' && window.devicePixelRatio) DPR = Math.min(window.devicePixelRatio, 2);
+  canvas.width = Math.round(W*DPR); canvas.height = Math.round(H*DPR);
+}
+if (typeof window !== 'undefined'){
+  if (window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', resize);
+  if (window.addEventListener) window.addEventListener('resize', resize);
+}
+resize();
+
+// ---------- palette ----------
+var COL = {
+  bg:'#050508', nebula:'#3B2E7A', core:'#B8A9FF', web:'#7FD8E8',
+  smear:'#FF2E88', grain:'#E8E8E0'
+};
+function hexRgb(h){ return [parseInt(h.slice(1,3),16), parseInt(h.slice(3,5),16), parseInt(h.slice(5,7),16)]; }
+function rgba(h, a){ var c = hexRgb(h); return 'rgba('+c[0]+','+c[1]+','+c[2]+','+a+')'; }
+function mix(h1, h2, k){ var a=hexRgb(h1), b=hexRgb(h2); return 'rgb('+Math.round(a[0]+(b[0]-a[0])*k)+','+Math.round(a[1]+(b[1]-a[1])*k)+','+Math.round(a[2]+(b[2]-a[2])*k)+')'; }
+
+// ---------- layer model ----------
+// gains: index 0 NEBULA, 1 WEB, 2 SMEAR, 3 GRAIN
+var LNAME = ['NEBULA','WEB','SMEAR','GRAIN'];
+var LCOL  = [COL.nebula, COL.web, COL.smear, COL.grain];
+var gainTarget = [0.8, 0.6, 0.5, 0.4];
+var gainShown  = [0.8, 0.6, 0.5, 0.4];
+var masterTarget = 0.9, masterShown = 0.9;
+var soloLayer = -1, soloUntil = -1; // in sim seconds
+
+// ---------- nebula particles ----------
+var NEB = [];
+(function(){
+  for (var i=0;i<400;i++){
+    // radial falloff: cluster toward center
+    var r = Math.pow(rng(), 1.3);
+    var a = rng()*Math.PI*2;
+    NEB.push({
+      bx: Math.cos(a)*r, by: Math.sin(a)*r*0.82,
+      core: Math.max(0, 1 - r*1.55),
+      sp: 0.05 + rng()*0.16, ph: rng()*Math.PI*2,
+      sz: 0.8 + rng()*2.3, wob: 0.01 + rng()*0.035
+    });
+  }
+})();
+// ---------- web points ----------
+var WEB = [];
+(function(){
+  for (var i=0;i<26;i++){
+    WEB.push({
+      cx: 0.14 + rng()*0.72, cy: 0.14 + rng()*0.72,
+      ax: 0.03 + rng()*0.13, ay: 0.03 + rng()*0.13,
+      fx: 0.11 + rng()*0.30, fy: 0.11 + rng()*0.30,
+      p1: rng()*Math.PI*2, p2: rng()*Math.PI*2
+    });
+  }
+})();
+// ---------- smear comets ----------
+var COMET = [];
+(function(){
+  for (var i=0;i<34;i++){
+    COMET.push({
+      cx: 0.15 + rng()*0.7, cy: 0.15 + rng()*0.7,
+      ax: 0.05 + rng()*0.20, ay: 0.04 + rng()*0.17,
+      fx: 0.07 + rng()*0.16, fy: 0.06 + rng()*0.15,
+      p1: rng()*Math.PI*2, p2: rng()*Math.PI*2,
+      sz: 0.8 + rng()*1.6
+    });
+  }
+})();
+function cometPos(c, t){
+  return [ (c.cx + c.ax*Math.sin(c.fx*t*6.283 + c.p1)) * W,
+           (c.cy + c.ay*Math.sin(c.fy*t*6.283 + c.p2)) * H ];
+}
+
+// ---------- interaction state ----------
+var simT = 0;               // sim clock (seconds), advanced by rAF only
+var rotOff = 0;             // conductor rotation offset for nebula
+var smearTarget = 1.0;      // trail length multiplier 0.15..1.8
+var smearShown = 1.0;
+var freezeT = -1, freezeUntil = -1; // snapshot hold, in sim seconds
+
+// ---------- audio (lazy, guarded) ----------
+var AC = null, aMaster = null, aGain = [], aCrackleRng = mulberry32(777);
+function audioInit(){
+  if (AC) return;
+  var Ctor = null;
+  if (typeof AudioContext !== 'undefined') Ctor = AudioContext;
+  else if (typeof webkitAudioContext !== 'undefined') Ctor = webkitAudioContext;
+  if (!Ctor) return;
+  try {
+    AC = new Ctor();
+    aMaster = AC.createGain(); aMaster.gain.value = 0; aMaster.connect(AC.destination);
+    for (var i=0;i<4;i++){ var g = AC.createGain(); g.gain.value = 0; g.connect(aMaster); aGain.push(g); }
+    // NEBULA: deep drone, two detuned oscillators through a lowpass
+    var lp = AC.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value = 220; lp.connect(aGain[0]);
+    [55, 82.41, 110.3].forEach(function(f, k){
+      var o = AC.createOscillator(); o.type = k===2 ? 'sine' : 'triangle'; o.frequency.value = f;
+      var og = AC.createGain(); og.gain.value = k===2 ? 0.10 : 0.16; o.connect(og); og.connect(lp); o.start();
+    });
+    // WEB: mid shimmer, high sines with slow tremolo
+    [523.25, 783.99].forEach(function(f, k){
+      var o = AC.createOscillator(); o.type='sine'; o.frequency.value = f;
+      var og = AC.createGain(); og.gain.value = 0.05;
+      var lfo = AC.createOscillator(); lfo.frequency.value = 0.13 + k*0.07;
+      var lg = AC.createGain(); lg.gain.value = 0.03; lfo.connect(lg); lg.connect(og.gain);
+      o.connect(og); og.connect(aGain[1]); o.start(); lfo.start();
+    });
+    // SMEAR: filtered noise wash
+    var nb = AC.createBuffer(1, AC.sampleRate*2, AC.sampleRate);
+    var d = nb.getChannelData(0); var nr = mulberry32(4242);
+    for (var j=0;j<d.length;j++) d[j] = nr()*2-1;
+    var ns = AC.createBufferSource(); ns.buffer = nb; ns.loop = true;
+    var bp = AC.createBiquadFilter(); bp.type='bandpass'; bp.frequency.value = 640; bp.Q.value = 0.7;
+    var ng = AC.createGain(); ng.gain.value = 0.12;
+    ns.connect(bp); bp.connect(ng); ng.connect(aGain[2]); ns.start();
+    // GRAIN: crackle handled per-pop in the frame loop through aGain[3]
+  } catch(e){ AC = null; }
+}
+function audioFrame(){
+  if (!AC || !aMaster) return;
+  if (AC.resume) { try { AC.resume(); } catch(e){} }
+  var eg = effGains();
+  aMaster.gain.value = masterShown * 0.9;
+  var scale = [0.9, 0.8, 0.9, 1.0];
+  for (var i=0;i<4;i++) aGain[i].gain.value = eg[i]*scale[i];
+  // grain crackle: seeded pops, rate follows grain gain
+  if (eg[3] > 0.02 && aCrackleRng() < 0.09*eg[3]){
+    try {
+      var len = Math.floor(AC.sampleRate*0.012);
+      var b = AC.createBuffer(1, len, AC.sampleRate);
+      var ch = b.getChannelData(0);
+      for (var j=0;j<len;j++) ch[j] = (aCrackleRng()*2-1) * (1 - j/len);
+      var s = AC.createBufferSource(); s.buffer = b;
+      var g = AC.createGain(); g.gain.value = 0.5;
+      s.connect(g); g.connect(aGain[3]); s.start();
+    } catch(e){}
+  }
+}
+
+// ---------- effective gains (solo applied) ----------
+function effGains(){
+  var out = [];
+  var solo = (soloLayer >= 0 && simT < soloUntil);
+  for (var i=0;i<4;i++) out.push(solo && i !== soloLayer ? 0 : gainShown[i]);
+  return out;
+}
+
+// ---------- geometry of strips ----------
+function stripRect(i){ // vertical strip i along left edge
+  var usableTop = 8, usableBot = H - 40;
+  var seg = (usableBot - usableTop)/4;
+  return { x: 6, y: usableTop + seg*i, w: 12, h: seg - 10, hitX: 0, hitW: 36 };
+}
+function masterRect(){ return { x: 46, y: H - 26, w: W - 56, h: 12, hitY: H - 38, hitH: 38 }; }
+
+// ---------- pointer handling ----------
+var drag = null; // {zone:'strip'|'master'|'field', idx, sx, sy, lx, ly, t0, moved}
+var lastTapField = -10; // performance.now seconds
+function pnow(){ return (typeof performance !== 'undefined' && performance.now) ? performance.now()/1000 : simT; }
+function evPos(e){
+  var r = { x:0, y:0 };
+  if (e.clientX !== undefined){ r.x = e.clientX; r.y = e.clientY; }
+  else if (e.touches && e.touches[0]){ r.x = e.touches[0].clientX; r.y = e.touches[0].clientY; }
+  else if (e.changedTouches && e.changedTouches[0]){ r.x = e.changedTouches[0].clientX; r.y = e.changedTouches[0].clientY; }
+  return r;
+}
+function zoneOf(p){
+  var i;
+  for (i=0;i<4;i++){ var s = stripRect(i); if (p.x < s.hitW && p.y >= s.y - 4 && p.y <= s.y + s.h + 4) return { zone:'strip', idx:i }; }
+  var m = masterRect();
+  if (p.y >= m.hitY && p.x >= 40) return { zone:'master', idx:-1 };
+  return { zone:'field', idx:-1 };
+}
+function stripGainFromY(i, y){ var s = stripRect(i); var k = 1 - (y - s.y)/s.h; return Math.max(0, Math.min(1, k)); }
+function onDown(e){
+  audioInit();
+  var p = evPos(e); var z = zoneOf(p);
+  drag = { zone:z.zone, idx:z.idx, sx:p.x, sy:p.y, lx:p.x, ly:p.y, t0:pnow(), moved:false };
+  if (z.zone === 'strip') gainTarget[z.idx] = stripGainFromY(z.idx, p.y);
+  if (z.zone === 'master'){ var m = masterRect(); masterTarget = Math.max(0, Math.min(1, (p.x - m.x)/m.w)); }
+  if (e.preventDefault) e.preventDefault();
+}
+function onMove(e){
+  if (!drag) return;
+  var p = evPos(e);
+  var dx = p.x - drag.lx, dy = p.y - drag.ly;
+  if (Math.abs(p.x - drag.sx) + Math.abs(p.y - drag.sy) > 6) drag.moved = true;
+  if (drag.zone === 'strip') gainTarget[drag.idx] = stripGainFromY(drag.idx, p.y);
+  else if (drag.zone === 'master'){ var m = masterRect(); masterTarget = Math.max(0, Math.min(1, (p.x - m.x)/m.w)); }
+  else { // field: conductor's hand
+    rotOff += dx * 0.004;
+    smearTarget = Math.max(0.15, Math.min(1.8, smearTarget - dy*0.006));
+  }
+  drag.lx = p.x; drag.ly = p.y;
+  if (e.preventDefault) e.preventDefault();
+}
+function onUp(e){
+  if (!drag) return;
+  var quick = (pnow() - drag.t0) < 0.35;
+  if (drag.zone === 'strip' && quick && !drag.moved){
+    soloLayer = drag.idx; soloUntil = simT + 5;
+  }
+  if (drag.zone === 'field' && quick && !drag.moved){
+    var now = pnow();
+    if (now - lastTapField < 0.4){ freezeT = simT; freezeUntil = simT + 3; lastTapField = -10; }
+    else lastTapField = now;
+  }
+  drag = null;
+  if (e.preventDefault) e.preventDefault();
+}
+if (canvas.addEventListener){
+  canvas.addEventListener('pointerdown', onDown);
+  canvas.addEventListener('pointermove', onMove);
+  canvas.addEventListener('pointerup', onUp);
+  canvas.addEventListener('pointercancel', function(){ drag = null; });
+  canvas.addEventListener('touchstart', onDown, { passive:false });
+  canvas.addEventListener('touchmove', onMove, { passive:false });
+  canvas.addEventListener('touchend', onUp, { passive:false });
+  canvas.addEventListener('mousedown', onDown);
+  canvas.addEventListener('mousemove', onMove);
+  canvas.addEventListener('mouseup', onUp);
+}
+
+// ---------- drawing ----------
+function layerTime(){
+  if (freezeT >= 0 && simT < freezeUntil) return freezeT;
+  return simT;
+}
+function draw(){
+  canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  var t = layerTime();
+  var eg = effGains();
+  var master = masterShown;
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = COL.bg; ctx.fillRect(0, 0, W, H);
+
+  var phone = isPhone();
+  var cx = W*0.54, cy = H*0.47;
+  var R = Math.min(W, H) * (phone ? 0.40 : 0.44);
+
+  ctx.globalCompositeOperation = 'lighter';
+
+  // --- SMEAR trails (under nebula heads, above bg) ---
+  if (eg[2] > 0.003){
+    var steps = Math.max(4, Math.round(26 * smearShown));
+    var dt = 0.055;
+    ctx.lineCap = 'round';
+    for (var ci=0; ci<COMET.length; ci++){
+      var c = COMET[ci];
+      var prev = cometPos(c, t);
+      for (var k=1;k<=steps;k++){
+        var pos = cometPos(c, t - k*dt);
+        var a = (1 - k/steps) * 0.27 * eg[2] * master;
+        if (a > 0.004){
+          ctx.strokeStyle = rgba(COL.smear, a);
+          ctx.lineWidth = c.sz * (1 - k/steps*0.6);
+          ctx.beginPath(); ctx.moveTo(prev[0], prev[1]); ctx.lineTo(pos[0], pos[1]); ctx.stroke();
+        }
+        prev = pos;
+      }
+      ctx.fillStyle = rgba(COL.smear, 0.5*eg[2]*master);
+      var head = cometPos(c, t);
+      ctx.beginPath(); ctx.arc(head[0], head[1], c.sz*0.7, 0, 6.2832); ctx.fill();
+    }
+  }
+
+  // --- NEBULA ---
+  if (eg[0] > 0.003){
+    var rot = 0.02*t + rotOff;
+    var cr = Math.cos(rot), sr = Math.sin(rot);
+    for (var i=0;i<NEB.length;i++){
+      var p = NEB[i];
+      var wob = 1 + p.wob*Math.sin(t*0.6 + p.ph);
+      var lx = p.bx*R*wob, ly = p.by*R*wob;
+      var x = cx + lx*cr - ly*sr;
+      var y = cy + lx*sr + ly*cr;
+      var tw = 0.72 + 0.28*Math.sin(t*p.sp*6.0 + p.ph*3.0);
+      var a = (0.17 + 0.30*p.core) * tw * eg[0] * master;
+      ctx.fillStyle = p.core > 0.45 ? rgba(COL.core, a) : rgba(COL.nebula, a*1.25);
+      if (p.core > 0.45) ctx.fillStyle = mix(COL.nebula, COL.core, Math.min(1,(p.core-0.2)*1.6)) ;
+      ctx.globalAlpha = a;
+      ctx.beginPath(); ctx.arc(x, y, p.sz*(1+p.core*0.9), 0, 6.2832); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // --- WEB ---
+  if (eg[1] > 0.003){
+    var pts = [];
+    for (var wi=0; wi<WEB.length; wi++){
+      var q = WEB[wi];
+      pts.push([ (q.cx + q.ax*Math.sin(q.fx*t*6.283 + q.p1)) * W,
+                 (q.cy + q.ay*Math.sin(q.fy*t*6.283 + q.p2)) * H ]);
+    }
+    var thresh = Math.min(W,H)*0.30;
+    ctx.lineWidth = 1;
+    for (var a2=0; a2<pts.length; a2++){
+      for (var b2=a2+1; b2<pts.length; b2++){
+        var dx = pts[a2][0]-pts[b2][0], dy = pts[a2][1]-pts[b2][1];
+        var dist = Math.sqrt(dx*dx + dy*dy);
+        if (dist < thresh){
+          var al = (1 - dist/thresh) * 0.34 * eg[1] * master;
+          if (al > 0.01){
+            ctx.strokeStyle = rgba(COL.web, al);
+            ctx.beginPath(); ctx.moveTo(pts[a2][0], pts[a2][1]); ctx.lineTo(pts[b2][0], pts[b2][1]); ctx.stroke();
+          }
+        }
+      }
+    }
+    ctx.fillStyle = rgba(COL.web, 0.55*eg[1]*master);
+    for (var wj=0; wj<pts.length; wj++){ ctx.beginPath(); ctx.arc(pts[wj][0], pts[wj][1], 1.6, 0, 6.2832); ctx.fill(); }
+  }
+
+  // --- GRAIN: seeded by frame index ---
+  if (eg[3] > 0.003){
+    var frameIdx = Math.floor(t*18);
+    var gr = mulberry32(9000 + frameIdx);
+    var n = phone ? 130 : 200;
+    ctx.fillStyle = COL.grain;
+    for (var gi=0; gi<n; gi++){
+      var gx = gr()*W, gy = gr()*H, ga = gr();
+      ctx.globalAlpha = ga * 0.16 * eg[3] * master;
+      ctx.fillRect(gx, gy, 1.3, 1.3);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  ctx.globalCompositeOperation = 'source-over';
+
+  // --- fader strips (UI) ---
+  ctx.textBaseline = 'middle';
+  for (var si=0; si<4; si++){
+    var s = stripRect(si);
+    var solo = (soloLayer === si && simT < soloUntil);
+    // track
+    ctx.fillStyle = 'rgba(232,232,224,0.10)';
+    ctx.fillRect(s.x, s.y, s.w, s.h);
+    // fill by shown gain
+    var fh = s.h * gainShown[si];
+    ctx.fillStyle = rgba(LCOL[si] === COL.nebula ? COL.core : LCOL[si], solo ? 0.85 : 0.5);
+    if (si === 0) ctx.fillStyle = rgba(COL.core, solo ? 0.85 : 0.5);
+    ctx.fillRect(s.x, s.y + s.h - fh, s.w, fh);
+    // cap line
+    ctx.fillStyle = 'rgba(232,232,224,0.85)';
+    ctx.fillRect(s.x - 2, s.y + s.h - fh - 1, s.w + 4, 2);
+    // label, rotated, quiet
+    ctx.save();
+    ctx.translate(s.x + 26, s.y + s.h/2);
+    ctx.rotate(-Math.PI/2);
+    ctx.font = (phone ? '8px' : '9px') + ' monospace';
+    ctx.textAlign = 'center';
+    ctx.fillStyle = solo ? 'rgba(232,232,224,0.95)' : 'rgba(232,232,224,0.55)';
+    ctx.fillText(LNAME[si], 0, 0);
+    ctx.restore();
+  }
+  // master strip
+  var m = masterRect();
+  ctx.fillStyle = 'rgba(232,232,224,0.10)';
+  ctx.fillRect(m.x, m.y, m.w, m.h);
+  ctx.fillStyle = 'rgba(232,232,224,0.45)';
+  ctx.fillRect(m.x, m.y, m.w * masterShown, m.h);
+  ctx.fillStyle = 'rgba(232,232,224,0.9)';
+  ctx.fillRect(m.x + m.w*masterShown - 1, m.y - 2, 2, m.h + 4);
+  ctx.font = (phone ? '8px' : '9px') + ' monospace';
+  ctx.textAlign = 'left';
+  ctx.fillStyle = 'rgba(232,232,224,0.55)';
+  ctx.fillText('MASTER', m.x, m.y - 12);
+}
+
+// ---------- main loop ----------
+var lastMs = -1;
+function frame(ms){
+  if (lastMs < 0) lastMs = ms;
+  var dt = Math.min(0.05, (ms - lastMs)/1000); lastMs = ms;
+  simT += dt;
+  var k = 1 - Math.exp(-dt*9);
+  for (var i=0;i<4;i++) gainShown[i] += (gainTarget[i] - gainShown[i])*k;
+  masterShown += (masterTarget - masterShown)*k;
+  smearShown += (smearTarget - smearShown)*(1 - Math.exp(-dt*6));
+  draw();
+  audioFrame();
+}
+draw(); // frame one: synchronous, t = 0, default mix
+if (typeof requestAnimationFrame === 'function'){
+  var loop = function(ms){ frame(ms); requestAnimationFrame(loop); };
+  requestAnimationFrame(loop);
+}
+})();
+</script>
+</body>
+</html>

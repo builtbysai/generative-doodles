@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Oscilloscope Music</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #000000; overflow: hidden; height: 100%; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  "use strict";
+
+  // Palette (strict)
+  var BLACK = "#000000";
+  var WHITE = "#FFFFFF";
+  var TRACE = "#6A6A6A";
+
+  function hexRGB(hex) {
+    return [parseInt(hex.slice(1, 3), 16), parseInt(hex.slice(3, 5), 16), parseInt(hex.slice(5, 7), 16)];
+  }
+  function rgba(hex, a) {
+    var c = hexRGB(hex);
+    return "rgba(" + c[0] + "," + c[1] + "," + c[2] + "," + a + ")";
+  }
+
+  // Seeded RNG (mulberry32)
+  function mulberry32(seed) {
+    var s = seed >>> 0;
+    return function () {
+      s = (s + 0x6D2B79F5) >>> 0;
+      var t = s;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  var canvas = document.getElementById("c");
+  var ctx = canvas.getContext("2d");
+  var W = 0, H = 0, DPR = 1;
+
+  function isPhone() {
+    try {
+      var sw = window.screen ? window.screen.width : 0;
+      var sh = window.screen ? window.screen.height : 0;
+      var mn = Math.min(sw, sh);
+      if (mn > 0 && mn < 700) return true;
+    } catch (e) {}
+    return H > W * 1.15;
+  }
+
+  function resize() {
+    var vv = window.visualViewport;
+    var w = vv && vv.width ? vv.width : window.innerWidth;
+    var h = vv && vv.height ? vv.height : window.innerHeight;
+    DPR = window.devicePixelRatio || 1;
+    W = w; H = h;
+    canvas.width = Math.round(w * DPR);
+    canvas.height = Math.round(h * DPR);
+  }
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener("resize", resize);
+  }
+  window.addEventListener("resize", resize);
+  resize();
+
+  // ============================================================
+  // ONE SOURCE OF TRUTH: a single ratio(t) and phase state drive
+  // both the picture and (once armed) the two audio oscillators.
+  // Audio runs at base 55 Hz; the visual phase advances at the
+  // fixed proportional rate VF1 = 0.30 Hz (scale 55 / 0.30), so
+  // ear and eye stay locked to the same numbers.
+  // ============================================================
+  var VF1 = 0.30;              // visual base frequency, Hz
+  var AF1 = 55.0;              // audio base frequency, Hz (A1)
+  var GOLD = 1.61803398875;    // golden ratio, sphere y-offset multiplier
+  var NSPH = 7;
+  var HARMONICS = [1, 9 / 8, 6 / 5, 5 / 4, 4 / 3, 3 / 2, 5 / 3, 2, 5 / 2, 3];
+  var HARM0 = 5;               // index of 3:2, the opening ratio
+
+  // Global slow wander riding on the ratio (suppressed while dragging
+  // or locked, so the hand and the lock stay exact). w(0) = 0, so
+  // frame one sits at exactly 3:2.
+  var WA1 = 0.035, WW1 = Math.PI * 2 / 47.0;
+  var WA2 = 0.020, WW2 = Math.PI * 2 / 23.3;
+  function wander(t) { return WA1 * Math.sin(WW1 * t) + WA2 * Math.sin(WW2 * t); }
+  function wanderInt(t) { // integral of wander from 0 to t
+    return WA1 / WW1 * (1 - Math.cos(WW1 * t)) + WA2 / WW2 * (1 - Math.cos(WW2 * t));
+  }
+
+  // ---------- Ratio timeline: analytic segments ----------
+  // Segment kinds: "hold" {R}, "lock" {R}, "ease" {R0,R1}, "drag" {samples}.
+  // An "auto" hold carries {harmIdx, epoch, k, holdDur} and is split by
+  // ensureTimeline into ease + next auto hold, with choices hashed from
+  // (epoch, k) so the schedule is a pure function of the event history.
+  var segments = [];
+  var curEpoch = 0;
+
+  function hashRand(epoch, k, salt) {
+    var rnd = mulberry32((882043 + epoch * 7919 + k * 104729 + salt * 31) >>> 0);
+    return rnd();
+  }
+  function holdDurFor(epoch, k) { return 12 + 9 * hashRand(epoch, k, 7); }
+
+  function makeAutoHold(t0, R, harmIdx, epoch, k, holdDur) {
+    return { t0: t0, t1: Infinity, kind: "hold", R: R, wander: true,
+             auto: true, harmIdx: harmIdx, epoch: epoch, k: k, holdDur: holdDur };
+  }
+  segments.push(makeAutoHold(0, HARMONICS[HARM0], HARM0, 0, 0, 16));
+
+  function ensureTimeline(t) {
+    for (var guard = 0; guard < 64; guard++) {
+      var last = segments[segments.length - 1];
+      if (!last || !last.auto) return;
+      var sw = last.t0 + last.holdDur;
+      if (t < sw) return;
+      var stepOpts = [-2, -1, 1, 2];
+      var step = stepOpts[Math.floor(hashRand(last.epoch, last.k + 1, 3) * 4)];
+      var nIdx = Math.max(0, Math.min(HARMONICS.length - 1, last.harmIdx + step));
+      if (nIdx === last.harmIdx) nIdx = Math.max(0, Math.min(HARMONICS.length - 1, last.harmIdx + (step > 0 ? 1 : -1)));
+      last.t1 = sw;
+      segments.push({ t0: sw, t1: sw + 6, kind: "ease", R0: last.R, R1: HARMONICS[nIdx], wander: true });
+      segments.push(makeAutoHold(sw + 6, HARMONICS[nIdx], nIdx, last.epoch, last.k + 1, holdDurFor(last.epoch, last.k + 1)));
+    }
+  }
+
+  function segAt(t) {
+    for (var i = 0; i < segments.length; i++) {
+      if (t < segments[i].t1) return segments[i];
+    }
+    return segments[segments.length - 1];
+  }
+
+  function baseAt(seg, t) {
+    if (seg.kind === "hold" || seg.kind === "lock") return seg.R;
+    if (seg.kind === "ease") {
+      var D = seg.t1 - seg.t0;
+      var u = D > 0 ? (t - seg.t0) / D : 1;
+      u = Math.max(0, Math.min(1, u));
+      var s = u * u * (3 - 2 * u);
+      return seg.R0 + (seg.R1 - seg.R0) * s;
+    }
+    // drag: piecewise linear over recorded samples
+    var sm = seg.samples;
+    if (t <= sm[0].t) return sm[0].v;
+    for (var i = 1; i < sm.length; i++) {
+      if (t <= sm[i].t) {
+        var a = sm[i - 1], b = sm[i];
+        var f = b.t > a.t ? (t - a.t) / (b.t - a.t) : 0;
+        return a.v + (b.v - a.v) * f;
+      }
+    }
+    return sm[sm.length - 1].v;
+  }
+
+  function baseInt(seg, a, b) { // integral of base over [a, b] inside seg
+    if (b <= a) return 0;
+    if (seg.kind === "hold" || seg.kind === "lock") return seg.R * (b - a);
+    if (seg.kind === "ease") {
+      var D = seg.t1 - seg.t0;
+      function F(x) {
+        var u = D > 0 ? (x - seg.t0) / D : 1;
+        u = Math.max(0, Math.min(1, u));
+        return seg.R0 * (x - seg.t0) + (seg.R1 - seg.R0) * D * (u * u * u - 0.5 * u * u * u * u);
+      }
+      return F(b) - F(a);
+    }
+    var sm = seg.samples, acc = 0;
+    for (var i = 1; i < sm.length; i++) {
+      var t0 = sm[i - 1].t, t1 = sm[i].t;
+      var lo = Math.max(a, t0), hi = Math.min(b, t1);
+      if (hi > lo && t1 > t0) {
+        var va = sm[i - 1].v + (sm[i].v - sm[i - 1].v) * ((lo - t0) / (t1 - t0));
+        var vb = sm[i - 1].v + (sm[i].v - sm[i - 1].v) * ((hi - t0) / (t1 - t0));
+        acc += 0.5 * (va + vb) * (hi - lo);
+      }
+    }
+    if (b > sm[sm.length - 1].t) {
+      acc += sm[sm.length - 1].v * (b - Math.max(a, sm[sm.length - 1].t));
+    }
+    return acc;
+  }
+
+  function ratioAt(t) {
+    if (t <= 0) return HARMONICS[HARM0];
+    ensureTimeline(t);
+    var seg = segAt(t);
+    return baseAt(seg, t) + (seg.wander ? wander(t) : 0);
+  }
+
+  function integralRatio(t) { // integral of ratio from 0 to t
+    if (t <= 0) return HARMONICS[HARM0] * t;
+    ensureTimeline(t);
+    var acc = 0;
+    for (var i = 0; i < segments.length; i++) {
+      var seg = segments[i];
+      var a = Math.max(seg.t0, 0), b = Math.min(t, seg.t1);
+      if (b > a) {
+        acc += baseInt(seg, a, b);
+        if (seg.wander) acc += wanderInt(b) - wanderInt(a);
+      }
+      if (t <= seg.t1) break;
+    }
+    return acc;
+  }
+
+  function truncateTimeline(tc) {
+    var out = [];
+    for (var i = 0; i < segments.length; i++) {
+      var seg = segments[i];
+      if (seg.t1 <= tc) { out.push(seg); continue; }
+      if (seg.t0 < tc) {
+        var c = { t0: seg.t0, t1: tc, kind: seg.kind, R: seg.R, R0: seg.R0, R1: seg.R1,
+                  samples: seg.samples, wander: seg.wander };
+        out.push(c);
+      }
+      break;
+    }
+    segments = out;
+    curEpoch++;
+  }
+
+  function nearestHarmIdx(r) {
+    var best = 0, bd = Infinity;
+    for (var i = 0; i < HARMONICS.length; i++) {
+      var d = Math.abs(Math.log(r) - Math.log(HARMONICS[i]));
+      if (d < bd) { bd = d; best = i; }
+    }
+    return best;
+  }
+
+  // ---------- Phase offset (vertical drag): breakpoint list ----------
+  var offBp = [{ t: 0, v: 0 }];
+  function offAt(t) {
+    var lo = 0, hi = offBp.length - 1;
+    if (t <= offBp[0].t) return offBp[0].v;
+    if (t >= offBp[hi].t) return offBp[hi].v;
+    while (hi - lo > 1) {
+      var mid = (lo + hi) >> 1;
+      if (offBp[mid].t <= t) lo = mid; else hi = mid;
+    }
+    var a = offBp[lo], b = offBp[hi];
+    var f = b.t > a.t ? (t - a.t) / (b.t - a.t) : 0;
+    return a.v + (b.v - a.v) * f;
+  }
+
+  // ---------- Phase jumps (tap strikes): same jump on both phases ----------
+  var jumps = [];
+  function jumpSum(t) {
+    var s = 0;
+    for (var i = 0; i < jumps.length; i++) if (jumps[i].t <= t) s += jumps[i].d;
+    return s;
+  }
+
+  function phase1(t) { return Math.PI * 2 * VF1 * t + jumpSum(t); }
+  function phase2(t) { return Math.PI * 2 * VF1 * integralRatio(t) + offAt(t) + jumpSum(t); }
+
+  function spherePos(i, t) {
+    var off = i * Math.PI * 2 / NSPH;
+    return [Math.sin(phase1(t) + off), Math.sin(phase2(t) + off * GOLD)];
+  }
+
+  // ---------- Readout ----------
+  var FRACS = [];
+  (function () {
+    var seen = {};
+    for (var p = 1; p <= 8; p++) {
+      for (var q = 1; q <= 8; q++) {
+        var v = p / q;
+        if (v < 0.45 || v > 4.05) continue;
+        var key = v.toFixed(4);
+        if (seen[key]) continue;
+        seen[key] = true;
+        FRACS.push({ v: v, txt: p + ":" + q });
+      }
+    }
+    FRACS.sort(function (a, b) { return a.v - b.v; });
+  })();
+  function ratioText(r) {
+    var best = null, bd = Infinity;
+    for (var i = 0; i < FRACS.length; i++) {
+      var d = Math.abs(r - FRACS[i].v);
+      if (d < bd) { bd = d; best = FRACS[i]; }
+    }
+    if (best && bd < 0.02) return best.txt;
+    return r.toFixed(2);
+  }
+
+  // ---------- Audio (lazy, gesture-armed, typeof-guarded) ----------
+  var AC = null, osc1 = null, osc2 = null, masterGain = null;
+  function ensureAudio() {
+    if (AC) { if (AC.resume) AC.resume(); return; }
+    try {
+      var Ctor = (typeof window !== "undefined" && (window.AudioContext || window.webkitAudioContext)) ||
+                 (typeof AudioContext !== "undefined" ? AudioContext : null);
+      if (!Ctor) return;
+      AC = new Ctor();
+      var comp = AC.createDynamicsCompressor();
+      comp.threshold.value = -12; comp.knee.value = 18; comp.ratio.value = 12;
+      comp.attack.value = 0.004; comp.release.value = 0.24;
+      comp.connect(AC.destination);
+      masterGain = AC.createGain();
+      masterGain.gain.value = 0.0;
+      masterGain.gain.setTargetAtTime(0.16, AC.currentTime, 0.4);
+      masterGain.connect(comp);
+      // slow amplitude LFO breathing on the master
+      var lfo = AC.createOscillator();
+      lfo.frequency.value = 0.07;
+      var lfoG = AC.createGain(); lfoG.gain.value = 0.045;
+      lfo.connect(lfoG); lfoG.connect(masterGain.gain); lfo.start();
+      function voice(pan) {
+        var o = AC.createOscillator(); o.type = "sine";
+        var g = AC.createGain(); g.gain.value = 0.5;
+        var p = null;
+        if (AC.createStereoPanner) { p = AC.createStereoPanner(); p.pan.value = pan; }
+        o.connect(g);
+        if (p) { g.connect(p); p.connect(masterGain); } else { g.connect(masterGain); }
+        o.start();
+        return o;
+      }
+      osc1 = voice(-0.65); osc1.frequency.value = AF1;
+      osc2 = voice(0.65); osc2.frequency.value = AF1 * ratioAt(tNow);
+    } catch (e) { AC = null; }
+  }
+  function ping() {
+    if (!AC) return;
+    try {
+      var o = AC.createOscillator(); o.type = "sine";
+      o.frequency.value = AF1 * 2 * ratioAt(tNow);
+      var g = AC.createGain();
+      var t0 = AC.currentTime;
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.exponentialRampToValueAtTime(0.22, t0 + 0.012);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.7);
+      o.connect(g); g.connect(masterGain);
+      o.start(t0); o.stop(t0 + 0.75);
+    } catch (e) {}
+  }
+  function audioTick() {
+    if (!AC || !osc2) return;
+    try { osc2.frequency.setTargetAtTime(AF1 * ratioAt(tNow), AC.currentTime, 0.05); } catch (e) {}
+  }
+
+  // ---------- Interaction ----------
+  var tNow = 0;
+  var dragging = false, dragMoved = false, downT = 0, downX = 0, downY = 0;
+  var dragSeg = null;
+  var pendingTap = null;   // {tUp}
+  var maybeDouble = false;
+  var strikeCount = 0;
+
+  function ratioFromX(x) { return 0.5 * Math.pow(8, Math.max(0, Math.min(1, x / Math.max(1, W)))); }
+  function offFromY(y) { return (1 - Math.max(0, Math.min(1, y / Math.max(1, H)))) * Math.PI * 2; }
+
+  function commitStrike(tUp) {
+    strikeCount++;
+    jumps.push({ t: tUp, d: strikeCount * 2.399963229728653 }); // golden-angle steps
+    jumps.sort(function (a, b) { return a.t - b.t; });
+    ping();
+  }
+  function commitLock(tc) {
+    var frozen = ratioAt(tc);
+    truncateTimeline(tc);
+    segments.push({ t0: tc, t1: tc + 10, kind: "lock", R: frozen, wander: false });
+    var hi = nearestHarmIdx(frozen);
+    segments.push({ t0: tc + 10, t1: tc + 14, kind: "ease", R0: frozen, R1: HARMONICS[hi], wander: true });
+    segments.push(makeAutoHold(tc + 14, HARMONICS[hi], hi, curEpoch, 0, holdDurFor(curEpoch, 0)));
+    ping();
+  }
+  function beginDrag(tc, x, y) {
+    truncateTimeline(tc);
+    dragSeg = { t0: tc, t1: Infinity, kind: "drag", samples: [{ t: tc, v: ratioFromX(x) }], wander: false };
+    segments.push(dragSeg);
+    offBp.push({ t: tc, v: offAt(tc) }); // continuity anchor; moves set the offset from here
+  }
+  function endDrag(tc) {
+    if (!dragSeg) return;
+    var lastV = dragSeg.samples[dragSeg.samples.length - 1].v;
+    dragSeg.t1 = tc;
+    dragSeg = null;
+    var hi = nearestHarmIdx(lastV);
+    segments.push({ t0: tc, t1: tc + 4, kind: "ease", R0: lastV, R1: HARMONICS[hi], wander: true });
+    segments.push(makeAutoHold(tc + 4, HARMONICS[hi], hi, curEpoch, 0, holdDurFor(curEpoch, 0)));
+  }
+
+  function evtPos(e) {
+    var r = null;
+    try { r = canvas.getBoundingClientRect(); } catch (err) {}
+    var x = (e.clientX != null ? e.clientX : 0) - (r ? r.left : 0);
+    var y = (e.clientY != null ? e.clientY : 0) - (r ? r.top : 0);
+    return [x, y];
+  }
+  function onDown(e) {
+    ensureAudio();
+    var p = evtPos(e), x = p[0], y = p[1];
+    downT = tNow; downX = x; downY = y;
+    dragging = true; dragMoved = false;
+    maybeDouble = !!(pendingTap && (tNow - pendingTap.tUp) <= 0.35);
+    try { if (canvas.setPointerCapture && e.pointerId != null) canvas.setPointerCapture(e.pointerId); } catch (err) {}
+    if (e.preventDefault) e.preventDefault();
+  }
+  function onMove(e) {
+    if (!dragging) return;
+    var p = evtPos(e), x = p[0], y = p[1];
+    if (!dragMoved && Math.hypot(x - downX, y - downY) > 6) {
+      dragMoved = true;
+      if (maybeDouble && pendingTap) { commitStrike(pendingTap.tUp); pendingTap = null; maybeDouble = false; }
+      beginDrag(downT, downX, downY);
+    }
+    if (dragMoved && dragSeg) {
+      dragSeg.samples.push({ t: tNow, v: ratioFromX(x) });
+      offBp.push({ t: tNow, v: offFromY(y) });
+    }
+  }
+  function onUp(e) {
+    if (!dragging) return;
+    dragging = false;
+    if (dragMoved) {
+      endDrag(tNow);
+      dragMoved = false;
+      maybeDouble = false;
+      return;
+    }
+    // a tap
+    if (maybeDouble && pendingTap) {
+      pendingTap = null;
+      maybeDouble = false;
+      commitLock(tNow);
+    } else {
+      pendingTap = { tUp: tNow };
+      maybeDouble = false;
+    }
+  }
+  canvas.addEventListener("pointerdown", onDown);
+  canvas.addEventListener("pointermove", onMove);
+  canvas.addEventListener("pointerup", onUp);
+  canvas.addEventListener("pointercancel", onUp);
+  canvas.addEventListener("touchstart", function (e) { if (e.cancelable) e.preventDefault(); }, { passive: false });
+
+  // ---------- Draw ----------
+  var TRAIL_N = 240, TRAIL_SPAN = 8.0;
+
+  function draw(t) {
+    canvas.style.width = W + "px";
+    canvas.style.height = H + "px";
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = BLACK;
+    ctx.fillRect(0, 0, W, H);
+
+    ensureTimeline(t + 1);
+    var S = Math.min(W, H);
+    var phone = isPhone();
+    var cx = W / 2, cy = H / 2;
+    var R = S * (phone ? 0.40 : 0.36);
+
+    // trails: each sphere's last ~240 positions, phosphor fade
+    ctx.lineWidth = Math.max(1, S * 0.0016);
+    ctx.lineCap = "round";
+    var i, k;
+    for (i = 0; i < NSPH; i++) {
+      var px = null, py = null;
+      for (k = TRAIL_N - 1; k >= 0; k--) {
+        var tt = t - (k / (TRAIL_N - 1)) * TRAIL_SPAN;
+        var pos = spherePos(i, tt);
+        var X = cx + R * pos[0], Y = cy + R * pos[1];
+        if (px !== null) {
+          var fade = 1 - k / TRAIL_N;
+          ctx.strokeStyle = rgba(TRACE, 0.55 * Math.pow(fade, 1.5));
+          ctx.beginPath();
+          ctx.moveTo(px, py);
+          ctx.lineTo(X, Y);
+          ctx.stroke();
+        }
+        px = X; py = Y;
+      }
+    }
+
+    // connecting lines (closed ring through the spheres)
+    var cur = [];
+    for (i = 0; i < NSPH; i++) {
+      var cp = spherePos(i, t);
+      cur.push([cx + R * cp[0], cy + R * cp[1]]);
+    }
+    ctx.strokeStyle = rgba(WHITE, 0.85);
+    ctx.lineWidth = Math.max(1, S * 0.0018);
+    ctx.beginPath();
+    for (i = 0; i < NSPH; i++) {
+      if (i === 0) ctx.moveTo(cur[i][0], cur[i][1]); else ctx.lineTo(cur[i][0], cur[i][1]);
+    }
+    ctx.closePath();
+    ctx.stroke();
+
+    // spheres
+    var sr = Math.max(2.5, S * 0.007);
+    ctx.fillStyle = WHITE;
+    for (i = 0; i < NSPH; i++) {
+      ctx.beginPath();
+      ctx.arc(cur[i][0], cur[i][1], sr, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // ratio readout: the number is the honesty
+    ctx.fillStyle = TRACE;
+    ctx.font = Math.round(Math.max(12, S * 0.021)) + "px monospace";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "alphabetic";
+    ctx.fillText(ratioText(ratioAt(t)), cx, H - Math.max(12, S * 0.028));
+  }
+
+  draw(0);
+
+  // ---------- Loop ----------
+  var lastTs = null;
+  function loop(ts) {
+    if (lastTs == null) lastTs = ts;
+    var dt = (ts - lastTs) / 1000;
+    lastTs = ts;
+    if (dt > 0 && dt < 0.25) tNow += dt;
+    if (pendingTap && tNow > pendingTap.tUp + 0.32) {
+      var pt = pendingTap; pendingTap = null;
+      commitStrike(pt.tUp);
+    }
+    draw(tNow);
+    audioTick();
+    requestAnimationFrame(loop);
+  }
+  if (typeof requestAnimationFrame === "function") {
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>

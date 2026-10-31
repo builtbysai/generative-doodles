@@ -1,0 +1,624 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>001 to 108</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0A0A0A; overflow: hidden; height: 100%; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+/* No.884 "001 to 108" - the sketch lab.
+   108 numbered monochrome sketches, 12 small systems cycled with seeded
+   variation (seed = sketch number, so a sketch always looks like itself).
+   Frame one is the synchronous draw at t = 0; the wall clock is never read. */
+
+var BG = '#0A0A0A', WHITE = '#FFFFFF', AMBER = '#FFB000';
+var TOTAL = 108, ADVANCE = 20, PREROLL_001 = 6;
+
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+
+var W = 300, H = 300, PHONE = false, U = 300;
+
+function fit() {
+  var w, h;
+  if (typeof window !== 'undefined' && window.visualViewport) {
+    w = window.visualViewport.width; h = window.visualViewport.height;
+  } else if (typeof window !== 'undefined' && window.innerWidth) {
+    w = window.innerWidth; h = window.innerHeight;
+  } else { w = 300; h = 300; }
+  w = Math.max(50, Math.round(w)); h = Math.max(50, Math.round(h));
+  if (w !== W || h !== H || canvas.width !== w) {
+    W = w; H = h; canvas.width = w; canvas.height = h;
+  }
+  var scr = (typeof window !== 'undefined' && window.screen) ? window.screen : null;
+  if (scr && scr.width && scr.height) {
+    PHONE = Math.min(scr.width, scr.height) < 700;
+  } else {
+    PHONE = (h > w * 1.15) && Math.min(w, h) < 700;
+  }
+  U = Math.min(W, H);
+}
+if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.addEventListener) {
+  window.visualViewport.addEventListener('resize', fit);
+}
+if (typeof window !== 'undefined' && window.addEventListener) {
+  window.addEventListener('resize', fit);
+}
+
+/* ---------- deterministic helpers ---------- */
+function mulberry32(a) {
+  a = a >>> 0;
+  return function () {
+    a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function hashN(x, y, z) {
+  var h = Math.imul(x | 0, 374761393) ^ Math.imul(y | 0, 668265263) ^ Math.imul(z | 0, 1442695041);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  h ^= h >>> 16;
+  return (h >>> 0) / 4294967296;
+}
+function wrapN(n) { return ((n - 1) % TOTAL + TOTAL) % TOTAL + 1; }
+function pad3(n) { return ('00' + n).slice(-3); }
+
+var TITLES = ['waveform', 'burst', 'matrix', 'pixel', 'osc', 'flock',
+              'noise', 'pulse', 'dots', 'storm', 'feedback', 'stack'];
+function titleFor(n) {
+  if (n === 1) return 'superposition';
+  if (n === 108) return 'bloom';
+  return TITLES[(n - 1) % 12];
+}
+function sysFor(n) { return n === 1 ? 12 : (n - 1) % 12; } // 12 = ghost (001 only)
+function sysParams(n) { return mulberry32((n * 7919 + 13) >>> 0); }
+
+/* ---------- navigation state (events drive everything) ---------- */
+var curN = 1;          // current sketch
+var localStart = 0;    // piece time at which curN's local clock was 0
+var nextAdvance = ADVANCE;
+var held = false;      // tap toggles the auto-advance hold
+var holdRemaining = ADVANCE;
+var jumpCount = 0;
+var landVoice = false; // a landing happened; audio voice due
+
+var scrub = null;      // {startX, startN, previewN, previewStart, lastN, moved}
+var pendingTap = null; // {t, snap:{held,nextAdvance,holdRemaining}}
+
+function land(n, t, keepLocalStart) {
+  curN = n;
+  localStart = (typeof keepLocalStart === 'number') ? keepLocalStart : t;
+  nextAdvance = t + ADVANCE;
+  if (held) holdRemaining = ADVANCE;
+  landVoice = true;
+}
+function applyHoldToggle(t) {
+  if (!held) { held = true; holdRemaining = Math.max(0, nextAdvance - t); }
+  else { held = false; nextAdvance = t + holdRemaining; }
+}
+function restoreSnap(s) {
+  held = s.held; nextAdvance = s.nextAdvance; holdRemaining = s.holdRemaining;
+}
+function doJump(t) {
+  jumpCount++;
+  var jr = mulberry32((jumpCount * 131 + 7) >>> 0);
+  var target = 1 + Math.floor(jr() * TOTAL);
+  if (target === curN) target = wrapN(target + 1);
+  land(target, t);
+}
+function updateNav(t) {
+  if (scrub) return;
+  if (pendingTap && t - pendingTap.t > 0.38) pendingTap = null; // window closed, toggle already applied
+  if (!held) {
+    while (t >= nextAdvance) {
+      var at = nextAdvance;
+      curN = wrapN(curN + 1);
+      localStart = at;
+      nextAdvance = at + ADVANCE;
+      landVoice = true;
+    }
+  }
+}
+
+/* ---------- audio (lazy, gesture-only, typeof-guarded) ---------- */
+var actx = null, masterGain = null, noiseBuf = null, nextVoiceT = 0, voiceIdx = 0;
+function ensureAudio() {
+  if (actx) { if (actx.resume) { try { actx.resume(); } catch (e) {} } return; }
+  try {
+    var Ctor = null;
+    if (typeof window !== 'undefined') Ctor = window.AudioContext || window.webkitAudioContext;
+    if (!Ctor) return;
+    actx = new Ctor();
+    masterGain = actx.createGain();
+    masterGain.gain.value = 0.55;
+    masterGain.connect(actx.destination);
+    var len = Math.floor(actx.sampleRate * 1.2);
+    noiseBuf = actx.createBuffer(1, len, actx.sampleRate);
+    var d = noiseBuf.getChannelData(0);
+    var r = mulberry32(884);
+    for (var i = 0; i < len; i++) d[i] = r() * 2 - 1;
+    nextVoiceT = 0;
+  } catch (e) { actx = null; }
+}
+function playBlip(freq, vol) {
+  if (!actx) return;
+  try {
+    var t0 = actx.currentTime;
+    var o = actx.createOscillator(), g = actx.createGain();
+    o.type = 'sine'; o.frequency.value = freq;
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(vol, t0 + 0.015);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.32);
+    o.connect(g); g.connect(masterGain);
+    o.start(t0); o.stop(t0 + 0.36);
+  } catch (e) {}
+}
+function playTick(vol) {
+  if (!actx || !noiseBuf) return;
+  try {
+    var t0 = actx.currentTime;
+    var s = actx.createBufferSource(); s.buffer = noiseBuf;
+    var f = actx.createBiquadFilter(); f.type = 'highpass'; f.frequency.value = 3200;
+    var g = actx.createGain();
+    g.gain.setValueAtTime(vol, t0);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.045);
+    s.connect(f); f.connect(g); g.connect(masterGain);
+    s.start(t0, Math.random() * 0.5); s.stop(t0 + 0.06);
+  } catch (e) {}
+}
+function playWash(baseFreq) {
+  if (!actx || !noiseBuf) return;
+  try {
+    var t0 = actx.currentTime;
+    var s = actx.createBufferSource(); s.buffer = noiseBuf; s.loop = true;
+    var f = actx.createBiquadFilter(); f.type = 'bandpass';
+    f.frequency.value = baseFreq; f.Q.value = 1.1;
+    var g = actx.createGain();
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(0.035, t0 + 0.25);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.95);
+    s.connect(f); f.connect(g); g.connect(masterGain);
+    s.start(t0, Math.random() * 0.4); s.stop(t0 + 1.0);
+  } catch (e) {}
+}
+var VOICE_FAM = ['blip', 'wash', 'tick', 'tick', 'blip', 'wash', 'wash',
+                 'blip', 'tick', 'wash', 'tick', 'blip', 'wash'];
+function playVoice(sys) {
+  var fam = VOICE_FAM[sys];
+  var k = voiceIdx++;
+  if (fam === 'blip') playBlip(190 + ((k * 137) % 5) * 55 + sys * 9, 0.045);
+  else if (fam === 'tick') playTick(0.035);
+  else playWash(500 + ((k * 211) % 4) * 260);
+}
+function audioStep(t, sys) {
+  if (!actx) return;
+  if (landVoice) { landVoice = false; playVoice(sys); nextVoiceT = t + 2.4; return; }
+  if (t >= nextVoiceT) {
+    playVoice(sys);
+    nextVoiceT = t + 2.0 + ((voiceIdx * 37) % 10) * 0.17;
+  }
+}
+
+/* ---------- pointer interaction ---------- */
+function pieceT() {
+  if (typeof performance !== 'undefined' && performance.now) return (performance.now() - T0) / 1000;
+  return frameCount / 60;
+}
+var ptr = null; // {x0,y0,t0,x,y}
+function onDown(x, y) {
+  ensureAudio();
+  var t = pieceT();
+  if (pendingTap) { restoreSnap(pendingTap.snap); pendingTap = null; }
+  ptr = { x0: x, y0: y, t0: t, x: x, y: y };
+  scrub = null;
+}
+function onMove(x, y) {
+  if (!ptr) return;
+  ptr.x = x; ptr.y = y;
+  var t = pieceT();
+  var dx = x - ptr.x0;
+  if (!scrub && Math.abs(dx) > 7) {
+    scrub = { startX: ptr.x0, startN: curN, previewN: curN, previewStart: localStart, lastN: curN };
+  }
+  if (scrub) {
+    var per = Math.max(22, W * 0.055);
+    var steps = Math.round((x - scrub.startX) / per);
+    var n = wrapN(scrub.startN + steps);
+    if (n !== scrub.previewN) {
+      scrub.previewN = n;
+      scrub.previewStart = t; // the sketch under the finger starts playing live
+      playTick(0.03);
+    }
+  }
+}
+function onUp(x, y) {
+  if (!ptr) return;
+  var t = pieceT();
+  var dur = t - ptr.t0;
+  var moved = Math.max(Math.abs(x - ptr.x0), Math.abs(y - ptr.y0));
+  if (scrub) {
+    land(scrub.previewN, t, scrub.previewStart);
+    scrub = null;
+  } else if (dur < 0.35 && moved < 8) {
+    // tap: first tap toggles hold (snapshot kept), second tap inside the
+    // window restores the snapshot and jumps instead.
+    if (pendingTap && t - pendingTap.t < 0.38) {
+      restoreSnap(pendingTap.snap);
+      pendingTap = null;
+      doJump(t);
+    } else {
+      var snap = { held: held, nextAdvance: nextAdvance, holdRemaining: holdRemaining };
+      applyHoldToggle(t);
+      pendingTap = { t: t, snap: snap };
+    }
+  }
+  ptr = null;
+}
+function evtPos(e) {
+  if (e && typeof e.clientX === 'number') return { x: e.clientX, y: e.clientY };
+  if (e && e.touches && e.touches[0]) return { x: e.touches[0].clientX, y: e.touches[0].clientY };
+  if (e && e.changedTouches && e.changedTouches[0]) return { x: e.changedTouches[0].clientX, y: e.changedTouches[0].clientY };
+  return { x: W / 2, y: H / 2 };
+}
+if (canvas.addEventListener) {
+  canvas.addEventListener('pointerdown', function (e) { var p = evtPos(e); if (e.preventDefault) e.preventDefault(); onDown(p.x, p.y); }, { passive: false });
+  canvas.addEventListener('touchstart', function (e) { var p = evtPos(e); if (e.preventDefault) e.preventDefault(); onDown(p.x, p.y); }, { passive: false });
+}
+if (typeof window !== 'undefined' && window.addEventListener) {
+  window.addEventListener('pointermove', function (e) { var p = evtPos(e); onMove(p.x, p.y); }, { passive: true });
+  window.addEventListener('pointerup', function (e) { var p = evtPos(e); onUp(p.x, p.y); }, { passive: true });
+  window.addEventListener('touchmove', function (e) { var p = evtPos(e); onMove(p.x, p.y); }, { passive: true });
+  window.addEventListener('touchend', function (e) { var p = evtPos(e); onUp(p.x, p.y); }, { passive: true });
+}
+
+/* ---------- the twelve systems (+ ghost for 001) ---------- */
+/* R = content rect {x,y,w,h}; lt = sketch-local seconds. All closed-form. */
+
+function drawWaveform(R, lt, P) {
+  var cx = R.x + R.w / 2, cy = R.y + R.h / 2;
+  var k1 = 2 + P() * 3, k2 = 5 + P() * 5, a2 = 0.3 + P() * 0.4, sp = 0.9 + P() * 0.9;
+  ctx.strokeStyle = WHITE; ctx.globalAlpha = 0.07; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(R.x, cy); ctx.lineTo(R.x + R.w, cy); ctx.stroke();
+  for (var pass = 0; pass < 2; pass++) {
+    ctx.globalAlpha = pass === 0 ? 0.22 : 0.9;
+    ctx.lineWidth = pass === 0 ? 2.5 : 1.4;
+    ctx.beginPath();
+    for (var x = 0; x <= R.w; x += 4) {
+      var u = x / R.w;
+      var y = cy + Math.sin(u * Math.PI * 2 * k1 + lt * sp + pass * 1.7) * R.h * 0.22
+                   + Math.sin(u * Math.PI * 2 * k2 - lt * sp * 1.7 + pass) * R.h * 0.22 * a2;
+      if (x === 0) ctx.moveTo(R.x + x, y); else ctx.lineTo(R.x + x, y);
+    }
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawBurst(R, lt, P) {
+  var cx = R.x + R.w / 2 + (P() - 0.5) * R.w * 0.25;
+  var cy = R.y + R.h / 2 + (P() - 0.5) * R.h * 0.25;
+  var T = 3.2 + P() * 2, M = 90, maxR = Math.min(R.w, R.h) * 0.48;
+  ctx.strokeStyle = WHITE; ctx.lineWidth = Math.max(1, U * 0.0022);
+  for (var i = 0; i < M; i++) {
+    var ang = P() * Math.PI * 2, spd = 0.3 + P() * 0.7, ph = P() * 0.4;
+    var p = ((lt / T) + ph) % 1;
+    var r = spd * p * maxR;
+    ctx.globalAlpha = (1 - p) * 0.85;
+    ctx.beginPath();
+    ctx.moveTo(cx + Math.cos(ang) * r * 0.9, cy + Math.sin(ang) * r * 0.9);
+    ctx.lineTo(cx + Math.cos(ang) * r, cy + Math.sin(ang) * r);
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 0.9;
+  ctx.fillStyle = WHITE;
+  ctx.beginPath(); ctx.arc(cx, cy, Math.max(1.5, U * 0.004), 0, Math.PI * 2); ctx.fill();
+  ctx.globalAlpha = 1;
+}
+
+function drawMatrix(R, lt, P) {
+  var cols = 8 + Math.floor(P() * 5);
+  var rows = Math.max(5, Math.round(cols * R.h / R.w));
+  var phase = P() * 6;
+  var cw = R.w / cols, ch = R.h / rows;
+  ctx.fillStyle = WHITE;
+  for (var i = 0; i < cols; i++) {
+    for (var j = 0; j < rows; j++) {
+      var d = (i + j) / (cols + rows);
+      var s = Math.sin(lt * 1.4 - d * 6 + phase);
+      var a = Math.max(0, s); a = a * a * a;
+      ctx.globalAlpha = 0.05 + 0.8 * a;
+      ctx.fillRect(R.x + i * cw + cw * 0.13, R.y + j * ch + ch * 0.13, cw * 0.74, ch * 0.74);
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+/* DUD by design: the pixel field stays sparse and near-static. The lab
+   keeps its failures; this one barely blinks and that is the point. */
+function drawPixel(R, lt, P) {
+  var M = 46, frame = Math.floor(lt * 0.6);
+  ctx.fillStyle = WHITE;
+  for (var i = 0; i < M; i++) {
+    var x = R.x + P() * R.w, y = R.y + P() * R.h;
+    var big = P() < 0.2, sz = big ? 5 : 3;
+    var b = hashN(i, 7, frame + Math.floor(P() * 90));
+    ctx.globalAlpha = b > 0.9 ? 0.85 : 0.055;
+    ctx.fillRect(x, y, sz, sz);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawOsc(R, lt, P) {
+  var ratios = [[2, 3], [3, 4], [3, 5], [4, 5], [5, 6]];
+  var rr = ratios[Math.floor(P() * ratios.length)];
+  var delta = Math.PI / 2 * (0.4 + P() * 0.6);
+  var cx = R.x + R.w / 2, cy = R.y + R.h / 2;
+  var ax = R.w * 0.36, ay = R.h * 0.36, J = 150;
+  var pts = [];
+  for (var j = 0; j <= J; j++) {
+    var phi = lt * 0.9 - j * 0.045;
+    pts.push([cx + Math.sin(rr[0] * phi + delta) * ax, cy + Math.sin(rr[1] * phi) * ay]);
+  }
+  ctx.strokeStyle = WHITE; ctx.lineJoin = 'round';
+  ctx.globalAlpha = 0.16; ctx.lineWidth = 3;
+  ctx.beginPath();
+  for (var a = 0; a < pts.length; a++) { if (a === 0) ctx.moveTo(pts[a][0], pts[a][1]); else ctx.lineTo(pts[a][0], pts[a][1]); }
+  ctx.stroke();
+  ctx.globalAlpha = 0.85; ctx.lineWidth = 1.4;
+  ctx.beginPath();
+  for (var b = 0; b < 44 && b < pts.length; b++) { if (b === 0) ctx.moveTo(pts[b][0], pts[b][1]); else ctx.lineTo(pts[b][0], pts[b][1]); }
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = WHITE;
+  ctx.beginPath(); ctx.arc(pts[0][0], pts[0][1], Math.max(1.6, U * 0.004), 0, Math.PI * 2); ctx.fill();
+}
+
+/* Boids-mini as a closed-form flock: an analytic wandering centroid with
+   per-bird orbital offsets. No simulation state, so any lt is exact. */
+function flockPos(P0, R, lt, i, out) {
+  var rng = mulberry32(P0 + i * 131);
+  var ph1 = rng() * 6.28, ph2 = rng() * 6.28;
+  var rad = Math.min(R.w, R.h) * (0.03 + rng() * 0.17);
+  var wob = (0.4 + rng() * 0.8) * (rng() < 0.3 ? -1 : 1);
+  var ph = rng() * 6.28;
+  var gx = R.x + R.w / 2 + Math.sin(lt * 0.13 + ph1) * R.w * 0.22;
+  var gy = R.y + R.h / 2 + Math.sin(lt * 0.17 + ph2) * R.h * 0.2;
+  out.x = gx + Math.cos(wob * lt + ph) * rad * 1.35;
+  out.y = gy + Math.sin(wob * lt + ph) * rad * 0.8;
+}
+function drawFlock(R, lt, P) {
+  var seedBase = Math.floor(P() * 100000);
+  var M = 26, s = Math.min(R.w, R.h) * 0.013 * (PHONE ? 1.3 : 1);
+  var a = { x: 0, y: 0 }, b = { x: 0, y: 0 };
+  ctx.fillStyle = WHITE; ctx.globalAlpha = 0.85;
+  for (var i = 0; i < M; i++) {
+    flockPos(seedBase, R, lt, i, a);
+    flockPos(seedBase, R, lt + 0.045, i, b);
+    var dx = b.x - a.x, dy = b.y - a.y, m = Math.sqrt(dx * dx + dy * dy) || 1;
+    dx /= m; dy /= m;
+    var px = -dy, py = dx;
+    ctx.beginPath();
+    ctx.moveTo(a.x + dx * s * 1.7, a.y + dy * s * 1.7);
+    ctx.lineTo(a.x + px * s * 0.7, a.y + py * s * 0.7);
+    ctx.lineTo(a.x - px * s * 0.7, a.y - py * s * 0.7);
+    ctx.closePath(); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawNoise(R, lt, P) {
+  var seedOff = Math.floor(P() * 500);
+  var cell = Math.max(8, Math.min(R.w, R.h) / 22);
+  var cols = Math.ceil(R.w / cell), rows = Math.ceil(R.h / cell);
+  var frame = Math.floor(lt * 3);
+  ctx.fillStyle = WHITE;
+  for (var i = 0; i < cols; i++) {
+    for (var j = 0; j < rows; j++) {
+      var v = hashN(i, j, frame + seedOff);
+      if (v > 0.45) {
+        ctx.globalAlpha = Math.min(0.9, (v - 0.45) * 1.5);
+        ctx.fillRect(R.x + i * cell, R.y + j * cell, cell - 1, cell - 1);
+      }
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawPulse(R, lt, P) {
+  var cx = R.x + R.w / 2 + (P() - 0.5) * R.w * 0.2;
+  var cy = R.y + R.h / 2 + (P() - 0.5) * R.h * 0.2;
+  var rate = 0.22 * (0.8 + P() * 0.4), K = 4, maxR = Math.min(R.w, R.h) * 0.52;
+  ctx.strokeStyle = WHITE; ctx.lineWidth = Math.max(1, U * 0.003);
+  for (var i = 0; i < K; i++) {
+    var f = ((lt * rate) + i / K) % 1;
+    ctx.globalAlpha = (1 - f) * 0.75;
+    ctx.beginPath(); ctx.arc(cx, cy, Math.max(0.5, f * maxR), 0, Math.PI * 2); ctx.stroke();
+  }
+  ctx.globalAlpha = 0.5 + 0.4 * Math.sin(lt * 2.2);
+  ctx.fillStyle = WHITE;
+  ctx.beginPath(); ctx.arc(cx, cy, Math.max(1.6, U * 0.005), 0, Math.PI * 2); ctx.fill();
+  ctx.globalAlpha = 1;
+}
+
+/* DUD by design: a plain dot grid with one slow diagonal sweep. Nothing
+   else happens in it, on purpose. The lab does not apologise for it. */
+function drawDots(R, lt, P) {
+  var cols = 16, rows = 12;
+  var cw = R.w / cols, ch = R.h / rows;
+  var sweep = ((lt * 1.5) % (cols + rows + 6)) - 3;
+  ctx.fillStyle = WHITE;
+  for (var i = 0; i < cols; i++) {
+    for (var j = 0; j < rows; j++) {
+      var near = Math.abs((i + j) - sweep);
+      ctx.globalAlpha = near < 1.2 ? 0.85 : 0.13;
+      ctx.beginPath();
+      ctx.arc(R.x + (i + 0.5) * cw, R.y + (j + 0.5) * ch, Math.max(1.2, U * 0.0032), 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawStorm(R, lt, P) {
+  var M = 110;
+  ctx.strokeStyle = WHITE; ctx.lineWidth = Math.max(1, U * 0.002);
+  for (var i = 0; i < M; i++) {
+    var x = R.x + P() * R.w, y = R.y + P() * R.h;
+    var base = P() * Math.PI * 2, lr = 0.02 + P() * 0.05, pa = 0.3 + P() * 0.5;
+    var ang = base + Math.sin(lt * 1.3 + i * 1.7) * 0.7;
+    var len = Math.min(R.w, R.h) * lr;
+    var jx = Math.sin(lt * 2.1 + i) * 3, jy = Math.cos(lt * 1.7 + i * 1.3) * 3;
+    ctx.globalAlpha = pa + 0.3 * (0.5 + 0.5 * Math.sin(lt * 3 + i * 2.3));
+    ctx.beginPath();
+    ctx.moveTo(x + jx - Math.cos(ang) * len / 2, y + jy - Math.sin(ang) * len / 2);
+    ctx.lineTo(x + jx + Math.cos(ang) * len / 2, y + jy + Math.sin(ang) * len / 2);
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+}
+
+/* Feedback box, emulated analytically: nested rotated squares with
+   decaying alpha. True canvas self-feedback would need accumulated frame
+   state, which the determinism gate forbids; the nesting reads the same. */
+function drawFeedback(R, lt, P) {
+  var cx = R.x + R.w / 2, cy = R.y + R.h / 2;
+  var half = Math.min(R.w, R.h) * 0.46, K = 16;
+  var dir = P() < 0.5 ? 1 : -1, twist = 0.6 + P() * 0.6;
+  ctx.strokeStyle = WHITE; ctx.lineWidth = Math.max(1, U * 0.002);
+  for (var i = 0; i < K; i++) {
+    var f = i / K, sc = 1 - f * 0.88, rot = lt * 0.07 * dir + f * twist * dir;
+    var s = half * sc, co = Math.cos(rot), si = Math.sin(rot);
+    ctx.globalAlpha = 0.08 + 0.7 * (1 - f);
+    ctx.beginPath();
+    var corners = [[-1, -1], [1, -1], [1, 1], [-1, 1]];
+    for (var c = 0; c < 4; c++) {
+      var px = cx + (corners[c][0] * co - corners[c][1] * si) * s;
+      var py = cy + (corners[c][0] * si + corners[c][1] * co) * s;
+      if (c === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.closePath(); ctx.stroke();
+  }
+  ctx.globalAlpha = 0.5; ctx.fillStyle = WHITE;
+  var s0 = half * 0.1;
+  ctx.fillRect(cx - s0 / 2, cy - s0 / 2, s0, s0);
+  ctx.globalAlpha = 1;
+}
+
+function drawStack(R, lt, P) {
+  var rows = 13, rowPh = P() * 6;
+  ctx.strokeStyle = WHITE; ctx.lineWidth = 1.4;
+  for (var j = 0; j < rows; j++) {
+    var yB = R.y + R.h * (j + 0.5) / rows;
+    var amp = (R.h / rows) * (0.3 + 0.28 * Math.sin(rowPh + j * 1.3));
+    var fr = 1.5 + (j % 4) * 0.5;
+    ctx.globalAlpha = 0.25 + 0.55 * (j / (rows - 1));
+    ctx.beginPath();
+    for (var x = 0; x <= R.w; x += 6) {
+      var y = yB + Math.sin((x / R.w) * Math.PI * 2 * fr + lt * (0.6 + 0.18 * j) + j * 0.7) * amp;
+      if (x === 0) ctx.moveTo(R.x + x, y); else ctx.lineTo(R.x + x, y);
+    }
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+}
+
+/* 001 "superposition": every dot is a smear of ghost positions around a
+   home point, shimmering and never settling. Drawn with a pre-roll so
+   frame one is already mid-shimmer. */
+function drawGhost(R, lt, P) {
+  var M = 80;
+  ctx.fillStyle = WHITE;
+  for (var i = 0; i < M; i++) {
+    var hx = R.x + ((P() + P() + P()) / 3) * R.w;
+    var hy = R.y + ((P() + P() + P()) / 3) * R.h;
+    var orad = Math.min(R.w, R.h) * (0.008 + P() * 0.03);
+    var asp = (0.3 + P() * 1.2) * (P() < 0.5 ? -1 : 1);
+    var ph = P() * Math.PI * 2;
+    var mx = hx + Math.cos(ph + lt * 0.11) * orad * 0.7;
+    var my = hy + Math.sin(ph * 1.3 + lt * 0.09) * orad * 0.7;
+    for (var g = 0; g < 4; g++) {
+      var ga = ph + g * 1.7 + asp * lt;
+      ctx.globalAlpha = 0.1;
+      ctx.beginPath();
+      ctx.arc(mx + Math.cos(ga) * orad, my + Math.sin(ga) * orad, Math.max(1.4, U * 0.0032), 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 0.32;
+    ctx.beginPath();
+    ctx.arc(mx, my, Math.max(1, U * 0.002), 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+var SYSTEMS = [drawWaveform, drawBurst, drawMatrix, drawPixel, drawOsc,
+               drawFlock, drawNoise, drawPulse, drawDots, drawStorm,
+               drawFeedback, drawStack, drawGhost];
+
+/* ---------- chrome: number + title (top), progress rail (bottom) ---------- */
+function drawChrome(n) {
+  var fs = Math.max(13, Math.round(U * 0.034));
+  ctx.fillStyle = AMBER;
+  ctx.font = '700 ' + fs + 'px ui-monospace, Menlo, Consolas, monospace';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillText(pad3(n) + ' ' + titleFor(n), W * 0.05, H * 0.066);
+  var rx = W * 0.05, rw = W * 0.9, ry = H * 0.955;
+  ctx.strokeStyle = WHITE; ctx.globalAlpha = 0.25; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(rx, ry); ctx.lineTo(rx + rw, ry); ctx.stroke();
+  ctx.globalAlpha = 0.18;
+  ctx.beginPath();
+  for (var i = 0; i < TOTAL; i++) {
+    var tx = rx + rw * i / (TOTAL - 1);
+    ctx.moveTo(tx, ry - 2); ctx.lineTo(tx, ry + 2);
+  }
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+  var mx = rx + rw * (n - 1) / (TOTAL - 1);
+  ctx.fillStyle = AMBER;
+  ctx.globalAlpha = 0.25;
+  ctx.beginPath(); ctx.arc(mx, ry, 7, 0, Math.PI * 2); ctx.fill();
+  ctx.globalAlpha = 1;
+  ctx.beginPath(); ctx.arc(mx, ry, 3.4, 0, Math.PI * 2); ctx.fill();
+}
+
+/* ---------- main draw ---------- */
+function draw(t) {
+  fit();
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  if (!scrub) updateNav(t);
+  var n, lt;
+  if (scrub) { n = scrub.previewN; lt = t - scrub.previewStart; }
+  else { n = curN; lt = t - localStart; }
+  ctx.fillStyle = BG;
+  ctx.fillRect(0, 0, W, H);
+  var R = { x: W * 0.05, y: H * 0.11, w: W * 0.9, h: H * 0.8 };
+  var sys = sysFor(n);
+  var drawLt = (n === 1) ? lt + PREROLL_001 : lt;
+  SYSTEMS[sys](R, drawLt, sysParams(n));
+  drawChrome(n);
+  audioStep(t, sys);
+}
+
+var T0 = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+var frameCount = 0;
+draw(0);
+if (typeof requestAnimationFrame === 'function') {
+  var loop = function () {
+    frameCount++;
+    draw(pieceT());
+    requestAnimationFrame(loop);
+  };
+  requestAnimationFrame(loop);
+}
+</script>
+</body>
+</html>

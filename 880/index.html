@@ -1,0 +1,519 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Murmuration</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #000000; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- Palette (strict, monochrome) ----------
+  var BLACK = '#000000';
+  var WHITE = '#FFFFFF';
+
+  // ---------- Seeded RNG (mulberry32) ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  var W = 0, H = 0, U = 0; // U = min dimension, in px; sim units are U-sized
+  var isPhone = false;
+
+  function detectPhone(w, h) {
+    var sw = (window.screen && window.screen.width) || w;
+    var sh = (window.screen && window.screen.height) || h;
+    if (Math.min(sw, sh) < 700) return true;
+    return h > w * 1.15;
+  }
+
+  function resize() {
+    var vv = window.visualViewport;
+    var w = vv ? vv.width : window.innerWidth;
+    var h = vv ? vv.height : window.innerHeight;
+    W = w; H = h; U = Math.min(w, h);
+    canvas.width = w; canvas.height = h;
+    isPhone = detectPhone(w, h);
+  }
+
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { resize(); draw(simT); });
+  }
+  window.addEventListener('resize', function () { resize(); draw(simT); });
+
+  // ---------- Simulation space ----------
+  // Sim coordinates: x in [0, SW], y in [0, SH], where 1 unit = U px.
+  var SW = 1, SH = 1;
+  var DT = 1 / 60;
+
+  function wrapDelta(d, span) {
+    if (d > span / 2) return d - span;
+    if (d < -span / 2) return d + span;
+    return d;
+  }
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+  function lerp(a, b, t) { return a + (b - a) * t; }
+
+  // ---------- Phase machine ----------
+  // A pure function of phaseT (plus recorded locks): three 24 s phases,
+  // weights blend over the first 3 s of each phase segment.
+  var PHASE_LEN = 24, BLEND = 3;
+  var PHASE_NAMES = ['SCATTER', 'VORTEX', 'MURMURATION'];
+
+  function phaseWeights(phaseT) {
+    var cyc = PHASE_LEN * 3;
+    var c = ((phaseT % cyc) + cyc) % cyc;
+    var seg = Math.floor(c / PHASE_LEN);       // 0 scatter, 1 vortex, 2 murmuration
+    var frac = c - seg * PHASE_LEN;
+    var w = [0, 0, 0];
+    if (frac < BLEND) {
+      var prev = (seg + 2) % 3;
+      var k = frac / BLEND;
+      k = k * k * (3 - 2 * k); // smoothstep
+      w[prev] = 1 - k;
+      w[seg] = k;
+    } else {
+      w[seg] = 1;
+    }
+    return { w: w, seg: seg };
+  }
+
+  // ---------- Flock state ----------
+  var BASE_SEED = 880041;
+  var boids = [];        // {x,y,vx,vy, ph (wander phase), wr (wander rate), seed}
+  var simT = 0;          // simulation clock, fixed-step driven
+  var phaseT = 0;        // phase clock; advances with simT unless locked
+  var locked = false;
+  var pulses = [];       // recorded tap pulses {x, y, t}
+  var N_DESKTOP = 380, N_PHONE = 220;
+
+  // User attractor state
+  var dragging = false;
+  var ptrX = 0, ptrY = 0;         // sim units
+  var ptrSpeed = 0;               // smoothed pointer speed, U/s
+  var uStr = 0;                   // user attractor strength 0..1
+
+  function seedFlock(seed) {
+    var rng = mulberry32(seed);
+    var n = isPhone ? N_PHONE : N_DESKTOP;
+    boids = [];
+    pulses = [];
+    var STREAMS = 5;
+    var streams = [];
+    for (var s = 0; s < STREAMS; s++) {
+      var ang = (rng() - 0.5) * 1.1 + (s % 2 === 0 ? 0.12 : -0.18);
+      streams.push({
+        cx: (0.15 + 0.7 * rng()) * SW,
+        cy: (0.12 + 0.76 * rng()) * SH,
+        dx: Math.cos(ang), dy: Math.sin(ang),
+        spd: 0.16 + rng() * 0.10
+      });
+    }
+    for (var i = 0; i < n; i++) {
+      var st = streams[i % STREAMS];
+      var along = (rng() - 0.5) * 1.15;
+      var side = (rng() - 0.5) * 0.20;
+      var x = st.cx + st.dx * along - st.dy * side;
+      var y = st.cy + st.dy * along + st.dx * side;
+      x = ((x % SW) + SW) % SW;
+      y = ((y % SH) + SH) % SH;
+      var sp = st.spd * (0.8 + rng() * 0.45);
+      boids.push({
+        x: x, y: y,
+        vx: st.dx * sp + (rng() - 0.5) * 0.05,
+        vy: st.dy * sp + (rng() - 0.5) * 0.05,
+        ph: rng() * Math.PI * 2,
+        wr: 0.25 + rng() * 0.5,
+        seed: rng()
+      });
+    }
+  }
+
+  // ---------- Boids step (fixed timestep) ----------
+  var PERC = 0.085, PERC2 = PERC * PERC, SEP_R = 0.034, SEP2 = SEP_R * SEP_R;
+
+  function step(dt, t) {
+    if (!locked) phaseT += dt;
+    var pw = phaseWeights(phaseT);
+    var wS = pw.w[0], wV = pw.w[1], wM = pw.w[2];
+
+    // User attractor strength envelope
+    if (dragging) uStr = Math.min(1, uStr + dt / 0.25);
+    else if (uStr > 0) uStr = Math.max(0, uStr - dt / 2);
+
+    // Phase attractor points
+    var cx = SW / 2, cy = SH / 2;
+    var le = phaseT * (Math.PI * 2 / 40); // figure-eight clock, 40 s loop
+    var mx = cx + Math.sin(le) * SW * 0.24;
+    var my = cy + Math.sin(le * 2) * SH * 0.15;
+    var mvx = Math.cos(le) * SW * 0.24 * (Math.PI * 2 / 40);
+    var mvy = Math.cos(le * 2) * SH * 0.15 * (Math.PI * 2 / 40) * 2;
+
+    // Blended flock parameters
+    var cohW = 0.35 * wS + 0.90 * wV + 1.35 * wM;
+    var aliW = 0.80 * wS + 1.00 * wV + 1.60 * wM;
+    var wanW = 0.90 * wS + 0.15 * wV + 0.30 * wM;
+    var maxSp = 0.30 * wS + 0.44 * wV + 0.40 * wM;
+    var minSp = 0.10;
+
+    // Orbit radius for the user well: fast drag = tight, slow = wide
+    var speedK = clamp(ptrSpeed / 1.1, 0, 1);
+    var orbitR = lerp(0.30, 0.07, speedK);
+
+    var i, j, b, o;
+    var n = boids.length;
+    for (i = 0; i < n; i++) {
+      b = boids[i];
+      var cnt = 0, sepCnt = 0;
+      var ax = 0, ay = 0;         // alignment sum
+      var gx = 0, gy = 0;         // cohesion sum
+      var sx = 0, sy = 0;         // separation sum
+      for (j = 0; j < n; j++) {
+        if (j === i) continue;
+        o = boids[j];
+        var dx = wrapDelta(o.x - b.x, SW);
+        var dy = wrapDelta(o.y - b.y, SH);
+        var d2 = dx * dx + dy * dy;
+        if (d2 < PERC2 && d2 > 1e-9) {
+          cnt++;
+          ax += o.vx; ay += o.vy;
+          gx += dx; gy += dy;
+          if (d2 < SEP2) {
+            var inv = 1 / d2;
+            sx -= dx * inv; sy -= dy * inv;
+            sepCnt++;
+          }
+        }
+      }
+      var fx = 0, fy = 0;
+      if (cnt > 0) {
+        // alignment: steer toward mean velocity
+        var mvx2 = ax / cnt, mvy2 = ay / cnt;
+        var msp = Math.sqrt(mvx2 * mvx2 + mvy2 * mvy2) || 1;
+        fx += (mvx2 / msp * maxSp - b.vx) * aliW;
+        fy += (mvy2 / msp * maxSp - b.vy) * aliW;
+        // cohesion: steer toward local centre
+        fx += (gx / cnt) * cohW * 2.2;
+        fy += (gy / cnt) * cohW * 2.2;
+      }
+      if (sepCnt > 0) { fx += sx * 1.4; fy += sy * 1.4; }
+
+      // wander (per-boid seeded rotation)
+      var wa = b.ph + t * b.wr * Math.PI * 2;
+      fx += Math.cos(wa) * wanW * 0.55;
+      fy += Math.sin(wa * 1.13) * wanW * 0.55;
+
+      // gentle global flow, keeps scatter streams coherent
+      var fl = 0.35 * Math.sin(1.9 * b.y + 0.31 * t) + 0.9;
+      fx += Math.cos(fl) * wS * 0.10;
+      fy += Math.sin(fl) * wS * 0.10;
+
+      // phase attractors, scaled down as the user well takes over
+      var auto = 1 - uStr;
+      if (wV > 0.003) {
+        var vdx = wrapDelta(cx - b.x, SW), vdy = wrapDelta(cy - b.y, SH);
+        // anisotropic spring: weaker in y, so the cluster elongates vertically
+        fx += (vdx * 3.4 + (-vdy) * 1.5) * wV * auto;
+        fy += (vdy * 1.5 + (vdx) * 1.5) * wV * auto;
+      }
+      if (wM > 0.003) {
+        var mdx = wrapDelta(mx - b.x, SW), mdy = wrapDelta(my - b.y, SH);
+        fx += (mdx * 2.4 + mvx * 0.55) * wM * auto;
+        fy += (mdy * 2.4 + mvy * 0.55) * wM * auto;
+      }
+
+      // user attractor: spring to an orbit ring + tangential swirl
+      if (uStr > 0.003) {
+        var udx = wrapDelta(ptrX - b.x, SW), udy = wrapDelta(ptrY - b.y, SH);
+        var ud = Math.sqrt(udx * udx + udy * udy) || 1e-4;
+        var ux = udx / ud, uy = udy / ud;
+        var radial = (ud - orbitR) * 5.0;
+        fx += (ux * radial + (-uy) * 1.9) * uStr;
+        fy += (uy * radial + (ux) * 1.9) * uStr;
+      }
+
+      // tap pulses: radial shockwave, 1.1 s envelope
+      for (var p = 0; p < pulses.length; p++) {
+        var pu = pulses[p];
+        var age = t - pu.t;
+        if (age < 0 || age > 1.1) continue;
+        var pdx = wrapDelta(b.x - pu.x, SW), pdy = wrapDelta(b.y - pu.y, SH);
+        var pd = Math.sqrt(pdx * pdx + pdy * pdy) || 1e-4;
+        var front = age * 0.85;
+        var band = Math.exp(-Math.pow((pd - front) * 4.5, 2));
+        var amp = band * (1 - age / 1.1) * 3.2;
+        fx += (pdx / pd) * amp;
+        fy += (pdy / pd) * amp;
+      }
+
+      b.vx += fx * dt;
+      b.vy += fy * dt;
+      var spd = Math.sqrt(b.vx * b.vx + b.vy * b.vy) || 1e-4;
+      if (spd > maxSp) { b.vx = b.vx / spd * maxSp; b.vy = b.vy / spd * maxSp; }
+      else if (spd < minSp) { b.vx = b.vx / spd * minSp; b.vy = b.vy / spd * minSp; }
+      b.x += b.vx * dt;
+      b.y += b.vy * dt;
+      b.x = ((b.x % SW) + SW) % SW;
+      b.y = ((b.y % SH) + SH) % SH;
+    }
+    // prune dead pulses
+    for (var q = pulses.length - 1; q >= 0; q--) {
+      if (t - pulses[q].t > 1.2) pulses.splice(q, 1);
+    }
+  }
+
+  // ---------- Draw ----------
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.fillStyle = BLACK;
+    ctx.fillRect(0, 0, W, H);
+
+    var pw = phaseWeights(phaseT);
+    var maxSp = 0.30 * pw.w[0] + 0.44 * pw.w[1] + 0.40 * pw.w[2];
+    var len = U * 0.016, wid = U * 0.0062;
+
+    ctx.fillStyle = WHITE;
+    for (var i = 0; i < boids.length; i++) {
+      var b = boids[i];
+      var px = b.x * U, py = b.y * U;
+      var spd = Math.sqrt(b.vx * b.vx + b.vy * b.vy) || 1e-4;
+      var ux = b.vx / spd, uy = b.vy / spd;
+      var a = 0.30 + 0.70 * clamp(spd / (maxSp || 1), 0, 1);
+      ctx.globalAlpha = a;
+      ctx.beginPath();
+      ctx.moveTo(px + ux * len, py + uy * len);
+      ctx.lineTo(px - ux * len * 0.7 - uy * wid, py - uy * len * 0.7 + ux * wid);
+      ctx.lineTo(px - ux * len * 0.7 + uy * wid, py - uy * len * 0.7 - ux * wid);
+      ctx.closePath();
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // phase readout, bottom edge, quiet
+    ctx.globalAlpha = 0.55;
+    ctx.fillStyle = WHITE;
+    ctx.font = '600 ' + Math.max(10, Math.round(U * 0.017)) + 'px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillText(PHASE_NAMES[pw.seg], W / 2, H - Math.max(10, U * 0.022));
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- Audio (lazy, gesture-gated, guarded) ----------
+  var AC = (typeof window !== 'undefined') ? (window.AudioContext || window.webkitAudioContext) : null;
+  var actx = null, bedGain = null, sweepOsc = null, sweepGain = null;
+  var humOsc = null, humGain = null, aRng = null, nextEvent = 0;
+
+  function initAudio() {
+    if (!AC || actx) return;
+    try {
+      actx = new AC();
+      aRng = mulberry32(8807);
+      var master = actx.createGain();
+      master.gain.value = 0.9;
+      master.connect(actx.destination);
+
+      // airy noise bed
+      var lenS = actx.sampleRate * 2;
+      var buf = actx.createBuffer(1, lenS, actx.sampleRate);
+      var d = buf.getChannelData(0);
+      for (var i = 0; i < lenS; i++) d[i] = Math.random() * 2 - 1;
+      var src = actx.createBufferSource();
+      src.buffer = buf; src.loop = true;
+      var bp = actx.createBiquadFilter();
+      bp.type = 'bandpass'; bp.frequency.value = 900; bp.Q.value = 0.6;
+      bedGain = actx.createGain(); bedGain.gain.value = 0.035;
+      src.connect(bp); bp.connect(bedGain); bedGain.connect(master);
+      src.start();
+
+      // vortex sweep voice
+      sweepOsc = actx.createOscillator();
+      sweepOsc.type = 'sine'; sweepOsc.frequency.value = 160;
+      var swFilter = actx.createBiquadFilter();
+      swFilter.type = 'lowpass'; swFilter.frequency.value = 1200;
+      sweepGain = actx.createGain(); sweepGain.gain.value = 0;
+      sweepOsc.connect(swFilter); swFilter.connect(sweepGain); sweepGain.connect(master);
+      sweepOsc.start();
+
+      // drag hum
+      humOsc = actx.createOscillator();
+      humOsc.type = 'sine'; humOsc.frequency.value = 55;
+      humGain = actx.createGain(); humGain.gain.value = 0;
+      humOsc.connect(humGain); humGain.connect(master);
+      humOsc.start();
+
+      actx._master = master;
+      actx._noiseBuf = buf;
+      nextEvent = actx.currentTime + 0.4;
+    } catch (e) { actx = null; }
+  }
+
+  function blip(freq, dur, gain, type) {
+    var o = actx.createOscillator();
+    o.type = type || 'sine'; o.frequency.value = freq;
+    var g = actx.createGain();
+    var now = actx.currentTime;
+    g.gain.setValueAtTime(0, now);
+    g.gain.linearRampToValueAtTime(gain, now + 0.008);
+    g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+    o.connect(g); g.connect(actx._master);
+    o.start(now); o.stop(now + dur + 0.05);
+  }
+
+  function grain(dur, gain) {
+    var s = actx.createBufferSource();
+    s.buffer = actx._noiseBuf;
+    s.playbackRate.value = 0.8 + aRng() * 0.5;
+    var bp = actx.createBiquadFilter();
+    bp.type = 'bandpass'; bp.frequency.value = 2600 + aRng() * 1600; bp.Q.value = 2.5;
+    var g = actx.createGain();
+    var now = actx.currentTime;
+    g.gain.setValueAtTime(gain, now);
+    g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+    s.connect(bp); bp.connect(g); g.connect(actx._master);
+    s.start(now, aRng() * 1.5, dur + 0.05);
+  }
+
+  function audioFrame() {
+    if (!actx) return;
+    var pw = phaseWeights(phaseT);
+    var now = actx.currentTime;
+    var segFrac = ((phaseT % (PHASE_LEN * 3)) / PHASE_LEN) % 1;
+    if (sweepGain) {
+      sweepOsc.frequency.setTargetAtTime(150 + 380 * segFrac, now, 0.1);
+      sweepGain.gain.setTargetAtTime(0.045 * pw.w[1], now, 0.15);
+    }
+    if (humGain) {
+      humOsc.frequency.setTargetAtTime(50 + ptrSpeed * 85, now, 0.08);
+      humGain.gain.setTargetAtTime(0.11 * uStr, now, 0.1);
+    }
+    if (bedGain) bedGain.gain.setTargetAtTime(0.03 + 0.02 * pw.w[2], now, 0.2);
+    if (now >= nextEvent) {
+      if (pw.w[0] > 0.55) {          // SCATTER: sparse high ticks
+        blip(2200 + aRng() * 2200, 0.06, 0.045, 'sine');
+        nextEvent = now + 0.3 + aRng() * 1.1;
+      } else if (pw.w[2] > 0.55) {   // MURMURATION: dense shimmering grains
+        grain(0.05, 0.05);
+        nextEvent = now + 0.05 + aRng() * 0.13;
+      } else {                        // VORTEX: sweep carries it; rare tick
+        nextEvent = now + 0.8 + aRng() * 1.2;
+      }
+    }
+  }
+
+  // ---------- Input ----------
+  function toLocal(e) {
+    var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    return { x: (e.clientX - r.left) / U, y: (e.clientY - r.top) / U };
+  }
+
+  var downT = 0, downX = 0, downY = 0, lastPX = 0, lastPY = 0, lastPT = 0, moved = false;
+  var pendingTap = null;
+
+  function doPulse(x, y) {
+    pulses.push({ x: x, y: y, t: simT });
+    if (pulses.length > 6) pulses.shift();
+  }
+
+  function toggleLock() {
+    locked = !locked;
+    if (locked) {
+      // snap to the middle of the current phase segment so the hold is pure
+      var segStart = Math.floor(phaseT / PHASE_LEN) * PHASE_LEN;
+      phaseT = segStart + PHASE_LEN / 2;
+    }
+  }
+
+  canvas.addEventListener('pointerdown', function (e) {
+    initAudio();
+    if (actx && actx.state === 'suspended' && actx.resume) actx.resume();
+    var p = toLocal(e);
+    dragging = true; moved = false;
+    downT = simT; downX = p.x; downY = p.y;
+    lastPX = p.x; lastPY = p.y; lastPT = performance.now();
+    ptrX = p.x; ptrY = p.y; ptrSpeed = 0;
+    if (canvas.setPointerCapture && e.pointerId !== undefined) {
+      try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+    }
+  });
+
+  canvas.addEventListener('pointermove', function (e) {
+    if (!dragging) return;
+    var p = toLocal(e);
+    var now = performance.now();
+    var dtm = Math.max(1, now - lastPT) / 1000;
+    var ddx = wrapDelta(p.x - lastPX, SW), ddy = wrapDelta(p.y - lastPY, SH);
+    var inst = Math.sqrt(ddx * ddx + ddy * ddy) / dtm;
+    ptrSpeed = ptrSpeed * 0.65 + inst * 0.35;
+    if (Math.abs(p.x - downX) > 0.02 || Math.abs(p.y - downY) > 0.02) moved = true;
+    ptrX = p.x; ptrY = p.y;
+    lastPX = p.x; lastPY = p.y; lastPT = now;
+  });
+
+  function endPointer(e) {
+    if (!dragging) return;
+    dragging = false;
+    var p = e ? toLocal(e) : { x: lastPX, y: lastPY };
+    var quick = (simT - downT) < 0.35;
+    if (!moved && quick) {
+      if (pendingTap) {
+        pendingTap = null;
+        toggleLock();
+      } else {
+        var pt = { x: p.x, y: p.y };
+        pendingTap = pt;
+        setTimeout(function () {
+          if (pendingTap === pt) { pendingTap = null; doPulse(pt.x, pt.y); }
+        }, 260);
+      }
+    }
+  }
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', function () { dragging = false; });
+
+  // ---------- Boot + main loop ----------
+  resize();
+  SW = W / U; SH = H / U;
+  seedFlock(BASE_SEED);
+  draw(0);
+
+  if (typeof requestAnimationFrame === 'function') {
+    var lastNow = null, acc = 0;
+    var frame = function (now) {
+      if (lastNow === null) lastNow = now;
+      var elapsed = (now - lastNow) / 1000;
+      lastNow = now;
+      if (elapsed > 0.25) elapsed = 0.25;
+      acc += elapsed;
+      while (acc >= DT) {
+        simT += DT;
+        step(DT, simT);
+        if (!dragging && ptrSpeed > 0) ptrSpeed = Math.max(0, ptrSpeed - DT * 1.5);
+        acc -= DT;
+      }
+      audioFrame();
+      draw(simT);
+      requestAnimationFrame(frame);
+    };
+    requestAnimationFrame(frame);
+  }
+})();
+</script>
+</body>
+</html>
