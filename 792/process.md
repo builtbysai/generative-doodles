@@ -1,0 +1,28 @@
+# No.792 "Thirty Centimeters"
+
+EXPANSION #97 niele-toroni, prompt block PP1. The canonical Toroni: imprints of one No. 50 brush repeated at regular intervals, nothing else, since 1966.
+
+## Concept
+
+A warm-white ground (#ECE8DE) carries a sparse 4x4 field of cobalt (#2B5FA6) brush imprints in a brick-offset lattice: alternate rows shifted half a step. The interval is mechanically exact and is never jittered; the hand lives only inside each imprint's texture (rotation, scale, paint load, bristle streaks). Imprints cover roughly a tenth of the frame, floating on a vast ground, as in the sparse Van Ham canvas. Watch-only: the field stamps itself in, holds, dissolves back to fresh ground, and stamps again with a subtly different hand.
+
+## Construction
+
+- Lattice: pitch P = min(frame width, height) / 5.4; dab size = P/2. Even rows sit at column offsets (c - 1.75) * P, odd rows at (c - 1.25) * P, which centers the offset field's bounding box on the frame center. Positions are pure functions of the frame; no placement randomness exists anywhere in the piece.
+- Imprint texture: each imprint is precomputed seeded data (mulberry32). The dab body is solid paint: a squarish block drawn as 12 horizontal bands at alpha 0.9 to 1.0, at full density through the upper two-thirds where the brush pressed, easing to just over half density at the bottom band where it lifted. Inside the body, 26 to 38 cobalt ridges add density and 18 to 27 thin ground-coloured gaps score the separations between bristle bundles; both run from the top edge downward in three stacked segments with alpha multipliers 1.0 / 0.62 / 0.35. A further 8 to 12 short, denser load strokes sit at the very top edge. Per-imprint jitter: rotation within +-2 degrees, scale within +-5 percent, alpha within +-10 percent.
+- Variants: three full fields are precomputed from three seeds (792001, 799920, 807839). Layout is identical across variants; only the texture jitter differs. The variant advances once per 30 s loop, so the piece repeats exactly every 90 s.
+- Motion: a seamless 30 s loop, all closed-form in the phase. Imprints stamp in row-major, one every 0.35 s; each press takes 0.2 s (alpha 0 to 1, scale 1.06 to 1.0, ease-out). The last stamp lands at 5.45 s; the field holds, then cross-fades to fresh ground between 26 s and 29.5 s, leaving a blank breath before the next cycle stamps its variant.
+- Frame one phase choice: the loop is drawn at a constant phase offset of 1.75 s. At that instant the first row (4 imprints) plus the first imprint of the second row are fully pressed and the sixth is just beginning. A literal t = 0 frame would be a blank ground, which would misrepresent the piece as its gallery thumb; 1.75 s is its emptiest honest moment. Recorded here per the brief.
+- Sizing: canvas follows the Visual Viewport API with resize listeners on both visualViewport and window; the canvas element's CSS size is pinned in pixels inside every draw. Phone detection uses window.screen's smaller dimension (< 700 px) with the aspect fallback, per house rules; the field composition is identical at every size, only the pitch rescales. Page ground is the piece's own ground tone.
+- Determinism: frame one is the synchronous draw at the constant phase; the animation is phase plus elapsed-since-load via requestAnimationFrame (typeof-guarded), never a wall clock. All randomness is the seeded setup streams. No gradients, no shadowBlur, no filters, no offscreen canvas; streaks are drawn directly.
+
+## QA log
+
+- Rendered with node ~/workspace/tools/render-piece.js at 1280x900 (qa-desktop.png), 390x844 (qa-mobile.png), 720x720 (thumb.png).
+- Determinism: thumb.png rendered twice and compared with cmp: byte-identical. Second render deleted.
+- Desktop (frame one): warm-white field, first row of four cobalt dabs evenly spaced, fifth dab below-left in the brick-shifted second row, bristle streaks visible with dense tops and dry bottoms. Nothing else in frame.
+- Thumb: same moment at square aspect; field centered, spacing even, nothing clipped.
+- Mobile: same moment in the tall frame; field centered, dabs small but legible, nothing clipped.
+- Mid-loop check: a throwaway copy phased to t = 8 s rendered the complete 4x4 brick-offset field (all sixteen imprints down, spacing mechanically even, texture varying dab to dab) and was deleted after inspection.
+- Deviations: the frame-one phase offset described above (sanctioned by the brief, recorded here). No other deviations; palette is exactly the two specced tones; no text anywhere except the document title.
+- Gate fix round (fly's catch): the first build's imprints read as a pale watercolor wash — the dab body was a single fill at alpha 0.24 to 0.34, so the ground showed through everywhere and the cobalt gathered only in the streak lines. Toroni's imprint is a dab of solid paint. Fixed in the dab construction only: the body is now 12 horizontal bands at alpha 0.9 to 1.0 (full density through the upper two-thirds, easing to just over half at the lift-off edge); ridge alphas raised to 0.45 to 0.85 and load strokes to 0.65 to 0.95; and a new set of 18 to 27 thin ground-coloured gap strokes per imprint scores the bristle separations inside the solid body, so the texture reads as striation within paint rather than paint itself. Lattice, timing, loop, frame-one phase (1.75 s), jitter ranges, and palette unchanged. All three sizes re-rendered; thumb rendered twice and cmp-compared byte-identical (duplicate deleted); a mid-loop throwaway at t = 8 s confirmed all sixteen dabs read solid across the field, then was deleted. Desktop, thumb, and mobile read back: saturated cobalt dabs with fine vertical striations and dry bottom edges.
