@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Thaki</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #131A17; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // Palette (strict): land night, new path, old path ghost,
+  // pacarina marker, breath shimmer. Nothing else.
+  var LAND = '#131A17';
+  var NEW = '#E8D9A8';
+  var GHOST = '#5A5A48';
+  var PAC = '#C9683A';
+  var SHIMMER = '#7FA8A0';
+
+  var BASE_SEED = 685001;
+  var LOOP_S = 240;         // one full palimpsest cycle, seconds
+  var N_ROUTES = 44;        // seeded caravan routes in the cycle
+  var FORCE_T = -1;         // QA hook: -1 = live clock, else fixed elapsed seconds
+
+  // QA seed hook: ?seed=tNN pins the elapsed time (used by the headless
+  // renderer to inspect later loop phases).
+  try {
+    if (typeof location !== 'undefined' && location.search) {
+      var qm = /[?&]seed=t([0-9]+(?:\.[0-9]+)?)/.exec(location.search);
+      if (qm) FORCE_T = parseFloat(qm[1]);
+    }
+  } catch (e) { /* live mode */ }
+
+  // Seeded RNG (mulberry32). All route geometry, scheduling and land
+  // texture come from this one stream, so the whole palimpsest is data:
+  // precomputed once, then every frame is a pure function of loop phase.
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+  function lerp(a, b, u) { return a + (b - a) * u; }
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ------------------------------------------------------------------
+  // Route generation. A route is a walk from one canvas edge to another
+  // in normalized coordinates: heading persists (caravan momentum), a
+  // switchback phase keeps flipping the perpendicular bias so the path
+  // zigzags like a mountain traverse, and small seeded noise keeps it
+  // from ever looking like a GPS trace. One Chaikin pass softens the
+  // corners without straightening the switchbacks.
+  // ------------------------------------------------------------------
+  function edgePoint(rng, edge) {
+    var u = 0.06 + rng() * 0.88;
+    if (edge === 0) return [u, -0.04];        // top
+    if (edge === 1) return [1.04, u];         // right
+    if (edge === 2) return [u, 1.04];         // bottom
+    return [-0.04, u];                        // left
+  }
+
+  function genRoute(rng) {
+    var e0 = Math.floor(rng() * 4);
+    var e1 = (e0 + 1 + Math.floor(rng() * 3)) % 4;
+    var start = edgePoint(rng, e0);
+    var end = edgePoint(rng, e1);
+    var pts = [[start[0], start[1]]];
+    var px = start[0], py = start[1];
+    var heading = Math.atan2(end[1] - py, end[0] - px);
+    var step = 0.016 + rng() * 0.008;
+    var sbPhase = rng() * Math.PI * 2;
+    var sbRate = 0.55 + rng() * 0.5;          // switchback flip speed
+    var sbAmp = 0.38 + rng() * 0.22;
+    var guard = 0;
+    while (guard++ < 500) {
+      var dx = end[0] - px, dy = end[1] - py;
+      var dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist < step * 1.6) break;
+      var want = Math.atan2(dy, dx);
+      var diff = want - heading;
+      while (diff > Math.PI) diff -= Math.PI * 2;
+      while (diff < -Math.PI) diff += Math.PI * 2;
+      heading += clamp(diff, -0.32, 0.32);
+      sbPhase += sbRate * step * 9;
+      var sb = Math.sin(sbPhase) > 0 ? sbAmp : -sbAmp;
+      var h = heading + sb * clamp(dist * 2.2, 0.25, 1) + (rng() - 0.5) * 0.16;
+      px += Math.cos(h) * step;
+      py += Math.sin(h) * step;
+      pts.push([px, py]);
+    }
+    pts.push([end[0], end[1]]);
+    // One Chaikin smoothing pass (corner cut 0.25).
+    var sm = [pts[0]];
+    for (var i = 0; i < pts.length - 1; i++) {
+      var a = pts[i], b = pts[i + 1];
+      sm.push([a[0] * 0.75 + b[0] * 0.25, a[1] * 0.75 + b[1] * 0.25]);
+      sm.push([a[0] * 0.25 + b[0] * 0.75, a[1] * 0.25 + b[1] * 0.75]);
+    }
+    sm.push(pts[pts.length - 1]);
+    // Cumulative arc lengths for progress cutoffs and marker placement.
+    var cum = [0];
+    for (var j = 1; j < sm.length; j++) {
+      var ddx = sm[j][0] - sm[j - 1][0], ddy = sm[j][1] - sm[j - 1][1];
+      cum.push(cum[j - 1] + Math.sqrt(ddx * ddx + ddy * ddy));
+    }
+    return { pts: sm, cum: cum, total: cum[cum.length - 1] };
+  }
+
+  function pointAt(route, frac) {
+    var target = frac * route.total;
+    var cum = route.cum, pts = route.pts;
+    var lo = 0, hi = cum.length - 1;
+    while (lo < hi) {
+      var mid = (lo + hi) >> 1;
+      if (cum[mid] < target) lo = mid + 1; else hi = mid;
+    }
+    var i = Math.max(1, lo);
+    var segLen = cum[i] - cum[i - 1];
+    var u = segLen > 0 ? (target - cum[i - 1]) / segLen : 0;
+    return [lerp(pts[i - 1][0], pts[i][0], u), lerp(pts[i - 1][1], pts[i][1], u)];
+  }
+
+  // Build the whole seeded cycle once: routes with birth times and draw
+  // durations on the loop clock, pacarina stopping points per route, and
+  // the land texture blotches. Frame one (t = 0) is already a developed
+  // palimpsest: births are spread across the loop, so at t = 0 most
+  // routes are old ghosts and a few near the loop's end are mid-draw.
+  var routes = [];
+  var blotches = [];
+  (function buildWorld() {
+    var rng = mulberry32(BASE_SEED);
+    for (var i = 0; i < N_ROUTES; i++) {
+      var r = genRoute(rng);
+      r.drawDur = 17 + rng() * 13;                       // 17..30 s to inscribe
+      r.birth = (i + 0.12 + rng() * 0.76) * (LOOP_S / N_ROUTES);
+      r.markers = [];
+      var mroll = rng();                                 // pacarinas are occasional
+      var nm = mroll < 0.55 ? 1 : (mroll < 0.85 ? 2 : 0);
+      for (var k = 0; k < nm; k++) {
+        r.markers.push(0.18 + rng() * 0.72);             // arc-length fraction
+      }
+      r.markers.sort();
+      routes.push(r);
+    }
+    // Oldest first, so fresh ink draws over deep ghosts.
+    routes.sort(function (a, b) { return a.birth - b.birth; });
+    for (var b = 0; b < 80; b++) {
+      blotches.push({
+        x: rng(), y: rng(),
+        rx: 0.05 + rng() * 0.16, ry: 0.04 + rng() * 0.12,
+        dark: rng() < 0.6, a: 0.025 + rng() * 0.035
+      });
+    }
+  })();
+
+  // ------------------------------------------------------------------
+  // Drawing
+  // ------------------------------------------------------------------
+  var W = 0, H = 0, S = 0, isPhone = false;
+  var lastElapsed = 0;
+
+  function strokePath(route, frac, color, alpha, width) {
+    var pts = route.pts, cum = route.cum;
+    var target = frac * route.total;
+    ctx.strokeStyle = color;
+    ctx.globalAlpha = alpha;
+    ctx.lineWidth = width;
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(pts[0][0] * W, pts[0][1] * H);
+    var i = 1;
+    while (i < pts.length && cum[i] <= target) {
+      ctx.lineTo(pts[i][0] * W, pts[i][1] * H);
+      i++;
+    }
+    if (i < pts.length) {
+      var segLen = cum[i] - cum[i - 1];
+      var u = segLen > 0 ? (target - cum[i - 1]) / segLen : 0;
+      ctx.lineTo(lerp(pts[i - 1][0], pts[i][0], u) * W,
+                 lerp(pts[i - 1][1], pts[i][1], u) * H);
+    }
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  // Stroke only the arc span [f0, f1] of a route, following the path.
+  function strokeSpan(route, f0, f1, color, alpha, width) {
+    if (f1 <= f0) return;
+    var pts = route.pts, cum = route.cum;
+    var t0 = f0 * route.total, t1 = f1 * route.total;
+    var p0 = pointAt(route, f0);
+    ctx.strokeStyle = color;
+    ctx.globalAlpha = alpha;
+    ctx.lineWidth = width;
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(p0[0] * W, p0[1] * H);
+    var i = 1;
+    while (i < pts.length && cum[i] <= t0) i++;
+    while (i < pts.length && cum[i] < t1) {
+      ctx.lineTo(pts[i][0] * W, pts[i][1] * H);
+      i++;
+    }
+    var p1 = pointAt(route, f1);
+    ctx.lineTo(p1[0] * W, p1[1] * H);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  function drawRoute(r, loopT) {
+    var age = loopT - r.birth;
+    if (age < 0) age += LOOP_S;
+    var ghostW = Math.max(1, S * 0.0016);
+    var newW = Math.max(1.2, S * 0.0023);
+    if (age < r.drawDur) {
+      // Inscribing now: revealed trail in new-path tone, leading head brighter.
+      var frac = age / r.drawDur;
+      strokePath(r, frac, NEW, 0.5, newW);
+      strokeSpan(r, Math.max(0, frac - 0.07), frac, NEW, 0.95, newW);
+    } else {
+      // Complete: fresh ink cools from new-path tone to ghost tone.
+      var since = age - r.drawDur;
+      if (since < 26) {
+        strokePath(r, 1, NEW, lerp(0.5, 0.16, since / 26), newW);
+      } else {
+        var v = clamp((since - 26) / (LOOP_S - 26 - r.drawDur), 0, 1);
+        strokePath(r, 1, GHOST, lerp(0.3, 0.12, v), ghostW);
+      }
+    }
+    // Pacarina markers: appear as the inscription passes them, then stay.
+    for (var k = 0; k < r.markers.length; k++) {
+      var f = r.markers[k];
+      if (age < f * r.drawDur) continue;
+      var p = pointAt(r, f);
+      var rad = S * 0.006 + 1.2;
+      ctx.strokeStyle = PAC;
+      ctx.globalAlpha = 0.5;
+      ctx.lineWidth = Math.max(1, S * 0.0013);
+      ctx.beginPath();
+      ctx.arc(p[0] * W, p[1] * H, rad, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.fillStyle = PAC;
+      ctx.globalAlpha = 0.65;
+      ctx.beginPath();
+      ctx.arc(p[0] * W, p[1] * H, rad * 0.32, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  // The visitor's own route: sampled pointer path in breath-shimmer,
+  // fading over 60 s once the drag ends.
+  var userPts = null;      // [{x, y}] in canvas px
+  var userEndT = -1;       // anchored elapsed at release, -1 while drawing
+  var userDown = false;
+
+  function drawUser(elapsed) {
+    if (!userPts || userPts.length < 2) return;
+    var alpha = 0.85;
+    if (userEndT >= 0) {
+      var gone = (elapsed - userEndT) / 60;
+      if (gone >= 1) { userPts = null; userEndT = -1; return; }
+      alpha = 0.85 * (1 - gone);
+    }
+    ctx.strokeStyle = SHIMMER;
+    ctx.globalAlpha = alpha;
+    ctx.lineWidth = Math.max(1.4, S * 0.0026);
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(userPts[0].x, userPts[0].y);
+    for (var i = 1; i < userPts.length; i++) ctx.lineTo(userPts[i].x, userPts[i].y);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  function draw(elapsed) {
+    lastElapsed = elapsed;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    var loopT = ((elapsed % LOOP_S) + LOOP_S) % LOOP_S;
+
+    ctx.fillStyle = LAND;
+    ctx.fillRect(0, 0, W, H);
+
+    // Land texture: seeded soft blotches, tonal shades of the land only.
+    for (var b = 0; b < blotches.length; b++) {
+      var bl = blotches[b];
+      ctx.fillStyle = bl.dark ? '#000000' : GHOST;
+      ctx.globalAlpha = bl.a;
+      ctx.beginPath();
+      ctx.ellipse(bl.x * W, bl.y * H, bl.rx * W, bl.ry * H, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    for (var i = 0; i < routes.length; i++) drawRoute(routes[i], loopT);
+
+    drawUser(elapsed);
+  }
+
+  // ------------------------------------------------------------------
+  // Pointer: drag inscribes a temporary route of your own.
+  // ------------------------------------------------------------------
+  function recordPoint(e) {
+    var x = 0, y = 0, got = false;
+    if (e) {
+      if (typeof e.clientX === 'number') { x = e.clientX; y = e.clientY; got = true; }
+      else if (e.touches && e.touches[0]) { x = e.touches[0].clientX; y = e.touches[0].clientY; got = true; }
+      else if (e.changedTouches && e.changedTouches[0]) { x = e.changedTouches[0].clientX; y = e.changedTouches[0].clientY; got = true; }
+      if (got && canvas.getBoundingClientRect) {
+        var rect = canvas.getBoundingClientRect();
+        x -= rect.left; y -= rect.top;
+      }
+    }
+    if (!got) return;
+    if (!userPts) userPts = [];
+    var n = userPts.length;
+    if (n === 0) { userPts.push({ x: x, y: y }); return; }
+    var last = userPts[n - 1];
+    var dx = x - last.x, dy = y - last.y;
+    if (dx * dx + dy * dy >= 36) userPts.push({ x: x, y: y });
+  }
+
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', function (e) {
+      userDown = true; userPts = []; userEndT = -1;
+      recordPoint(e);
+      if (e && e.preventDefault) e.preventDefault();
+    });
+    canvas.addEventListener('pointermove', function (e) {
+      if (userDown) recordPoint(e);
+    });
+    var endDrag = function () {
+      if (userDown) { userDown = false; userEndT = lastElapsed; }
+    };
+    canvas.addEventListener('pointerup', endDrag);
+    canvas.addEventListener('pointercancel', endDrag);
+    canvas.addEventListener('pointerleave', endDrag);
+  }
+
+  function resize() {
+    var vv = window.visualViewport;
+    W = vv ? vv.width : window.innerWidth;
+    H = vv ? vv.height : window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    S = Math.min(W, H);
+    if (window.screen) {
+      isPhone = Math.min(window.screen.width, window.screen.height) < 700;
+    } else {
+      isPhone = H > W * 1.15;
+    }
+    draw(lastElapsed);
+  }
+
+  resize();
+  draw(FORCE_T >= 0 ? FORCE_T : 0);
+
+  if (typeof window.requestAnimationFrame === 'function') {
+    var t0 = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+    var raf = function () {
+      var now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : t0;
+      draw(FORCE_T >= 0 ? FORCE_T : (now - t0) / 1000);
+      window.requestAnimationFrame(raf);
+    };
+    window.requestAnimationFrame(raf);
+  }
+
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', resize);
+  }
+  if (window.addEventListener) window.addEventListener('resize', resize);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Whistling Vessel</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #14100F; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // Palette (strict): vessel clay, vessel shadow, engobe band, water,
+  // pitch ribbon, background. Nothing else.
+  var CLAY = '#A4552F';
+  var SHADOW = '#5E2F1B';
+  var ENGOBE = '#E4D3B8';
+  var WATER = '#3E7C8C';
+  var RIBBON = '#F5E9C8';
+  var BG = '#14100F';
+
+  var BASE_SEED = 684001;
+  var FORCE_T = -1;    // QA hook: ?seed=tNN pins elapsed seconds
+  var FORCE_W = -1;    // QA hook: ?seed=wNN pins the water level 0..1
+
+  try {
+    if (typeof location !== 'undefined' && location.search) {
+      var qm = /[?&]seed=([tw])([0-9]+(?:\.[0-9]+)?)/.exec(location.search);
+      if (qm) {
+        if (qm[1] === 't') FORCE_T = parseFloat(qm[2]);
+        else FORCE_W = parseFloat(qm[2]) / 100;
+      }
+    }
+  } catch (e) { /* live mode */ }
+
+  // Seeded RNG (mulberry32). Used once at init for ribbon edge fray.
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+  function lerp(a, b, t) { return a + (b - a) * t; }
+
+  // ------------------------------------------------------------------
+  // Model. One parameter carries the whole piece: w, the water level
+  // inside the vessel, a fraction 0..1 of the body interior.
+  //
+  //   ribbon half-width at base  ~ 0.008 + 0.034*w   (thin -> thick)
+  //   ribbon reach (length)      ~ mouthY * (1.02 - 0.42*w)
+  //                                  (low water: ribbon climbs nearly
+  //                                   to the top edge; high water: it
+  //                                   stays low and heavy)
+  //   ribbon curl phase sweep    ~ (1.2 + 2.4*w)*PI rad along length
+  //   whistle frequency          ~ 920 Hz at w=0 falling to 300 Hz
+  //                                  at w=1, sounded only while the
+  //                                  level is actually changing.
+  //
+  // Idle, w breathes slowly around its rest 0.5 (amplitude 0.045,
+  // period 11 s); its rate of change stays under the whistle onset
+  // threshold, so an untouched piece is silent. A vertical drag pours:
+  // down raises w, up lowers it, through a spring with inertia.
+  // ------------------------------------------------------------------
+  var DT = 1 / 120;
+  var W_REST = 0.5;
+  var W_MIN = 0.06, W_MAX = 0.94;
+  var BREATH_AMP = 0.045, BREATH_PERIOD = 11;
+  var FLOW_ON = 0.05;          // |dw/dt| above this, the whistle speaks
+
+  var simTime = 0;
+  var state = {
+    w: W_REST, wVel: 0,
+    dragging: false, downY: 0, wAtDown: W_REST, dragTarget: W_REST
+  };
+  var events = [];   // {t, type, y} on the anchored clock
+
+  function idleTarget(t) {
+    return W_REST + BREATH_AMP * Math.sin(2 * Math.PI * t / BREATH_PERIOD);
+  }
+
+  function stepSim(toT) {
+    while (simTime < toT - 1e-9) {
+      var t = simTime;
+      while (events.length && events[0].t <= t + 1e-9) {
+        var ev = events.shift();
+        if (ev.type === 'down') {
+          state.dragging = true;
+          state.downY = ev.y;
+          state.wAtDown = state.w;
+          state.dragTarget = state.w;
+          ensureAudio();
+        } else if (ev.type === 'move') {
+          if (state.dragging) {
+            state.dragTarget = clamp(
+              state.wAtDown + (ev.y - state.downY) / (0.5 * U), W_MIN, W_MAX);
+          }
+        } else if (ev.type === 'up') {
+          state.dragging = false;
+        }
+      }
+      var target = state.dragging ? state.dragTarget : idleTarget(t);
+      if (FORCE_W >= 0) target = FORCE_W;
+      // Spring with inertia: stiff enough to follow a pour, loose
+      // enough to slosh a little past it.
+      var k = 42, c = 10.5;
+      var acc = (target - state.w) * k - state.wVel * c;
+      state.wVel += acc * DT;
+      state.w += state.wVel * DT;
+      state.w = clamp(state.w, 0, 1);
+      simTime += DT;
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Audio. Lazy WebAudio, created only inside the first pointer
+  // gesture (typeof-guarded, try/caught): a sine with a slow vibrato.
+  // It sounds while the water level changes; gain follows |dw/dt|.
+  // Never on load, never autoplay.
+  // ------------------------------------------------------------------
+  var AC = null, whistleOsc = null, whistleGain = null, vibOsc = null;
+  function ensureAudio() {
+    if (AC) { if (AC.resume) { try { AC.resume(); } catch (e) {} } return; }
+    try {
+      var Ctor = (typeof window !== 'undefined' &&
+        (window.AudioContext || window.webkitAudioContext)) || null;
+      if (!Ctor) return;
+      AC = new Ctor();
+      whistleOsc = AC.createOscillator();
+      whistleOsc.type = 'sine';
+      whistleOsc.frequency.value = lerp(920, 300, state.w);
+      vibOsc = AC.createOscillator();
+      vibOsc.type = 'sine';
+      vibOsc.frequency.value = 5.4;
+      var vibGain = AC.createGain();
+      vibGain.gain.value = 5;
+      vibOsc.connect(vibGain);
+      vibGain.connect(whistleOsc.frequency);
+      whistleGain = AC.createGain();
+      whistleGain.gain.value = 0;
+      whistleOsc.connect(whistleGain);
+      whistleGain.connect(AC.destination);
+      whistleOsc.start();
+      vibOsc.start();
+    } catch (e) {
+      AC = null; whistleOsc = null; whistleGain = null; vibOsc = null;
+    }
+  }
+
+  function updateAudio() {
+    if (!AC || !whistleOsc || !whistleGain) return;
+    try {
+      var rate = Math.abs(state.wVel);
+      var g = rate > FLOW_ON ? clamp((rate - FLOW_ON) * 1.5, 0, 0.11) : 0;
+      var t = AC.currentTime;
+      whistleOsc.frequency.setTargetAtTime(lerp(920, 300, state.w), t, 0.03);
+      whistleGain.gain.setTargetAtTime(g, t, 0.05);
+    } catch (e) { /* audio is decoration; never break the drawing */ }
+  }
+
+  // ------------------------------------------------------------------
+  // Layout. U = min(viewport w, h) drives all vessel proportions.
+  // ------------------------------------------------------------------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0, U = 0, DPR = 1;
+  var cx = 0, tableY = 0, bodyTop = 0, bodyH = 0, mouthY = 0, mouthX = 0;
+
+  function isPhone(w, h) {
+    var sw = 0, sh = 0;
+    try {
+      if (typeof window !== 'undefined' && window.screen) {
+        sw = window.screen.width || 0;
+        sh = window.screen.height || 0;
+      }
+    } catch (e) {}
+    if (sw && sh && Math.min(sw, sh) < 700) return true;
+    return h > w * 1.15;   // aspect fallback only
+  }
+
+  function fit() {
+    var w = 0, h = 0;
+    try {
+      var vv = (typeof window !== 'undefined') ? window.visualViewport : null;
+      if (vv && vv.width) { w = vv.width; h = vv.height; }
+      else if (typeof window !== 'undefined' && window.innerWidth) {
+        w = window.innerWidth; h = window.innerHeight;
+      }
+    } catch (e) {}
+    if (!w || !h) { w = 800; h = 600; }
+    W = w; H = h;
+    DPR = 1;
+    try {
+      if (typeof window !== 'undefined' && window.devicePixelRatio) {
+        DPR = clamp(window.devicePixelRatio, 1, 2);
+      }
+    } catch (e) {}
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    U = Math.min(W, H);
+    cx = W / 2;
+    var phone = isPhone(W, H);
+    // On phones the vessel rides a little higher in the tall frame so
+    // the ribbon has room to climb; proportions stay U-driven.
+    tableY = phone ? 0.84 * H : 0.895 * H;
+    bodyH = (phone ? 0.46 : 0.44) * U;
+    bodyTop = tableY - bodyH;
+    mouthY = bodyTop - 0.17 * U;
+    mouthX = cx;
+  }
+
+  // Vessel body silhouette: a globular lathe profile, flat base,
+  // swelling sides, shoulder narrowing to the neck.
+  function bodyPath() {
+    var hw = 0.27 * U;
+    ctx.beginPath();
+    ctx.moveTo(cx - 0.16 * U, tableY);
+    ctx.bezierCurveTo(cx - 0.26 * U, tableY,
+      cx - hw, tableY - 0.10 * U, cx - hw, tableY - 0.24 * U);
+    ctx.bezierCurveTo(cx - hw, tableY - 0.36 * U,
+      cx - 0.20 * U, bodyTop + 0.05 * U, cx - 0.088 * U, bodyTop + 0.015 * U);
+    ctx.lineTo(cx + 0.088 * U, bodyTop + 0.015 * U);
+    ctx.bezierCurveTo(cx + 0.20 * U, bodyTop + 0.05 * U,
+      cx + hw, tableY - 0.36 * U, cx + hw, tableY - 0.24 * U);
+    ctx.bezierCurveTo(cx + hw, tableY - 0.10 * U,
+      cx + 0.26 * U, tableY, cx + 0.16 * U, tableY);
+    ctx.closePath();
+  }
+
+  // Stirrup spout: two risers from the shoulders joining a bridge,
+  // with a single short mouth at the top center.
+  function spoutPath() {
+    ctx.beginPath();
+    ctx.moveTo(cx - 0.105 * U, bodyTop + 0.03 * U);
+    ctx.bezierCurveTo(cx - 0.095 * U, bodyTop - 0.08 * U,
+      cx - 0.088 * U, mouthY + 0.055 * U, cx - 0.030 * U, mouthY + 0.048 * U);
+    ctx.lineTo(cx - 0.030 * U, mouthY);
+    ctx.lineTo(cx + 0.030 * U, mouthY);
+    ctx.lineTo(cx + 0.030 * U, mouthY + 0.048 * U);
+    ctx.bezierCurveTo(cx + 0.088 * U, mouthY + 0.055 * U,
+      cx + 0.095 * U, bodyTop - 0.08 * U, cx + 0.105 * U, bodyTop + 0.03 * U);
+    ctx.closePath();
+  }
+
+  function archVoidPath() {
+    ctx.beginPath();
+    ctx.moveTo(cx - 0.052 * U, bodyTop + 0.03 * U);
+    ctx.bezierCurveTo(cx - 0.050 * U, mouthY + 0.085 * U,
+      cx - 0.036 * U, mouthY + 0.075 * U, cx, mouthY + 0.075 * U);
+    ctx.bezierCurveTo(cx + 0.036 * U, mouthY + 0.075 * U,
+      cx + 0.050 * U, mouthY + 0.085 * U, cx + 0.052 * U, bodyTop + 0.03 * U);
+    ctx.closePath();
+  }
+
+  // ------------------------------------------------------------------
+  // The pitch ribbon. Sampled centerline rising from the spout mouth;
+  // drawn as stacked quads whose alpha dissolves with height (flat
+  // segments, no gradients). Edge fray is precomputed seeded data.
+  // ------------------------------------------------------------------
+  var RIB_N = 30;
+  var fray = [];
+  (function () {
+    var rng = mulberry32(BASE_SEED);
+    for (var i = 0; i <= RIB_N; i++) fray.push(0.9 + 0.2 * rng());
+  })();
+
+  function drawRibbon(t, w) {
+    var L = mouthY * (1.02 - 0.42 * w);
+    var sweep = (1.2 + 2.4 * w) * Math.PI;   // total curl phase along length
+    var swayAmp = U * (0.05 + 0.09 * w);
+    var baseHalf = U * (0.008 + 0.034 * w);
+    var phase = t * 1.15;
+    var pts = [];
+    for (var i = 0; i <= RIB_N; i++) {
+      var s = i / RIB_N;
+      var env = Math.pow(Math.sin(Math.PI * Math.min(s * 1.12, 1)), 0.8);
+      var xoff = swayAmp * env * Math.sin(phase * 0.85 + s * sweep)
+        + U * 0.05 * Math.sin(phase * 0.6) * s;
+      var x = mouthX + xoff;
+      var y = mouthY - s * L
+        + U * 0.008 * Math.sin(phase * 2 + s * 9) * env;
+      var half = (baseHalf * Math.pow(1 - s, 0.75) + U * 0.0012) * fray[i]
+        * (1 + 0.13 * Math.sin(phase * 2 - s * 7));
+      pts.push({ x: x, y: y, half: half, s: s });
+    }
+    // Edges offset along each point's normal, so the band keeps its
+    // width around bends instead of pinching into a smoke-like zigzag.
+    for (var k = 0; k <= RIB_N; k++) {
+      var p = pts[k];
+      var pa = pts[Math.max(0, k - 1)], pb = pts[Math.min(RIB_N, k + 1)];
+      var tx = pb.x - pa.x, ty = pb.y - pa.y;
+      var tl = Math.sqrt(tx * tx + ty * ty) || 1;
+      p.nx = -ty / tl; p.ny = tx / tl;
+    }
+    for (var j = 0; j < RIB_N; j++) {
+      var a = pts[j], b = pts[j + 1];
+      var al = 0.88 * Math.pow(1 - a.s, 1.25);
+      if (al <= 0.004) continue;
+      ctx.globalAlpha = al;
+      ctx.fillStyle = RIBBON;
+      ctx.beginPath();
+      ctx.moveTo(a.x - a.nx * a.half, a.y - a.ny * a.half);
+      ctx.lineTo(a.x + a.nx * a.half, a.y + a.ny * a.half);
+      ctx.lineTo(b.x + b.nx * b.half, b.y + b.ny * b.half);
+      ctx.lineTo(b.x - b.nx * b.half, b.y - b.ny * b.half);
+      ctx.closePath();
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function draw(t) {
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+
+    // Ground.
+    ctx.fillStyle = BG;
+    ctx.fillRect(0, 0, W, H);
+
+    var w = state.w;
+    var surfY = tableY - w * bodyH * 0.92;
+
+    // The ribbon first, so its root tucks behind the spout mouth.
+    drawRibbon(t, w);
+
+    // Faint water-table line the vessel rests on.
+    ctx.globalAlpha = 0.16;
+    ctx.strokeStyle = ENGOBE;
+    ctx.lineWidth = Math.max(1, 0.0016 * U);
+    ctx.beginPath();
+    ctx.moveTo(0, tableY + 0.004 * H);
+    ctx.lineTo(W, tableY + 0.004 * H);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    // Contact shadow.
+    ctx.globalAlpha = 0.35;
+    ctx.fillStyle = '#000000';
+    ctx.beginPath();
+    ctx.ellipse(cx, tableY + 0.006 * U, 0.20 * U, 0.016 * U, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+
+    // Stirrup spout (behind the body's shoulder line).
+    spoutPath();
+    ctx.fillStyle = CLAY;
+    ctx.fill();
+    ctx.save();
+    spoutPath();
+    ctx.clip();
+    ctx.globalAlpha = 0.55;
+    ctx.fillStyle = SHADOW;
+    ctx.fillRect(cx, mouthY - 0.01 * U, 0.12 * U, 0.20 * U);
+    ctx.restore();
+    ctx.globalAlpha = 1;
+    archVoidPath();
+    ctx.fillStyle = BG;
+    ctx.fill();
+    spoutPath();
+    ctx.strokeStyle = SHADOW;
+    ctx.globalAlpha = 0.8;
+    ctx.lineWidth = Math.max(1, 0.005 * U);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    // Mouth rim.
+    ctx.strokeStyle = ENGOBE;
+    ctx.globalAlpha = 0.75;
+    ctx.lineWidth = Math.max(1, 0.004 * U);
+    ctx.beginPath();
+    ctx.moveTo(cx - 0.030 * U, mouthY);
+    ctx.lineTo(cx + 0.030 * U, mouthY);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    // Body: clay, then the shadow side.
+    bodyPath();
+    ctx.fillStyle = CLAY;
+    ctx.fill();
+    ctx.save();
+    bodyPath();
+    ctx.clip();
+    ctx.globalAlpha = 0.5;
+    ctx.fillStyle = SHADOW;
+    ctx.beginPath();
+    ctx.moveTo(cx + 0.02 * U, bodyTop - 0.02 * U);
+    ctx.bezierCurveTo(cx + 0.16 * U, bodyTop + 0.10 * U,
+      cx + 0.20 * U, tableY - 0.22 * U, cx + 0.14 * U, tableY + 0.01 * U);
+    ctx.lineTo(cx + 0.30 * U, tableY + 0.01 * U);
+    ctx.lineTo(cx + 0.30 * U, bodyTop - 0.02 * U);
+    ctx.closePath();
+    ctx.fill();
+    ctx.globalAlpha = 1;
+
+    // Cutaway interior: air chamber above, water below the level.
+    ctx.save();
+    ctx.translate(cx, tableY);
+    ctx.scale(0.93, 0.94);
+    ctx.translate(-cx, -tableY);
+    bodyPath();
+    ctx.clip();
+    ctx.globalAlpha = 0.45;
+    ctx.fillStyle = SHADOW;
+    ctx.fillRect(cx - 0.30 * U, bodyTop - 0.02 * U, 0.60 * U, surfY - bodyTop + 0.02 * U);
+    ctx.globalAlpha = 0.92;
+    ctx.fillStyle = WATER;
+    ctx.fillRect(cx - 0.30 * U, surfY, 0.60 * U, tableY - surfY + 0.02 * U);
+    ctx.globalAlpha = 1;
+    ctx.restore();
+
+    // Water surface line, with a small travelling ripple.
+    ctx.strokeStyle = ENGOBE;
+    ctx.globalAlpha = 0.55;
+    ctx.lineWidth = Math.max(1, 0.0035 * U);
+    ctx.beginPath();
+    var surfHalf = 0.245 * U;
+    for (var px = -surfHalf; px <= surfHalf; px += U * 0.02) {
+      var yy = surfY + U * 0.0035 *
+        Math.sin(px / U * 22 + t * 2.1) * (0.4 + 0.6 * Math.abs(state.wVel) * 6);
+      if (px === -surfHalf) ctx.moveTo(cx + px, yy);
+      else ctx.lineTo(cx + px, yy);
+    }
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    // Engobe banding arcs across the body.
+    ctx.strokeStyle = ENGOBE;
+    ctx.globalAlpha = 0.7;
+    ctx.lineWidth = Math.max(1.2, 0.011 * U);
+    var bands = [
+      { f: 0.30, half: 0.262 * U },
+      { f: 0.55, half: 0.268 * U },
+      { f: 0.78, half: 0.205 * U }
+    ];
+    for (var bi = 0; bi < bands.length; bi++) {
+      var by = tableY - bands[bi].f * bodyH;
+      ctx.beginPath();
+      ctx.moveTo(cx - bands[bi].half, by);
+      ctx.quadraticCurveTo(cx, by + 0.018 * U, cx + bands[bi].half, by);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+    ctx.restore();
+
+    // Body outline.
+    bodyPath();
+    ctx.strokeStyle = SHADOW;
+    ctx.globalAlpha = 0.85;
+    ctx.lineWidth = Math.max(1, 0.005 * U);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  // ------------------------------------------------------------------
+  // Clock and loop. Anchored: elapsed is measured from load; frame
+  // one is drawn synchronously at t = 0 with w at rest. The QA time
+  // hook steps the same simulation to the pinned time before drawing.
+  // ------------------------------------------------------------------
+  var t0 = (typeof performance !== 'undefined' && performance.now)
+    ? performance.now() : 0;
+  function elapsedNow() {
+    if (FORCE_T >= 0) return FORCE_T;
+    if (typeof performance !== 'undefined' && performance.now) {
+      return (performance.now() - t0) / 1000;
+    }
+    return 0;
+  }
+
+  function render() {
+    var el = elapsedNow();
+    stepSim(el);
+    draw(el);
+    updateAudio();
+  }
+
+  // Pointer input: vertical drag pours. Events carry anchored times
+  // and are consumed by the fixed-step simulation.
+  function evtPos(e) {
+    var x = 0, y = 0;
+    if (e) {
+      if (typeof e.clientX === 'number') { x = e.clientX; y = e.clientY; }
+      else if (e.touches && e.touches.length) {
+        x = e.touches[0].clientX; y = e.touches[0].clientY;
+      }
+    }
+    return { x: x, y: y };
+  }
+  function pushEvent(type, e) {
+    var p = evtPos(e);
+    events.push({ t: elapsedNow(), type: type, y: p.y });
+    if (type === 'down') ensureAudio();
+  }
+
+  var usePointer = (typeof window !== 'undefined' && 'PointerEvent' in window);
+  if (usePointer) {
+    canvas.addEventListener('pointerdown', function (e) { pushEvent('down', e); });
+    canvas.addEventListener('pointermove', function (e) { pushEvent('move', e); });
+    canvas.addEventListener('pointerup', function (e) { pushEvent('up', e); });
+    canvas.addEventListener('pointercancel', function (e) { pushEvent('up', e); });
+  } else {
+    canvas.addEventListener('mousedown', function (e) { pushEvent('down', e); });
+    canvas.addEventListener('mousemove', function (e) { pushEvent('move', e); });
+    canvas.addEventListener('mouseup', function (e) { pushEvent('up', e); });
+    canvas.addEventListener('touchstart', function (e) { pushEvent('down', e); });
+    canvas.addEventListener('touchmove', function (e) { pushEvent('move', e); });
+    canvas.addEventListener('touchend', function (e) { pushEvent('up', e); });
+  }
+
+  fit();
+  // Frame one, synchronous and exact: t = 0 at rest, never the live
+  // clock. With a QA level pin, step 3 s so the spring settles on the
+  // pinned target before the boot draw.
+  var bootT = FORCE_T >= 0 ? FORCE_T : (FORCE_W >= 0 ? 3 : 0);
+  stepSim(bootT);
+  draw(bootT);
+
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('resize', function () { fit(); render(); });
+  }
+  try {
+    if (typeof window !== 'undefined' && window.visualViewport &&
+        window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', function () {
+        fit(); render();
+      });
+    }
+  } catch (e) {}
+
+  if (typeof window !== 'undefined' &&
+      typeof window.requestAnimationFrame === 'function') {
+    var raf = function () {
+      render();
+      window.requestAnimationFrame(raf);
+    };
+    window.requestAnimationFrame(raf);
+  }
+})();
+</script>
+</body>
+</html>
