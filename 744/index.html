@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Skyspace Dawn</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0A0A0C; height: 100%; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  "use strict";
+
+  // Palette: strict, anchors only. Sky tones are interpolated between these.
+  var GROUND = "#0A0A0C";   // dark room
+  var STONE  = "#1A1C20";   // aperture bezel
+  var ROSE   = "#E8A2A8";   // pre-dawn rose
+  var AMBER  = "#F2B880";   // peach / amber
+  var PALE   = "#AFC8E8";   // pale sky
+  var NOON   = "#7FA8D8";   // noon blue
+
+  var ROSE_RGB  = [232, 162, 168];
+  var AMBER_RGB = [242, 184, 128];
+  var PALE_RGB  = [175, 200, 232];
+  var NOON_RGB  = [127, 168, 216];
+  var LAT_RAD = 40 * Math.PI / 180; // fixed mid-latitude for the solar model
+
+  var canvas = document.getElementById("c");
+  var ctx = canvas.getContext("2d");
+
+  var W = 0, H = 0, DPR = 1;
+
+  function isPhone() {
+    try {
+      var sw = window.screen ? window.screen.width : 0;
+      var sh = window.screen ? window.screen.height : 0;
+      var mn = Math.min(sw, sh);
+      if (mn > 0 && mn < 700) return true;
+    } catch (e) {}
+    return H > W * 1.15;
+  }
+
+  function resize() {
+    var vv = window.visualViewport;
+    var w = vv ? vv.width : window.innerWidth;
+    var h = vv ? vv.height : window.innerHeight;
+    DPR = window.devicePixelRatio || 1;
+    W = w; H = h;
+    canvas.width = Math.round(w * DPR);
+    canvas.height = Math.round(h * DPR);
+  }
+  if (window.visualViewport) window.visualViewport.addEventListener("resize", resize);
+  window.addEventListener("resize", resize);
+  resize();
+
+  // mulberry32: seeded stream for the band layout and static grain.
+  function makeRng(seed) {
+    var s = seed | 0;
+    return function () {
+      s = (s + 0x6D2B79F5) | 0;
+      var t = Math.imul(s ^ (s >>> 15), 1 | s);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // QA hook only: ?seed=tH:MM forces the program minute (inert otherwise).
+  function minuteOverride() {
+    try {
+      var search = "";
+      try { search = window.location.search || ""; } catch (e1) {}
+      if (!search) { try { search = location.search || ""; } catch (e2) {} }
+      var m = /[?&]seed=([^&]*)/.exec(search);
+      if (!m) return -1;
+      var t = /^t(\d{1,2}):(\d{2})$/.exec(decodeURIComponent(m[1]));
+      if (!t) return -1;
+      return (parseInt(t[1], 10) * 60 + parseInt(t[2], 10)) % 1440;
+    } catch (e) { return -1; }
+  }
+  var OVERRIDE = minuteOverride();
+
+  // The program clock: local date + local minute-of-day, nothing finer.
+  // Date is read only at (year, month, day, hour, minute) resolution, so the
+  // frame is constant inside any minute and back-to-back renders agree.
+  function programClock() {
+    var now = new Date();
+    var minute = now.getHours() * 60 + now.getMinutes();
+    if (OVERRIDE >= 0) minute = OVERRIDE;
+    return {
+      year: now.getFullYear(), month: now.getMonth(), day: now.getDate(),
+      minute: minute
+    };
+  }
+
+  // Simple solar model: declination from day-of-year, hour angle at a fixed
+  // latitude, solar noon at 12:00 local. Returns sunrise/sunset in minutes.
+  function sunMinutes(year, month, day) {
+    var start = Date.UTC(year, 0, 0);
+    var doy = Math.floor((Date.UTC(year, month, day) - start) / 86400000);
+    var decl = -23.44 * Math.PI / 180 * Math.cos(2 * Math.PI * (doy + 10) / 365);
+    var cosH = -Math.tan(LAT_RAD) * Math.tan(decl);
+    if (cosH < -1) cosH = -1;
+    if (cosH > 1) cosH = 1;
+    var half = Math.acos(cosH) * 180 / Math.PI / 15 * 60; // minutes of half-day
+    return { rise: 720 - half, set: 720 + half };
+  }
+
+  function mix(a, b, t) {
+    return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+  }
+  function css(c, a) {
+    return "rgba(" + Math.round(c[0]) + "," + Math.round(c[1]) + "," + Math.round(c[2]) + "," + a + ")";
+  }
+
+  // Sky keyframes as [bottom, top] tone pairs.
+  var KF_ROSE = [ROSE_RGB, ROSE_RGB];     // pre-dawn: uniform rose plane
+  var KF_MID  = [AMBER_RGB, ROSE_RGB];    // amber low, rose still high
+  var KF_DAY  = [PALE_RGB, NOON_RGB];     // pale low, noon blue high
+
+  function lerpKF(a, b, t) {
+    return [mix(a[0], b[0], t), mix(a[1], b[1], t)];
+  }
+  // One sequence in progress p (0..1): rose -> amber/rose -> pale/noon.
+  function sequenceKF(p) {
+    if (p < 0.5) return lerpKF(KF_ROSE, KF_MID, p * 2);
+    return lerpKF(KF_MID, KF_DAY, (p - 0.5) * 2);
+  }
+
+  // Sky state for a program minute: inside the 40-minute dawn window the
+  // sequence runs forward; inside the dusk window it runs in reverse;
+  // otherwise the sky holds the still noon flatness, per the prompt.
+  function skyState(clock) {
+    var sun = sunMinutes(clock.year, clock.month, clock.day);
+    var m = clock.minute;
+    var dawnStart = sun.rise - 20, duskStart = sun.set - 20;
+    if (m >= dawnStart && m < dawnStart + 40) return sequenceKF((m - dawnStart) / 40);
+    if (m >= duskStart && m < duskStart + 40) return sequenceKF(1 - (m - duskStart) / 40);
+    return KF_DAY;
+  }
+
+  // Noise-band layout: fixed by seed, positions are pure functions of the
+  // program minute (closed form), so drift never breaks determinism.
+  var bands = [];
+  (function buildBands() {
+    var rng = makeRng(74409013);
+    for (var i = 0; i < 3; i++) {
+      bands.push({
+        baseV: 0.18 + rng() * 0.6,          // vertical center, fraction of aperture height
+        thick: 0.10 + rng() * 0.12,         // thickness, fraction of aperture height
+        period: 90 + Math.floor(rng() * 150), // drift period, minutes
+        phase: rng() * Math.PI * 2,
+        alpha: 0.05 + rng() * 0.04,         // peak alpha, kept very low
+        seg: 5 + Math.floor(rng() * 4)      // horizontal segment count for block texture
+      });
+    }
+  })();
+
+  // Static seeded grain inside the aperture (unit coordinates).
+  var grain = [];
+  (function buildGrain() {
+    var rng = makeRng(7445177);
+    for (var i = 0; i < 420; i++) {
+      grain.push({ x: rng(), y: rng(), a: 0.012 + rng() * 0.02, r: 0.6 + rng() * 1.4 });
+    }
+  })();
+
+  function draw() {
+    if (W <= 0 || H <= 0) return;
+    canvas.style.width = W + "px";
+    canvas.style.height = H + "px";
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+    var clock = programClock();
+    var kf = skyState(clock);
+    var bottom = kf[0], top = kf[1];
+    var phone = isPhone();
+
+    // Room.
+    ctx.fillStyle = GROUND;
+    ctx.fillRect(0, 0, W, H);
+
+    // Aperture geometry: 70% of frame height, centered, proportion kept.
+    var apH = H * 0.70;
+    var apW = Math.min(W * 0.86, apH * 1.35);
+    if (phone) apW = Math.min(W * 0.88, apH * 1.1);
+    if (apW / apH < 0.55) apH = apW / 0.55;
+    var ax = (W - apW) / 2, ay = (H - apH) / 2;
+    var bez = Math.max(5, Math.min(apW, apH) * 0.055);
+
+    // Stone bezel.
+    ctx.fillStyle = STONE;
+    ctx.fillRect(ax - bez, ay - bez, apW + bez * 2, apH + bez * 2);
+
+    // Sky, clipped to the aperture.
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(ax, ay, apW, apH);
+    ctx.clip();
+
+    // Stepped flat bands in place of a gradient: 56 horizontal strips.
+    var STRIPS = 56;
+    var i, y0, y1;
+    for (i = 0; i < STRIPS; i++) {
+      var t = STRIPS === 1 ? 0 : i / (STRIPS - 1); // 0 at top, 1 at bottom
+      y0 = ay + apH * (i / STRIPS) - 1;
+      y1 = ay + apH * ((i + 1) / STRIPS) + 1;
+      ctx.fillStyle = css(mix(top, bottom, t), 1);
+      ctx.fillRect(ax - 1, y0, apW + 2, y1 - y0);
+    }
+
+    // Drifting noise bands: stacks of thin strips, raised-cosine alpha,
+    // block-textured horizontally. Everything is a function of the minute.
+    for (var b = 0; b < bands.length; b++) {
+      var bd = bands[b];
+      var vc = bd.baseV + 0.055 * Math.sin(2 * Math.PI * (clock.minute / bd.period) + bd.phase);
+      var halfT = bd.thick / 2;
+      var ROWS = 12;
+      for (var r = 0; r < ROWS; r++) {
+        var v = vc - halfT + bd.thick * (r + 0.5) / ROWS;
+        var d = Math.abs(v - vc) / halfT;
+        if (d >= 1) continue;
+        var prof = Math.cos(d * Math.PI / 2);
+        var ry = ay + apH * (vc - halfT + bd.thick * r / ROWS) - 1;
+        var rh = apH * bd.thick / ROWS + 2;
+        var segW = apW / bd.seg;
+        var drift = ((clock.minute * (b + 1)) % bd.seg) / bd.seg;
+        for (var sIdx = -1; sIdx < bd.seg + 1; sIdx++) {
+          var jitter = 0.75 + 0.25 * Math.sin(sIdx * 12.9898 + b * 78.233);
+          ctx.fillStyle = css(PALE_RGB, bd.alpha * prof * jitter);
+          ctx.fillRect(ax + (sIdx + drift) * segW - 1, ry, segW + 2, rh);
+        }
+      }
+    }
+
+    // Static grain.
+    for (i = 0; i < grain.length; i++) {
+      var g = grain[i];
+      ctx.fillStyle = css(PALE_RGB, g.a);
+      ctx.fillRect(ax + g.x * apW, ay + g.y * apH, g.r, g.r);
+    }
+
+    // Knife-edge shading: a shadow line inside the lower rim, a faint light
+    // catch on the upper rim. Palette tones only, kept nearly invisible.
+    ctx.fillStyle = "rgba(10,10,12,0.5)";
+    ctx.fillRect(ax, ay + apH - 2, apW, 2);
+    ctx.fillRect(ax + apW - 2, ay, 2, apH);
+    ctx.fillStyle = css(PALE_RGB, 0.16);
+    ctx.fillRect(ax, ay, apW, 1.5);
+    ctx.fillRect(ax, ay, 1.5, apH);
+
+    ctx.restore();
+  }
+
+  draw();
+
+  if (typeof requestAnimationFrame === "function") {
+    var loop = function () { draw(); requestAnimationFrame(loop); };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
