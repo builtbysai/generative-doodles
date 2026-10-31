@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Recorded From Somewhere</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #060607; height: 100%; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- palette (strict) ----------
+  var BG    = '#060607';              // night base
+  var WARM  = [216, 160, 60];         // mark warm  #D8A03C (day / loud)
+  var COOL  = [60, 90, 110];          // mark cool  #3C5A6E (night / quiet)
+  var FLASH = [232, 226, 212];        // collision flash #E8E2D4
+  var RED   = [110, 31, 36];          // deep red   #6E1F24 (peak ambience only)
+
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function clamp01(v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
+  function smoothstep(a, b, v) { var u = clamp01((v - a) / (b - a)); return u * u * (3 - 2 * u); }
+  function wrap1(v) { v = v % 1; return v < 0 ? v + 1 : v; }
+
+  // ---------- seeded RNG (mulberry32) ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ---------- layout ----------
+  var W = 0, H = 0, DPR = 1, S = 1, isPhone = false;
+
+  function viewSize() {
+    var vv = window.visualViewport;
+    if (vv && vv.width) return { w: vv.width, h: vv.height };
+    return { w: window.innerWidth || 0, h: window.innerHeight || 0 };
+  }
+
+  function layout() {
+    var s = viewSize();
+    W = s.w; H = s.h;
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    var sw = (window.screen && window.screen.width) ? Math.min(window.screen.width, window.screen.height) : 9999;
+    isPhone = sw < 700 || H > W * 1.15;
+    S = Math.min(W, H) || 1;
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+  }
+
+  // ---------- simulated place ----------
+  // No microphone, no device clock. The "place" is a simulated ambience
+  // engine: a closed-form weather function of the piece clock plus a
+  // simulated day cycle (24 h compressed to 24 min), both anchored so
+  // frame one sits at ambience 0.45 on a warm afternoon.
+  var DAY_LEN = 1440;          // seconds per simulated day
+  var DAY0 = 0.718;            // day phase at t=0 (late afternoon)
+  var NMARKS = 620;
+
+  var seedBase = 866027;
+  var epoch = 0;
+  var epochStart = 0;          // piece-clock time of the current epoch
+  var place = null;            // per-epoch seeded data
+  var marks = [];
+  var transients = [];
+  var nextTransient = 0;
+
+  function buildPlace(seed) {
+    var rng = mulberry32(seed);
+    var p = {};
+    // ambience: sum of slow sines, phases seeded; anchored A(0) = 0.45
+    p.terms = [];
+    var periods = [150 + rng() * 90, 260 + rng() * 120, 430 + rng() * 190];
+    var amps = [0.26, 0.17, 0.11];
+    for (var i = 0; i < 3; i++) {
+      p.terms.push({ om: 2 * Math.PI / periods[i], amp: amps[i] * (0.8 + rng() * 0.45), ph: rng() * Math.PI * 2 });
+    }
+    // prevailing drift direction for this place
+    p.wind = rng() * Math.PI * 2;
+    // patchiness: cluster centres some marks gather around
+    p.centres = [];
+    for (var c = 0; c < 7; c++) p.centres.push({ x: rng(), y: rng(), r: 0.10 + rng() * 0.13 });
+    p.rng = rng;
+    return p;
+  }
+
+  // raw (unclamped) ambience, closed form in t
+  function ambRaw(t) {
+    var a = 0.45;
+    for (var i = 0; i < place.terms.length; i++) {
+      var tm = place.terms[i];
+      a += tm.amp * (Math.sin(tm.om * t + tm.ph) - Math.sin(tm.ph));
+    }
+    return a;
+  }
+  function ambience(t) { return clamp01(ambRaw(t)); }
+
+  // integral of drift speed 0.30 + 1.25 * ambRaw, closed form in t:
+  // how far the place has drifted by time t (drives mark drift)
+  function driftDist(t) {
+    var g = (0.30 + 1.25 * 0.45) * t;
+    for (var i = 0; i < place.terms.length; i++) {
+      var tm = place.terms[i];
+      g += 1.25 * tm.amp * ((Math.cos(tm.ph) - Math.cos(tm.om * t + tm.ph)) / tm.om - t * Math.sin(tm.ph));
+    }
+    return g;
+  }
+
+  // simulated warmth from the day cycle, closed form in t
+  function warmth(t) {
+    var dp = wrap1(DAY0 + t / DAY_LEN);
+    return clamp01(0.5 + 0.55 * Math.cos(2 * Math.PI * (dp - 0.56)));
+  }
+
+  function buildMarks() {
+    var rng = place.rng;
+    marks = [];
+    for (var i = 0; i < NMARKS; i++) {
+      var bx, by;
+      if (rng() < 0.42) {  // clustered patch
+        var c = place.centres[Math.floor(rng() * place.centres.length)];
+        bx = c.x + ((rng() + rng() + rng()) / 3 - 0.5) * 2 * c.r * 1.7;
+        by = c.y + ((rng() + rng() + rng()) / 3 - 0.5) * 2 * c.r * 1.7;
+      } else {
+        bx = rng(); by = rng();
+      }
+      var ang = place.wind + (rng() - 0.5) * 1.7;
+      marks.push({
+        bx: wrap1(bx), by: wrap1(by),
+        dx: Math.cos(ang), dy: Math.sin(ang),
+        spd: 0.0022 + rng() * 0.0068,          // drift speed (units of driftDist)
+        theta: rng(),                           // lit threshold vs population level
+        ff: 0.5 + rng() * 1.6, fp: rng() * Math.PI * 2,   // flicker
+        wf: 0.05 + rng() * 0.10, wp: rng() * Math.PI * 2, // wander
+        type: rng() < 0.55 ? 0 : 1,             // 0 dot, 1 dash
+        size: 1.7 + rng() * 2.2,
+        len: 2.2 + rng() * 3.6,
+        warmBias: (rng() - 0.5) * 0.8,
+        flare: rng() < 0.05
+      });
+    }
+    // ambient transients: seeded "boat collisions" of the ambience itself
+    transients = [];
+    var tt = 9 + rng() * 14;
+    for (var k = 0; k < 48; k++) {
+      var amp = 0.35 + 0.65 * ambience(tt);
+      transients.push({ t: tt, x: rng(), y: rng(), amp: amp, freq: 1100 + rng() * 1600 });
+      tt += 17 + rng() * 30;
+    }
+    nextTransient = 0;
+  }
+
+  function resetEpoch(tNow) {
+    place = buildPlace(seedBase + epoch * 7919);
+    buildMarks();
+    stirs.length = 0;
+    bursts.length = 0;
+    epochStart = tNow;
+    lastTapT = -10;
+  }
+
+  // ---------- interaction (recorded events) ----------
+  var stirs = [];    // {x, y, vx, vy, t} drag samples, px space
+  var bursts = [];   // {x, y, t0, amp} tap collisions, px space
+  var lastTapT = -10;
+
+  // burst brightness / push shape for one event at mark distance d (px), age (s)
+  function burstAt(b, d, age) {
+    if (age < 0 || age > 1.7) return 0;
+    var rho = 0.14 * S;
+    var fall = Math.exp(-(d * d) / (2 * rho * rho));
+    return fall * Math.exp(-age * 2.1) * b.amp;
+  }
+
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = BG;
+    ctx.fillRect(0, 0, W, H);
+
+    var A = ambience(t);
+    var P = clamp01(A * 0.95 + 0.03);        // lit population level
+    var Wm = warmth(t);
+    var G = driftDist(t);
+    var flareW = smoothstep(0.85, 0.97, A);
+    var sizeMul = (S / 700) * (isPhone ? 1.35 : 1);
+    var i, m, j;
+
+    // burst rings (tap collisions + ambient transients), drawn under the marks
+    ctx.lineWidth = Math.max(1, S * 0.0016);
+    function ring(x, y, t0, amp) {
+      var age = t - t0;
+      if (age < 0 || age > 1.7) return;
+      var r = S * (0.015 + age * 0.085);
+      ctx.globalAlpha = (1 - age / 1.7) * 0.28 * amp;
+      ctx.strokeStyle = 'rgb(232,226,212)';
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    for (i = 0; i < bursts.length; i++) ring(bursts[i].x, bursts[i].y, bursts[i].t0, bursts[i].amp);
+    for (i = 0; i < transients.length; i++) {
+      var tr = transients[i];
+      if (tr.t <= t && t - tr.t < 1.7) ring(tr.x * W, tr.y * H, tr.t, tr.amp * 0.8);
+    }
+    ctx.globalAlpha = 1;
+
+    var stirSig = 0.16 * S;
+    for (i = 0; i < marks.length; i++) {
+      m = marks[i];
+      var ux = wrap1(m.bx + m.dx * m.spd * G + 0.0035 * Math.sin(m.wf * t + m.wp));
+      var uy = wrap1(m.by + m.dy * m.spd * G + 0.0035 * Math.cos(m.wf * 0.83 * t + m.wp * 1.7));
+      var px = ux * W, py = uy * H;
+      var ox = 0, oy = 0, flash = 0;
+
+      // drag stirs: slow swirl that settles back over seconds
+      for (j = 0; j < stirs.length; j++) {
+        var st = stirs[j];
+        var sage = t - st.t;
+        if (sage < 0 || sage > 9) continue;
+        var sx = px - st.x, sy = py - st.y;
+        var d2 = sx * sx + sy * sy;
+        if (d2 > 9 * stirSig * stirSig) continue;
+        var infl = Math.exp(-d2 / (2 * stirSig * stirSig)) * Math.exp(-sage / 5);
+        var dist = Math.sqrt(d2) || 1;
+        ox += (-sy / dist) * infl * 0.045 * S + st.vx * infl * 0.30;
+        oy += (sx / dist) * infl * 0.045 * S + st.vy * infl * 0.30;
+      }
+      // bursts push marks outward and flash them
+      for (j = 0; j < bursts.length; j++) {
+        var b = bursts[j];
+        var bx2 = px - b.x, by2 = py - b.y;
+        var bd = Math.sqrt(bx2 * bx2 + by2 * by2) || 1;
+        var bf = burstAt(b, bd, t - b.t0);
+        if (bf > 0) {
+          flash += bf;
+          var u = (t - b.t0) / 0.5;
+          var push = u * Math.exp(1 - u) * bf * 0.05 * S;
+          ox += (bx2 / bd) * push; oy += (by2 / bd) * push;
+        }
+      }
+      for (j = 0; j < transients.length; j++) {
+        var te = transients[j];
+        var tage = t - te.t;
+        if (tage < 0 || tage > 1.7) continue;
+        var tx = px - te.x * W, ty = py - te.y * H;
+        var td = Math.sqrt(tx * tx + ty * ty) || 1;
+        var tf = burstAt(te, td, tage) * 0.8;
+        if (tf > 0) {
+          flash += tf;
+          var tu = tage / 0.5;
+          var tpush = tu * Math.exp(1 - tu) * tf * 0.04 * S;
+          ox += (tx / td) * tpush; oy += (ty / td) * tpush;
+        }
+      }
+      var om = Math.sqrt(ox * ox + oy * oy), omax = 0.085 * S;
+      if (om > omax) { ox = ox / om * omax; oy = oy / om * omax; }
+      px += ox; py += oy;
+      flash = clamp01(flash);
+
+      // brightness: population threshold eased over 0.16 (weather, not switches)
+      var lit = clamp01((P + 0.08 - m.theta) / 0.16);
+      var flick = 0.78 + 0.22 * Math.sin(m.ff * t + m.fp);
+      var alpha = (0.15 + 0.88 * lit) * flick + flash * 0.75;
+      if (alpha > 1) alpha = 1;
+
+      // colour: cool <-> warm by simulated day warmth + per-mark bias
+      var cw = clamp01(Wm + m.warmBias);
+      var r = COOL[0] + (WARM[0] - COOL[0]) * cw;
+      var g = COOL[1] + (WARM[1] - COOL[1]) * cw;
+      var bl = COOL[2] + (WARM[2] - COOL[2]) * cw;
+      if (flash > 0) {
+        r += (FLASH[0] - r) * flash * 0.9;
+        g += (FLASH[1] - g) * flash * 0.9;
+        bl += (FLASH[2] - bl) * flash * 0.9;
+      }
+      if (flareW > 0 && m.flare) {
+        var fw = flareW * (0.6 + 0.4 * Math.sin(t * 2.1 + m.fp)) * 0.85;
+        r += (RED[0] - r) * fw; g += (RED[1] - g) * fw; bl += (RED[2] - bl) * fw;
+        alpha = Math.min(1, alpha + flareW * 0.25);
+      }
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = 'rgb(' + (r | 0) + ',' + (g | 0) + ',' + (bl | 0) + ')';
+      var sz = Math.max(1.1, m.size * sizeMul);
+      if (m.type === 0) {
+        ctx.fillRect(px - sz / 2, py - sz / 2, sz, sz);
+      } else {
+        var aa = Math.atan2(m.dy, m.dx) + 0.6 * Math.sin(t * 0.3 + m.fp);
+        var ln = m.len * sizeMul * 1.35;
+        ctx.strokeStyle = ctx.fillStyle;
+        ctx.lineWidth = Math.max(1, sz * 0.8);
+        ctx.beginPath();
+        ctx.moveTo(px, py);
+        ctx.lineTo(px + Math.cos(aa) * ln, py + Math.sin(aa) * ln);
+        ctx.stroke();
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- audio (lazy, guarded; granular bed + metallic pings) ----------
+  var AC = null, master = null, noiseBuf = null, audioOK = false, nextGrain = 0;
+  var aRng = mulberry32(4242);
+
+  function ensureAudio() {
+    if (audioOK) return;
+    audioOK = true;   // try once
+    try {
+      var Ctor = window.AudioContext || window.webkitAudioContext;
+      if (typeof Ctor !== 'function') return;
+      AC = new Ctor();
+      master = AC.createGain();
+      master.gain.value = 0.4;
+      master.connect(AC.destination);
+      var len = AC.sampleRate;
+      noiseBuf = AC.createBuffer(1, len, AC.sampleRate);
+      var d = noiseBuf.getChannelData(0);
+      for (var i = 0; i < len; i++) d[i] = aRng() * 2 - 1;
+    } catch (e) { AC = null; }
+  }
+
+  function grain(t) {
+    if (!AC || !noiseBuf) return;
+    try {
+      var src = AC.createBufferSource();
+      src.buffer = noiseBuf;
+      src.playbackRate.value = 0.7 + aRng() * 0.7;
+      var bp = AC.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.value = 450 + aRng() * 2300;
+      bp.Q.value = 7;
+      var gn = AC.createGain();
+      var dur = 0.05 + aRng() * 0.12;
+      var t0 = AC.currentTime;
+      gn.gain.setValueAtTime(0, t0);
+      gn.gain.linearRampToValueAtTime(0.05, t0 + 0.012);
+      gn.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      src.connect(bp); bp.connect(gn); gn.connect(master);
+      src.start(t0, aRng() * 0.8, dur + 0.05);
+      src.stop(t0 + dur + 0.1);
+    } catch (e) { /* silent */ }
+  }
+
+  function ping(freq, scale) {
+    if (!AC) return;
+    try {
+      var t0 = AC.currentTime;
+      var parts = [1, 2.756];
+      var gains = [0.10, 0.035];
+      for (var i = 0; i < 2; i++) {
+        var o = AC.createOscillator();
+        o.type = 'sine';
+        o.frequency.value = freq * parts[i];
+        var gn = AC.createGain();
+        gn.gain.setValueAtTime(gains[i] * scale, t0);
+        gn.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.55);
+        o.connect(gn); gn.connect(master);
+        o.start(t0); o.stop(t0 + 0.6);
+      }
+    } catch (e) { /* silent */ }
+  }
+
+  // ---------- time ----------
+  var T0 = 0;
+  function nowS() { return performance.now() / 1000 - T0; }
+
+  // ---------- pointer ----------
+  var downAt = null, downT = 0, dragging = false, lastStirT = -1, lastStirX = 0, lastStirY = 0;
+
+  function evtPos(e) {
+    var rect = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    return { x: (e.clientX || 0) - rect.left, y: (e.clientY || 0) - rect.top };
+  }
+
+  function onDown(e) {
+    ensureAudio();
+    if (AC && AC.resume) { try { AC.resume(); } catch (err) { /* ignore */ } }
+    var p = evtPos(e);
+    downAt = p; downT = nowS(); dragging = false;
+    lastStirT = -1;
+    if (e.preventDefault) e.preventDefault();
+  }
+
+  function onMove(e) {
+    if (!downAt) return;
+    var p = evtPos(e);
+    var t = nowS();
+    var dx = p.x - downAt.x, dy = p.y - downAt.y;
+    if (!dragging && dx * dx + dy * dy > 36) dragging = true;
+    if (dragging) {
+      var dt = t - lastStirT;
+      var moved = Math.abs(p.x - lastStirX) + Math.abs(p.y - lastStirY);
+      if (lastStirT < 0 || (dt > 0.045 && moved > 6)) {
+        var vx = 0, vy = 0;
+        if (lastStirT > 0 && dt > 0.001) {
+          vx = clamp((p.x - lastStirX) / dt, -900, 900) / 60;  // per-frame-ish carry
+          vy = clamp((p.y - lastStirY) / dt, -900, 900) / 60;
+        }
+        stirs.push({ x: p.x, y: p.y, vx: vx, vy: vy, t: t - epochStart });
+        if (stirs.length > 80) stirs.shift();
+        lastStirT = t; lastStirX = p.x; lastStirY = p.y;
+      }
+    }
+    if (e.preventDefault) e.preventDefault();
+  }
+
+  function onUp(e) {
+    if (!downAt) return;
+    var t = nowS();
+    var wasDrag = dragging;
+    var p = evtPos(e);
+    downAt = null; dragging = false;
+    if (wasDrag) return;
+    if (t - downT > 0.45) return;   // long press: not a tap
+    var tl = t - epochStart;
+    if (t - lastTapT < 0.35) {      // double-tap: reseed place and field
+      epoch++;
+      resetEpoch(t);
+      draw(0);
+      return;
+    }
+    lastTapT = t;
+    bursts.push({ x: p.x, y: p.y, t0: tl, amp: 1 });
+    if (bursts.length > 12) bursts.shift();
+    ping(900 + aRng() * 1400, 1);
+    if (e.preventDefault) e.preventDefault();
+  }
+
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', function () { downAt = null; dragging = false; });
+  }
+
+  // ---------- main ----------
+  T0 = performance.now() / 1000;
+  layout();
+  resetEpoch(0);
+  draw(0);
+
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { layout(); draw(nowS() - epochStart); });
+  }
+  window.addEventListener('resize', function () { layout(); draw(nowS() - epochStart); });
+
+  if (typeof requestAnimationFrame === 'function') {
+    var frame = function () {
+      var tl = nowS() - epochStart;
+      // ambient transient pings, as their seeded times pass
+      while (nextTransient < transients.length && transients[nextTransient].t <= tl) {
+        if (AC) ping(transients[nextTransient].freq, 0.35 + 0.55 * transients[nextTransient].amp);
+        nextTransient++;
+      }
+      // granular bed: density tracks the lit population
+      if (AC && tl >= nextGrain) {
+        grain(tl);
+        var P = clamp01(ambience(tl) * 0.95 + 0.03);
+        nextGrain = tl + (0.55 - 0.50 * P) * (0.4 + aRng() * 0.9);
+      }
+      // prune dead events
+      while (bursts.length && tl - bursts[0].t0 > 1.8) bursts.shift();
+      while (stirs.length && tl - stirs[0].t > 9.5) stirs.shift();
+      draw(tl);
+      requestAnimationFrame(frame);
+    };
+    requestAnimationFrame(frame);
+  }
+})();
+</script>
+</body>
+</html>

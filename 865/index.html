@@ -1,0 +1,543 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>The DJ Replaces the Orchestra</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0A0908; height: 100%; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- palette (strict) ----------
+  var INK    = '#0A0908';  // archive black
+  var SILVER = '#B8B2A6';  // silver grain
+  var WARM   = '#C98A2E';  // warm tint, only under gesture
+  var COLD   = '#2E3A44';  // cold stillness, only in stillness
+  var WHITE  = '#EDE8DA';  // scratch white
+
+  // ---------- seeded RNG (mulberry32) + helpers ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function hash01(n) { var x = Math.sin(n * 127.1 + 311.7) * 43758.5453; return x - Math.floor(x); }
+  function parseRGB(hex) {
+    return [parseInt(hex.slice(1, 3), 16), parseInt(hex.slice(3, 5), 16), parseInt(hex.slice(5, 7), 16)];
+  }
+  function rgba(hex, a) {
+    var c = parseRGB(hex);
+    return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a + ')';
+  }
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ---------- QA hook: ?seed=<seconds> offsets the piece clock (inert in production) ----------
+  var T_OFF = 0;
+  try {
+    var qs = (typeof location !== 'undefined' && location.search) ? location.search : '';
+    var sm = /[?&]seed=([0-9]+(?:\.[0-9]+)?)/.exec(qs);
+    if (sm) T_OFF = parseFloat(sm[1]);
+  } catch (e) { /* no hook */ }
+
+  // ---------- energy model ----------
+  // E(t) is a closed-form sum of decaying exponentials over the recorded drag
+  // samples: a resting term that decays from E_REST toward E_MIN (tau 8 s),
+  // plus one excitation per throttled drag-speed sample (tau 2 s, so a gesture
+  // is felt for about 6 s). PHI(t) is the exact analytic integral of the drift
+  // rate k(E) = 0.05 + 1.05 * E, so silhouette positions are closed-form too.
+  var E_REST = 0.42;   // frame one sits here: moderate, neutral-to-warm
+  var E_MIN  = 0.10;   // the stillness floor: cold, near-frozen
+  var TAU_IDLE = 8, TAU_EXC = 2;
+  var excitations = [];  // {t, a}
+
+  function energyAt(t) {
+    var e = E_MIN + (E_REST - E_MIN) * Math.exp(-t / TAU_IDLE);
+    for (var i = 0; i < excitations.length; i++) {
+      var dt = t - excitations[i].t;
+      if (dt >= 0) e += excitations[i].a * Math.exp(-dt / TAU_EXC);
+    }
+    return e;
+  }
+  function phiAt(t) {
+    var ie = E_MIN * t + (E_REST - E_MIN) * TAU_IDLE * (1 - Math.exp(-t / TAU_IDLE));
+    for (var i = 0; i < excitations.length; i++) {
+      var dt = t - excitations[i].t;
+      if (dt >= 0) ie += excitations[i].a * TAU_EXC * (1 - Math.exp(-dt / TAU_EXC));
+    }
+    return 0.05 * t + 1.05 * ie;
+  }
+
+  // ---------- archive content: eras, layouts, scratches ----------
+  var eraSeed = 86526;
+  var cutIndex = 0;
+  var layout = null;
+  var scratches = null;
+  var bandBase = 0.28;
+
+  function genLayout() {
+    var rnd = mulberry32(eraSeed * 7919 + cutIndex * 104729 + 865);
+    var types = ['boat', 'figures', 'rooftop', 'bicycle', 'crane'];
+    for (var i = types.length - 1; i > 0; i--) {
+      var j = Math.floor(rnd() * (i + 1));
+      var tmp = types[i]; types[i] = types[j]; types[j] = tmp;
+    }
+    var count = 4 + Math.floor(rnd() * 2);
+    var arr = [];
+    for (var k = 0; k < count; k++) {
+      var sp = {
+        type: types[k],
+        u0: cutIndex === 0 ? 0.14 + rnd() * 0.72 : rnd(),
+        speed: 0.010 + rnd() * 0.016,
+        dir: rnd() < 0.5 ? -1 : 1,
+        scale: 0.55 + rnd() * 0.40,
+        yOff: rnd() * 0.03,
+        aux: null
+      };
+      if (sp.type === 'rooftop') {
+        var wr = mulberry32(eraSeed * 31 + cutIndex * 7 + k * 131);
+        sp.aux = [];
+        for (var wI = 0; wI < 12; wI++) sp.aux.push([wr(), wr()]);
+      }
+      arr.push(sp);
+    }
+    return arr;
+  }
+
+  function genScratches() {
+    var rnd = mulberry32(eraSeed * 3313 + 41);
+    var arr = [{ xf: 0.62, off: 0.7, durF: 0.20 }];  // one scratch is up at t = 0
+    for (var i = 0; i < 4; i++) {
+      arr.push({ xf: rnd(), off: rnd() * 7, durF: 0.10 + rnd() * 0.16 });
+    }
+    return arr;
+  }
+
+  function regen() {
+    layout = genLayout();
+    scratches = genScratches();
+    bandBase = 0.24 + hash01(eraSeed * 3.7) * 0.08;
+  }
+  regen();
+
+  var lastCutT = -1e9;
+
+  // ---------- viewport / layout ----------
+  var W = 0, H = 0, DPR = 1, isPhone = false;
+  var bandY = 0, bandH = 0, bandBot = 0;
+
+  function viewSize() {
+    var vv = window.visualViewport;
+    if (vv && vv.width) return { w: vv.width, h: vv.height };
+    return { w: window.innerWidth || 0, h: window.innerHeight || 0 };
+  }
+
+  function layoutScreen() {
+    var s = viewSize();
+    W = s.w; H = s.h;
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    var sw = (window.screen && window.screen.width) ? Math.min(window.screen.width, window.screen.height) : 9999;
+    isPhone = sw < 700 || H > W * 1.15;
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    bandH = H * (isPhone ? 0.46 : 0.44);
+    bandY = (H - bandH) / 2;
+    bandBot = bandY + bandH;
+  }
+
+  var nowT = T_OFF;
+
+  // ---------- audio (lazy, gesture-gated, typeof-guarded) ----------
+  var AC = null, master = null, bedGain = null, bedFilter = null, audioOn = false;
+  function ensureAudio() {
+    if (typeof window === 'undefined') return;
+    var Ctor = window.AudioContext || window.webkitAudioContext;
+    if (typeof Ctor !== 'function') return;
+    try {
+      if (!AC) {
+        AC = new Ctor();
+        master = AC.createGain();
+        master.gain.value = 0.9;
+        if (typeof AC.createDynamicsCompressor === 'function') {
+          var comp = AC.createDynamicsCompressor();
+          master.connect(comp); comp.connect(AC.destination);
+        } else {
+          master.connect(AC.destination);
+        }
+        // the bed: low drone + filtered noise through one lowpass, gain from E
+        bedFilter = AC.createBiquadFilter();
+        bedFilter.type = 'lowpass'; bedFilter.frequency.value = 300; bedFilter.Q.value = 0.4;
+        bedGain = AC.createGain(); bedGain.gain.value = 0;
+        bedFilter.connect(bedGain); bedGain.connect(master);
+        var d1 = AC.createOscillator(); d1.type = 'sine'; d1.frequency.value = 48;
+        var dg1 = AC.createGain(); dg1.gain.value = 0.55;
+        d1.connect(dg1); dg1.connect(bedFilter); d1.start();
+        var d2 = AC.createOscillator(); d2.type = 'triangle'; d2.frequency.value = 96.5;
+        var dg2 = AC.createGain(); dg2.gain.value = 0.16;
+        d2.connect(dg2); dg2.connect(bedFilter); d2.start();
+        var nb = AC.createBuffer(1, AC.sampleRate * 2, AC.sampleRate);
+        var nd = nb.getChannelData(0);
+        var nr = mulberry32(86599);
+        for (var i = 0; i < nd.length; i++) nd[i] = nr() * 2 - 1;
+        var ns = AC.createBufferSource(); ns.buffer = nb; ns.loop = true;
+        var nf = AC.createBiquadFilter(); nf.type = 'bandpass'; nf.frequency.value = 420; nf.Q.value = 0.5;
+        var ng = AC.createGain(); ng.gain.value = 0.35;
+        ns.connect(nf); nf.connect(ng); ng.connect(bedFilter); ns.start();
+      }
+      if (AC.state === 'suspended' && typeof AC.resume === 'function') AC.resume();
+      audioOn = true;
+    } catch (e) { /* audio unavailable: the piece stays silent */ }
+  }
+  function updateAudio() {
+    if (!audioOn || !AC || !bedGain) return;
+    try {
+      var ed = clamp(energyAt(nowT), 0, 1);
+      var tc = AC.currentTime;
+      bedFilter.frequency.setTargetAtTime(140 + 950 * ed, tc, 0.25);
+      bedGain.gain.setTargetAtTime(0.012 * ed + 0.16 * ed * ed, tc, 0.3);
+    } catch (e) { /* ignore */ }
+  }
+  function thump() {
+    if (!audioOn || !AC || !master) return;
+    try {
+      var t = AC.currentTime;
+      var o = AC.createOscillator(); o.type = 'sine';
+      o.frequency.setValueAtTime(68, t);
+      o.frequency.exponentialRampToValueAtTime(38, t + 0.16);
+      var g = AC.createGain();
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(0.28, t + 0.012);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.22);
+      o.connect(g); g.connect(master);
+      o.start(t); o.stop(t + 0.25);
+    } catch (e) { /* ignore */ }
+  }
+
+  // ---------- interaction ----------
+  var activePtr = null, downT = 0, downX = 0, downY = 0, moved = false;
+  var lastMoveX = 0, lastMoveY = 0, lastMoveT = 0, lastSampleT = -9;
+  var pendingTap = null;  // {t} waiting out the double-tap window
+
+  function evPos(e) { return { x: e.clientX || 0, y: e.clientY || 0 }; }
+
+  canvas.addEventListener('pointerdown', function (e) {
+    ensureAudio();
+    if (activePtr !== null) return;
+    var pos = evPos(e);
+    activePtr = e.pointerId;
+    downT = nowT; downX = pos.x; downY = pos.y; moved = false;
+    lastMoveX = pos.x; lastMoveY = pos.y; lastMoveT = nowT; lastSampleT = -9;
+    if (e.preventDefault) e.preventDefault();
+  });
+  window.addEventListener('pointermove', function (e) {
+    if (activePtr === null || e.pointerId !== activePtr) return;
+    var pos = evPos(e);
+    if (Math.hypot(pos.x - downX, pos.y - downY) > 9) moved = true;
+    var dt = nowT - lastMoveT;
+    if (dt > 0.005) {
+      var dist = Math.hypot(pos.x - lastMoveX, pos.y - lastMoveY);
+      var sn = clamp((dist / dt) / 1500, 0, 1);
+      if (sn > 0.04 && nowT - lastSampleT > 0.07) {
+        excitations.push({ t: nowT, a: 0.5 * sn });
+        if (excitations.length > 400) excitations.splice(0, excitations.length - 400);
+        lastSampleT = nowT;
+      }
+    }
+    lastMoveX = pos.x; lastMoveY = pos.y; lastMoveT = nowT;
+  });
+  function endPointer(e) {
+    if (activePtr === null || e.pointerId !== activePtr) return;
+    activePtr = null;
+    if (!moved && nowT - downT < 0.4) {
+      if (pendingTap !== null && nowT - pendingTap.t < 0.35) {
+        // double-tap: reseed the archive, a new era
+        pendingTap = null;
+        eraSeed += 1;
+        cutIndex = 0;
+        regen();
+        lastCutT = nowT;
+        thump();
+      } else {
+        pendingTap = { t: nowT };
+      }
+    }
+    draw(nowT);
+  }
+  window.addEventListener('pointerup', endPointer);
+  window.addEventListener('pointercancel', endPointer);
+
+  // ---------- silhouette sprites (flat, procedural, anonymous) ----------
+  function drawBoat(x, base, s, flip) {
+    ctx.save();
+    ctx.translate(x, base);
+    if (flip) ctx.scale(-1, 1);
+    ctx.beginPath();
+    ctx.moveTo(-1.30 * s, -0.34 * s);
+    ctx.lineTo(1.30 * s, -0.34 * s);
+    ctx.lineTo(1.02 * s, 0);
+    ctx.lineTo(-0.95 * s, 0);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillRect(-0.55 * s, -0.62 * s, 0.95 * s, 0.28 * s);
+    ctx.save();
+    ctx.translate(0.62 * s, -0.60 * s);
+    ctx.rotate(-0.10);
+    ctx.fillRect(-0.09 * s, -0.36 * s, 0.18 * s, 0.38 * s);
+    ctx.restore();
+    ctx.fillRect(-0.97 * s, -1.02 * s, 0.045 * s, 0.68 * s);
+    ctx.fillRect(-0.97 * s, -1.02 * s, 0.55 * s, 0.035 * s);
+    ctx.restore();
+  }
+
+  function drawFigures(x, base, s) {
+    var figs = [
+      { dx: -0.52, h: 0.95, w: 0.34 },
+      { dx: 0.04, h: 1.10, w: 0.39 },
+      { dx: 0.56, h: 0.87, w: 0.32 }
+    ];
+    for (var i = 0; i < figs.length; i++) {
+      var f = figs[i], cx = x + f.dx * s, h = f.h * s, w = f.w * s;
+      ctx.beginPath();
+      ctx.arc(cx, base - h + 0.14 * h, 0.115 * h, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo(cx - w * 0.30, base - h + 0.26 * h);
+      ctx.lineTo(cx + w * 0.30, base - h + 0.26 * h);
+      ctx.lineTo(cx + w * 0.52, base);
+      ctx.lineTo(cx - w * 0.52, base);
+      ctx.closePath();
+      ctx.fill();
+    }
+  }
+
+  function drawRooftop(x, base, s, aux) {
+    var segs = [
+      { w: 0.50, h: 0.42 }, { w: 0.42, h: 0.66 }, { w: 0.60, h: 0.36 },
+      { w: 0.45, h: 0.80 }, { w: 0.55, h: 0.50 }, { w: 0.68, h: 0.58 }
+    ];
+    var cx = x - 1.60 * s;
+    var tops = [];
+    for (var i = 0; i < segs.length; i++) {
+      var w = segs[i].w * s, h = segs[i].h * s;
+      ctx.fillRect(cx, base - h, w, h);
+      tops.push({ x: cx, w: w, h: h });
+      cx += w;
+    }
+    // chimneys
+    ctx.fillRect(tops[1].x + tops[1].w * 0.55, base - tops[1].h - 0.16 * s, 0.09 * s, 0.16 * s);
+    ctx.fillRect(tops[4].x + tops[4].w * 0.30, base - tops[4].h - 0.13 * s, 0.08 * s, 0.13 * s);
+    // water tower on the tall segment
+    var tx = tops[3].x + tops[3].w * 0.5, ty = base - tops[3].h;
+    ctx.fillRect(tx - 0.03 * s, ty - 0.30 * s, 0.06 * s, 0.30 * s);
+    ctx.fillRect(tx - 0.17 * s, ty - 0.52 * s, 0.34 * s, 0.24 * s);
+    ctx.beginPath();
+    ctx.moveTo(tx - 0.20 * s, ty - 0.52 * s);
+    ctx.lineTo(tx + 0.20 * s, ty - 0.52 * s);
+    ctx.lineTo(tx, ty - 0.68 * s);
+    ctx.closePath();
+    ctx.fill();
+    // lit windows, seeded per layout
+    if (aux) {
+      ctx.fillStyle = rgba(SILVER, 0.22);
+      for (var k = 0; k < aux.length; k++) {
+        var seg = tops[Math.floor(aux[k][0] * tops.length)];
+        var wx = seg.x + 0.12 * seg.w + aux[k][1] * 0.72 * seg.w;
+        var wy = base - seg.h * (0.25 + 0.55 * aux[k][0]);
+        ctx.fillRect(wx, wy, Math.max(1.2, 0.035 * s), Math.max(1.2, 0.035 * s));
+      }
+      ctx.fillStyle = rgba(INK, 0.88);
+    }
+  }
+
+  function drawBicycle(x, base, s, flip) {
+    ctx.save();
+    ctx.translate(x, base);
+    if (flip) ctx.scale(-1, 1);
+    ctx.lineWidth = Math.max(1.2, 0.045 * s);
+    ctx.beginPath(); ctx.arc(-0.44 * s, -0.30 * s, 0.30 * s, 0, Math.PI * 2); ctx.stroke();
+    ctx.beginPath(); ctx.arc(0.44 * s, -0.30 * s, 0.30 * s, 0, Math.PI * 2); ctx.stroke();
+    ctx.lineWidth = Math.max(1.2, 0.05 * s);
+    ctx.beginPath();
+    ctx.moveTo(-0.44 * s, -0.30 * s); ctx.lineTo(-0.08 * s, -0.80 * s);
+    ctx.moveTo(-0.08 * s, -0.80 * s); ctx.lineTo(0.36 * s, -0.74 * s);
+    ctx.moveTo(0.36 * s, -0.74 * s); ctx.lineTo(0.44 * s, -0.30 * s);
+    ctx.moveTo(0.36 * s, -0.74 * s); ctx.lineTo(0.02 * s, -0.40 * s);
+    ctx.moveTo(0.02 * s, -0.40 * s); ctx.lineTo(-0.44 * s, -0.30 * s);
+    ctx.moveTo(-0.08 * s, -0.80 * s); ctx.lineTo(0.02 * s, -0.40 * s);
+    ctx.moveTo(-0.20 * s, -0.84 * s); ctx.lineTo(0.04 * s, -0.84 * s);
+    ctx.moveTo(0.36 * s, -0.74 * s); ctx.lineTo(0.48 * s, -0.82 * s);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawCrane(x, base, s, flip) {
+    ctx.save();
+    ctx.translate(x, base);
+    if (flip) ctx.scale(-1, 1);
+    ctx.fillRect(-0.32 * s, -0.09 * s, 0.64 * s, 0.09 * s);
+    ctx.fillRect(-0.05 * s, -1.50 * s, 0.10 * s, 1.50 * s);
+    ctx.lineWidth = Math.max(1.4, 0.075 * s);
+    ctx.beginPath();
+    ctx.moveTo(0, -1.46 * s); ctx.lineTo(1.18 * s, -1.04 * s);
+    ctx.moveTo(0, -1.46 * s); ctx.lineTo(-0.52 * s, -1.22 * s);
+    ctx.stroke();
+    ctx.lineWidth = Math.max(1, 0.022 * s);
+    ctx.beginPath();
+    ctx.moveTo(-0.52 * s, -1.22 * s); ctx.lineTo(0, -1.02 * s); ctx.lineTo(1.18 * s, -1.04 * s);
+    ctx.moveTo(0.95 * s, -1.09 * s); ctx.lineTo(0.95 * s, -0.52 * s);
+    ctx.stroke();
+    ctx.fillRect(0.87 * s, -0.52 * s, 0.16 * s, 0.13 * s);
+    ctx.restore();
+  }
+
+  function drawSprite(sp, phi) {
+    var u = sp.u0 + sp.dir * sp.speed * phi;
+    u = u - Math.floor(u);
+    var m = Math.max(220, W * 0.22);
+    var x = -m + u * (W + 2 * m);
+    var s = bandH * 0.30 * sp.scale * (isPhone ? 0.85 : 1);
+    var base = bandBot - bandH * 0.05 - sp.yOff * bandH;
+    if (sp.type === 'rooftop') base = bandBot - 1;
+    if (sp.type === 'boat') drawBoat(x, base, s, sp.dir < 0);
+    else if (sp.type === 'figures') drawFigures(x, base, s);
+    else if (sp.type === 'rooftop') drawRooftop(x, base, s, sp.aux);
+    else if (sp.type === 'bicycle') drawBicycle(x, base, s, sp.dir < 0);
+    else if (sp.type === 'crane') drawCrane(x, base, s, sp.dir < 0);
+  }
+
+  // ---------- drawing ----------
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+    var E = energyAt(t);
+    var Ed = clamp(E, 0, 1);
+    var phi = phiAt(t);
+    var warmth = clamp((Ed - 0.30) / 0.70, 0, 1);
+    var coldness = clamp((0.30 - Ed) / 0.30, 0, 1);
+
+    ctx.fillStyle = INK;
+    ctx.fillRect(0, 0, W, H);
+
+    // the screen band
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, bandY, W, bandH);
+    ctx.clip();
+    ctx.fillStyle = rgba(SILVER, bandBase);
+    ctx.fillRect(0, bandY, W, bandH);
+    // a worn horizon smudge behind the silhouettes
+    ctx.fillStyle = rgba(SILVER, 0.05);
+    ctx.fillRect(0, bandBot - bandH * 0.10, W, bandH * 0.10);
+
+    ctx.fillStyle = rgba(INK, 0.88);
+    ctx.strokeStyle = rgba(INK, 0.88);
+    for (var i = 0; i < layout.length; i++) drawSprite(layout[i], phi);
+
+    // tints wash over the footage itself
+    if (coldness > 0.001) { ctx.fillStyle = rgba(COLD, 0.40 * coldness); ctx.fillRect(0, bandY, W, bandH); }
+    if (warmth > 0.001) { ctx.fillStyle = rgba(WARM, 0.32 * warmth); ctx.fillRect(0, bandY, W, bandH); }
+    // the cut flash: one bright frame, decaying
+    var flash = 0.10 * Math.exp(-(t - lastCutT) * 10);
+    if (flash > 0.002) { ctx.fillStyle = rgba(WHITE, flash); ctx.fillRect(0, bandY, W, bandH); }
+    ctx.restore();
+
+    // letterbox edges
+    ctx.fillStyle = rgba(SILVER, 0.18);
+    ctx.fillRect(0, bandY - 0.5, W, 1);
+    ctx.fillRect(0, bandBot - 0.5, W, 1);
+
+    // film grain over the whole frame, deterministic per grain-frame index
+    var gFrame = Math.floor(t * 12);
+    var grnd = mulberry32((gFrame * 2654435761 ^ eraSeed * 977 + 865) | 0);
+    var n = Math.floor(W * H / 430 * (0.30 + 1.40 * Ed));
+    if (n > 3800) n = 3800;
+    if (n < 60) n = 60;
+    for (var g = 0; g < n; g++) {
+      var gx = grnd() * W, gy = grnd() * H;
+      var ga = 0.04 + grnd() * 0.13;
+      var gs = grnd() < Ed - 0.30 ? 2 : 1;
+      ctx.fillStyle = grnd() < 0.10 ? rgba(WHITE, ga) : rgba(SILVER, ga);
+      ctx.fillRect(gx, gy, gs, gs);
+    }
+
+    // scratches: thin vertical lines on fixed 7 s cycles
+    ctx.fillStyle = WHITE;
+    for (var si = 0; si < scratches.length; si++) {
+      var sc = scratches[si];
+      var cyc = Math.floor((t + sc.off) / 7);
+      var phase = ((t + sc.off) / 7) - cyc;
+      if (phase < sc.durF) {
+        var env = Math.sin(Math.PI * phase / sc.durF);
+        var sx = (sc.xf + (hash01(cyc * 57 + si * 131) - 0.5) * 0.012) * W;
+        ctx.globalAlpha = env * (0.16 + 0.30 * Ed);
+        ctx.fillRect(sx, 0, 1, H);
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    // flicker: a deterministic hash per flicker tick, dying in stillness
+    var flAmp = 0.14 * clamp((Ed - 0.14) / 0.86, 0, 1);
+    if (flAmp > 0.002) {
+      var flIdx = Math.floor(t * (7 + 9 * Ed));
+      var fh = hash01(flIdx * 13.7 + eraSeed);
+      ctx.fillStyle = rgba(INK, flAmp * fh);
+      ctx.fillRect(0, 0, W, H);
+    }
+  }
+
+  // ---------- boot ----------
+  layoutScreen();
+  draw(nowT);   // frame one: resting energy 0.42, silhouettes mid-drift, one scratch up
+
+  if (window.visualViewport && typeof window.visualViewport.addEventListener === 'function') {
+    window.visualViewport.addEventListener('resize', function () { layoutScreen(); draw(nowT); });
+  }
+  if (typeof window.addEventListener === 'function') {
+    window.addEventListener('resize', function () { layoutScreen(); draw(nowT); });
+  }
+
+  if (typeof requestAnimationFrame === 'function') {
+    var t0 = null;
+    var frame = 0;
+    var loop = function (ts) {
+      if (t0 === null) t0 = ts - T_OFF * 1000;
+      nowT = (ts - t0) / 1000;
+      // a lone tap becomes a cut once the double-tap window has passed
+      if (pendingTap !== null && nowT - pendingTap.t >= 0.32) {
+        pendingTap = null;
+        cutIndex += 1;
+        layout = genLayout();
+        lastCutT = nowT;
+        thump();
+      }
+      // prune spent excitations
+      if (frame % 60 === 0) {
+        while (excitations.length && excitations[0].t < nowT - 30) excitations.shift();
+      }
+      if (audioOn && frame % 12 === 0) updateAudio();
+      frame++;
+      draw(nowT);
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
