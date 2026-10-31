@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Gothic Hypnosis</title>
+<style>
+  html, body { margin:0; padding:0; background:#0C0A08; height:100%; overflow:hidden; }
+  canvas { display:block; touch-action:none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  "use strict";
+
+  // Palette (strict; every other tone is a mix of these five)
+  var COL_GROUND = "#0C0A08";  // ground black
+  var COL_WOOD   = "#4A3226";  // harmonium wood
+  var COL_VIOLET = "#3E2A4A";  // funereal violet
+  var COL_GREY   = "#7A746A";  // eulogy grey
+  var COL_EMBER  = "#B3452B";  // contrast ember
+
+  var DRIFT_PERIOD = 90;       // seconds for one full attitude drift cycle
+  var PHASE0 = 0.15;           // drift phase at t=0: attitude = 0.6, rising
+  var DRONE_HZ = 55;           // harmonium drone fundamental (audio)
+
+  var canvas = document.getElementById("c");
+  var ctx = canvas.getContext("2d");
+
+  var W = 0, H = 0, DPR = 1, minDim = 0, bandTop = 0, upperH = 0;
+
+  function isPhone() {
+    try {
+      if (window.screen) {
+        var m = Math.min(window.screen.width || 0, window.screen.height || 0);
+        if (m > 0) return m < 700;
+      }
+    } catch (e) {}
+    return H > W * 1.15;
+  }
+
+  function resize() {
+    var vv = window.visualViewport;
+    var w = vv ? vv.width : window.innerWidth;
+    var h = vv ? vv.height : window.innerHeight;
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = Math.max(1, Math.round(w));
+    H = Math.max(1, Math.round(h));
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    minDim = Math.min(W, H);
+    bandTop = H * 2 / 3;
+    upperH = bandTop;
+  }
+
+  // Seeded RNG (mulberry32)
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function hexRgb(c) {
+    if (c.charAt(0) === "#") {
+      return [parseInt(c.slice(1, 3), 16), parseInt(c.slice(3, 5), 16), parseInt(c.slice(5, 7), 16)];
+    }
+    var m = c.match(/\d+(\.\d+)?/g);   // "rgb(r,g,b)" from an earlier mix()
+    return [Math.round(+m[0]), Math.round(+m[1]), Math.round(+m[2])];
+  }
+  function mix(c1, c2, f) {
+    var a = hexRgb(c1), b = hexRgb(c2);
+    return "rgb(" + Math.round(a[0] + (b[0] - a[0]) * f) + "," +
+                    Math.round(a[1] + (b[1] - a[1]) * f) + "," +
+                    Math.round(a[2] + (b[2] - a[2]) * f) + ")";
+  }
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+  function lerp(a, b, f) { return a + (b - a) * f; }
+
+  // ----- Attitude model -------------------------------------------------
+  // Attitude a in [0,2]: 0 = COAX, 1 = SOOTHE, 2 = CONTRAST.
+  // Free drift is a triangle wave over DRIFT_PERIOD. A horizontal drag
+  // records a segment of pointer samples; on release a new free segment
+  // is anchored so the drift resumes from the released value, keeping
+  // the direction the drift had when it was grabbed. Everything is a
+  // closed-form function of the recorded segment list and t.
+  function tri(p) {
+    p = p - Math.floor(p);
+    return p < 0.5 ? 2 * p : 2 - 2 * p;
+  }
+  var segs = [{ kind: "free", t0: 0, phase: PHASE0 }];
+
+  function attitudeAt(t) {
+    for (var i = segs.length - 1; i >= 0; i--) {
+      var s = segs[i];
+      if (t < s.t0) continue;
+      if (s.kind === "free") {
+        return 2 * tri((t - s.t0) / DRIFT_PERIOD + s.phase);
+      }
+      // drag segment: piecewise linear over recorded samples
+      var pts = s.pts, dt = t - s.t0;
+      if (dt <= pts[0][0]) return pts[0][1];
+      for (var j = 1; j < pts.length; j++) {
+        if (dt <= pts[j][0]) {
+          var d0 = pts[j - 1], d1 = pts[j];
+          var f = (dt - d0[0]) / Math.max(1e-6, d1[0] - d0[0]);
+          return lerp(d0[1], d1[1], f);
+        }
+      }
+      return pts[pts.length - 1][1];
+    }
+    return 0.6;
+  }
+
+  // ----- Figure shapes (seeded; double-tap reseeds) ---------------------
+  var SEED0 = 837001;
+  var generation = 0;
+  var arcF = null, shardF = null, hazeF = null;
+
+  function buildShapes() {
+    var rnd = mulberry32(SEED0 + generation * 104729);
+    arcF = {
+      cxF: 0.36, spanF: 0.58,
+      bow: 0.16 + rnd() * 0.10,          // bow height, fraction of upperH
+      tilt: (rnd() - 0.5) * 0.10,       // control point sideways lean
+      hug: 0.10, rise: 1.00, stabPhase: 0.0
+    };
+    shardF = {
+      cxF: 0.82, hug: 0.08, rise: 0.80, stabPhase: 0.37,
+      tilt0: (rnd() - 0.5) * 0.5,
+      pts: []
+    };
+    var np = 5 + Math.floor(rnd() * 2);
+    for (var i = 0; i < np; i++) {
+      var ang = (i / np) * Math.PI * 2 + rnd() * 0.5;
+      var rad = 0.65 + rnd() * 0.5;
+      shardF.pts.push([Math.cos(ang) * rad, Math.sin(ang) * rad * 0.78]);
+    }
+    hazeF = {
+      cxF: 0.62, hug: 0.16, rise: 1.15, stabPhase: 0.71,
+      n: 7, blobs: []
+    };
+    for (var k = 0; k < hazeF.n; k++) {
+      hazeF.blobs.push({
+        dx: (rnd() - 0.5) * 0.9,
+        dy: (rnd() - 0.5) * 0.7 - k * 0.055,
+        s: 1 - k * 0.09 + (rnd() - 0.5) * 0.15
+      });
+    }
+  }
+  buildShapes();
+
+  // ----- Drawing --------------------------------------------------------
+  function stabPulse(t, ph) {
+    var s = (t * 2.2 + ph) % 1;
+    if (s < 0) s += 1;
+    var u = 1 - s;
+    return u * u * u;
+  }
+
+  function drawBand(t, dp) {
+    var bandH = H - bandTop;
+    ctx.fillStyle = COL_WOOD;
+    ctx.fillRect(0, bandTop, W, bandH);
+    // strata, darkening downward, with a slow shimmer
+    var NB = 10, bh = bandH / NB;
+    for (var i = 0; i < NB; i++) {
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = mix(COL_WOOD, COL_GROUND, 0.18 + 0.5 * (i / NB));
+      ctx.fillRect(0, bandTop + i * bh, W, bh + 1);
+      ctx.globalAlpha = 0.05 + 0.05 * Math.sin(2 * Math.PI * t / 13 + i * 1.7);
+      ctx.fillStyle = mix(COL_WOOD, COL_GREY, 0.25);
+      ctx.fillRect(0, bandTop + i * bh, W, bh + 1);
+    }
+    // light travelling slowly across the wood
+    var NS = 26, sw = W / NS;
+    for (var j = 0; j < NS; j++) {
+      ctx.globalAlpha = 0.030 + 0.035 * (0.5 + 0.5 * Math.sin(2 * Math.PI * (t / 19) - j * 0.55));
+      ctx.fillStyle = mix(COL_WOOD, COL_GREY, 0.4);
+      ctx.fillRect(j * sw, bandTop, sw + 1, bandH);
+    }
+    // the drone breathing on the wood
+    ctx.globalAlpha = 0.04 + 0.05 * dp;
+    ctx.fillStyle = COL_WOOD;
+    ctx.fillRect(0, bandTop, W, bandH);
+    ctx.globalAlpha = 1;
+  }
+
+  function drawDivider(t, w2) {
+    ctx.fillStyle = mix(COL_GREY, COL_WOOD, 0.45);
+    ctx.globalAlpha = 0.85;
+    ctx.fillRect(0, bandTop - 1, W, 2);
+    if (w2 > 0.02) {
+      ctx.globalAlpha = w2 * 0.45 * (0.5 + 0.5 * stabPulse(t, 0.13));
+      ctx.fillStyle = COL_EMBER;
+      ctx.fillRect(0, bandTop - 1, W, 2);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function figCenter(fig, riseW) {
+    var f = ligHugRise(fig, riseW);
+    return bandTop - upperH * f;
+  }
+  function ligHugRise(fig, riseW) {
+    return ligBase(fig) + 0.45 * riseW * ligRise(fig);
+  }
+  function ligBase(fig) { return fig.hug; }
+  function ligRise(fig) { return fig.rise; }
+
+  function drawArc(t, w0, w1, w2, riseW, dp) {
+    var wid = (1 + 0.30 * w1);
+    var span = arcF.spanF * W * wid;
+    var cxp = arcF.cxF * W;
+    var cyp = figCenter(arcF, riseW);
+    var sway = w0 * 0.012 * H * Math.sin(2 * Math.PI * t / 7)
+             + w1 * 0.020 * H * Math.sin(2 * Math.PI * t / 11 + 1.0);
+    var rot = -0.38 * w2 + w0 * 0.03 * Math.sin(2 * Math.PI * t / 7)
+            + w1 * 0.02 * Math.sin(2 * Math.PI * t / 11 + 1.0);
+    var bow = arcF.bow * upperH * (1 + 0.30 * w1);
+    var col = mix(mix(COL_GREY, COL_VIOLET, 0.35 + 0.45 * w1), COL_EMBER, w2 * 0.75);
+    var lw = Math.max(2, minDim * 0.007);
+
+    function qpt(s) {
+      var x0 = -span / 2, x1 = span / 2, cxq = arcF.tilt * span, cyq = -bow;
+      var u = 1 - s;
+      return [u * u * x0 + 2 * u * s * cxq + s * s * x1,
+              2 * u * s * cyq];
+    }
+    ctx.save();
+    ctx.translate(cxp, cyp + sway);
+    ctx.rotate(rot);
+    ctx.lineCap = "round";
+    // soft under-stroke
+    ctx.beginPath();
+    for (var i = 0; i <= 28; i++) {
+      var p = qpt(i / 28);
+      if (i === 0) ctx.moveTo(p[0], p[1]); else ctx.lineTo(p[0], p[1]);
+    }
+    ctx.globalAlpha = 0.18;
+    ctx.strokeStyle = col;
+    ctx.lineWidth = lw * 2.6;
+    ctx.stroke();
+    // main stroke
+    ctx.beginPath();
+    for (var m = 0; m <= 28; m++) {
+      var q = qpt(m / 28);
+      if (m === 0) ctx.moveTo(q[0], q[1]); else ctx.lineTo(q[0], q[1]);
+    }
+    ctx.globalAlpha = 0.9;
+    ctx.lineWidth = lw;
+    ctx.stroke();
+    // contrast: ember dashes stabbing off the curve toward the band
+    if (w2 > 0.02) {
+      var drop = w2 * stabPulse(t, arcF.stabPhase) * 0.035 * H;
+      ctx.strokeStyle = COL_EMBER;
+      ctx.globalAlpha = w2 * 0.85;
+      ctx.lineWidth = Math.max(1.5, lw * 0.8);
+      for (var d = 0; d < 28; d += 2) {
+        var a1 = qpt(d / 28), a2 = qpt((d + 1) / 28);
+        ctx.beginPath();
+        ctx.moveTo(a1[0], a1[1] + drop);
+        ctx.lineTo(a2[0], a2[1] + drop);
+        ctx.stroke();
+      }
+    }
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
+  function drawShard(t, w0, w1, w2, riseW) {
+    var R = minDim * 0.115;
+    var cxp = shardF.cxF * W;
+    var cyp = figCenter(shardF, riseW);
+    var pulse = stabPulse(t, shardF.stabPhase);
+    var yOff = w2 * pulse * 0.05 * H + w0 * 0.008 * H * Math.sin(2 * Math.PI * t / 7 + 2.0);
+    var rot = shardF.tilt0 + 0.55 * w2 + w1 * 0.04 * Math.sin(2 * Math.PI * t / 13 + 0.5);
+    var fill = mix(mix(COL_VIOLET, COL_GREY, 0.30), COL_EMBER, w2 * 0.8);
+    ctx.save();
+    ctx.translate(cxp, cyp + yOff);
+    ctx.rotate(rot);
+    ctx.scale(1 + 0.5 * w2, 1 - 0.25 * w2);
+    if (w1 > 0.02) {  // soothe: a soft violet underlay takes the edge off
+      ctx.beginPath();
+      for (var s = 0; s < shardF.pts.length; s++) {
+        var sp = shardF.pts[s];
+        var sx = sp[0] * R * 1.18, sy = sp[1] * R * 1.18;
+        if (s === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
+      }
+      ctx.closePath();
+      ctx.globalAlpha = 0.22 * w1;
+      ctx.fillStyle = COL_VIOLET;
+      ctx.fill();
+    }
+    ctx.beginPath();
+    for (var i = 0; i < shardF.pts.length; i++) {
+      var pp = shardF.pts[i];
+      var px = pp[0] * R, py = pp[1] * R;
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.closePath();
+    ctx.globalAlpha = 0.88;
+    ctx.fillStyle = fill;
+    ctx.fill();
+    ctx.globalAlpha = 0.5;
+    ctx.strokeStyle = mix(COL_GREY, COL_EMBER, w2 * 0.6);
+    ctx.lineWidth = Math.max(1, minDim * 0.002);
+    ctx.stroke();
+    ctx.restore();
+    // contrast: short ember stabs from the shard toward the band
+    if (w2 > 0.02) {
+      ctx.strokeStyle = COL_EMBER;
+      ctx.globalAlpha = w2 * 0.8;
+      ctx.lineWidth = Math.max(1.5, minDim * 0.004);
+      for (var k = 0; k < 3; k++) {
+        var bx = cxp + (k - 1) * R * 0.5;
+        var by = cyp + yOff + R * 0.55;
+        var len = (0.03 + 0.03 * pulse) * H * 0.5 + 0.02 * H;
+        ctx.beginPath();
+        ctx.moveTo(bx, by);
+        ctx.lineTo(bx - len * 0.3, by + len);
+        ctx.stroke();
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawHaze(t, w0, w1, w2, riseW, dp) {
+    var cxp = hazeF.cxF * W;
+    var cyp = figCenter(hazeF, riseW);
+    var breathe = 1 + 0.05 * Math.sin(2 * Math.PI * t / 9 + 0.7) * (w0 + w1);
+    var squash = lerp(0.55, 1.0, clamp(w1 + w2 * 0.6, 0, 1)); // coax compresses the haze low
+    var grow = (1 + 0.35 * w1) * breathe;
+    var rot = 0.5 * w2;
+    var flick = 1;
+    if (w2 > 0.02) {
+      var st = Math.floor(t * 3 + hazeF.stabPhase * 3);
+      var hr = mulberry32(977 + st)();
+      flick = 0.85 + 0.15 * hr;
+    }
+    ctx.save();
+    ctx.translate(cxp, cyp);
+    ctx.rotate(rot);
+    ctx.scale((1 + 0.4 * w2) * grow, (1 - 0.3 * w2) * grow * squash);
+    for (var i = 0; i < hazeF.n; i++) {
+      var b = hazeF.blobs[i];
+      var rx = minDim * 0.13 * b.s, ry = minDim * 0.075 * b.s;
+      var base = mix(COL_VIOLET, COL_GREY, 0.25 + 0.1 * Math.sin(i * 2.3));
+      var colr = i >= hazeF.n - 2 ? mix(base, COL_EMBER, w2 * 0.55) : base;
+      ctx.beginPath();
+      ctx.ellipse(b.dx * minDim * 0.13, b.dy * minDim * 0.13, rx, ry, 0, 0, Math.PI * 2);
+      ctx.globalAlpha = (0.075 + 0.03 * dp) * flick;
+      ctx.fillStyle = colr;
+      ctx.fill();
+    }
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
+  function draw(t) {
+    canvas.style.width = W + "px";
+    canvas.style.height = H + "px";
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    var a = attitudeAt(t);
+    var w0 = clamp(1 - a, 0, 1);
+    var w2 = clamp(a - 1, 0, 1);
+    var w1 = clamp(1 - w0 - w2, 0, 1);
+    var riseW = w1 + 0.25 * w2;
+    var dp = 0.5 + 0.5 * Math.sin(2 * Math.PI * t / 7);   // drone breathing
+
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = COL_GROUND;
+    ctx.fillRect(0, 0, W, H);
+    if (w1 > 0.02) {  // soothe deepens the violet of the upper dark
+      ctx.globalAlpha = 0.06 * w1;
+      ctx.fillStyle = COL_VIOLET;
+      ctx.fillRect(0, 0, W, bandTop);
+      ctx.globalAlpha = 1;
+    }
+
+    drawHaze(t, w0, w1, w2, riseW, dp);
+    drawArc(t, w0, w1, w2, riseW, dp);
+    drawShard(t, w0, w1, w2, riseW);
+    drawBand(t, dp);
+    drawDivider(t, w2);
+  }
+
+  // ----- Clock ----------------------------------------------------------
+  var perfNow = (typeof performance !== "undefined" && performance && typeof performance.now === "function")
+    ? function () { return performance.now(); }
+    : function () { return 0; };
+  var T0 = perfNow();
+  function tNow() { return (perfNow() - T0) / 1000; }
+
+  // ----- Audio (first tap only, lazy, guarded) --------------------------
+  var AC = null, masterGain = null, toneRnd = mulberry32(837555), nextToneAt = 0;
+  function ensureAudio() {
+    if (AC) { if (AC.resume) AC.resume(); return; }
+    var Ctor = null;
+    try {
+      if (typeof AudioContext !== "undefined") Ctor = AudioContext;
+      else if (typeof webkitAudioContext !== "undefined") Ctor = webkitAudioContext;
+    } catch (e) {}
+    if (!Ctor) return;
+    try {
+      AC = new Ctor();
+      var comp = AC.createDynamicsCompressor();
+      comp.threshold.value = -18; comp.ratio.value = 12; comp.attack.value = 0.003; comp.release.value = 0.24;
+      masterGain = AC.createGain();
+      masterGain.gain.value = 0.9;
+      masterGain.connect(comp);
+      comp.connect(AC.destination);
+      // the drone: two detuned saws through a lowpass, always on once started
+      var dg = AC.createGain(); dg.gain.value = 0.045;
+      var lp = AC.createBiquadFilter(); lp.type = "lowpass"; lp.frequency.value = 300;
+      var o1 = AC.createOscillator(); o1.type = "sawtooth"; o1.frequency.value = DRONE_HZ;
+      var o2 = AC.createOscillator(); o2.type = "sawtooth"; o2.frequency.value = DRONE_HZ * 1.0145;
+      o1.connect(lp); o2.connect(lp); lp.connect(dg); dg.connect(masterGain);
+      o1.start(); o2.start();
+      nextToneAt = AC.currentTime + 2.0;
+    } catch (e) { AC = null; }
+  }
+  function playTone(freq, dur, gain, type) {
+    if (!AC) return;
+    try {
+      var t0 = AC.currentTime;
+      var o = AC.createOscillator(); o.type = type; o.frequency.value = freq;
+      var g = AC.createGain();
+      g.gain.setValueAtTime(0, t0);
+      g.gain.linearRampToValueAtTime(gain, t0 + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      o.connect(g); g.connect(masterGain);
+      o.start(t0); o.stop(t0 + dur + 0.05);
+    } catch (e) {}
+  }
+  function serviceAudio() {
+    if (!AC || !nextToneAt) return;
+    if (AC.currentTime >= nextToneAt) {
+      var a = attitudeAt(tNow());
+      var pick = toneRnd();
+      if (a < 0.7) {
+        playTone(DRONE_HZ * 2, 0.5, 0.055, "triangle");                    // coax: the drone pitch
+      } else if (a < 1.5) {
+        var iv = [1, 1.25, 1.5][Math.floor(pick * 3)];
+        playTone(DRONE_HZ * 2 * iv, 0.9, 0.045, "sine");                  // soothe: soft intervals
+      } else {
+        playTone(DRONE_HZ * 2 * 1.4142, 0.13, 0.11, "sawtooth");         // contrast: tritone stab
+      }
+      nextToneAt = AC.currentTime + 2.5 + toneRnd() * 3.5;
+    }
+  }
+
+  // ----- Interaction ------------------------------------------------------
+  var dragging = false, dragMoved = false, downX = 0, downY = 0, downT = 0;
+  var dragSeg = null, dirAtGrab = 1;
+  var lastTapT = -10, lastTapX = 0, lastTapY = 0;
+
+  function evtPos(e) {
+    if (e.clientX !== undefined) return [e.clientX, e.clientY];
+    if (e.touches && e.touches.length) return [e.touches[0].clientX, e.touches[0].clientY];
+    if (e.changedTouches && e.changedTouches.length) return [e.changedTouches[0].clientX, e.changedTouches[0].clientY];
+    return [0, 0];
+  }
+  function onDown(e) {
+    ensureAudio();
+    var p = evtPos(e), t = tNow();
+    if (t - lastTapT < 0.32 && Math.abs(p[0] - lastTapX) < 44 && Math.abs(p[1] - lastTapY) < 44) {
+      generation++;
+      buildShapes();
+      lastTapT = -10;
+    } else {
+      lastTapT = t; lastTapX = p[0]; lastTapY = p[1];
+    }
+    dragging = true; dragMoved = false;
+    downX = p[0]; downY = p[1]; downT = t;
+    var aBefore = attitudeAt(Math.max(0, t - 0.05));
+    var aAfter = attitudeAt(t + 0.05);
+    dirAtGrab = aAfter >= aBefore ? 1 : -1;
+    dragSeg = null;
+    if (e.preventDefault) e.preventDefault();
+  }
+  function onMove(e) {
+    if (!dragging) return;
+    var p = evtPos(e), t = tNow();
+    if (!dragMoved && Math.abs(p[0] - downX) < 6 && Math.abs(p[1] - downY) < 6) return;
+    if (!dragSeg) {
+      dragSeg = { kind: "drag", t0: downT, pts: [[0, attitudeAt(downT)]] };
+      segs.push(dragSeg);
+      dragMoved = true;
+    }
+    var a = clamp((p[0] / Math.max(1, W)) * 2, 0, 2);
+    dragSeg.pts.push([t - downT, a]);
+    if (e.preventDefault) e.preventDefault();
+  }
+  function onUp(e) {
+    if (!dragging) return;
+    dragging = false;
+    if (dragSeg) {
+      var t = tNow();
+      var aEnd = dragSeg.pts[dragSeg.pts.length - 1][1];
+      var phase = dirAtGrab > 0 ? aEnd / 4 : 1 - aEnd / 4;
+      segs.push({ kind: "free", t0: t, phase: phase });
+      dragSeg = null;
+    }
+    if (e && e.preventDefault) e.preventDefault();
+  }
+
+  if (typeof window !== "undefined" && typeof window.PointerEvent !== "undefined") {
+    canvas.addEventListener("pointerdown", onDown);
+    canvas.addEventListener("pointermove", onMove);
+    canvas.addEventListener("pointerup", onUp);
+    canvas.addEventListener("pointercancel", onUp);
+  } else {
+    canvas.addEventListener("mousedown", onDown);
+    canvas.addEventListener("mousemove", onMove);
+    canvas.addEventListener("mouseup", onUp);
+    canvas.addEventListener("touchstart", onDown);
+    canvas.addEventListener("touchmove", onMove);
+    canvas.addEventListener("touchend", onUp);
+  }
+
+  // ----- Boot -------------------------------------------------------------
+  resize();
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener("resize", resize);
+  }
+  window.addEventListener("resize", resize);
+
+  draw(0);
+  if (typeof requestAnimationFrame === "function") {
+    var loop = function () {
+      draw(tNow());
+      serviceAudio();
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>

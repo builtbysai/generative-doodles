@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Not Bloody Likely</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #8A8A3A; overflow: hidden; height: 100%; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // Palette (strict). Tone steps inside a bust are recorded mixes of these
+  // with the olive ground; the mixing factors live in the tone tables below.
+  var COL = {
+    ground: '#8A8A3A',
+    cale: '#1A1A1A',
+    eno: '#D8D4C0',
+    orange: '#D96C1A',
+    purple: '#6C2A8C',
+    steel: '#9AA0A6'
+  };
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ---------- seeded RNG (mulberry32) ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function hexRgb(h) {
+    return [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
+  }
+  function mixHex(a, b, f) {
+    var A = hexRgb(a), B = hexRgb(b), i, v, out = '#';
+    for (i = 0; i < 3; i++) {
+      v = Math.round(A[i] + (B[i] - A[i]) * f);
+      out += ('0' + v.toString(16)).slice(-2);
+    }
+    return out;
+  }
+  // tone steps: mixes of the bust base colour toward the olive ground
+  function tonesFor(base) {
+    return {
+      base: mixHex(base, COL.ground, 0.20),   // silhouette body
+      hair: base,                              // pure base: hair + collar band
+      face: mixHex(base, COL.ground, 0.36),   // face plane
+      line: mixHex(base, COL.ground, 0.62)    // eye slit
+    };
+  }
+  var TONES = [tonesFor(COL.cale), tonesFor(COL.eno)];
+
+  // ---------- sizing: Visual Viewport API ----------
+  var W = 0, H = 0, DPR = 1;
+  function resize() {
+    var vv = (typeof window !== 'undefined') ? window.visualViewport : null;
+    var w = vv ? vv.width : window.innerWidth;
+    var h = vv ? vv.height : window.innerHeight;
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = w; H = h;
+    canvas.width = Math.round(w * DPR);
+    canvas.height = Math.round(h * DPR);
+  }
+  function isPhone() {
+    var s = (typeof window !== 'undefined') ? window.screen : null;
+    if (s && typeof s.width === 'number' && typeof s.height === 'number') {
+      return Math.min(s.width, s.height) < 700;
+    }
+    return H > W * 1.15;
+  }
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('resize', resize);
+  }
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', resize);
+  }
+
+  // ---------- piece clock (never Date.now) ----------
+  var startMs = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+  function nowT() {
+    return (typeof performance !== 'undefined' && performance.now)
+      ? (performance.now() - startMs) / 1000 : 0;
+  }
+
+  function clamp(x, a, b) { return x < a ? a : (x > b ? b : x); }
+  function smoother(u) { u = clamp(u, 0, 1); return u * u * u * (u * (u * 6 - 15) + 10); }
+
+  // ---------- bust form epochs (double-tap reseeds) ----------
+  // Local bust space: profile facing +x (nose at +x), crown at -y,
+  // classical truncated base at +y. Origin sits near the form's centre.
+  var BASE_SEED = 839208;
+  var epochs = [{ t0: 0, seed: BASE_SEED }];
+  var epochCount = 0;
+
+  function bustParams(seed, which) {
+    var rnd = mulberry32((seed + which * 7919) | 0);
+    return {
+      headLen: 0.94 + rnd() * 0.14,     // x-scale on the head points
+      noseLen: 0.90 + rnd() * 0.26,     // nose protrusion
+      crownH: 0.94 + rnd() * 0.16,      // crown height
+      neckW: 0.28 + rnd() * 0.12,       // neck front inset
+      shoulderW: 1.02 + rnd() * 0.26,   // base back reach
+      chestW: 0.70 + rnd() * 0.16,      // base front reach
+      hairSweep: rnd()                  // where the hair cap's inner edge falls
+    };
+  }
+  function epochAt(t) {
+    var e = epochs[0], i;
+    for (i = 1; i < epochs.length; i++) {
+      if (epochs[i].t0 <= t) e = epochs[i]; else break;
+    }
+    return e;
+  }
+  function paramsAt(t, which) {
+    return bustParams(epochAt(t).seed, which);
+  }
+  function reseed(t) {
+    epochCount++;
+    epochs.push({ t0: t, seed: (BASE_SEED + epochCount * 1013904223) | 0 });
+  }
+
+  // silhouette outline points (local units), clockwise from the base back.
+  // Cut-paper construction: the points ARE the vertices (a midpoint-smoothed
+  // path melted the nose and brow in QA); joins are rounded by stroking the
+  // fill with itself in fillShape below.
+  function silhouette(p) {
+    var hl = p.headLen, ch = p.crownH;
+    return [
+      [-p.shoulderW, 1.25],           // base back
+      [p.chestW, 1.25],               // base front (chest cut)
+      [0.66, 0.86],                   // chest front rises
+      [p.neckW + 0.04, 0.56],         // throat / neck front
+      [0.50 * hl, 0.36],              // chin
+      [0.42 * hl, 0.22],              // mouth notch
+      [0.60 * hl, 0.10],              // under-nose
+      [1.02 * p.noseLen, 0.0],        // NOSE TIP
+      [0.55 * hl, -0.14],             // nose bridge
+      [0.58 * hl, -0.30],             // brow
+      [0.44 * hl, -0.58 * ch],        // forehead
+      [0.16, -0.82 * ch],             // crown front
+      [-0.20, -0.90 * ch],            // crown back
+      [-0.52, -0.72 * ch],            // back of head, upper
+      [-0.60, -0.40 * ch],            // back of head, lower
+      [-0.42, 0.28],                  // back of neck
+      [-p.shoulderW + 0.05, 0.90]     // shoulder back
+    ];
+  }
+  function noseX(p) { return 1.02 * p.noseLen; }
+
+  function tracePoly(pts) {
+    var i;
+    ctx.beginPath();
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    for (i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+    ctx.closePath();
+  }
+  // fill a polygon, stroking with the same colour so the round joins
+  // soften corners without rounding the vertices away
+  function fillShape(pts, color) {
+    ctx.fillStyle = color;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 0.035;
+    ctx.lineJoin = 'round';
+    tracePoly(pts);
+    ctx.fill();
+    ctx.stroke();
+  }
+
+  function drawBust(p, tone) {
+    var hl = p.headLen, ch = p.crownH;
+    // silhouette body
+    fillShape(silhouette(p), tone.base);
+    // hair cap: follows the crown edge, inner edge set by hairSweep
+    var hs = 0.16 + p.hairSweep * 0.20;
+    fillShape([
+      [0.44 * hl, -0.58 * ch],
+      [0.16, -0.82 * ch],
+      [-0.20, -0.90 * ch],
+      [-0.52, -0.72 * ch],
+      [-0.60, -0.40 * ch],
+      [-0.34, -0.30 * ch],
+      [-0.02, -hs * ch],
+      [0.26 * hl, -0.44 * ch]
+    ], tone.hair);
+    // face plane: hugs the profile front (brow, nose, mouth, chin, throat)
+    fillShape([
+      [0.58 * hl, -0.30],
+      [0.55 * hl, -0.14],
+      [1.02 * p.noseLen, 0.0],
+      [0.60 * hl, 0.10],
+      [0.42 * hl, 0.22],
+      [0.50 * hl, 0.36],
+      [p.neckW + 0.04, 0.56],
+      [0.18, 0.40],
+      [0.15, 0.02],
+      [0.30 * hl, -0.22]
+    ], tone.face);
+    // collar / truncation band across the base
+    fillShape([
+      [-p.shoulderW + 0.03, 1.00],
+      [0.66, 1.00],
+      [p.chestW, 1.25],
+      [-p.shoulderW, 1.25]
+    ], tone.hair);
+    // eye slit: one flat dash, nothing more (shapes, not likenesses)
+    ctx.strokeStyle = tone.line;
+    ctx.lineWidth = 0.045;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(0.26 * hl, -0.20 * ch);
+    ctx.lineTo(0.44 * hl, -0.20 * ch);
+    ctx.stroke();
+  }
+
+  // ---------- approach cycle (closed form) ----------
+  // 132 s loop: close 60 s, hold 12 s, apart 60 s. Phase offset puts
+  // frame one 26 s into the closing half: mid-approach.
+  var CYCLE = 132, PHASE0 = 26;
+  function approachU(t) {
+    var ph = (t + PHASE0) % CYCLE;
+    if (ph < 60) return smoother(ph / 60);
+    if (ph < 72) return 1;
+    return 1 - smoother((ph - 72) / 60);
+  }
+
+  // ---------- flips (recorded per bust) ----------
+  // Base orientations: bust 0 (upper, Cale dark) at +90deg so its face
+  // points down at the seam; bust 1 (lower, Eno light) at -90deg, the
+  // exact 180-degree counterpart, face pointing up. A flip adds PI.
+  var BASE_ANG = [Math.PI / 2, -Math.PI / 2];
+  var FLIP_DUR = 1.5;
+  var flips = [[], []];
+  function angleAt(which, t) {
+    var list = flips[which], a = BASE_ANG[which], i, f;
+    for (i = 0; i < list.length; i++) {
+      f = list[i];
+      if (t < f.t0) break;
+      a = f.a0 + (f.a1 - f.a0) * smoother((t - f.t0) / FLIP_DUR);
+    }
+    return a;
+  }
+  function flip(which, t) {
+    var a0 = angleAt(which, t);
+    flips[which].push({ t0: t, a0: a0, a1: a0 + Math.PI });
+  }
+
+  // ---------- layout ----------
+  function layout() {
+    var u = Math.min(W, H);
+    var fs = clamp(0.032 * u, 12, 30);
+    var band = fs * 1.8;
+    var inset = band + 0.03 * u;
+    var stageW = W - 2 * inset, stageH = H - 2 * inset;
+    var s = Math.min(stageW / 3.0, stageH / 6.0);
+    return {
+      u: u, fs: fs, band: band, inset: inset,
+      stageW: stageW, stageH: stageH, s: s,
+      cx: W / 2, seamY: H / 2, gapMin: 0.06 * u
+    };
+  }
+  // bust centres and angles at time t (shared by draw + hit tests)
+  function bustStates(t, L) {
+    var p0 = paramsAt(t, 0), p1 = paramsAt(t, 1);
+    var nxMax = Math.max(noseX(p0), noseX(p1));
+    var distMin = nxMax * L.s + L.gapMin / 2;
+    var distMax = L.stageH / 2 - 1.22 * L.s;
+    if (distMax < distMin) distMax = distMin;
+    var dist = distMax - (distMax - distMin) * approachU(t);
+    return [
+      { p: p0, tone: TONES[0], x: L.cx, y: L.seamY - dist, ang: angleAt(0, t) },
+      { p: p1, tone: TONES[1], x: L.cx, y: L.seamY + dist, ang: angleAt(1, t) }
+    ];
+  }
+
+  // ---------- border: ENO/CALE repeated, drawn from live text metrics ----------
+  function drawBorder(L) {
+    var word = 'ENO/CALE', unit = word + '   ';
+    ctx.fillStyle = COL.orange;
+    ctx.font = '700 ' + L.fs + 'px sans-serif';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    var step = ctx.measureText(unit).width;
+    if (!(step > 0)) step = L.fs * 5;
+    // horizontal rows keep clear of the corner squares; vertical columns
+    // stop a band short of them too (first build crowded the corners)
+    var start = L.band * 1.05, x;
+    // top, left to right
+    for (x = start; x + step < W - start + step * 0.5; x += step) {
+      ctx.fillText(unit, x, L.band / 2);
+    }
+    // bottom, left to right
+    for (x = start; x + step < W - start + step * 0.5; x += step) {
+      ctx.fillText(unit, x, H - L.band / 2);
+    }
+    var colStart = L.band * 0.95, colLen = H - 2 * L.band * 0.95;
+    // left column, reading bottom to top
+    ctx.save();
+    ctx.translate(L.band / 2, H - colStart);
+    ctx.rotate(-Math.PI / 2);
+    for (x = 0; x + step < colLen + step * 0.5; x += step) {
+      ctx.fillText(unit, x, 0);
+    }
+    ctx.restore();
+    // right column, reading top to bottom
+    ctx.save();
+    ctx.translate(W - L.band / 2, colStart);
+    ctx.rotate(Math.PI / 2);
+    for (x = 0; x + step < colLen + step * 0.5; x += step) {
+      ctx.fillText(unit, x, 0);
+    }
+    ctx.restore();
+  }
+
+  // ---------- lightning zigzags (fixed seed: layout furniture, not bust data) ----------
+  function drawBolt(x0, y0, len, flipX, flipY) {
+    var pts = [[0, 0], [0.34, 0.40], [0.13, 0.44], [0.48, 1.0], [0.30, 1.0], [0.52, 0.52], [0.72, 0.52], [0.38, 0.06]];
+    ctx.beginPath();
+    for (var i = 0; i < pts.length; i++) {
+      var px = x0 + flipX * pts[i][0] * len * 0.55;
+      var py = y0 + flipY * pts[i][1] * len;
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.closePath();
+    ctx.fillStyle = COL.purple;
+    ctx.fill();
+  }
+
+  // ---------- daggers at the seam ----------
+  // One path per dagger, all points down: pommel, grip, wide guard, long
+  // blade. (A first build's guard/dot/triangle stack read as division
+  // signs; the single-silhouette version reads as blades.)
+  function drawDaggers(L) {
+    var n = 9;
+    var bladeL = 0.026 * L.u, bladeW = 0.0062 * L.u;
+    var guardW = 0.017 * L.u, guardT = 0.005 * L.u;
+    var gripL = 0.011 * L.u, gripW = 0.0045 * L.u, pomR = 0.0042 * L.u;
+    var total = bladeL + guardT + gripL + pomR * 2;
+    var top = L.seamY - total / 2;
+    var spread = Math.min(L.stageW * 0.62, n * 0.095 * L.u);
+    ctx.fillStyle = COL.steel;
+    for (var i = 0; i < n; i++) {
+      var x = L.cx + (i - (n - 1) / 2) * (spread / (n - 1));
+      var y = top;
+      ctx.beginPath();
+      ctx.arc(x, y + pomR, pomR, 0, Math.PI * 2); // pommel
+      ctx.fill();
+      y += pomR * 2;
+      ctx.fillRect(x - gripW / 2, y, gripW, gripL); // grip
+      y += gripL;
+      ctx.fillRect(x - guardW / 2, y, guardW, guardT); // guard
+      y += guardT;
+      ctx.beginPath(); // blade: shoulders tapering to the point
+      ctx.moveTo(x - bladeW / 2, y);
+      ctx.lineTo(x + bladeW / 2, y);
+      ctx.lineTo(x, y + bladeL);
+      ctx.closePath();
+      ctx.fill();
+    }
+  }
+
+  // ---------- draw ----------
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+    ctx.fillStyle = COL.ground;
+    ctx.fillRect(0, 0, W, H);
+
+    var L = layout();
+    var states = bustStates(t, L);
+    var i, st;
+
+    // zigzags: top-left and bottom-right corners of the stage
+    var zl = 0.17 * L.u;
+    drawBolt(L.inset + 0.025 * L.u, L.inset + 0.02 * L.u, zl, 1, 1);
+    drawBolt(W - L.inset - 0.025 * L.u, H - L.inset - 0.02 * L.u, zl, -1, -1);
+
+    // busts: lower first, upper over it (they never overlap, but order is cheap)
+    for (i = 1; i >= 0; i--) {
+      st = states[i];
+      ctx.save();
+      ctx.translate(st.x, st.y);
+      ctx.rotate(st.ang);
+      ctx.scale(L.s, L.s);
+      ctx.translate(-0.05, -0.15);
+      drawBust(st.p, st.tone);
+      ctx.restore();
+    }
+
+    drawDaggers(L);
+    drawBorder(L);
+  }
+
+  // ---------- pointer: drag across a bust flips it; double-tap reseeds ----------
+  var dragInfo = null;
+  var lastTapT = -10, lastTapX = 0, lastTapY = 0;
+  function evtPos(e) {
+    if (e && typeof e.clientX === 'number') return { x: e.clientX, y: e.clientY };
+    if (e && e.touches && e.touches.length) return { x: e.touches[0].clientX, y: e.touches[0].clientY };
+    if (e && e.changedTouches && e.changedTouches.length) return { x: e.changedTouches[0].clientX, y: e.changedTouches[0].clientY };
+    return { x: 0, y: 0 };
+  }
+  function bustAtPoint(t, x, y) {
+    var L = layout();
+    var states = bustStates(t, L);
+    for (var i = 0; i < 2; i++) {
+      var st = states[i];
+      // rotate the point into bust-local space
+      var dx = x - st.x, dy = y - st.y;
+      var c = Math.cos(-st.ang), sn = Math.sin(-st.ang);
+      var lx = (dx * c - dy * sn) / L.s + 0.05;
+      var ly = (dx * sn + dy * c) / L.s + 0.15;
+      if (lx > -1.45 && lx < 1.25 && ly > -1.15 && ly < 1.45) return i;
+    }
+    return -1;
+  }
+  function onDown(e) {
+    var t = nowT(), p = evtPos(e);
+    var dx = p.x - lastTapX, dy = p.y - lastTapY;
+    if (t - lastTapT < 0.35 && (dx * dx + dy * dy) < 1600) {
+      reseed(t);
+      lastTapT = -10;
+      dragInfo = null;
+    } else {
+      lastTapT = t; lastTapX = p.x; lastTapY = p.y;
+      dragInfo = { which: bustAtPoint(t, p.x, p.y), x0: p.x, y0: p.y, fired: false };
+    }
+    if (e && e.preventDefault) e.preventDefault();
+  }
+  function onMove(e) {
+    if (!dragInfo || dragInfo.fired || dragInfo.which < 0) return;
+    var t = nowT(), p = evtPos(e);
+    var dx = p.x - dragInfo.x0, dy = p.y - dragInfo.y0;
+    if (dx * dx + dy * dy > 44 * 44) {
+      flip(dragInfo.which, t);
+      dragInfo.fired = true;
+    }
+    if (e && e.preventDefault) e.preventDefault();
+  }
+  function onUp() { dragInfo = null; }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+    canvas.addEventListener('touchstart', onDown, { passive: false });
+    canvas.addEventListener('touchmove', onMove, { passive: false });
+    canvas.addEventListener('touchend', onUp);
+    canvas.addEventListener('mousedown', onDown);
+    canvas.addEventListener('mousemove', onMove);
+    canvas.addEventListener('mouseup', onUp);
+  }
+
+  // ---------- run ----------
+  resize();
+  draw(0);
+  function frame() {
+    draw(nowT());
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+  }
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
