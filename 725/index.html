@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Void Blooms</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #101014; height: 100%; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+
+// The Void Blooms (EXPANSION #88 okazzsp, block 6)
+// Negative-space figuration: a field of flat cartoon daisies covers the
+// whole frame except one clean silhouette, a rounded bear head (two round
+// ears, one round head) that stays bare dark ground. The figure is the
+// hole. Flowers bloom in ring by ring from the silhouette outward, hold
+// while a few swap petal colors, then fade to ground and the loop
+// restarts. Placements are precomputed per seed by rejection sampling on
+// a jittered grid against the silhouette mask (the union of 3 circles);
+// bloom delays, color swaps and fades are closed-form functions of loop
+// time, so a seed fully determines every frame. Watch-only; tap reseeds.
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+var GROUND = '#101014';
+var PETALS = ['#FF5DA2', '#FFD23F', '#3FA7FF', '#5FD35F', '#FF8C42', '#9B5DE5'];
+var CENTER = '#FFFFFF';
+
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var W = 0, H = 0, isPhone = false;
+var curT = 0;
+
+// Inert QA hook: ?seed=tNN renders the frame at NN seconds into the loop.
+// No effect in the gallery, where location.search is empty.
+(function () {
+  var s = (typeof location !== 'undefined' && location.search) || '';
+  var m = /[?&]seed=t(\d+(?:\.\d+)?)/.exec(s);
+  if (m) curT = parseFloat(m[1]);
+})();
+
+var SEED_BASE = 72588;
+var LOOP_T = 45;          // full cycle: bloom, hold, fade, rest
+var POP_DUR = 1.5;        // per-flower pop-in duration
+var FADE_START = 31;      // fade to ground runs 31..38
+var FADE_DUR = 7;
+
+// ---------------------------------------------------------------------------
+// Silhouette mask: union of 3 circles (head + two ears), in design units
+// where 1 unit = min(W, H), origin at canvas center, y down. The head
+// center sits at 58% of frame height.
+// ---------------------------------------------------------------------------
+function maskCircles(Hd) {
+  var cy = 0.08 * Hd; // (0.58 - 0.50) * Hd
+  return [
+    { x: 0, y: cy, r: 0.175 },              // head
+    { x: -0.118, y: cy - 0.128, r: 0.078 }, // left ear
+    { x: 0.118, y: cy - 0.128, r: 0.078 }   // right ear
+  ];
+}
+
+function signedDist(px, py, circles) {
+  var d = Infinity;
+  for (var i = 0; i < circles.length; i++) {
+    var dx = px - circles[i].x, dy = py - circles[i].y;
+    var dd = Math.sqrt(dx * dx + dy * dy) - circles[i].r;
+    if (dd < d) d = dd;
+  }
+  return d;
+}
+
+// ---------------------------------------------------------------------------
+// Epoch state: flower placements. Regenerated on a tap reseed (and on
+// resize, since the field must cover the current aspect).
+// ---------------------------------------------------------------------------
+var epoch = 0;
+var epochT0 = 0;
+var flowers = []; // {x, y, r, petals, rot, col, alt, delay, swapT}
+
+function buildEpoch(ep) {
+  var rng = mulberry32(SEED_BASE + ep * 7919);
+  var Wd = W / Math.min(W, H), Hd = H / Math.min(W, H);
+  var circles = maskCircles(Hd);
+  var cx = 0, cy = 0.08 * Hd; // silhouette centroid
+  var g = 0.037;              // jittered grid spacing
+  var list = [];
+  var maxDc = 0.0001, minDc = Infinity;
+  for (var gy = -Hd / 2 - g; gy <= Hd / 2 + g; gy += g) {
+    for (var gx = -Wd / 2 - g; gx <= Wd / 2 + g; gx += g) {
+      var px = gx + (rng() * 2 - 1) * 0.011;
+      var py = gy + (rng() * 2 - 1) * 0.011;
+      var d = signedDist(px, py, circles);
+      // Size classes by distance from the silhouette boundary: small and
+      // dense at the edge so the outline reads crisply, larger far away.
+      var base = d < 0.055 ? 0.0175 : (d < 0.15 ? 0.027 : 0.041);
+      var r = base * (0.85 + rng() * 0.3);
+      // Rejection rule: keep a flower only if its center, plus a margin
+      // of 0.45 radii, clears the mask. The void stays empty.
+      if (d <= 0.45 * r) continue;
+      var dcx = px - cx, dcy = py - cy;
+      var dc = Math.sqrt(dcx * dcx + dcy * dcy);
+      if (dc > maxDc) maxDc = dc;
+      if (dc < minDc) minDc = dc;
+      list.push({
+        x: px, y: py, r: r, dc: dc,
+        petals: 6 + Math.floor(rng() * 3),
+        rot: rng() * Math.PI * 2,
+        col: Math.floor(rng() * PETALS.length),
+        alt: 0, delay: 0, swapT: -1,
+        swapRng: rng(), swapTimeRng: rng(), swapColRng: rng(), delayRng: rng()
+      });
+    }
+  }
+  for (var i = 0; i < list.length; i++) {
+    var f = list[i];
+    // Bloom delay keyed to distance from the silhouette centroid,
+    // normalized over the placed flowers (the void itself holds no
+    // flowers, so raw distance never starts at 0): the ring around the
+    // void pops first (already mid-pop at t = 0), the far field last.
+    f.delay = -0.6 + ((f.dc - minDc) / Math.max(maxDc - minDc, 0.0001)) * 16.5 + f.delayRng * 0.9;
+    // A few flowers swap petal color during the hold (19..31 s).
+    if (f.swapRng < 0.055) {
+      f.swapT = 20.5 + f.swapTimeRng * 9.5;
+      f.alt = (f.col + 1 + Math.floor(f.swapColRng * (PETALS.length - 1))) % PETALS.length;
+    }
+    delete f.dc; delete f.swapRng; delete f.swapTimeRng; delete f.swapColRng; delete f.delayRng;
+  }
+  // Draw large flowers first so the small edge flowers sit on top and
+  // the silhouette outline stays crisp.
+  list.sort(function (a, b) { return b.r - a.r; });
+  flowers = list;
+}
+
+// ---------------------------------------------------------------------------
+// Drawing. Pure function of loop time.
+// ---------------------------------------------------------------------------
+function backOut(p) {
+  var c1 = 1.70158, c3 = c1 + 1, q = p - 1;
+  return 1 + c3 * q * q * q + c1 * q * q;
+}
+function smooth(p) { return p * p * (3 - 2 * p); }
+
+function draw(tAbs) {
+  ctx.fillStyle = GROUND;
+  ctx.fillRect(0, 0, W, H);
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  var U = Math.min(W, H);
+  var ox = W / 2, oy = H / 2;
+  var t = (tAbs - epochT0) % LOOP_T;
+  if (t < 0) t += LOOP_T;
+
+  var alpha = 1, shrink = 1;
+  if (t > FADE_START) {
+    var fp = Math.min((t - FADE_START) / FADE_DUR, 1);
+    alpha = 1 - smooth(fp);
+    shrink = 1 - 0.15 * fp;
+  }
+  if (alpha <= 0) return;
+  ctx.globalAlpha = alpha;
+
+  for (var i = 0; i < flowers.length; i++) {
+    var f = flowers[i];
+    var p = (t - f.delay) / POP_DUR;
+    if (p <= 0) continue;
+    if (p > 1) p = 1;
+    var s = backOut(p) * shrink;
+    // Color swap during the hold: a quick dip, color flips at the bottom.
+    var col = f.col;
+    if (f.swapT >= 0 && t >= f.swapT) {
+      var q = (t - f.swapT) / 0.55;
+      if (q < 1) {
+        s *= 1 - 0.45 * Math.sin(Math.PI * q);
+        if (q >= 0.5) col = f.alt;
+      } else {
+        col = f.alt;
+      }
+    }
+    var cxp = ox + f.x * U, cyp = oy + f.y * U;
+    var r = f.r * U * s;
+    if (r < 0.4) continue;
+    ctx.fillStyle = PETALS[col];
+    var step = (Math.PI * 2) / f.petals;
+    for (var k = 0; k < f.petals; k++) {
+      var a = f.rot + k * step;
+      var px = cxp + Math.cos(a) * 0.60 * r;
+      var py = cyp + Math.sin(a) * 0.60 * r;
+      ctx.beginPath();
+      ctx.ellipse(px, py, 0.46 * r, 0.31 * r, a, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.fillStyle = CENTER;
+    ctx.beginPath();
+    ctx.arc(cxp, cyp, 0.335 * r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Interaction: tap reseeds (new epoch, fresh placements). Never a reload.
+// ---------------------------------------------------------------------------
+if (canvas.addEventListener) {
+  canvas.addEventListener('pointerdown', function () {
+    epoch++;
+    epochT0 = curT;
+    buildEpoch(epoch);
+    draw(curT);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Sizing and main loop.
+// ---------------------------------------------------------------------------
+function resize() {
+  var vw = (window.visualViewport && window.visualViewport.width) || window.innerWidth;
+  var vh = (window.visualViewport && window.visualViewport.height) || window.innerHeight;
+  W = Math.round(vw);
+  H = Math.round(vh);
+  canvas.width = W;
+  canvas.height = H;
+  var sw = (window.screen && window.screen.width) || 9999;
+  var sh = (window.screen && window.screen.height) || 9999;
+  isPhone = Math.min(sw, sh) < 700 || H > W * 1.15;
+  buildEpoch(epoch);
+  draw(curT);
+}
+
+if (window.visualViewport && window.visualViewport.addEventListener) {
+  window.visualViewport.addEventListener('resize', resize);
+}
+if (window.addEventListener) window.addEventListener('resize', resize);
+
+// Frame one: synchronous draw at loop t=0 (deterministic; never
+// clock-derived). The ring nearest the void is already mid-pop.
+resize();
+
+var bootOffset = curT; // nonzero only under the inert QA seed hook
+var startStamp = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+if (typeof requestAnimationFrame === 'function') {
+  var loop = function () {
+    curT = bootOffset + (performance.now() - startStamp) / 1000;
+    draw(curT);
+    requestAnimationFrame(loop);
+  };
+  requestAnimationFrame(loop);
+}
+</script>
+</body>
+</html>
