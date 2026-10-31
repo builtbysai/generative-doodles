@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>R_u.'n</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #060606; overflow: hidden; height: 100%; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded RNG (mulberry32) ----------
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(90162);
+
+  // ---------- palette (strict) ----------
+  var GROUND = '#060606';   // the black field
+  var LINE = '#FFFFFF';     // the line, at its head
+  var ECHO = '#3A3A3C';     // the line, at its fading tail
+  var STRIP = '#141416';    // the sequencer strip
+  var LIT = '#FF9E5C';      // the one lit step (amber)
+  var DIM = '#3A2E24';      // unlit steps
+
+  var LINE_RGB = [255, 255, 255];
+  var ECHO_RGB = [58, 58, 60];
+  function blendRGB(f) { // f: 0 at the tail, 1 at the head
+    var r = Math.round(ECHO_RGB[0] + (LINE_RGB[0] - ECHO_RGB[0]) * f);
+    var g = Math.round(ECHO_RGB[1] + (LINE_RGB[1] - ECHO_RGB[1]) * f);
+    var b = Math.round(ECHO_RGB[2] + (LINE_RGB[2] - ECHO_RGB[2]) * f);
+    return 'rgb(' + r + ',' + g + ',' + b + ')';
+  }
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 720, H = 720, DPR = 1;
+
+  function isPhone() {
+    var sw = 0, sh = 0;
+    if (typeof window !== 'undefined' && window.screen) {
+      sw = window.screen.width || 0; sh = window.screen.height || 0;
+    }
+    var mn = Math.min(sw, sh);
+    if (mn > 0) return mn < 700;
+    return H > W * 1.15;
+  }
+
+  function resize() {
+    var w = 0, h = 0;
+    if (typeof window !== 'undefined' && window.visualViewport) {
+      w = window.visualViewport.width || 0; h = window.visualViewport.height || 0;
+    }
+    if (!w || !h) {
+      w = (typeof window !== 'undefined' && window.innerWidth) || 720;
+      h = (typeof window !== 'undefined' && window.innerHeight) || 720;
+    }
+    W = Math.round(w); H = Math.round(h);
+    DPR = 1;
+    if (typeof window !== 'undefined' && typeof window.devicePixelRatio === 'number') {
+      DPR = Math.min(window.devicePixelRatio, 2);
+    }
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+  }
+
+  function panelH() { return Math.round(H * 0.72); }
+
+  // ---------- seeded 2D value noise (integer hash, exact) ----------
+  function hash2(ix, iy) {
+    var h = Math.imul(ix, 374761393) ^ Math.imul(iy, 668265263) ^ Math.imul(90162, 1442695041);
+    h = Math.imul(h ^ (h >>> 13), 1274126177);
+    return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+  }
+  function noise2(x, y) {
+    var ix = Math.floor(x), iy = Math.floor(y);
+    var fx = x - ix, fy = y - iy;
+    var ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+    var a = hash2(ix, iy), b = hash2(ix + 1, iy);
+    var c = hash2(ix, iy + 1), d = hash2(ix + 1, iy + 1);
+    return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
+  }
+  function fbm2(x, y) {
+    return noise2(x, y) * 0.55 + noise2(x * 2.13 + 7.3, y * 2.13 + 3.1) * 0.28 +
+           noise2(x * 4.31 + 19.1, y * 4.31 + 11.7) * 0.17;
+  }
+  // curl-style steering angle from the field; drifts very slowly with sim time.
+  // The field scale is tied to the frame so the knot tangles at any size.
+  function fieldAngle(x, y, t, S) {
+    var s = 3.4 / Math.max(1, S);
+    var n = fbm2(x * s + t * 0.013, y * s - t * 0.009);
+    return (n - 0.5) * Math.PI * 5.2;
+  }
+
+  // ---------- the line: one head, one trail ----------
+  var TRAIL_MAX = 560;
+  var trail = [];            // oldest first, head last: [x, y] in CSS px
+  var hx = 0, hy = 0;        // head position
+  var heading = 0;           // head direction, radians
+  var headSpeed = 0;         // px/s, smoothed; feeds the sequencer rate
+  var simTime = 0;
+
+  function baseSpeed() { return 0.30 * Math.min(W, panelH()); }
+
+  // mode blend: 0 = knot (flow-field scribble), 1 = coil (dense spiral)
+  var MODE_PERIOD = 40;      // seconds for a full knot -> coil -> knot cycle
+  var MODE_PHASE = -0.35;    // frame one: m ~ 0.33 and rising toward coil
+  function modeBlend(t) {
+    var s = 0.5 + 0.5 * Math.sin((Math.PI * 2 * t / MODE_PERIOD) + MODE_PHASE);
+    return s * s * (3 - 2 * s);
+  }
+  var coilEvents = [];       // sim times of double-taps: force coil for 4 s
+  function coilForced(t) {
+    for (var i = 0; i < coilEvents.length; i++) {
+      if (t >= coilEvents[i] && t <= coilEvents[i] + 4) return true;
+    }
+    return false;
+  }
+  // the coil's heart wanders slowly so the spiral never closes on itself
+  function coilCenter(t) {
+    return {
+      x: W * 0.5 + W * 0.17 * Math.sin(t * 0.051 + 1.7),
+      y: panelH() * 0.5 + panelH() * 0.15 * Math.sin(t * 0.037 + 0.4)
+    };
+  }
+
+  // ---------- the sequencer: one clock for the lights and the notes ----------
+  var STEPS = 16;
+  var BASE_RATE = 7;         // steps per second
+  var stepPhase = 5.0;       // frame one: step 5 lit, partway along the row
+  var lastStep = 5;
+
+  // minor pentatonic row (A minor): one plucked note per step
+  var SCALE = [220.00, 261.63, 293.66, 329.63, 392.00, 440.00, 523.25];
+  var MELODY = [0, 2, 4, 3, 5, 4, 2, 1, 0, 3, 4, 5, 4, 2, 1, 3]; // scale degrees per step
+
+  // ---------- interaction state ----------
+  var pointerDown = false;
+  var pointerInPanel = false;
+  var px = 0, py = 0;        // pointer position (drag steering)
+  var downTime = 0, downX = 0, downY = 0, dragDist = 0;
+  var pendingTap = null;     // { t, x, y } awaiting double-tap disambiguation
+
+  // ---------- audio: lazy, gesture-born, guarded ----------
+  var AC = null, masterGain = null;
+  function ensureAudio() {
+    if (AC) { if (AC.resume) AC.resume(); return; }
+    var Ctor = null;
+    if (typeof window !== 'undefined') {
+      if (typeof window.AudioContext === 'function') Ctor = window.AudioContext;
+      else if (typeof window.webkitAudioContext === 'function') Ctor = window.webkitAudioContext;
+    }
+    if (!Ctor) return;
+    try {
+      AC = new Ctor();
+      masterGain = AC.createGain();
+      masterGain.gain.value = 0.5;
+      masterGain.connect(AC.destination);
+    } catch (e) { AC = null; masterGain = null; }
+  }
+  function pluck(stepIdx) {
+    if (!AC || !masterGain) return;
+    try {
+      var t0 = AC.currentTime;
+      var osc = AC.createOscillator();
+      osc.type = 'triangle';
+      osc.frequency.value = SCALE[MELODY[stepIdx % STEPS] % SCALE.length];
+      var g = AC.createGain();
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.exponentialRampToValueAtTime(0.22, t0 + 0.008);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.38);
+      var out = masterGain;
+      if (typeof AC.createStereoPanner === 'function') {
+        var pan = AC.createStereoPanner();
+        var pv = (hx / Math.max(1, W)) * 1.6 - 0.8;
+        pan.pan.value = Math.max(-0.85, Math.min(0.85, pv)); // pan = the head's x
+        osc.connect(g); g.connect(pan); pan.connect(masterGain);
+      } else {
+        osc.connect(g); g.connect(out);
+      }
+      osc.start(t0);
+      osc.stop(t0 + 0.42);
+    } catch (e) { /* audio is garnish; the line keeps drawing */ }
+  }
+
+  // ---------- simulation: fixed timestep ----------
+  var DT = 1 / 120;
+
+  function angDiff(a, b) {
+    var d = a - b;
+    while (d > Math.PI) d -= Math.PI * 2;
+    while (d < -Math.PI) d += Math.PI * 2;
+    return d;
+  }
+
+  function stepSim() {
+    var t = simTime;
+    var ph = panelH();
+    var S = Math.min(W, ph);
+
+    // pending tap matures into a reseed if no second tap converts it
+    if (pendingTap && t - pendingTap.t > 0.35) {
+      hx = pendingTap.x; hy = pendingTap.y;
+      trail.length = 0;
+      trail.push([hx, hy]);
+      pendingTap = null;
+    }
+
+    // --- desired direction ---
+    var m = coilForced(t) ? 1 : modeBlend(t);
+    var knotA = fieldAngle(hx, hy, t, S);
+    var cc = coilCenter(t);
+    var toC = Math.atan2(cc.y - hy, cc.x - hx);
+    var coilA = toC + 1.85; // tangent plus inward bite: a tightening spiral
+    var dx = Math.cos(knotA) * (1 - m) + Math.cos(coilA) * m;
+    var dy = Math.sin(knotA) * (1 - m) + Math.sin(coilA) * m;
+
+    // soft walls: keep the head inside the upper panel
+    var mg = S * 0.13;
+    if (hx < mg) dx += (mg - hx) / mg * 2.6;
+    if (hx > W - mg) dx -= (hx - (W - mg)) / mg * 2.6;
+    if (hy < mg) dy += (mg - hy) / mg * 2.6;
+    if (hy > ph - mg) dy -= (hy - (ph - mg)) / mg * 2.6;
+
+    var speed = baseSpeed();
+    if (pointerDown && pointerInPanel) {
+      // the hand of the line: steer to the finger; orbit it when close
+      var vx = px - hx, vy = py - hy;
+      var dist = Math.sqrt(vx * vx + vy * vy);
+      if (dist > 1) {
+        var ux = vx / dist, uy = vy / dist;
+        if (dist < S * 0.055) { // close: coil around the finger
+          var txv = -uy, tyv = ux;
+          dx = txv * 1.4 + ux * 0.35; dy = tyv * 1.4 + uy * 0.35;
+          speed = baseSpeed() * 0.85;
+        } else {
+          dx = ux; dy = uy;
+          speed = Math.max(baseSpeed() * 0.35, Math.min(baseSpeed() * 2.3, dist * 4.2));
+        }
+      }
+    }
+
+    var desired = Math.atan2(dy, dx);
+    var turn = angDiff(desired, heading);
+    var maxTurn = 5.0 * DT;
+    if (turn > maxTurn) turn = maxTurn;
+    if (turn < -maxTurn) turn = -maxTurn;
+    heading += turn;
+
+    hx += Math.cos(heading) * speed * DT;
+    hy += Math.sin(heading) * speed * DT;
+    if (hx < 2) hx = 2; if (hx > W - 2) hx = W - 2;
+    if (hy < 2) hy = 2; if (hy > ph - 2) hy = ph - 2;
+
+    headSpeed += (speed - headSpeed) * 0.04;
+
+    trail.push([hx, hy]);
+    if (trail.length > TRAIL_MAX) trail.shift();
+
+    // --- the sequencer: step rate nudged by the head's speed ---
+    var speedNorm = Math.max(0, Math.min(1, headSpeed / (baseSpeed() * 1.6)));
+    var rate = BASE_RATE * (0.88 + 0.3 * speedNorm);
+    stepPhase += rate * DT;
+    var stepIdx = Math.floor(stepPhase) % STEPS;
+    if (stepIdx !== lastStep) {
+      lastStep = stepIdx;
+      pluck(stepIdx); // no-op until the first gesture births the context
+    }
+
+    simTime += DT;
+  }
+
+  // ---------- drawing ----------
+  function draw() {
+    // pin the canvas CSS size every frame (house rule)
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    var ph = panelH();
+
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = GROUND;
+    ctx.fillRect(0, 0, W, H);
+
+    // the line: one polyline, echo at the tail, white at the head
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, 0, W, ph);
+    ctx.clip();
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    var n = trail.length;
+    if (n > 1) {
+      ctx.lineWidth = Math.max(1.4, Math.min(W, ph) * 0.004);
+      for (var i = 1; i < n; i++) {
+        var f = i / (n - 1);
+        ctx.strokeStyle = blendRGB(f * f * 0.7 + f * 0.3);
+        ctx.beginPath();
+        ctx.moveTo(trail[i - 1][0], trail[i - 1][1]);
+        ctx.lineTo(trail[i][0], trail[i][1]);
+        ctx.stroke();
+      }
+      // the head: a bright point
+      ctx.fillStyle = LINE;
+      ctx.beginPath();
+      ctx.arc(hx, hy, Math.max(1.6, Math.min(W, ph) * 0.005), 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+
+    // the strip: quiet, dark, sixteen dots, one lit
+    ctx.fillStyle = STRIP;
+    ctx.fillRect(0, ph, W, H - ph);
+    var stripMidY = ph + (H - ph) / 2;
+    var r = Math.max(3, Math.min(11, (H - ph) * 0.085));
+    var span = W * 0.8;
+    var x0 = (W - span) / 2;
+    var stepIdxNow = Math.floor(stepPhase) % STEPS;
+    for (var s = 0; s < STEPS; s++) {
+      var cx = STEPS === 1 ? W / 2 : x0 + span * (s / (STEPS - 1));
+      ctx.fillStyle = (s === stepIdxNow) ? LIT : DIM;
+      ctx.beginPath();
+      ctx.arc(cx, stripMidY, s === stepIdxNow ? r : r * 0.82, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  // ---------- pointer ----------
+  function posOf(e) {
+    var r = { left: 0, top: 0 };
+    if (canvas.getBoundingClientRect) r = canvas.getBoundingClientRect();
+    var cx = (typeof e.clientX === 'number') ? e.clientX : 0;
+    var cy = (typeof e.clientY === 'number') ? e.clientY : 0;
+    return { x: cx - r.left, y: cy - r.top };
+  }
+  function onDown(e) {
+    ensureAudio();
+    var p = posOf(e);
+    pointerDown = true;
+    pointerInPanel = p.y < panelH();
+    px = p.x; py = p.y;
+    downTime = simTime; downX = p.x; downY = p.y; dragDist = 0;
+    if (e && e.preventDefault) e.preventDefault();
+  }
+  function onMove(e) {
+    if (!pointerDown) return;
+    var p = posOf(e);
+    dragDist += Math.sqrt((p.x - px) * (p.x - px) + (p.y - py) * (p.y - py));
+    px = p.x; py = p.y;
+    pointerInPanel = p.y < panelH();
+    if (e && e.preventDefault) e.preventDefault();
+  }
+  function onUp(e) {
+    if (!pointerDown) return;
+    pointerDown = false;
+    var held = simTime - downTime;
+    var isTap = held < 0.3 && dragDist < Math.min(W, H) * 0.02;
+    if (isTap) {
+      var p = { x: downX, y: downY };
+      if (pendingTap && simTime - pendingTap.t <= 0.35) {
+        pendingTap = null; // the second tap converts: force the knot
+        coilEvents.push(simTime);
+        if (coilEvents.length > 6) coilEvents.shift();
+      } else {
+        pendingTap = { t: simTime, x: p.x, y: Math.min(p.y, panelH() - 4) };
+      }
+    }
+    if (e && e.preventDefault) e.preventDefault();
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+  }
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', function () { resize(); clampHead(); draw(); });
+    }
+    if (window.addEventListener) {
+      window.addEventListener('resize', function () { resize(); clampHead(); draw(); });
+    }
+  }
+  function clampHead() {
+    var ph = panelH();
+    if (hx > W - 2) hx = W - 2;
+    if (hy > ph - 2) hy = ph - 2;
+  }
+
+  // ---------- go ----------
+  resize();
+  // deterministic start: head at panel center-ish, trail pre-rolled
+  hx = W * 0.44; hy = panelH() * 0.42;
+  heading = -0.6;
+  headSpeed = baseSpeed();
+  trail.push([hx, hy]);
+  var PREROLL = 660; // 5.5 s of sim at 120 Hz: frame one is already mid-formation
+  for (var i = 0; i < PREROLL; i++) stepSim();
+  draw(); // frame one
+
+  var lastNow = -1, acc = 0;
+  function frame(now) {
+    if (lastNow < 0) lastNow = now;
+    var dt = (now - lastNow) / 1000;
+    lastNow = now;
+    if (dt > 0.06) dt = 0.06;
+    if (dt > 0) {
+      acc += dt;
+      var guard = 0;
+      while (acc >= DT && guard < 40) { stepSim(); acc -= DT; guard++; }
+      if (guard >= 40) acc = 0;
+      draw();
+    }
+    if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(frame);
+  }
+  if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
