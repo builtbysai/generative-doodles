@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Low End Brightness</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #050505;
+    overflow: hidden;
+    height: 100%;
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- palette (strict) ----------
+  var GROUND = '#050505';
+  var LINE = '#E8E8E0';
+  var FILAMENT = '#8A8A86';
+  var BLOOM = '#B8A9FF';
+  var NOISE = '#FFFFFF';
+
+  // ---------- seeded RNG (mulberry32) ----------
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a = (a + 0x6D2B79F5) >>> 0;
+      var t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(0x10E893);
+
+  // ---------- viewport ----------
+  var canvas = document.getElementById('stage');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0, DPR = 1;
+
+  function isPhone() {
+    var sw = 0, sh = 0;
+    if (typeof window !== 'undefined' && window.screen) {
+      sw = window.screen.width || 0;
+      sh = window.screen.height || 0;
+    }
+    var mn = Math.min(sw, sh);
+    if (mn > 0) return mn < 700;
+    return H > W * 1.15;
+  }
+
+  function resize() {
+    var w, h;
+    if (typeof window !== 'undefined' && window.visualViewport) {
+      w = window.visualViewport.width;
+      h = window.visualViewport.height;
+    } else if (typeof window !== 'undefined' && window.innerWidth) {
+      w = window.innerWidth;
+      h = window.innerHeight;
+    } else {
+      w = 720; h = 720;
+    }
+    DPR = 1;
+    if (typeof window !== 'undefined' && window.devicePixelRatio) {
+      DPR = Math.min(2, window.devicePixelRatio || 1);
+    }
+    W = Math.round(w);
+    H = Math.round(h);
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+  }
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', resize);
+  }
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('resize', resize);
+  }
+  resize();
+
+  // ---------- the P model (closed form) ----------
+  // Base arc: 180 s cosine breath. Phase chosen so P(0) = 0.14 exactly:
+  // 0.5 - 0.5*cos(PHASE0) = 0.14  =>  cos(PHASE0) = 0.72.
+  var ARC_PERIOD = 180;
+  var PHASE0 = Math.acos(0.72);
+  var HOLD_LEN = 6;      // double-tap hold, seconds
+  var CONDUCT_TAU = 4.0; // drag momentum decay, seconds
+  var CONDUCT_GAIN = 0.0016; // per px of drag travel
+  var TAP_DECAY = 3.5;   // snare envelope: ~0.8 s to near zero
+
+  var dragEvents = []; // {t, dx}
+  var tapEvents = [];  // {t}
+  var holds = [];      // {start, dur}
+
+  function clamp01(v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
+
+  // Effective arc time: real t minus time spent inside holds.
+  function effTime(t) {
+    var frozen = 0;
+    for (var i = 0; i < holds.length; i++) {
+      var s = holds[i].start, e = s + holds[i].dur;
+      if (t <= s) break;
+      frozen += Math.min(t, e) - s;
+    }
+    return t - frozen;
+  }
+
+  function baseP(t) {
+    var u = effTime(t);
+    return 0.5 - 0.5 * Math.cos(PHASE0 + (2 * Math.PI * u) / ARC_PERIOD);
+  }
+
+  function conduct(t) {
+    var c = 0;
+    for (var i = 0; i < dragEvents.length; i++) {
+      var ev = dragEvents[i];
+      if (ev.t > t) continue;
+      var age = t - ev.t;
+      if (age > 20) continue;
+      c += ev.dx * CONDUCT_GAIN * Math.exp(-age / CONDUCT_TAU);
+    }
+    return c;
+  }
+
+  function tapEnv(t) {
+    var s = 0;
+    for (var i = 0; i < tapEvents.length; i++) {
+      var dt = t - tapEvents[i].t;
+      if (dt < 0) continue;
+      s += Math.exp(-TAP_DECAY * dt);
+    }
+    return s;
+  }
+
+  // The one shared value. Returns {p, display, smear, flash}.
+  function stateAt(t) {
+    var p = clamp01(baseP(t) + conduct(t));
+    var env = tapEnv(t);
+    var flash = Math.min(1, env);
+    var smearBase = Math.pow(p, 2.2) * 0.9;
+    var smear = Math.min(1.6, smearBase + env * 1.1);
+    var display = clamp01(p + env * 0.18);
+    return { p: p, display: display, smear: smear, flash: flash };
+  }
+
+  // ---------- precomputed seeded geometry ----------
+  var MAXF = 26;
+  var filaments = [];
+  (function () {
+    var r = mulberry32(0xF11A);
+    for (var i = 0; i < MAXF; i++) {
+      filaments.push({
+        off: (i / (MAXF - 1)) - 0.5,          // -0.5 .. 0.5 across the spread
+        phase: r() * Math.PI * 2,
+        k: 1.5 + r() * 2.5,                    // waves across the band
+        amp: 0.4 + r() * 0.9,                  // relative waviness
+        wob: 0.2 + r() * 0.5                   // slow temporal wobble rate
+      });
+    }
+  })();
+
+  var SPECKS = [];
+  (function () {
+    var r = mulberry32(0x59EC5EED);
+    for (var i = 0; i < 1100; i++) {
+      SPECKS.push({
+        x: r(),                                // 0..1 across the band
+        y: (r() * 2 - 1),                      // -1..1 around centre, denser mid
+        thr: 0.68 + r() * 0.32,                // appears as P passes this
+        s: r() < 0.18 ? 2 : 1                  // px size class
+      });
+    }
+    // centre-bias the y distribution
+    for (var j = 0; j < SPECKS.length; j++) {
+      var y = SPECKS[j].y;
+      SPECKS[j].y = Math.sign(y) * Math.pow(Math.abs(y), 1.6);
+    }
+  })();
+
+  // ---------- drawing ----------
+  function hexRgb(hex) {
+    return [
+      parseInt(hex.slice(1, 3), 16),
+      parseInt(hex.slice(3, 5), 16),
+      parseInt(hex.slice(5, 7), 16)
+    ];
+  }
+  var C_LINE = hexRgb(LINE), C_FIL = hexRgb(FILAMENT),
+      C_BLOOM = hexRgb(BLOOM), C_NOISE = hexRgb(NOISE);
+  function rgba(c, a) {
+    return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a.toFixed(3) + ')';
+  }
+
+  function filamentPath(cx, x0, x1, spread, i, t, stretchY) {
+    var f = filaments[i];
+    var segs = 28;
+    ctx.beginPath();
+    for (var s = 0; s <= segs; s++) {
+      var u = s / segs;
+      var x = x0 + (x1 - x0) * u;
+      var wob = Math.sin(u * Math.PI * f.k + f.phase + t * f.wob * 0.35);
+      var taper = Math.sin(u * Math.PI); // ends settle to the line
+      var y = cx + (f.off * spread + wob * f.amp * (2 + spread * 0.10) * taper) * stretchY;
+      if (s === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+    var st = stateAt(t);
+    var p = st.p;
+
+    ctx.fillStyle = GROUND;
+    ctx.fillRect(0, 0, W, H);
+
+    var phone = isPhone();
+    var margin = phone ? 0 : Math.round(W * 0.07);
+    var x0 = margin, x1 = W - margin;
+    var cy = H * 0.46;
+    var bandH = Math.min(H * 0.52, (phone ? W : W * 0.62) * 0.62);
+
+    var brightness = 0.45 + 0.55 * p + st.flash * 0.25;
+    if (brightness > 1) brightness = 1;
+
+    var filCount = 1 + Math.round((MAXF - 1) * Math.pow(p, 0.65));
+    var spread = bandH * 0.5 * (0.06 + 0.94 * Math.pow(p, 1.1));
+
+    // bloom ghosts: analytic stretched copies behind the filaments
+    // (a whisper of halo even in the quiet opening, full bloom as P climbs)
+    var bloomStrength = Math.max(0, (p - 0.38) / 0.62);
+    var ghosts = 3;
+    for (var g = ghosts; g >= 1; g--) {
+      var stretch = 1 + g * 0.30 * (0.3 + st.smear);
+      var ga = 0.075 * (0.30 + bloomStrength) * (1 - g / (ghosts + 1)) + 0.02 * st.flash;
+      ctx.strokeStyle = rgba(C_BLOOM, ga);
+      ctx.lineWidth = 5 + g * 3;
+      for (var gi = 0; gi < filCount; gi += 2) {
+        filamentPath(cy, x0, x1, spread, gi, t, stretch);
+      }
+    }
+
+    // filaments
+    var filAlpha = (0.25 + 0.45 * p) * brightness;
+    ctx.strokeStyle = rgba(C_FIL, filAlpha);
+    ctx.lineWidth = 1;
+    for (var i = 0; i < filCount; i++) {
+      if (i === (MAXF >> 1)) continue; // centre slot belongs to the core line
+      filamentPath(cy, x0, x1, spread, i, t, 1);
+    }
+
+    // core line: width is P rendered directly
+    var coreW = 1 + p * 9 + st.flash * 3;
+    ctx.strokeStyle = rgba(C_LINE, Math.min(1, (0.35 + 0.65 * p) * brightness + st.flash * 0.2));
+    ctx.lineWidth = coreW;
+    ctx.beginPath();
+    var mid = filaments[MAXF >> 1];
+    var segs = 28;
+    for (var s2 = 0; s2 <= segs; s2++) {
+      var u2 = s2 / segs;
+      var xx = x0 + (x1 - x0) * u2;
+      var yy = cy + Math.sin(u2 * Math.PI * mid.k + mid.phase + t * mid.wob * 0.35) *
+               mid.amp * 1.2 * Math.sin(u2 * Math.PI);
+      if (s2 === 0) ctx.moveTo(xx, yy); else ctx.lineTo(xx, yy);
+    }
+    ctx.stroke();
+
+    // noise saturation: white specks whose thresholds P has passed
+    if (p > 0.66) {
+      for (var n = 0; n < SPECKS.length; n++) {
+        var sp = SPECKS[n];
+        if (p <= sp.thr) continue;
+        var a = Math.min(1, (p - sp.thr) / 0.10) * (0.35 + 0.65 * p);
+        var sx = x0 + sp.x * (x1 - x0);
+        var sy = cy + sp.y * bandH * (0.20 + 0.38 * p);
+        ctx.fillStyle = rgba(C_NOISE, a.toFixed(3) === '0.000' ? 0 : a);
+        ctx.fillRect(sx, sy, sp.s, sp.s);
+      }
+    }
+
+    // progression arc + marker (the only furniture)
+    var arcY = H * 0.88;
+    var ax0 = Math.round(W * 0.08), ax1 = W - ax0;
+    ctx.strokeStyle = rgba(C_FIL, 0.4);
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(ax0, arcY);
+    ctx.lineTo(ax1, arcY);
+    ctx.stroke();
+    ctx.fillStyle = rgba(C_FIL, 0.4);
+    ctx.fillRect(ax0, arcY - 3, 1, 7);
+    ctx.fillRect(ax1 - 1, arcY - 3, 1, 7);
+    var mx = ax0 + st.display * (ax1 - ax0);
+    ctx.fillStyle = rgba(C_LINE, 0.9);
+    ctx.beginPath();
+    ctx.arc(mx, arcY, 3, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // ---------- audio (lazy, gesture-only, guarded) ----------
+  var AC = null, subOsc = null, subGain = null, noiseGain = null, audioOn = false;
+  function ensureAudio() {
+    if (audioOn) return;
+    audioOn = true;
+    try {
+      var Ctor = (typeof window !== 'undefined') &&
+        (window.AudioContext || window.webkitAudioContext);
+      if (!Ctor) return;
+      AC = new Ctor();
+      subOsc = AC.createOscillator();
+      subOsc.type = 'sine';
+      subOsc.frequency.value = 41;
+      var sub2 = AC.createOscillator();
+      sub2.type = 'sine';
+      sub2.frequency.value = 82.5;
+      subGain = AC.createGain();
+      subGain.gain.value = 0;
+      var sub2Gain = AC.createGain();
+      sub2Gain.gain.value = 0.35;
+      subOsc.connect(subGain);
+      sub2.connect(sub2Gain);
+      sub2Gain.connect(subGain);
+      subGain.connect(AC.destination);
+      subOsc.start();
+      sub2.start();
+
+      var len = AC.sampleRate * 2;
+      var buf = AC.createBuffer(1, len, AC.sampleRate);
+      var data = buf.getChannelData(0);
+      var nr = mulberry32(0xBEEF);
+      for (var i = 0; i < len; i++) data[i] = nr() * 2 - 1;
+      var src = AC.createBufferSource();
+      src.buffer = buf;
+      src.loop = true;
+      var bp = AC.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.value = 3200;
+      bp.Q.value = 0.7;
+      noiseGain = AC.createGain();
+      noiseGain.gain.value = 0;
+      src.connect(bp);
+      bp.connect(noiseGain);
+      noiseGain.connect(AC.destination);
+      src.start();
+    } catch (e) {
+      AC = null;
+    }
+  }
+  function updateAudio(st) {
+    if (!AC || !subGain) return;
+    try {
+      var t = AC.currentTime;
+      subGain.gain.setTargetAtTime(st.p * 0.22, t, 0.1);
+      noiseGain.gain.setTargetAtTime(Math.min(0.12, st.smear * 0.07 + st.flash * 0.05), t, 0.05);
+    } catch (e) { /* silent in QA */ }
+  }
+
+  // ---------- interaction ----------
+  var startT = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+  function nowT() {
+    if (typeof performance !== 'undefined' && performance.now) {
+      return (performance.now() - startT) / 1000;
+    }
+    return 0;
+  }
+
+  var dragging = false, downT = 0, downX = 0, downY = 0, lastX = 0, moved = 0;
+  var lastTapT = -10, lastTapIdx = -1;
+
+  function onDown(e) {
+    ensureAudio();
+    if (AC && AC.resume) { try { AC.resume(); } catch (err) {} }
+    dragging = true;
+    downT = nowT();
+    downX = lastX = e.clientX;
+    downY = e.clientY;
+    moved = 0;
+  }
+  function onMove(e) {
+    if (!dragging) return;
+    var t = nowT();
+    var dx = e.clientX - lastX;
+    lastX = e.clientX;
+    moved += Math.abs(dx) + Math.abs(e.clientY - downY) * 0.25;
+    if (dx !== 0) {
+      dragEvents.push({ t: t, dx: dx });
+      if (dragEvents.length > 600) dragEvents.splice(0, dragEvents.length - 600);
+    }
+  }
+  function onUp(e) {
+    if (!dragging) return;
+    dragging = false;
+    var t = nowT();
+    var quick = (t - downT) < 0.30;
+    var still = moved < 9 && Math.abs(e.clientX - downX) < 9 && Math.abs(e.clientY - downY) < 9;
+    if (quick && still) {
+      if (t - lastTapT < 0.35 && lastTapIdx >= 0) {
+        // double-tap: convert the previous snare into a hold
+        tapEvents.splice(lastTapIdx, 1);
+        holds.push({ start: t, dur: HOLD_LEN });
+        lastTapT = -10;
+        lastTapIdx = -1;
+      } else {
+        tapEvents.push({ t: t });
+        lastTapIdx = tapEvents.length - 1;
+        lastTapT = t;
+      }
+    }
+  }
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', function () { dragging = false; });
+  }
+
+  // ---------- run ----------
+  draw(0); // frame one: synchronous, fixed phase, P = 0.14
+  if (typeof requestAnimationFrame === 'function') {
+    var loop = function () {
+      var t = nowT();
+      var st = stateAt(t);
+      draw(t);
+      updateAudio(st);
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>

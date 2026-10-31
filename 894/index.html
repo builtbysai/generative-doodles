@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Bliss Seed</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #050506; height: 100%; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- palette (strict) ----------
+  var GROUND = '#050506';
+  var SEED_GRAY = [200, 200, 204];   // #C8C8CC
+  var GROWN = [232, 232, 224];       // #E8E8E0
+  var FRINGE = [138, 92, 255];       // #8A5CFF
+  var WHITE = [255, 255, 255];       // #FFFFFF
+
+  function rgba(c, a) {
+    return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a + ')';
+  }
+  function mix(c1, c2, f) {
+    return [
+      Math.round(c1[0] + (c2[0] - c1[0]) * f),
+      Math.round(c1[1] + (c2[1] - c1[1]) * f),
+      Math.round(c1[2] + (c2[2] - c1[2]) * f)
+    ];
+  }
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+  function smoothstep(a, b, x) {
+    var t = clamp((x - a) / (b - a), 0, 1);
+    return t * t * (3 - 2 * t);
+  }
+
+  // ---------- seeded RNG (mulberry32) ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(89455);
+  // Per-blade length jitter, fixed at birth: keeps the star hand-made, never random per frame.
+  var jitter = [];
+  for (var ji = 0; ji < 24; ji++) jitter.push(0.9 + rng() * 0.2);
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0, isPhone = false;
+
+  function resize() {
+    var vv = (typeof window !== 'undefined' && window.visualViewport) ? window.visualViewport : null;
+    var w = vv ? vv.width : window.innerWidth;
+    var h = vv ? vv.height : window.innerHeight;
+    var dpr = window.devicePixelRatio || 1;
+    if (dpr > 2) dpr = 2;
+    W = w; H = h;
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    // Phone detection: physical screen size first, aspect only as fallback.
+    var sw = (window.screen && window.screen.width) ? window.screen.width : 9999;
+    var sh = (window.screen && window.screen.height) ? window.screen.height : 9999;
+    isPhone = Math.min(sw, sh) < 700 || (sw >= 700 && h > w * 1.15 && Math.min(w, h) < 700);
+    draw(nowS());
+  }
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', resize);
+  }
+  window.addEventListener('resize', resize);
+
+  // ---------- clock (elapsed since load; frame one is t = 0, drawn synchronously) ----------
+  var startT = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+  function nowS() {
+    if (typeof performance !== 'undefined' && performance.now) {
+      return (performance.now() - startT) / 1000;
+    }
+    return 0;
+  }
+
+  // ---------- growth model ----------
+  // G is a closed-form function of the recorded event history and t.
+  //   near-touch segments: G rises at RISE (1/30 per s, ~30 s of care to full bloom)
+  //   everything else:     G decays at DECAY toward FLOOR (the seed never dies)
+  //   tap:                 +BUMP, effective after the double-tap disambiguation window
+  //   double-tap:          a rest interval pins G to FLOOR for REST seconds
+  var G0 = 0.2;          // seeded modest start
+  var FLOOR = 0.06;      // dimmest the seed can sink; it can always be revived
+  var RISE = 1 / 30;
+  var DECAY = 1 / 50;
+  var BUMP = 0.04;
+  var REST = 5;
+  var DISAMBIG = 0.33;   // tap bump lands this long after the tap, so a double-tap can pre-empt it
+
+  var segments = [];     // {t0, t1 (Infinity while open), near:bool}
+  var rawTaps = [];      // times of completed tap gestures
+
+  // Derive bumps and rests from the raw tap list, deterministically.
+  function deriveTaps() {
+    var bumps = [], rests = [];
+    var ts = rawTaps.slice().sort(function (a, b) { return a - b; });
+    var i = 0;
+    while (i < ts.length) {
+      if (i + 1 < ts.length && ts[i + 1] - ts[i] <= 0.4) {
+        rests.push({ t0: ts[i + 1], t1: ts[i + 1] + REST });
+        i += 2;
+      } else {
+        bumps.push(ts[i] + DISAMBIG);
+        i += 1;
+      }
+    }
+    return { bumps: bumps, rests: rests };
+  }
+
+  function growthAt(t) {
+    var d = deriveTaps();
+    // Collect critical times: segment edges, bump times, rest edges, 0 and t.
+    var crit = [0, t];
+    var i, j;
+    for (i = 0; i < segments.length; i++) {
+      crit.push(segments[i].t0);
+      if (segments[i].t1 !== Infinity) crit.push(segments[i].t1);
+    }
+    for (i = 0; i < d.bumps.length; i++) crit.push(d.bumps[i]);
+    for (i = 0; i < d.rests.length; i++) { crit.push(d.rests[i].t0); crit.push(d.rests[i].t1); }
+    crit = crit.filter(function (x) { return x >= 0 && x <= t; }).sort(function (a, b) { return a - b; });
+
+    function regimeAt(tm) {
+      for (var k = 0; k < d.rests.length; k++) {
+        if (tm >= d.rests[k].t0 && tm < d.rests[k].t1) return 'rest';
+      }
+      for (var s = 0; s < segments.length; s++) {
+        if (segments[s].near && tm >= segments[s].t0 && tm < segments[s].t1) return 'near';
+      }
+      return 'far';
+    }
+
+    var G = G0;
+    for (i = 0; i < crit.length; i++) {
+      var ct = crit[i];
+      // apply any bump landing exactly here
+      for (j = 0; j < d.bumps.length; j++) {
+        if (Math.abs(d.bumps[j] - ct) < 1e-9 && ct > 0) G = Math.min(1, G + BUMP);
+      }
+      if (i + 1 < crit.length) {
+        var nt = crit[i + 1], dt = nt - ct;
+        if (dt > 0) {
+          var r = regimeAt(ct + dt / 2);
+          if (r === 'rest') G = FLOOR;
+          else if (r === 'near') G = Math.min(1, G + RISE * dt);
+          else G = Math.max(FLOOR, G - DECAY * dt);
+        }
+      }
+    }
+    // If t itself sits inside a rest, the seed is at its dimmest.
+    if (regimeAt(t) === 'rest') G = FLOOR;
+    return G;
+  }
+
+  // Pulse rings from landed bumps (closed form of the same derived list).
+  function pulsesAt(t) {
+    var d = deriveTaps();
+    var out = [];
+    for (var i = 0; i < d.bumps.length; i++) {
+      var age = t - d.bumps[i];
+      if (age >= 0 && age < 1.6) out.push(age);
+    }
+    return out;
+  }
+
+  // ---------- interaction ----------
+  var pointerDown = false;
+  var downT = 0, downX = 0, downY = 0, moved = 0;
+  var curSeg = null;
+
+  function centerDist(x, y) {
+    var dx = x - W / 2, dy = y - H / 2;
+    return Math.sqrt(dx * dx + dy * dy);
+  }
+  function isNear(x, y) { return centerDist(x, y) <= 0.15 * W; }
+
+  function openSeg(t, near) {
+    curSeg = { t0: t, t1: Infinity, near: near };
+    segments.push(curSeg);
+  }
+  function closeSeg(t) {
+    if (curSeg) { curSeg.t1 = t; curSeg = null; }
+  }
+
+  function onDown(x, y) {
+    ensureAudio();
+    var t = nowS();
+    pointerDown = true;
+    downT = t; downX = x; downY = y; moved = 0;
+    closeSeg(t);
+    openSeg(t, isNear(x, y));
+  }
+  function onMove(x, y) {
+    if (!pointerDown) return;
+    var t = nowS();
+    moved = Math.max(moved, Math.abs(x - downX) + Math.abs(y - downY));
+    var n = isNear(x, y);
+    if (curSeg && curSeg.near !== n) {
+      closeSeg(t);
+      openSeg(t, n);
+    }
+  }
+  function onUp(x, y) {
+    if (!pointerDown) return;
+    var t = nowS();
+    pointerDown = false;
+    closeSeg(t);
+    // A tap: short and nearly still.
+    if (t - downT < 0.3 && moved < 12) rawTaps.push(t);
+  }
+
+  function evtPos(e) {
+    if (e.touches && e.touches.length) return { x: e.touches[0].clientX, y: e.touches[0].clientY };
+    if (e.changedTouches && e.changedTouches.length) return { x: e.changedTouches[0].clientX, y: e.changedTouches[0].clientY };
+    return { x: e.clientX, y: e.clientY };
+  }
+  if (typeof window !== 'undefined' && window.PointerEvent) {
+    canvas.addEventListener('pointerdown', function (e) { var p = evtPos(e); onDown(p.x, p.y); });
+    canvas.addEventListener('pointermove', function (e) { var p = evtPos(e); onMove(p.x, p.y); });
+    canvas.addEventListener('pointerup', function (e) { var p = evtPos(e); onUp(p.x, p.y); });
+    canvas.addEventListener('pointercancel', function (e) { var p = evtPos(e); onUp(p.x, p.y); });
+  } else {
+    canvas.addEventListener('mousedown', function (e) { var p = evtPos(e); onDown(p.x, p.y); });
+    canvas.addEventListener('mousemove', function (e) { var p = evtPos(e); onMove(p.x, p.y); });
+    canvas.addEventListener('mouseup', function (e) { var p = evtPos(e); onUp(p.x, p.y); });
+    canvas.addEventListener('touchstart', function (e) { if (e.preventDefault) e.preventDefault(); var p = evtPos(e); onDown(p.x, p.y); }, { passive: false });
+    canvas.addEventListener('touchmove', function (e) { if (e.preventDefault) e.preventDefault(); var p = evtPos(e); onMove(p.x, p.y); }, { passive: false });
+    canvas.addEventListener('touchend', function (e) { var p = evtPos(e); onUp(p.x, p.y); });
+  }
+
+  // ---------- audio (lazy, first gesture only, all guarded) ----------
+  var AC = null, aMaster = null, aPartials = [], aShimmer = null;
+  function ensureAudio() {
+    if (AC) {
+      if (AC.resume) { try { AC.resume(); } catch (e) {} }
+      return;
+    }
+    var Ctor = null;
+    if (typeof AudioContext !== 'undefined') Ctor = AudioContext;
+    else if (typeof window !== 'undefined' && window.webkitAudioContext) Ctor = window.webkitAudioContext;
+    if (!Ctor) return;
+    try {
+      AC = new Ctor();
+      aMaster = AC.createGain();
+      aMaster.gain.value = 0.14;
+      aMaster.connect(AC.destination);
+      var base = 196;
+      var ratios = [1, 2, 3, 4, 5];
+      for (var i = 0; i < ratios.length; i++) {
+        var o = AC.createOscillator();
+        o.type = 'sine';
+        o.frequency.value = base * ratios[i];
+        var g = AC.createGain();
+        g.gain.value = 0;
+        o.connect(g); g.connect(aMaster);
+        o.start();
+        aPartials.push(g);
+      }
+      var s = AC.createOscillator();
+      s.type = 'sine';
+      s.frequency.value = base * 18;
+      aShimmer = AC.createGain();
+      aShimmer.gain.value = 0;
+      s.connect(aShimmer); aShimmer.connect(aMaster);
+      s.start();
+    } catch (e) {
+      AC = null; aPartials = []; aShimmer = null;
+    }
+  }
+  function audioUpdate(G, t) {
+    if (!AC || !aPartials.length) return;
+    var thresholds = [0, 0.25, 0.45, 0.65, 0.8];
+    var levels = [0.5, 0.3, 0.2, 0.13, 0.08];
+    var ct = AC.currentTime;
+    for (var i = 0; i < aPartials.length; i++) {
+      var target = levels[i] * smoothstep(thresholds[i], thresholds[i] + 0.15, G);
+      try { aPartials[i].gain.setTargetAtTime(target, ct, 0.12); } catch (e) {}
+    }
+    if (aShimmer) {
+      var sh = 0.03 * smoothstep(0.9, 1, G) * (0.7 + 0.3 * Math.sin(t * 2.3));
+      try { aShimmer.gain.setTargetAtTime(Math.max(0, sh), ct, 0.12); } catch (e) {}
+    }
+  }
+
+  // ---------- drawing ----------
+  // One blade: a pointed lens from the center outward, drawn as stepped flat-alpha
+  // passes (no gradients): widest and faintest first, narrowest and brightest last.
+  function blade(cx, cy, ang, len, halfW, color, alpha) {
+    var dx = Math.cos(ang), dy = Math.sin(ang);
+    var px = -dy, py = dx;
+    var PASSES = 5;
+    for (var p = 0; p < PASSES; p++) {
+      var s = 1 - (p / PASSES) * 0.72;          // width scale 1 -> 0.28
+      var a = alpha * (0.16 + 0.84 * (p / (PASSES - 1)));
+      var hw = halfW * s;
+      var tipX = cx + dx * len, tipY = cy + dy * len;
+      var mx = cx + dx * len * 0.32, my = cy + dy * len * 0.32;
+      ctx.fillStyle = rgba(color, a);
+      ctx.beginPath();
+      ctx.moveTo(cx, cy);
+      ctx.quadraticCurveTo(mx + px * hw, my + py * hw, tipX, tipY);
+      ctx.quadraticCurveTo(mx - px * hw, my - py * hw, cx, cy);
+      ctx.fill();
+    }
+  }
+
+  function disc(cx, cy, r, color, alpha) {
+    var PASSES = 4;
+    for (var p = 0; p < PASSES; p++) {
+      var s = 1 - (p / PASSES) * 0.7;
+      ctx.fillStyle = rgba(color, alpha * (0.2 + 0.8 * (p / (PASSES - 1))));
+      ctx.beginPath();
+      ctx.arc(cx, cy, Math.max(0.4, r * s), 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  function draw(t) {
+    if (!W || !H) return;
+    // Pin the canvas CSS size every frame (house rule).
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+
+    var G = growthAt(t);
+    var breath = 1 + 0.04 * Math.sin(t * 0.6);
+    var bright = (0.32 + 0.68 * G) * breath;
+
+    ctx.fillStyle = GROUND;
+    ctx.fillRect(0, 0, W, H);
+
+    var cx = W / 2, cy = H / 2;
+    var S = Math.min(W, H);
+    var bladeCol = mix(SEED_GRAY, GROWN, G);
+
+    // Star blades: 8 directions. Horizontal and vertical take over as G rises;
+    // diagonals stay short. Extra faint pairs cross in past G 0.3 and G 0.65.
+    var starLen = S * (0.055 + 0.085 * G);
+    var hLen = W * (0.055 + 0.4 * G);
+    var vLen = H * (0.055 + 0.37 * G);
+    var starHW = S * (0.005 + 0.011 * G);
+    var crossHW = S * (0.007 + 0.02 * G);
+
+    var k, ang, len, hw, al;
+    // faint crossed-in pairs (drawn first, underneath)
+    if (G > 0.3) {
+      al = 0.3 * bright * smoothstep(0.3, 0.55, G);
+      for (k = 0; k < 4; k++) {
+        ang = Math.PI / 8 + k * Math.PI / 2;
+        blade(cx, cy, ang, starLen * 1.25 * jitter[k + 8], starHW * 0.8, bladeCol, al);
+      }
+    }
+    if (G > 0.65) {
+      al = 0.22 * bright * smoothstep(0.65, 0.85, G);
+      for (k = 0; k < 4; k++) {
+        ang = Math.PI / 4 + Math.PI / 8 + k * Math.PI / 2;
+        blade(cx, cy, ang, starLen * 1.1 * jitter[k + 12], starHW * 0.7, bladeCol, al);
+      }
+    }
+    // main star: diagonals
+    for (k = 0; k < 4; k++) {
+      ang = Math.PI / 4 + k * Math.PI / 2;
+      blade(cx, cy, ang, starLen * jitter[k], starHW, bladeCol, 0.5 * bright);
+    }
+    // the cross: horizontal blade and vertical beam, the lens artifact it grows into
+    blade(cx, cy, 0, hLen * jitter[16], crossHW, bladeCol, 0.62 * bright);
+    blade(cx, cy, Math.PI, hLen * jitter[17], crossHW, bladeCol, 0.62 * bright);
+    blade(cx, cy, Math.PI / 2, vLen * jitter[18], crossHW * 0.9, bladeCol, 0.58 * bright);
+    blade(cx, cy, -Math.PI / 2, vLen * jitter[19], crossHW * 0.9, bladeCol, 0.58 * bright);
+
+    // violet fringe at the cross tips, at full growth only
+    var fr = smoothstep(0.85, 1, G);
+    if (fr > 0) {
+      var tips = [
+        { x: cx + hLen * jitter[16], y: cy },
+        { x: cx - hLen * jitter[17], y: cy },
+        { x: cx, y: cy + vLen * jitter[18] },
+        { x: cx, y: cy - vLen * jitter[19] }
+      ];
+      for (k = 0; k < tips.length; k++) {
+        disc(tips[k].x, tips[k].y, S * 0.012, FRINGE, 0.4 * fr);
+      }
+    }
+
+    // pulse rings from tap bumps
+    var pulses = pulsesAt(t);
+    for (k = 0; k < pulses.length; k++) {
+      var age = pulses[k];
+      var pr = S * (0.03 + age * 0.11);
+      ctx.strokeStyle = rgba(GROWN, 0.3 * (1 - age / 1.6));
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      ctx.arc(cx, cy, pr, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+
+    // the core: layered discs, gray warming to white as it grows
+    var coreR = S * (0.009 + 0.026 * G);
+    disc(cx, cy, coreR * 2.1, bladeCol, 0.35 * bright);
+    disc(cx, cy, coreR, mix(bladeCol, WHITE, 0.35 + 0.65 * G), 0.85 * bright);
+
+    // growth readout: the only text besides the title
+    var word = G < 0.5 ? 'SEED' : 'BLOOM';
+    ctx.font = (isPhone ? 11 : 12) + 'px -apple-system, Helvetica, Arial, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillStyle = rgba(SEED_GRAY, 0.45);
+    ctx.fillText(word, cx, H - 14);
+
+    audioUpdate(G, t);
+  }
+
+  // ---------- run ----------
+  resize();
+  draw(0); // frame one: synchronous, at t = 0 exactly
+  if (typeof requestAnimationFrame === 'function') {
+    var loop = function () {
+      draw(nowS());
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
