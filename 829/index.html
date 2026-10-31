@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Loose Connection</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #AEC3CE; height: 100%; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- Palette (strict; shading mixes of these four only) ----------
+  var GRAY = '#D8D4CC';  // storefront gray
+  var RED  = '#B33A2B';  // sign red
+  var SKY  = '#AEC3CE';  // sky
+  var ASPH = '#4A4A48';  // asphalt
+
+  function hexRgb(h) {
+    if (h.charAt(0) === '#') {
+      return [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
+    }
+    var m = h.match(/\d+(\.\d+)?/g); // 'rgb(r,g,b)' from a previous mix()
+    return [+m[0], +m[1], +m[2]];
+  }
+  function mix(a, b, t) {
+    var A = hexRgb(a), B = hexRgb(b);
+    var r = Math.round(A[0] + (B[0] - A[0]) * t);
+    var g = Math.round(A[1] + (B[1] - A[1]) * t);
+    var bl = Math.round(A[2] + (B[2] - A[2]) * t);
+    return 'rgb(' + r + ',' + g + ',' + bl + ')';
+  }
+
+  // ---------- Seeded RNG (mulberry32) ----------
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function hashSeed(seed, side, i) {
+    var h = (seed >>> 0) ^ Math.imul((i + 0x9E37) | 0, 2654435761);
+    h ^= (side < 0) ? 0x85EBCA6B : 0x27D4EB2F;
+    return (h ^ (h >>> 13)) >>> 0;
+  }
+
+  // ---------- Street generation ----------
+  // Lots of fixed length along z; building i (either side) is a pure function
+  // of (streetSeed, side, i), so the street is infinite in both directions.
+  var LOT = 13;
+  var SIDE_X = 7;
+  var WORDS = ['HOTEL', 'CAFE', 'BAKERY', 'BOOKS', 'RADIO', 'SHOES',
+               'DRUGS', 'DELI', 'FLORIST', 'TAILOR', 'DINER', 'MUSIC'];
+
+  function buildingParams(seed, side, i) {
+    var r = mulberry32(hashSeed(seed, side, i));
+    var p = {};
+    p.h = 6 + r() * 9.5;                 // building height (world units)
+    p.bw = 5.5 + r() * 4.5;              // box depth outward from the facade
+    p.shade = r() * 0.32;                // facade mix toward asphalt
+    p.z0 = i * LOT + r() * 1.6;
+    p.z1 = (i + 1) * LOT - r() * 1.6;
+    p.cols = 2 + Math.floor(r() * 4);
+    p.rows = 2 + Math.floor(r() * 4);
+    p.hasSign = r() < 0.66;
+    p.word = WORDS[Math.floor(r() * WORDS.length)];
+    p.signLow = r() < 0.5;               // sign band low (over shop) vs high (roofline)
+    p.hasAwning = r() < 0.5;
+    p.awnRed = r() < 0.55;
+    p.hasShop = r() < 0.7;
+    p.doorU = 0.25 + r() * 0.5;          // door position along the facade, 0..1
+    p.lit = [];
+    var n = p.cols * p.rows;
+    for (var k = 0; k < n; k++) p.lit.push(r() < 0.4);
+    return p;
+  }
+
+  // ---------- Camera score ----------
+  // Programmed two-motion score: piecewise-constant (dolly speed, roll rate)
+  // segments that cycle. Net drift per 46 s cycle: +36 units of dolly,
+  // +0.226 rad of roll, with reversals inside the cycle, like Conrad's rig.
+  var SCORE = [
+    { dur: 9, vz:  2.1, om:  0.040 },
+    { dur: 7, vz:  2.7, om: -0.026 },
+    { dur: 8, vz: -1.5, om:  0.055 },
+    { dur: 6, vz:  0.7, om: -0.048 },
+    { dur: 9, vz:  2.3, om:  0.018 },
+    { dur: 7, vz: -2.1, om: -0.038 }
+  ];
+  var Z0 = 2.0;        // initial dolly position
+  var TH0 = -0.055;    // initial roll: horizon tilted a few degrees in frame one
+
+  // Camera state is a closed-form function of a recorded segment list:
+  // state(t) integrates the segment containing t from its opening state.
+  // Segments are appended deterministically (score continuation) or by
+  // recorded pointer events (drag micro-segments, each with constant
+  // velocity estimated from the pointer samples inside it).
+  var segs = [{
+    t0: 0, z: Z0, th: TH0,
+    vz: SCORE[0].vz, om: SCORE[0].om, dur: SCORE[0].dur,
+    kind: 'score', sIdx: 0
+  }];
+
+  function segEndState(s) {
+    return { z: s.z + s.vz * s.dur, th: s.th + s.om * s.dur };
+  }
+  function appendScoreAfter(s) {
+    var e = segEndState(s);
+    var idx = (s.sIdx + 1) % SCORE.length;
+    segs.push({
+      t0: s.t0 + s.dur, z: e.z, th: e.th,
+      vz: SCORE[idx].vz, om: SCORE[idx].om, dur: SCORE[idx].dur,
+      kind: 'score', sIdx: idx
+    });
+  }
+  function extendTo(t) {
+    var last = segs[segs.length - 1];
+    var guard = 0;
+    while (last.t0 + last.dur <= t && guard < 10000) {
+      if (last.kind === 'drag') {
+        // An open drag segment should have been closed by an event first;
+        // if time somehow runs past it, continue at its last velocity.
+        last.dur = t - last.t0 + 1;
+      } else {
+        appendScoreAfter(last);
+      }
+      last = segs[segs.length - 1];
+      guard++;
+    }
+  }
+  function stateAt(t) {
+    extendTo(t);
+    for (var i = segs.length - 1; i >= 0; i--) {
+      var s = segs[i];
+      if (s.t0 <= t) {
+        var dt = t - s.t0;
+        return { z: s.z + s.vz * dt, th: s.th + s.om * dt };
+      }
+    }
+    return { z: Z0, th: TH0 };
+  }
+  function closeSegmentAt(t) {
+    extendTo(t);
+    var last = segs[segs.length - 1];
+    var st = stateAt(t);
+    last.dur = Math.max(0, t - last.t0);
+    return { seg: last, st: st };
+  }
+
+  // ---------- Street reseeds (double-tap) ----------
+  var BASE_SEED = 829001;
+  var reseeds = []; // {t, seed}
+  var reseedCount = 0;
+  function seedAt(t) {
+    var s = BASE_SEED;
+    for (var i = 0; i < reseeds.length; i++) {
+      if (reseeds[i].t <= t) s = reseeds[i].seed; else break;
+    }
+    return s;
+  }
+
+  // ---------- Canvas / viewport ----------
+  var canvas = document.getElementById('stage');
+  var ctx = canvas.getContext('2d');
+  var cssW = 0, cssH = 0, dpr = 1;
+  var dirty = true;
+
+  function viewportSize() {
+    var w, h;
+    if (typeof window !== 'undefined' && window.visualViewport) {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    } else if (typeof window !== 'undefined') {
+      w = window.innerWidth; h = window.innerHeight;
+    } else { w = 720; h = 720; }
+    return { w: w, h: h };
+  }
+  function resize() {
+    var s = viewportSize();
+    cssW = s.w; cssH = s.h;
+    dpr = 1;
+    if (typeof window !== 'undefined' && window.devicePixelRatio) {
+      dpr = Math.min(window.devicePixelRatio, 2);
+    }
+    canvas.width = Math.round(cssW * dpr);
+    canvas.height = Math.round(cssH * dpr);
+    dirty = true;
+  }
+  function isPhone() {
+    var smallScreen = false;
+    if (typeof screen !== 'undefined' && screen) {
+      smallScreen = Math.min(screen.width, screen.height) < 700;
+    }
+    return smallScreen || cssH > cssW * 1.15;
+  }
+
+  // ---------- Projection ----------
+  var CAM_H = 2.3;
+  var NEAR = 0.7;
+  var FAR = 130;
+  var F = 600; // focal length in px, set per render from viewport
+
+  function proj(x, y, z, camZ) {
+    var d = z - camZ;
+    if (d < NEAR) d = NEAR;
+    var s = F / d;
+    return [x * s, -(y - CAM_H) * s];
+  }
+  function quad(pts, fill) {
+    ctx.fillStyle = fill;
+    ctx.beginPath();
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    for (var i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  // ---------- Scene rendering (at one sampled camera state) ----------
+  function renderScene(st, seed) {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = SKY;
+    ctx.fillRect(0, 0, cssW, cssH);
+
+    var cx = cssW / 2, cy = cssH * 0.52;
+    var diag = Math.ceil(Math.hypot(cssW, cssH) / 2) + 4;
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(st.th);
+
+    // Sky and ground in the rolled frame (oversized to cover the corners).
+    ctx.fillStyle = SKY;
+    ctx.fillRect(-diag, -diag, diag * 2, diag);
+    ctx.fillStyle = ASPH;
+    ctx.fillRect(-diag, 0, diag * 2, diag);
+
+    var camZ = st.z;
+
+    // Road, sidewalks, centre dashes: planar strips in z segments.
+    var zSeg = 8;
+    var zStart = Math.floor((camZ + 1) / zSeg) * zSeg;
+    var roadCol = mix(ASPH, GRAY, 0.14);
+    var walkCol = mix(ASPH, GRAY, 0.38);
+    var dashCol = mix(ASPH, GRAY, 0.55);
+    for (var z = zStart; z < camZ + FAR; z += zSeg) {
+      var za = Math.max(z, camZ + 1), zb = z + zSeg;
+      quad([proj(-SIDE_X, 0, za, camZ), proj(SIDE_X, 0, za, camZ),
+            proj(SIDE_X, 0, zb, camZ), proj(-SIDE_X, 0, zb, camZ)], roadCol);
+      quad([proj(-8.4, 0, za, camZ), proj(-SIDE_X, 0, za, camZ),
+            proj(-SIDE_X, 0, zb, camZ), proj(-8.4, 0, zb, camZ)], walkCol);
+      quad([proj(SIDE_X, 0, za, camZ), proj(8.4, 0, za, camZ),
+            proj(8.4, 0, zb, camZ), proj(SIDE_X, 0, zb, camZ)], walkCol);
+    }
+    var dashStep = 5;
+    var d0 = Math.floor((camZ + 1) / dashStep) * dashStep;
+    for (var dz = d0; dz < camZ + FAR; dz += dashStep) {
+      quad([proj(-0.18, 0, dz, camZ), proj(0.18, 0, dz, camZ),
+            proj(0.18, 0, dz + 2.2, camZ), proj(-0.18, 0, dz + 2.2, camZ)], dashCol);
+    }
+
+    // Buildings: collect the lots in range on both sides, far to near.
+    var items = [];
+    var iFrom = Math.floor((camZ - 14) / LOT);
+    var iTo = Math.floor((camZ + FAR) / LOT);
+    for (var side = -1; side <= 1; side += 2) {
+      for (var i = iFrom; i <= iTo; i++) {
+        var p = buildingParams(seed, side, i);
+        var dFar = Math.max(p.z0, p.z1) - camZ;
+        var dNear = Math.min(p.z0, p.z1) - camZ;
+        if (dFar < NEAR + 0.2 || dNear > FAR) continue;
+        items.push({ side: side, p: p, dSort: Math.max(dNear, 0) });
+      }
+    }
+    items.sort(function (a, b) { return b.dSort - a.dSort; });
+    for (var k = 0; k < items.length; k++) drawBuilding(items[k].side, items[k].p, camZ);
+
+    ctx.restore();
+  }
+
+  function drawBuilding(side, p, camZ) {
+    var fx = side * SIDE_X;              // facade plane
+    var ox = side * (SIDE_X + p.bw);     // outer back plane
+    var dNear = Math.min(p.z0, p.z1) - camZ;
+    var fade = Math.max(0, Math.min(0.45, (dNear - 30) / 160));
+    var facade = mix(mix(GRAY, ASPH, p.shade), SKY, fade);
+    var capCol = mix(mix(GRAY, ASPH, Math.min(1, p.shade + 0.30)), SKY, fade);
+    var roofCol = mix(mix(GRAY, SKY, 0.30), SKY, fade);
+
+    // End cap (the end that faces the camera).
+    var capZ = (camZ < (p.z0 + p.z1) / 2) ? p.z0 : p.z1;
+    if (capZ - camZ > NEAR) {
+      quad([proj(fx, 0, capZ, camZ), proj(ox, 0, capZ, camZ),
+            proj(ox, p.h, capZ, camZ), proj(fx, p.h, capZ, camZ)], capCol);
+    }
+    // Roof.
+    quad([proj(fx, p.h, p.z0, camZ), proj(fx, p.h, p.z1, camZ),
+          proj(ox, p.h, p.z1, camZ), proj(ox, p.h, p.z0, camZ)], roofCol);
+    // Facade.
+    quad([proj(fx, 0, p.z0, camZ), proj(fx, 0, p.z1, camZ),
+          proj(fx, p.h, p.z1, camZ), proj(fx, p.h, p.z0, camZ)], facade);
+
+    function fq(u, v) {
+      // Point on the facade: u along z (0 at z0, 1 at z1), v up (height units).
+      return proj(fx, v, p.z0 + (p.z1 - p.z0) * u, camZ);
+    }
+
+    // Shopfront band and door.
+    if (p.hasShop) {
+      quad([fq(0.05, 0.3), fq(0.95, 0.3), fq(0.95, 2.6), fq(0.05, 2.6)],
+           mix(facade, ASPH, 0.42));
+    }
+    var du = p.doorU, dw = 1.0 / (p.z1 - p.z0);
+    quad([fq(du - dw / 2, 0), fq(du + dw / 2, 0), fq(du + dw / 2, 2.3), fq(du - dw / 2, 2.3)],
+         mix(facade, ASPH, 0.62));
+
+    // Windows.
+    for (var c = 0; c < p.cols; c++) {
+      for (var r = 0; r < p.rows; r++) {
+        var u0 = 0.08 + (c + 0.22) / p.cols * 0.84;
+        var u1 = 0.08 + (c + 0.78) / p.cols * 0.84;
+        var v0 = 3.4 + (r + 0.2) / p.rows * Math.max(0.5, (p.h - 4.2));
+        var v1 = 3.4 + (r + 0.8) / p.rows * Math.max(0.5, (p.h - 4.2));
+        if (v1 > p.h - 0.5) v1 = p.h - 0.5;
+        if (v1 <= v0) continue;
+        var litCol = p.lit[r * p.cols + c]
+          ? mix(facade, SKY, 0.45) : mix(facade, ASPH, 0.50);
+        quad([fq(u0, v0), fq(u1, v0), fq(u1, v1), fq(u0, v1)], litCol);
+      }
+    }
+
+    // Awning over the shopfront: slanted quad out toward the street + flap.
+    if (p.hasAwning && p.hasShop) {
+      var awnCol = p.awnRed ? RED : mix(facade, ASPH, 0.25);
+      var ax = side * (SIDE_X - 1.3); // outer edge, toward the street
+      var a0 = [proj(fx, 2.9, p.z0 + (p.z1 - p.z0) * 0.05, camZ),
+                proj(fx, 2.9, p.z0 + (p.z1 - p.z0) * 0.95, camZ),
+                proj(ax, 2.35, p.z0 + (p.z1 - p.z0) * 0.95, camZ),
+                proj(ax, 2.35, p.z0 + (p.z1 - p.z0) * 0.05, camZ)];
+      quad(a0, awnCol);
+      quad([a0[3], a0[2],
+            proj(ax, 2.0, p.z0 + (p.z1 - p.z0) * 0.95, camZ),
+            proj(ax, 2.0, p.z0 + (p.z1 - p.z0) * 0.05, camZ)],
+           mix(awnCol, ASPH, 0.18));
+    }
+
+    // Sign band on the facade, word as pure typography.
+    if (p.hasSign) {
+      var sv0 = p.signLow ? 3.15 : p.h - 2.0;
+      var sv1 = p.signLow ? 4.35 : p.h - 0.9;
+      var s00 = fq(0.06, sv0), s10 = fq(0.94, sv0), s11 = fq(0.94, sv1), s01 = fq(0.06, sv1);
+      quad([s00, s10, s11, s01], RED);
+      var bandH = (Math.abs(s01[1] - s00[1]) + Math.abs(s11[1] - s10[1])) / 2;
+      var bandW = Math.abs(s10[0] - s00[0]);
+      if (bandH >= 8 && bandW >= 20) {
+        var cxp = (s00[0] + s10[0] + s11[0] + s01[0]) / 4;
+        var cyp = (s00[1] + s10[1] + s11[1] + s01[1]) / 4;
+        // Orient the word along the band's bottom edge, always reading left
+        // to right (the two sides of the street mirror the facade's u axis).
+        var ex = s10[0] - s00[0], ey = s10[1] - s00[1];
+        if (ex < 0) { ex = -ex; ey = -ey; }
+        var ang = Math.atan2(ey, ex);
+        ctx.save();
+        ctx.translate(cxp, cyp);
+        ctx.rotate(ang);
+        ctx.fillStyle = GRAY;
+        ctx.font = '700 ' + Math.round(bandH * 0.58) + 'px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(p.word, 0, 0);
+        ctx.restore();
+      }
+    }
+  }
+
+  // ---------- Sample gate ----------
+  // The camera state evolves smoothly, but the display only takes a new
+  // frame every TS seconds and holds it: the record, not the motion, is
+  // sparse. Conrad-style stutter.
+  var TS = 0.28;
+  var lastSample = null;
+
+  function draw(t) {
+    canvas.style.width = cssW + 'px';
+    canvas.style.height = cssH + 'px';
+    var td = Math.floor(t / TS) * TS;
+    if (!dirty && lastSample === td) return;
+    lastSample = td;
+    dirty = false;
+    F = isPhone() ? cssW * 1.3 : Math.min(cssW, cssH) * 0.8;
+    renderScene(stateAt(td), seedAt(td));
+  }
+
+  // ---------- Interaction ----------
+  // Drag = take the wheel: horizontal pointer velocity sets dolly speed,
+  // vertical sets roll rate. The drag is recorded as micro-segments of
+  // constant velocity (closed every 60 ms of movement), so the camera
+  // state stays a closed-form function of the recorded events and t.
+  // On release the score resumes from the state reached. Double-tap
+  // reseeds the street.
+  var tNow = 0;
+  var press = null;   // {x, y, t, dragging, lastX, lastY, lastT, moved}
+  var lastTap = null; // {t}
+
+  function piecePos(evt) {
+    var r = canvas.getBoundingClientRect();
+    return { x: evt.clientX - r.left, y: evt.clientY - r.top };
+  }
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+
+  function openDragSegment(t, vz, om) {
+    var c = closeSegmentAt(t);
+    segs.push({
+      t0: t, z: c.st.z, th: c.st.th,
+      vz: vz, om: om, dur: Infinity, kind: 'drag', sIdx: c.seg.sIdx
+    });
+  }
+  function resumeScore(t) {
+    var c = closeSegmentAt(t);
+    var idx = (c.seg.sIdx + 1) % SCORE.length;
+    segs.push({
+      t0: t, z: c.st.z, th: c.st.th,
+      vz: SCORE[idx].vz, om: SCORE[idx].om, dur: SCORE[idx].dur,
+      kind: 'score', sIdx: idx
+    });
+  }
+  function dragVelocity(p, dt) {
+    // px/s of pointer travel mapped to world units.
+    var vz = clamp(p.vx * 0.012, -6, 6);
+    var om = clamp(p.vy * 0.0011, -0.35, 0.35);
+    return { vz: vz, om: om };
+  }
+
+  canvas.addEventListener('pointerdown', function (evt) {
+    var p = piecePos(evt);
+    press = { x: p.x, y: p.y, t: tNow, dragging: false,
+              lastX: p.x, lastY: p.y, lastT: tNow, vx: 0, vy: 0, moved: 0 };
+    if (canvas.setPointerCapture) { try { canvas.setPointerCapture(evt.pointerId); } catch (e) {} }
+  });
+  canvas.addEventListener('pointermove', function (evt) {
+    if (!press) return;
+    var p = piecePos(evt);
+    var dx = p.x - press.x, dy = p.y - press.y;
+    press.moved += Math.abs(p.x - press.lastX) + Math.abs(p.y - press.lastY);
+    if (!press.dragging && Math.hypot(dx, dy) > 6) {
+      press.dragging = true;
+      var dt0 = Math.max(0.016, tNow - press.t);
+      press.vx = dx / dt0; press.vy = dy / dt0;
+      var v0 = dragVelocity(press, dt0);
+      openDragSegment(tNow, v0.vz, v0.om);
+      press.lastX = p.x; press.lastY = p.y; press.lastT = tNow;
+      return;
+    }
+    if (press.dragging) {
+      var dt = tNow - press.lastT;
+      if (dt >= 0.06) {
+        press.vx = (p.x - press.lastX) / dt;
+        press.vy = (p.y - press.lastY) / dt;
+        var v = dragVelocity(press, dt);
+        openDragSegment(tNow, v.vz, v.om);
+        press.lastX = p.x; press.lastY = p.y; press.lastT = tNow;
+      }
+    }
+  });
+  function endPress() {
+    if (!press) return;
+    var wasDrag = press.dragging;
+    var quick = (tNow - press.t) < 0.3;
+    var still = press.moved < 8;
+    press = null;
+    if (wasDrag) { resumeScore(tNow); return; }
+    if (quick && still) {
+      if (lastTap && (tNow - lastTap.t) < 0.35) {
+        reseedCount++;
+        reseeds.push({ t: tNow, seed: (BASE_SEED + reseedCount * 104729) >>> 0 });
+        lastTap = null;
+        dirty = true;
+      } else {
+        lastTap = { t: tNow };
+      }
+    }
+  }
+  canvas.addEventListener('pointerup', function () { endPress(); });
+  canvas.addEventListener('pointercancel', function () {
+    if (press && press.dragging) { press = null; resumeScore(tNow); }
+    else press = null;
+  });
+
+  // ---------- Main loop ----------
+  resize();
+  if (typeof window !== 'undefined') {
+    window.addEventListener('resize', resize);
+    if (window.visualViewport) window.visualViewport.addEventListener('resize', resize);
+  }
+  draw(0); // deterministic frame one: synchronous draw at t = 0 (sample 0)
+  if (typeof requestAnimationFrame === 'function') {
+    var epoch = null;
+    var loop = function (ts) {
+      if (epoch === null) epoch = ts;
+      tNow = (ts - epoch) / 1000;
+      draw(tNow);
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>

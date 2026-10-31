@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Outside the Dream</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0B0B0D; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+  // ---------- palette (strict) ----------
+  var GROUND = '#0B0B0D';   // near-black field
+  var DRONE = '#D8D8DC';    // drone line
+  var PULSE = '#8A8A90';    // beat pulse grey
+  var BRASS = '#C9A227';    // Faust pulse marker
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ---------- viewport sizing (Visual Viewport API) ----------
+  function viewSize() {
+    var w, h;
+    if (window.visualViewport) {
+      w = window.visualViewport.width;
+      h = window.visualViewport.height;
+    } else {
+      w = window.innerWidth;
+      h = window.innerHeight;
+    }
+    return { w: w, h: h };
+  }
+  function isPhone(w, h) {
+    var sw = 9999;
+    if (window.screen) sw = Math.min(window.screen.width, window.screen.height);
+    return sw < 700 || h > w * 1.15;
+  }
+
+  var W = 0, H = 0, DPR = 1, PHONE = false;
+  var GEO = null;
+  function resize() {
+    var s = viewSize();
+    W = Math.max(1, Math.round(s.w));
+    H = Math.max(1, Math.round(s.h));
+    DPR = window.devicePixelRatio || 1;
+    PHONE = isPhone(W, H);
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    buildScene();
+  }
+  function buildScene() {
+    var minD = Math.min(W, H);
+    var mx = W * 0.1;
+    GEO = {
+      minD: minD,
+      cx: W / 2,
+      cy: H * 0.46,
+      // six pairwise arcs, innermost to outermost
+      radii: [0.085, 0.13, 0.175, 0.22, 0.265, 0.31].map(function (f) { return minD * f; }),
+      lineW: Math.max(1.2, minD * 0.0024),
+      mx: mx,
+      barW: W - mx * 2,
+      barY: H - Math.max(26, H * 0.075),
+      barH: Math.max(2, minD * 0.004)
+    };
+  }
+
+  // ---------- drone model: closed-form phases ----------
+  // Four sine oscillators around a 110 Hz fundamental, with small resting
+  // offsets. Offsets are scaled by a time-varying SPREAD factor: 1 at rest,
+  // widened by horizontal drags, settling back exponentially on release.
+  // Spread is a recorded piecewise-linear control-point list, so the phase
+  // of oscillator i,
+  //   phase_i(t) = 110 * t + off_i * S(t),   S(t) = integral of spread,
+  // is a closed-form integral (trapezoids over the control points), never
+  // accumulated frame by frame. Each arc renders one PAIR of oscillators:
+  // its radius and brightness are functions of the pair's phase difference
+  //   dphi = (off_i - off_j) * S(t),
+  // which cycles at the pair's beat rate |off_i - off_j| * spread Hz.
+  var FUND = 110;
+  var OFFS = [0, 0.5, -1.2, 2.0];
+  // pairs [i, j], innermost arc first; resting beat rates:
+  // 0.5, 1.7, 1.2, 1.5, 2.0, 3.2 Hz (all inside the 0.5 to 4 Hz band)
+  var PAIRS = [[0, 1], [1, 2], [0, 2], [1, 3], [0, 3], [2, 3]];
+
+  var FAR = 1e9;
+  var spreadPts = [{ t: 0, s: 1 }, { t: FAR, s: 1 }];
+
+  function spreadAt(t) {
+    var pts = spreadPts;
+    if (t <= pts[0].t) return pts[0].s;
+    for (var i = 0; i < pts.length - 1; i++) {
+      var a = pts[i], b = pts[i + 1];
+      if (t <= b.t) {
+        var f = (t - a.t) / (b.t - a.t);
+        return a.s + (b.s - a.s) * f;
+      }
+    }
+    return pts[pts.length - 1].s;
+  }
+  function spreadInt(t) {           // integral of spread from 0 to t
+    var pts = spreadPts, total = 0;
+    for (var i = 0; i < pts.length - 1; i++) {
+      var a = pts[i], b = pts[i + 1];
+      if (t <= a.t) break;
+      if (t >= b.t) {
+        total += 0.5 * (a.s + b.s) * (b.t - a.t);
+      } else {
+        var sT = a.s + (b.s - a.s) * (t - a.t) / (b.t - a.t);
+        total += 0.5 * (a.s + sT) * (t - a.t);
+        break;
+      }
+    }
+    return total;
+  }
+  // Drop control points at or after t, append new ones, keep the far
+  // sentinel so spread holds its last value indefinitely.
+  function rewriteSpread(t, news) {
+    spreadPts = spreadPts.filter(function (p) { return p.t < t - 1e-9 && p.t < FAR; });
+    for (var i = 0; i < news.length; i++) spreadPts.push(news[i]);
+    var last = spreadPts[spreadPts.length - 1];
+    spreadPts.push({ t: FAR, s: last ? last.s : 1 });
+  }
+  function stateAt(t) {
+    var S = spreadInt(t);
+    var phases = [];
+    for (var i = 0; i < OFFS.length; i++) phases.push(FUND * t + OFFS[i] * S);
+    return { spread: spreadAt(t), phases: phases };
+  }
+
+  // ---------- Faust pulse ----------
+  // Steady 2 Hz. Toggled by tap; the marker sweeps the bottom bar once
+  // per beat. Off: the marker rests at the bar's left end.
+  var PULSE_HZ = 2;
+  var pulseOn = false;
+  var pulseT0 = 0;                  // piece time the pulse was switched on
+
+  // ---------- audio: real oscillators, never autoplay ----------
+  // Created lazily inside the first pointer gesture, typeof-guarded: the
+  // QA renderer has no AudioContext and the piece runs silently there.
+  // The sounding oscillators are driven per frame from the same closed-
+  // form state that draws the arcs.
+  var AC = null;
+  if (typeof AudioContext !== 'undefined') AC = AudioContext;
+  else if (typeof window !== 'undefined' && typeof window.webkitAudioContext !== 'undefined') AC = window.webkitAudioContext;
+
+  var actx = null, oscs = [], masterGain = null, audioOn = false;
+  function startAudio() {
+    if (audioOn || !AC) return;
+    try {
+      actx = new AC();
+      var comp = actx.createDynamicsCompressor();   // the limiter
+      comp.threshold.value = -16;
+      comp.ratio.value = 12;
+      masterGain = actx.createGain();
+      masterGain.gain.value = 0.05;                 // modest: four sines sum
+      masterGain.connect(comp);
+      comp.connect(actx.destination);
+      var st = stateAt(pieceT());
+      for (var i = 0; i < OFFS.length; i++) {
+        var o = actx.createOscillator();
+        o.type = 'sine';
+        o.frequency.value = FUND + OFFS[i] * st.spread;
+        o.connect(masterGain);
+        o.start();
+        oscs.push(o);
+      }
+      audioOn = true;
+    } catch (err) {
+      actx = null; oscs = []; audioOn = false;
+    }
+    if (actx && actx.state === 'suspended' && actx.resume) actx.resume();
+  }
+  var lastBeatIdx = -1;
+  function clickAt(idx, t) {
+    if (!audioOn || !actx || !pulseOn) return;
+    try {
+      var o = actx.createOscillator();
+      o.type = 'square';
+      o.frequency.value = 190;
+      var f = actx.createBiquadFilter();
+      f.type = 'bandpass';
+      f.frequency.value = 1400;
+      f.Q.value = 1.1;
+      var g = actx.createGain();
+      var now = actx.currentTime;
+      g.gain.setValueAtTime(0.0001, now);
+      g.gain.exponentialRampToValueAtTime(0.11, now + 0.004);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + 0.045);
+      o.connect(f); f.connect(g); g.connect(actx.destination);
+      o.start(now); o.stop(now + 0.06);
+    } catch (err) {}
+  }
+
+  // ---------- drawing ----------
+  function draw(t) {
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+
+    ctx.fillStyle = GROUND;
+    ctx.fillRect(0, 0, W, H);
+
+    var st = stateAt(t);
+    var S = spreadInt(t);
+
+    // concentric standing-wave arcs, one per oscillator pair
+    for (var k = 0; k < PAIRS.length; k++) {
+      var i = PAIRS[k][0], j = PAIRS[k][1];
+      var dphi = (OFFS[i] - OFFS[j]) * S;              // cycles of difference
+      var reinf = 0.5 + 0.5 * Math.cos(Math.PI * 2 * dphi);
+      var base = GEO.radii[k];
+      // radius breathes at the beat rate; sin puts frame one (dphi = 0)
+      // exactly at the mid radius, brightness peaks at reinforcement
+      var r = base * (1 + 0.055 * Math.sin(Math.PI * 2 * dphi));
+
+      ctx.strokeStyle = DRONE;
+      ctx.lineWidth = GEO.lineW;
+      ctx.globalAlpha = 0.10 + 0.30 * reinf;
+      ctx.beginPath();
+      ctx.arc(GEO.cx, GEO.cy, r, 0, Math.PI * 2);
+      ctx.stroke();
+
+      // beat highlight: an arc that travels once per beat cycle, its
+      // length and strength swelling with the reinforcement; the -0.25
+      // cycle offset puts frame one (dphi = 0) at the left horizontal
+      var hfrac = dphi - Math.floor(dphi) - 0.25;
+      var ang = Math.PI * 2 * hfrac;
+      var sweep = Math.PI * (0.25 + 0.85 * reinf);
+      ctx.strokeStyle = PULSE;
+      ctx.globalAlpha = 0.10 + 0.42 * reinf;
+      ctx.beginPath();
+      ctx.arc(GEO.cx, GEO.cy, r, ang - sweep / 2, ang + sweep / 2);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+
+    // metronome bar: Faust's relentless pulse, bottom
+    ctx.fillStyle = PULSE;
+    ctx.globalAlpha = 0.5;
+    ctx.fillRect(GEO.mx, GEO.barY - GEO.barH / 2, GEO.barW, GEO.barH);
+    ctx.globalAlpha = 1;
+
+    var frac = 0, flash = 0;
+    if (pulseOn) {
+      var cyc = (t - pulseT0) * PULSE_HZ;
+      frac = cyc - Math.floor(cyc);
+      flash = Math.max(0, 1 - frac * 6);        // brief flare at each tick
+      var idx = Math.floor(cyc);
+      if (idx !== lastBeatIdx) { lastBeatIdx = idx; clickAt(idx, t); }
+    }
+    var mxp = GEO.mx + frac * GEO.barW;
+    ctx.strokeStyle = BRASS;
+    ctx.globalAlpha = pulseOn ? 0.55 + 0.45 * flash : 0.4;
+    ctx.lineWidth = Math.max(1.6, GEO.minD * 0.0032);
+    ctx.beginPath();
+    ctx.moveTo(mxp, GEO.barY - GEO.barH * 2.6);
+    ctx.lineTo(mxp, GEO.barY + GEO.barH * 2.6);
+    ctx.stroke();
+    ctx.fillStyle = BRASS;
+    ctx.beginPath();
+    ctx.moveTo(mxp - GEO.barH * 0.95, GEO.barY - GEO.barH * 3.9);
+    ctx.lineTo(mxp + GEO.barH * 0.95, GEO.barY - GEO.barH * 3.9);
+    ctx.lineTo(mxp, GEO.barY - GEO.barH * 2.7);
+    ctx.closePath();
+    ctx.fill();
+    ctx.globalAlpha = 1;
+
+    // drive the sounding oscillators from this same state
+    if (audioOn) {
+      for (var n = 0; n < oscs.length; n++) {
+        try { oscs[n].frequency.value = FUND + OFFS[n] * st.spread; } catch (err) {}
+      }
+    }
+  }
+
+  // ---------- interaction ----------
+  // First pointer gesture ever: starts the audio, and (being a tap if it
+  // ends as one) also switches the Faust pulse on.
+  // TAP: toggles the Faust pulse on/off.
+  // DRAG horizontally: detunes; spread follows the horizontal distance
+  // from the drag start. On release the spread settles back toward 1
+  // exponentially (tau 1.6 s), sampled into control points at release.
+  function nowSec() { return performance.now() / 1000; }
+  var startTime = nowSec();
+  function pieceT() { return nowSec() - startTime; }
+  function evPos(e) {
+    var r = canvas.getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  }
+
+  var pDown = null;             // {t, x, y, moved, baseSpread, lastPushS}
+  var everInteracted = false;
+
+  canvas.addEventListener('pointerdown', function (e) {
+    var p = evPos(e);
+    everInteracted = true;
+    startAudio();                        // the gesture that unlocks sound
+    var t = pieceT();
+    pDown = { t: t, x: p.x, y: p.y, moved: false, baseSpread: spreadAt(t), lastPushS: -1 };
+    if (canvas.setPointerCapture) { try { canvas.setPointerCapture(e.pointerId); } catch (err) {} }
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (!pDown) return;
+    var p = evPos(e);
+    var dx = p.x - pDown.x, dy = p.y - pDown.y;
+    if (!pDown.moved && Math.sqrt(dx * dx + dy * dy) > 7) pDown.moved = true;
+    if (pDown.moved) {
+      var target = clamp(0.15 + Math.abs(dx) / (W * 0.45) * 3.4, 0.15, 3.6);
+      var t = pieceT();
+      if (Math.abs(target - pDown.lastPushS) > 0.04) {
+        rewriteSpread(t, [{ t: t, s: target }]);
+        pDown.lastPushS = target;
+      }
+    }
+  });
+  function endPointer(e) {
+    if (!pDown) return;
+    var t = pieceT();
+    if (!pDown.moved && t - pDown.t < 0.35) {
+      // a tap: toggle the Faust pulse
+      pulseOn = !pulseOn;
+      if (pulseOn) { pulseT0 = t; lastBeatIdx = -1; }
+    } else if (pDown.moved && pDown.lastPushS > 0) {
+      // released after a drag: settle back toward unison, exponentially
+      var s0 = spreadAt(t);
+      var news = [];
+      var taus = [0.3, 0.8, 1.5, 2.5, 4.0, 6.5];
+      for (var i = 0; i < taus.length; i++) {
+        news.push({ t: t + taus[i], s: 1 + (s0 - 1) * Math.exp(-taus[i] / 1.6) });
+      }
+      news.push({ t: t + 9, s: 1 });
+      rewriteSpread(t, news);
+    }
+    pDown = null;
+  }
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', endPointer);
+
+  // ---------- run ----------
+  resize();
+  if (window.visualViewport) window.visualViewport.addEventListener('resize', resize);
+  window.addEventListener('resize', resize);
+
+  draw(0); // frame one: silent, rest spread, beat phase 0, pulse off
+
+  if (typeof requestAnimationFrame === 'function') {
+    var loop = function () {
+      draw(pieceT());
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
