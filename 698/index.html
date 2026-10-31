@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Palimpsest Floor</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #0D0C0B; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // Strict palette
+  var STONE = '#D6CFC0';
+  var SAND = '#8A7B5C';
+  var WATER = '#4A6B8A';
+  var SEAMS = '#A89F8C';
+  var BG = '#0D0C0B';
+
+  var TAU = Math.PI * 2;
+  var BASE = 698001;
+  var GRID = 6;
+  var SAND_CYCLE = 90;      // seconds, slow alpha drift of the sand glyphs
+  var W_STAGGER = 7;        // seconds between water glyph events
+  var W_LIFE = 20;          // 8 gather + 4 hold + 8 disperse
+  var W_GATHER = 8, W_HOLD = 4;
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+  function easeOutCubic(x) { return 1 - Math.pow(1 - x, 3); }
+  function easeInOut(x) { return x < 0.5 ? 2 * x * x : 1 - Math.pow(-2 * x + 2, 2) / 2; }
+
+  // ---- Viewport (Visual Viewport API, listeners on both) ----
+  var viewW = 0, viewH = 0, dpr = 1, isPhone = false;
+  function computeSize() {
+    var vv = window.visualViewport;
+    var w = (vv && vv.width) ? vv.width : window.innerWidth;
+    var h = (vv && vv.height) ? vv.height : window.innerHeight;
+    viewW = w; viewH = h;
+    dpr = window.devicePixelRatio || 1;
+    if (window.screen && window.screen.width && window.screen.height) {
+      isPhone = Math.min(window.screen.width, window.screen.height) < 700;
+    } else {
+      isPhone = viewH > viewW * 1.15;
+    }
+    var bw = Math.max(1, Math.round(viewW * dpr));
+    var bh = Math.max(1, Math.round(viewH * dpr));
+    if (canvas.width !== bw) canvas.width = bw;
+    if (canvas.height !== bh) canvas.height = bh;
+  }
+
+  // ---- Anchored clock (frame one is never wall-clock derived) ----
+  var hasPerf = (typeof performance !== 'undefined' && performance && typeof performance.now === 'function');
+  var t0 = hasPerf ? performance.now() : 0;
+  function elapsed() { return hasPerf ? (performance.now() - t0) / 1000 : 0; }
+
+  // QA hook (batch convention): ?seed=tNN pins the boot draw to loop time NN.
+  var bootT = 0;
+  if (typeof location !== 'undefined' && location && location.search) {
+    var sm = /[?&]seed=t(\d+(?:\.\d+)?)/.exec(location.search);
+    if (sm) bootT = parseFloat(sm[1]);
+  }
+  function now() { return bootT + elapsed(); }
+
+  // ---- Glyph grammar ----
+  // Abstract skeletons only: a random walk on a 4x5 lattice with 8-way steps,
+  // plus an occasional branch stroke. The walk is constrained so it cannot
+  // trace real letters: steps are chosen freely (including diagonals and
+  // reversals of heading), strokes are jittered off-lattice, and no stroke
+  // set is ever assembled from letter parts. There are no names in this piece.
+  function genGlyph(rng) {
+    var NX = 4, NY = 5;
+    function latticePoint() {
+      return {
+        cx: Math.floor(rng() * NX),
+        cy: Math.floor(rng() * NY)
+      };
+    }
+    function toXY(p) {
+      return {
+        x: p.cx / (NX - 1) + (rng() - 0.5) * 0.07,
+        y: p.cy / (NY - 1) + (rng() - 0.5) * 0.07
+      };
+    }
+    function walk(start, steps) {
+      var pts = [start];
+      var cur = start, prev = null;
+      for (var i = 0; i < steps; i++) {
+        var opts = [];
+        for (var dx = -1; dx <= 1; dx++) {
+          for (var dy = -1; dy <= 1; dy++) {
+            if (dx === 0 && dy === 0) continue;
+            var nx = cur.cx + dx, ny = cur.cy + dy;
+            if (nx < 0 || ny < 0 || nx >= NX || ny >= NY) continue;
+            if (prev && nx === prev.cx && ny === prev.cy && opts.length > 0) continue;
+            opts.push({ cx: nx, cy: ny });
+          }
+        }
+        if (!opts.length) break;
+        var nxt = opts[Math.floor(rng() * opts.length)];
+        prev = cur; cur = nxt;
+        pts.push(cur);
+      }
+      return pts;
+    }
+    var strokes = [];
+    var main = walk(latticePoint(), 4 + Math.floor(rng() * 4));
+    strokes.push(main.map(toXY));
+    if (rng() < 0.5 && main.length > 1) {
+      var bp = main[Math.floor(rng() * main.length)];
+      strokes.push(walk(bp, 1 + Math.floor(rng() * 3)).map(toXY));
+    }
+    if (rng() < 0.25) {
+      var lone = latticePoint();
+      strokes.push([toXY(lone), toXY({ cx: lone.cx, cy: lone.cy })]);
+    }
+    // Arc-length table over all strokes, for pointAt(u).
+    var segs = [], total = 0;
+    for (var s = 0; s < strokes.length; s++) {
+      var st = strokes[s];
+      for (var j = 0; j + 1 < st.length; j++) {
+        var ax = st[j].x, ay = st[j].y, bx = st[j + 1].x, by = st[j + 1].y;
+        var len = Math.sqrt((bx - ax) * (bx - ax) + (by - ay) * (by - ay));
+        if (len < 1e-6) continue;
+        segs.push({ ax: ax, ay: ay, bx: bx, by: by, start: total, len: len });
+        total += len;
+      }
+      if (st.length === 1) {
+        segs.push({ ax: st[0].x, ay: st[0].y, bx: st[0].x, by: st[0].y, start: total, len: 0 });
+      }
+    }
+    if (total < 1e-6) total = 1e-6;
+    return {
+      strokes: strokes,
+      pointAt: function (u) {
+        var d = clamp(u, 0, 1) * total;
+        for (var i = 0; i < segs.length; i++) {
+          var sg = segs[i];
+          if (d <= sg.start + sg.len || i === segs.length - 1) {
+            var f = sg.len > 0 ? (d - sg.start) / sg.len : 0;
+            return { x: sg.ax + (sg.bx - sg.ax) * f, y: sg.ay + (sg.by - sg.ay) * f };
+          }
+        }
+        var last = segs[segs.length - 1];
+        return { x: last.bx, y: last.by };
+      }
+    };
+  }
+
+  // Dotted sampling of a glyph skeleton (for the sand rendering).
+  function glyphDots(glyph, rng) {
+    var dots = [];
+    for (var s = 0; s < glyph.strokes.length; s++) {
+      var st = glyph.strokes[s];
+      for (var j = 0; j + 1 < st.length; j++) {
+        var ax = st[j].x, ay = st[j].y, bx = st[j + 1].x, by = st[j + 1].y;
+        var len = Math.sqrt((bx - ax) * (bx - ax) + (by - ay) * (by - ay));
+        var n = Math.max(1, Math.round(len / 0.055));
+        for (var k = 0; k <= n; k++) {
+          var f = n === 0 ? 0 : k / n;
+          dots.push({
+            x: ax + (bx - ax) * f + (rng() - 0.5) * 0.016,
+            y: ay + (by - ay) * f + (rng() - 0.5) * 0.016,
+            am: 0.75 + rng() * 0.25
+          });
+        }
+      }
+      if (st.length === 1) dots.push({ x: st[0].x, y: st[0].y, am: 0.9 });
+    }
+    return dots;
+  }
+
+  // ---- Epoch state ----
+  // A tap reseeds: epoch increments, and the whole glyph set (sand + the
+  // water schedule) derives from the new epoch seed. Local time is measured
+  // from the epoch start on the anchored clock.
+  var epoch = 0;
+  var epochStart = 0; // local time = draw time - epochStart; boot draw uses bootT
+  var sandSet = null;      // per slab: { dots, phase }
+  var slabTex = null;      // per slab: { tone, specks: [{x,y,r,a,kind}] }
+  var waterCache = {};     // event index -> event data, per epoch
+
+  function buildSet(ep) {
+    var seed = BASE + ep * 100003;
+    sandSet = [];
+    slabTex = [];
+    waterCache = {};
+    for (var i = 0; i < GRID * GRID; i++) {
+      var rng = mulberry32(seed + i * 7919);
+      var g = genGlyph(rng);
+      sandSet.push({ dots: glyphDots(g, rng), phase: rng() * TAU });
+      var trng = mulberry32(seed + 555000 + i * 104729);
+      var specks = [];
+      var nsp = 22 + Math.floor(trng() * 10);
+      for (var k = 0; k < nsp; k++) {
+        specks.push({
+          x: trng(), y: trng(),
+          r: 0.6 + trng() * 1.5,
+          a: 0.04 + trng() * 0.09,
+          kind: trng() < 0.72 ? 0 : 1
+        });
+      }
+      slabTex.push({ tone: 0.02 + trng() * 0.045, specks: specks });
+    }
+  }
+
+  function waterEvent(ep, s) {
+    if (waterCache[s]) return waterCache[s];
+    var seed = BASE + ep * 100003;
+    // Splitmix-style finalizer so successive event seeds decorrelate
+    // (plain mulberry32 streams from neighbouring seeds cluster visibly).
+    var hx = (seed ^ Math.imul(s + 4096, 2654435761)) >>> 0;
+    hx = Math.imul(hx ^ (hx >>> 15), 2246822519);
+    hx ^= hx >>> 13;
+    hx = Math.imul(hx, 3266489917);
+    hx ^= hx >>> 16;
+    var rng = mulberry32(hx >>> 0);
+    var slab = Math.floor(rng() * GRID * GRID);
+    var glyph = genGlyph(rng);
+    var count = 60 + Math.floor(rng() * 61); // 60..120 droplets
+    var drops = [];
+    for (var i = 0; i < count; i++) {
+      var tp = glyph.pointAt(rng());
+      var ang = rng() * TAU;
+      var dist = 0.18 + rng() * 0.6;
+      drops.push({
+        tx: tp.x, ty: tp.y,
+        ox: Math.cos(ang) * dist, oy: Math.sin(ang) * dist,
+        dx: Math.cos(ang + 0.9) * (0.25 + rng() * 0.5),
+        dy: Math.sin(ang + 0.9) * (0.25 + rng() * 0.5),
+        r: 1.1 + rng() * 1.3,
+        am: 0.7 + rng() * 0.3,
+        wobP: rng() * TAU,
+        wobF: 0.6 + rng() * 1.1,
+        jitP: rng() * TAU
+      });
+    }
+    // Schedule offset -3.5 s: at local time 0 one event is mid-gather,
+    // one is holding, one is dispersing.
+    var ev = { slab: slab, drops: drops, start: s * W_STAGGER - 3.5 };
+    waterCache[s] = ev;
+    return ev;
+  }
+
+  // ---- Drawing ----
+  function draw(t) {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    canvas.style.width = viewW + 'px';
+    canvas.style.height = viewH + 'px';
+
+    ctx.fillStyle = BG;
+    ctx.fillRect(0, 0, viewW, viewH);
+
+    var lt = t - epochStart;
+    var side = Math.min(viewW, viewH) * (isPhone ? 0.94 : 0.88);
+    var ox = (viewW - side) / 2, oy = (viewH - side) / 2;
+    var cell = side / GRID;
+    var gap = Math.max(2, side * 0.007);
+
+    // Seam field behind the slabs.
+    ctx.fillStyle = SEAMS;
+    ctx.fillRect(ox, oy, side, side);
+
+    var gx0 = 0, gy0 = 0, gs = 0; // glyph box, set per slab below
+
+    for (var i = 0; i < GRID * GRID; i++) {
+      var cx = i % GRID, cy = (i / GRID) | 0;
+      var sx = ox + cx * cell + gap / 2, sy = oy + cy * cell + gap / 2;
+      var ss = cell - gap;
+
+      ctx.fillStyle = STONE;
+      ctx.fillRect(sx, sy, ss, ss);
+      // Seeded tonal variation + speckle texture, palette tones only.
+      ctx.globalAlpha = slabTex[i].tone;
+      ctx.fillStyle = SEAMS;
+      ctx.fillRect(sx, sy, ss, ss);
+      ctx.globalAlpha = 1;
+      var sp = slabTex[i].specks;
+      for (var k = 0; k < sp.length; k++) {
+        ctx.globalAlpha = sp[k].a;
+        ctx.fillStyle = sp[k].kind === 0 ? SEAMS : SAND;
+        ctx.beginPath();
+        ctx.arc(sx + sp[k].x * ss, sy + sp[k].y * ss, sp[k].r, 0, TAU);
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+
+      // Sand glyph: dotted skeleton, alpha drifting on the 90 s cycle.
+      var inset = ss * 0.19;
+      gx0 = sx + inset; gy0 = sy + inset; gs = ss - inset * 2;
+      var sg = sandSet[i];
+      var alpha = 0.325 + 0.075 * Math.sin(TAU * (lt / SAND_CYCLE) + sg.phase);
+      ctx.fillStyle = SAND;
+      for (var d = 0; d < sg.dots.length; d++) {
+        ctx.globalAlpha = alpha * sg.dots[d].am;
+        ctx.beginPath();
+        ctx.arc(gx0 + sg.dots[d].x * gs, gy0 + sg.dots[d].y * gs, Math.max(0.9, gs * 0.016), 0, TAU);
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    // Water glyphs: events on a repeating staggered schedule. Event local
+    // time e runs 0..20 (gather 8, hold 4, disperse 8), all closed-form.
+    var sMin = Math.floor(lt / W_STAGGER) - 3;
+    var sMax = Math.floor(lt / W_STAGGER) + 1;
+    ctx.fillStyle = WATER;
+    for (var s = sMin; s <= sMax; s++) {
+      var ev = waterEvent(epoch, s);
+      var e = lt - ev.start;
+      if (e < 0 || e >= W_LIFE) continue;
+      var scx = ev.slab % GRID, scy = (ev.slab / GRID) | 0;
+      var bsx = ox + scx * cell + gap / 2, bsy = oy + scy * cell + gap / 2;
+      var bss = cell - gap;
+      var binset = bss * 0.19;
+      var bx0 = bsx + binset, by0 = bsy + binset, bgs = bss - binset * 2;
+
+      var peak = 0.30;
+      for (var q = 0; q < ev.drops.length; q++) {
+        var dr = ev.drops[q];
+        var px, py, pa;
+        if (e < W_GATHER) {
+          var g = easeOutCubic(e / W_GATHER);
+          px = dr.tx + dr.ox * (1 - g);
+          py = dr.ty + dr.oy * (1 - g);
+          var wob = (1 - g) * 0.03 + 0.006;
+          px += Math.sin(lt * dr.wobF + dr.wobP) * wob;
+          py += Math.cos(lt * dr.wobF * 0.9 + dr.wobP) * wob;
+          pa = peak * Math.min(1, (e / W_GATHER) * 1.7);
+        } else if (e < W_GATHER + W_HOLD) {
+          px = dr.tx + Math.sin(lt * dr.wobF + dr.wobP) * 0.006;
+          py = dr.ty + Math.cos(lt * dr.wobF * 0.9 + dr.wobP) * 0.006;
+          pa = peak;
+        } else {
+          var dd = (e - W_GATHER - W_HOLD) / (W_LIFE - W_GATHER - W_HOLD);
+          var de = easeInOut(dd);
+          px = dr.tx + dr.dx * de + Math.sin(lt * 1.7 + dr.jitP) * 0.03 * dd;
+          py = dr.ty + dr.dy * de + Math.cos(lt * 1.5 + dr.jitP) * 0.03 * dd;
+          pa = peak * (1 - dd);
+        }
+        if (pa <= 0.004) continue;
+        // Water wells up within its own slab: clamp the droplet to the
+        // slab area (glyph box inset is 19% of the slab, so +/-0.28 glyph
+        // units is the furthest a droplet may stray).
+        px = clamp(px, -0.28, 1.28);
+        py = clamp(py, -0.28, 1.28);
+        ctx.globalAlpha = pa * dr.am;
+        ctx.beginPath();
+        ctx.arc(bx0 + px * bgs, by0 + py * bgs, Math.max(0.9, bgs * 0.011) * dr.r, 0, TAU);
+        ctx.fill();
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---- Interaction: tap reseeds the glyph set (new epoch) ----
+  function onTap() {
+    epoch++;
+    epochStart = now();
+    buildSet(epoch);
+    draw(now());
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onTap);
+  }
+
+  function onResize() { computeSize(); draw(now()); }
+  if (window.addEventListener) window.addEventListener('resize', onResize);
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', onResize);
+  }
+
+  // ---- Boot: frame one is the synchronous draw at t = bootT ----
+  computeSize();
+  buildSet(0);
+  draw(bootT);
+
+  if (typeof requestAnimationFrame === 'function') {
+    var loop = function () {
+      draw(now());
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
