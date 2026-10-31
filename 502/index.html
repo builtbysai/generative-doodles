@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Portrait Inset</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #FFFFFF; height: 100%; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ---------- seeded RNG (mulberry32, fixed seed) ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(50260);
+
+  // ---------- palette ----------
+  var WHITE = '#FFFFFF', TURQ = '#4FB8B0', MUSTARD = '#E9A63B',
+      NAVY = '#3D5577', SKIN = '#F8F5F0', SNOW = '#B9C6D4';
+
+  // ---------- seeded scene constants ----------
+  var angDeg = 35 + rng() * 20;                 // 35..55 degrees
+  var tanA = Math.tan(angDeg * Math.PI / 180);
+  // diagonal line through stage centre: y = 0.5 - (x - 0.5) * tanA  (rises to the right)
+  function lineY(x) { return 0.5 - (x - 0.5) * tanA; }
+
+  var NAME = 'NILO BRANDT';                     // invented name, stroke-only block
+  var beard = rng() > 0.35;                     // dot-cluster beard, on for this seed
+
+  // snow dashes: fixed seeded layout, drift is a pure function of t
+  var snow = [];
+  for (var i = 0; i < 130; i++) {
+    snow.push({ x: rng(), y: rng(), len: 0.012 + rng() * 0.016, sp: 0.014 + rng() * 0.03, sway: rng() * 6.283 });
+  }
+  // rain dashes around the slider
+  var rain = [];
+  for (var j = 0; j < 42; j++) {
+    rain.push({ x: 0.60 + rng() * 0.36, y: 0.26 + rng() * 0.34, len: 0.014 + rng() * 0.014 });
+  }
+  // beard dot cluster (seeded, along the jaw)
+  var beardDots = [];
+  if (beard) {
+    for (var b = 0; b < 26; b++) {
+      var ba = (0.25 + rng() * 0.5) * Math.PI;  // lower arc of the face
+      beardDots.push({ a: ba, rr: 0.50 + rng() * 0.10, r: 0.016 + rng() * 0.014 });
+    }
+  }
+
+  // ---------- viewport / sizing ----------
+  var W = 0, H = 0, S = 0, OX = 0, OY = 0, isPhone = false;
+  function resize() {
+    var vv = window.visualViewport;
+    var w = vv ? vv.width : window.innerWidth;
+    var h = vv ? vv.height : window.innerHeight;
+    W = w; H = h;
+    canvas.width = w; canvas.height = h;
+    var scr = window.screen;
+    var minDim = scr ? Math.min(scr.width, scr.height) : 9999;
+    isPhone = minDim < 700 || h > w * 1.15;
+    S = Math.min(w, h);
+    OX = (w - S) / 2; OY = (h - S) / 2;
+    draw(lastT);
+  }
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', resize);
+  }
+  window.addEventListener('resize', resize);
+
+  // ---------- half-plane clip (Sutherland-Hodgman on the unit square) ----------
+  // keepTop=true keeps the side above the diagonal (white), false keeps below (turquoise)
+  function halfPoly(keepTop) {
+    var sq = [[0, 0], [1, 0], [1, 1], [0, 1]];
+    var out = [];
+    function inside(p) {
+      var d = p[1] - lineY(p[0]); // >0 means below the line
+      return keepTop ? d <= 0 : d >= 0;
+    }
+    function cross(a, b) {
+      var da = a[1] - lineY(a[0]), db = b[1] - lineY(b[0]);
+      var t = da / (da - db);
+      return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+    }
+    for (var k = 0; k < sq.length; k++) {
+      var cur = sq[k], nxt = sq[(k + 1) % sq.length];
+      var ci = inside(cur), ni = inside(nxt);
+      if (ci) out.push(cur);
+      if (ci !== ni) out.push(cross(cur, nxt));
+    }
+    return out;
+  }
+  function pathPoly(poly) {
+    ctx.beginPath();
+    for (var k = 0; k < poly.length; k++) {
+      if (k === 0) ctx.moveTo(poly[k][0], poly[k][1]); else ctx.lineTo(poly[k][0], poly[k][1]);
+    }
+    ctx.closePath();
+  }
+
+  // ---------- inset spring state ----------
+  var anchor = { x: 0.5, y: 0.5 };
+  var pos = { x: 0.5, y: 0.5 };
+  var vel = { x: 0, y: 0 };
+  var dragging = false;
+  var pointer = { x: 0.5, y: 0.5 };
+  var INR = 0.125; // inset radius in stage units (diameter = 25% of width)
+
+  function toUnit(e) {
+    return { x: (e.clientX - OX) / S, y: (e.clientY - OY) / S };
+  }
+  canvas.addEventListener('pointerdown', function (e) {
+    var p = toUnit(e);
+    var dx = p.x - pos.x, dy = p.y - pos.y;
+    if (dx * dx + dy * dy <= (INR * 1.25) * (INR * 1.25)) {
+      dragging = true; pointer = p;
+      if (canvas.setPointerCapture) { try { canvas.setPointerCapture(e.pointerId); } catch (err) {} }
+    }
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (!dragging) return;
+    var p = toUnit(e);
+    pointer = p;
+    var nx = Math.max(INR, Math.min(1 - INR, p.x));
+    var ny = Math.max(INR, Math.min(1 - INR, p.y));
+    vel.x = (nx - pos.x) * 14; vel.y = (ny - pos.y) * 14;
+    pos.x = nx; pos.y = ny;
+  });
+  function endDrag() { dragging = false; }
+  canvas.addEventListener('pointerup', endDrag);
+  canvas.addEventListener('pointercancel', endDrag);
+
+  // ---------- scene drawing (unit stage space) ----------
+
+  function drawVillageAndSled() {
+    // village silhouette: navy houses along a baseline, white window cuts
+    var base = 0.665;
+    var houses = [
+      { x: 0.045, w: 0.075, h: 0.085 }, { x: 0.125, w: 0.06, h: 0.125 },
+      { x: 0.19, w: 0.08, h: 0.07 }, { x: 0.275, w: 0.055, h: 0.105 }
+    ];
+    ctx.fillStyle = NAVY;
+    for (var i = 0; i < houses.length; i++) {
+      var hs = houses[i];
+      ctx.fillRect(hs.x, base - hs.h, hs.w, hs.h);
+      ctx.beginPath(); // roof
+      ctx.moveTo(hs.x - 0.008, base - hs.h);
+      ctx.lineTo(hs.x + hs.w / 2, base - hs.h - 0.035);
+      ctx.lineTo(hs.x + hs.w + 0.008, base - hs.h);
+      ctx.closePath(); ctx.fill();
+      ctx.fillStyle = WHITE; // windows
+      ctx.fillRect(hs.x + hs.w * 0.22, base - hs.h * 0.62, 0.011, 0.014);
+      ctx.fillRect(hs.x + hs.w * 0.6, base - hs.h * 0.62, 0.011, 0.014);
+      ctx.fillStyle = NAVY;
+    }
+    ctx.fillRect(0.148, base - 0.155, 0.012, 0.03); // chimney
+
+    // kid on a sled, tilted down the slope, in front of the village
+    ctx.save();
+    ctx.translate(0.205, 0.715);
+    ctx.rotate(-0.32);
+    ctx.strokeStyle = NAVY; ctx.fillStyle = NAVY;
+    ctx.lineWidth = 0.009; ctx.lineCap = 'round';
+    // runners
+    ctx.beginPath();
+    ctx.moveTo(-0.075, 0.028); ctx.lineTo(0.07, 0.028); ctx.quadraticCurveTo(0.09, 0.028, 0.088, 0.008);
+    ctx.moveTo(-0.075, 0.04); ctx.lineTo(0.062, 0.04);
+    ctx.stroke();
+    ctx.beginPath(); // slats
+    ctx.moveTo(-0.05, 0.028); ctx.lineTo(-0.05, 0.016);
+    ctx.moveTo(0.0, 0.028); ctx.lineTo(0.0, 0.016);
+    ctx.moveTo(0.05, 0.028); ctx.lineTo(0.05, 0.016);
+    ctx.stroke();
+    // kid: legs forward, torso leaning back, head, cap, arm to the sled
+    ctx.lineWidth = 0.011;
+    ctx.beginPath();
+    ctx.moveTo(-0.028, 0.014); ctx.lineTo(0.045, 0.02);           // legs
+    ctx.moveTo(-0.028, 0.014); ctx.lineTo(-0.045, -0.035);        // torso
+    ctx.moveTo(-0.045, -0.03); ctx.lineTo(-0.005, 0.012);         // arm
+    ctx.stroke();
+    ctx.beginPath(); ctx.arc(-0.052, -0.052, 0.016, 0, 6.284); ctx.fill(); // head
+    ctx.beginPath(); // cap brim
+    ctx.moveTo(-0.068, -0.058); ctx.lineTo(-0.032, -0.06);
+    ctx.lineWidth = 0.007; ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawSlider(t) {
+    var gx = Math.sin(t * 0.9) * 0.006; // gentle glide, few px
+    // rain-dash texture field
+    ctx.strokeStyle = SNOW; ctx.lineWidth = 0.0045; ctx.lineCap = 'round';
+    ctx.beginPath();
+    for (var i = 0; i < rain.length; i++) {
+      var r = rain[i];
+      ctx.moveTo(r.x, r.y); ctx.lineTo(r.x - r.len * 0.4, r.y + r.len);
+    }
+    ctx.stroke();
+    // skeleton slider: prone figure on a low sled, white body, navy line
+    ctx.save();
+    ctx.translate(0.775 + gx, 0.415);
+    ctx.rotate(0.06);
+    ctx.strokeStyle = NAVY; ctx.fillStyle = WHITE;
+    ctx.lineWidth = 0.007; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    // sled board
+    ctx.beginPath();
+    ctx.moveTo(-0.115, 0.045); ctx.lineTo(0.115, 0.045);
+    ctx.moveTo(-0.1, 0.045); ctx.lineTo(-0.1, 0.03);
+    ctx.moveTo(0.1, 0.045); ctx.lineTo(0.1, 0.03);
+    ctx.stroke();
+    // body: long prone capsule
+    ctx.beginPath();
+    ctx.moveTo(-0.105, 0.028);
+    ctx.quadraticCurveTo(-0.11, 0.0, -0.07, -0.004);
+    ctx.lineTo(0.055, -0.01);
+    ctx.quadraticCurveTo(0.1, -0.012, 0.1, 0.012);
+    ctx.quadraticCurveTo(0.1, 0.03, 0.06, 0.03);
+    ctx.lineTo(-0.07, 0.03);
+    ctx.quadraticCurveTo(-0.105, 0.03, -0.105, 0.028);
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+    // feet up at the back
+    ctx.beginPath();
+    ctx.moveTo(-0.1, 0.005); ctx.lineTo(-0.125, -0.018);
+    ctx.moveTo(-0.095, 0.018); ctx.lineTo(-0.12, 0.0);
+    ctx.stroke();
+    // helmet head at the front, face down-slope
+    ctx.beginPath(); ctx.arc(0.112, 0.002, 0.021, 0, 6.284); ctx.fill(); ctx.stroke();
+    ctx.beginPath(); ctx.arc(0.112, -0.004, 0.021, Math.PI * 1.05, Math.PI * 1.95); ctx.stroke(); // helmet arc
+    ctx.restore();
+  }
+
+  function drawMedal() {
+    ctx.save();
+    ctx.translate(0.845, 0.815);
+    // ribbons
+    ctx.fillStyle = NAVY;
+    ctx.beginPath(); ctx.moveTo(-0.012, -0.005); ctx.lineTo(-0.038, -0.062); ctx.lineTo(-0.014, -0.068); ctx.lineTo(0.0, -0.02); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = WHITE;
+    ctx.beginPath(); ctx.moveTo(0.012, -0.005); ctx.lineTo(0.038, -0.062); ctx.lineTo(0.014, -0.068); ctx.lineTo(0.0, -0.02); ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = NAVY; ctx.lineWidth = 0.0035;
+    ctx.beginPath(); ctx.moveTo(0.012, -0.005); ctx.lineTo(0.038, -0.062); ctx.lineTo(0.014, -0.068); ctx.lineTo(0.0, -0.02); ctx.closePath(); ctx.stroke();
+    // disc
+    ctx.beginPath(); ctx.arc(0, 0.012, 0.034, 0, 6.284);
+    ctx.fillStyle = MUSTARD; ctx.fill();
+    ctx.strokeStyle = NAVY; ctx.lineWidth = 0.0045; ctx.stroke();
+    ctx.beginPath(); ctx.arc(0, 0.012, 0.023, 0, 6.284); ctx.lineWidth = 0.003; ctx.stroke();
+    // star
+    ctx.fillStyle = NAVY;
+    ctx.beginPath();
+    for (var i = 0; i < 10; i++) {
+      var a = -Math.PI / 2 + i * Math.PI / 5, rr = (i % 2 === 0) ? 0.013 : 0.0055;
+      var px = Math.cos(a) * rr, py = 0.012 + Math.sin(a) * rr;
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+
+  function drawInset(t) {
+    var cx = pos.x, cy = pos.y;
+    ctx.save();
+    // mustard disc
+    ctx.beginPath(); ctx.arc(cx, cy, INR, 0, 6.284);
+    ctx.fillStyle = MUSTARD; ctx.fill();
+    ctx.save();
+    ctx.clip();
+    // white dot field (shimmer), kept off the face by drawing the face over it
+    var shimmer = 0.55 + 0.25 * Math.sin(t * 1.6);
+    ctx.fillStyle = WHITE;
+    ctx.globalAlpha = shimmer;
+    var sp = 0.052, off = sp / 2;
+    for (var gy = cy - INR; gy <= cy + INR; gy += sp) {
+      var row = Math.round((gy - (cy - INR)) / sp);
+      for (var gx = cx - INR + (row % 2 ? off : 0); gx <= cx + INR; gx += sp) {
+        ctx.beginPath(); ctx.arc(gx, gy, 0.0075, 0, 6.284); ctx.fill();
+      }
+    }
+    ctx.globalAlpha = 1;
+    // face
+    var fr = INR * 0.62, fy = cy + INR * 0.04;
+    ctx.beginPath(); ctx.arc(cx, fy, fr, 0, 6.284);
+    ctx.fillStyle = SKIN; ctx.fill();
+    // dot-cluster beard along the jaw
+    if (beard) {
+      ctx.fillStyle = NAVY;
+      for (var i = 0; i < beardDots.length; i++) {
+        var bd = beardDots[i];
+        ctx.beginPath();
+        ctx.arc(cx + Math.cos(bd.a) * fr * (0.72 + bd.rr * 0.3),
+                fy + Math.sin(bd.a) * fr * (0.72 + bd.rr * 0.3), 0.0032, 0, 6.284);
+        ctx.fill();
+      }
+    }
+    // hair block: flat cap over the top of the face
+    ctx.beginPath();
+    ctx.arc(cx, fy, fr, Math.PI * 1.08, Math.PI * 1.92);
+    ctx.quadraticCurveTo(cx, fy - fr * 0.55, cx - fr * 0.968, fy - fr * 0.249);
+    ctx.closePath();
+    ctx.fillStyle = NAVY; ctx.fill();
+    // eyes: two arcs with pupils that track the drag / displacement
+    var lookX = 0, lookY = 0;
+    var tx = dragging ? (pointer.x - cx) : (pos.x - anchor.x);
+    var ty = dragging ? (pointer.y - cy) : (pos.y - anchor.y);
+    var tl = Math.sqrt(tx * tx + ty * ty);
+    if (tl > 0.001) { lookX = (tx / tl) * Math.min(0.016, tl * 0.25); lookY = (ty / tl) * Math.min(0.016, tl * 0.25); }
+    ctx.strokeStyle = NAVY; ctx.lineWidth = 0.006; ctx.lineCap = 'round';
+    var ey = fy - fr * 0.12, eo = fr * 0.36, er = fr * 0.17;
+    ctx.beginPath(); ctx.arc(cx - eo, ey, er, Math.PI * 1.15, Math.PI * 1.85); ctx.stroke();
+    ctx.beginPath(); ctx.arc(cx + eo, ey, er, Math.PI * 1.15, Math.PI * 1.85); ctx.stroke();
+    ctx.fillStyle = NAVY;
+    ctx.beginPath(); ctx.arc(cx - eo + lookX, ey - fr * 0.09 + lookY, 0.0058, 0, 6.284); ctx.fill();
+    ctx.beginPath(); ctx.arc(cx + eo + lookX, ey - fr * 0.09 + lookY, 0.0058, 0, 6.284); ctx.fill();
+    // L-line nose
+    ctx.lineWidth = 0.0055;
+    ctx.beginPath();
+    ctx.moveTo(cx + 0.002, fy + fr * 0.02);
+    ctx.lineTo(cx + 0.002, fy + fr * 0.3);
+    ctx.lineTo(cx - fr * 0.13, fy + fr * 0.3);
+    ctx.stroke();
+    // short-curve smile
+    ctx.beginPath(); ctx.arc(cx, fy + fr * 0.34, fr * 0.3, Math.PI * 0.25, Math.PI * 0.75); ctx.stroke();
+    ctx.restore(); // unclip
+    // ring
+    ctx.beginPath(); ctx.arc(cx, cy, INR, 0, 6.284);
+    ctx.strokeStyle = NAVY; ctx.lineWidth = 0.006; ctx.stroke();
+    ctx.restore();
+  }
+
+  // ---------- main draw ----------
+  var lastT = 0;
+  function draw(t) {
+    lastT = t;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.fillStyle = WHITE;
+    ctx.fillRect(0, 0, W, H);
+    ctx.save();
+    ctx.translate(OX, OY);
+    ctx.scale(S, S);
+
+    // halves
+    var top = halfPoly(true), bot = halfPoly(false);
+    pathPoly(top); ctx.fillStyle = WHITE; ctx.fill();
+    pathPoly(bot); ctx.fillStyle = TURQ; ctx.fill();
+    // (the split is left unedged, as in her device: two flat polygons share the diagonal)
+
+    // white-half scene, clipped to the white half
+    ctx.save(); pathPoly(top); ctx.clip(); drawVillageAndSled(); ctx.restore();
+    // turquoise-half scenes, clipped to the turquoise half
+    ctx.save(); pathPoly(bot); ctx.clip(); drawSlider(t); drawMedal(); ctx.restore();
+
+    // snow dashes drifting down, wrapping (pure function of t)
+    ctx.strokeStyle = SNOW; ctx.lineWidth = 0.0045; ctx.lineCap = 'round';
+    ctx.beginPath();
+    for (var i = 0; i < snow.length; i++) {
+      var d = snow[i];
+      var yy = (d.y + t * d.sp) % 1;
+      var xx = d.x + Math.sin(t * 0.7 + d.sway) * 0.006;
+      ctx.moveTo(xx, yy); ctx.lineTo(xx - d.len * 0.35, yy + d.len);
+    }
+    ctx.stroke();
+
+    // portrait inset on top
+    drawInset(t);
+
+    // vertical stroke-only name block along the right edge
+    ctx.save();
+    ctx.translate(0.962, 0.5);
+    ctx.rotate(-Math.PI / 2);
+    ctx.font = '700 ' + 0.047 + 'px "Arial Narrow", Arial, sans-serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.strokeStyle = NAVY; ctx.lineWidth = 0.0016;
+    ctx.strokeText(NAME, 0, 0);
+    ctx.restore();
+
+    ctx.restore();
+
+    // hint
+    ctx.fillStyle = 'rgba(61,85,119,0.5)';
+    ctx.font = (isPhone ? 11 : 12) + 'px monospace';
+    ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+    ctx.fillText('drag', 10, H - 10);
+  }
+
+  // ---------- run ----------
+  draw(0); // synchronous deterministic first frame: inset at anchor, fixed offsets
+  if (typeof requestAnimationFrame === 'function') {
+    var t0 = null;
+    var step = function (ts) {
+      if (t0 === null) t0 = ts;
+      var t = (ts - t0) / 1000;
+      if (!dragging) {
+        var dt = 1 / 60;
+        var k = 110, c = 10.5; // underdamped spring
+        vel.x += (-k * (pos.x - anchor.x) - c * vel.x) * dt;
+        vel.y += (-k * (pos.y - anchor.y) - c * vel.y) * dt;
+        pos.x += vel.x * dt; pos.y += vel.y * dt;
+        pos.x = Math.max(INR, Math.min(1 - INR, pos.x));
+        pos.y = Math.max(INR, Math.min(1 - INR, pos.y));
+      }
+      draw(t);
+      requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+  }
+  resize();
+})();
+</script>
+</body>
+</html>
