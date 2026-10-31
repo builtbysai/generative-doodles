@@ -1,0 +1,37 @@
+# No.580 — Ahora el Caballo
+
+EXPANSION #70 maria-j-luque, prompt block 4, "De Fondo a Protagonista". Her detail-to-protagonist promotion mechanism, built as the interaction itself: a background extra in a crowded gouache painting is tapped and re-born as the embroidered lead of its own folk textile piece, stitched colophon and all.
+
+## Concept
+
+Two states, two mediums, one horse.
+
+- **State A — the crowd.** A wide plaza/fair scene in her muted gouache register: grey-wash buildings with paper windows, a bunting string, three market stalls, and 26 tiny figures in three depth rows, all in ink, paper cream, grey wash and desaturated earth tones derived from them. Small in the background row, standing still among the bustle, is a single blue horse (#4A7AB8), the only saturated color in the painting. It is a detail, nothing more. Yet.
+- **State B — the promotion.** Tap the horse and the scene is re-composed around it in a different medium entirely: not a zoom, an embroidery. The horse stands large and centered as appliqué on a striped cloth ground (dusty rose, cream and blue bands with dark-thread running-stitch seams), its silhouette, legs, saddle blanket and chest patch all outlined in dashed running stitch. Its mane is strands of neon floss (lime #7ED321 alternating with yellow #F2C230), its tail tuft matches, and a stitched colophon along the bottom band names the real weekday, date and place of the viewing, in her manner: Rosario.
+- Tap anywhere in State B and the embroidery un-stitches back into the crowd. One protagonist at a time; the promotion never happens on its own.
+
+## Construction
+
+- Single self-contained `index.html`, canvas 2D, no external assets. Virtual stage 1000×720, letterboxed on the paper ground; on phones (window.screen min dimension < 700, aspect fallback h > w×1.15) the stage spans the full width.
+- **Crowd composition:** figures are generated once at load from a mulberry32 seeded RNG (seed 580070): 10 figures in the back row (scale ~0.55, baseline y≈486), 9 mid (scale ~0.82, y≈566), 7 front (scale ~1.12, y≈664). Each figure gets a muted tone, a fixed micro-loop phase and speed, a walk/stand flag, hair and skirt variants. Back-row figures are re-rolled away from the horse's x-range so the horse stays findable. Figures draw as simple ink figures (circle head, trapezoid body or skirt, swinging legs and arms for walkers, a gentle bob for everyone), sorted by baseline so the small horse slots into the depth order correctly.
+- **The gouache horse (A):** a ~96-unit flat silhouette in #4A7AB8 with ink outline — ellipse body, four legs, angled neck and head, ear, mane line, curved tail — standing still while the crowd moves around it. Its tap target is its body box plus a margin.
+- **Transition approach:** a 1.6 s stitch wipe. The destination state is revealed behind a moving vertical edge drawn as an animated dashed running stitch (dash offset driven by phase time), with a smoothstep easing; during the first half, four horizontal dashed stitch lines sweep the whole stage. Promotion wipes left to right; demotion reverses right to left. The medium changes under the needle.
+- **The embroidery (B):** cloth bands from a fixed table (rose/cream/blue), precomputed seeded fabric speckle (260 short strokes, seed 4242), dashed thread seams between bands. The horse is one bezier appliqué silhouette (body, neck, head) plus separate leg appliqués with dark-thread hooves; every fill is followed by a dashed running-stitch stroke in dark thread #2A2320 (`setLineDash([11,8])`). Saddle blanket in dusty rose with a dashed inner border and yellow star stitches; cream chest patch; paper cross-stitches scattered on the body; appliqué sun with thread rays, thread stars, lime grass tufts and petal flowers along the bottom. Idle motion is restrained to the medium: a barely-there breathing scale on the body, a slow sway in the tail and mane tips.
+- **Colophon:** the string is built once at load from `new Date()` with Spanish weekday/month tables, e.g. weekday + day + DE + month + DE + year + ". ROSARIO", and lettered letter by letter in a bold cursive stack, each glyph with a seeded jitter offset and rotation (mulberry32 seed 9157) so it reads hand-stitched rather than typeset. The date is the only `Date` use in the piece, and it never feeds animation phase.
+- **Interaction:** pointer events on the canvas. A press that moves less than ~10 px is a tap; more is a drag. Tap on the horse in A promotes; any tap in B demotes; taps during a transition are ignored. Drag gives a gentle three-layer parallax (buildings 0.4×, stalls 0.7×, crowd/cloth subject 1.0×, clamped to ±16/±10 stage units) that eases back to rest on release. No click-to-reload anywhere.
+- **Determinism:** the first frame is drawn synchronously at load by `resize()` at the fixed phase anchor PHASE0 = 0, with the crowd at its seeded fixed phases and the horse in place. The rAF loop is `typeof`-guarded and anchors phase as PHASE0 + elapsed-since-first-frame; `Date.now()` is never used. Canvas size comes from the Visual Viewport API with resize listeners on both visualViewport and window, and `draw()` pins `canvas.style.width/height` in px on every frame.
+
+## QA log
+
+- Rendered with `node ~/workspace/tools/render-piece.js` (node-canvas; no rAF, no AudioContext, no createElement in the shim — the piece uses none of them).
+  - `qa-desktop.png` (1280×900): State A — bunting and grey-wash buildings across the top, three stalls, 26 muted figures in three rows, the small blue horse standing at right-center in the back row, clearly the only saturated shape in the scene. Subtle "tap" hint bottom-right. Nothing clipped.
+  - `qa-mobile.png` (390×844): phone path — stage spans the full 390 px width, crowd and horse all legible, hint visible, nothing clipped.
+  - `thumb.png` (720×720): State A as on desktop, horse findable at gallery size.
+- **Determinism gate:** thumb rendered twice and `cmp` byte-compared — identical. Second render deleted.
+- **State B verification:** a throwaway preset copy (initial state flipped to B by a one-line sed on `START_STATE`, kept in /tmp, deleted after) rendered at 1280×900 and 390×844: striped rose/cream/blue cloth with dashed seams and fabric speckle; large blue appliqué horse with running-stitch outlines on body, legs, blanket and chest patch; neon lime/yellow mane strands; thread sun, stars, grass and flowers; colophon band reading the real QA-session date **"SÁBADO 31 DE OCTUBRE DE 2026. ROSARIO"** (Saturday 31 October 2026, correct for the QA day) in jittered stitched lettering. Legible at phone size, nothing clipped.
+
+## Deviations
+
+- **Colophon date from `new Date()`** — required by the prompt for this artist's pieces ("no invented dates — the colophon always reflects a real moment") and carried over as the sanctioned exception for her study: scoped strictly to the colophon string built once at load; animation phase, layout and the determinism gate (State A, no date shown) are unaffected.
+- **State A stall awnings** render as a zigzag pennant strip rather than individually striped canopy panels; kept because it sits naturally beside the bunting in her folk register and holds the strict muted palette (wash and paper only).
+- **State B horse idle motion** (breathing scale, tail/mane sway) is an addition beyond a static textile; kept extremely subtle so the piece still reads as cloth, and it is the kind of gentle loop her gallery pieces carry elsewhere in this batch.
