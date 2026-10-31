@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Until the Ice Gives</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0A0C0E; height: 100%; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- palette (strict) ----------
+  var ICE   = '#BFDCE5';  // ice blue
+  var MELT  = '#6FA8BE';  // meltwater
+  var DEEP  = '#2A4A5A';  // deep ice
+  var BG    = '#0A0C0E';  // stage black
+  var AMBER = '#C98A2B';  // machine line amber
+  var WHITE = '#F0EDE4';  // user line white
+
+  // ---------- seeded RNG (mulberry32) ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ---------- QA hook: ?seed=<seconds> offsets the piece clock (inert in production) ----------
+  var T_OFF = 0;
+  try {
+    var qs = (typeof location !== 'undefined' && location.search) ? location.search : '';
+    var sm = /[?&]seed=([0-9]+(?:\.[0-9]+)?)/.exec(qs);
+    if (sm) T_OFF = parseFloat(sm[1]);
+  } catch (e) { /* no hook */ }
+
+  // ---------- the clock ----------
+  var MELT_DUR = 240;     // seconds of ice per performance
+  var END_FADE = 6;       // seconds of fade to black after the ice is gone
+
+  // ---------- machine phrase: 16 steps, pentatonic degrees, -1 = rest ----------
+  var STEP_DUR = 0.5;                 // 8 s per pass
+  var MACHINE_OFF = 2.5;              // loop anchored so frame one is mid-phrase
+  var PHRASE = [4, -1, 3, 4, 5, 4, 3, -1, 2, 3, 4, -1, 5, 4, 3, 2];
+  var SEMIS = [0, 3, 5, 7, 10, 12, 15, 17];
+  function degFreq(d) { return 220 * Math.pow(2, SEMIS[d] / 12); }
+
+  // ---------- story fragments (original, deadpan, tapped in one at a time) ----------
+  var FRAGMENTS = [
+    'The ice was not in a hurry. Neither was I.',
+    'He said the song would last exactly as long as the winter.',
+    'Nobody watched the clock. The clock was made of water.',
+    'I played one note until the note changed its mind.',
+    'She asked how long it would take. I said, until it gives.',
+    'By the last verse the stage was a puddle, and the puddle had perfect pitch.'
+  ];
+
+  // ---------- drip schedule (seeded once; spawn interval tightens as the melt advances) ----------
+  var drips = [];
+  (function () {
+    var rnd = mulberry32(85377);
+    var tt = 1.2;
+    while (tt < 236) {
+      drips.push({ t: tt, block: rnd() < 0.5 ? 0 : 1, xf: 0.12 + 0.76 * rnd(), sz: 0.7 + 0.6 * rnd() });
+      var base = 2.3 - 1.6 * (tt / MELT_DUR);
+      tt += base * (0.65 + 0.7 * rnd());
+    }
+  })();
+
+  // ---------- layout ----------
+  var W = 0, H = 0, DPR = 1, isPhone = false;
+  var staffY = 0, staffX0 = 0, staffX1 = 0, staffW = 0;
+  var floorY = 0, blockBW = 0, blockBH = 0, blockCX = [0, 0];
+
+  function viewSize() {
+    var vv = window.visualViewport;
+    if (vv && vv.width) return { w: vv.width, h: vv.height };
+    return { w: window.innerWidth || 0, h: window.innerHeight || 0 };
+  }
+
+  function layout() {
+    var s = viewSize();
+    W = s.w; H = s.h;
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    var sw = (window.screen && window.screen.width) ? Math.min(window.screen.width, window.screen.height) : 9999;
+    isPhone = sw < 700 || H > W * 1.15;
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+
+    staffY = H * (isPhone ? 0.27 : 0.30);
+    staffX0 = W * (isPhone ? 0.06 : 0.10);
+    staffX1 = W * (isPhone ? 0.94 : 0.90);
+    staffW = staffX1 - staffX0;
+    floorY = H * (isPhone ? 0.82 : 0.84);
+    blockBW = Math.min(W * (isPhone ? 0.34 : 0.23), H * 0.52);
+    blockBH = H * (isPhone ? 0.22 : 0.27);
+    blockCX[0] = W / 2 - blockBW * 0.56;
+    blockCX[1] = W / 2 + blockBW * 0.56;
+  }
+
+  function degY(d) { return staffY - (d - 3.5) * H * 0.022; }
+
+  // ---------- melt geometry, closed-form in local time ----------
+  function meltFrac(lt) { return clamp(1 - Math.min(lt, MELT_DUR) / MELT_DUR, 0, 1); }
+  function blockH(lt) { return Math.max(1.5, blockBH * Math.pow(meltFrac(lt), 0.8)); }
+  function blockWid(lt) { return blockBW * (0.70 + 0.30 * meltFrac(lt)); }
+  function blockTop(lt) { return floorY - blockH(lt); }
+
+  // ---------- performance state: recorded events only ----------
+  var epoch = 0;              // piece-clock time at which the current performance began
+  var userMarks = [];         // {lt, xf, deg, stroke}
+  var taps = [];              // {lt, idx}
+  var fragCounter = 0;
+  var nowT = T_OFF;           // piece clock, driven by rAF
+
+  // ---------- audio (lazy, gesture-gated, typeof-guarded) ----------
+  var AC = null, master = null, audioOn = false;
+  function ensureAudio() {
+    if (typeof window === 'undefined') return;
+    var Ctor = window.AudioContext || window.webkitAudioContext;
+    if (typeof Ctor !== 'function') return;
+    try {
+      if (!AC) {
+        AC = new Ctor();
+        master = AC.createGain();
+        master.gain.value = 0.55;
+        if (typeof AC.createDynamicsCompressor === 'function') {
+          var comp = AC.createDynamicsCompressor();
+          master.connect(comp); comp.connect(AC.destination);
+        } else {
+          master.connect(AC.destination);
+        }
+      }
+      if (AC.state === 'suspended' && typeof AC.resume === 'function') AC.resume();
+      audioOn = true;
+    } catch (e) { /* audio unavailable: the piece stays silent */ }
+  }
+  function pluck(freq, vol, bright) {
+    if (!audioOn || !AC || !master) return;
+    try {
+      var t = AC.currentTime;
+      var o = AC.createOscillator(); o.type = 'triangle'; o.frequency.value = freq;
+      var o2 = AC.createOscillator(); o2.type = 'sine'; o2.frequency.value = freq * 2;
+      var g2 = AC.createGain(); g2.gain.value = 0.22;
+      var f = AC.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = bright; f.Q.value = 0.5;
+      var g = AC.createGain();
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(vol, t + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.55);
+      o.connect(f); o2.connect(g2); g2.connect(f); f.connect(g); g.connect(master);
+      o.start(t); o2.start(t); o.stop(t + 0.6); o2.stop(t + 0.6);
+    } catch (e) { /* ignore */ }
+  }
+
+  // ---------- interaction ----------
+  var activePtr = null, downT = 0, downX = 0, downY = 0, moved = false;
+  var strokeId = 0, lastDeg = -1, lastMarkLt = -9, lastNoteLt = -9;
+  var lastTapT = -9;
+
+  function evPos(e) { return { x: e.clientX || 0, y: e.clientY || 0 }; }
+
+  function staffDeg(y) {
+    return clamp(Math.round(3.5 - (y - staffY) / (H * 0.022)), 0, 7);
+  }
+
+  canvas.addEventListener('pointerdown', function (e) {
+    ensureAudio();
+    if (activePtr !== null) return;
+    var pos = evPos(e);
+    activePtr = e.pointerId;
+    downT = nowT; downX = pos.x; downY = pos.y; moved = false;
+    lastDeg = -1; lastMarkLt = -9; lastNoteLt = -9;
+    if (e.preventDefault) e.preventDefault();
+  });
+  window.addEventListener('pointermove', function (e) {
+    if (activePtr === null || e.pointerId !== activePtr) return;
+    var pos = evPos(e);
+    if (Math.hypot(pos.x - downX, pos.y - downY) > 9) moved = true;
+    var lt = nowT - epoch;
+    if (!moved || lt >= MELT_DUR) return;
+    if (Math.abs(pos.y - staffY) > H * 0.16) return;
+    if (pos.x < staffX0 - staffW * 0.04 || pos.x > staffX1 + staffW * 0.04) return;
+    var deg = staffDeg(pos.y);
+    var xf = clamp((pos.x - staffX0) / staffW, 0, 1);
+    if (deg !== lastDeg || lt - lastMarkLt > 0.09) {
+      userMarks.push({ lt: lt, xf: xf, deg: deg, stroke: strokeId });
+      lastMarkLt = lt;
+    }
+    if (deg !== lastDeg || lt - lastNoteLt > 0.14) {
+      pluck(degFreq(deg), 0.20, 2300);
+      lastNoteLt = lt;
+    }
+    lastDeg = deg;
+  });
+  function endPointer(e) {
+    if (activePtr === null || e.pointerId !== activePtr) return;
+    activePtr = null;
+    strokeId++;
+    var lt = nowT - epoch;
+    if (!moved && nowT - downT < 0.35) {
+      // a tap
+      if (nowT - lastTapT < 0.35) {
+        // double-tap: only meaningful after the end, where it reseeds a new performance
+        if (lt >= MELT_DUR) {
+          epoch = nowT;
+          userMarks = [];
+          taps = [];
+          fragCounter = 0;
+        }
+      } else if (lt < MELT_DUR) {
+        taps.push({ lt: lt, idx: fragCounter++ });
+      }
+      lastTapT = nowT;
+    }
+    draw(nowT);
+  }
+  window.addEventListener('pointerup', endPointer);
+  window.addEventListener('pointercancel', endPointer);
+
+  // ---------- drawing ----------
+  function drawPool(t, lt) {
+    var mf = meltFrac(lt);
+    var pw = W * (0.16 + 0.50 * (1 - mf));
+    var cy = floorY + H * 0.014;
+    ctx.fillStyle = MELT;
+    ctx.globalAlpha = 0.32;
+    ctx.beginPath();
+    ctx.ellipse(W / 2, cy, pw / 2, H * 0.016, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 0.14;
+    ctx.fillStyle = ICE;
+    ctx.beginPath();
+    ctx.ellipse(W / 2, cy, pw * 0.32, H * 0.009, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 0.8;
+    ctx.strokeStyle = MELT;
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    ctx.moveTo(W / 2 - pw / 2, cy);
+    ctx.lineTo(W / 2 + pw / 2, cy);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  function drawBlade(cx, w, A) {
+    // struts rise from the blade into the ice; drawn before the ice so they show through it
+    var strutH = blockBH * 0.34;
+    ctx.fillStyle = DEEP;
+    ctx.globalAlpha = 0.95 * A;
+    var sw2 = Math.max(3, W * 0.005);
+    ctx.fillRect(cx - w * 0.28 - sw2 / 2, floorY - strutH, sw2, strutH);
+    ctx.fillRect(cx + w * 0.28 - sw2 / 2, floorY - strutH, sw2, strutH);
+    // blade bar with a small upturned tip
+    ctx.fillRect(cx - w * 0.55, floorY - 2, w * 1.10, 3);
+    ctx.beginPath();
+    ctx.moveTo(cx + w * 0.55, floorY - 2);
+    ctx.lineTo(cx + w * 0.60, floorY - 6);
+    ctx.lineTo(cx + w * 0.60, floorY + 1);
+    ctx.closePath();
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  function drawBlock(cx, seedFlip, lt, A) {
+    var w = blockWid(lt), h = blockH(lt), top = floorY - h;
+    var x = cx - w / 2;
+    var r = Math.min(9, w * 0.06);
+    // body: layered flat tones, translucent like ice
+    ctx.fillStyle = ICE;
+    ctx.globalAlpha = 0.30 * A;
+    ctx.beginPath();
+    ctx.moveTo(x, floorY);
+    ctx.lineTo(x, top + r);
+    ctx.quadraticCurveTo(x, top, x + r, top);
+    ctx.lineTo(x + w - r, top);
+    ctx.quadraticCurveTo(x + w, top, x + w, top + r);
+    ctx.lineTo(x + w, floorY);
+    ctx.closePath();
+    ctx.fill();
+    // deep core
+    ctx.fillStyle = DEEP;
+    ctx.globalAlpha = 0.52 * A;
+    var cx0 = x + w * 0.10, cy0 = top + h * 0.16, cw = w * 0.80, ch = h * 0.72;
+    if (ch > 3) ctx.fillRect(cx0, cy0, cw, ch);
+    // inner light
+    ctx.fillStyle = ICE;
+    ctx.globalAlpha = 0.16 * A;
+    if (ch > 8) ctx.fillRect(x + w * 0.22, top + h * 0.30, w * 0.56, h * 0.42);
+    // meltwater sheen line near the top
+    ctx.strokeStyle = MELT;
+    ctx.globalAlpha = 0.85 * A;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(x + w * 0.08, top + h * 0.15);
+    ctx.lineTo(x + w * 0.92, top + h * 0.15);
+    ctx.stroke();
+    ctx.globalAlpha = 0.5 * A;
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.moveTo(x + w * 0.30, top + h * 0.15);
+    ctx.lineTo(x + w * 0.74, top + h * 0.15);
+    ctx.stroke();
+    // internal melt streaks (seeded positions, fixed per block)
+    ctx.globalAlpha = 0.30 * A;
+    ctx.lineWidth = 1.4;
+    var fr = seedFlip ? [0.30, 0.58, 0.80] : [0.24, 0.52, 0.74];
+    for (var i = 0; i < fr.length; i++) {
+      var sx = x + w * fr[i];
+      ctx.beginPath();
+      ctx.moveTo(sx, top + h * 0.18);
+      ctx.lineTo(sx + (i - 1) * 2, top + h * (0.42 + 0.10 * fr[i]));
+      ctx.stroke();
+    }
+    // outline
+    ctx.strokeStyle = ICE;
+    ctx.globalAlpha = 0.5 * A;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(x, floorY);
+    ctx.lineTo(x, top + r);
+    ctx.quadraticCurveTo(x, top, x + r, top);
+    ctx.lineTo(x + w - r, top);
+    ctx.quadraticCurveTo(x + w, top, x + w, top + r);
+    ctx.lineTo(x + w, floorY);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  function drawDrips(lt, A) {
+    var g = H * 2.2;
+    ctx.fillStyle = MELT;
+    for (var i = 0; i < drips.length; i++) {
+      var d = drips[i];
+      var age = lt - d.t;
+      if (age < 0) continue;
+      var y0 = blockTop(d.t);
+      var wAtSpawn = blockWid(d.t);
+      var x = blockCX[d.block] + (d.xf - 0.5) * wAtSpawn;
+      var dist = Math.max(10, floorY - y0);
+      var dur = clamp(Math.sqrt(2 * dist / g), 0.3, 1.0);
+      if (age <= dur) {
+        var y = y0 + 0.5 * g * age * age;
+        ctx.globalAlpha = 0.85 * A;
+        ctx.beginPath();
+        ctx.ellipse(x, y, 1.9 * d.sz, 3.1 * d.sz * (1 + age * 0.9), 0, 0, Math.PI * 2);
+        ctx.fill();
+      } else if (age <= dur + 0.3) {
+        var p = (age - dur) / 0.3;
+        ctx.globalAlpha = 0.55 * (1 - p) * A;
+        ctx.strokeStyle = MELT;
+        ctx.lineWidth = 1.2;
+        var swd = 3 + p * 9;
+        ctx.beginPath();
+        ctx.moveTo(x - swd, floorY + H * 0.012);
+        ctx.lineTo(x + swd, floorY + H * 0.012);
+        ctx.stroke();
+        ctx.fillStyle = MELT;
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawStaff(lt, A) {
+    var ltD = Math.min(lt, MELT_DUR);   // the machine freezes on its last frame once the ice is gone
+    // floor line the stage stands on
+    ctx.strokeStyle = DEEP;
+    ctx.globalAlpha = 0.45 * A;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(W * 0.08, floorY + 1);
+    ctx.lineTo(W * 0.92, floorY + 1);
+    ctx.stroke();
+    // staff line and step ticks
+    ctx.strokeStyle = WHITE;
+    ctx.globalAlpha = 0.20 * A;
+    ctx.beginPath();
+    ctx.moveTo(staffX0, staffY);
+    ctx.lineTo(staffX1, staffY);
+    ctx.stroke();
+    ctx.globalAlpha = 0.08 * A;
+    for (var i = 0; i <= 16; i++) {
+      var tx = staffX0 + (i / 16) * staffW;
+      ctx.beginPath();
+      ctx.moveTo(tx, staffY - H * 0.012);
+      ctx.lineTo(tx, staffY + H * 0.012);
+      ctx.stroke();
+    }
+    // playhead
+    var phase = ltD + MACHINE_OFF;
+    var stepPos = phase / STEP_DUR;
+    var cur = Math.floor(stepPos) % 16;
+    var frac = stepPos - Math.floor(stepPos);
+    var px = staffX0 + (((cur + frac) % 16) / 16) * staffW;
+    ctx.strokeStyle = AMBER;
+    ctx.globalAlpha = 0.30 * A;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(px, staffY - H * 0.105);
+    ctx.lineTo(px, staffY + H * 0.105);
+    ctx.stroke();
+    // machine notes for the current pass
+    var mw = staffW / 16 * 0.46;
+    ctx.fillStyle = AMBER;
+    for (var s = 0; s < 16; s++) {
+      var deg = PHRASE[s];
+      if (deg < 0) continue;
+      var nx = staffX0 + ((s + 0.5) / 16) * staffW;
+      var ny = degY(deg);
+      var a = s < cur ? 0.95 : (s === cur ? 1.0 : 0.22);
+      ctx.globalAlpha = a * A;
+      ctx.beginPath();
+      ctx.ellipse(nx, ny, mw / 2, 3, 0, 0, Math.PI * 2);
+      ctx.fill();
+      if (s === cur) {
+        ctx.globalAlpha = 0.7 * A;
+        ctx.strokeStyle = AMBER;
+        ctx.lineWidth = 1.2;
+        ctx.beginPath();
+        ctx.arc(nx, ny, 8, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.fillStyle = AMBER;
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawUserLine(lt, A) {
+    ctx.strokeStyle = WHITE;
+    ctx.fillStyle = WHITE;
+    ctx.lineCap = 'round';
+    for (var i = 0; i < userMarks.length; i++) {
+      var m = userMarks[i];
+      var age = lt - m.lt;
+      if (age < 0) continue;
+      var a = age < 0.1 ? age / 0.1 : (age < 24 ? 0.95 : Math.max(0.30, 0.95 - (age - 24) * 0.02));
+      var x = staffX0 + m.xf * staffW;
+      var y = degY(m.deg);
+      if (i > 0) {
+        var p = userMarks[i - 1];
+        if (p.stroke === m.stroke && m.lt - p.lt < 0.4) {
+          ctx.globalAlpha = 0.38 * a * A;
+          ctx.lineWidth = 1.4;
+          ctx.beginPath();
+          ctx.moveTo(staffX0 + p.xf * staffW, degY(p.deg));
+          ctx.lineTo(x, y);
+          ctx.stroke();
+        }
+      }
+      ctx.globalAlpha = a * A;
+      ctx.beginPath();
+      ctx.ellipse(x, y, Math.max(3, staffW * 0.011), 2.4, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawFragment(lt, A) {
+    if (!taps.length) return;
+    var tp = taps[taps.length - 1];
+    var age = lt - tp.lt;
+    if (age < 0 || age >= 6) return;
+    var env = Math.min(1, age / 0.4) * (age > 4.8 ? Math.max(0, (6 - age) / 1.2) : 1);
+    var fs = Math.max(12, Math.min(W, H) * 0.021);
+    ctx.font = '300 ' + fs + 'px "Helvetica Neue", Arial, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = WHITE;
+    ctx.globalAlpha = 0.92 * env * A;
+    ctx.fillText(FRAGMENTS[tp.idx % FRAGMENTS.length], W / 2, H * 0.945);
+    ctx.globalAlpha = 1;
+  }
+
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+    var lt = t - epoch;
+    var A = lt >= MELT_DUR ? clamp(1 - (lt - MELT_DUR) / END_FADE, 0, 1) : 1;
+
+    ctx.fillStyle = BG;
+    ctx.fillRect(0, 0, W, H);
+
+    // the pool outlives everything: it is the only thing left at the end
+    drawPool(t, lt);
+
+    if (A > 0) {
+      drawStaff(lt, A);
+      drawUserLine(lt, A);
+      drawBlade(blockCX[0], blockWid(lt), A);
+      drawBlade(blockCX[1], blockWid(lt), A);
+      drawBlock(blockCX[0], false, lt, A);
+      drawBlock(blockCX[1], true, lt, A);
+      drawDrips(Math.min(lt, MELT_DUR), A);
+      if (lt < MELT_DUR) drawFragment(lt, A);
+    }
+  }
+
+  // ---------- boot ----------
+  layout();
+  draw(nowT);   // frame one: melt at 100%, machine mid-phrase, synchronous
+
+  if (window.visualViewport && typeof window.visualViewport.addEventListener === 'function') {
+    window.visualViewport.addEventListener('resize', function () { layout(); draw(nowT); });
+  }
+  if (typeof window.addEventListener === 'function') {
+    window.addEventListener('resize', function () { layout(); draw(nowT); });
+  }
+
+  if (typeof requestAnimationFrame === 'function') {
+    var t0 = null;
+    var lastGStep = -1;
+    var loop = function (ts) {
+      if (t0 === null) t0 = ts - T_OFF * 1000;
+      nowT = (ts - t0) / 1000;
+      var lt = nowT - epoch;
+      // machine audio follows the same closed-form step clock as the drawing
+      var gstep = Math.floor((Math.min(lt, MELT_DUR) + MACHINE_OFF) / STEP_DUR);
+      if (gstep !== lastGStep) {
+        lastGStep = gstep;
+        if (audioOn && lt < MELT_DUR && lt >= 0) {
+          var d = PHRASE[gstep % 16];
+          if (d >= 0) pluck(degFreq(d), 0.15, 1500);
+        }
+      }
+      draw(nowT);
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>

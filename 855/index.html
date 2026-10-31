@@ -1,0 +1,530 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Six Feet of Granulation</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0B0C0E; height: 100%; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- palette (strict) ----------
+  var HAZE  = [42, 58, 74];     // stage haze #2A3A4A
+  var AMBER = [232, 160, 32];   // baton amber #E8A020
+  var CHALK = [216, 212, 200];  // grain chalk #D8D4C8
+  var RED   = [160, 58, 42];    // scattered-noise red #A03A2A
+  var BG    = '#0B0C0E';        // black
+
+  function rgba(c, a) { return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a + ')'; }
+  function mix(a, b, k) {
+    return [Math.round(a[0] + (b[0] - a[0]) * k),
+            Math.round(a[1] + (b[1] - a[1]) * k),
+            Math.round(a[2] + (b[2] - a[2]) * k)];
+  }
+  function clamp01(v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
+  function smootherstep(x) { x = clamp01(x); return x * x * x * (x * (x * 6 - 15) + 10); }
+
+  // ---------- seeded RNG (mulberry32) ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ---------- layout ----------
+  var W = 0, H = 0, DPR = 1, S = 1, isPhone = false;
+
+  function viewSize() {
+    var vv = window.visualViewport;
+    if (vv && vv.width) return { w: vv.width, h: vv.height };
+    return { w: window.innerWidth || 0, h: window.innerHeight || 0 };
+  }
+
+  function layout() {
+    var s = viewSize();
+    W = s.w; H = s.h;
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    var sw = (window.screen && window.screen.width) ? Math.min(window.screen.width, window.screen.height) : 9999;
+    isPhone = sw < 700 || H > W * 1.15;
+    S = Math.min(W, H) || 1;
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+  }
+
+  // ---------- baton geometry ----------
+  // Butt (held end) is fixed; the tip rests upper-right and follows the drag.
+  function buttPos() { return { x: W * 0.10, y: H * 0.88 }; }
+  function restTip() { return { x: W * 0.74, y: H * 0.26 }; }
+
+  // ---------- interaction record (everything drawn is a function of this + t) ----------
+  var drags = [];    // { downT, upT (null while down), pts: [{t,x,y}] }
+  var strikes = [];  // { t, x, y }
+  var curDrag = null;
+  var lastStrikeT = -10;
+
+  function nowSec() { return performance.now() / 1000; }
+  var T0 = nowSec();
+
+  function tipAt(tau) {
+    var rest = restTip();
+    for (var i = drags.length - 1; i >= 0; i--) {
+      var d = drags[i];
+      if (tau < d.downT) continue;
+      var upT = (d.upT === null) ? tau : d.upT;
+      if (tau <= upT) {
+        var pts = d.pts;
+        if (tau <= pts[0].t) return { x: pts[0].x, y: pts[0].y };
+        for (var j = pts.length - 1; j >= 0; j--) {
+          if (pts[j].t <= tau) {
+            if (j === pts.length - 1) return { x: pts[j].x, y: pts[j].y };
+            var a = pts[j], b = pts[j + 1];
+            var k = (tau - a.t) / Math.max(1e-6, b.t - a.t);
+            return { x: a.x + (b.x - a.x) * k, y: a.y + (b.y - a.y) * k };
+          }
+        }
+        return { x: pts[0].x, y: pts[0].y };
+      }
+      // after this drag ended: exponential return to rest
+      var end = d.pts[d.pts.length - 1];
+      var k2 = Math.exp(-(tau - d.upT) / 0.9);
+      return { x: rest.x + (end.x - rest.x) * k2, y: rest.y + (end.y - rest.y) * k2 };
+    }
+    return rest;
+  }
+
+  // Tip-speed envelope at time tau: max of segment speeds, exponentially decayed.
+  function speedAt(tau) {
+    var best = 0;
+    for (var i = 0; i < drags.length; i++) {
+      var pts = drags[i].pts;
+      for (var j = 1; j < pts.length; j++) {
+        var dt = pts[j].t - pts[j - 1].t;
+        if (dt <= 0) continue;
+        var tm = pts[j].t;
+        if (tm > tau) continue;
+        var dx = pts[j].x - pts[j - 1].x, dy = pts[j].y - pts[j - 1].y;
+        var sp = Math.sqrt(dx * dx + dy * dy) / dt / S; // units of min-dimension / s
+        var v = sp * Math.exp(-(tau - tm) / 0.38);
+        if (v > best) best = v;
+      }
+    }
+    return best;
+  }
+
+  // 1 while a drag is held at tau, decaying after release.
+  function activeAt(tau) {
+    var a = 0;
+    for (var i = 0; i < drags.length; i++) {
+      var d = drags[i];
+      if (tau >= d.downT && (d.upT === null || tau <= d.upT)) return 1;
+      if (d.upT !== null && tau > d.upT) {
+        var v = Math.exp(-(tau - d.upT) / 1.1);
+        if (v > a) a = v;
+      }
+    }
+    return a;
+  }
+
+  // ---------- grain field ----------
+  var N = 120;
+  var BASE_SEED = 855016;
+
+  // Five abstract constellation patterns: near-letterforms that never resolve.
+  // Points in a unit box, scaled at field build.
+  var PATTERNS = [
+    // stem and bowl (almost a P)
+    [[-0.30, -0.45], [-0.30, -0.15], [-0.30, 0.15], [-0.30, 0.45],
+     [-0.12, -0.42], [0.10, -0.34], [0.22, -0.16], [0.10, 0.02], [-0.12, 0.06]],
+    // zigzag (almost a Z)
+    [[-0.38, -0.38], [-0.13, -0.38], [0.13, -0.38], [0.38, -0.38],
+     [0.13, -0.13], [-0.13, 0.13], [-0.38, 0.38], [-0.13, 0.38], [0.13, 0.38], [0.38, 0.38]],
+    // offset cross (almost a t)
+    [[0.0, -0.45], [0.0, -0.15], [0.0, 0.15], [0.0, 0.45],
+     [-0.34, -0.18], [-0.11, -0.18], [0.11, -0.18], [0.34, -0.18]],
+    // open arc with fallen dots (almost a C that lost its points)
+    [[0.30, -0.34], [0.08, -0.44], [-0.18, -0.38], [-0.34, -0.12],
+     [-0.34, 0.14], [-0.16, 0.38], [0.10, 0.44], [-0.02, 0.62], [0.22, 0.60]],
+    // steps (almost an E lying down)
+    [[-0.38, 0.40], [-0.38, 0.13], [-0.13, 0.13], [-0.13, -0.13],
+     [0.13, -0.13], [0.13, -0.40], [0.38, -0.40]]
+  ];
+
+  function genField(seed) {
+    var rnd = mulberry32(seed);
+    var grains = [];
+    var perCluster = Math.floor(N / PATTERNS.length);
+    for (var i = 0; i < N; i++) {
+      var c = Math.min(PATTERNS.length - 1, Math.floor(i / perCluster));
+      var pat = PATTERNS[c];
+      var pp = pat[Math.floor(rnd() * pat.length)];
+      var sAng = rnd() * Math.PI * 2;
+      grains.push({
+        idleS: 0.06 + rnd() * 0.90,                    // along-axis position, loose band near baton
+        // bimodal spread: most grains hug the baton, a third drift wider into the field
+        idlePerp: (rnd() < 0.30 ? (rnd() + rnd() - 1) * 0.17 : (rnd() + rnd() - 1) * 0.055),
+        clS: 0.16 + c * 0.17 + (rnd() - 0.5) * 0.05,    // cluster center along axis
+        clPerp: (rnd() + rnd() - 1) * 0.035,
+        patX: pp[0] * (0.85 + rnd() * 0.3),
+        patY: pp[1] * (0.85 + rnd() * 0.3),
+        jitX: (rnd() - 0.5) * 0.016,
+        jitY: (rnd() - 0.5) * 0.016,
+        sdX: Math.cos(sAng),
+        sdY: Math.sin(sAng),
+        sMag: 0.05 + rnd() * 0.17,
+        lag: Math.floor(rnd() * 10) * 0.05,            // quantized per-grain lag
+        r: 1.1 + rnd() * 1.9,
+        alpha: 0.45 + rnd() * 0.5,
+        ph1: rnd() * Math.PI * 2,
+        ph2: rnd() * Math.PI * 2,
+        w1: 0.25 + rnd() * 0.5,
+        w2: 0.2 + rnd() * 0.45
+      });
+    }
+    return grains;
+  }
+
+  var fieldPrev = genField(BASE_SEED);
+  var fieldCur = fieldPrev;
+  var epoch = 0;
+  var epochT = -10;
+
+  function reseed(t) {
+    fieldPrev = fieldCur;
+    epoch++;
+    epochT = t;
+    fieldCur = genField(BASE_SEED + epoch * 7919);
+  }
+
+  // ---------- per-frame cached envelopes (keyed by quantized lag bucket) ----------
+  function frameState(t, lagBucket) {
+    var tau = Math.max(0, t - lagBucket);
+    var tip = tipAt(tau);
+    var sp = speedAt(tau);
+    var act = activeAt(tau);
+    var scatter = clamp01((sp - 0.55) / 1.25);
+    var gather = act * (1 - scatter);
+    return { tip: tip, scatter: scatter, gather: gather, act: act };
+  }
+
+  // ---------- drawing ----------
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = BG;
+    ctx.fillRect(0, 0, W, H);
+
+    // stage haze at the edges: stacked flat-alpha bands, no gradients
+    var band = S * 0.022;
+    var alphas = [0.16, 0.10, 0.05];
+    for (var e = 0; e < 3; e++) {
+      ctx.fillStyle = rgba(HAZE, alphas[e]);
+      var o = band * e;
+      ctx.fillRect(o, o, W - 2 * o, band);                 // top
+      ctx.fillRect(o, H - o - band, W - 2 * o, band);     // bottom
+      ctx.fillRect(o, o, band, H - 2 * o);                // left
+      ctx.fillRect(W - o - band, o, band, H - 2 * o);     // right
+    }
+
+    var butt = buttPos();
+    var blend = smootherstep((t - epochT) / 0.8);
+    var cache = {};
+
+    function stateFor(lag) {
+      var key = lag.toFixed(2);
+      if (!cache[key]) cache[key] = frameState(t, lag);
+      return cache[key];
+    }
+
+    // grains (drawn under the baton)
+    for (var i = 0; i < N; i++) {
+      var g = fieldCur[i];
+      var gp = fieldPrev[i];
+      var st = stateFor(g.lag);
+      var tip = st.tip;
+      var ax = tip.x - butt.x, ay = tip.y - butt.y;
+      var len = Math.sqrt(ax * ax + ay * ay) || 1;
+      var ux = ax / len, uy = ay / len;
+      var vx = -uy, vy = ux;
+
+      // home (cluster) point, blended across a reseed
+      var clS = gp.clS + (g.clS - gp.clS) * blend;
+      var clPerp = gp.clPerp + (g.clPerp - gp.clPerp) * blend;
+      var patX = gp.patX + (g.patX - gp.patX) * blend;
+      var patY = gp.patY + (g.patY - gp.patY) * blend;
+      var homeX = butt.x + ux * (clS * len) + vx * (clPerp * S) + ux * (patX * 0.11 * S + g.jitX * S) + vx * (patY * 0.11 * S + g.jitY * S);
+      var homeY = butt.y + uy * (clS * len) + vy * (clPerp * S) + uy * (patX * 0.11 * S + g.jitX * S) + vy * (patY * 0.11 * S + g.jitY * S);
+
+      // idle point, loosely gathered along the baton
+      var idleX = butt.x + ux * (g.idleS * len) + vx * (g.idlePerp * S);
+      var idleY = butt.y + uy * (g.idleS * len) + vy * (g.idlePerp * S);
+
+      var gw = st.gather;
+      // at rest the clusters are faintly suggested through the idle field;
+      // wielding slowly pulls the suggestion into a near-word
+      var gwEff = 0.28 + 0.72 * gw;
+      var px = idleX + (homeX - idleX) * gwEff;
+      var py = idleY + (homeY - idleY) * gwEff;
+
+      // scatter burst along the grain's seeded direction (in baton frame)
+      var so = st.scatter * g.sMag * S;
+      px += ux * (g.sdX * so) + vx * (g.sdY * so);
+      py += uy * (g.sdX * so) + vy * (g.sdY * so);
+
+      // idle drift, damped while gathered so clusters stay loose, never locked
+      var damp = 1 - gwEff * 0.7;
+      px += Math.sin(t * g.w1 + g.ph1) * 0.004 * S * damp;
+      py += Math.cos(t * g.w2 + g.ph2) * 0.004 * S * damp;
+
+      var col = mix(CHALK, RED, Math.pow(st.scatter, 1.5));
+      ctx.fillStyle = rgba(col, g.alpha * (0.75 + 0.25 * gw));
+      ctx.beginPath();
+      ctx.arc(px, py, g.r * (isPhone ? 1.15 : 1), 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // baton: tapered polygon, butt to tip
+    var tipNow = tipAt(t);
+    var bx = tipNow.x - butt.x, by = tipNow.y - butt.y;
+    var bl = Math.sqrt(bx * bx + by * by) || 1;
+    var bux = bx / bl, buy = by / bl;
+    var bvx = -buy, bvy = bux;
+    var wButt = S * 0.011, wTip = S * 0.0035;
+    ctx.fillStyle = rgba(AMBER, 0.92);
+    ctx.beginPath();
+    ctx.moveTo(butt.x + bvx * wButt, butt.y + bvy * wButt);
+    ctx.lineTo(tipNow.x + bvx * wTip, tipNow.y + bvy * wTip);
+    ctx.lineTo(tipNow.x - bvx * wTip, tipNow.y - bvy * wTip);
+    ctx.lineTo(butt.x - bvx * wButt, butt.y - bvy * wButt);
+    ctx.closePath();
+    ctx.fill();
+    // butt cap
+    ctx.beginPath();
+    ctx.arc(butt.x, butt.y, wButt, 0, Math.PI * 2);
+    ctx.fill();
+    // spine highlight
+    ctx.strokeStyle = rgba(CHALK, 0.20);
+    ctx.lineWidth = Math.max(1, S * 0.0016);
+    ctx.beginPath();
+    ctx.moveTo(butt.x + bvx * wButt * 0.45, butt.y + bvy * wButt * 0.45);
+    ctx.lineTo(tipNow.x + bvx * wTip * 0.4, tipNow.y + bvy * wTip * 0.4);
+    ctx.stroke();
+
+    // tip glow: layered flat-alpha discs
+    var glowR = [0.030, 0.018, 0.010];
+    var glowA = [0.10, 0.18, 0.35];
+    for (var gi = 0; gi < 3; gi++) {
+      ctx.fillStyle = rgba(AMBER, glowA[gi]);
+      ctx.beginPath();
+      ctx.arc(tipNow.x, tipNow.y, glowR[gi] * S, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.fillStyle = rgba(AMBER, 1);
+    ctx.beginPath();
+    ctx.arc(tipNow.x, tipNow.y, Math.max(1.6, S * 0.0035), 0, Math.PI * 2);
+    ctx.fill();
+
+    // strike pulses: one bright cluster word at the tip, once
+    for (var si = strikes.length - 1; si >= 0; si--) {
+      var age = t - strikes[si].t;
+      if (age < 0 || age > 0.8) continue;
+      var p = age / 0.8;
+      var cx = strikes[si].x, cy = strikes[si].y;
+      // expanding ring
+      ctx.strokeStyle = rgba(AMBER, (1 - p) * (1 - p) * 0.8);
+      ctx.lineWidth = Math.max(1, S * 0.002);
+      ctx.beginPath();
+      ctx.arc(cx, cy, 0.16 * S * (0.2 + 0.8 * p), 0, Math.PI * 2);
+      ctx.stroke();
+      // tight dot cluster, pulsing
+      var dots = 10;
+      for (var di = 0; di < dots; di++) {
+        var ang = di / dots * Math.PI * 2 + si;
+        var rr = (0.012 + 0.02 * p) * S * (0.6 + 0.4 * Math.sin(di * 2.3));
+        ctx.fillStyle = rgba(CHALK, (1 - p) * 0.9);
+        ctx.beginPath();
+        ctx.arc(cx + Math.cos(ang) * rr, cy + Math.sin(ang) * rr, Math.max(1, S * 0.003), 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.fillStyle = rgba(AMBER, (1 - p) * 0.9);
+      ctx.beginPath();
+      ctx.arc(cx, cy, Math.max(1.4, S * 0.004), 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  // ---------- audio (lazy, gesture-gated, guarded) ----------
+  var AC = (typeof AudioContext !== 'undefined') ? AudioContext :
+           (typeof webkitAudioContext !== 'undefined' ? webkitAudioContext : null);
+  var ac = null, master = null, noiseBuf = null, nextGrainT = 0;
+
+  function ensureAudio() {
+    if (ac || !AC) return;
+    try {
+      ac = new AC();
+      var comp = ac.createDynamicsCompressor();
+      comp.threshold.value = -18; comp.ratio.value = 8;
+      master = ac.createGain();
+      master.gain.value = 0.5;
+      master.connect(comp); comp.connect(ac.destination);
+      var len = ac.sampleRate;
+      noiseBuf = ac.createBuffer(1, len, ac.sampleRate);
+      var d = noiseBuf.getChannelData(0);
+      for (var i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+      nextGrainT = ac.currentTime + 0.05;
+    } catch (e) { ac = null; }
+  }
+
+  function spawnGrain(when, scatter, act) {
+    if (!ac || !noiseBuf) return;
+    try {
+      var dur = 0.03 + Math.random() * 0.05;
+      var src = ac.createBufferSource();
+      src.buffer = noiseBuf;
+      src.playbackRate.value = 0.5 + scatter * 1.5 + Math.random() * 0.3;
+      var bp = ac.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.value = 300 + scatter * 1800 + Math.random() * 300;
+      bp.Q.value = 1.1;
+      var g = ac.createGain();
+      var peak = (0.04 + Math.random() * 0.10) * (0.4 + 0.6 * act);
+      g.gain.setValueAtTime(0, when);
+      g.gain.linearRampToValueAtTime(peak, when + 0.005);
+      g.gain.exponentialRampToValueAtTime(0.0008, when + dur);
+      src.connect(bp); bp.connect(g); g.connect(master);
+      src.start(when, Math.random() * 0.8, dur + 0.05);
+      src.stop(when + dur + 0.06);
+    } catch (e) { /* silent */ }
+  }
+
+  function strikeTone() {
+    if (!ac) return;
+    try {
+      var t0 = ac.currentTime;
+      var o = ac.createOscillator();
+      o.type = 'sine'; o.frequency.value = 620;
+      var o2 = ac.createOscillator();
+      o2.type = 'sine'; o2.frequency.value = 1240;
+      var g = ac.createGain();
+      g.gain.setValueAtTime(0.22, t0);
+      g.gain.exponentialRampToValueAtTime(0.0008, t0 + 0.35);
+      var g2 = ac.createGain(); g2.gain.value = 0.3;
+      o.connect(g); o2.connect(g2); g2.connect(g); g.connect(master);
+      o.start(t0); o2.start(t0); o.stop(t0 + 0.4); o2.stop(t0 + 0.4);
+    } catch (e) { /* silent */ }
+  }
+
+  function audioTick(t) {
+    if (!ac || ac.state === 'suspended') return;
+    var st = frameState(t, 0);
+    if (st.act < 0.05) { nextGrainT = Math.max(nextGrainT, ac.currentTime + 0.05); return; }
+    var rate = st.act * (6 + 22 * st.scatter); // grains per second
+    if (rate < 0.5) return;
+    var ahead = ac.currentTime + 0.15;
+    if (nextGrainT < ac.currentTime) nextGrainT = ac.currentTime + 0.02;
+    while (nextGrainT < ahead) {
+      spawnGrain(nextGrainT, st.scatter, st.act);
+      nextGrainT += 1 / rate;
+    }
+  }
+
+  // ---------- pointer input ----------
+  function evtPos(e) {
+    return { x: e.clientX, y: e.clientY };
+  }
+
+  function onDown(e) {
+    ensureAudio();
+    if (ac && ac.state === 'suspended') { try { ac.resume(); } catch (err) {} }
+    var t = nowSec() - T0;
+    var p = evtPos(e);
+    curDrag = { downT: t, upT: null, pts: [{ t: t, x: p.x, y: p.y }] };
+    drags.push(curDrag);
+    if (drags.length > 12) drags.splice(0, drags.length - 12);
+    if (e.preventDefault) e.preventDefault();
+  }
+
+  function onMove(e) {
+    if (!curDrag) return;
+    var t = nowSec() - T0;
+    var p = evtPos(e);
+    curDrag.pts.push({ t: t, x: p.x, y: p.y });
+    if (curDrag.pts.length > 240) curDrag.pts.splice(0, curDrag.pts.length - 240);
+  }
+
+  function onUp(e) {
+    if (!curDrag) return;
+    var t = nowSec() - T0;
+    var p = evtPos(e);
+    curDrag.pts.push({ t: t, x: p.x, y: p.y });
+    curDrag.upT = t;
+    // strike test: quick, nearly stationary press
+    var dur = t - curDrag.downT;
+    var first = curDrag.pts[0];
+    var travel = Math.sqrt((p.x - first.x) * (p.x - first.x) + (p.y - first.y) * (p.y - first.y));
+    if (dur < 0.28 && travel < S * 0.03) {
+      if (t - lastStrikeT < 0.35) {
+        reseed(t);
+        strikes.length = 0;
+        lastStrikeT = -10;
+      } else {
+        var tip = tipAt(t);
+        strikes.push({ t: t, x: tip.x, y: tip.y });
+        if (strikes.length > 4) strikes.shift();
+        lastStrikeT = t;
+        strikeTone();
+      }
+    }
+    curDrag = null;
+  }
+
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+  }
+  if (window.addEventListener) {
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  }
+
+  // ---------- resize ----------
+  function onResize() { layout(); }
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', onResize);
+  }
+  if (window.addEventListener) window.addEventListener('resize', onResize);
+
+  // ---------- run ----------
+  layout();
+  draw(0); // deterministic first frame, synchronous
+
+  if (typeof requestAnimationFrame === 'function') {
+    var loop = function () {
+      var t = nowSec() - T0;
+      draw(t);
+      audioTick(t);
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
