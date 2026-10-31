@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Footage</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #F5F5F5; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  "use strict";
+
+  // No.812 "Footage" (EXPANSION #99 jacob-kassay, block 5).
+  // A tall OSB panel photographed, printed, and laid back on itself:
+  // two procedural flake layers, the actual and the depicted, offset
+  // by a few pixels. At zero offset the panel is one surface; as the
+  // offset grows the flakes double, a misregistered print shimmering
+  // at a slightly different depth. Drag sideways to widen the schism.
+
+  var WALL = "#F5F5F5";       // gallery wall margins (ground family)
+  var BLUE = "#1F4FD6";       // the thin saturated floor strip
+  var PRINT = "#5E3A1C";      // printed layer: darker flake tone
+  // Actual-layer flake tones, the wood browns of the prompt palette.
+  var FLAKES = ["#8A5A2E", "#A9713A", "#6B4220", "#3A2410"];
+  var FLAKE_W = [0.40, 0.30, 0.22, 0.08]; // cumulative pick weights
+  var BASE = "#6B4220";       // panel base coat under both layers
+  var PANEL_SHADOW = "rgba(58,36,16,0.16)"; // shadow tone, wall float
+
+  var MAXOFF = 30;            // the schism never exceeds ~30px
+  var INITOFF = 8;            // frame one: the doubling already whispers
+  var VSH = 0.35;             // vertical component of the print shift
+
+  var canvas = document.getElementById("c");
+  var ctx = canvas.getContext("2d");
+
+  var W = 0, H = 0, DPR = 1;
+
+  function isPhone() {
+    var sw = window.screen ? window.screen.width : 0;
+    var sh = window.screen ? window.screen.height : 0;
+    var mn = Math.min(sw || 1e9, sh || 1e9);
+    if (mn < 700) return true;
+    var s = viewSize();
+    return s.h > s.w * 1.15;
+  }
+
+  function viewSize() {
+    var w = window.innerWidth, h = window.innerHeight;
+    if (window.visualViewport) {
+      w = window.visualViewport.width;
+      h = window.visualViewport.height;
+    }
+    return { w: w, h: h };
+  }
+
+  function resize() {
+    var s = viewSize();
+    DPR = window.devicePixelRatio || 1;
+    W = Math.round(s.w);
+    H = Math.round(s.h);
+    canvas.width = Math.max(1, Math.round(W * DPR));
+    canvas.height = Math.max(1, Math.round(H * DPR));
+  }
+
+  // ---- seeded RNG: mulberry32 ----
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---- flake generation (precomputed polygon data, unit panel space) ----
+  // A flake is an elongated strand chip: centre, length, width, angle,
+  // tone, and a jittered 9-point outline in flake-local fractions.
+  // Positions are fractions of the panel rect, so the same seeded data
+  // serves every frame size and the layers never re-randomise.
+  var OUTLINE = [
+    [-0.50, -0.16], [-0.30, -0.50], [0.02, -0.46], [0.34, -0.50],
+    [0.50, -0.08], [0.44, 0.30], [0.12, 0.50], [-0.24, 0.44], [-0.48, 0.18]
+  ];
+
+  function makeLayer(seed, count) {
+    var rng = mulberry32(seed);
+    var out = [];
+    for (var i = 0; i < count; i++) {
+      // OSB strands run in loose directional clusters: most lie near
+      // horizontal or near vertical, with a hand of scatter.
+      var vertical = rng() < 0.45;
+      var ang = (vertical ? Math.PI / 2 : 0) + (rng() - 0.5) * 0.48;
+      var r = rng(), ci = 0, acc = 0;
+      while (ci < FLAKE_W.length - 1 && r > (acc += FLAKE_W[ci])) ci++;
+      var pts = [];
+      for (var k = 0; k < OUTLINE.length; k++) {
+        pts.push([
+          OUTLINE[k][0] + (rng() - 0.5) * 0.14,
+          OUTLINE[k][1] + (rng() - 0.5) * 0.14
+        ]);
+      }
+      out.push({
+        cx: rng() * 1.04 - 0.02,
+        cy: rng() * 1.04 - 0.02,
+        len: 0.085 + rng() * 0.115,        // fraction of panel width
+        wid: 0.013 + rng() * 0.017,        // fraction of panel width
+        ang: ang,
+        ci: ci,
+        alpha: 0.42 + rng() * 0.22,        // print-layer ink strength
+        pts: pts
+      });
+    }
+    return out;
+  }
+
+  var actualLayer = makeLayer(81201, 700);
+  var printLayer = makeLayer(81277, 700);
+
+  // ---- geometry ----
+  function geom() {
+    var stripH = Math.max(10, Math.round(H * 0.035));
+    var top = Math.round(H * 0.06);
+    var bottom = H - stripH;
+    var ph = bottom - top;
+    var pw = Math.min(W * (isPhone() ? 0.82 : 0.56), ph * 0.64);
+    return {
+      stripH: stripH,
+      px: Math.round((W - pw) / 2),
+      py: top,
+      pw: Math.round(pw),
+      ph: ph
+    };
+  }
+
+  // ---- interaction: recorded samples, closed-form offset ----
+  // events: {type:'grab'|'move'|'release', x, base}
+  // offsetAt() is a pure function of this list. The offset is a plain
+  // horizontal drag distance from the grab point, clamped 0..MAXOFF,
+  // and it stays where the drag leaves it. No spring, no reset.
+  var events = [];
+  var dragging = false;
+
+  function clampOff(o) { return o < 0 ? 0 : (o > MAXOFF ? MAXOFF : o); }
+
+  function offsetAt() {
+    var o = INITOFF;
+    for (var i = 0; i < events.length; i++) {
+      var e = events[i];
+      if (e.type === "grab") { e.base = o; }
+      else if (e.type === "move") {
+        var g = null;
+        for (var j = i; j >= 0; j--) if (events[j].type === "grab") { g = events[j]; break; }
+        if (g) o = clampOff(g.base + (e.x - g.x));
+      }
+    }
+    return o;
+  }
+
+  function pointerX(ev) {
+    if (ev.touches && ev.touches.length) return ev.touches[0].clientX;
+    if (ev.changedTouches && ev.changedTouches.length) return ev.changedTouches[0].clientX;
+    return ev.clientX;
+  }
+
+  function onDown(ev) {
+    events.push({ type: "grab", x: pointerX(ev) });
+    dragging = true;
+    if (ev.preventDefault) ev.preventDefault();
+  }
+  function onMove(ev) {
+    if (!dragging) return;
+    events.push({ type: "move", x: pointerX(ev) });
+    if (ev.preventDefault) ev.preventDefault();
+  }
+  function onUp(ev) {
+    if (!dragging) return;
+    events.push({ type: "release", x: pointerX(ev) });
+    dragging = false;
+    if (ev.preventDefault) ev.preventDefault();
+  }
+
+  if (canvas.addEventListener) {
+    canvas.addEventListener("pointerdown", onDown);
+    canvas.addEventListener("pointermove", onMove);
+    canvas.addEventListener("pointerup", onUp);
+    canvas.addEventListener("pointercancel", onUp);
+    canvas.addEventListener("touchstart", onDown, { passive: false });
+    canvas.addEventListener("touchmove", onMove, { passive: false });
+    canvas.addEventListener("touchend", onUp, { passive: false });
+    canvas.addEventListener("mousedown", onDown);
+    canvas.addEventListener("mousemove", onMove);
+    canvas.addEventListener("mouseup", onUp);
+  }
+
+  // ---- drawing ----
+
+  function drawFlakes(layer, g, ox, oy, printed) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(g.px, g.py, g.pw, g.ph);
+    ctx.clip();
+    ctx.translate(ox, oy);
+    for (var i = 0; i < layer.length; i++) {
+      var f = layer[i];
+      ctx.save();
+      ctx.translate(g.px + f.cx * g.pw, g.py + f.cy * g.ph);
+      ctx.rotate(f.ang);
+      ctx.scale(f.len * g.pw, f.wid * g.pw);
+      ctx.beginPath();
+      ctx.moveTo(f.pts[0][0], f.pts[0][1]);
+      for (var k = 1; k < f.pts.length; k++) ctx.lineTo(f.pts[k][0], f.pts[k][1]);
+      ctx.closePath();
+      if (printed) {
+        // The print sits on the surface as darker ink: a flat tone at
+        // partial strength, no blend mode, so the doubling reads as a
+        // misregistered darker twin of the wood.
+        ctx.globalAlpha = f.alpha;
+        ctx.fillStyle = PRINT;
+      } else {
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = FLAKES[f.ci];
+      }
+      ctx.fill();
+      ctx.restore();
+    }
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
+  function draw() {
+    if (W === 0) resize();
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    canvas.style.width = W + "px";
+    canvas.style.height = H + "px";
+
+    var g = geom();
+    var off = offsetAt();
+
+    // Wall.
+    ctx.fillStyle = WALL;
+    ctx.fillRect(0, 0, W, H);
+
+    // The panel floats a breath off the wall.
+    ctx.fillStyle = PANEL_SHADOW;
+    ctx.fillRect(g.px + 7, g.py + 9, g.pw, g.ph);
+
+    // Panel base coat, so no gap between flakes shows the wall.
+    ctx.fillStyle = BASE;
+    ctx.fillRect(g.px, g.py, g.pw, g.ph);
+
+    // The actual layer: sharp procedural flakes, fixed to the panel.
+    drawFlakes(actualLayer, g, 0, 0, false);
+
+    // The depicted layer: the same kind of surface, printed darker
+    // and shifted by the schism offset.
+    drawFlakes(printLayer, g, off, Math.round(off * VSH), true);
+
+    // A hairline of the shadow tone seats the panel's edge.
+    ctx.strokeStyle = "rgba(58,36,16,0.45)";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(g.px + 0.5, g.py + 0.5, g.pw - 1, g.ph - 1);
+
+    // The floor: one thin saturated blue strip the panel stands on.
+    ctx.fillStyle = BLUE;
+    ctx.fillRect(0, H - g.stripH, W, g.stripH);
+  }
+
+  function frame() {
+    draw();
+    if (typeof requestAnimationFrame === "function") {
+      requestAnimationFrame(frame);
+    }
+  }
+
+  resize();
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener("resize", function () { resize(); draw(); });
+  }
+  window.addEventListener("resize", function () { resize(); draw(); });
+
+  // Frame one: the synchronous draw at the initial 8px offset.
+  draw();
+  if (typeof requestAnimationFrame === "function") {
+    requestAnimationFrame(frame);
+  }
+})();
+</script>
+</body>
+</html>

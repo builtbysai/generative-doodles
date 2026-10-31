@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Burnt Edge</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #111111; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // Palette (strict): clouded silver, the amber-brown stain entering at its
+  // lightest, the deep tarnish it settles into, the near-black ground.
+  var SILVER = [196, 196, 196];
+  var STAIN  = [138, 90, 42];
+  var DEEP   = [74, 46, 18];
+  var GROUND = '#111111';
+
+  var LOOP = 60; // seconds, seamless: grow 46, hold 8, fade 6
+
+  // Frame-one phase: the synchronous first frame is drawn at loop t = T0,
+  // seventeen seconds into the growth, so the stain is already established
+  // at the top, bottom, and left edges while the centre is still silver.
+  // A fully clean panel would hide the subject. The animation continues
+  // from this phase; the loop point itself passes through clean silver.
+  var T0 = 17;
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // mulberry32: deterministic seeded RNG
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function viewportSize() {
+    var w, h;
+    if (window.visualViewport) {
+      w = window.visualViewport.width;
+      h = window.visualViewport.height;
+    } else {
+      w = window.innerWidth;
+      h = window.innerHeight;
+    }
+    return { w: Math.max(1, Math.round(w)), h: Math.max(1, Math.round(h)) };
+  }
+
+  function isPhone(w, h) {
+    var sw = 0, sh = 0;
+    if (window.screen) {
+      sw = window.screen.width || 0;
+      sh = window.screen.height || 0;
+    }
+    var mn = Math.min(sw, sh);
+    if (mn > 0) return mn < 700;
+    return h > w * 1.15;
+  }
+
+  function clamp01(x) { return x < 0 ? 0 : (x > 1 ? 1 : x); }
+  function smoother(x) { x = clamp01(x); return x * x * x * (x * (x * 6 - 15) + 10); }
+
+  // Seeded value noise: a lattice of random values, smoothstep-interpolated.
+  // lattice = number of cells across the panel; sampling is in panel uv.
+  function makeNoise(lattice, seed) {
+    var rng = mulberry32(seed);
+    var n = lattice + 1, grid = new Float32Array(n * n), i;
+    for (i = 0; i < n * n; i++) grid[i] = rng();
+    return function (u, v) {
+      var x = u * lattice, y = v * lattice;
+      var xi = Math.min(lattice - 1, Math.floor(x)), yi = Math.min(lattice - 1, Math.floor(y));
+      var xf = x - xi, yf = y - yi;
+      var sx = xf * xf * (3 - 2 * xf), sy = yf * yf * (3 - 2 * yf);
+      var a = grid[yi * n + xi], b = grid[yi * n + xi + 1];
+      var c = grid[(yi + 1) * n + xi], d = grid[(yi + 1) * n + xi + 1];
+      return (a + (b - a) * sx) + ((c + (d - c) * sx) - (a + (b - a) * sx)) * sy;
+    };
+  }
+
+  // ---------- precomputed field (function of size only, fixed seeds) ----------
+  // The panel is sampled as an NC x NC grid of cells. Per cell we store the
+  // growth threshold for each edge: the loop-growth value at which the stain
+  // front reaches that cell from that edge. Threshold = edge distance /
+  // (edge reach x noise modulation), so the front is an irregular organic
+  // bloom, never a geometric wipe. Also stored: a mottle value (how much the
+  // silver clouds there) and a depth-noise value (how dark the stain settles).
+  var NC = 144;
+
+  var layout = null;
+
+  function buildLayout(w, h) {
+    var phone = isPhone(w, h);
+    var side = Math.min(w, h) * (phone ? 0.84 : 0.78);
+    var px = (w - side) / 2, py = (h - side) / 2;
+
+    var nFront = makeNoise(4, 80911);  // low frequency: the bloom's fingers
+    var nFrontHi = makeNoise(9, 80941); // second octave: breaks the fingers' regularity
+    var nDepth = makeNoise(7, 80923);  // mid frequency: stain depth variation
+    var nMottle = makeNoise(11, 80937); // finer: silver clouding
+
+    // Maximum stain reach per edge, as a fraction of the panel side.
+    // Left strongest, top and bottom close behind, right deliberately weak.
+    var reachL = 0.88, reachT = 0.82, reachB = 0.80, reachR = 0.30;
+
+    var tL = new Float32Array(NC * NC), tT = new Float32Array(NC * NC);
+    var tB = new Float32Array(NC * NC), tR = new Float32Array(NC * NC);
+    var mott = new Float32Array(NC * NC), depN = new Float32Array(NC * NC);
+
+    for (var j = 0; j < NC; j++) {
+      var v = (j + 0.5) / NC;
+      for (var i = 0; i < NC; i++) {
+        var u = (i + 0.5) / NC, k = j * NC + i;
+        // Each edge reads the front noise through a different mirror, so the
+        // four blooms do not share one fingerprint.
+        var mL = 0.60 + 0.52 * nFront(u, v) + 0.28 * nFrontHi(u, v);
+        var mT = 0.60 + 0.52 * nFront(1 - u, v) + 0.28 * nFrontHi(1 - u, v);
+        var mB = 0.60 + 0.52 * nFront(u, 1 - v) + 0.28 * nFrontHi(u, 1 - v);
+        var mR = 0.60 + 0.52 * nFront(1 - v, 1 - u) + 0.28 * nFrontHi(1 - v, 1 - u);
+        tL[k] = u / (reachL * mL);
+        tT[k] = v / (reachT * mT);
+        tB[k] = (1 - v) / (reachB * mB);
+        tR[k] = (1 - u) / (reachR * mR);
+        mott[k] = nMottle(u, v);
+        depN[k] = nDepth(u, v);
+      }
+    }
+
+    return {
+      w: w, h: h, px: px, py: py, side: side,
+      tL: tL, tT: tT, tB: tB, tR: tR, mott: mott, depN: depN
+    };
+  }
+
+  // Growth over the loop: a slow ease across 46 s, an 8 s hold at full
+  // tarnish, then a gentle 6 s fade back to clean silver.
+  function growth(lt) {
+    if (lt < 46) return smoother(lt / 46);
+    if (lt < 54) return 1;
+    return 1 - smoother((lt - 54) / 6);
+  }
+
+  function rgb(c) { return 'rgb(' + c[0] + ',' + c[1] + ',' + c[2] + ')'; }
+  function mix(a, b, f) {
+    return [
+      Math.round(a[0] + (b[0] - a[0]) * f),
+      Math.round(a[1] + (b[1] - a[1]) * f),
+      Math.round(a[2] + (b[2] - a[2]) * f)
+    ];
+  }
+
+  // ---------- drawing ----------
+
+  function draw(t) {
+    var size = viewportSize();
+    if (!layout || layout.w !== size.w || layout.h !== size.h) {
+      canvas.width = size.w;
+      canvas.height = size.h;
+      layout = buildLayout(size.w, size.h);
+    }
+    canvas.style.width = size.w + 'px';
+    canvas.style.height = size.h + 'px';
+
+    var w = layout.w, h = layout.h;
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = GROUND;
+    ctx.fillRect(0, 0, w, h);
+
+    var px = layout.px, py = layout.py, side = layout.side;
+    var lt = (t + T0) % LOOP;
+    var G = growth(lt) * 1.08; // slight overshoot so the hold is fully tarnished
+    var SOFT = 0.09;           // front softness, in growth units
+    var cell = side / NC, over = 0.7;
+
+    // the silver panel
+    ctx.fillStyle = rgb(SILVER);
+    ctx.fillRect(px, py, side, side);
+
+    var tL = layout.tL, tT = layout.tT, tB = layout.tB, tR = layout.tR;
+    var mott = layout.mott, depN = layout.depN;
+
+    for (var j = 0; j < NC; j++) {
+      var y = py + j * cell;
+      for (var i = 0; i < NC; i++) {
+        var k = j * NC + i;
+        // stain amount and depth from the winning (earliest) edge
+        var sL = clamp01((G - tL[k]) / SOFT), sT = clamp01((G - tT[k]) / SOFT);
+        var sB = clamp01((G - tB[k]) / SOFT), sR = clamp01((G - tR[k]) / SOFT);
+        var s = sL, tw = tL[k];
+        if (sT > s) { s = sT; tw = tT[k]; }
+        if (sB > s) { s = sB; tw = tB[k]; }
+        if (sR > s) { s = sR; tw = tR[k]; }
+        var tmin = Math.min(tL[k], tT[k], tB[k], tR[k]);
+
+        if (s < 1) {
+          // clouding: the silver is faintly mottled everywhere, and clouds
+          // harder just ahead of the advancing front, where the bath's
+          // memory arrives before the stain itself
+          var prox = clamp01(1 - Math.abs(tmin - G) / 0.30);
+          var ca = mott[k] * (0.05 + 0.13 * prox);
+          if (ca > 0.012) {
+            ctx.globalAlpha = ca;
+            ctx.fillStyle = rgb(DEEP);
+            ctx.fillRect(px + i * cell - 0.3, y - 0.3, cell + over, cell + over);
+          }
+        }
+        if (s > 0) {
+          var depth = clamp01((G - tw) / 0.5) * (0.78 + 0.28 * depN[k]);
+          if (depth > 1) depth = 1;
+          ctx.globalAlpha = s * (0.90 + 0.10 * depN[k]);
+          ctx.fillStyle = rgb(mix(STAIN, DEEP, depth));
+          ctx.fillRect(px + i * cell - 0.3, y - 0.3, cell + over, cell + over);
+        }
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // frame one: synchronous, at the fixed phase T0 (stain established)
+  draw(0);
+
+  var start = null;
+  function frame(ts) {
+    if (start === null) start = ts;
+    draw(((ts - start) / 1000) % LOOP);
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+  }
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+
+  function onResize() { draw(0); }
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', onResize);
+  }
+  window.addEventListener('resize', onResize);
+})();
+</script>
+</body>
+</html>

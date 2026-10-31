@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Foggy Mirror</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #1A1A1A; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+// The Foggy Mirror - EXPANSION #99 jacob-kassay, block 1.
+// A silvered canvas: the piece IS the reflection. A simulated room
+// (bright window, dark doorway, warm and cool patches) is blurred into
+// the fog of the metal by nested low-alpha shapes. Oxidation creeps the
+// top, bottom, and left margins. Dragging turns the room; idle, it drifts.
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function mix(h1, h2, f) {
+  var a = [parseInt(h1.slice(1, 3), 16), parseInt(h1.slice(3, 5), 16), parseInt(h1.slice(5, 7), 16)];
+  var b = [parseInt(h2.slice(1, 3), 16), parseInt(h2.slice(3, 5), 16), parseInt(h2.slice(5, 7), 16)];
+  return "rgb(" + Math.round(a[0] + (b[0] - a[0]) * f) + "," +
+                  Math.round(a[1] + (b[1] - a[1]) * f) + "," +
+                  Math.round(a[2] + (b[2] - a[2]) * f) + ")";
+}
+
+// Palette (strict). Tints are mixes of these only, recorded in process.md.
+var GROUND = "#1A1A1A";
+var SILVER_HI = "#C8C8C8", SILVER_LO = "#A9A9A9", WEAVE = "#BDBDBD";
+var OX_HI = "#8A5A2A", OX_LO = "#4A2E12";
+var WIN_TINT = mix(SILVER_HI, "#FFFFFF", 0.0); // window core uses SILVER_HI mixes below
+var WARM = mix(SILVER_HI, OX_HI, 0.16);        // warm patch: silver warmed by oxidation tone
+var COOL = mix(SILVER_LO, GROUND, 0.10);       // cool patch: silver cooled toward the room dark
+var DOOR = mix(SILVER_LO, GROUND, 0.52);       // doorway ghost: silver sunk toward ground
+
+var canvas = document.getElementById("c");
+var ctx = canvas.getContext("2d");
+var W = 0, H = 0, DPR = 1;
+
+function resize() {
+  var w = window.innerWidth, h = window.innerHeight;
+  if (window.visualViewport) { w = window.visualViewport.width; h = window.visualViewport.height; }
+  DPR = window.devicePixelRatio || 1;
+  W = Math.round(w); H = Math.round(h);
+  canvas.width = Math.round(W * DPR);
+  canvas.height = Math.round(H * DPR);
+}
+if (window.visualViewport) window.visualViewport.addEventListener("resize", function () { resize(); draw(now()); });
+window.addEventListener("resize", function () { resize(); draw(now()); });
+
+// ---------- seeded precomputed data (panel-relative units, 0..1) ----------
+var rng = mulberry32(808001);
+
+// Per-layer center jitter: breaks concentric rings so soft shapes mottle.
+function makeJit(layers, amt) {
+  var arr = [];
+  for (var i = 0; i < layers; i++) arr.push({ x: (rng() * 2 - 1) * amt, y: (rng() * 2 - 1) * amt });
+  return arr;
+}
+
+// Clouding: large soft tonal patches in the silver itself.
+var clouds = [];
+for (var i = 0; i < 26; i++) {
+  clouds.push({
+    x: rng(), y: rng(), r: 0.16 + rng() * 0.30,
+    tone: rng() < 0.5 ? SILVER_HI : SILVER_LO, a: 0.05 + rng() * 0.05, depth: 0.10,
+    jit: makeJit(6, 0.03)
+  });
+}
+// Reflected room shapes. depth = parallax factor under viewpoint shift.
+var roomShapes = [
+  // warm ceiling patch, upper right
+  { kind: "blob", x: 0.70, y: 0.16, rx: 0.34, ry: 0.13, tone: WARM, a: 0.34, layers: 9, depth: 0.65 },
+  // cool patch, lower left
+  { kind: "blob", x: 0.26, y: 0.80, rx: 0.32, ry: 0.15, tone: COOL, a: 0.38, layers: 9, depth: 0.60 },
+  // doorway: dark rectangle, right-center, soft nested rects
+  { kind: "rect", x: 0.66, y: 0.30, w: 0.24, h: 0.52, tone: DOOR, a: 0.40, layers: 16, depth: 0.55 },
+  // window: bright rectangle, upper left-center (drawn last, most present)
+  { kind: "rect", x: 0.15, y: 0.09, w: 0.38, h: 0.32, tone: SILVER_HI, a: 0.74, layers: 14, depth: 1.00 }
+];
+for (var rs = 0; rs < roomShapes.length; rs++) roomShapes[rs].jit = makeJit(roomShapes[rs].layers, 0.012);
+// Window inner cross mullion ghost (two faint seams inside the window).
+var mullions = [
+  { x: 0.335, y: 0.09, w: 0.020, h: 0.32 }, { x: 0.15, y: 0.245, w: 0.38, h: 0.020 }
+];
+// Weave: seeded micro-speckle ghosts.
+var weave = [];
+for (var j = 0; j < 2600; j++) {
+  weave.push({ x: rng(), y: rng(), s: 0.6 + rng() * 1.1, tone: rng() < 0.62 ? WEAVE : SILVER_LO, a: 0.07 + rng() * 0.06, depth: 0.15 });
+}
+// Oxidation: a per-cell threshold field along the top, bottom, and left
+// edge bands (the No.809 construction). Each cell's alpha is a seeded
+// low-frequency noise field times an inward falloff: densest at the edge
+// line, feathering to an irregular front 10-20% inward. Cells are small
+// overlapping rects at low alpha, so the aggregate reads as one
+// continuous creeping stain with no round units.
+var noiseGrid = [];
+for (var ng = 0; ng < 32 * 32; ng++) noiseGrid.push(rng());
+function vnoise(x, y) {
+  var xi = Math.floor(x), yi = Math.floor(y);
+  var xf = x - xi, yf = y - yi;
+  var sx = xf * xf * (3 - 2 * xf), sy = yf * yf * (3 - 2 * yf);
+  function gv(i, j) { return noiseGrid[((j & 31) << 5) + (i & 31)]; }
+  var na = gv(xi, yi), nb = gv(xi + 1, yi), nc = gv(xi, yi + 1), nd = gv(xi + 1, yi + 1);
+  return na + (nb - na) * sx + (nc - na) * sy + (na - nb - nc + nd) * sx * sy;
+}
+// Panel aspect is fixed (pw = 0.60 * ph), so a cell square in px has
+// y-fraction height = x-fraction width * 0.60. Field coordinates
+// (u along the edge, d inward) are kept in pw units on both axes.
+var stainCells = [];
+function stainBand(edge, bandDepth, seedOff) {
+  var passes = [
+    { step: 0.024, aMax: 0.24, frontMul: 1.00 },  // coarse stain body
+    { step: 0.011, aMax: 0.13, frontMul: 1.07 }   // fine mottle, front a touch deeper
+  ];
+  var edgeLen = edge === "left" ? 1 / 0.60 : 1;
+  for (var pi = 0; pi < passes.length; pi++) {
+    var P = passes[pi];
+    var cols = Math.ceil(edgeLen / P.step), rows = Math.ceil(bandDepth / P.step);
+    for (var i2 = 0; i2 < cols; i2++) {
+      for (var j2 = 0; j2 < rows; j2++) {
+        var u = (i2 + 0.5) * P.step;
+        var d = (j2 + 0.5) * P.step;
+        // Irregular front: the creep reach undulates along the edge.
+        var reach = bandDepth * (0.55 + 0.75 * vnoise(u * 5 + seedOff, seedOff * 3.1)) * P.frontMul;
+        if (d > reach) continue;
+        var inten = 1 - d / reach; // 1 at the edge line, 0 at the front
+        var mott = 0.55 + 0.65 * vnoise(u * 9 + seedOff * 7.3, d * 12 + seedOff);
+        var a = P.aMax * Math.pow(inten, 1.35) * mott * (0.8 + 0.4 * rng());
+        if (a < 0.015) continue;
+        // Seeded position jitter breaks the cell lattice, so overlaps
+        // land irregularly and no woven grid can form.
+        var ju = (rng() * 2 - 1) * P.step * 0.45;
+        var jd = (rng() * 2 - 1) * P.step * 0.45;
+        var cell = { tone: mix(OX_HI, OX_LO, Math.min(1, inten * 1.15)), a: a, w: P.step * 2.0, h: P.step * 2.0 * 0.60 };
+        if (edge === "top") { cell.x = u - P.step / 2 + ju; cell.y = (d - P.step / 2) * 0.60 + jd * 0.60; }
+        else if (edge === "bottom") { cell.x = u - P.step / 2 + ju; cell.y = 1 - (d + P.step / 2) * 0.60 - jd * 0.60; }
+        else { cell.x = d - P.step / 2 + jd; cell.y = u * 0.60 - P.step * 0.30 + ju * 0.60; }
+        stainCells.push(cell);
+      }
+    }
+  }
+}
+stainBand("top", 0.26, 0.0);
+stainBand("bottom", 0.24, 11.7);
+stainBand("left", 0.24, 23.9);
+
+// ---------- viewpoint: closed form of (drag samples, t) ----------
+var drags = []; // {t0, t1, dx, dy} completed or active drags, in CSS px deltas
+var active = null;
+var T0 = (typeof performance !== "undefined" && performance.now) ? performance.now() : 0;
+function now() { return (((typeof performance !== "undefined" && performance.now) ? performance.now() : 0) - T0) / 1000; }
+
+function dragOffset(t) {
+  // Sum of drag contributions: while a drag runs it holds its current delta;
+  // after release the delta decays back to rest over ~7 s (closed form).
+  var ox = 0, oy = 0;
+  for (var i = 0; i < drags.length; i++) {
+    var d = drags[i];
+    if (t < d.t0) continue;
+    if (d.t1 === null || t <= d.t1) { ox += d.dx; oy += d.dy; }
+    else {
+      var k = Math.exp(-(t - d.t1) / 2.4);
+      ox += d.dx * k; oy += d.dy * k;
+    }
+  }
+  return { x: ox, y: oy };
+}
+function viewpoint(t) {
+  // Idle drift: gentle slow sway, phase 0 at t=0.
+  var driftX = Math.sin(t * 0.11) * 10 + Math.sin(t * 0.043 + 1.3) * 6;
+  var driftY = Math.sin(t * 0.083 + 0.6) * 6;
+  var d = dragOffset(t);
+  var vx = (driftX + d.x) / Math.max(W, 1);
+  var vy = (driftY + d.y) / Math.max(H, 1);
+  // Clamp so the room slides but never leaves the fog.
+  vx = Math.max(-0.10, Math.min(0.10, vx));
+  vy = Math.max(-0.07, Math.min(0.07, vy));
+  return { x: vx, y: vy };
+}
+
+function softRect(x, y, w, h, tone, alpha, layers, jit) {
+  // Nested shrinking rects: softness built from flat alpha layers.
+  ctx.fillStyle = tone;
+  for (var i = 0; i < layers; i++) {
+    var f = i / layers;
+    var inset = f * 0.22;
+    var jx = jit ? jit[i].x * w : 0, jy = jit ? jit[i].y * h : 0;
+    ctx.globalAlpha = alpha / layers * 1.9;
+    ctx.fillRect(x + w * inset * 0.5 + jx, y + h * inset * 0.5 + jy, w * (1 - inset), h * (1 - inset));
+  }
+  ctx.globalAlpha = 1;
+}
+function softBlob(cx, cy, rx, ry, tone, alpha, layers, jit) {
+  ctx.fillStyle = tone;
+  for (var i = 0; i < layers; i++) {
+    var f = i / layers;
+    var jx = jit ? jit[i].x * rx * 2 : 0, jy = jit ? jit[i].y * ry * 2 : 0;
+    ctx.globalAlpha = (alpha / layers) * 1.9;
+    ctx.beginPath();
+    ctx.ellipse(cx + jx, cy + jy, rx * (1 - f * 0.55), ry * (1 - f * 0.55), 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function draw(t) {
+  if (W === 0) resize();
+  canvas.style.width = W + "px";
+  canvas.style.height = H + "px";
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = GROUND;
+  ctx.fillRect(0, 0, W, H);
+
+  var isPhone = (window.screen && Math.min(window.screen.width, window.screen.height) < 700) || H > W * 1.15;
+  // Panel geometry: tall rectangle, centered, generous margins.
+  var pw = Math.min(W * (isPhone ? 0.78 : 0.42), H * 0.52);
+  var ph = pw / 0.60;
+  if (ph > H * 0.88) { ph = H * 0.88; pw = ph * 0.60; }
+  var px = (W - pw) / 2, py = (H - ph) / 2;
+  var vp = viewpoint(t);
+
+  // Float shadow: layered offset dark shapes (no blur in this house).
+  for (var s = 6; s >= 1; s--) {
+    ctx.globalAlpha = 0.05;
+    ctx.fillStyle = "#000000";
+    ctx.fillRect(px + s * 2.2, py + s * 3.0, pw, ph);
+  }
+  ctx.globalAlpha = 1;
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(px, py, pw, ph);
+  ctx.clip();
+
+  // Silver base: a mid mix, then clouding patches.
+  ctx.fillStyle = mix(SILVER_HI, SILVER_LO, 0.45);
+  ctx.fillRect(px, py, pw, ph);
+  for (var c = 0; c < clouds.length; c++) {
+    var cl = clouds[c];
+    softBlob(px + (cl.x + vp.x * cl.depth) * pw, py + (cl.y + vp.y * cl.depth) * ph,
+             cl.r * pw, cl.r * pw, cl.tone, cl.a, 6, cl.jit);
+  }
+  // Reflected room.
+  for (var r = 0; r < roomShapes.length; r++) {
+    var sh = roomShapes[r];
+    var ox = vp.x * sh.depth, oy = vp.y * sh.depth;
+    if (sh.kind === "rect") {
+      softRect(px + (sh.x + ox) * pw, py + (sh.y + oy) * ph, sh.w * pw, sh.h * ph, sh.tone, sh.a, sh.layers, sh.jit);
+    } else {
+      softBlob(px + (sh.x + ox) * pw, py + (sh.y + oy) * ph, sh.rx * pw, sh.ry * ph, sh.tone, sh.a, sh.layers, sh.jit);
+    }
+  }
+  // Mullion ghosts inside the window (move with the window's depth): faint,
+  // wide, doubled so the seam reads as fog, not as a drawn cross.
+  ctx.fillStyle = mix(SILVER_LO, GROUND, 0.25);
+  for (var n = 0; n < mullions.length; n++) {
+    var mu = mullions[n];
+    for (var ml = 0; ml < 3; ml++) {
+      ctx.globalAlpha = 0.055;
+      var grow = 1 + ml * 0.9;
+      // Grow only the seam's thickness; its length stays inside the window.
+      if (mu.h > mu.w) {
+        ctx.fillRect(px + (mu.x + vp.x - mu.w * (grow - 1) / 2) * pw, py + (mu.y + vp.y) * ph, mu.w * grow * pw, mu.h * ph);
+      } else {
+        ctx.fillRect(px + (mu.x + vp.x) * pw, py + (mu.y + vp.y - mu.h * (grow - 1) / 2) * ph, mu.w * pw, mu.h * grow * ph);
+      }
+    }
+  }
+  ctx.globalAlpha = 1;
+  // Weave speckle.
+  for (var q = 0; q < weave.length; q++) {
+    var wv = weave[q];
+    ctx.globalAlpha = wv.a;
+    ctx.fillStyle = wv.tone;
+    ctx.fillRect(px + (wv.x + vp.x * wv.depth) * pw, py + (wv.y + vp.y * wv.depth) * ph, wv.s, wv.s * 0.6);
+  }
+  ctx.globalAlpha = 1;
+  // Oxidation: the precomputed per-cell stain field, fixed to the
+  // surface, never slides. Densest at the edge lines, feathering inward.
+  for (var z = 0; z < stainCells.length; z++) {
+    var sc = stainCells[z];
+    ctx.globalAlpha = sc.a;
+    ctx.fillStyle = sc.tone;
+    ctx.fillRect(px + sc.x * pw, py + sc.y * ph, sc.w * pw, sc.h * ph);
+  }
+  ctx.globalAlpha = 1;
+  // Faint overall vertical tonal falloff in flat bands (clouded, not polished).
+  for (var b = 0; b < 7; b++) {
+    ctx.globalAlpha = 0.028;
+    ctx.fillStyle = b % 2 ? SILVER_LO : SILVER_HI;
+    ctx.fillRect(px, py + (ph * b) / 7, pw, ph / 7 + 1);
+  }
+  ctx.globalAlpha = 1;
+  ctx.restore();
+
+  // Panel edge: a hairline of the darker silver.
+  ctx.strokeStyle = mix(SILVER_LO, GROUND, 0.35);
+  ctx.globalAlpha = 0.6;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(px + 0.5, py + 0.5, pw - 1, ph - 1);
+  ctx.globalAlpha = 1;
+}
+
+// ---------- pointer: drag turns the room ----------
+function ptr(e) { return { x: e.clientX, y: e.clientY }; }
+canvas.addEventListener("pointerdown", function (e) {
+  var p = ptr(e);
+  active = { t0: now(), t1: null, dx: 0, dy: 0, lx: p.x, ly: p.y };
+  drags.push(active);
+  if (canvas.setPointerCapture) { try { canvas.setPointerCapture(e.pointerId); } catch (err) {} }
+});
+canvas.addEventListener("pointermove", function (e) {
+  if (!active) return;
+  var p = ptr(e);
+  active.dx += (p.x - active.lx) * 0.55;
+  active.dy += (p.y - active.ly) * 0.55;
+  active.lx = p.x; active.ly = p.y;
+});
+function endDrag() { if (active) { active.t1 = now(); active = null; } }
+canvas.addEventListener("pointerup", endDrag);
+canvas.addEventListener("pointercancel", endDrag);
+
+resize();
+draw(0);
+if (typeof requestAnimationFrame !== "undefined") {
+  var loop = function () { draw(now()); requestAnimationFrame(loop); };
+  requestAnimationFrame(loop);
+}
+</script>
+</body>
+</html>
