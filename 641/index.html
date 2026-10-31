@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Doce Metros</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0C0F14; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded RNG (mulberry32) ----------
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  var SEEDBASE = 641013;
+  var FORCED_OFF = null;
+  // QA hooks via ?seed=: "off<px>" forces a static strip offset (wrap check),
+  // a bare number reseeds the strip. No effect in normal viewing.
+  (function parseQuery() {
+    var q = (typeof location !== 'undefined' && location.search) || '';
+    var m = q.match(/seed=([^&]+)/);
+    if (!m) return;
+    var v = m[1];
+    if (v.indexOf('off') === 0) {
+      var f = parseFloat(v.slice(3));
+      if (!isNaN(f)) FORCED_OFF = f;
+    } else {
+      var n = parseInt(v, 10);
+      if (!isNaN(n)) SEEDBASE = n;
+    }
+  })();
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ---------- palette (strict, no other hues) ----------
+  var GROUND = '#0C0F14';  // near-black ground / sky
+  var FAR = '#2E3A4A';     // far ridge
+  var MID = '#1E2836';     // mid ridge / folio tabs
+  var NEAR = '#141B26';    // near ridge
+  var SNOW = '#E8EDF2';    // snow caps
+  var AMBER = '#E8A33D';   // dawn band / tab tick
+
+  function clamp(x, a, b) { return x < a ? a : (x > b ? b : x); }
+  function mod(n, m) { return ((n % m) + m) % m; }
+
+  // ---------- sizing (Visual Viewport API) ----------
+  var W = 0, H = 0, lastElapsed = 0;
+  function resize() {
+    var vv = window.visualViewport;
+    W = Math.round(vv ? vv.width : window.innerWidth);
+    H = Math.round(vv ? vv.height : window.innerHeight);
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = W * dpr;
+    canvas.height = H * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    draw(lastElapsed);
+  }
+  if (window.visualViewport) window.visualViewport.addEventListener('resize', resize);
+  window.addEventListener('resize', resize);
+
+  function isPhone(w, h) {
+    var sw = (window.screen && window.screen.width) || w;
+    var sh = (window.screen && window.screen.height) || h;
+    if (Math.min(sw, sh) < 700) return true;
+    return h > w * 1.15;
+  }
+
+  // ---------- toroidal ridgelines ----------
+  // Each ridge is 1D midpoint displacement on a ring: N samples span one
+  // strip segment (3 screen widths) and sample N is sample 0, so the height
+  // function is periodic with the segment and the wrap has no seam.
+  var N = 256;
+  function genRidge(seed, base, scale0, rough) {
+    var rng = mulberry32(seed);
+    var a = new Array(N + 1);
+    a[0] = base; a[N] = base;
+    (function fill(lo, hi, s) {
+      if (hi - lo <= 1) return;
+      var mid = (lo + hi) >> 1;
+      a[mid] = (a[lo] + a[hi]) / 2 + (rng() * 2 - 1) * s;
+      fill(lo, mid, s * rough);
+      fill(mid, hi, s * rough);
+    })(0, N, scale0);
+    // normalize to [0.04, 1] so each ridge uses its full relief; the two
+    // endpoints share one value before and after, so the ring stays closed
+    var mn = Infinity, mx = -Infinity, i;
+    for (i = 0; i <= N; i++) { if (a[i] < mn) mn = a[i]; if (a[i] > mx) mx = a[i]; }
+    var span = (mx - mn) || 1;
+    for (i = 0; i <= N; i++) a[i] = 0.04 + (a[i] - mn) / span * 0.96;
+    return a;
+  }
+  function ridgeN(L, u) {
+    var x = mod(u, 1) * N;
+    var i = Math.floor(x), f = x - i;
+    return L.samples[i] + (L.samples[i + 1] - L.samples[i]) * f;
+  }
+
+  var LAYER_DEFS = [
+    { color: FAR,  num: 1,  den: 4,  baseY: 0.57, amp: 0.37, snowY: 0.290, base: 0.50, scale0: 0.50, rough: 0.68 },
+    { color: MID,  num: 11, den: 20, baseY: 0.76, amp: 0.40, snowY: 0.500, base: 0.50, scale0: 0.52, rough: 0.70 },
+    { color: NEAR, num: 1,  den: 1,  baseY: 1.05, amp: 0.47, snowY: 0.685, base: 0.50, scale0: 0.55, rough: 0.72 }
+  ];
+  var TAB_NUM = 11, TAB_DEN = 20; // tabs ride at mid-layer parallax
+
+  var gen = 0;              // reseed generation counter
+  var genStart = -10;       // elapsed time of last reseed (fade-in)
+  var layers = [];
+  var tabCount = 9, tabPhase = 0;
+
+  function buildAll() {
+    var rngT = mulberry32(SEEDBASE + gen * 104729 + 7);
+    tabCount = 8 + Math.floor(rngT() * 3);   // 8 to 10 tabs per segment
+    tabPhase = rngT();                        // fraction of one tab spacing
+    layers = [];
+    for (var i = 0; i < LAYER_DEFS.length; i++) {
+      var d = LAYER_DEFS[i];
+      var L = { color: d.color, num: d.num, den: d.den, baseY: d.baseY, amp: d.amp, snowY: d.snowY };
+      L.samples = genRidge(SEEDBASE + gen * 7919 + i * 131071 + 17, d.base, d.scale0, d.rough);
+      layers.push(L);
+    }
+  }
+  buildAll();
+
+  // ---------- state ----------
+  var off = 0;              // strip offset in px (near-layer space)
+  var dragging = false;
+  function effOff() { return FORCED_OFF !== null ? FORCED_OFF : off; }
+  function segW() { return 3 * W; }
+  // Layer offset in [0, segW). Written as mod(off, segW*den)*num/den so a
+  // whole-period base offset (20 segments) lands on exactly 0 per layer.
+  function layerOff(num, den) {
+    var sw = segW();
+    return mod(mod(effOff(), sw * den) * num / den, sw);
+  }
+
+  // ---------- drawing ----------
+  function ridgeY(L, wx) {
+    return L.baseY * H - L.amp * H * ridgeN(L, wx / segW());
+  }
+  function traceRidge(L, lo, step) {
+    ctx.beginPath();
+    ctx.moveTo(-6, H + 6);
+    for (var x = -6; x <= W + step; x += step) {
+      ctx.lineTo(x, ridgeY(L, x + lo));
+    }
+    ctx.lineTo(W + 6, H + 6);
+    ctx.closePath();
+  }
+  function drawLayer(L, step) {
+    var lo = layerOff(L.num, L.den);
+    ctx.fillStyle = L.color;
+    traceRidge(L, lo, step);
+    ctx.fill();
+    // snow: the same silhouette clipped to above the layer's fixed snow
+    // line, so caps follow the ridge shape exactly and never float
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, 0, W, L.snowY * H);
+    ctx.clip();
+    ctx.fillStyle = SNOW;
+    traceRidge(L, lo, step);
+    ctx.fill();
+    ctx.restore();
+  }
+  function drawTabs() {
+    var sw = segW();
+    var spacing = sw / tabCount;
+    var lo = layerOff(TAB_NUM, TAB_DEN);
+    var phone = isPhone(W, H);
+    var tabW = clamp(W * 0.030, phone ? 26 : 20, 42);
+    var tabH = clamp(H * 0.062, 30, 60);
+    var sx = mod(tabPhase * spacing - lo, spacing) - spacing;
+    ctx.fillStyle = MID;
+    for (; sx < W + tabW; sx += spacing) {
+      ctx.fillRect(sx - tabW / 2, 0, tabW, tabH);
+    }
+    ctx.fillStyle = AMBER;
+    sx = mod(tabPhase * spacing - lo, spacing) - spacing;
+    for (; sx < W + tabW; sx += spacing) {
+      ctx.fillRect(sx - 1.5, tabH * 0.36, 3, tabH * 0.32);
+    }
+  }
+
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    var step = Math.max(2, Math.round(W / 430));
+    // sky / ground
+    ctx.fillStyle = GROUND;
+    ctx.fillRect(0, 0, W, H);
+    // dawn-amber band: one flat rectangle behind the far ridge, hard edges
+    ctx.fillStyle = AMBER;
+    ctx.fillRect(0, H * 0.28, W, H * 0.25);
+    // ridges far to near
+    for (var i = 0; i < layers.length; i++) drawLayer(layers[i], step);
+    // folio tabs at the top edge
+    drawTabs();
+    // reseed fade: the new stretch fades in from the ground tone
+    var fa = t - genStart;
+    if (fa < 0.55) {
+      ctx.globalAlpha = clamp(1 - fa / 0.55, 0, 1);
+      ctx.fillStyle = GROUND;
+      ctx.fillRect(0, 0, W, H);
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  // ---------- interaction ----------
+  // DRAG horizontally unfolds the leporello (parallax per layer).
+  // DOUBLE-TAP reseeds: a new 12-metre stretch behind a brief fade.
+  var lastX = 0, lastTapT = -9, lastTapX = 0;
+  canvas.addEventListener('pointerdown', function (e) {
+    dragging = true;
+    lastX = e.clientX;
+    if (canvas.setPointerCapture) { try { canvas.setPointerCapture(e.pointerId); } catch (err) {} }
+    if (lastElapsed - lastTapT < 0.4 && Math.abs(e.clientX - lastTapX) < 48) {
+      gen++;
+      buildAll();
+      genStart = lastElapsed;
+      lastTapT = -9;
+    } else {
+      lastTapT = lastElapsed; lastTapX = e.clientX;
+    }
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (!dragging) return;
+    off -= (e.clientX - lastX);
+    lastX = e.clientX;
+  });
+  function endDrag() { dragging = false; }
+  canvas.addEventListener('pointerup', endDrag);
+  canvas.addEventListener('pointercancel', endDrag);
+
+  // ---------- clock / loop (anchored elapsed, rAF guarded) ----------
+  var t0 = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+  var prevElapsed = 0;
+  function frame() {
+    var now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : t0;
+    var elapsed = (now - t0) / 1000;
+    var dt = Math.min(0.05, Math.max(0, elapsed - prevElapsed));
+    prevElapsed = elapsed;
+    lastElapsed = elapsed;
+    if (!dragging && FORCED_OFF === null) off += W * 0.006 * dt; // slow self drift
+    draw(elapsed);
+  }
+
+  resize();
+  draw(0); // synchronous first frame: offset 0, frame one of the strip
+  if (typeof requestAnimationFrame === 'function') {
+    var loop = function () { frame(); requestAnimationFrame(loop); };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cuaderno de Terreno</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #EFE7D3; height: 100%; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  var PAPER = '#EFE7D3';
+  var BORDER = '#1B2430';
+  var INK = '#2A3340';
+  var ACCENTS = ['#B4572E', '#5C7A4D', '#3A4E6B']; // rust, moss, dusk blue
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function isPhone(w, h) {
+    var sw = 1e9, sh = 1e9;
+    if (window.screen) { sw = window.screen.width; sh = window.screen.height; }
+    if (Math.min(sw, sh) < 700) return true;
+    return h > w * 1.15;
+  }
+
+  // ---------- plate model ----------
+  // types: 0 piolet, 1 crampon, 2 calafate, 3 chinchilla, 4 slope, 5 summit
+  var plateIndex = 0;
+  var plate = null;
+
+  function buildPlate(idx) {
+    var rng = mulberry32(0xC0FFEE + idx * 7919 + 13);
+    var order = [0, 1, 2, 3, 4, 5];
+    if (idx > 0) {
+      for (var i = order.length - 1; i > 0; i--) {
+        var j = Math.floor(rng() * (i + 1));
+        var t = order[i]; order[i] = order[j]; order[j] = t;
+      }
+    }
+    // accent assignment: grid adjacency (2 cols x 3 rows), shuffle attempts until valid
+    var acc = [0, 1, 2, 0, 1, 2];
+    var ok = false, tries = 0;
+    while (!ok && tries < 200) {
+      tries++;
+      for (var k = acc.length - 1; k > 0; k--) {
+        var m = Math.floor(rng() * (k + 1));
+        var t2 = acc[k]; acc[k] = acc[m]; acc[m] = t2;
+      }
+      ok = true;
+      for (var r = 0; r < 3; r++) for (var c = 0; c < 2; c++) {
+        var p = r * 2 + c;
+        if (c === 0 && acc[p] === acc[p + 1]) ok = false;
+        if (r < 2 && acc[p] === acc[p + 2]) ok = false;
+      }
+    }
+    var cards = [];
+    for (var n = 0; n < 6; n++) {
+      var crng = mulberry32(0xBEEF00 + idx * 104729 + n * 331 + 7);
+      cards.push({
+        type: order[n],
+        accent: ACCENTS[acc[n]],
+        seed: Math.floor(crng() * 1e9),
+        chanStart: 0,
+        wob: null
+      });
+    }
+    return cards;
+  }
+
+  // precompute wobble offsets for a card (deterministic from its seed)
+  function wobbleFor(card) {
+    if (card.wob) return card.wob;
+    var rng = mulberry32(card.seed);
+    var arr = [];
+    for (var i = 0; i < 300; i++) arr.push((rng() - 0.5) * 2);
+    card.wob = arr;
+    return arr;
+  }
+
+  plate = buildPlate(0);
+
+  var startTime = null; // anchored at first frame (rAF timestamp); frame one uses t=0
+
+  // ---------- drawing helpers ----------
+  // hand-wobbled polyline: points sampled from a segment list, each point jittered
+  function wobLine(pts, wi, amp) {
+    ctx.beginPath();
+    for (var i = 0; i < pts.length; i++) {
+      var p = pts[i];
+      var jx = (wi.arr[wi.i % wi.arr.length]) * amp; wi.i++;
+      var jy = (wi.arr[wi.i % wi.arr.length]) * amp; wi.i++;
+      if (i === 0) ctx.moveTo(p[0] + jx, p[1] + jy);
+      else ctx.lineTo(p[0] + jx, p[1] + jy);
+    }
+    ctx.stroke();
+  }
+  function wobEllipse(cx, cy, rx, ry, rot, wi, amp) {
+    var pts = [];
+    var N = 28;
+    for (var i = 0; i <= N; i++) {
+      var a = (i / N) * Math.PI * 2;
+      var x = Math.cos(a) * rx, y = Math.sin(a) * ry;
+      var xr = x * Math.cos(rot) - y * Math.sin(rot);
+      var yr = x * Math.sin(rot) + y * Math.cos(rot);
+      pts.push([cx + xr, cy + yr]);
+    }
+    wobLine(pts, wi, amp);
+  }
+  function wobArc(cx, cy, r, a0, a1, wi, amp) {
+    var pts = [];
+    var N = 20;
+    for (var i = 0; i <= N; i++) {
+      var a = a0 + (a1 - a0) * (i / N);
+      pts.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r]);
+    }
+    wobLine(pts, wi, amp);
+  }
+  function seg(x0, y0, x1, y1, n) {
+    var pts = [];
+    for (var i = 0; i <= n; i++) pts.push([x0 + (x1 - x0) * i / n, y0 + (y1 - y0) * i / n]);
+    return pts;
+  }
+
+  // ---------- specimens ----------
+  // each drawn inside card box (x,y,w,h), centered, with air. u = unit scale.
+  function drawPiolet(card, x, y, w, h, t) {
+    var wi = { arr: wobbleFor(card), i: 0 };
+    var rng = mulberry32(card.seed + 1);
+    var ang = (plateIndex === 0 && card.type === 0 ? -0.42 : -0.25 - rng() * 0.35);
+    var cx = x + w / 2, cy = y + h / 2;
+    var L = Math.min(w, h) * 0.62;
+    // shaft from bottom point to top point
+    var bx = cx + Math.sin(ang) * L * 0.5, by = cy + Math.cos(ang) * L * 0.5;
+    var tx = cx - Math.sin(ang) * L * 0.5, ty = cy - Math.cos(ang) * L * 0.5;
+    ctx.strokeStyle = INK; ctx.lineWidth = 2; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    wobLine(seg(bx, by, tx, ty, 8), wi, 0.7);
+    // head: pick arc curving one way, adze tick the other
+    var px = -Math.cos(ang), py = Math.sin(ang); // perpendicular
+    var pickPts = [];
+    for (var i = 0; i <= 10; i++) {
+      var s = i / 10;
+      pickPts.push([tx + px * L * 0.30 * s, ty + py * L * 0.30 * s + Math.sin(s * 1.9) * L * 0.10]);
+    }
+    wobLine(pickPts, wi, 0.6);
+    var adzePts = seg(tx - px * L * 0.02, ty - py * L * 0.02, tx - px * L * 0.16, ty - py * L * 0.16 + L * 0.05, 4);
+    wobLine(adzePts, wi, 0.6);
+    // wrist loop (accent) hanging from shaft near bottom
+    ctx.strokeStyle = card.accent;
+    wobArc(bx + L * 0.02, by + L * 0.06, L * 0.085, 0, Math.PI * 2, wi, 0.6);
+    // glint channel: period 9s, flash in first 0.35s
+    var ph = (t - card.chanStart) % 9;
+    if (ph >= 0 && ph < 0.35) {
+      var gx = pickPts[10][0], gy = pickPts[10][1];
+      var ga = 1 - ph / 0.35;
+      ctx.strokeStyle = INK; ctx.globalAlpha = ga; ctx.lineWidth = 1.6;
+      wobLine([[gx - 5, gy], [gx + 5, gy]], wi, 0.2);
+      wobLine([[gx, gy - 5], [gx, gy + 5]], wi, 0.2);
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function drawCrampon(card, x, y, w, h, t) {
+    var wi = { arr: wobbleFor(card), i: 40 };
+    var rng = mulberry32(card.seed + 2);
+    var sizeF = plateIndex === 0 ? 1 : 0.9 + rng() * 0.2;
+    var cx = x + w / 2, cy = y + h / 2;
+    var fw = Math.min(w, h) * 0.56 * sizeF, fh = fw * 0.46;
+    var fx = cx - fw / 2, fy = cy - fh / 2;
+    // tap channel: period 11s, two bounces in first 0.6s at front (bottom) spikes
+    var ph = (t - card.chanStart) % 11;
+    var bounce = 0;
+    if (ph < 0.6) bounce = Math.abs(Math.sin(ph / 0.6 * Math.PI * 2)) * 2.2 * (1 - ph / 0.6);
+    ctx.strokeStyle = INK; ctx.lineWidth = 2; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    // sole frame: rounded rect outline
+    var fp = [];
+    fp = fp.concat(seg(fx + 6, fy, fx + fw - 6, fy, 6));
+    fp = fp.concat(seg(fx + fw, fy + 6, fx + fw, fy + fh - 6, 4));
+    fp = fp.concat(seg(fx + fw - 6, fy + fh, fx + 6, fy + fh, 6));
+    fp = fp.concat(seg(fx, fy + fh - 6, fx, fy + 6, 4));
+    fp.push([fx + 6, fy]);
+    wobLine(fp, wi, 0.6);
+    // 10 spikes: 5 per long side
+    for (var s = 0; s < 5; s++) {
+      var sx = fx + fw * (0.12 + 0.19 * s);
+      var bTop = 0, bBot = bounce;
+      wobLine(seg(sx, fy, sx, fy - 7 - bTop, 2), wi, 0.4);
+      wobLine(seg(sx, fy + fh, sx, fy + fh + 7 + bBot, 2), wi, 0.4);
+    }
+    // straps (accent): two arcs over the frame
+    ctx.strokeStyle = card.accent;
+    wobArc(cx - fw * 0.22, cy, fw * 0.17, Math.PI * 1.15, Math.PI * 1.85, wi, 0.6);
+    wobArc(cx + fw * 0.22, cy, fw * 0.17, Math.PI * 1.15, Math.PI * 1.85, wi, 0.6);
+    wobArc(cx - fw * 0.22, cy, fw * 0.17, Math.PI * 0.15, Math.PI * 0.85, wi, 0.6);
+    wobArc(cx + fw * 0.22, cy, fw * 0.17, Math.PI * 0.15, Math.PI * 0.85, wi, 0.6);
+  }
+
+  function drawCalafate(card, x, y, w, h, t) {
+    var wi = { arr: wobbleFor(card), i: 80 };
+    var rng = mulberry32(card.seed + 3);
+    var berries = plateIndex === 0 ? 7 : 5 + Math.floor(rng() * 5);
+    var cx = x + w / 2, cy = y + h / 2;
+    var S = Math.min(w, h);
+    // stem: curve from bottom-left up to top-right
+    var stem = [];
+    for (var i = 0; i <= 14; i++) {
+      var s = i / 14;
+      stem.push([cx - S * 0.26 + S * 0.5 * s, cy + S * 0.30 - S * 0.58 * s + Math.sin(s * 2.4) * S * 0.05]);
+    }
+    ctx.strokeStyle = INK; ctx.lineWidth = 2; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    wobLine(stem, wi, 0.7);
+    // leaves along stem
+    for (var lf = 0; lf < 4; lf++) {
+      var ls = 0.2 + lf * 0.2;
+      var lp = stem[Math.floor(ls * 14)];
+      var side = lf % 2 === 0 ? 1 : -1;
+      ctx.save();
+      ctx.translate(lp[0], lp[1]);
+      ctx.rotate(side * 0.7 - 0.4);
+      wobEllipse(side * S * 0.055, 0, S * 0.055, S * 0.028, 0, wi, 0.5);
+      ctx.restore();
+    }
+    // berry cluster near stem top, accent filled, slow swell
+    var swell = 1 + Math.sin((t - card.chanStart) * (Math.PI * 2 / 12)) * 0.045;
+    var bx = stem[12][0], by = stem[12][1];
+    ctx.fillStyle = card.accent;
+    for (var b = 0; b < berries; b++) {
+      var ba = (b / berries) * Math.PI * 2 + card.seed % 3;
+      var br = S * 0.085 * (b === 0 ? 0 : 1);
+      var px2 = bx + Math.cos(ba) * br, py2 = by + Math.sin(ba) * br * 0.8 + S * 0.03;
+      var rr = S * 0.030 * swell;
+      ctx.beginPath();
+      ctx.arc(px2, py2, rr, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = INK;
+      ctx.beginPath();
+      ctx.arc(px2, py2 - rr * 0.8, 0.9, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = card.accent;
+    }
+  }
+
+  function drawChinchilla(card, x, y, w, h, t) {
+    var wi = { arr: wobbleFor(card), i: 120 };
+    var rng = mulberry32(card.seed + 4);
+    var flip = (plateIndex > 0 && rng() > 0.5) ? -1 : 1;
+    var cx = x + w / 2, cy = y + h / 2;
+    var S = Math.min(w, h);
+    ctx.strokeStyle = INK; ctx.lineWidth = 2; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.scale(flip, 1);
+    // tail: big spiral behind body
+    var tail = [];
+    for (var i = 0; i <= 40; i++) {
+      var s = i / 40;
+      var a = s * Math.PI * 3.4;
+      var rr = S * 0.20 * (1 - s * 0.72);
+      tail.push([-S * 0.16 + Math.cos(a) * rr, S * 0.05 + Math.sin(a) * rr * 0.8]);
+    }
+    wobLine(tail, wi, 0.6);
+    // body
+    wobEllipse(-S * 0.02, S * 0.02, S * 0.21, S * 0.155, -0.12, wi, 0.6);
+    // head
+    wobEllipse(S * 0.17, -S * 0.08, S * 0.105, S * 0.09, 0, wi, 0.6);
+    // ears: two round ears; near ear twitches (period 7s, 0.15s)
+    var ph = (t - card.chanStart) % 7;
+    var twitch = (ph < 0.15) ? Math.sin(ph / 0.15 * Math.PI) * 0.35 : 0;
+    ctx.save();
+    ctx.translate(S * 0.13, -S * 0.165);
+    ctx.rotate(-0.15 + twitch);
+    wobEllipse(0, 0, S * 0.045, S * 0.045, 0, wi, 0.4);
+    ctx.restore();
+    ctx.save();
+    ctx.translate(S * 0.225, -S * 0.15);
+    ctx.rotate(0.2);
+    wobEllipse(0, 0, S * 0.04, S * 0.04, 0, wi, 0.4);
+    ctx.restore();
+    // eye dot
+    ctx.fillStyle = INK;
+    ctx.beginPath(); ctx.arc(S * 0.205, -S * 0.085, 1.8, 0, Math.PI * 2); ctx.fill();
+    // whiskers
+    for (var k = 0; k < 3; k++) {
+      wobLine(seg(S * 0.26, -S * 0.06 + k * S * 0.022, S * 0.36, -S * 0.075 + k * S * 0.03, 3), wi, 0.3);
+    }
+    // tail tip tuft (accent): few short strokes at spiral end
+    ctx.strokeStyle = card.accent;
+    var tip = tail[40];
+    for (var q = 0; q < 4; q++) {
+      var qa = -0.6 + q * 0.4;
+      wobLine(seg(tip[0], tip[1], tip[0] + Math.cos(qa) * S * 0.045, tip[1] + Math.sin(qa) * S * 0.045, 2), wi, 0.3);
+    }
+    ctx.restore();
+  }
+
+  function drawSlope(card, x, y, w, h, t) {
+    var wi = { arr: wobbleFor(card), i: 160 };
+    var rng = mulberry32(card.seed + 5);
+    var steep = plateIndex === 0 ? 0.62 : 0.5 + rng() * 0.3;
+    var cx = x + w / 2, cy = y + h / 2;
+    var S = Math.min(w, h);
+    var baseY = cy + S * 0.24;
+    var leftX = cx - S * 0.30, rightX = cx + S * 0.30;
+    var apexX = cx + S * 0.06, apexY = baseY - S * 0.52 * steep - S * 0.14;
+    ctx.strokeStyle = INK; ctx.lineWidth = 2; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    // triangle slope
+    wobLine(seg(leftX, baseY, apexX, apexY, 8), wi, 0.7);
+    wobLine(seg(apexX, apexY, rightX, baseY, 8), wi, 0.7);
+    wobLine(seg(leftX, baseY, rightX, baseY, 8), wi, 0.7);
+    // 45-degree threshold line (accent), alpha pulsing slowly
+    var alpha = 0.45 + 0.4 * (0.5 + 0.5 * Math.sin((t - card.chanStart) * (Math.PI * 2 / 8)));
+    ctx.strokeStyle = card.accent;
+    ctx.globalAlpha = alpha;
+    var tl = S * 0.34;
+    var mx = (leftX + apexX) / 2, my = (baseY + apexY) / 2;
+    wobLine(seg(mx - tl * 0.36, my + tl * 0.36, mx + tl * 0.36, my - tl * 0.36, 6), wi, 0.5);
+    ctx.globalAlpha = 1;
+    // handle dot on slope
+    ctx.fillStyle = INK;
+    ctx.beginPath(); ctx.arc(mx, my, 3.4, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = INK; ctx.lineWidth = 1.4;
+    ctx.beginPath(); ctx.arc(mx, my, 6, 0, Math.PI * 2); ctx.stroke();
+  }
+
+  function drawSummit(card, x, y, w, h, t) {
+    var wi = { arr: wobbleFor(card), i: 200 };
+    var rng = mulberry32(card.seed + 6);
+    var barH = plateIndex === 0 ? 0.42 : 0.32 + rng() * 0.24;
+    var cx = x + w / 2, cy = y + h / 2;
+    var S = Math.min(w, h);
+    var baseY = cy + S * 0.26;
+    ctx.strokeStyle = INK; ctx.lineWidth = 2; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    // triangle
+    var apexX = cx - S * 0.10, apexY = baseY - S * 0.46;
+    wobLine(seg(cx - S * 0.34, baseY, apexX, apexY, 8), wi, 0.7);
+    wobLine(seg(apexX, apexY, cx + S * 0.12, baseY, 8), wi, 0.7);
+    wobLine(seg(cx - S * 0.34, baseY, cx + S * 0.12, baseY, 8), wi, 0.7);
+    // snow notch at apex
+    ctx.lineWidth = 1.4;
+    wobLine([[apexX - S * 0.045, apexY + S * 0.075], [apexX - S * 0.015, apexY + S * 0.045], [apexX + S * 0.012, apexY + S * 0.08], [apexX + S * 0.04, apexY + S * 0.05]], wi, 0.4);
+    // altitude bar (accent): grows a hair and settles each 13s
+    var ph = (t - card.chanStart) % 13;
+    var grow = 1;
+    if (ph < 1.1) grow = 1 + Math.sin(ph / 1.1 * Math.PI) * 0.035;
+    var barX = cx + S * 0.22;
+    var bh = S * barH * grow;
+    ctx.strokeStyle = card.accent; ctx.lineWidth = 2.4;
+    wobLine(seg(barX, baseY, barX, baseY - bh, 6), wi, 0.5);
+    // tick marks (no numbers)
+    ctx.lineWidth = 1.4;
+    for (var k = 1; k <= 4; k++) {
+      var ty2 = baseY - (bh * k / 4);
+      wobLine(seg(barX, ty2, barX + (k === 4 ? S * 0.055 : S * 0.035), ty2, 2), wi, 0.3);
+    }
+    // baseline tick
+    wobLine(seg(barX - S * 0.03, baseY, barX + S * 0.03, baseY, 2), wi, 0.3);
+  }
+
+  var DRAWERS = [drawPiolet, drawCrampon, drawCalafate, drawChinchilla, drawSlope, drawSummit];
+
+  // ---------- layout ----------
+  function layout(W, H) {
+    var phone = isPhone(W, H);
+    var margin = phone ? Math.max(14, W * 0.05) : Math.max(28, Math.min(W, H) * 0.07);
+    var gap = phone ? 12 : 22;
+    var availW = W - margin * 2, availH = H - margin * 2;
+    var cw = (availW - gap) / 2;
+    var ch = (availH - gap * 2) / 3;
+    var rects = [];
+    for (var r = 0; r < 3; r++) for (var c = 0; c < 2; c++) {
+      rects.push({ x: margin + c * (cw + gap), y: margin + r * (ch + gap), w: cw, h: ch });
+    }
+    return { rects: rects, margin: margin };
+  }
+
+  function draw(nowMs) {
+    var vv = window.visualViewport;
+    var W = vv ? vv.width : window.innerWidth;
+    var H = vv ? vv.height : window.innerHeight;
+    var dpr = window.devicePixelRatio || 1;
+    if (canvas.width !== Math.round(W * dpr) || canvas.height !== Math.round(H * dpr)) {
+      canvas.width = Math.round(W * dpr);
+      canvas.height = Math.round(H * dpr);
+    }
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    var t = 0;
+    if (startTime !== null && typeof nowMs === 'number') t = (nowMs - startTime) / 1000;
+    if (t < 0) t = 0;
+
+    ctx.fillStyle = PAPER;
+    ctx.fillRect(0, 0, W, H);
+
+    var L = layout(W, H);
+    for (var i = 0; i < 6; i++) {
+      var R = L.rects[i];
+      var card = plate[i];
+      ctx.strokeStyle = BORDER;
+      ctx.lineWidth = 2;
+      ctx.strokeRect(R.x, R.y, R.w, R.h);
+      DRAWERS[card.type](card, R.x, R.y, R.w, R.h, t);
+    }
+  }
+
+  function frame(nowMs) {
+    if (startTime === null && typeof nowMs === 'number') startTime = nowMs;
+    draw(nowMs);
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+  }
+
+  // frame one: synchronous draw at t=0
+  draw(0);
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+
+  var _lastNow = 0;
+  // keep _lastNow updated inside frame loop
+  var _origFrame = frame;
+  frame = function (nowMs) {
+    if (typeof nowMs === 'number') _lastNow = nowMs;
+    _origFrame(nowMs);
+  };
+
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { draw(_lastNow); });
+  }
+  window.addEventListener('resize', function () { draw(_lastNow); });
+
+  // ---------- interaction ----------
+  function localT() {
+    if (startTime === null || _lastNow === 0) return 0;
+    return (_lastNow - startTime) / 1000;
+  }
+  var lastTapTime = -10, lastTapX = -1, lastTapY = -1;
+
+  function handleTap(clientX, clientY) {
+    var vv = window.visualViewport;
+    var W = vv ? vv.width : window.innerWidth;
+    var H = vv ? vv.height : window.innerHeight;
+    var L = layout(W, H);
+    var tNow = localT();
+    var inCard = -1;
+    for (var i = 0; i < 6; i++) {
+      var R = L.rects[i];
+      if (clientX >= R.x && clientX <= R.x + R.w && clientY >= R.y && clientY <= R.y + R.h) inCard = i;
+    }
+    var isDouble = (tNow - lastTapTime) < 0.35 &&
+      Math.abs(clientX - lastTapX) < 24 && Math.abs(clientY - lastTapY) < 24;
+    if (isDouble && inCard === -1) {
+      plateIndex++;
+      plate = buildPlate(plateIndex);
+      lastTapTime = -10;
+    } else if (inCard >= 0) {
+      plate[inCard].chanStart = tNow;
+    }
+    lastTapTime = tNow; lastTapX = clientX; lastTapY = clientY;
+    draw(_lastNow);
+  }
+
+  canvas.addEventListener('pointerdown', function (e) { handleTap(e.clientX, e.clientY); });
+})();
+</script>
+</body>
+</html>
