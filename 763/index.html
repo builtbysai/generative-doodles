@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Floating Volume</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: #F2F0EB;
+    overflow: hidden;
+  }
+  canvas {
+    display: block;
+  }
+</style>
+</head>
+<body>
+<canvas id="field"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  var canvas = document.getElementById('field');
+  var ctx = canvas.getContext('2d');
+
+  // Strict palette. Nothing else is ever drawn.
+  var CHROME = [201, 205, 211];  // #C9CDD3
+  var GOLD   = [216, 180, 106];  // #D8B46A vapor gold
+  var VIOLET = [122, 111, 168];  // #7A6FA8 interference violet
+  var TEAL   = [95, 168, 163];   // #5FA8A3 teal shift
+  var SMOKE  = [142, 148, 153];  // #8E9499
+  var FLOOR  = [237, 234, 228];  // #EDEAE4
+  var BG     = [242, 240, 235];  // #F2F0EB
+
+  var ORBIT = 90;   // seconds per full light orbit
+  var FLOAT = 12;   // seconds per float cycle (pure sine, no bounce)
+
+  function lerp(a, b, u) { return a + (b - a) * u; }
+
+  function mix(c1, c2, u) {
+    return [lerp(c1[0], c2[0], u), lerp(c1[1], c2[1], u), lerp(c1[2], c2[2], u)];
+  }
+
+  function cl(v) { return Math.max(0, Math.min(255, Math.round(v))); }
+
+  function rgbString(c, a) {
+    if (typeof a === 'number') {
+      return 'rgba(' + cl(c[0]) + ',' + cl(c[1]) + ',' + cl(c[2]) + ',' + a + ')';
+    }
+    return 'rgb(' + cl(c[0]) + ',' + cl(c[1]) + ',' + cl(c[2]) + ')';
+  }
+
+  // Thin-film LUT across the interference set. Saturation peaks mid-band;
+  // both extremes wash toward chrome and smoke, like a real coated pane
+  // going off-angle. Shared model with the sibling cube piece (No.760):
+  // face angle -> interference parameter -> this table.
+  var LUT = [
+    [0.00, SMOKE],
+    [0.18, CHROME],
+    [0.38, TEAL],
+    [0.55, VIOLET],
+    [0.72, GOLD],
+    [0.88, CHROME],
+    [1.00, SMOKE]
+  ];
+
+  function film(u) {
+    if (u <= 0) return LUT[0][1].slice();
+    if (u >= 1) return LUT[LUT.length - 1][1].slice();
+    for (var i = 1; i < LUT.length; i++) {
+      if (u <= LUT[i][0]) {
+        var f = (u - LUT[i - 1][0]) / (LUT[i][0] - LUT[i - 1][0]);
+        return mix(LUT[i - 1][1], LUT[i][1], f);
+      }
+    }
+    return LUT[LUT.length - 1][1].slice();
+  }
+
+  // Thin-film interference parameter for a surface whose phase is phi,
+  // under a light azimuth theta: the sum of two offset sine waves of the
+  // angle between view and light, clamped to the LUT range.
+  function thinAt(theta, phi) {
+    var d = theta - phi;
+    var u = 0.5 + 0.30 * Math.sin(d) + 0.20 * Math.sin(2 * d + 1.3);
+    return Math.max(0, Math.min(1, u));
+  }
+
+  function saturation(c) {
+    var mx = Math.max(c[0], c[1], c[2]);
+    var mn = Math.min(c[0], c[1], c[2]);
+    return mx === 0 ? 0 : (mx - mn) / mx;
+  }
+
+  // Cube geometry: isometric projection, half-edge a (set per frame from
+  // the frame size). Visible faces: top, front (z=+1), right (x=+1).
+  var FACES = [
+    { name: 'front', phi: 2.4, shade: 0.80,
+      v: [[-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1]] },
+    { name: 'right', phi: 4.2, shade: 0.90,
+      v: [[1, -1, 1], [1, -1, -1], [1, 1, -1], [1, 1, 1]] },
+    { name: 'top', phi: 0.9, shade: 1.00,
+      v: [[-1, 1, 1], [1, 1, 1], [1, 1, -1], [-1, 1, -1]] }
+  ];
+
+  // The 9 visible edges, each joining two faces (indices into FACES:
+  // 0 front, 1 right, 2 top); silhouette edges name one face twice.
+  var EDGES = [
+    { a: [-1, 1, -1], b: [1, 1, -1], f: [2, 2] },
+    { a: [1, 1, -1], b: [1, 1, 1], f: [2, 1] },
+    { a: [1, 1, 1], b: [-1, 1, 1], f: [2, 0] },
+    { a: [-1, 1, 1], b: [-1, 1, -1], f: [2, 2] },
+    { a: [-1, 1, 1], b: [-1, -1, 1], f: [0, 0] },
+    { a: [1, 1, 1], b: [1, -1, 1], f: [0, 1] },
+    { a: [1, 1, -1], b: [1, -1, -1], f: [1, 1] },
+    { a: [-1, -1, 1], b: [1, -1, 1], f: [0, 0] },
+    { a: [1, -1, 1], b: [1, -1, -1], f: [1, 1] }
+  ];
+
+  function proj(v, cx, cy, a) {
+    return [
+      cx + (v[0] - v[2]) * 0.8660254 * a,
+      cy + ((v[0] + v[2]) * 0.5 - v[1]) * a
+    ];
+  }
+
+  function pathOf(pts) {
+    ctx.beginPath();
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    for (var i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+    ctx.closePath();
+  }
+
+  var W = 0, H = 0, DPR = 1;
+
+  function isPhone() {
+    var sw = (window.screen && window.screen.width) || 0;
+    var sh = (window.screen && window.screen.height) || 0;
+    var mn = Math.min(sw, sh);
+    if (mn > 0 && mn < 700) return true;
+    return H > W * 1.15;
+  }
+
+  function resize() {
+    var vv = window.visualViewport;
+    W = vv ? vv.width : window.innerWidth;
+    H = vv ? vv.height : window.innerHeight;
+    DPR = window.devicePixelRatio || 1;
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+  }
+
+  // Drag state: the visitor drags the LIGHT, never the cube. Segments are
+  // recorded with their frame-clock times so the azimuth offset at any t
+  // is a closed-form ease toward the latest target (house event model).
+  var dragSegs = [];   // {t0, from, target}
+  var dragging = false;
+  var dragStartX = 0;
+  var dragBaseTarget = 0;
+
+  function offsetAt(t) {
+    var off = 0;
+    for (var i = 0; i < dragSegs.length; i++) {
+      var s = dragSegs[i];
+      if (t < s.t0) break;
+      off = s.target + (s.from - s.target) * Math.exp(-(t - s.t0) / 0.25);
+    }
+    return off;
+  }
+
+  function nowT() {
+    var n = (typeof performance !== 'undefined' && performance.now)
+      ? performance.now() : 0;
+    return startT + n / 1000;
+  }
+
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+    var mn = Math.min(W, H);
+    var a = 0.105 * mn;                       // cube half-edge
+    var cx = W / 2;
+    var floorY = 0.70 * H;
+    var hn = Math.sin(2 * Math.PI * t / FLOAT);   // +1 = highest float
+    var amp = Math.max(2, 0.0032 * mn);           // about +/-2px at 720
+    var cy = 0.36 * H - hn * amp;
+    var theta = 2 * Math.PI * t / ORBIT + offsetAt(t);
+
+    // Room: background, floor, floor line.
+    ctx.fillStyle = rgbString(BG);
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = rgbString(FLOOR);
+    ctx.fillRect(0, floorY, W, H - floorY);
+    ctx.fillStyle = rgbString(SMOKE, 0.18);
+    ctx.fillRect(0, floorY, W, 1);
+
+    // Face colors for this instant, and the dominant hue among them.
+    var faceCols = [];
+    var domCol = null, domSat = -1;
+    for (var i = 0; i < FACES.length; i++) {
+      var base = film(thinAt(theta, FACES[i].phi));
+      if (saturation(base) > domSat) { domSat = saturation(base); domCol = base; }
+      faceCols.push(mix(base, SMOKE, (1 - FACES[i].shade) * 0.8));
+    }
+
+    // Glow pool on the floor: layered ellipses of the dominant hue.
+    // Coupling: the same float sine that lifts the cube tightens and
+    // dims the pool; when the cube sinks, the pool spreads and deepens.
+    var poolCx = cx;
+    var poolCy = floorY + 0.115 * H;
+    var poolRx = 1.95 * a * (1 - 0.07 * hn);
+    var poolRy = poolRx * 0.30;
+    var poolAlpha = 0.35 * (1 - 0.22 * hn);
+    var layers = [
+      [1.00, 0.10], [0.88, 0.13], [0.76, 0.16],
+      [0.65, 0.18], [0.55, 0.20], [0.46, 0.23]
+    ];
+    for (var L = 0; L < layers.length; L++) {
+      ctx.beginPath();
+      ctx.ellipse(poolCx, poolCy, poolRx * layers[L][0], poolRy * layers[L][0], 0, 0, Math.PI * 2);
+      ctx.fillStyle = rgbString(domCol, poolAlpha * layers[L][1]);
+      ctx.fill();
+    }
+
+    // The pedestal: effectively invisible, a 2px thread at alpha 0.03.
+    var cubeBottom = proj([1, -1, 1], cx, cy, a);
+    ctx.fillStyle = rgbString(SMOKE, 0.03);
+    ctx.fillRect(cx - 1, cubeBottom[1], 2, Math.max(0, poolCy - cubeBottom[1]));
+
+    // Faces, back to front: front, right, top (draw order among the
+    // three visible faces does not overlap; seams drawn after).
+    var screenFaces = [];
+    for (var f = 0; f < FACES.length; f++) {
+      var face = FACES[f];
+      var pts = [];
+      for (var k = 0; k < 4; k++) pts.push(proj(face.v[k], cx, cy, a));
+      screenFaces.push(pts);
+      var col = faceCols[f];
+      var thin = thinAt(theta, face.phi);
+
+      pathOf(pts);
+      ctx.fillStyle = rgbString(col);
+      ctx.fill();
+
+      ctx.save();
+      pathOf(pts);
+      ctx.clip();
+
+      var minX = Math.min(pts[0][0], pts[1][0], pts[2][0], pts[3][0]);
+      var maxX = Math.max(pts[0][0], pts[1][0], pts[2][0], pts[3][0]);
+      var minY = Math.min(pts[0][1], pts[1][1], pts[2][1], pts[3][1]);
+      var maxY = Math.max(pts[0][1], pts[1][1], pts[2][1], pts[3][1]);
+
+      // Transmission wash: the lower body of the pane reads deeper
+      // into the film, as if the coating thickened downward. Two
+      // shallow steps keep the deepening from reading as a hard line.
+      var washCol = mix(film(Math.min(1, thin + 0.07)), SMOKE, (1 - face.shade) * 0.8);
+      ctx.fillStyle = rgbString(washCol, 0.14);
+      ctx.fillRect(minX, minY + (maxY - minY) * 0.40, maxX - minX, (maxY - minY) * 0.60);
+      ctx.fillStyle = rgbString(washCol, 0.16);
+      ctx.fillRect(minX, minY + (maxY - minY) * 0.68, maxX - minX, (maxY - minY) * 0.32);
+
+      // Reflection streak: a diagonal mirrored band that slides across
+      // the face as the light turns.
+      var p = 0.5 + 0.5 * Math.sin(theta - face.phi + 0.7);
+      var sx = minX + (maxX - minX) * (0.15 + 0.7 * p);
+      var swd = (maxX - minX) * 0.22;
+      ctx.beginPath();
+      ctx.moveTo(sx - swd, maxY);
+      ctx.lineTo(sx, minY);
+      ctx.lineTo(sx + swd, minY);
+      ctx.lineTo(sx + swd * 0.4, maxY);
+      ctx.closePath();
+      ctx.fillStyle = rgbString(CHROME, 0.30);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo(sx - swd * 0.35, maxY);
+      ctx.lineTo(sx + swd * 0.30, minY);
+      ctx.lineTo(sx + swd * 0.55, minY);
+      ctx.lineTo(sx + swd * 0.30, maxY);
+      ctx.closePath();
+      ctx.fillStyle = rgbString(CHROME, 0.22);
+      ctx.fill();
+
+      // Absorption: the foot of each pane drinks the light.
+      ctx.fillStyle = rgbString(SMOKE, 0.22);
+      ctx.fillRect(minX, maxY - (maxY - minY) * 0.22, maxX - minX, (maxY - minY) * 0.22);
+
+      ctx.restore();
+    }
+
+    // Edge seams: where two panes meet the coating stacks and the seam
+    // burns at maximum interference. Each seam takes its own thin-film
+    // value from the mean phase of its two faces, biased into the
+    // saturated zone, and is drawn as a soft glow under a bright core.
+    for (var e = 0; e < EDGES.length; e++) {
+      var ed = EDGES[e];
+      var pa = proj(ed.a, cx, cy, a);
+      var pb = proj(ed.b, cx, cy, a);
+      var phiE = (FACES[ed.f[0]].phi + FACES[ed.f[1]].phi) / 2;
+      var thinE = 0.35 + 0.40 * (0.5 + 0.5 * Math.sin(theta - phiE + 0.5));
+      var seamCol = mix(film(thinE), CHROME, 0.20);
+      ctx.beginPath();
+      ctx.moveTo(pa[0], pa[1]);
+      ctx.lineTo(pb[0], pb[1]);
+      ctx.strokeStyle = rgbString(seamCol, 0.18);
+      ctx.lineWidth = 5;
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(pa[0], pa[1]);
+      ctx.lineTo(pb[0], pb[1]);
+      ctx.strokeStyle = rgbString(seamCol, 0.75);
+      ctx.lineWidth = 1.6;
+      ctx.stroke();
+    }
+  }
+
+  // Pointer handling: horizontal drag retargets the light azimuth.
+  function pointerX(ev) {
+    if (ev.clientX !== undefined) return ev.clientX;
+    if (ev.touches && ev.touches.length) return ev.touches[0].clientX;
+    return 0;
+  }
+
+  canvas.addEventListener('pointerdown', function (ev) {
+    dragging = true;
+    dragStartX = pointerX(ev);
+    dragBaseTarget = dragSegs.length ? dragSegs[dragSegs.length - 1].target : 0;
+  });
+  canvas.addEventListener('pointermove', function (ev) {
+    if (!dragging) return;
+    var tt = nowT();
+    var target = dragBaseTarget + (pointerX(ev) - dragStartX) / Math.max(1, W) * Math.PI * 2;
+    dragSegs.push({ t0: tt, from: offsetAt(tt), target: target });
+    if (dragSegs.length > 240) dragSegs.splice(0, dragSegs.length - 240);
+  });
+  function endDrag() { dragging = false; }
+  canvas.addEventListener('pointerup', endDrag);
+  canvas.addEventListener('pointercancel', endDrag);
+  canvas.addEventListener('pointerleave', endDrag);
+
+  // Inert QA hook (house convention): ?seed=tNN draws frame one at loop
+  // time NN seconds. Without the parameter the piece starts at t = 0.
+  var startT = 0;
+  var searchStr = (window.location && window.location.search) ||
+    (typeof location !== 'undefined' ? location.search : '') || '';
+  var m = /[?&]seed=t(\d+(?:\.\d+)?)/.exec(searchStr);
+  if (m) startT = parseFloat(m[1]);
+
+  resize();
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { resize(); draw(startT); });
+  }
+  window.addEventListener('resize', function () { resize(); draw(startT); });
+
+  // Frame one: the synchronous draw at t = startT (0 in normal viewing:
+  // float at mid-height, pool at its matching neutral state).
+  draw(startT);
+
+  if (typeof requestAnimationFrame === 'function') {
+    var t0 = null;
+    var frame = function (ts) {
+      if (t0 === null) t0 = ts;
+      draw(startT + (ts - t0) / 1000);
+      requestAnimationFrame(frame);
+    };
+    requestAnimationFrame(frame);
+  }
+})();
+</script>
+</body>
+</html>
