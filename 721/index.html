@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ribbon Weather</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #050507; height: 100%; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+
+// Ribbon Weather (EXPANSION #88 okazzsp, block 2)
+// 26 circular nodes drift across a black field, joined to their nearest
+// neighbours by thin translucent curved ribbons. The overlaps stack into
+// soft bright crossings. Dragging pulls nearby nodes toward the pointer;
+// a tap reseeds the drift.
+//
+// Determinism adaptation: the prompt's particle physics (velocity,
+// attraction, repulsion integrated per frame) is realised as closed-form
+// wander. Each node's position is a pure function of time: a seeded
+// anchor, a slow linear drift reflected softly at the field edges, plus
+// two sine wobbles. Drag influence is a sum of decaying displacement
+// vectors frozen at recorded pointer samples. Nothing is integrated, so
+// frame one is exact and any frame can be recomputed from (epoch, t,
+// samples) alone.
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+var COL = {
+  bg: '#050507',
+  pal: ['#FF4757', '#FFC312', '#12CBC4', '#FDA7DF', '#FFFFFF']
+};
+
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var W = 0, H = 0, isPhone = false;
+var UX = 1, UY = 1; // design-unit scales (field is full-bleed), set per frame
+var curT = 0;
+
+// Inert QA hook: ?seed=tNN renders the frame at NN seconds. No effect in
+// the gallery, where location.search is empty.
+(function () {
+  var s = (typeof location !== 'undefined' && location.search) || '';
+  var m = /[?&]seed=t(\d+(?:\.\d+)?)/.exec(s);
+  if (m) curT = parseFloat(m[1]);
+})();
+
+var SEED_BASE = 72188;
+var N_NODES = 26;
+var FIELD = 1000;          // design space is FIELD x FIELD
+var EDGE_LO = 34, EDGE_HI = FIELD - 34;
+var DRAG_R = 300;          // drag influence radius, design units
+var DRAG_TAU = 1.5;        // drag offset decay, seconds
+var DRAG_K = 0.85;         // drag pull strength
+
+// ---------------------------------------------------------------------------
+// Epoch state: node wander parameters, regenerated on a tap reseed.
+// ---------------------------------------------------------------------------
+var epoch = 0;
+var epochT0 = 0;
+var nodes = [];   // per node: anchors, drift, wobbles, color, radius phase
+var samples = []; // recorded drag samples {t, x, y} in design units
+
+function buildEpoch(ep) {
+  var rng = mulberry32(SEED_BASE + ep * 7919);
+  nodes = [];
+  // Anchors on a jittered 5x5 lattice plus one extra, so the field starts
+  // spread edge to edge.
+  var anchors = [];
+  for (var gy = 0; gy < 5; gy++) {
+    for (var gx = 0; gx < 5; gx++) {
+      anchors.push({
+        x: 110 + gx * 195 + (rng() - 0.5) * 120,
+        y: 110 + gy * 195 + (rng() - 0.5) * 120
+      });
+    }
+  }
+  anchors.push({ x: 200 + rng() * 600, y: 200 + rng() * 600 });
+  // Shuffle so lattice order does not map to color order.
+  for (var i = anchors.length - 1; i > 0; i--) {
+    var j = Math.floor(rng() * (i + 1));
+    var tmp = anchors[i]; anchors[i] = anchors[j]; anchors[j] = tmp;
+  }
+  for (var n = 0; n < N_NODES; n++) {
+    var driftA = rng() * Math.PI * 2;
+    var driftS = 5 + rng() * 9; // design units per second
+    nodes.push({
+      ax: anchors[n].x, ay: anchors[n].y,
+      dvx: Math.cos(driftA) * driftS, dvy: Math.sin(driftA) * driftS,
+      a1x: 30 + rng() * 55, w1x: (Math.PI * 2) / (24 + rng() * 30), p1x: rng() * Math.PI * 2,
+      a1y: 30 + rng() * 55, w1y: (Math.PI * 2) / (24 + rng() * 30), p1y: rng() * Math.PI * 2,
+      a2x: 12 + rng() * 26, w2x: (Math.PI * 2) / (9 + rng() * 12), p2x: rng() * Math.PI * 2,
+      a2y: 12 + rng() * 26, w2y: (Math.PI * 2) / (9 + rng() * 12), p2y: rng() * Math.PI * 2,
+      col: Math.floor(rng() * COL.pal.length),
+      rPh: rng() * Math.PI * 2
+    });
+  }
+}
+
+// Soft edge behaviour: reflect a raw coordinate into [lo, hi] with a
+// triangle wave, so drift turns around at the edge instead of wrapping
+// (a wrap would streak a ribbon across the whole frame for one frame).
+function reflect(v, lo, hi) {
+  var range = hi - lo;
+  var m = (v - lo) % (2 * range);
+  if (m < 0) m += 2 * range;
+  if (m > range) m = 2 * range - m;
+  return lo + m;
+}
+
+// Base position of node nd at local time lt: pure function, no state.
+function basePos(nd, lt) {
+  var rx = nd.ax + nd.dvx * lt
+    + nd.a1x * Math.sin(nd.w1x * lt + nd.p1x)
+    + nd.a2x * Math.sin(nd.w2x * lt + nd.p2x);
+  var ry = nd.ay + nd.dvy * lt
+    + nd.a1y * Math.sin(nd.w1y * lt + nd.p1y)
+    + nd.a2y * Math.sin(nd.w2y * lt + nd.p2y);
+  return { x: reflect(rx, EDGE_LO, EDGE_HI), y: reflect(ry, EDGE_LO, EDGE_HI) };
+}
+
+// Node position at absolute time t: base wander plus the sum of drag
+// displacements. Each sample froze the vector from the node's position at
+// sample time to the pointer; its weight decays exponentially.
+function nodePos(idx, t) {
+  var nd = nodes[idx];
+  var lt = t - epochT0;
+  var p = basePos(nd, lt);
+  var ox = 0, oy = 0;
+  for (var s = 0; s < samples.length; s++) {
+    var sm = samples[s];
+    var age = t - sm.t;
+    if (age < 0 || age > 9) continue;
+    var bp = basePos(nd, sm.t - epochT0);
+    var d = Math.hypot(bp.x - sm.x, bp.y - sm.y);
+    if (d >= DRAG_R) continue;
+    var fall = 1 - d / DRAG_R;
+    var wgt = Math.exp(-age / DRAG_TAU) * fall * fall * DRAG_K;
+    ox += (sm.x - bp.x) * wgt;
+    oy += (sm.y - bp.y) * wgt;
+  }
+  return { x: p.x + ox, y: p.y + oy };
+}
+
+// ---------------------------------------------------------------------------
+// Ribbons.
+// ---------------------------------------------------------------------------
+function drawRibbon(a, b, colIdx, phase, lt) {
+  var dx = b.x - a.x, dy = b.y - a.y;
+  var dist = Math.hypot(dx, dy) || 1;
+  var mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+  var px = -dy / dist, py = dx / dist;
+  // Control point bowed perpendicular, swaying with time and pair phase.
+  var bow = Math.sin(lt * 0.55 + phase) * dist * 0.16;
+  var cx = mx + px * bow, cy = my + py * bow;
+  // Width swells as the pair closes and breathes slowly; 6-14 px at
+  // design scale (U = 1).
+  var distF = Math.min(1.15, Math.max(0.55, 1.18 - dist / 900));
+  var breathe = 1 + 0.22 * Math.sin(lt * 0.9 + phase * 1.7);
+  var halfW = 5.2 * distF * breathe; // full width ~6-14 design units
+  var SEG = 14;
+  var left = [], right = [];
+  for (var i = 0; i <= SEG; i++) {
+    var s = i / SEG, u = 1 - s;
+    var x = u * u * a.x + 2 * u * s * cx + s * s * b.x;
+    var y = u * u * a.y + 2 * u * s * cy + s * s * b.y;
+    // Tangent of the quadratic, for the band's perpendicular.
+    var tx = 2 * u * (cx - a.x) + 2 * s * (b.x - cx);
+    var ty = 2 * u * (cy - a.y) + 2 * s * (b.y - cy);
+    var tl = Math.hypot(tx, ty) || 1;
+    var taper = Math.pow(Math.sin(Math.PI * Math.min(1, Math.max(0.02, s))), 0.65);
+    var hw = halfW * (0.25 + 0.75 * taper);
+    left.push({ x: x + (-ty / tl) * hw, y: y + (tx / tl) * hw });
+    right.push({ x: x - (-ty / tl) * hw, y: y - (tx / tl) * hw });
+  }
+  var alpha = 0.18 + 0.17 * (0.5 + 0.5 * Math.sin(lt * 0.7 + phase * 2.3));
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = COL.pal[colIdx];
+  ctx.beginPath();
+  ctx.moveTo(OXp(left[0].x), OYp(left[0].y));
+  for (var i2 = 1; i2 < left.length; i2++) ctx.lineTo(OXp(left[i2].x), OYp(left[i2].y));
+  for (var j = right.length - 1; j >= 0; j--) ctx.lineTo(OXp(right[j].x), OYp(right[j].y));
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+function OXp(x) { return x * UX; }
+function OYp(y) { return y * UY; }
+
+// ---------------------------------------------------------------------------
+// Draw.
+// ---------------------------------------------------------------------------
+function draw(t) {
+  if (W === 0 || H === 0) return;
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  UX = W / FIELD;
+  UY = H / FIELD;
+  var lt = t - epochT0;
+
+  ctx.fillStyle = COL.bg;
+  ctx.fillRect(0, 0, W, H);
+
+  var pos = [];
+  for (var i = 0; i < N_NODES; i++) pos.push(nodePos(i, t));
+
+  // Each node links to its 3 nearest neighbours; pairs are deduped and
+  // drawn in a fixed index order so stacking is stable frame to frame.
+  var pairSeen = {};
+  var pairs = [];
+  for (var a = 0; a < N_NODES; a++) {
+    var dists = [];
+    for (var b = 0; b < N_NODES; b++) {
+      if (b === a) continue;
+      dists.push({ b: b, d: Math.hypot(pos[a].x - pos[b].x, pos[a].y - pos[b].y) });
+    }
+    dists.sort(function (p, q) { return p.d - q.d || p.b - q.b; });
+    for (var k = 0; k < 3 && k < dists.length; k++) {
+      var o = dists[k].b;
+      var key = Math.min(a, o) + '-' + Math.max(a, o);
+      if (!pairSeen[key]) {
+        pairSeen[key] = true;
+        pairs.push({ a: Math.min(a, o), b: Math.max(a, o) });
+      }
+    }
+  }
+  pairs.sort(function (p, q) { return p.a - q.a || p.b - q.b; });
+  for (var pi = 0; pi < pairs.length; pi++) {
+    var pr = pairs[pi];
+    drawRibbon(pos[pr.a], pos[pr.b], nodes[pr.a].col,
+      nodes[pr.a].rPh + nodes[pr.b].rPh, lt);
+  }
+
+  // Nodes on top. Drawn stronger than the ribbons (alpha 0.9) so the
+  // endpoints stay legible under the translucent stacking.
+  var avgU = (UX + UY) / 2;
+  for (var n = 0; n < N_NODES; n++) {
+    var r = Math.max(2.2, 6.4 * avgU * (1 + 0.12 * Math.sin(lt * 1.3 + nodes[n].rPh)));
+    ctx.save();
+    ctx.globalAlpha = 0.9;
+    ctx.fillStyle = COL.pal[nodes[n].col];
+    ctx.beginPath();
+    ctx.arc(OXp(pos[n].x), OYp(pos[n].y), r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Pointer: drag disturbs, tap reseeds.
+// ---------------------------------------------------------------------------
+var pDown = null;    // {t, x, y, moved}
+var lastSample = null;
+
+function toDesign(ev) {
+  var rect = canvas.getBoundingClientRect();
+  return {
+    x: (ev.clientX - rect.left) / UX,
+    y: (ev.clientY - rect.top) / UY
+  };
+}
+
+if (canvas.addEventListener) {
+  canvas.addEventListener('pointerdown', function (ev) {
+    var p = toDesign(ev);
+    pDown = { t: curT, x: p.x, y: p.y, moved: 0 };
+    lastSample = { t: curT, x: p.x, y: p.y };
+    samples.push({ t: curT, x: p.x, y: p.y });
+  });
+  canvas.addEventListener('pointermove', function (ev) {
+    if (!pDown) return;
+    var p = toDesign(ev);
+    pDown.moved = Math.max(pDown.moved, Math.hypot(p.x - pDown.x, p.y - pDown.y));
+    if (!lastSample || Math.hypot(p.x - lastSample.x, p.y - lastSample.y) > 3 ||
+        curT - lastSample.t > 0.03) {
+      samples.push({ t: curT, x: p.x, y: p.y });
+      lastSample = { t: curT, x: p.x, y: p.y };
+      if (samples.length > 400) samples.splice(0, samples.length - 400);
+    }
+  });
+  canvas.addEventListener('pointerup', function (ev) {
+    if (!pDown) return;
+    var p = toDesign(ev);
+    var dur = curT - pDown.t;
+    var moved = Math.max(pDown.moved, Math.hypot(p.x - pDown.x, p.y - pDown.y));
+    if (dur < 0.3 && moved < 12) {
+      // Tap: reseed into a fresh epoch of wander phases.
+      epoch++;
+      epochT0 = curT;
+      samples = [];
+      buildEpoch(epoch);
+    }
+    pDown = null;
+    lastSample = null;
+    draw(curT);
+  });
+  canvas.addEventListener('pointercancel', function () {
+    pDown = null;
+    lastSample = null;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Sizing and main loop.
+// ---------------------------------------------------------------------------
+function resize() {
+  var vw = (window.visualViewport && window.visualViewport.width) || window.innerWidth;
+  var vh = (window.visualViewport && window.visualViewport.height) || window.innerHeight;
+  W = Math.round(vw);
+  H = Math.round(vh);
+  canvas.width = W;
+  canvas.height = H;
+  var sw = (window.screen && window.screen.width) || 9999;
+  var sh = (window.screen && window.screen.height) || 9999;
+  isPhone = Math.min(sw, sh) < 700 || H > W * 1.15;
+  draw(curT);
+}
+
+if (window.visualViewport && window.visualViewport.addEventListener) {
+  window.visualViewport.addEventListener('resize', resize);
+}
+if (window.addEventListener) window.addEventListener('resize', resize);
+
+buildEpoch(0);
+
+// Frame one: synchronous draw at wander phase 0 (deterministic; never
+// clock-derived).
+resize();
+
+var bootOffset = curT; // nonzero only under the inert QA seed hook
+var startStamp = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+if (typeof requestAnimationFrame === 'function') {
+  var loop = function () {
+    curT = bootOffset + (performance.now() - startStamp) / 1000;
+    draw(curT);
+    requestAnimationFrame(loop);
+  };
+  requestAnimationFrame(loop);
+}
+</script>
+</body>
+</html>

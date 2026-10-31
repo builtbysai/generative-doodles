@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Detach</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #FFFFFF; height: 100%; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+
+// Detach (EXPANSION #88 okazzsp, block 5)
+// One black mass of tiny square pixels on white. Edge pixels detach on a
+// seeded schedule, wander, and fly home. Loose colored squares drift in the
+// outer field and flip between attraction to and repulsion from the mass.
+// Everything is a closed-form function of loop time and the epoch seed:
+// no integrated state, frame one is the synchronous draw at t = 0.
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+var COL = {
+  bg: '#FFFFFF',
+  mass: '#0D0D0D',
+  loose: ['#FF6B9D', '#FFD93D', '#4ECDC4', '#C44DFF'],
+  white: '#FFFFFF'
+};
+
+var LOOP = 36;              // seconds
+var R = 0.225;              // mass radius, in units of min(canvas w, h)
+var BASE_SEED = 72488;
+
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var W = 0, H = 0, isPhone = false;
+var curT = 0;
+var epoch = 0;
+
+// ---------------------------------------------------------------------------
+// Seeded scene data. Pixel homes are fixed for the life of the piece; the
+// detach schedule, flash events and loose particles are regenerated per
+// epoch (a tap advances the epoch).
+// ---------------------------------------------------------------------------
+var pixels = [];      // {hx, hy, rf} homes in design units (minDim = 1)
+var edgeIdx = [];     // indices of pixels eligible to detach (rf > 0.80)
+var detach = {};      // pixelIndex -> [{start, dur, dx, dy, px, py, wob, wfr}]
+var flashes = [];     // {t0, dur, x, y, size}
+var loose = [];       // {hx, hy, size, ci, f1, p1, f2, p2, amp}
+var ovalPhase = 0;
+
+function buildHomes() {
+  var rng = mulberry32(BASE_SEED);
+  var n = isPhone ? 1500 : 3000;
+  pixels = [];
+  edgeIdx = [];
+  for (var i = 0; i < n; i++) {
+    var ang = rng() * Math.PI * 2;
+    var rr = R * Math.sqrt(rng());
+    var hx = Math.cos(ang) * rr, hy = Math.sin(ang) * rr;
+    pixels.push({ hx: hx, hy: hy, rf: rr / R });
+    if (rr / R > 0.80) edgeIdx.push(i);
+  }
+}
+
+function buildEpoch() {
+  var rng = mulberry32(BASE_SEED + 1013 + epoch * 7919);
+  ovalPhase = epoch * 1.7;
+
+  // Detach windows: starts in [2, 31], durations <= 4.8 s, so no window is
+  // active at loop t = 0 and frame one always shows the mass whole.
+  detach = {};
+  for (var e = 0; e < edgeIdx.length; e++) {
+    var idx = edgeIdx[e];
+    var p = pixels[idx];
+    var count = rng() < 0.55 ? 2 : 1;
+    var wins = [];
+    for (var k = 0; k < count; k++) {
+      var baseAng = Math.atan2(p.hy, p.hx);
+      var dirAng = baseAng + (rng() - 0.5) * 0.9;
+      var dist = 0.030 + rng() * 0.085;
+      wins.push({
+        start: 2 + rng() * 29,
+        dur: 3.0 + rng() * 1.8,
+        dx: Math.cos(dirAng) * dist,
+        dy: Math.sin(dirAng) * dist,
+        px: -Math.sin(dirAng), py: Math.cos(dirAng),
+        wob: rng() * 0.018, wfr: 1.5 + rng() * 2.5, wph: rng() * Math.PI * 2
+      });
+    }
+    detach[idx] = wins;
+  }
+
+  // Flash events: a white plus inside the mass with a thin rounded black
+  // square frame blinking around it. Sparse, seeded.
+  flashes = [];
+  for (var f = 0; f < 4; f++) {
+    var fa = rng() * Math.PI * 2;
+    var fr = (0.30 + rng() * 0.45) * R;
+    flashes.push({
+      t0: 3 + rng() * 30, dur: 0.55,
+      x: Math.cos(fa) * fr, y: Math.sin(fa) * fr,
+      size: 0.055 + rng() * 0.035
+    });
+  }
+
+  // Loose particles: homes in the outer field only.
+  loose = [];
+  var bx = (W / 2) / Math.min(W, H), by = (H / 2) / Math.min(W, H);
+  var tries = 0;
+  while (loose.length < 90 && tries < 4000) {
+    tries++;
+    var lx = (rng() * 2 - 1) * bx * 0.96;
+    var ly = (rng() * 2 - 1) * by * 0.96;
+    if (Math.hypot(lx, ly) < 0.315) continue;
+    loose.push({
+      hx: lx, hy: ly,
+      size: 0.010 + rng() * 0.010,
+      ci: Math.floor(rng() * 4),
+      f1: 0.11 + rng() * 0.17, p1: rng() * Math.PI * 2,
+      f2: 0.09 + rng() * 0.15, p2: rng() * Math.PI * 2,
+      amp: 0.020 + rng() * 0.050
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Closed-form helpers.
+// ---------------------------------------------------------------------------
+function easeOutCubic(x) { return 1 - Math.pow(1 - x, 3); }
+function easeInOutCubic(x) { return x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2; }
+
+// Excursion envelope: out (0-0.32), pause (0.32-0.62), fly home (0.62-1).
+function envelope(p) {
+  if (p <= 0) return 0;
+  if (p < 0.32) return easeOutCubic(p / 0.32);
+  if (p < 0.62) return 1;
+  if (p < 1) return 1 - easeInOutCubic((p - 0.62) / 0.38);
+  return 0;
+}
+
+// Mood: +1 attracted, -1 repelled, flipping every ~9 s with a smooth ease.
+function mood(t) {
+  return Math.tanh(2.2 * Math.sin(2 * Math.PI * t / 18));
+}
+
+// Recorded drag samples: {x, y, t} in design units / piece seconds.
+var dragSamples = [];
+var dragging = false;
+
+function dragPush(x, y, t) {
+  // Returns [ox, oy] offset for a point at design (x, y) at time t.
+  var ox = 0, oy = 0;
+  for (var i = 0; i < dragSamples.length; i++) {
+    var s = dragSamples[i];
+    var age = t - s.t;
+    if (age < 0 || age > 1.6) continue;
+    var dx = x - s.x, dy = y - s.y;
+    var d = Math.hypot(dx, dy);
+    var rad = 0.11;
+    if (d >= rad || d === 0) continue;
+    var fall = (1 - d / rad) * (1 - age / 1.6);
+    var str = 0.055 * fall;
+    ox += (dx / d) * str;
+    oy += (dy / d) * str;
+  }
+  return [ox, oy];
+}
+
+// ---------------------------------------------------------------------------
+// Draw. All positions derive from (seeded data, loop time, recorded drags).
+// ---------------------------------------------------------------------------
+function draw(t) {
+  if (W === 0 || H === 0) return;
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+
+  var M = Math.min(W, H);
+  var cx = W / 2, cy = H / 2;
+  var lt = t % LOOP;
+
+  ctx.fillStyle = COL.bg;
+  ctx.fillRect(0, 0, W, H);
+
+  // Oval oscillation: near-circle at lt = 0, oval at the quarter loop.
+  var o = Math.sin(2 * Math.PI * lt / LOOP + ovalPhase);
+  var sx = 1 + 0.15 * o, sy = 1 - 0.10 * o;
+
+  var pixSide = Math.max(2, R * 0.040 * M);
+
+  // Mass pixels, batched into one path. Direct draw every frame: the QA
+  // renderer has no offscreen canvas, and a few thousand rects batch fine.
+  ctx.fillStyle = COL.mass;
+  ctx.beginPath();
+  for (var i = 0; i < pixels.length; i++) {
+    var p = pixels[i];
+    var x = p.hx * sx, y = p.hy * sy;
+    var wins = detach[i];
+    if (wins) {
+      for (var k = 0; k < wins.length; k++) {
+        var wn = wins[k];
+        var local = lt - wn.start;
+        if (local <= 0 || local >= wn.dur) continue;
+        var env = envelope(local / wn.dur);
+        if (env <= 0) continue;
+        var wob = Math.sin(local * wn.wfr + wn.wph) * wn.wob * env;
+        x += wn.dx * env + wn.px * wob;
+        y += wn.dy * env + wn.py * wob;
+      }
+    }
+    if (dragSamples.length) {
+      var push = dragPush(x, y, t);
+      x += push[0]; y += push[1];
+    }
+    ctx.rect(cx + x * M - pixSide / 2, cy + y * M - pixSide / 2, pixSide, pixSide);
+  }
+  ctx.fill();
+
+  // Flash events: thin rounded black frame, then the white plus on top.
+  for (var f = 0; f < flashes.length; f++) {
+    var fl = flashes[f];
+    var flt = lt - fl.t0;
+    if (flt < 0 || flt > fl.dur) continue;
+    var a = Math.sin(Math.PI * flt / fl.dur);
+    var fx = cx + fl.x * M, fy = cy + fl.y * M;
+    var half = fl.size * M / 2;
+    var rad = half * 0.35;
+    ctx.save();
+    ctx.globalAlpha = a;
+    ctx.strokeStyle = COL.mass;
+    ctx.lineWidth = Math.max(1.2, 0.0035 * M);
+    ctx.beginPath();
+    ctx.moveTo(fx - half + rad, fy - half);
+    ctx.lineTo(fx + half - rad, fy - half);
+    ctx.arc(fx + half - rad, fy - half + rad, rad, -Math.PI / 2, 0);
+    ctx.lineTo(fx + half, fy + half - rad);
+    ctx.arc(fx + half - rad, fy + half - rad, rad, 0, Math.PI / 2);
+    ctx.lineTo(fx - half + rad, fy + half);
+    ctx.arc(fx - half + rad, fy + half - rad, rad, Math.PI / 2, Math.PI);
+    ctx.lineTo(fx - half, fy - half + rad);
+    ctx.arc(fx - half + rad, fy - half + rad, rad, Math.PI, Math.PI * 1.5);
+    ctx.stroke();
+    var arm = half * 0.62, th = Math.max(1.2, 0.0045 * M);
+    ctx.fillStyle = COL.white;
+    ctx.fillRect(fx - arm, fy - th / 2, arm * 2, th);
+    ctx.fillRect(fx - th / 2, fy - arm, th, arm * 2);
+    ctx.restore();
+  }
+
+  // Loose particles, batched by color into one path each.
+  var m = mood(lt);
+  var byColor = [[], [], [], []];
+  for (var j = 0; j < loose.length; j++) {
+    var q = loose[j];
+    var qx = q.hx + Math.sin(lt * q.f1 * Math.PI * 2 + q.p1) * 0.013;
+    var qy = q.hy + Math.cos(lt * q.f2 * Math.PI * 2 + q.p2) * 0.013;
+    var dl = Math.hypot(qx, qy) || 1;
+    qx += (-qx / dl) * m * q.amp;
+    qy += (-qy / dl) * m * q.amp;
+    if (dragSamples.length) {
+      var qp = dragPush(qx, qy, t);
+      qx += qp[0] * 1.6; qy += qp[1] * 1.6;
+    }
+    byColor[q.ci].push([qx, qy, q.size]);
+  }
+  for (var c = 0; c < 4; c++) {
+    if (!byColor[c].length) continue;
+    ctx.fillStyle = COL.loose[c];
+    ctx.beginPath();
+    for (var b = 0; b < byColor[c].length; b++) {
+      var it = byColor[c][b];
+      var ss = it[2] * M;
+      ctx.rect(cx + it[0] * M - ss / 2, cy + it[1] * M - ss / 2, ss, ss);
+    }
+    ctx.fill();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Pointer: drag stirs (samples recorded), a clean tap reseeds the epoch.
+// ---------------------------------------------------------------------------
+function toDesign(ev) {
+  var rect = canvas.getBoundingClientRect();
+  var M = Math.min(W, H) || 1;
+  return [
+    (ev.clientX - rect.left - W / 2) / M,
+    (ev.clientY - rect.top - H / 2) / M
+  ];
+}
+
+var downAt = 0, downPos = null, downT = 0;
+if (canvas.addEventListener) {
+  canvas.addEventListener('pointerdown', function (ev) {
+    dragging = true;
+    downPos = toDesign(ev);
+    downT = curT;
+    downAt = (typeof performance !== 'undefined') ? performance.now() : 0;
+    dragSamples.push({ x: downPos[0], y: downPos[1], t: curT });
+  });
+  canvas.addEventListener('pointermove', function (ev) {
+    if (!dragging) return;
+    var p = toDesign(ev);
+    var last = dragSamples[dragSamples.length - 1];
+    if (!last || Math.hypot(p[0] - last.x, p[1] - last.y) > 0.008) {
+      dragSamples.push({ x: p[0], y: p[1], t: curT });
+      if (dragSamples.length > 48) dragSamples.splice(0, dragSamples.length - 48);
+    }
+  });
+  var endPointer = function (ev) {
+    if (!dragging) return;
+    dragging = false;
+    var p = toDesign(ev);
+    var moved = downPos ? Math.hypot(p[0] - downPos[0], p[1] - downPos[1]) : 1;
+    var held = (typeof performance !== 'undefined') ? performance.now() - downAt : 999;
+    if (moved < 0.012 && held < 300) {
+      // Tap: reseed particle colors and blob phase via a new epoch.
+      epoch++;
+      dragSamples = [];
+      buildEpoch();
+    }
+  };
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', function () { dragging = false; });
+}
+
+// ---------------------------------------------------------------------------
+// Sizing (Visual Viewport API) and main loop.
+// ---------------------------------------------------------------------------
+function resize() {
+  var vw = (window.visualViewport && window.visualViewport.width) || window.innerWidth;
+  var vh = (window.visualViewport && window.visualViewport.height) || window.innerHeight;
+  W = Math.round(vw);
+  H = Math.round(vh);
+  canvas.width = W;
+  canvas.height = H;
+  var sw = (window.screen && window.screen.width) || 9999;
+  var sh = (window.screen && window.screen.height) || 9999;
+  isPhone = Math.min(sw, sh) < 700 || H > W * 1.15;
+  buildHomes();
+  buildEpoch();
+  draw(curT);
+}
+
+if (window.visualViewport && window.visualViewport.addEventListener) {
+  window.visualViewport.addEventListener('resize', resize);
+}
+if (window.addEventListener) window.addEventListener('resize', resize);
+
+// Frame one: synchronous draw at t = 0 (deterministic; never clock-derived).
+resize();
+draw(0);
+
+var startStamp = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+if (typeof requestAnimationFrame === 'function') {
+  var loop = function () {
+    curT = (performance.now() - startStamp) / 1000;
+    draw(curT);
+    requestAnimationFrame(loop);
+  };
+  requestAnimationFrame(loop);
+}
+</script>
+</body>
+</html>
