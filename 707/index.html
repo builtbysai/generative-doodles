@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>All of a Quiver</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #0B0B0D; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // Palette (strict): background, steel, stress edges, floor, shadow.
+  // Nothing else.
+  var BG = '#0B0B0D';
+  var STEEL = '#8A8F96';
+  var STRESS = '#C9CDD4';
+  var FLOOR = '#131316';
+  var SHADOW = '#000000';
+
+  var BASE_SEED = 707001;
+  var GX = 3, GZ = 4, GY = 9;        // tower: 3 wide, 4 deep, 9 high
+  var CYCLE = 45;                    // seconds per buckle cycle
+  var FORCE_T = -1;                  // QA hook: -1 = live clock
+
+  // QA seed hook: ?seed=tNN pins the elapsed time (used by the headless
+  // renderer to inspect later phases). Inert in normal viewing.
+  try {
+    if (typeof location !== 'undefined' && location.search) {
+      var qm = /[?&]seed=t([0-9]+(?:\.[0-9]+)?)/.exec(location.search);
+      if (qm) FORCE_T = parseFloat(qm[1]);
+    }
+  } catch (e) { /* live mode */ }
+
+  // Seeded RNG (mulberry32). Tower character per cycle derives from the
+  // cycle stream, so every frame is reproducible.
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+  function smooth(a, b, x) {
+    var u = clamp((x - a) / (b - a), 0, 1);
+    return u * u * (3 - 2 * u);
+  }
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  var W = 0, H = 0, DPR = 1, PHONE = false;
+
+  function viewSize() {
+    var w, h;
+    if (typeof window !== 'undefined' && window.visualViewport &&
+        window.visualViewport.width) {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    } else if (typeof window !== 'undefined' && window.innerWidth) {
+      w = window.innerWidth; h = window.innerHeight;
+    } else { w = 800; h = 600; }
+    return { w: w, h: h };
+  }
+
+  function resize() {
+    var s = viewSize();
+    W = s.w; H = s.h;
+    DPR = 1;
+    if (typeof window !== 'undefined' && window.devicePixelRatio) {
+      DPR = clamp(window.devicePixelRatio, 1, 2);
+    }
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    // Phone detection: physical screen size first (min dimension < 700),
+    // tall-aspect as the fallback signal only.
+    var smin = 100000;
+    if (typeof window !== 'undefined' && window.screen &&
+        window.screen.width && window.screen.height) {
+      smin = Math.min(window.screen.width, window.screen.height);
+    }
+    PHONE = (smin < 700) || (H > W * 1.15 && smin === 100000);
+  }
+
+  // ---- The buckle cycle -------------------------------------------------
+  // One 45 s cycle, a closed-form envelope of cycle time ct:
+  //   0-10   calm: the tower stands true (envelope 0).
+  //   10-18  buckle builds (smoothstep ramp), wave centred mid-height
+  //          and travelling up then down, lean growing with height.
+  //   18-26  hold: full deformation, wave still travelling slowly.
+  //   26-38  recompose: a recovery front sweeps from the base upward;
+  //          each level keeps its deformation until the front passes.
+  //   38-45  calm again.
+  // Per-level envelope env(ct, u), u = height fraction 0..1.
+  function envBase(ct) { return smooth(10, 18, ct); }
+
+  function levelEnv(ct, u) {
+    var b = envBase(ct);
+    if (b <= 0) return 0;
+    if (ct <= 26) return b;
+    var f = -0.05 + 1.30 * clamp((ct - 26) / 12, 0, 1);  // recovery front
+    return b * smooth(f - 0.25, f + 0.05, u);
+  }
+
+  // Travelling bulge: a Gaussian in height whose centre wanders up and
+  // down the tower while the buckle is active.
+  function bulgeCentre(ct) { return 0.5 + 0.32 * Math.sin((ct - 10) * 0.30); }
+  function bulge(u, ct) {
+    if (ct < 10) return 0;
+    var d = (u - bulgeCentre(ct)) / 0.20;
+    return Math.exp(-d * d);
+  }
+
+  // Per-cycle character: lean direction, wave direction and twist, a
+  // per-level magnitude so the deformation reads organic, one phase.
+  var cycCache = { key: -1, c: null };
+  function buildCycle(cycle) {
+    if (cycCache.key === cycle) return cycCache.c;
+    var rng = mulberry32(BASE_SEED + cycle * 7919 + 11);
+    var c = {
+      leanAng: rng() * Math.PI * 2,
+      waveAng: rng() * Math.PI * 2,
+      twist: 0.8 + rng() * 0.9,
+      phase: rng() * Math.PI * 2,
+      levelMag: []
+    };
+    for (var k = 0; k < GY; k++) c.levelMag.push(0.7 + rng() * 0.6);
+    cycCache = { key: cycle, c: c };
+    return c;
+  }
+
+  // ---- Pointer lean -------------------------------------------------------
+  // Recorded pointer state on the anchored clock. While dragging near
+  // the tower the lean eases toward a target that pushes away from the
+  // pointer; on release it springs back as a damped oscillation. Both
+  // are closed-form functions of the recorded events and t.
+  var ptr = { mode: 'idle', t0: 0, base: { x: 0, z: 0 }, target: { x: 0, z: 0 } };
+
+  function pointerLean(t) {
+    if (ptr.mode === 'drag') {
+      var u = smooth(0, 0.35, t - ptr.t0);
+      return {
+        x: ptr.base.x + (ptr.target.x - ptr.base.x) * u,
+        z: ptr.base.z + (ptr.target.z - ptr.base.z) * u
+      };
+    }
+    if (ptr.mode === 'spring') {
+      var dt = t - ptr.t0;
+      var d = Math.exp(-dt * 1.6) * Math.cos(dt * 4.2);
+      return { x: ptr.base.x * d, z: ptr.base.z * d };
+    }
+    return { x: 0, z: 0 };
+  }
+
+  // ---- Geometry -----------------------------------------------------------
+  // Isometric projection of world (x right, z depth, y up), unit = one
+  // cube edge. The unit scale s fits the tower to the frame: projected
+  // width (GX+GZ)*cos30, projected height (GX+GZ)*sin30 + GY.
+  var COS = 0.8660254, SIN = 0.5;
+  function layout() {
+    var s = Math.min(W * 0.82 / ((GX + GZ) * COS),
+                     H * (PHONE ? 0.80 : 0.86) / ((GX + GZ) * SIN + GY));
+    return {
+      s: s,
+      cx: W / 2,
+      cy: GY * s + (H - ((GX + GZ) * SIN + GY) * s) / 2
+    };
+  }
+  function proj(L, x, z, y) {
+    return {
+      x: L.cx + (x - z) * COS * L.s,
+      y: L.cy + (x + z) * SIN * L.s - y * L.s
+    };
+  }
+
+  // World position of lattice node (i, j, k) at cycle time ct. The base
+  // is fixed (envelope vanishes at u = 0); displacement grows with
+  // height: a global lean (top sway about 1.25 units, near 8 degrees)
+  // plus a travelling per-level bulge field, plus the pointer lean.
+  function nodeWorld(i, j, k, ct, cyc, pl) {
+    var u = k / GY;
+    var e = levelEnv(ct, u);
+    var mag = cyc.levelMag[Math.min(k, GY - 1)];
+    var b = bulge(u, ct) * e;
+    // Lean.
+    var lp = 1.25 * Math.pow(u, 1.6) * e;
+    var lx = Math.cos(cyc.leanAng) * lp, lz = Math.sin(cyc.leanAng) * lp;
+    // Travelling bulge: direction twists with height, mild spatial
+    // variation across the footprint, sampled at the shared node so
+    // every edge stays welded.
+    var wa = cyc.waveAng + u * cyc.twist;
+    var spatial = 0.8 + 0.2 * Math.sin(i * 1.7 + j * 1.3 + cyc.phase);
+    var wamp = b * 0.38 * mag * spatial;
+    var wx = Math.cos(wa) * wamp, wz = Math.sin(wa) * wamp;
+    // Slight vertical compression where the bulge bites.
+    var yOff = -0.12 * bulge(u, ct) * e * u;
+    // Pointer lean grows with height too.
+    var pu = Math.pow(u, 1.5);
+    return {
+      x: i + lx + wx + pl.x * pu,
+      z: j + lz + wz + pl.z * pu,
+      y: k + yOff
+    };
+  }
+
+  function strokeEdge(p, q, stress) {
+    ctx.strokeStyle = STEEL;
+    ctx.beginPath();
+    ctx.moveTo(p.x, p.y);
+    ctx.lineTo(q.x, q.y);
+    ctx.stroke();
+    if (stress > 0.30) {
+      ctx.globalAlpha = 0.85 * clamp((stress - 0.30) / 0.55, 0, 1);
+      ctx.strokeStyle = STRESS;
+      ctx.beginPath();
+      ctx.moveTo(p.x, p.y);
+      ctx.lineTo(q.x, q.y);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function strokeBent(p, q, ctrl, stress) {
+    ctx.strokeStyle = STEEL;
+    ctx.beginPath();
+    ctx.moveTo(p.x, p.y);
+    ctx.quadraticCurveTo(ctrl.x, ctrl.y, q.x, q.y);
+    ctx.stroke();
+    if (stress > 0.30) {
+      ctx.globalAlpha = 0.85 * clamp((stress - 0.30) / 0.55, 0, 1);
+      ctx.strokeStyle = STRESS;
+      ctx.beginPath();
+      ctx.moveTo(p.x, p.y);
+      ctx.quadraticCurveTo(ctrl.x, ctrl.y, q.x, q.y);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = BG;
+    ctx.fillRect(0, 0, W, H);
+    var cycle = Math.floor(t / CYCLE);
+    var ct = t - cycle * CYCLE;
+    var cyc = buildCycle(cycle);
+    var L = layout();
+    var pl = pointerLean(t);
+
+    // Floor: a slab a little larger than the footprint, at y = 0.
+    var fc = [[-1, -1], [GX + 1, -1], [GX + 1, GZ + 1], [-1, GZ + 1]];
+    ctx.fillStyle = FLOOR;
+    ctx.beginPath();
+    for (var f = 0; f < 4; f++) {
+      var fp = proj(L, fc[f][0], fc[f][1], 0);
+      if (f === 0) ctx.moveTo(fp.x, fp.y); else ctx.lineTo(fp.x, fp.y);
+    }
+    ctx.closePath();
+    ctx.fill();
+
+    // Faint shadow: the footprint in black, three soft passes.
+    var sc = [[0, 0], [GX, 0], [GX, GZ], [0, GZ]];
+    var cen = proj(L, GX / 2, GZ / 2, 0);
+    var passes = [[1.0, 0.32], [1.08, 0.18], [1.17, 0.09]];
+    ctx.fillStyle = SHADOW;
+    for (var pi = 0; pi < 3; pi++) {
+      ctx.globalAlpha = passes[pi][1];
+      ctx.beginPath();
+      for (var si = 0; si < 4; si++) {
+        var sp = proj(L, sc[si][0] + 0.18, sc[si][1] + 0.10, 0);
+        var sx = cen.x + (sp.x - cen.x) * passes[pi][0];
+        var sy = cen.y + (sp.y - cen.y) * passes[pi][0];
+        if (si === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
+      }
+      ctx.closePath();
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // Node screen positions for this frame.
+    var nodes = [];
+    var i, j, k;
+    for (i = 0; i <= GX; i++) {
+      nodes.push([]);
+      for (j = 0; j <= GZ; j++) {
+        nodes[i].push([]);
+        for (k = 0; k <= GY; k++) {
+          var wpos = nodeWorld(i, j, k, ct, cyc, pl);
+          nodes[i][j].push(proj(L, wpos.x, wpos.z, wpos.y));
+        }
+      }
+    }
+
+    ctx.lineWidth = clamp(L.s / 45, 0.8, 1.6);
+    ctx.lineCap = 'round';
+
+    // Vertical edges, back to front by footprint diagonal. Each bends
+    // as a quadratic curve when its cell is inside the bulge: the
+    // control point is the midpoint pushed twice the bend offset along
+    // the wave direction (a quadratic passes halfway to its control).
+    var s2, a, bIdx;
+    for (s2 = 0; s2 <= GX + GZ; s2++) {
+      for (i = 0; i <= GX; i++) {
+        j = s2 - i;
+        if (j < 0 || j > GZ) continue;
+        for (k = 0; k < GY; k++) {
+          var p = nodes[i][j][k], q = nodes[i][j][k + 1];
+          var um = (k + 0.5) / GY;
+          var em = levelEnv(ct, um);
+          var bm = bulge(um, ct) * em;
+          var stress = bm * cyc.levelMag[k];
+          if (bm > 0.02) {
+            var wa2 = cyc.waveAng + um * cyc.twist;
+            var bend = bm * 0.17 * cyc.levelMag[k];
+            var wLo = nodeWorld(i, j, k, ct, cyc, pl);
+            var wHi = nodeWorld(i, j, k + 1, ct, cyc, pl);
+            var ctrl = proj(L,
+              (wLo.x + wHi.x) / 2 + Math.cos(wa2) * bend * 2,
+              (wLo.z + wHi.z) / 2 + Math.sin(wa2) * bend * 2,
+              k + 0.5);
+            strokeBent(p, q, ctrl, stress);
+          } else {
+            strokeEdge(p, q, stress);
+          }
+        }
+      }
+    }
+
+    // Horizontal ring edges at every level, back to front.
+    for (k = 0; k <= GY; k++) {
+      var u2 = k / GY;
+      var rStress = bulge(u2, ct) * levelEnv(ct, u2) *
+                    cyc.levelMag[Math.min(k, GY - 1)];
+      for (s2 = 0; s2 <= GX + GZ; s2++) {
+        for (i = 0; i <= GX; i++) {
+          j = s2 - i;
+          if (j < 0 || j > GZ) continue;
+          if (i < GX) strokeEdge(nodes[i][j][k], nodes[i + 1][j][k], rStress);
+          if (j < GZ) strokeEdge(nodes[i][j][k], nodes[i][j + 1][k], rStress);
+        }
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---- Clock, pointer, boot ---------------------------------------------
+  var startStamp = -1;
+  function nowSec() {
+    if (FORCE_T >= 0) return FORCE_T;
+    if (typeof performance !== 'undefined' && performance.now) {
+      if (startStamp < 0) startStamp = performance.now();
+      return (performance.now() - startStamp) / 1000;
+    }
+    return 0;
+  }
+
+  function evtPos(e) {
+    if (e && typeof e.clientX === 'number') return { x: e.clientX, y: e.clientY };
+    if (e && e.touches && e.touches.length) {
+      return { x: e.touches[0].clientX, y: e.touches[0].clientY };
+    }
+    return { x: W / 2, y: H / 2 };
+  }
+
+  // Convert a pointer position into a lean target: a horizontal push
+  // away from the pointer, in world units, fading with distance from
+  // the tower centre. Screen-x push maps to the world (x, -z) diagonal.
+  function leanTarget(p) {
+    var L = layout();
+    var dx = L.cx - p.x;
+    var dist = Math.abs(dx);
+    var radius = L.s * (GX + GZ) * COS * 0.85;
+    var fall = clamp(1 - dist / radius, 0, 1);
+    var a = clamp(dx / L.s, -1.4, 1.4) * 0.30 * fall;
+    a = clamp(a, -0.45, 0.45);
+    return { x: a, z: -a };
+  }
+
+  function onDown(e) {
+    var t = nowSec();
+    ptr.base = pointerLean(t);
+    ptr.target = leanTarget(evtPos(e));
+    ptr.t0 = t;
+    ptr.mode = 'drag';
+    draw(t);
+  }
+  function onMove(e) {
+    if (ptr.mode !== 'drag') return;
+    ptr.target = leanTarget(evtPos(e));
+    draw(nowSec());
+  }
+  function onUp() {
+    var t = nowSec();
+    if (ptr.mode !== 'drag') return;
+    ptr.base = pointerLean(t);
+    ptr.t0 = t;
+    ptr.mode = 'spring';
+    draw(t);
+  }
+
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+  }
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('resize', function () { resize(); draw(nowSec()); });
+  }
+  if (typeof window !== 'undefined' && window.visualViewport &&
+      window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () {
+      resize(); draw(nowSec());
+    });
+  }
+
+  resize();
+  draw(0); // frame one: the synchronous draw at t = 0, tower true
+
+  if (FORCE_T >= 0) {
+    draw(FORCE_T);
+  } else if (typeof requestAnimationFrame === 'function') {
+    var tick = function () {
+      draw(nowSec());
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }
+})();
+</script>
+</body>
+</html>

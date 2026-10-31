@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Web, Over</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #0A0A0C;
+    overflow: hidden;
+    height: 100%;
+  }
+  canvas {
+    display: block;
+    touch-action: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ---------- seeded RNG (mulberry32) ----------
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- palette (strict) ----------
+  var COL_BG = '#0A0A0C';
+  var COL_STRAND = '#6B7078';
+  var COL_SPHERE = '#DDE3EA';
+  var COL_HIGHLIGHT = '#FFFFFF';
+  var COL_SHADOW = '#050506';
+
+  // ---------- state ----------
+  var BASE_SEED = 70686;
+  var epoch = 0;
+  var epochStart = 0;      // anchored elapsed seconds when this epoch began
+  var topo = null;         // topology for current epoch
+  var W = 0, H = 0;
+  var isPhone = false;
+
+  var bootTime = (typeof performance !== 'undefined' && performance.now)
+    ? performance.now() : 0;
+
+  function elapsed() {
+    if (typeof performance !== 'undefined' && performance.now) {
+      return (performance.now() - bootTime) / 1000;
+    }
+    return 0;
+  }
+
+  // ---------- topology ----------
+  // A web is a polar graph: a hub, N radial strands with jittered angles,
+  // M capture-spiral rings at power-spaced fractions, and glass spheres
+  // pinned to a seeded subset of (radial, ring) intersections.
+  function buildTopology(seed) {
+    var rnd = mulberry32(seed);
+    var t = {};
+    t.hubFx = 0.44 + rnd() * 0.12;          // slightly off-center
+    t.hubFy = 0.30 + rnd() * 0.08;          // upper area: the web is overhead
+    t.radials = 12 + Math.floor(rnd() * 5); // 12..16
+    t.rings = 8 + Math.floor(rnd() * 5);    // 8..12
+    t.angles = [];
+    t.swayPhase = [];
+    t.swayPeriod = [];
+    var baseStep = (Math.PI * 2) / t.radials;
+    for (var i = 0; i < t.radials; i++) {
+      t.angles.push(i * baseStep + (rnd() - 0.5) * baseStep * 0.45);
+      t.swayPhase.push(rnd() * Math.PI * 2);
+      t.swayPeriod.push(20 + rnd() * 10);   // 20..30 s pendulums
+    }
+    // ring fractions: power spacing, denser near hub, last ring near the edge
+    t.fracs = [];
+    for (var j = 0; j < t.rings; j++) {
+      var u = (j + 1) / t.rings;
+      t.fracs.push(0.10 + 0.88 * Math.pow(u, 1.45));
+    }
+    // spheres: seeded subset of intersections on rings 1..end,
+    // larger toward the outer rings; target 40..70 spheres.
+    t.spheres = [];
+    var p = 0.34 + rnd() * 0.10;
+    for (var r = 0; r < t.radials; r++) {
+      for (var k = 1; k < t.rings; k++) {
+        if (rnd() < p) {
+          t.spheres.push({
+            radial: r,
+            ring: k,
+            sizeJitter: 0.8 + rnd() * 0.45,
+            hlPhase: rnd() * Math.PI * 2
+          });
+        }
+      }
+    }
+    while (t.spheres.length > 70) t.spheres.splice(Math.floor(rnd() * t.spheres.length), 1);
+    var guard = 0;
+    while (t.spheres.length < 40 && guard < 400) {
+      guard++;
+      var rr = Math.floor(rnd() * t.radials);
+      var kk = 1 + Math.floor(rnd() * (t.rings - 1));
+      var dup = false;
+      for (var s = 0; s < t.spheres.length; s++) {
+        if (t.spheres[s].radial === rr && t.spheres[s].ring === kk) { dup = true; break; }
+      }
+      if (!dup) {
+        t.spheres.push({ radial: rr, ring: kk, sizeJitter: 0.8 + rnd() * 0.45, hlPhase: rnd() * Math.PI * 2 });
+      }
+    }
+    t.hubPhase = rnd() * Math.PI * 2;
+    return t;
+  }
+
+  // distance from hub to just past the frame edge along direction (dx, dy)
+  function edgeReach(hx, hy, dx, dy) {
+    var best = Infinity;
+    var m = Math.max(W, H) * 0.12;
+    if (dx > 1e-6) best = Math.min(best, (W + m - hx) / dx);
+    if (dx < -1e-6) best = Math.min(best, (-m - hx) / dx);
+    if (dy > 1e-6) best = Math.min(best, (H + m - hy) / dy);
+    if (dy < -1e-6) best = Math.min(best, (-m - hy) / dy);
+    return best;
+  }
+
+  // position of a point on radial i at fraction f, at local time lt.
+  // Ring points (f < 1) get a vertical squash so the capture-spiral zone
+  // sits in the upper frame like a canopy seen from below; the radial
+  // anchors themselves run on out to the frame edges.
+  var RING_SQUASH = 0.66;
+  function strandPoint(i, f, lt, hub) {
+    var sway = 0.006 * Math.sin((Math.PI * 2) * lt / topo.swayPeriod[i] + topo.swayPhase[i]);
+    var a = topo.angles[i] + sway;
+    var dx = Math.cos(a), dy = Math.sin(a);
+    var reach = edgeReach(hub.x, hub.y, dx, dy);
+    var breathe = 1 + 0.008 * Math.sin((Math.PI * 2) * lt / 26 + topo.swayPhase[i] * 1.7);
+    var d = reach * f * breathe;
+    var x = hub.x + dx * d;
+    var y = hub.y + dy * d;
+    if (f < 0.999) y = hub.y + (y - hub.y) * RING_SQUASH;
+    return { x: x, y: y };
+  }
+
+  function draw(lt) {
+    if (!W || !H) return;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+
+    // ground
+    ctx.fillStyle = COL_BG;
+    ctx.fillRect(0, 0, W, H);
+
+    // deep shadow anchoring the lower frame: stacked flat bands
+    var bandTop = H * 0.72;
+    var bandH = H - bandTop;
+    var steps = 5;
+    for (var b = 0; b < steps; b++) {
+      ctx.globalAlpha = 0.18 + 0.2 * b;
+      ctx.fillStyle = COL_SHADOW;
+      ctx.fillRect(0, bandTop + (bandH * b) / steps, W, bandH / steps + 1);
+    }
+    ctx.globalAlpha = 1;
+
+    // hub drifts a breath
+    var hub = {
+      x: topo.hubFx * W + Math.sin((Math.PI * 2) * lt / 31 + topo.hubPhase) * W * 0.004,
+      y: topo.hubFy * H + Math.cos((Math.PI * 2) * lt / 27 + topo.hubPhase * 1.3) * H * 0.004
+    };
+
+    var unit = Math.min(W, H);
+    ctx.lineCap = 'round';
+
+    // radial strands: hub out to the frame edges
+    ctx.strokeStyle = COL_STRAND;
+    ctx.globalAlpha = 0.75;
+    ctx.lineWidth = Math.max(1, unit * 0.0016);
+    ctx.beginPath();
+    for (var i = 0; i < topo.radials; i++) {
+      // polyline through the ring points so strands pass exactly through
+      // the (squashed) intersections, then on to the edge anchor
+      ctx.moveTo(hub.x, hub.y);
+      for (var j = 0; j < topo.rings; j++) {
+        var rp = strandPoint(i, topo.fracs[j], lt, hub);
+        ctx.lineTo(rp.x, rp.y);
+      }
+      var end = strandPoint(i, 1.0, lt, hub);
+      ctx.lineTo(end.x, end.y);
+    }
+    ctx.stroke();
+
+    // capture spirals: sagging polygon rings between neighbouring radials
+    ctx.globalAlpha = 0.62;
+    ctx.lineWidth = Math.max(1, unit * 0.0013);
+    for (var j = 0; j < topo.rings; j++) {
+      var f = topo.fracs[j];
+      ctx.beginPath();
+      for (var k = 0; k <= topo.radials; k++) {
+        var idx = k % topo.radials;
+        var p = strandPoint(idx, f, lt, hub);
+        if (k === 0) {
+          ctx.moveTo(p.x, p.y);
+        } else {
+          var prev = strandPoint((k - 1) % topo.radials, f, lt, hub);
+          // sag: control point pulled toward the hub and slightly down
+          var mx = (prev.x + p.x) / 2;
+          var my = (prev.y + p.y) / 2;
+          var sag = 0.16 + 0.5 * f;
+          var cx = mx + (hub.x - mx) * 0.06 * sag + 0;
+          var cy = my + (hub.y - my) * 0.06 * sag + Math.hypot(p.x - prev.x, p.y - prev.y) * 0.045;
+          ctx.quadraticCurveTo(cx, cy, p.x, p.y);
+        }
+      }
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+
+    // glass spheres at intersections: translucent disc, rim, one highlight dot
+    for (var s = 0; s < topo.spheres.length; s++) {
+      var sp = topo.spheres[s];
+      var pos = strandPoint(sp.radial, topo.fracs[sp.ring], lt, hub);
+      var ringU = sp.ring / (topo.rings - 1);          // 0 inner .. 1 outer
+      var rad = unit * (0.006 + 0.016 * ringU) * sp.sizeJitter * (isPhone ? 0.85 : 1);
+      ctx.globalAlpha = 0.16;
+      ctx.fillStyle = COL_SPHERE;
+      ctx.beginPath();
+      ctx.arc(pos.x, pos.y, rad, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 0.38;
+      ctx.strokeStyle = COL_SPHERE;
+      ctx.lineWidth = Math.max(1, unit * 0.0011);
+      ctx.beginPath();
+      ctx.arc(pos.x, pos.y, rad, 0, Math.PI * 2);
+      ctx.stroke();
+      // highlight dot, offset toward a light that drifts slowly
+      var hlA = -0.8 + 0.35 * Math.sin((Math.PI * 2) * lt / 37 + sp.hlPhase);
+      var hx = pos.x + Math.cos(hlA) * rad * 0.38;
+      var hy = pos.y + Math.sin(hlA) * rad * 0.38;
+      ctx.globalAlpha = 0.85;
+      ctx.fillStyle = COL_HIGHLIGHT;
+      ctx.beginPath();
+      ctx.arc(hx, hy, Math.max(1, rad * 0.22), 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // hub bead
+    ctx.globalAlpha = 0.5;
+    ctx.fillStyle = COL_SPHERE;
+    ctx.beginPath();
+    ctx.arc(hub.x, hub.y, Math.max(1.5, unit * 0.004), 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- sizing ----------
+  function resize() {
+    var w, h;
+    if (typeof window !== 'undefined' && window.visualViewport) {
+      w = window.visualViewport.width;
+      h = window.visualViewport.height;
+    } else {
+      w = window.innerWidth;
+      h = window.innerHeight;
+    }
+    W = Math.round(w);
+    H = Math.round(h);
+    canvas.width = W;
+    canvas.height = H;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    var sw = (typeof window !== 'undefined' && window.screen) ? window.screen.width : W;
+    var sh = (typeof window !== 'undefined' && window.screen) ? window.screen.height : H;
+    isPhone = Math.min(sw, sh) < 700 || (H > W * 1.15 && Math.min(W, H) < 700);
+    draw(elapsed() - epochStart);
+  }
+
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', resize);
+    }
+    window.addEventListener('resize', resize);
+    window.addEventListener('orientationchange', resize);
+  }
+
+  // ---------- interaction: tap reseeds a new web topology ----------
+  function reseed() {
+    epoch++;
+    epochStart = elapsed();
+    topo = buildTopology(BASE_SEED + epoch * 7919);
+    draw(0);
+  }
+  canvas.addEventListener('pointerdown', function () { reseed(); });
+
+  // ---------- boot: frame one at sway phase 0 ----------
+  topo = buildTopology(BASE_SEED);
+  resize();
+  draw(0);
+
+  if (typeof requestAnimationFrame === 'function') {
+    var loop = function () {
+      draw(elapsed() - epochStart);
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
