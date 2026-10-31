@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>El Bosque Infinito</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0B0E11; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded RNG (mulberry32) ----------
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function hash2(a, b) {
+    var h = (a * 374761393 + b * 668265263) | 0;
+    h = Math.imul(h ^ (h >>> 13), 1274126177);
+    return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+  }
+
+  var SEEDBASE = 633077;
+  var FORCED_OFF = null;
+  // QA hooks via ?seed=: "off<px>" forces a static strip offset (wrap check),
+  // a bare number reseeds the forest. No effect in normal viewing.
+  (function parseQuery() {
+    var q = (typeof location !== 'undefined' && location.search) || '';
+    var m = q.match(/seed=([^&]+)/);
+    if (!m) return;
+    var v = m[1];
+    if (v.indexOf('off') === 0) {
+      var f = parseFloat(v.slice(3));
+      if (!isNaN(f)) FORCED_OFF = f;
+    } else {
+      var n = parseInt(v, 10);
+      if (!isNaN(n)) SEEDBASE = n;
+    }
+  })();
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ---------- palette (strict, no other hues) ----------
+  var GROUND = '#0B0E11';   // near-black ground / page
+  var NEAR = '#12211A';     // near-tree black-green
+  var MID = '#24382E';       // mid-tree
+  var FAR = '#3E5A52';       // far-tree blue-gray
+  var ACCENT = '#D8A94E';   // canopy accent warm
+  var OWL = '#E8B93B';      // owl amber eye
+  var FLY = '#F2EDDA';      // firefly white
+
+  function hexRgb(h) {
+    if (h.charAt(0) === '#') return [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
+    var m = h.match(/\d+(\.\d+)?/g);
+    return [Math.round(+m[0]), Math.round(+m[1]), Math.round(+m[2])];
+  }
+  function rgba(h, a) {
+    var c = hexRgb(h);
+    return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a + ')';
+  }
+  function shade(h, f) {
+    var c = hexRgb(h);
+    function cl(v) { return Math.max(0, Math.min(255, Math.round(v))); }
+    return 'rgb(' + cl(c[0] * f) + ',' + cl(c[1] * f) + ',' + cl(c[2] * f) + ')';
+  }
+  function mixc(h1, h2, t) {
+    var a = hexRgb(h1), b = hexRgb(h2);
+    function cl(v) { return Math.max(0, Math.min(255, Math.round(v))); }
+    return 'rgb(' + cl(a[0] + (b[0] - a[0]) * t) + ',' + cl(a[1] + (b[1] - a[1]) * t) + ',' + cl(a[2] + (b[2] - a[2]) * t) + ')';
+  }
+  function clamp01(x) { return x < 0 ? 0 : (x > 1 ? 1 : x); }
+  function smooth(a, b, x) {
+    var t = clamp01((x - a) / (b - a));
+    return t * t * (3 - 2 * t);
+  }
+  function mod(n, m) { return ((n % m) + m) % m; }
+
+  // ---------- sizing (Visual Viewport API) ----------
+  var W = 0, H = 0, lastElapsed = 0;
+  function resize() {
+    var vv = window.visualViewport;
+    W = Math.round(vv ? vv.width : window.innerWidth);
+    H = Math.round(vv ? vv.height : window.innerHeight);
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = W * dpr;
+    canvas.height = H * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    draw(lastElapsed);
+  }
+  if (window.visualViewport) window.visualViewport.addEventListener('resize', resize);
+  window.addEventListener('resize', resize);
+
+  function isPhone(w, h) {
+    var sw = (window.screen && window.screen.width) || w;
+    var sh = (window.screen && window.screen.height) || h;
+    if (Math.min(sw, sh) < 700) return true;
+    return h > w * 1.15;
+  }
+
+  // ---------- state ----------
+  var off = 0;              // strip offset in px (near-layer space)
+  var gen = 0;              // reseed generation counter
+  var genStart = -10;       // elapsed time of last reseed (fade-in)
+  var dragging = false;
+
+  function effOff() { return FORCED_OFF !== null ? FORCED_OFF : off; }
+
+  // ---------- day / night ----------
+  // 120 s cycle. Frame one (elapsed 0) is deep night: daylight 0.
+  function daylightAt(t) {
+    var p = mod(t, 120) / 120;
+    return 0.55 * (smooth(0.30, 0.45, p) - smooth(0.62, 0.78, p));
+  }
+  function dawnGlowAt(t) {
+    var d = daylightAt(t) / 0.55;
+    return 4 * d * (1 - d) * 0.85 * (d > 0 ? 1 : 0);
+  }
+
+  // ---------- layers ----------
+  var PERIOD = 12; // toroidal period in screen widths (see process.md)
+  var LAYERS = [
+    { idx: 0, factor: 0.25, base: FAR, baseY: 0.862, count: 9, hMin: 0.33, hMax: 0.52, blobsMin: 10, blobsVar: 7, trunkW: 0.020, accent: false, fauna: false },
+    { idx: 1, factor: 0.55, base: MID, baseY: 0.942, count: 7, hMin: 0.45, hMax: 0.62, blobsMin: 18, blobsVar: 11, trunkW: 0.030, accent: true, fauna: false },
+    { idx: 2, factor: 1.00, base: NEAR, baseY: 1.000, count: 5, hMin: 0.58, hMax: 0.78, blobsMin: 26, blobsVar: 15, trunkW: 0.042, accent: true, fauna: true }
+  ];
+
+  function ridgeY(L, wx) {
+    // Phases are whole cycles per toroidal period (12 screen widths), so the
+    // ridge is continuous across segment joins and repeats exactly on wrap.
+    var u = wx / (PERIOD * W) * Math.PI * 2;
+    return L.baseY * H
+      + H * 0.010 * Math.sin(u * 10 + L.idx * 1.7)
+      + H * 0.006 * Math.sin(u * 23 + L.idx * 3.1);
+  }
+
+  // ---------- tree grammar (all values in units of tree height) ----------
+  function genTree(rng, L) {
+    var i, t;
+    var lean = (rng() - 0.5) * 0.10;
+    // wobbly trunk: 5 points from base (0,0) to top (lean, -0.60)
+    var pts = [];
+    var wob = 0;
+    for (i = 0; i <= 5; i++) {
+      t = i / 5;
+      if (i > 0 && i < 5) wob += (rng() - 0.5) * 0.035;
+      pts.push([lean * t + wob * (1 - t), -0.60 * t]);
+    }
+    var topX = pts[5][0];
+    // branches: 3-5, from upper trunk toward the canopy
+    var branches = [];
+    var nb = 3 + Math.floor(rng() * 3);
+    for (i = 0; i < nb; i++) {
+      var bt = 0.45 + rng() * 0.5;
+      var bi = bt * 5, i0 = Math.floor(bi), fr = bi - i0;
+      var sx = pts[i0][0] + (pts[Math.min(5, i0 + 1)][0] - pts[i0][0]) * fr;
+      var sy = pts[i0][1] + (pts[Math.min(5, i0 + 1)][1] - pts[i0][1]) * fr;
+      var side = rng() < 0.5 ? -1 : 1;
+      var ex = sx + side * (0.06 + rng() * 0.13);
+      var ey = sy - (0.05 + rng() * 0.10);
+      branches.push({ sx: sx, sy: sy, mx: (sx + ex) / 2 + (rng() - 0.5) * 0.05, my: (sy + ey) / 2 + (rng() - 0.5) * 0.04, ex: ex, ey: ey });
+    }
+    // canopy blobs around (topX, -0.80); every tree a different seed stream
+    var blobs = [];
+    var nbl = L.blobsMin + Math.floor(rng() * L.blobsVar);
+    for (i = 0; i < nbl; i++) {
+      var dx = (rng() + rng() - 1) * 0.30;
+      var dy = (rng() + rng() - 1) * 0.19;
+      var r = 0.04 + rng() * 0.05;
+      var roll = rng();
+      var tone = roll < 0.62 ? 0 : (roll < 0.85 ? 1 : (roll < 0.985 ? 2 : 3));
+      if (!L.accent && tone === 3) tone = 1;
+      if (tone === 3) r *= 0.55; // warm accent stays a small fleck, never a disc
+      blobs.push({ dx: dx, dy: dy, rx: r, ry: r * (0.72 + rng() * 0.4), rot: rng() * Math.PI, tone: tone });
+    }
+    // Gate fix (fly): at most ONE warm accent fleck per canopy. It is capped
+    // at 0.32x the canopy's typical blob radius and pulled halfway toward the
+    // canopy centre so it sits inside the silhouette; any further accent
+    // rolls become plain light blobs. Pure post-processing: no RNG calls, so
+    // the seeded stream, tree shapes and wrap are untouched.
+    var typ = 0, tn = 0, ai = -1, bi;
+    for (bi = 0; bi < blobs.length; bi++) {
+      if (blobs[bi].tone === 3) { if (ai < 0) ai = bi; }
+      else { typ += blobs[bi].rx; tn++; }
+    }
+    if (ai >= 0) {
+      if (tn === 0) { typ = blobs[ai].rx; tn = 1; }
+      typ /= tn;
+      for (bi = 0; bi < blobs.length; bi++) {
+        if (blobs[bi].tone === 3 && bi !== ai) blobs[bi].tone = 1;
+      }
+      var ab = blobs[ai], capR = 0.32 * typ;
+      if (ab.rx > capR) { var sc = capR / ab.rx; ab.rx *= sc; ab.ry *= sc; }
+      ab.dx *= 0.5; ab.dy *= 0.5;
+    }
+    return { fx: 0, hFrac: L.hMin + rng() * (L.hMax - L.hMin), pts: pts, branches: branches, cx: topX, blobs: blobs };
+  }
+
+  function genSegment(L, ci) {
+    var rng = mulberry32((SEEDBASE + gen * 7919) * 100003 + L.idx * 7919 + ci * 104729 + 13);
+    var trees = [];
+    for (var i = 0; i < L.count; i++) {
+      var tr = genTree(rng, L);
+      tr.fx = (i + 0.12 + rng() * 0.76) / L.count;
+      trees.push(tr);
+    }
+    return trees;
+  }
+
+  var FAUNA_TYPES = ['owl', 'mouse', 'fox', 'hummingbird'];
+  function genFauna(ci, trees) {
+    var rng = mulberry32((SEEDBASE + gen * 7919) * 31337 + ci * 7717 + 3);
+    var type = FAUNA_TYPES[mod(ci, 4)];
+    var ti = Math.floor(rng() * trees.length);
+    var canopy = (type === 'owl' || type === 'hummingbird');
+    return {
+      type: type, ti: ti,
+      dx: (rng() - 0.5) * (canopy ? 0.22 : 0.34),
+      dy: canopy ? -0.80 + (rng() - 0.5) * 0.10 : 0,
+      flip: rng() < 0.5 ? -1 : 1,
+      ph: rng() * Math.PI * 2
+    };
+  }
+
+  // ---------- drawing ----------
+  function layerColors(L, bright) {
+    return [
+      shade(L.base, bright),
+      shade(L.base, bright * 1.30),
+      shade(L.base, bright * 0.70),
+      rgba(shade(ACCENT, 1 + 0.15 * bright - 0.15), 0.5) // accent fleck at half alpha (gate fix)
+    ];
+  }
+
+  function drawTree(L, tr, bx, by, cols) {
+    var h = tr.hFrac * H;
+    var i, p;
+    ctx.strokeStyle = cols[2];
+    ctx.lineCap = 'round';
+    // branches first (behind canopy, above trunk top)
+    ctx.lineWidth = Math.max(1, h * 0.012);
+    for (i = 0; i < tr.branches.length; i++) {
+      var b = tr.branches[i];
+      ctx.beginPath();
+      ctx.moveTo(bx + b.sx * h, by + b.sy * h);
+      ctx.quadraticCurveTo(bx + b.mx * h, by + b.my * h, bx + b.ex * h, by + b.ey * h);
+      ctx.stroke();
+    }
+    // trunk: segments with decreasing width
+    for (i = 0; i < 5; i++) {
+      var t = i / 5;
+      ctx.lineWidth = Math.max(1, h * L.trunkW * (1 - t * 0.55));
+      ctx.beginPath();
+      ctx.moveTo(bx + tr.pts[i][0] * h, by + tr.pts[i][1] * h);
+      ctx.lineTo(bx + tr.pts[i + 1][0] * h, by + tr.pts[i + 1][1] * h);
+      ctx.stroke();
+    }
+    // canopy blobs
+    var cxp = bx + tr.cx * h, cyp = by - 0.80 * h;
+    for (i = 0; i < tr.blobs.length; i++) {
+      p = tr.blobs[i];
+      ctx.fillStyle = cols[p.tone];
+      ctx.beginPath();
+      ctx.ellipse(cxp + p.dx * h, cyp + p.dy * h, p.rx * h, p.ry * h, p.rot, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  function drawFauna(fa, rec, t, dark) {
+    // rec: {bx, by, h} of the host tree in screen px
+    var s = H * 0.036;
+    var x = rec.bx + fa.dx * rec.h;
+    var y = rec.by + fa.dy * rec.h;
+    ctx.fillStyle = dark;
+    ctx.strokeStyle = dark;
+    if (fa.type === 'owl') {
+      // perched body + head, two amber eyes: the only bright marks
+      ctx.beginPath(); ctx.ellipse(x, y, s * 0.34, s * 0.46, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(x, y - s * 0.48, s * 0.30, s * 0.26, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo(x - s * 0.28, y - s * 0.66); ctx.lineTo(x - s * 0.12, y - s * 0.52); ctx.lineTo(x - s * 0.30, y - s * 0.50);
+      ctx.moveTo(x + s * 0.28, y - s * 0.66); ctx.lineTo(x + s * 0.12, y - s * 0.52); ctx.lineTo(x + s * 0.30, y - s * 0.50);
+      ctx.fill();
+      ctx.fillStyle = OWL;
+      ctx.beginPath(); ctx.arc(x - s * 0.11, y - s * 0.48, s * 0.065, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(x + s * 0.11, y - s * 0.48, s * 0.065, 0, Math.PI * 2); ctx.fill();
+    } else if (fa.type === 'mouse') {
+      var gy = y - s * 0.16;
+      ctx.beginPath(); ctx.ellipse(x, gy, s * 0.46, s * 0.24, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(x + fa.flip * s * 0.30, gy - s * 0.20, s * 0.13, 0, Math.PI * 2); ctx.fill();
+      // pale tail curving away along the ground
+      ctx.strokeStyle = rgba(FLY, 0.55);
+      ctx.lineWidth = Math.max(1, s * 0.05);
+      ctx.beginPath();
+      ctx.moveTo(x - fa.flip * s * 0.42, gy);
+      ctx.quadraticCurveTo(x - fa.flip * s * 0.85, gy - s * 0.16, x - fa.flip * s * 1.05, gy + s * 0.05);
+      ctx.stroke();
+    } else if (fa.type === 'fox') {
+      var fy = y - s * 0.30;
+      ctx.beginPath(); ctx.ellipse(x, fy, s * 0.34, s * 0.30, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(x + fa.flip * s * 0.26, fy - s * 0.28, s * 0.21, 0, Math.PI * 2); ctx.fill();
+      // ears: one dark, one warm accent
+      ctx.beginPath();
+      ctx.moveTo(x + fa.flip * s * 0.10, fy - s * 0.42); ctx.lineTo(x + fa.flip * s * 0.16, fy - s * 0.62); ctx.lineTo(x + fa.flip * s * 0.24, fy - s * 0.42);
+      ctx.fill();
+      ctx.fillStyle = ACCENT;
+      ctx.beginPath();
+      ctx.moveTo(x + fa.flip * s * 0.28, fy - s * 0.42); ctx.lineTo(x + fa.flip * s * 0.36, fy - s * 0.62); ctx.lineTo(x + fa.flip * s * 0.42, fy - s * 0.40);
+      ctx.fill();
+      // tail sweeping to the ground
+      ctx.strokeStyle = dark;
+      ctx.lineWidth = Math.max(1.2, s * 0.13);
+      ctx.beginPath();
+      ctx.moveTo(x - fa.flip * s * 0.28, fy + s * 0.05);
+      ctx.quadraticCurveTo(x - fa.flip * s * 0.70, fy + s * 0.22, x - fa.flip * s * 0.95, fy + s * 0.28);
+      ctx.stroke();
+    } else { // hummingbird: tiny body, one warm wing dot, hovering
+      var hy = y + Math.sin(t * 2.2 + fa.ph) * s * 0.06;
+      ctx.beginPath(); ctx.ellipse(x, hy, s * 0.30, s * 0.13, fa.flip * -0.3, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = dark;
+      ctx.lineWidth = Math.max(1, s * 0.045);
+      ctx.beginPath();
+      ctx.moveTo(x + fa.flip * s * 0.28, hy - s * 0.02);
+      ctx.lineTo(x + fa.flip * s * 0.62, hy + s * 0.05);
+      ctx.stroke();
+      ctx.fillStyle = rgba(ACCENT, 0.85);
+      ctx.beginPath(); ctx.ellipse(x - fa.flip * s * 0.05, hy - s * 0.20, s * 0.16, s * 0.07, fa.flip * 0.7, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+
+  function drawSky(t, day, dawn) {
+    var g = ctx.createLinearGradient(0, 0, 0, H * 0.78);
+    g.addColorStop(0, mixc(GROUND, FAR, 0.15 + 0.50 * (day / 0.55)));
+    var mid = mixc(GROUND, FAR, 0.08 + 0.30 * (day / 0.55));
+    g.addColorStop(0.55, mixc(mid, ACCENT, dawn * 0.28));
+    g.addColorStop(1, mixc(GROUND, ACCENT, dawn * 0.45 + day * 0.18));
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H * 0.78);
+    ctx.fillStyle = mixc(GROUND, ACCENT, dawn * 0.45 + day * 0.18);
+    ctx.fillRect(0, H * 0.78, W, H * 0.22);
+  }
+
+  function drawStars(t, night) {
+    if (night <= 0.02) return;
+    // Star field lives in strip space too: one seeded set per screen-width
+    // segment, content period 6 segments, parallax 0.075 (see process.md).
+    var starOff = effOff() * 0.075;
+    var seg = Math.floor(starOff / W);
+    ctx.fillStyle = FLY;
+    for (var s = seg - 1; s <= seg + 1; s++) {
+      var rng = mulberry32(555001 + mod(s, 6) * 131 + (SEEDBASE % 97));
+      for (var k = 0; k < 9; k++) {
+        var fx = rng(), fy = rng(), ph = rng() * 6.28, sz = 0.8 + rng() * 1.0;
+        var sx = (s + fx) * W - starOff;
+        var sy = fy * H * 0.52 + H * 0.02;
+        var tw = 0.35 + 0.65 * (0.5 + 0.5 * Math.sin(t * 0.7 + ph));
+        ctx.globalAlpha = night * tw * 0.8;
+        ctx.beginPath();
+        ctx.arc(sx, sy, sz, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawLayer(L, t, bright, fadeA) {
+    var lo = effOff() * L.factor;
+    var seg = Math.floor(lo / W);
+    var cols = layerColors(L, bright);
+    ctx.globalAlpha = fadeA;
+    // ground ridge, continuous in world x so segments join invisibly
+    ctx.fillStyle = cols[0];
+    ctx.beginPath();
+    ctx.moveTo(-4, H + 4);
+    for (var px = -4; px <= W + 16; px += 16) {
+      ctx.lineTo(px, ridgeY(L, px + lo));
+    }
+    ctx.lineTo(W + 4, H + 4);
+    ctx.closePath();
+    ctx.fill();
+    // trees of the visible segments (plus neighbours for canopy overhang)
+    for (var s = seg - 1; s <= seg + 1; s++) {
+      var ci = mod(s, PERIOD);
+      var trees = genSegment(L, ci);
+      var recs = [];
+      for (var i = 0; i < trees.length; i++) {
+        var tr = trees[i];
+        var wx = (s + tr.fx) * W;
+        var rec = { bx: wx - lo, by: ridgeY(L, wx), h: tr.hFrac * H };
+        recs.push(rec);
+        if (rec.bx < -W * 0.45 || rec.bx > W * 1.45) continue;
+        drawTree(L, tr, rec.bx, rec.by, cols);
+      }
+      if (L.fauna) {
+        var fa = genFauna(ci, trees);
+        drawFauna(fa, recs[fa.ti], t, cols[2]);
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawFireflies(t, night, fadeA) {
+    if (night <= 0.02) return;
+    var span = PERIOD * W;
+    ctx.globalAlpha = fadeA;
+    for (var k = 0; k < 14; k++) {
+      var r1 = hash2(k + 5, 77), r2 = hash2(k + 31, 78), r3 = hash2(k + 57, 79);
+      var wx = r1 * span + Math.sin(t * 0.30 + k * 1.7) * 7;
+      var sx = mod(wx - effOff(), span);
+      if (sx > W + 20) continue;
+      var sy = (0.16 + r2 * 0.42) * H + Math.sin(t * 0.23 + k * 2.3) * 9;
+      var pulse = 0.30 + 0.70 * (0.5 + 0.5 * Math.sin(t * (0.6 + r3 * 0.7) + k * 2.1));
+      var a = night * pulse;
+      ctx.fillStyle = rgba(FLY, a * 0.16);
+      ctx.beginPath(); ctx.arc(sx, sy, 5.2, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = rgba(FLY, a * 0.92);
+      ctx.beginPath(); ctx.arc(sx, sy, 1.5 + r3 * 0.9, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    var day = daylightAt(t);
+    var dawn = dawnGlowAt(t);
+    var night = 1 - day / 0.55;
+    var bright = 1 + 0.38 * (day / 0.55);
+    var fadeA = clamp01((t - genStart) / 0.9);
+    ctx.fillStyle = GROUND;
+    ctx.fillRect(0, 0, W, H);
+    drawSky(t, day, dawn);
+    drawStars(t, night);
+    for (var i = 0; i < LAYERS.length; i++) drawLayer(LAYERS[i], t, bright, fadeA);
+    drawFireflies(t, night, fadeA);
+  }
+
+  // ---------- interaction ----------
+  // DRAG horizontally unfolds the concertina (parallax per layer).
+  // DOUBLE-TAP reseeds: the forest regrows behind a brief fade.
+  var downX = 0, lastX = 0, lastTapT = -9, lastTapX = 0;
+  canvas.addEventListener('pointerdown', function (e) {
+    dragging = true;
+    downX = e.clientX; lastX = e.clientX;
+    if (canvas.setPointerCapture) { try { canvas.setPointerCapture(e.pointerId); } catch (err) {} }
+    if (lastElapsed - lastTapT < 0.4 && Math.abs(e.clientX - lastTapX) < 48) {
+      gen++;
+      genStart = lastElapsed;
+      lastTapT = -9;
+    } else {
+      lastTapT = lastElapsed; lastTapX = e.clientX;
+    }
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (!dragging) return;
+    off -= (e.clientX - lastX);
+    lastX = e.clientX;
+  });
+  function endDrag() { dragging = false; }
+  canvas.addEventListener('pointerup', endDrag);
+  canvas.addEventListener('pointercancel', endDrag);
+
+  // ---------- clock / loop (anchored elapsed, rAF guarded) ----------
+  var t0 = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+  var prevElapsed = 0;
+  function frame() {
+    var now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : t0;
+    var elapsed = (now - t0) / 1000;
+    var dt = Math.min(0.05, Math.max(0, elapsed - prevElapsed));
+    prevElapsed = elapsed;
+    lastElapsed = elapsed;
+    if (!dragging && FORCED_OFF === null) off += W * 0.008 * dt; // slow self drift
+    draw(elapsed);
+  }
+
+  resize();
+  draw(0); // synchronous first frame: offset 0, deep night, owl in segment 0
+  if (typeof requestAnimationFrame === 'function') {
+    var loop = function () { frame(); requestAnimationFrame(loop); };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>The Healthy Mycelium</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0C0F0A; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded RNG (mulberry32) ----------
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ---------- palette (strict, no more) ----------
+  var GROUND = '#0C0F0A';   // near-black field
+  var CREAM  = '#E6DDBE';   // hyphae
+  var GOLD   = '#E8B93B';   // fusion pulse
+  var SPORE  = '#F2EDDA';   // spore dots
+  var RUST   = '#B4572E';   // fruiting bodies only
+
+  // ---------- sizing (Visual Viewport API) ----------
+  var W = 0, H = 0, DPR = 1;
+  function resize() {
+    var vv = window.visualViewport;
+    W = Math.round(vv ? vv.width : window.innerWidth);
+    H = Math.round(vv ? vv.height : window.innerHeight);
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = W * DPR;
+    canvas.height = H * DPR;
+    draw();
+  }
+  if (window.visualViewport) window.visualViewport.addEventListener('resize', resize);
+  window.addEventListener('resize', resize);
+
+  function isPhone(w, h) {
+    var sw = (window.screen && window.screen.width) || w;
+    var sh = (window.screen && window.screen.height) || h;
+    if (Math.min(sw, sh) < 700) return true;
+    return h > w * 1.15;
+  }
+
+  // ---------- simulation ----------
+  // Field is a fixed 100x100 unit square, drawn cover-fit so the sim is
+  // resolution independent and fully reproducible from the seed.
+  var FIELD = 100;
+  var STEP_S = 1 / 30;            // fixed sim step (seconds of sim time)
+  var STEP_LEN = 0.85;            // units a tip advances per step
+  var MAX_TIPS = 380;             // hard cap on active growing tips
+  var POINT_CAP = 30000;          // density cap: total strand points
+  var POINT_TARGET = 21500;       // dimming stops once back near here
+  var STRAND_POINT_MAX = 950;     // a single strand stops growing past this
+  var DIM_STEPS = 100;            // ~3.3 s fade for overgrowth / reseed deaths
+  var SEVER_STEPS = 60;           // ~2 s fade for severed strands
+  var PULSE_S = 1.7;              // fusion pulse lifetime (sim seconds)
+  var MAX_CAPS = 6;               // fruiting bodies per generation, ever
+  var CELL = 2.4;                 // spatial hash cell size (units)
+  var BASE_SEED = 636077;
+
+  var rng = null;                 // the one sim RNG stream (per generation)
+  var simTime = 0;                // sim seconds elapsed (steps * STEP_S)
+  var stepCount = 0;
+  var generation = 0;
+  var strands = [];               // {pts:[x0,y0,...], lin, born, state, dimLeft, dimSpan, gen, sporeClock}
+  var tips = [];                  // {x, y, ang, strand, lin, age, maxAge}
+  var nodes = [];                 // {x, y, gen}
+  var spores = [];                // {x, y, vx, vy, age, life}
+  var pulses = [];                // {x, y, born} in sim seconds
+  var caps = [];                  // {x, y, r, strand}
+  var capCount = 0;
+  var totalPoints = 0;
+  var grid = new Map();           // cellKey -> [{s, lin, x, y}]
+
+  function cellKey(cx, cy) { return cx * 4096 + cy; }
+
+  function gridAdd(sIdx, lin, x, y) {
+    var k = cellKey(Math.floor(x / CELL), Math.floor(y / CELL));
+    var arr = grid.get(k);
+    if (!arr) { arr = []; grid.set(k, arr); }
+    arr.push({ s: sIdx, lin: lin, x: x, y: y });
+  }
+
+  function newStrand(lin, x, y, gen) {
+    var s = {
+      pts: [x, y], lin: lin, born: stepCount,
+      state: 0, dimLeft: 0, dimSpan: 1, gen: gen, sporeClock: 0
+    };
+    strands.push(s);
+    totalPoints += 1;
+    gridAdd(strands.length - 1, lin, x, y);
+    return strands.length - 1;
+  }
+
+  function newTip(sIdx, x, y, ang) {
+    if (tips.length >= MAX_TIPS) return;
+    var s = strands[sIdx];
+    tips.push({
+      x: x, y: y, ang: ang, strand: sIdx, lin: s.lin,
+      age: 0, maxAge: 300 + Math.floor(rng() * 320)
+    });
+  }
+
+  function seedNode(x, y, gen) {
+    var lin = gen * 1000 + nodes.length; // lineage is per node
+    nodes.push({ x: x, y: y, gen: gen });
+    var base = rng() * Math.PI * 2;
+    for (var i = 0; i < 3; i++) {
+      var sIdx = newStrand(lin, x, y, gen);
+      newTip(sIdx, x, y, base + (i / 3) * Math.PI * 2 + rng() * 0.5);
+    }
+  }
+
+  function releaseSpore(x, y) {
+    var a = rng() * Math.PI * 2;
+    var sp = 1.5 + rng() * 3.5;
+    spores.push({
+      x: x, y: y,
+      vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 1.2,
+      age: 0, life: 80 + Math.floor(rng() * 80)
+    });
+  }
+
+  // Is there a live strand point of a different lineage near (x, y)?
+  function fusionAt(x, y, selfStrand, selfLin) {
+    var cx = Math.floor(x / CELL), cy = Math.floor(y / CELL);
+    for (var gx = cx - 1; gx <= cx + 1; gx++) {
+      for (var gy = cy - 1; gy <= cy + 1; gy++) {
+        var arr = grid.get(cellKey(gx, gy));
+        if (!arr) continue;
+        for (var i = 0; i < arr.length; i++) {
+          var e = arr[i];
+          if (e.s === selfStrand || e.lin === selfLin) continue;
+          var es = strands[e.s];
+          if (!es || es.state !== 0 || es.gen !== generation) continue;
+          var dx = e.x - x, dy = e.y - y;
+          if (dx * dx + dy * dy < 2.6) return e;
+        }
+      }
+    }
+    return null;
+  }
+
+  function enforceDensity() {
+    if (totalPoints <= POINT_CAP) return;
+    var toShed = totalPoints - POINT_TARGET;
+    var shed = 0;
+    for (var i = 0; i < strands.length && shed < toShed; i++) {
+      var s = strands[i];
+      if (s.gen !== generation || s.state !== 0) continue;
+      s.state = 1; s.dimSpan = DIM_STEPS; s.dimLeft = DIM_STEPS; s.sporeClock = 0;
+      shed += s.pts.length / 2;
+    }
+    // tips on dimming strands stop
+    for (var j = 0; j < tips.length; j++) {
+      if (strands[tips[j].strand].state !== 0) tips[j].age = tips[j].maxAge;
+    }
+  }
+
+  function stepSim() {
+    stepCount++;
+    simTime = stepCount * STEP_S;
+    var i, j;
+
+    // --- grow tips ---
+    var kept = [];
+    for (i = 0; i < tips.length; i++) {
+      var t = tips[i];
+      var s = strands[t.strand];
+      t.age++;
+      if (!s || s.state !== 0 || t.age > t.maxAge) continue;
+      if (s.pts.length / 2 >= STRAND_POINT_MAX) continue;
+
+      t.ang += (rng() - 0.5) * 0.55;
+      var dx = Math.cos(t.ang), dy = Math.sin(t.ang) - 0.16; // slight upward bias
+      var m = Math.sqrt(dx * dx + dy * dy) || 1;
+      t.x += (dx / m) * STEP_LEN;
+      t.y += (dy / m) * STEP_LEN;
+      if (t.x < -4 || t.x > FIELD + 4 || t.y < -4 || t.y > FIELD + 4) continue;
+
+      s.pts.push(t.x, t.y);
+      totalPoints++;
+      gridAdd(t.strand, t.lin, t.x, t.y);
+
+      // fusion with a different lineage
+      var hit = fusionAt(t.x, t.y, t.strand, t.lin);
+      if (hit) {
+        pulses.push({ x: t.x, y: t.y, born: simTime });
+        if (capCount < MAX_CAPS && rng() < 0.16) {
+          caps.push({ x: t.x, y: t.y, r: 1.5 + rng() * 1.1, strand: t.strand });
+          capCount++;
+        }
+        continue; // the tip fuses and stops
+      }
+
+      // branching
+      if (rng() < 0.014 && tips.length + kept.length < MAX_TIPS) {
+        var ns = newStrand(t.lin, t.x, t.y, generation);
+        var dir = rng() < 0.5 ? -1 : 1;
+        newTip(ns, t.x, t.y, t.ang + dir * (0.45 + rng() * 0.5));
+      }
+      kept.push(t);
+    }
+    tips = kept;
+
+    // --- dimming strands fade and release spores ---
+    for (i = 0; i < strands.length; i++) {
+      var ds = strands[i];
+      if (ds.state !== 1) continue;
+      ds.dimLeft--;
+      ds.sporeClock++;
+      if (ds.sporeClock >= 13 && ds.pts.length >= 4) {
+        ds.sporeClock = 0;
+        var pi = Math.floor(rng() * (ds.pts.length / 2)) * 2;
+        releaseSpore(ds.pts[pi], ds.pts[pi + 1]);
+      }
+      if (ds.dimLeft <= 0) {
+        ds.state = 2;
+        if (ds.gen === generation) totalPoints -= ds.pts.length / 2;
+        ds.pts = [];
+      }
+    }
+
+    // --- spores drift, settle, seed new nodes ---
+    var liveSpores = [];
+    for (i = 0; i < spores.length; i++) {
+      var sp = spores[i];
+      sp.age++;
+      sp.x += sp.vx * STEP_S * 6;
+      sp.y += sp.vy * STEP_S * 6;
+      sp.vx *= 0.985; sp.vy = sp.vy * 0.985 - 0.004;
+      if (sp.age >= sp.life) {
+        var nx = Math.max(4, Math.min(FIELD - 4, sp.x));
+        var ny = Math.max(4, Math.min(FIELD - 4, sp.y));
+        seedNode(nx, ny, generation);
+      } else if (sp.x > -2 && sp.x < FIELD + 2 && sp.y > -2 && sp.y < FIELD + 2) {
+        liveSpores.push(sp);
+      }
+    }
+    spores = liveSpores;
+
+    // --- keep the cycle endless ---
+    if (tips.length === 0 && spores.length === 0) {
+      seedNode(15 + rng() * 70, 15 + rng() * 70, generation);
+    }
+
+    enforceDensity();
+
+    // pulses are short lived; prune
+    if (pulses.length > 24) pulses.splice(0, pulses.length - 24);
+  }
+
+  function buildGeneration(gen, pregrowSteps) {
+    generation = gen;
+    rng = mulberry32(BASE_SEED + gen * 7919);
+    strands = []; tips = []; nodes = []; spores = []; pulses = []; caps = [];
+    capCount = 0; totalPoints = 0; grid = new Map();
+    stepCount = 0; simTime = 0;
+    for (var n = 0; n < 5; n++) {
+      seedNode(16 + rng() * 68, 16 + rng() * 68, gen);
+    }
+    var fusionSites = [];
+    for (var i = 0; i < pregrowSteps; i++) {
+      var before = pulses.length;
+      stepSim();
+      if (pulses.length > before) {
+        var np = pulses[pulses.length - 1];
+        fusionSites.push({ x: np.x, y: np.y });
+      }
+    }
+    // Restraint: frame one shows at most two fruiting bodies, however many
+    // fusions the pregrow produced. Live growth may still add up to MAX_CAPS.
+    if (caps.length > 2) caps.length = 2;
+    capCount = caps.length;
+    // Frame one needs one pulse ring frozen mid-pulse: take the fusion
+    // junction nearest the field center (visible at every aspect, since the
+    // field is drawn cover-fit) and re-time it to mid-pulse.
+    if (fusionSites.length) {
+      var best = fusionSites[0], bd = Infinity;
+      for (var f = 0; f < fusionSites.length; f++) {
+        var ddx = fusionSites[f].x - 50, ddy = fusionSites[f].y - 50;
+        var dd = ddx * ddx + ddy * ddy;
+        if (dd < bd) { bd = dd; best = fusionSites[f]; }
+      }
+      pulses = [{ x: best.x, y: best.y, born: simTime - PULSE_S * 0.45 }];
+    } else {
+      // No fusion happened in pregrow (rare): place the ring where two
+      // lineages pass closest, still deterministic.
+      pulses = [{ x: 50, y: 50, born: simTime - PULSE_S * 0.45 }];
+    }
+  }
+
+  // ---------- interaction ----------
+  var dragging = false;
+  var lastPt = null;
+  var severQueue = [];            // [{x0,y0,x1,y1}] in field units
+  var elapsed = 0;                // anchored elapsed seconds (rAF clock)
+  var lastTap = null;
+  var downInfo = null;
+
+  function toField(e) {
+    var rect = canvas.getBoundingClientRect();
+    var px = e.clientX - rect.left, py = e.clientY - rect.top;
+    var scale = Math.max(W / FIELD, H / FIELD) || 1;
+    return {
+      x: (px - W / 2) / scale + FIELD / 2,
+      y: (py - H / 2) / scale + FIELD / 2
+    };
+  }
+
+  function distToSeg(px, py, s) {
+    var vx = s.x1 - s.x0, vy = s.y1 - s.y0;
+    var wx = px - s.x0, wy = py - s.y0;
+    var L2 = vx * vx + vy * vy;
+    var tt = L2 ? (wx * vx + wy * vy) / L2 : 0;
+    tt = tt < 0 ? 0 : (tt > 1 ? 1 : tt);
+    var dx = wx - vx * tt, dy = wy - vy * tt;
+    return Math.sqrt(dx * dx + dy * dy);
+  }
+
+  function applySever() {
+    if (!severQueue.length) return;
+    var R = 2.7;
+    for (var i = 0; i < strands.length; i++) {
+      var s = strands[i];
+      if (s.gen !== generation || s.state !== 0) continue;
+      var hitSev = false;
+      for (var p = 0; p < s.pts.length && !hitSev; p += 4) {
+        for (var q = 0; q < severQueue.length; q++) {
+          if (distToSeg(s.pts[p], s.pts[p + 1], severQueue[q]) < R) { hitSev = true; break; }
+        }
+      }
+      if (hitSev) {
+        s.state = 1; s.dimSpan = SEVER_STEPS; s.dimLeft = SEVER_STEPS; s.sporeClock = 0;
+        for (var k = 0; k < 3 && s.pts.length >= 4; k++) {
+          var pi = Math.floor(rng() * (s.pts.length / 2)) * 2;
+          releaseSpore(s.pts[pi], s.pts[pi + 1]);
+        }
+        for (var j = 0; j < tips.length; j++) {
+          if (tips[j].strand === i) tips[j].age = tips[j].maxAge;
+        }
+      }
+    }
+    severQueue = [];
+  }
+
+  canvas.addEventListener('pointerdown', function (e) {
+    dragging = true;
+    lastPt = toField(e);
+    downInfo = { t: elapsed, moved: 0 };
+    if (canvas.setPointerCapture) { try { canvas.setPointerCapture(e.pointerId); } catch (err) {} }
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (!dragging || !lastPt) return;
+    var p = toField(e);
+    severQueue.push({ x0: lastPt.x, y0: lastPt.y, x1: p.x, y1: p.y });
+    if (downInfo) downInfo.moved += Math.abs(p.x - lastPt.x) + Math.abs(p.y - lastPt.y);
+    lastPt = p;
+  });
+  function endPointer(e) {
+    var wasDrag = dragging;
+    dragging = false; lastPt = null;
+    if (!wasDrag || !downInfo) { downInfo = null; return; }
+    var quick = (elapsed - downInfo.t) < 0.35 && downInfo.moved < 1.2;
+    downInfo = null;
+    if (!quick) { lastTap = null; return; }
+    if (lastTap !== null && (elapsed - lastTap) < 0.38) {
+      lastTap = null;
+      reseedAll();
+    } else {
+      lastTap = elapsed;
+    }
+  }
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', endPointer);
+
+  function reseedAll() {
+    // Old network fades fast while a fresh generation starts growing.
+    var old = strands;
+    buildGeneration(generation + 1, 150);
+    for (var i = 0; i < old.length; i++) {
+      var s = old[i];
+      if (s.state === 2) continue;
+      s.state = 1; s.dimSpan = 45; s.dimLeft = 45;
+      s.gen = -1; // no longer counted or interactive
+      strands.push(s);
+    }
+  }
+
+  // ---------- drawing ----------
+  function strandAlpha(s) {
+    if (s.state === 1) return 0.85 * Math.max(0, s.dimLeft / s.dimSpan);
+    return 0.85;
+  }
+
+  function draw() {
+    if (!W || !H) return;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = GROUND;
+    ctx.fillRect(0, 0, W, H);
+
+    var scale = Math.max(W / FIELD, H / FIELD);
+    ctx.save();
+    ctx.translate(W / 2, H / 2);
+    ctx.scale(scale, scale);
+    ctx.translate(-FIELD / 2, -FIELD / 2);
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+
+    // spore nodes
+    ctx.fillStyle = CREAM;
+    for (var n = 0; n < nodes.length; n++) {
+      ctx.globalAlpha = 0.18;
+      ctx.beginPath(); ctx.arc(nodes[n].x, nodes[n].y, 2.1, 0, 6.2832); ctx.fill();
+      ctx.globalAlpha = 0.9;
+      ctx.beginPath(); ctx.arc(nodes[n].x, nodes[n].y, 0.8, 0, 6.2832); ctx.fill();
+    }
+
+    // hyphae strands
+    ctx.strokeStyle = CREAM;
+    ctx.lineWidth = 0.5;
+    for (var i = 0; i < strands.length; i++) {
+      var s = strands[i];
+      if (s.state === 2 || s.pts.length < 4) continue;
+      ctx.globalAlpha = strandAlpha(s);
+      ctx.beginPath();
+      ctx.moveTo(s.pts[0], s.pts[1]);
+      for (var p = 2; p < s.pts.length; p += 2) ctx.lineTo(s.pts[p], s.pts[p + 1]);
+      ctx.stroke();
+    }
+
+    // fruiting bodies (few, rust caps at fused junctions)
+    for (var c = 0; c < caps.length; c++) {
+      var cap = caps[c];
+      var host = strands[cap.strand];
+      var a = host ? strandAlpha(host) : 0.85;
+      if (host && host.state === 2) continue;
+      ctx.globalAlpha = a;
+      ctx.strokeStyle = CREAM;
+      ctx.lineWidth = 0.45;
+      ctx.beginPath();
+      ctx.moveTo(cap.x, cap.y);
+      ctx.lineTo(cap.x, cap.y - cap.r * 0.9);
+      ctx.stroke();
+      ctx.fillStyle = RUST;
+      ctx.beginPath();
+      ctx.arc(cap.x, cap.y - cap.r * 0.9, cap.r, Math.PI, 0);
+      ctx.closePath();
+      ctx.fill();
+    }
+
+    // drifting spores
+    ctx.fillStyle = SPORE;
+    for (var q = 0; q < spores.length; q++) {
+      var sp2 = spores[q];
+      var fade = sp2.age < 8 ? sp2.age / 8 : 1;
+      ctx.globalAlpha = 0.85 * fade;
+      ctx.beginPath(); ctx.arc(sp2.x, sp2.y, 0.55, 0, 6.2832); ctx.fill();
+    }
+
+    // fusion pulses
+    ctx.strokeStyle = GOLD;
+    for (var u = 0; u < pulses.length; u++) {
+      var pu = pulses[u];
+      var age = simTime - pu.born;
+      if (age < 0 || age > PULSE_S) continue;
+      var f = age / PULSE_S;
+      ctx.globalAlpha = (1 - f) * 0.85;
+      ctx.lineWidth = 0.55 * (1 - f) + 0.15;
+      ctx.beginPath(); ctx.arc(pu.x, pu.y, 1 + f * 13, 0, 6.2832); ctx.stroke();
+      ctx.globalAlpha = (1 - f) * 0.5;
+      ctx.beginPath(); ctx.arc(pu.x, pu.y, (1 + f * 13) * 0.55, 0, 6.2832); ctx.stroke();
+    }
+
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- main loop (anchored elapsed clock, fixed-step accumulator) ----------
+  buildGeneration(0, 520);        // deterministic pre-growth: frame one is a young network
+  resize();
+  draw();                          // synchronous first frame
+  if (typeof requestAnimationFrame === 'function') {
+    var firstTs = null, lastTs = null, acc = 0;
+    var loop = function (ts) {
+      if (firstTs === null) { firstTs = ts; lastTs = ts; }
+      elapsed = (ts - firstTs) / 1000;
+      acc += Math.min(ts - lastTs, 250);
+      lastTs = ts;
+      var steps = 0;
+      while (acc >= STEP_S * 1000 && steps < 8) {
+        applySever();
+        stepSim();
+        acc -= STEP_S * 1000;
+        steps++;
+      }
+      if (steps === 8) acc = 0;
+      draw();
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,637 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Pop-Up Engine</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #EFE7D3; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded RNG (mulberry32) ----------
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  var SEED = 634077;
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ---------- palette (strict, no more) ----------
+  var PAPER = '#EFE7D3', RUST = '#B4572E', INK = '#1B2430',
+      BONE = '#EDE6D2', BLUE = '#27405E', ANT = '#14110D';
+
+  function hexRgb(h) {
+    return [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
+  }
+  function rgba(h, a) {
+    var c = hexRgb(h);
+    return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a + ')';
+  }
+  function clamp01(x) { return x < 0 ? 0 : (x > 1 ? 1 : x); }
+  function clamp(x, a, b) { return x < a ? a : (x > b ? b : x); }
+  function lerp(a, b, k) { return a + (b - a) * k; }
+  function easeIO(x) { x = clamp01(x); return x * x * (3 - 2 * x); }
+  function easeOutBack(x) {
+    x = clamp01(x);
+    var c = 1.15, u = x - 1;
+    return 1 + (c + 1) * u * u * u + c * u * u;
+  }
+  function ellip(cx, cy, rx, ry) {
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.scale(1, ry / rx);
+    ctx.beginPath();
+    ctx.arc(0, 0, rx, 0, Math.PI * 2);
+    ctx.restore();
+  }
+
+  // ---------- scene geometry (scene units: 100 x 75, y down) ----------
+  var HORIZON = 52;
+  var rng = mulberry32(SEED);
+
+  var STARS = [];
+  for (var si = 0; si < 24; si++) {
+    STARS.push({ x: 3 + rng() * 94, y: 3 + rng() * 37, r: 0.35 + rng() * 0.5, a: 0.25 + rng() * 0.3 });
+  }
+  var SPECKS = [];
+  for (var pi = 0; pi < 46; pi++) {
+    SPECKS.push({ x: rng() * 100, y: rng() * 75, r: 0.12 + rng() * 0.2 });
+  }
+  var ANTS = [];
+  for (var ai = 0; ai < 6; ai++) {
+    ANTS.push({
+      s0: 4 + rng() * 76,
+      speed: 1.6 + rng() * 1.0,
+      lane: 1.7 + rng() * 2.9,
+      size: 0.9 + rng() * 0.25,
+      ph: rng() * Math.PI * 2
+    });
+  }
+
+  // ---------- fold cycle ----------
+  // period 30 s: flat rest 0-4, fold up 4-12, hold 12-18, collapse 18-26, rest 26-30
+  var PERIOD = 30;
+  var EL = {
+    m1:    { up: [4.0, 9.0],  dn: [22.5, 26.0], upEase: easeIO,      dnEase: easeIO },
+    m2:    { up: [4.6, 9.6],  dn: [22.0, 25.6], upEase: easeIO,      dnEase: easeIO },
+    trees: { up: [6.5, 10.0], dn: [21.0, 24.5], upEase: easeOutBack, dnEase: easeIO },
+    moon:  { up: [8.0, 11.5], dn: [19.0, 23.0], upEase: easeIO,      dnEase: easeIO },
+    ledge: { up: [9.5, 12.0], dn: [18.0, 20.5], upEase: easeIO,      dnEase: easeIO }
+  };
+  function seg(p, a, b) { return clamp01((p - a) / (b - a)); }
+  function foldOf(el, p) {
+    if (p < el.up[0]) return 0;
+    if (p < el.up[1]) return clamp01(el.upEase(seg(p, el.up[0], el.up[1])));
+    if (p < el.dn[0]) return 1;
+    if (p < el.dn[1]) return clamp01(1 - el.dnEase(seg(p, el.dn[0], el.dn[1])));
+    return 0;
+  }
+  function glowOf(el, p) {
+    var rate = Math.abs(foldOf(el, p + 0.06) - foldOf(el, p - 0.06)) / 0.12;
+    return clamp01(rate * 2.0);
+  }
+
+  // ---------- interaction state ----------
+  var shift = 0;               // tap-driven cycle time shift (seconds)
+  var orbit = 0, orbitTarget = 0;
+  var pDown = null;
+  var lastElapsed = 0, lastT = 0;
+
+  function phaseNow() {
+    var p = (lastElapsed + shift) % PERIOD;
+    return p < 0 ? p + PERIOD : p;
+  }
+  function doTap() {
+    var p = phaseNow();
+    if (p >= 26 || p < 4) shift += ((4 - p) + PERIOD) % PERIOD;
+    else if (p >= 12 && p < 18) shift += (18 - p);
+  }
+  canvas.addEventListener('pointerdown', function (e) {
+    pDown = { x: e.clientX, y: e.clientY, t: lastElapsed, moved: false, orb0: orbitTarget };
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (!pDown) return;
+    var dx = e.clientX - pDown.x, dy = e.clientY - pDown.y;
+    if (Math.abs(dx) + Math.abs(dy) > 10) pDown.moved = true;
+    if (pDown.moved && foldOf(EL.m1, phaseNow()) > 0.97) {
+      orbitTarget = clamp(pDown.orb0 + dx / (0.32 * (W || 1)), -1, 1);
+    }
+  });
+  canvas.addEventListener('pointerup', function () {
+    if (pDown && !pDown.moved && (lastElapsed - pDown.t) < 0.6) doTap();
+    pDown = null;
+    orbitTarget = 0;
+  });
+  canvas.addEventListener('pointercancel', function () { pDown = null; orbitTarget = 0; });
+
+  // ---------- sizing (Visual Viewport API) ----------
+  var W = 0, H = 0, S = 1, OX = 0, OY = 0;
+  function isPhone(w, h) {
+    var sw = (window.screen && window.screen.width) || w;
+    var sh = (window.screen && window.screen.height) || h;
+    if (Math.min(sw, sh) < 700) return true;
+    return h > w * 1.15;
+  }
+  function resize() {
+    var vv = window.visualViewport;
+    W = Math.round(vv ? vv.width : window.innerWidth);
+    H = Math.round(vv ? vv.height : window.innerHeight);
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = W * dpr;
+    canvas.height = H * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    var m = Math.max(8, (isPhone(W, H) ? 0.03 : 0.05) * Math.min(W, H));
+    S = Math.min((W - 2 * m) / 109, (H - 2 * m) / 84);
+    OX = (W - 100 * S) / 2;
+    OY = (H - 75 * S) / 2;
+    draw(lastElapsed);
+  }
+  if (window.visualViewport) window.visualViewport.addEventListener('resize', resize);
+  window.addEventListener('resize', resize);
+
+  // ---------- elements ----------
+  function drawMountain(cfg, f, glow, orb) {
+    var A = f * Math.PI / 2, sA = Math.sin(A), cA = Math.cos(A);
+    var r = HORIZON - cfg.apexY;
+    var ax = cfg.apexX + orb * sA * r * 0.10;
+    var ay = HORIZON - r * (cA + sA * 0.82);
+    var dw = 1.9 * sA * (1 + orb * 0.45), dd = 1.05 * sA;
+    var midX = (cfg.x0 + cfg.x1) / 2;
+    // ground shadow (cast forward on the page, hugging the base)
+    if (sA > 0.01) {
+      ctx.beginPath();
+      ctx.moveTo(cfg.x0 + 1.8 * sA, HORIZON + 0.5 * sA);
+      ctx.lineTo(cfg.x1 + 1.8 * sA, HORIZON + 0.5 * sA);
+      ctx.lineTo(ax + 3.3 * sA, HORIZON + 3.6 * sA);
+      ctx.closePath();
+      ctx.fillStyle = rgba(INK, 0.14 * sA);
+      ctx.fill();
+    }
+    // side face (thin paper edge toward viewer, right)
+    if (sA > 0.01) {
+      ctx.beginPath();
+      ctx.moveTo(ax, ay);
+      ctx.lineTo(cfg.x1, HORIZON);
+      ctx.lineTo(cfg.x1 + dw, HORIZON + dd);
+      ctx.lineTo(ax + dw, ay + dd);
+      ctx.closePath();
+      ctx.fillStyle = BLUE;
+      ctx.fill();
+      ctx.fillStyle = rgba(INK, 0.30);
+      ctx.fill();
+    }
+    // main face
+    ctx.beginPath();
+    ctx.moveTo(cfg.x0, HORIZON);
+    ctx.lineTo(ax, ay);
+    ctx.lineTo(cfg.x1, HORIZON);
+    ctx.closePath();
+    ctx.fillStyle = BLUE;
+    ctx.fill();
+    ctx.strokeStyle = rgba(INK, 0.85);
+    ctx.lineWidth = 0.3;
+    ctx.stroke();
+    // right half shade (the V turning)
+    ctx.beginPath();
+    ctx.moveTo(ax, ay);
+    ctx.lineTo(midX, HORIZON);
+    ctx.lineTo(cfg.x1, HORIZON);
+    ctx.closePath();
+    ctx.fillStyle = rgba(INK, 0.10 + 0.08 * sA);
+    ctx.fill();
+    // snow cap
+    var c1x = lerp(cfg.x0, ax, 0.78), c1y = lerp(HORIZON, ay, 0.78);
+    var c2x = lerp(cfg.x1, ax, 0.78), c2y = lerp(HORIZON, ay, 0.78);
+    ctx.beginPath();
+    ctx.moveTo(c1x, c1y);
+    ctx.lineTo(ax, ay);
+    ctx.lineTo(c2x, c2y);
+    ctx.lineTo(lerp(c1x, c2x, 0.5), lerp(c1y, c2y, 0.5) + (HORIZON - ay) * 0.05);
+    ctx.closePath();
+    ctx.fillStyle = rgba(BONE, 0.95);
+    ctx.fill();
+    // V crease (printed fold mark)
+    ctx.beginPath();
+    ctx.setLineDash([1.5, 1.1]);
+    ctx.moveTo(ax, ay);
+    ctx.lineTo(midX, HORIZON);
+    ctx.strokeStyle = rgba(RUST, 0.8);
+    ctx.lineWidth = 0.32;
+    ctx.stroke();
+    ctx.setLineDash([]);
+    // crease shading while bending
+    if (glow > 0.02) {
+      var bh = (HORIZON - ay) * 0.07;
+      for (var i = 0; i < 3; i++) {
+        var yTop = HORIZON - (i + 1) * bh, yBot = HORIZON - i * bh;
+        var hwTop = (cfg.x1 - cfg.x0) / 2 * (yTop - ay) / Math.max(1, HORIZON - ay);
+        var hwBot = (cfg.x1 - cfg.x0) / 2 * (yBot - ay) / Math.max(1, HORIZON - ay);
+        var cxTop = lerp(midX, ax, (yTop - ay) / Math.max(1, HORIZON - ay));
+        var cxBot = lerp(midX, ax, (yBot - ay) / Math.max(1, HORIZON - ay));
+        ctx.beginPath();
+        ctx.moveTo(cxBot - hwBot, yBot);
+        ctx.lineTo(cxBot + hwBot, yBot);
+        ctx.lineTo(cxTop + hwTop, yTop);
+        ctx.lineTo(cxTop - hwTop, yTop);
+        ctx.closePath();
+        ctx.fillStyle = rgba(INK, glow * (0.16 - i * 0.045));
+        ctx.fill();
+      }
+    }
+    // hinge: printed dashed fold line + glow while bending
+    ctx.beginPath();
+    ctx.setLineDash([1.6, 1.2]);
+    ctx.moveTo(cfg.x0, HORIZON);
+    ctx.lineTo(cfg.x1, HORIZON);
+    ctx.strokeStyle = rgba(RUST, 0.9);
+    ctx.lineWidth = 0.4;
+    ctx.stroke();
+    ctx.setLineDash([]);
+    if (glow > 0.02) {
+      ctx.beginPath();
+      ctx.moveTo(cfg.x0, HORIZON);
+      ctx.lineTo(cfg.x1, HORIZON);
+      ctx.strokeStyle = rgba(RUST, glow * 0.85);
+      ctx.lineWidth = 0.6;
+      ctx.stroke();
+    }
+  }
+
+  function drawTree(cfg, f, glow, orb) {
+    var A = f * Math.PI / 2, sA = Math.sin(A), cA = Math.cos(A);
+    var ax = cfg.x + orb * sA * cfg.h * 0.10;
+    var ay = HORIZON - cfg.h * (cA + sA * 0.82);
+    var dw = 1.1 * sA * (1 + orb * 0.45), dd = 0.65 * sA;
+    var x0 = cfg.x - cfg.w / 2, x1 = cfg.x + cfg.w / 2;
+    if (sA > 0.01) {
+      ctx.beginPath();
+      ctx.moveTo(x0 + 0.9 * sA, HORIZON + 0.4 * sA);
+      ctx.lineTo(x1 + 0.9 * sA, HORIZON + 0.4 * sA);
+      ctx.lineTo(ax + 1.7 * sA, HORIZON + 2.2 * sA);
+      ctx.closePath();
+      ctx.fillStyle = rgba(INK, 0.14 * sA);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo(ax, ay);
+      ctx.lineTo(x1, HORIZON);
+      ctx.lineTo(x1 + dw, HORIZON + dd);
+      ctx.lineTo(ax + dw, ay + dd);
+      ctx.closePath();
+      ctx.fillStyle = BLUE;
+      ctx.fill();
+      ctx.fillStyle = rgba(INK, 0.30);
+      ctx.fill();
+    }
+    ctx.beginPath();
+    ctx.moveTo(x0, HORIZON);
+    ctx.lineTo(ax, ay);
+    ctx.lineTo(x1, HORIZON);
+    ctx.closePath();
+    ctx.fillStyle = BLUE;
+    ctx.fill();
+    ctx.strokeStyle = rgba(INK, 0.85);
+    ctx.lineWidth = 0.28;
+    ctx.stroke();
+    // tier ticks (print detail)
+    ctx.strokeStyle = rgba(INK, 0.45);
+    ctx.lineWidth = 0.22;
+    [0.4, 0.65].forEach(function (k) {
+      var yy = lerp(HORIZON, ay, k);
+      var hw = (cfg.w / 2) * (1 - k) * 0.8;
+      var cxp = lerp(cfg.x, ax, k);
+      ctx.beginPath();
+      ctx.moveTo(cxp - hw, yy);
+      ctx.lineTo(cxp + hw, yy);
+      ctx.stroke();
+    });
+    // tab hinge
+    ctx.beginPath();
+    ctx.setLineDash([1.2, 0.9]);
+    ctx.moveTo(x0, HORIZON);
+    ctx.lineTo(x1, HORIZON);
+    ctx.strokeStyle = rgba(RUST, 0.9);
+    ctx.lineWidth = 0.36;
+    ctx.stroke();
+    ctx.setLineDash([]);
+    if (glow > 0.02) {
+      ctx.beginPath();
+      ctx.moveTo(x0, HORIZON);
+      ctx.lineTo(x1, HORIZON);
+      ctx.strokeStyle = rgba(RUST, glow * 0.85);
+      ctx.lineWidth = 0.55;
+      ctx.stroke();
+    }
+  }
+
+  function drawMoon(f, glow, orb) {
+    var A = f * Math.PI / 2, sA = Math.sin(A);
+    var mcx = 64 + orb * 2.4 * sA;
+    var mcy = 16.5 - 5.6 * sA;
+    var rr = 8.5 * (1 + 0.10 * sA);
+    // cast shadow on the page
+    if (sA > 0.01) {
+      ellip(64 + 1.6 * sA, 30.8, 7.5, 1.5);
+      ctx.fillStyle = rgba(INK, 0.13 * sA);
+      ctx.fill();
+    }
+    // parallel-fold struts
+    [-1, 1].forEach(function (side) {
+      var b0 = 64 + side * 5.5 - 1.5, b1 = b0 + 3;
+      var tCx = mcx + side * 4.4;
+      var topY = lerp(25, mcy + rr * 0.74, sA);
+      var tx0 = lerp(b0, tCx - 1.5, sA), tx1 = lerp(b1, tCx + 1.5, sA);
+      ctx.beginPath();
+      ctx.moveTo(tx0, topY);
+      ctx.lineTo(tx1, topY);
+      ctx.lineTo(b1, 30);
+      ctx.lineTo(b0, 30);
+      ctx.closePath();
+      ctx.fillStyle = PAPER;
+      ctx.fill();
+      ctx.fillStyle = rgba(INK, 0.06);
+      ctx.fill();
+      ctx.strokeStyle = rgba(INK, 0.8);
+      ctx.lineWidth = 0.26;
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.setLineDash([1.4, 1.0]);
+      ctx.moveTo((tx0 + tx1) / 2, topY);
+      ctx.lineTo((b0 + b1) / 2, 30);
+      ctx.strokeStyle = rgba(RUST, 0.75);
+      ctx.lineWidth = 0.3;
+      ctx.stroke();
+      ctx.setLineDash([]);
+      if (glow > 0.02) {
+        ctx.beginPath();
+        ctx.moveTo((tx0 + tx1) / 2, topY);
+        ctx.lineTo((b0 + b1) / 2, 30);
+        ctx.strokeStyle = rgba(RUST, glow * 0.8);
+        ctx.lineWidth = 0.5;
+        ctx.stroke();
+      }
+    });
+    // disc
+    ctx.beginPath();
+    ctx.arc(mcx, mcy, rr, 0, Math.PI * 2);
+    ctx.fillStyle = BONE;
+    ctx.fill();
+    ctx.strokeStyle = rgba(INK, 0.9);
+    ctx.lineWidth = 0.3;
+    ctx.stroke();
+    ctx.strokeStyle = rgba(INK, 0.22);
+    ctx.lineWidth = 0.22;
+    [[-3, -2, 1.7], [2.6, 1.2, 1.25], [-0.6, 3.4, 0.95]].forEach(function (c) {
+      ctx.beginPath();
+      ctx.arc(mcx + c[0] * rr / 8.5, mcy + c[1] * rr / 8.5, c[2] * rr / 8.5, 0, Math.PI * 2);
+      ctx.stroke();
+    });
+  }
+
+  function ledgeY(r, cA, sA) { return HORIZON + r * (cA + sA * 0.90); }
+
+  function drawLedge(f, glow) {
+    var A = f * Math.PI / 2, sA = Math.sin(A), cA = Math.cos(A);
+    var yB = ledgeY(7, cA, sA);
+    // shadow under the strip
+    if (sA > 0.01) {
+      ctx.fillStyle = rgba(INK, 0.10 * sA);
+      ctx.fillRect(5 + 1.3 * sA, yB + 0.4, 90, 2.4);
+    }
+    // end caps (toward viewer)
+    if (sA > 0.01) {
+      ctx.beginPath();
+      ctx.moveTo(95, HORIZON);
+      ctx.lineTo(95, yB);
+      ctx.lineTo(95 + 2.6 * sA, yB + 1.6 * sA);
+      ctx.lineTo(95 + 1.8 * sA, HORIZON + 0.9 * sA);
+      ctx.closePath();
+      ctx.fillStyle = PAPER;
+      ctx.fill();
+      ctx.fillStyle = rgba(INK, 0.22);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo(5, HORIZON);
+      ctx.lineTo(5, yB);
+      ctx.lineTo(5 - 2.6 * sA, yB + 1.6 * sA);
+      ctx.lineTo(5 - 1.8 * sA, HORIZON + 0.9 * sA);
+      ctx.closePath();
+      ctx.fillStyle = PAPER;
+      ctx.fill();
+      ctx.fillStyle = rgba(INK, 0.22);
+      ctx.fill();
+    }
+    // strip face
+    ctx.beginPath();
+    ctx.moveTo(5, HORIZON);
+    ctx.lineTo(95, HORIZON);
+    ctx.lineTo(95, yB);
+    ctx.lineTo(5, yB);
+    ctx.closePath();
+    ctx.fillStyle = PAPER;
+    ctx.fill();
+    ctx.fillStyle = rgba(INK, 0.05 + 0.04 * sA);
+    ctx.fill();
+    // printed mid crease
+    ctx.beginPath();
+    ctx.moveTo(5, ledgeY(3.5, cA, sA));
+    ctx.lineTo(95, ledgeY(3.5, cA, sA));
+    ctx.strokeStyle = rgba(INK, 0.30);
+    ctx.lineWidth = 0.22;
+    ctx.stroke();
+    // crease shading while bending
+    if (glow > 0.02) {
+      ctx.fillStyle = rgba(INK, glow * 0.13);
+      ctx.fillRect(5, HORIZON, 90, ledgeY(2.2, cA, sA) - HORIZON);
+    }
+    // bottom edge: printed dashed fold line + glow
+    ctx.beginPath();
+    ctx.setLineDash([1.6, 1.2]);
+    ctx.moveTo(5, yB);
+    ctx.lineTo(95, yB);
+    ctx.strokeStyle = rgba(RUST, 0.85);
+    ctx.lineWidth = 0.36;
+    ctx.stroke();
+    ctx.setLineDash([]);
+    if (glow > 0.02) {
+      ctx.beginPath();
+      ctx.moveTo(5, yB);
+      ctx.lineTo(95, yB);
+      ctx.strokeStyle = rgba(RUST, glow * 0.7);
+      ctx.lineWidth = 0.55;
+      ctx.stroke();
+    }
+    return { cA: cA, sA: sA };
+  }
+
+  function drawAnt(ant, t, ledge) {
+    var L = 86;
+    var raw = ant.s0 + ant.speed * t;
+    var m = raw % (2 * L);
+    if (m < 0) m += 2 * L;
+    var s = m < L ? m : 2 * L - m;
+    var dir = m < L ? 1 : -1;
+    var x = 7 + s;
+    var feetY = ledgeY(ant.lane, ledge.cA, ledge.sA);
+    var sc = ant.size * (1 + 0.12 * ledge.sA);
+    var phase = raw * 2.4 + ant.ph;
+    ctx.save();
+    ctx.translate(x, feetY);
+    ctx.scale(dir * sc, sc);
+    ctx.strokeStyle = ANT;
+    ctx.fillStyle = ANT;
+    ctx.globalAlpha = 0.95;
+    // legs
+    ctx.lineWidth = 0.16;
+    for (var i = -1; i <= 1; i++) {
+      var lx = i * 0.52;
+      var swing = 0.30 * Math.sin(phase + i * 1.13);
+      ctx.beginPath();
+      ctx.moveTo(lx * 0.7, -0.55);
+      ctx.lineTo(lx + swing, 0);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(lx * 0.7, -0.55);
+      ctx.lineTo(lx - swing * 0.7, 0);
+      ctx.stroke();
+    }
+    // body: three segments, head forward
+    ellip(-0.78, -0.78, 0.46, 0.38); ctx.fill();
+    ellip(0, -0.80, 0.58, 0.47); ctx.fill();
+    ellip(0.72, -0.76, 0.40, 0.33); ctx.fill();
+    // antennae
+    ctx.lineWidth = 0.13;
+    ctx.beginPath();
+    ctx.moveTo(1.02, -0.98);
+    ctx.lineTo(1.48, -1.48 + 0.12 * Math.sin(phase * 1.7));
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(0.94, -1.04);
+    ctx.lineTo(1.22, -1.56 + 0.10 * Math.cos(phase * 1.7));
+    ctx.stroke();
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- QA state hook (forced standing render; unused in normal loads) ----------
+  var SEARCH = (typeof location !== 'undefined' && location.search) || '';
+  var FORCED_T = /standing/.test(SEARCH) ? 15 : null;
+
+  // ---------- drawing ----------
+  function draw(rawT) {
+    if (FORCED_T !== null) rawT = FORCED_T;
+    var t = rawT;
+    var dt = clamp(t - lastT, 0, 0.06);
+    if (t < lastT) dt = 0;
+    lastT = t;
+    lastElapsed = t;
+    orbit += (orbitTarget - orbit) * Math.min(1, dt * 7);
+    if (!W || !H) return;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+
+    var p = ((t + shift) % PERIOD + PERIOD) % PERIOD;
+    var fM1 = foldOf(EL.m1, p), fM2 = foldOf(EL.m2, p), fTr = foldOf(EL.trees, p),
+        fMo = foldOf(EL.moon, p), fLe = foldOf(EL.ledge, p);
+    var gM1 = glowOf(EL.m1, p), gM2 = glowOf(EL.m2, p), gTr = glowOf(EL.trees, p),
+        gMo = glowOf(EL.moon, p), gLe = glowOf(EL.ledge, p);
+
+    // page ground
+    ctx.fillStyle = PAPER;
+    ctx.fillRect(0, 0, W, H);
+    // sheet soft shadow (stacked offsets, no blur)
+    var shU = Math.min(W, H);
+    var sx0 = OX - 4.5 * S, sy0 = OY - 4.5 * S, swd = 109 * S, shg = 84 * S;
+    ctx.fillStyle = rgba(INK, 0.05);
+    ctx.fillRect(sx0 + shU * 0.004, sy0 + shU * 0.006, swd, shg);
+    ctx.fillStyle = rgba(INK, 0.04);
+    ctx.fillRect(sx0 + shU * 0.007, sy0 + shU * 0.010, swd, shg);
+    ctx.fillStyle = rgba(INK, 0.03);
+    ctx.fillRect(sx0 + shU * 0.010, sy0 + shU * 0.014, swd, shg);
+    // the sheet
+    ctx.fillStyle = PAPER;
+    ctx.fillRect(sx0, sy0, swd, shg);
+
+    ctx.save();
+    ctx.translate(OX, OY);
+    ctx.scale(S, S);
+
+    // print: stars and grain
+    STARS.forEach(function (st) {
+      ctx.fillStyle = rgba(INK, st.a);
+      ctx.beginPath();
+      ctx.arc(st.x, st.y, st.r * 0.45, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = rgba(INK, st.a * 0.8);
+      ctx.lineWidth = 0.16;
+      ctx.beginPath();
+      ctx.moveTo(st.x - st.r, st.y);
+      ctx.lineTo(st.x + st.r, st.y);
+      ctx.moveTo(st.x, st.y - st.r);
+      ctx.lineTo(st.x, st.y + st.r);
+      ctx.stroke();
+    });
+    SPECKS.forEach(function (sp) {
+      ctx.fillStyle = rgba(INK, 0.05);
+      ctx.beginPath();
+      ctx.arc(sp.x, sp.y, sp.r, 0, Math.PI * 2);
+      ctx.fill();
+    });
+    // printed border
+    ctx.strokeStyle = rgba(INK, 0.8);
+    ctx.lineWidth = 0.3;
+    ctx.strokeRect(0, 0, 100, 75);
+    // horizon line
+    ctx.beginPath();
+    ctx.moveTo(5, HORIZON);
+    ctx.lineTo(95, HORIZON);
+    ctx.strokeStyle = rgba(INK, 0.9);
+    ctx.lineWidth = 0.35;
+    ctx.stroke();
+
+    // ledge (front strip; mountain shadows fall across its top)
+    var ledge = drawLedge(fLe, gLe);
+    // mountains (back right first, then left)
+    drawMountain({ x0: 50, x1: 84, apexX: 67, apexY: 34 }, fM2, gM2, orbit);
+    drawMountain({ x0: 12, x1: 46, apexX: 28, apexY: 27 }, fM1, gM1, orbit);
+    // trees on tabs
+    drawTree({ x: 8.5, w: 5, h: 12 }, fTr, gTr, orbit);
+    drawTree({ x: 47.5, w: 4.4, h: 9 }, fTr, gTr, orbit);
+    drawTree({ x: 91, w: 5.4, h: 13 }, fTr, gTr, orbit);
+    // moon on parallel folds (struts print over the right mountain's flat print)
+    drawMoon(fMo, gMo, orbit);
+    // ants ride the ledge
+    ANTS.forEach(function (ant) { drawAnt(ant, t, ledge); });
+
+    ctx.restore();
+  }
+
+  // ---------- frame one + loop ----------
+  resize();
+  draw(0);
+  var startStamp = null;
+  if (typeof requestAnimationFrame === 'function') {
+    var loop = function (ts) {
+      if (startStamp === null) startStamp = ts;
+      draw((ts - startStamp) / 1000);
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
