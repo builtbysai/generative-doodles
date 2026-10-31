@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Glacier Quipu</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #0E1518; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // Palette (strict): ice white, glacial blue, deep glacial, raw wool,
+  // bamboo tan, meltwater, deep cold dark ground. Nothing else.
+  var ICE = '#EDF3F5';
+  var GLACIAL = '#B9D4DE';
+  var DEEP = '#7FA3B3';
+  var WOOL = '#E8DDC8';
+  var BAMBOO = '#C9A96A';
+  var MELT = '#DCE9EE';
+  var GROUND = '#0E1518';
+
+  var BASE_SEED = 694001;
+  var LOOP = 180;               // the slow loop, ~3 minutes
+  var N_CORDS = 24;
+  var FORCE_T = -1;             // QA hook: -1 = live clock, else fixed elapsed seconds
+
+  // QA seed hook: ?seed=tNN pins the elapsed time (used by the headless
+  // renderer to inspect later phases). Inert in normal viewing.
+  try {
+    if (typeof location !== 'undefined' && location.search) {
+      var qm = /[?&]seed=t([0-9]+(?:\.[0-9]+)?)/.exec(location.search);
+      if (qm) FORCE_T = parseFloat(qm[1]);
+    }
+  } catch (e) { /* live mode */ }
+
+  // Seeded RNG (mulberry32). The whole field layout, the retreat picks,
+  // the droplet schedule: all from this one stream, so the glacier is
+  // the same glacier everywhere.
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+  function smooth(a, b, x) {
+    var u = clamp((x - a) / (b - a), 0, 1);
+    return u * u * (3 - 2 * u);
+  }
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  var W = 0, H = 0, DPR = 1, PHONE = false;
+
+  function viewSize() {
+    var w, h;
+    if (typeof window !== 'undefined' && window.visualViewport &&
+        window.visualViewport.width) {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    } else if (typeof window !== 'undefined' && window.innerWidth) {
+      w = window.innerWidth; h = window.innerHeight;
+    } else { w = 800; h = 600; }
+    return { w: w, h: h };
+  }
+
+  function resize() {
+    var s = viewSize();
+    W = s.w; H = s.h;
+    DPR = 1;
+    if (typeof window !== 'undefined' && window.devicePixelRatio) {
+      DPR = clamp(window.devicePixelRatio, 1, 2);
+    }
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    // Phone detection: physical screen size first (min dimension < 700),
+    // tall-aspect as the fallback signal only.
+    var smin = 100000;
+    if (typeof window !== 'undefined' && window.screen &&
+        window.screen.width && window.screen.height) {
+      smin = Math.min(window.screen.width, window.screen.height);
+    }
+    PHONE = (smin < 700) || (H > W * 1.15 && smin === 100000);
+    buildField();
+  }
+
+  // ---- The field -------------------------------------------------------
+  // Bamboo spars: four diagonal structural lines. Each spar is stored as
+  // its x at the top and bottom edges; crossings with a cord's height
+  // give the cord its anchor points.
+  var spars = [];   // { xt, xb, phase }
+  var cords = [];   // see buildField
+  var droplets = []; // { cord, x, period, offset, maxR }
+
+  var CORD_COLORS = [ICE, GLACIAL, DEEP, WOOL, GLACIAL, ICE, DEEP, GLACIAL];
+
+  function buildField() {
+    var rng = mulberry32(BASE_SEED);
+    spars = [];
+    var sparTop = [0.16, 0.40, 0.64, 0.87];
+    for (var i = 0; i < 4; i++) {
+      var lean = (rng() < 0.5 ? -1 : 1) * (0.05 + rng() * 0.07);
+      spars.push({
+        xt: sparTop[i] + (rng() - 0.5) * 0.03,
+        xb: sparTop[i] + lean,
+        seg: 0.085 + rng() * 0.03     // bamboo node spacing, fraction of H
+      });
+    }
+
+    // Retreat cast, picked once: A starts shortened and is restored
+    // mid-loop; B and C shorten during the loop; D stands shortened.
+    var pool = [];
+    for (var k = 8; k < N_CORDS; k++) pool.push(k);
+    function pickFromPool() {
+      var j = Math.floor(rng() * pool.length);
+      return pool.splice(j, 1)[0];
+    }
+    var roleOf = {};
+    roleOf[pickFromPool()] = 'A';
+    roleOf[pickFromPool()] = 'B';
+    roleOf[pickFromPool()] = 'C';
+    roleOf[pickFromPool()] = 'D';
+
+    cords = [];
+    for (var ci = 0; ci < N_CORDS; ci++) {
+      var f = ci / (N_CORDS - 1);
+      // Density toward the top: exponent > 1 compresses spacing up high,
+      // so the field thins as it descends toward the dark.
+      var y = 0.055 + 0.80 * Math.pow(f, 1.35);
+      var role = roleOf[ci] || '';
+      cords.push({
+        y: y,
+        color: CORD_COLORS[Math.floor(rng() * CORD_COLORS.length)],
+        lw: 1.3 + rng() * 1.3,
+        sagK: 0.045 + rng() * 0.035,          // sag depth per unit span
+        swayPh: rng() * Math.PI * 2,
+        swayAmp: 0.6 + rng() * 1.1,           // px of slow vertical sway
+        role: role,
+        termSpar: 2 + Math.floor(rng() * 2),  // anchor index it retreats to (2 or 3)
+        j1: (rng() - 0.5) * 2, j2: (rng() - 0.5) * 2,
+        j3: (rng() - 0.5) * 2, j4: (rng() - 0.5) * 2
+      });
+    }
+
+    // Droplets ride the lowest cords that never retreat.
+    droplets = [];
+    var lowIdx = [];
+    for (var d = N_CORDS - 1; d >= 0 && lowIdx.length < 5; d--) {
+      if (!cords[d].role) lowIdx.push(d);
+    }
+    for (var di = 0; di < lowIdx.length; di++) {
+      var period = 24 + rng() * 20;
+      droplets.push({
+        cord: lowIdx[di],
+        period: period,
+        // Cord 0's droplet is mid-formation at t = 0 by construction:
+        // its cycle offset puts local phase at 0.25 when the loop opens.
+        offset: di === 0 ? period * 0.25 : rng() * period,
+        maxR: 2.7 + rng() * 1.6,
+        segPick: rng()
+      });
+    }
+  }
+
+  function sparX(spar, yFrac) {
+    return (spar.xt + (spar.xb - spar.xt) * yFrac) * W;
+  }
+
+  // Anchor xs for a cord: left edge, the four spar crossings, right edge.
+  function anchorXs(cord) {
+    var xs = [-0.012 * W];
+    var js = [cord.j1, cord.j2, cord.j3, cord.j4];
+    for (var i = 0; i < 4; i++) xs.push(sparX(spars[i], cord.y) + js[i]);
+    xs.push(1.012 * W);
+    return xs;
+  }
+
+  // Retreat amount r in [0,1] as a pure function of loop phase.
+  // Every role returns to its opening value as phase wraps, so the loop
+  // is seamless: across one loop two cords shorten, one shortened cord
+  // is restored (then re-shortens late, back to its frame-one state),
+  // and one stands shortened throughout.
+  function retreat(cord, p) {
+    if (cord.role === 'A') {
+      // shortened at open, restored 0.30-0.45, re-shortens 0.80-0.95
+      return 1 - smooth(0.30, 0.45, p) + smooth(0.80, 0.95, p) *
+             (1 - (1 - smooth(0.30, 0.45, p)));
+    }
+    if (cord.role === 'B') {
+      return smooth(0.15, 0.35, p) * (1 - smooth(0.70, 0.88, p));
+    }
+    if (cord.role === 'C') {
+      return smooth(0.45, 0.62, p) * (1 - smooth(0.85, 0.98, p));
+    }
+    if (cord.role === 'D') return 1;
+    return 0;
+  }
+
+  // Fraction of the cord's anchor-span arc at anchor index k.
+  function arcFracAt(xs, k) {
+    var total = 0, upto = 0, i;
+    for (i = 1; i < xs.length; i++) {
+      total += xs[i] - xs[i - 1];
+      if (i <= k) upto += xs[i] - xs[i - 1];
+    }
+    return total > 0 ? upto / total : 1;
+  }
+
+  // Drag waves: { t0, x0, dir } recorded on the anchored clock. A wave is
+  // a slow front crossing the field; where it passes, the sag deepens
+  // briefly, like wind pressing on ice.
+  var waves = [];
+  function waveOffset(x, t) {
+    var off = 0;
+    for (var i = 0; i < waves.length; i++) {
+      var age = t - waves[i].t0;
+      if (age < 0 || age > 7) continue;
+      var front = waves[i].x0 + waves[i].dir * 0.16 * W * age;
+      var dx = (x - front) / (0.055 * W);
+      off += 5.2 * Math.exp(-dx * dx) * Math.exp(-age / 3.2) *
+             Math.sin(Math.PI * clamp(age / 7, 0, 1));
+    }
+    return off;
+  }
+
+  // Point on a cord at horizontal position x, time t.
+  // Returns { y, drawn } where drawn says x is inside the live span.
+  function cordPoint(cord, xs, drawFrac, x, t, p) {
+    // Map x to arc fraction along the anchor polyline (xs monotonic).
+    var total = xs[xs.length - 1] - xs[0];
+    var frac = (x - xs[0]) / total;
+    // Find the segment.
+    var si = 0;
+    while (si < xs.length - 2 && x > xs[si + 1]) si++;
+    var x1 = xs[si], x2 = xs[si + 1];
+    var u = (x2 > x1) ? (x - x1) / (x2 - x1) : 0;
+    var breath = 1 + 0.06 * Math.sin(2 * Math.PI * t / 53 + cord.swayPh);
+    var sag = (x2 - x1) * cord.sagK * breath;
+    // Quadratic sag curve: control point sits 2*sag below the chord so
+    // the curve's belly is exactly sag deep at midspan. A parabola is
+    // the honest small-sag limit of the catenary.
+    var yBase = cord.y * H +
+      cord.swayAmp * Math.sin(2 * Math.PI * t / 37 + cord.swayPh);
+    var y = yBase + 4 * sag * u * (1 - u);
+    y += waveOffset(x, t) * Math.sin(Math.PI * u) ;
+    return { y: y, drawn: frac <= drawFrac + 0.0001, frac: frac };
+  }
+
+  function drawCord(cord, t, p) {
+    var xs = anchorXs(cord);
+    var r = retreat(cord, p);
+    var drawFrac = 1;
+    if (r > 0) {
+      var tf = arcFracAt(xs, cord.termSpar);
+      drawFrac = 1 - r * (1 - tf);
+    }
+    var x1 = xs[xs.length - 1];
+    var xEnd = xs[0] + drawFrac * (x1 - xs[0]);
+    var steps = Math.max(24, Math.floor((xEnd - xs[0]) / 9));
+    ctx.strokeStyle = cord.color;
+    ctx.lineWidth = cord.lw;
+    ctx.globalAlpha = 0.92;
+    ctx.beginPath();
+    var endPt = null;
+    for (var s = 0; s <= steps; s++) {
+      var x = xs[0] + (xEnd - xs[0]) * (s / steps);
+      var pt = cordPoint(cord, xs, drawFrac, x, t, p);
+      if (s === 0) ctx.moveTo(x, pt.y); else ctx.lineTo(x, pt.y);
+      endPt = { x: x, y: pt.y };
+    }
+    ctx.stroke();
+    // Knot dots where the cord rests on a spar.
+    ctx.fillStyle = cord.color;
+    ctx.globalAlpha = 0.95;
+    for (var a = 1; a <= 4; a++) {
+      if (a / 5 > drawFrac + 0.02 && xs[a] > xEnd) continue;
+      if (xs[a] > xEnd) continue;
+      var kp = cordPoint(cord, xs, drawFrac, xs[a], t, p);
+      ctx.beginPath();
+      ctx.arc(xs[a], kp.y, cord.lw + 0.7, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    // A retreated end hangs free: a short drooping tail and a knot.
+    if (r > 0.02 && endPt) {
+      var tailLen = (0.028 + 0.02 * r) * H;
+      var drift = 3 + 4 * r;
+      ctx.strokeStyle = cord.color;
+      ctx.lineWidth = cord.lw;
+      ctx.beginPath();
+      ctx.moveTo(endPt.x, endPt.y);
+      ctx.quadraticCurveTo(
+        endPt.x + drift * 0.3, endPt.y + tailLen * 0.6,
+        endPt.x + drift, endPt.y + tailLen);
+      ctx.stroke();
+      ctx.fillStyle = cord.color;
+      ctx.beginPath();
+      ctx.arc(endPt.x + drift, endPt.y + tailLen, cord.lw + 1.6, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    return { xs: xs, drawFrac: drawFrac };
+  }
+
+  function drawSpars() {
+    ctx.strokeStyle = BAMBOO;
+    ctx.globalAlpha = 0.55;
+    for (var i = 0; i < spars.length; i++) {
+      var sp = spars[i];
+      var xTop = sp.xt * W, xBot = sp.xb * W;
+      // Bamboo reads by its nodes: draw the spar as runs of segment with
+      // small gaps at the joints instead of one continuous rule.
+      var joints = Math.floor(1 / sp.seg);
+      ctx.lineWidth = PHONE ? 2 : 3;
+      for (var j = 0; j < joints; j++) {
+        var f0 = j / joints, f1 = (j + 0.82) / joints;
+        ctx.beginPath();
+        ctx.moveTo(xTop + (xBot - xTop) * f0, f0 * H * 1.04 - 0.02 * H);
+        ctx.lineTo(xTop + (xBot - xTop) * f1, f1 * H * 1.04 - 0.02 * H);
+        ctx.stroke();
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawDroplet(dr, t, geom) {
+    var cord = cords[dr.cord];
+    var u = ((t + dr.offset) % dr.period) / dr.period;
+    // The droplet hangs at the belly of the cord's widest low segment.
+    var xs = geom.xs;
+    var bestSeg = 1, bestSag = -1;
+    for (var i = 1; i < xs.length; i++) {
+      var span = xs[i] - xs[i - 1];
+      if (span > bestSag) { bestSag = span; bestSeg = i; }
+    }
+    var x = (xs[bestSeg - 1] + xs[bestSeg]) / 2;
+    var pt = cordPoint(cord, xs, geom.drawFrac, x, t, (t / LOOP) % 1);
+    var y = pt.y + cord.lw;
+    if (u < 0.5) {
+      // Forming: a bead gathers and swells at the low point, drawing
+      // down into a teardrop as it nears release.
+      var g = u / 0.5;
+      var r = dr.maxR * (0.25 + 0.75 * g);
+      var stretch = 1 + 0.55 * g * g;
+      ctx.fillStyle = MELT;
+      ctx.globalAlpha = 0.35 + 0.6 * g;
+      ctx.beginPath();
+      ctx.ellipse(x, y + r * stretch * 0.8, r * 0.82, r * stretch, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    } else {
+      // Falling: gravity takes it, and the dark takes it.
+      var ft = (u - 0.5) * dr.period;
+      var fall = 0.5 * 0.22 * H * ft * ft;
+      var fade = clamp(1 - ft / 2.6, 0, 1);
+      if (fade <= 0) return;
+      var r2 = dr.maxR;
+      ctx.fillStyle = MELT;
+      ctx.globalAlpha = 0.9 * fade;
+      ctx.beginPath();
+      ctx.ellipse(x, y + fall, r2 * 0.8, r2 * 1.25, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = GROUND;
+    ctx.fillRect(0, 0, W, H);
+    var p = ((t / LOOP) % 1 + 1) % 1;
+    drawSpars();
+    var geoms = [];
+    for (var i = 0; i < cords.length; i++) geoms.push(drawCord(cords[i], t, p));
+    for (var d = 0; d < droplets.length; d++) {
+      drawDroplet(droplets[d], t, geoms[droplets[d].cord]);
+    }
+  }
+
+  // ---- Clock and interaction -------------------------------------------
+  var startStamp = -1;
+  function nowSec() {
+    if (FORCE_T >= 0) return FORCE_T;
+    if (typeof performance !== 'undefined' && performance.now) {
+      if (startStamp < 0) startStamp = performance.now();
+      return (performance.now() - startStamp) / 1000;
+    }
+    return 0;
+  }
+
+  var dragging = false, lastPX = 0, lastPT = 0;
+  function onDown(e) {
+    dragging = true;
+    lastPX = (e && typeof e.clientX === 'number') ? e.clientX : W / 2;
+    lastPT = nowSec();
+  }
+  function onMove(e) {
+    if (!dragging || !e || typeof e.clientX !== 'number') return;
+    var t = nowSec();
+    var dx = e.clientX - lastPX;
+    if (Math.abs(dx) > 26 && t - lastPT > 0.12) {
+      waves.push({ t0: t, x0: lastPX, dir: dx > 0 ? 1 : -1 });
+      if (waves.length > 6) waves.shift();
+      lastPX = e.clientX;
+      lastPT = t;
+    }
+  }
+  function onUp() { dragging = false; }
+
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointerleave', onUp);
+  }
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('resize', function () { resize(); draw(nowSec()); });
+  }
+  if (typeof window !== 'undefined' && window.visualViewport &&
+      window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () {
+      resize(); draw(nowSec());
+    });
+  }
+
+  resize();
+  draw(0); // frame one: the synchronous draw at loop t = 0
+
+  if (FORCE_T >= 0) {
+    draw(FORCE_T);
+  } else if (typeof requestAnimationFrame === 'function') {
+    var tick = function () {
+      draw(nowSec());
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }
+})();
+</script>
+</body>
+</html>

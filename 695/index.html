@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Umbilical</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #0B0B0C; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // Strict palette
+  var YARN = '#A83232';
+  var DEEP = '#6E1B1B';
+  var KNOT = '#E8DDC8';
+  var BG = '#0B0B0C';
+
+  var TAU = Math.PI * 2;
+  var BASE = 695001;
+  var MAXP = 90;
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+  // ---- Viewport (Visual Viewport API, listeners on both) ----
+  var viewW = 0, viewH = 0, dpr = 1, isPhone = false;
+  function computeSize() {
+    var vv = window.visualViewport;
+    var w = (vv && vv.width) ? vv.width : window.innerWidth;
+    var h = (vv && vv.height) ? vv.height : window.innerHeight;
+    viewW = w; viewH = h;
+    dpr = window.devicePixelRatio || 1;
+    if (window.screen && window.screen.width && window.screen.height) {
+      isPhone = Math.min(window.screen.width, window.screen.height) < 700;
+    } else {
+      isPhone = viewH > viewW * 1.15;
+    }
+    var bw = Math.max(1, Math.round(viewW * dpr));
+    var bh = Math.max(1, Math.round(viewH * dpr));
+    if (canvas.width !== bw) canvas.width = bw;
+    if (canvas.height !== bh) canvas.height = bh;
+  }
+
+  // ---- Anchored clock (never wall-clock derived frame one) ----
+  var hasPerf = (typeof performance !== 'undefined' && performance && typeof performance.now === 'function');
+  var t0 = hasPerf ? performance.now() : 0;
+  function elapsed() { return hasPerf ? (performance.now() - t0) / 1000 : 0; }
+
+  // ---- Web state ----
+  // A web is { points: [], edges: [] }.
+  // Point: { x, y (normalized anchor), born, ph1, ph2, wraps: [{a0, len, rr}], drag }
+  // Edge:  { a, b (point refs), born, sagMul, phase, seed }
+  var edgeCounter = 0;
+
+  function makeEdge(a, b, born) {
+    var rng = mulberry32(BASE + 31337 + edgeCounter * 97);
+    edgeCounter++;
+    return {
+      a: a, b: b, born: born,
+      sagMul: 0.8 + rng() * 0.45,
+      phase: rng() * TAU,
+      wob: rng() * TAU
+    };
+  }
+
+  function connectNearest(web, p) {
+    // Two nearest existing points by anchor distance (aspect-corrected).
+    var aspect = viewH > 0 ? viewW / viewH : 1;
+    var best = null, second = null, bd = Infinity, sd = Infinity;
+    for (var i = 0; i < web.points.length; i++) {
+      var q = web.points[i];
+      if (q === p) continue;
+      var dx = (q.x - p.x) * aspect, dy = q.y - p.y;
+      var d = dx * dx + dy * dy;
+      if (d < bd) { second = best; sd = bd; best = q; bd = d; }
+      else if (d < sd) { second = q; sd = d; }
+    }
+    if (best) web.edges.push(makeEdge(best, p, p.born));
+    if (second) web.edges.push(makeEdge(second, p, p.born));
+  }
+
+  function makePoint(x, y, born, rng) {
+    var wraps = [];
+    var nw = 2 + Math.floor(rng() * 2); // 2-3 yarn turns
+    for (var i = 0; i < nw; i++) {
+      wraps.push({ a0: rng() * TAU, len: 2.2 + rng() * 2.6, rr: 1.6 + i * 1.5 });
+    }
+    return {
+      x: x, y: y, born: born,
+      ph1: rng() * TAU, ph2: rng() * TAU,
+      wraps: wraps, drag: null, drift: null
+    };
+  }
+
+  function buildConstellation(ep, start) {
+    var rng = mulberry32(BASE + ep * 7919);
+    var web = { points: [], edges: [] };
+    var pts = [];
+    var guard = 0;
+    while (pts.length < 8 && guard < 400) {
+      guard++;
+      var x = 0.13 + rng() * 0.74;
+      var y = 0.13 + rng() * 0.74;
+      var ok = true;
+      for (var i = 0; i < pts.length; i++) {
+        var dx = pts[i].x - x, dy = pts[i].y - y;
+        if (dx * dx + dy * dy < 0.16 * 0.16) { ok = false; break; }
+      }
+      if (ok) pts.push({ x: x, y: y });
+    }
+    while (pts.length < 8) pts.push({ x: 0.2 + 0.6 * rng(), y: 0.2 + 0.6 * rng() });
+    for (var j = 0; j < pts.length; j++) {
+      var born = (ep === 0) ? start - 2 : start + j * 0.1;
+      var p = makePoint(pts[j].x, pts[j].y, born, rng);
+      web.points.push(p);
+      connectNearest(web, p);
+    }
+    return web;
+  }
+
+  var epoch = 0;
+  var current = null;
+  var dissolving = null; // { web, start, }
+  var constellationPending = false;
+  var epochStart = 0;
+  var lastInteraction = 0;
+  var idleCount = 0;
+  var tapCounter = 0;
+
+  // ---- Interaction records ----
+  var dragging = null;      // point being dragged
+  var downInfo = null;      // { t, x, y, moved }
+  var lastTap = null;       // { t, x, y }
+
+  function plantPoint(x, y, born, rng) {
+    if (!current || constellationPending) return null;
+    if (current.points.length >= MAXP) return null;
+    var p = makePoint(x, y, born, rng);
+    current.points.push(p);
+    connectNearest(current, p);
+    return p;
+  }
+
+  function maybeIdlePlant(t) {
+    if (!current || constellationPending) return;
+    var idleFor = t - lastInteraction;
+    if (idleFor < 30) { idleCount = 0; return; }
+    var should = Math.floor((idleFor - 30) / 6) + 1;
+    while (idleCount < should && current.points.length < MAXP) {
+      var idx = idleCount;
+      var rng = mulberry32(BASE + 555000 + epoch * 7717 + idx * 131);
+      var x = 0.12 + rng() * 0.76;
+      var y = 0.12 + rng() * 0.76;
+      plantPoint(x, y, lastInteraction + 30 + idx * 6, rng);
+      idleCount++;
+    }
+  }
+
+  function reseed(t) {
+    if (!current) return;
+    // Snapshot current web as dissolving, with seeded drift per point.
+    var rng = mulberry32(BASE + 909090 + epoch * 331);
+    for (var i = 0; i < current.points.length; i++) {
+      var p = current.points[i];
+      p.drag = null;
+      p.drift = { x: (rng() - 0.5) * 0.11, y: 0.02 + rng() * 0.07, ph: rng() * TAU };
+    }
+    dissolving = { web: current, start: t };
+    epoch++;
+    current = { points: [], edges: [] };
+    epochStart = t + 1.15;
+    constellationPending = true;
+    dragging = null;
+    downInfo = null;
+    idleCount = 0;
+    lastInteraction = t;
+  }
+
+  // ---- Geometry: rendered position of a point at time t ----
+  function swayX(p, t) { return 0.006 * Math.sin(TAU * t / 17.3 + p.ph1 + p.y * 2.3); }
+  function swayY(p, t) { return 0.0045 * Math.sin(TAU * t / 23.7 + p.ph2 + p.x * 1.9); }
+
+  function sampleAt(samples, time) {
+    if (!samples.length) return null;
+    if (time <= samples[0].t) return samples[0];
+    for (var i = samples.length - 1; i >= 0; i--) {
+      if (samples[i].t <= time) {
+        if (i === samples.length - 1) return samples[i];
+        var a = samples[i], b = samples[i + 1];
+        var f = (time - a.t) / Math.max(1e-6, b.t - a.t);
+        return { x: a.x + (b.x - a.x) * f, y: a.y + (b.y - a.y) * f };
+      }
+    }
+    return samples[samples.length - 1];
+  }
+
+  function pointPos(p, t, dissolveU) {
+    var nx = p.x + swayX(p, t);
+    var ny = p.y + swayY(p, t);
+    var stretch = 0;
+    if (dissolveU !== null && dissolveU !== undefined && p.drift) {
+      var u2 = dissolveU * dissolveU;
+      nx += p.drift.x * u2 + 0.01 * Math.sin(TAU * t / 9 + p.drift.ph) * dissolveU;
+      ny += p.drift.y * u2;
+    }
+    var d = p.drag;
+    if (d) {
+      if (d.active) {
+        var sp = sampleAt(d.samples, t - 0.12); // elastic lag
+        if (sp) {
+          var ddx = sp.x - nx, ddy = sp.y - ny;
+          nx = sp.x + swayX(p, t) * 0.3;
+          ny = sp.y + swayY(p, t) * 0.3;
+          stretch = clamp(Math.sqrt(ddx * ddx + ddy * ddy) * 4, 0, 1.5);
+        }
+      } else if (d.releaseT !== null && d.releaseT !== undefined) {
+        var age = t - d.releaseT;
+        if (age >= 0 && age < 3) {
+          var dec = Math.exp(-age / 0.85) * Math.cos(age * 5.2);
+          nx += d.releaseOff.x * dec;
+          ny += d.releaseOff.y * dec;
+          stretch = clamp(Math.abs(dec) * Math.sqrt(d.releaseOff.x * d.releaseOff.x + d.releaseOff.y * d.releaseOff.y) * 4, 0, 1.5);
+        }
+      }
+    }
+    return { x: nx * viewW, y: ny * viewH, nx: nx, ny: ny, stretch: stretch };
+  }
+
+  // ---- Drawing ----
+  function drawEdge(e, PA, PB, t, alphaMul, sagBoost) {
+    var g = clamp((t - e.born) / 1.0, 0, 1);
+    if (g <= 0) return;
+    var dx = PB.x - PA.x, dy = PB.y - PA.y;
+    var dist = Math.sqrt(dx * dx + dy * dy);
+    if (dist < 2) return;
+    var minDim = Math.min(viewW, viewH);
+    var stretch = (PA.stretch || 0) + (PB.stretch || 0);
+    var sag = dist * (0.15 + 0.11 * e.sagMul) * (1 + stretch * 0.6) * sagBoost;
+    var pxn = -dy / dist, pyn = dx / dist;
+    var lat = Math.sin(TAU * t / 19 + e.phase) * Math.min(5, dist * 0.02);
+    var cx = (PA.x + PB.x) / 2 + pxn * lat;
+    var cy = (PA.y + PB.y) / 2 + sag + pyn * lat * 0.3;
+    var LW = clamp(minDim * 0.0024, 1.1, 2.2);
+    var passes = [
+      { col: DEEP, al: 0.38, lw: LW, off: -1.2 },
+      { col: YARN, al: 0.60, lw: LW * 1.15, off: 0 },
+      { col: DEEP, al: 0.30, lw: LW * 0.8, off: 1.2 }
+    ];
+    var steps = 14;
+    for (var k = 0; k < passes.length; k++) {
+      var ps = passes[k];
+      var ccx = cx + pxn * ps.off, ccy = cy + pyn * ps.off;
+      ctx.strokeStyle = ps.col;
+      ctx.globalAlpha = ps.al * alphaMul;
+      ctx.lineWidth = ps.lw;
+      ctx.beginPath();
+      var n = Math.max(2, Math.round(steps * g));
+      for (var i = 0; i <= n; i++) {
+        var u = g * (i / n);
+        var mt = 1 - u;
+        var bx = mt * mt * PA.x + 2 * mt * u * ccx + u * u * PB.x;
+        var by = mt * mt * PA.y + 2 * mt * u * ccy + u * u * PB.y;
+        var wob = Math.sin(u * 9.4 + e.wob + k * 1.7) * 0.7;
+        bx += pxn * wob; by += pyn * wob;
+        if (i === 0) ctx.moveTo(bx, by); else ctx.lineTo(bx, by);
+      }
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawKnot(p, P, t, alphaMul) {
+    var grow = clamp((t - p.born) / 0.4, 0, 1);
+    if (grow <= 0) return;
+    var minDim = Math.min(viewW, viewH);
+    var r = clamp(minDim * 0.007, 3.5, 6) * (isPhone ? 1.15 : 1) * grow;
+    ctx.globalAlpha = alphaMul;
+    ctx.fillStyle = KNOT;
+    ctx.beginPath();
+    ctx.arc(P.x, P.y, r, 0, TAU);
+    ctx.fill();
+    ctx.strokeStyle = YARN;
+    ctx.lineWidth = 1.1;
+    for (var i = 0; i < p.wraps.length; i++) {
+      var w = p.wraps[i];
+      ctx.globalAlpha = 0.75 * alphaMul;
+      ctx.beginPath();
+      ctx.arc(P.x, P.y, r + w.rr * grow, w.a0, w.a0 + w.len);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawWeb(web, t, dissolveStart) {
+    var isD = (dissolveStart !== null && dissolveStart !== undefined);
+    var u = isD ? clamp((t - dissolveStart) / 1.8, 0, 1) : null;
+    var alphaMul = isD ? (1 - u) : 1;
+    var sagBoost = isD ? (1 + 2.0 * u) : 1;
+    var pos = [];
+    var i;
+    for (i = 0; i < web.points.length; i++) pos.push(pointPos(web.points[i], t, u));
+    var idx = {};
+    for (i = 0; i < web.points.length; i++) idx[web.points[i]] = i;
+    for (i = 0; i < web.edges.length; i++) {
+      var e = web.edges[i];
+      var ia = web.points.indexOf(e.a), ib = web.points.indexOf(e.b);
+      if (ia < 0 || ib < 0) continue;
+      drawEdge(e, pos[ia], pos[ib], t, alphaMul, sagBoost);
+    }
+    for (i = 0; i < web.points.length; i++) drawKnot(web.points[i], pos[i], t, alphaMul);
+  }
+
+  function draw(t) {
+    // Pin canvas CSS size every frame (house rule).
+    canvas.style.width = viewW + 'px';
+    canvas.style.height = viewH + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = BG;
+    ctx.fillRect(0, 0, viewW, viewH);
+
+    maybeIdlePlant(t);
+    if (constellationPending && t >= epochStart) {
+      current = buildConstellation(epoch, epochStart);
+      constellationPending = false;
+    }
+    if (dissolving) {
+      drawWeb(dissolving.web, t, dissolving.start);
+      if (t > dissolving.start + 1.8) dissolving = null;
+    }
+    if (current) drawWeb(current, t, null);
+  }
+
+  // ---- Pointer interaction ----
+  function toNorm(ev) {
+    var rect = canvas.getBoundingClientRect();
+    return {
+      x: (ev.clientX - rect.left) / rect.width,
+      y: (ev.clientY - rect.top) / rect.height
+    };
+  }
+  function nearestPoint(np, t) {
+    if (!current) return null;
+    var minDim = Math.min(viewW, viewH);
+    var grab = Math.max(26, minDim * 0.05);
+    var best = null, bd = Infinity;
+    for (var i = 0; i < current.points.length; i++) {
+      var P = pointPos(current.points[i], t, null);
+      var dx = P.x - np.x * viewW, dy = P.y - np.y * viewH;
+      var d = Math.sqrt(dx * dx + dy * dy);
+      if (d < bd) { bd = d; best = current.points[i]; }
+    }
+    return (best && bd <= grab) ? best : null;
+  }
+
+  function onDown(ev) {
+    var t = elapsed();
+    lastInteraction = t;
+    var np = toNorm(ev);
+    downInfo = { t: t, x: np.x, y: np.y, moved: false };
+    var p = nearestPoint(np, t);
+    if (p) {
+      dragging = p;
+      p.drag = { active: true, samples: [{ t: t, x: np.x, y: np.y }], releaseT: null, releaseOff: { x: 0, y: 0 } };
+    }
+    if (ev.preventDefault) ev.preventDefault();
+  }
+  function onMove(ev) {
+    if (!downInfo) return;
+    var t = elapsed();
+    var np = toNorm(ev);
+    var dx = np.x - downInfo.x, dy = np.y - downInfo.y;
+    if (dx * dx + dy * dy > 0.02 * 0.02) downInfo.moved = true;
+    if (dragging && dragging.drag && dragging.drag.active) {
+      var s = dragging.drag.samples;
+      s.push({ t: t, x: np.x, y: np.y });
+      while (s.length > 2 && s[0].t < t - 1.0) s.shift();
+    }
+  }
+  function onUp(ev) {
+    var t = elapsed();
+    lastInteraction = t;
+    var np = toNorm(ev);
+    if (dragging && dragging.drag && dragging.drag.active) {
+      var p = dragging;
+      var P = pointPos(p, t, null);
+      p.drag.active = false;
+      p.drag.releaseT = t;
+      p.drag.releaseOff = {
+        x: P.nx - (p.x + swayX(p, t)),
+        y: P.ny - (p.y + swayY(p, t))
+      };
+      dragging = null;
+      downInfo = null;
+      return;
+    }
+    // Tap?
+    if (downInfo && (t - downInfo.t) < 0.3 && !downInfo.moved) {
+      if (lastTap && (t - lastTap.t) < 0.35) {
+        var ddx = np.x - lastTap.x, ddy = np.y - lastTap.y;
+        if (ddx * ddx + ddy * ddy < 0.09 * 0.09) {
+          lastTap = null;
+          downInfo = null;
+          reseed(t);
+          return;
+        }
+      }
+      lastTap = { t: t, x: np.x, y: np.y };
+      tapCounter++;
+      var rng = mulberry32(BASE + 777000 + tapCounter * 389);
+      plantPoint(clamp(np.x, 0.02, 0.98), clamp(np.y, 0.02, 0.98), t, rng);
+    }
+    downInfo = null;
+  }
+
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+  }
+  function onResize() { computeSize(); draw(elapsed()); }
+  if (window.addEventListener) window.addEventListener('resize', onResize);
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', onResize);
+  }
+
+  // ---- Boot: frame one is the synchronous draw at t = 0 ----
+  computeSize();
+  current = buildConstellation(0, 0);
+  draw(0);
+
+  if (typeof requestAnimationFrame === 'function') {
+    var loop = function () {
+      draw(elapsed());
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
