@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fractured Wire</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: #E4E4E0;
+    overflow: hidden;
+  }
+  canvas {
+    display: block;
+  }
+</style>
+</head>
+<body>
+<canvas id="field"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  var canvas = document.getElementById('field');
+  var ctx = canvas.getContext('2d');
+
+  // Strict palette. Nothing else is ever drawn.
+  var WARM = [245, 216, 168];   // #F5D8A8 warm wash
+  var COOL = [184, 212, 232];   // #B8D4E8 cool wash
+  var BASE = [228, 228, 224];   // #E4E4E0 room base
+  var SCRIM = [248, 248, 246];  // #F8F8F6
+  var SILVER = [201, 205, 210]; // #C9CDD2 wire silver
+  var WHITE = [255, 255, 255];  // #FFFFFF connection white
+
+  var CYCLE = 240;  // 4-minute warm/cool cycle, seamless
+
+  function lerp(a, b, u) { return a + (b - a) * u; }
+
+  function mix(c1, c2, u) {
+    return [lerp(c1[0], c2[0], u), lerp(c1[1], c2[1], u), lerp(c1[2], c2[2], u)];
+  }
+
+  function cl(v) { return Math.max(0, Math.min(255, Math.round(v))); }
+
+  function rgbString(c, a) {
+    if (typeof a === 'number') {
+      return 'rgba(' + cl(c[0]) + ',' + cl(c[1]) + ',' + cl(c[2]) + ',' + a + ')';
+    }
+    return 'rgb(' + cl(c[0]) + ',' + cl(c[1]) + ',' + cl(c[2]) + ')';
+  }
+
+  // Seeded RNG (mulberry32) for the wire layout.
+  function mulberry32(seed) {
+    var s = seed >>> 0;
+    return function () {
+      s = (s + 0x6D2B79F5) >>> 0;
+      var z = s;
+      z = Math.imul(z ^ (z >>> 15), z | 1);
+      z ^= z + Math.imul(z ^ (z >>> 7), z | 61);
+      return ((z ^ (z >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // The wire layout: precomputed seeded data, positions in unit space.
+  // Irregular random-walk spacing, never a grid. Each wire carries:
+  //  p     position across the frame (0..1, unit space)
+  //  phase its own offset in the temperature cycle
+  //  keep  how much of it survives at mid-span when fully defined (0..1);
+  //        low-keep wires ghost out entirely mid-run at low definition.
+  var WIRES = (function () {
+    var rnd = mulberry32(759013);
+    function run() {
+      var list = [];
+      var p = 0.05 + rnd() * 0.05;
+      while (p < 0.97) {
+        list.push({
+          p: p,
+          phase: rnd() * Math.PI * 2,
+          keep: 0.08 + rnd() * 0.55
+        });
+        p += 0.085 + rnd() * 0.13;
+      }
+      return list;
+    }
+    return { h: run(), v: run() };
+  })();
+
+  // Room color as a closed-form function of cycle time.
+  // temp: -1 (cool dominant) .. 0 (neutral base) .. +1 (warm dominant).
+  // temp(0) = 0 and rising, so frame one is the neutral midpoint and the
+  // warm peak lands exactly at the cycle quarter (t = 60).
+  function tempAt(t) {
+    return Math.sin(2 * Math.PI * (t % CYCLE) / CYCLE);
+  }
+
+  function roomColor(t) {
+    var temp = tempAt(t);
+    if (temp >= 0) return mix(BASE, WARM, temp);
+    return mix(BASE, COOL, -temp);
+  }
+
+  // Per-wire definition: how strongly this wire catches the light now.
+  // All wires ride the same 240 s temperature cycle, each with its own
+  // seeded phase, so they trade definition as the temperature swings.
+  function definition(wire, t) {
+    var s = 0.5 + 0.62 * Math.sin(2 * Math.PI * (t % CYCLE) / CYCLE + wire.phase);
+    if (s < 0) return 0;
+    if (s > 1) return 1;
+    return s;
+  }
+
+  // Scrim breathing alpha: slow 120 s breath (integer ratio 2 against the
+  // cycle), phased so frame one is at its faintest.
+  function scrimAlpha(t) {
+    return 0.085 + 0.045 * Math.sin(2 * Math.PI * (t % 120) / 120 - Math.PI / 2);
+  }
+
+  var W = 0, H = 0, DPR = 1;
+
+  function isPhone() {
+    var sw = (window.screen && window.screen.width) || 0;
+    var sh = (window.screen && window.screen.height) || 0;
+    var mn = Math.min(sw, sh);
+    if (mn > 0 && mn < 700) return true;
+    return H > W * 1.15;
+  }
+
+  function resize() {
+    var vv = window.visualViewport;
+    W = vv ? vv.width : window.innerWidth;
+    H = vv ? vv.height : window.innerHeight;
+    DPR = window.devicePixelRatio || 1;
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+  }
+
+  // One wire, drawn as stepped-alpha segments along its span.
+  // horiz: true for a horizontal wire (constant y), false for vertical.
+  // Alpha is highest near the walls and falls toward mid-span on a
+  // parabola; the mid-span level is (definition x keep), so a wire at low
+  // definition or with low keep vanishes mid-run and survives only as
+  // bright stubs near its connections. The last ~6 px at each end are the
+  // painted-out attachments, drawn white afterwards by drawWireEnds.
+  function drawWire(horiz, wire, t, room) {
+    var d = definition(wire, t);
+    var edgeA = 0.85 * (0.35 + 0.65 * d);
+    var midA = 0.85 * d * wire.keep;
+    // At low definition the silver also sinks toward the room tone:
+    // the wire loses contrast as well as alpha.
+    var col = mix(SILVER, room, (1 - d) * 0.35);
+    var len = horiz ? W : H;
+    var pos = wire.p * (horiz ? H : W);
+    var thick = Math.max(1 / DPR, 0.6);
+    var SEG = 56;
+    var segLen = len / SEG;
+    for (var i = 0; i < SEG; i++) {
+      var u = (i + 0.5) / SEG;
+      var q = 2 * u - 1;
+      var prof = 1 - q * q; // 0 at the walls, 1 at mid-span
+      var a = lerp(edgeA, midA, prof);
+      if (a < 0.004) continue;
+      ctx.fillStyle = rgbString(col, a);
+      if (horiz) ctx.fillRect(i * segLen, pos - thick / 2, segLen + 0.5, thick);
+      else ctx.fillRect(pos - thick / 2, i * segLen, thick, segLen + 0.5);
+    }
+  }
+
+  // The painted-out wall connections: white for the last ~6 px at each
+  // end of every wire, so the attachment points themselves vanish into
+  // the wash and the wires appear to float.
+  function drawWireEnds(horiz, wire) {
+    var stub = 6;
+    var thick = Math.max(1 / DPR, 0.6);
+    ctx.fillStyle = rgbString(WHITE, 0.85);
+    if (horiz) {
+      var y = wire.p * H;
+      ctx.fillRect(0, y - thick / 2, stub, thick);
+      ctx.fillRect(W - stub, y - thick / 2, stub, thick);
+    } else {
+      var x = wire.p * W;
+      ctx.fillRect(x - thick / 2, 0, thick, stub);
+      ctx.fillRect(x - thick / 2, H - stub, thick, stub);
+    }
+  }
+
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+    var room = roomColor(t);
+
+    // The room: one flat wash at the cycle's current temperature.
+    ctx.fillStyle = rgbString(room);
+    ctx.fillRect(0, 0, W, H);
+
+    // The scrim band across the upper third: layered translucent strips
+    // of scrim white with a soft sheen, breathing in alpha. No blur, no
+    // gradient: the layers themselves make the falloff.
+    var sa = scrimAlpha(t);
+    var y0 = H * 0.16, y1 = H * 0.36;
+    var bh = y1 - y0;
+    ctx.fillStyle = rgbString(SCRIM, sa);
+    ctx.fillRect(0, y0, W, bh);
+    var strips = 6;
+    for (var i = 0; i < strips; i++) {
+      var f = i / strips;
+      var sh = 0.5 + 0.5 * Math.sin(f * Math.PI);
+      ctx.fillStyle = rgbString(SCRIM, sa * 0.45 * sh);
+      ctx.fillRect(0, y0 + f * bh, W, bh / strips + 0.5);
+    }
+    // Hairline edges where the scrim is tensioned top and bottom.
+    var thick = Math.max(1 / DPR, 0.6);
+    ctx.fillStyle = rgbString(SCRIM, Math.min(1, sa * 1.7));
+    ctx.fillRect(0, y0 - thick / 2, W, thick);
+    ctx.fillRect(0, y1 - thick / 2, W, thick);
+
+    // The wires, then their white connection stubs on top.
+    var i;
+    for (i = 0; i < WIRES.h.length; i++) drawWire(true, WIRES.h[i], t, room);
+    for (i = 0; i < WIRES.v.length; i++) drawWire(false, WIRES.v[i], t, room);
+    for (i = 0; i < WIRES.h.length; i++) drawWireEnds(true, WIRES.h[i]);
+    for (i = 0; i < WIRES.v.length; i++) drawWireEnds(false, WIRES.v[i]);
+
+    if (document.body && document.body.style) document.body.style.background = rgbString(room);
+  }
+
+  // Inert QA hook (house convention): ?seed=tNN draws frame one at cycle
+  // time NN seconds. Without the parameter the piece starts at t = 0.
+  var startT = 0;
+  var searchStr = (window.location && window.location.search) ||
+    (typeof location !== 'undefined' ? location.search : '') || '';
+  var m = /[?&]seed=t(\d+(?:\.\d+)?)/.exec(searchStr);
+  if (m) startT = parseFloat(m[1]);
+
+  resize();
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { resize(); draw(startT); });
+  }
+  window.addEventListener('resize', function () { resize(); draw(startT); });
+
+  // Frame one: the synchronous draw at cycle t = 0, the neutral midpoint:
+  // room at base tone, wires at mid-definition, scrim at its faintest.
+  draw(startT);
+
+  if (typeof requestAnimationFrame === 'function') {
+    var t0 = null;
+    var frame = function (ts) {
+      if (t0 === null) t0 = ts;
+      draw(startT + (ts - t0) / 1000);
+      requestAnimationFrame(frame);
+    };
+    requestAnimationFrame(frame);
+  }
+})();
+</script>
+</body>
+</html>
