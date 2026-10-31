@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Twenty Hertz</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0A0A0A; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+  // ---------- palette (strict) ----------
+  var ROOM = '#0A0A0A';    // dark room
+  var LAMP = '#E8E8E8';    // pulse light / needle / readout
+  var METER = '#3A3A3A';   // meter bar
+  var BRASS = '#C9A227';   // 20 Hz threshold marker
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ---------- viewport sizing (Visual Viewport API) ----------
+  function viewSize() {
+    var w, h;
+    if (window.visualViewport) {
+      w = window.visualViewport.width;
+      h = window.visualViewport.height;
+    } else {
+      w = window.innerWidth;
+      h = window.innerHeight;
+    }
+    return { w: w, h: h };
+  }
+  function isPhone(w, h) {
+    var sw = 9999;
+    if (window.screen) sw = Math.min(window.screen.width, window.screen.height);
+    return sw < 700 || h > w * 1.15;
+  }
+
+  var W = 0, H = 0, DPR = 1, PHONE = false;
+  var GEO = null;
+  function resize() {
+    var s = viewSize();
+    W = Math.max(1, Math.round(s.w));
+    H = Math.max(1, Math.round(s.h));
+    DPR = window.devicePixelRatio || 1;
+    PHONE = isPhone(W, H);
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    buildScene();
+  }
+  function buildScene() {
+    var minD = Math.min(W, H);
+    var mx = W * 0.08;
+    GEO = {
+      minD: minD,
+      cx: W / 2,
+      cy: H * 0.46,
+      lampR: Math.max(7, minD * 0.034),
+      mx: mx,
+      barW: W - mx * 2,
+      barY: H - Math.max(30, H * 0.09),
+      barH: Math.max(3, minD * 0.007),
+      readX: mx,
+      readY: Math.max(26, H * 0.085),
+      readSize: clamp(minD * 0.027, 12, 22)
+    };
+  }
+
+  // ---------- frequency model: closed-form segments ----------
+  // One oscillator, 4 to 40 Hz. Modes:
+  //   sweep  - auto ping-pong, 4 -> 40 Hz in 40 s, back in 40 s (period 80 s)
+  //   fixed  - holds 20 Hz, the rhythm/pitch threshold
+  //   manual - holds whatever frequency the last drag set
+  // A segment is {t0, kind, P0, f, s0}: P0 = oscillator phase in cycles at
+  // t0, f = held frequency for fixed/manual, s0 = sweep-cycle position in
+  // seconds at t0 for sweep. Phase is the time integral of frequency,
+  // evaluated in closed form per segment; the visual pulse and the audio
+  // oscillator are both driven from this one state.
+  var SWEEP_HALF = 40;                 // seconds per leg of the ping-pong
+  var SWEEP_PERIOD = SWEEP_HALF * 2;   // 80 s
+  var F_MIN = 4, F_MAX = 40, F_SPAN = F_MAX - F_MIN;
+  var RATE = F_SPAN / SWEEP_HALF;      // 0.9 Hz per second
+
+  function sweepFreq(s) {              // s in [0, 80)
+    return s < SWEEP_HALF ? F_MIN + RATE * s : F_MAX - RATE * (s - SWEEP_HALF);
+  }
+  var INT_HALF = F_MIN * SWEEP_HALF + 0.5 * RATE * SWEEP_HALF * SWEEP_HALF; // 880
+  function sweepInt(s) {               // integral of sweepFreq from 0 to s
+    if (s <= SWEEP_HALF) return F_MIN * s + 0.5 * RATE * s * s;
+    var u = s - SWEEP_HALF;
+    return INT_HALF + F_MAX * u - 0.5 * RATE * u * u;
+  }
+  var SWEEP_CYCLE = sweepInt(SWEEP_PERIOD);   // 1760 cycles per ping-pong
+
+  var segments = [{ t0: 0, kind: 'sweep', P0: 0, f: F_MIN, s0: 0 }];
+
+  function segAt(t) {
+    for (var i = segments.length - 1; i >= 0; i--) {
+      if (segments[i].t0 <= t) return segments[i];
+    }
+    return segments[0];
+  }
+  function stateAt(t) {
+    var s = segAt(t);
+    if (s.kind === 'sweep') {
+      var total = s.s0 + (t - s.t0);
+      var cyc = Math.floor(total / SWEEP_PERIOD);
+      var rem = total - cyc * SWEEP_PERIOD;
+      return {
+        kind: 'sweep',
+        freq: sweepFreq(rem),
+        phase: s.P0 + cyc * SWEEP_CYCLE + sweepInt(rem) - sweepInt(s.s0)
+      };
+    }
+    return { kind: s.kind, freq: s.f, phase: s.P0 + s.f * (t - s.t0) };
+  }
+  function pushSegment(t, kind, f) {
+    var cur = stateAt(t);
+    var seg = {
+      t0: t,
+      kind: kind,
+      P0: cur.phase - Math.floor(cur.phase),   // keep phase small, exact mod 1
+      f: kind === 'sweep' ? cur.freq : f,
+      s0: 0
+    };
+    if (kind === 'sweep') {
+      // re-enter the ping-pong on its rising leg at the current frequency,
+      // so the sweep continues from where the ear already is
+      seg.s0 = clamp((cur.freq - F_MIN) / RATE, 0, SWEEP_HALF);
+    }
+    segments.push(seg);
+    if (segments.length > 64) segments.splice(1, segments.length - 64);
+  }
+
+  // ---------- meter mapping (log scale, 4..40 Hz is one decade) ----------
+  function freqToX(f) {
+    return GEO.mx + (Math.log(f / F_MIN) / Math.LN10) * GEO.barW;
+  }
+  function xToFreq(x) {
+    var frac = clamp((x - GEO.mx) / GEO.barW, 0, 1);
+    return F_MIN * Math.pow(10, frac);
+  }
+
+  // ---------- audio: one sine oscillator, never autoplay ----------
+  // Created lazily inside the first pointer gesture, typeof-guarded: the
+  // QA renderer has no AudioContext and the piece runs silently there.
+  var AC = null;
+  if (typeof AudioContext !== 'undefined') AC = AudioContext;
+  else if (typeof window !== 'undefined' && typeof window.webkitAudioContext !== 'undefined') AC = window.webkitAudioContext;
+
+  var actx = null, osc = null, audioOn = false;
+  function startAudio() {
+    if (audioOn || !AC) return;
+    try {
+      actx = new AC();
+      var comp = actx.createDynamicsCompressor();   // the limiter
+      comp.threshold.value = -18;
+      comp.ratio.value = 12;
+      var gain = actx.createGain();
+      gain.gain.value = 0.12;                        // low gain, one oscillator
+      osc = actx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.value = stateAt(pieceT()).freq;
+      osc.connect(gain);
+      gain.connect(comp);
+      comp.connect(actx.destination);
+      osc.start();
+      audioOn = true;
+    } catch (err) {
+      actx = null; osc = null; audioOn = false;
+    }
+    if (actx && actx.state === 'suspended' && actx.resume) actx.resume();
+  }
+
+  // ---------- drawing ----------
+  function draw(t) {
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+
+    ctx.fillStyle = ROOM;
+    ctx.fillRect(0, 0, W, H);
+
+    var st = stateAt(t);
+    // lamp brightness follows the oscillator phase: below ~20 Hz the eye
+    // resolves separate flashes, above it the lamp reads steady
+    var b = 0.5 + 0.5 * Math.sin(Math.PI * 2 * st.phase);
+    var R = GEO.lampR;
+
+    // halo: layered flat-alpha discs (no gradients)
+    ctx.fillStyle = LAMP;
+    ctx.globalAlpha = 0.045 * b;
+    ctx.beginPath(); ctx.arc(GEO.cx, GEO.cy, R * 3.1, 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = 0.09 * b;
+    ctx.beginPath(); ctx.arc(GEO.cx, GEO.cy, R * 2.0, 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = 0.16 + 0.24 * b;
+    ctx.beginPath(); ctx.arc(GEO.cx, GEO.cy, R * 1.35, 0, Math.PI * 2); ctx.fill();
+    // the pilot lamp itself
+    ctx.globalAlpha = 0.22 + 0.78 * b;
+    ctx.beginPath(); ctx.arc(GEO.cx, GEO.cy, R, 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = 1;
+
+    // meter bar
+    ctx.fillStyle = METER;
+    ctx.fillRect(GEO.mx, GEO.barY - GEO.barH / 2, GEO.barW, GEO.barH);
+
+    // threshold marker at 20 Hz, brass
+    var tx = freqToX(20);
+    ctx.strokeStyle = BRASS;
+    ctx.lineWidth = Math.max(2, GEO.minD * 0.004);
+    ctx.beginPath();
+    ctx.moveTo(tx, GEO.barY - GEO.barH * 2.1);
+    ctx.lineTo(tx, GEO.barY + GEO.barH * 2.1);
+    ctx.stroke();
+    ctx.fillStyle = BRASS;
+    ctx.beginPath();
+    ctx.moveTo(tx - GEO.barH * 0.9, GEO.barY - GEO.barH * 3.4);
+    ctx.lineTo(tx + GEO.barH * 0.9, GEO.barY - GEO.barH * 3.4);
+    ctx.lineTo(tx, GEO.barY - GEO.barH * 2.2);
+    ctx.closePath();
+    ctx.fill();
+
+    // needle at the current frequency
+    var nx = freqToX(st.freq);
+    ctx.strokeStyle = LAMP;
+    ctx.globalAlpha = 0.92;
+    ctx.lineWidth = Math.max(1.6, GEO.minD * 0.0032);
+    ctx.beginPath();
+    ctx.moveTo(nx, GEO.barY - GEO.barH * 2.6);
+    ctx.lineTo(nx, GEO.barY + GEO.barH * 2.6);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    // frequency readout, top-left, plain mono
+    ctx.fillStyle = LAMP;
+    ctx.globalAlpha = 0.85;
+    ctx.font = GEO.readSize + 'px ui-monospace, Menlo, Consolas, monospace';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillText(st.freq.toFixed(1) + ' Hz', GEO.readX, GEO.readY);
+    ctx.globalAlpha = 1;
+
+    // drive the oscillator from the same closed-form state
+    if (audioOn && osc) {
+      try { osc.frequency.value = st.freq; } catch (err) {}
+    }
+  }
+
+  // ---------- interaction ----------
+  // Mode model:
+  //   first pointer gesture ever - starts the audio, nothing else
+  //   drag horizontally          - manual mode, frequency scrubbed by x;
+  //                                stays manual after release
+  //   tap (not the first)        - toggles fixed 20 Hz <-> auto sweep
+  //   double-tap                 - returns to the auto sweep from any mode
+  function nowSec() { return performance.now() / 1000; }
+  var startTime = nowSec();
+  function pieceT() { return nowSec() - startTime; }
+  function evPos(e) {
+    var r = canvas.getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  }
+
+  var pDown = null;            // {t, x, y, moved, wasFirst}
+  var everInteracted = false;
+  var lastTapUp = -10;
+  var lastDragF = -1;
+
+  canvas.addEventListener('pointerdown', function (e) {
+    var p = evPos(e);
+    var wasFirst = !everInteracted;
+    everInteracted = true;
+    startAudio();                       // the gesture that unlocks sound
+    pDown = { t: pieceT(), x: p.x, y: p.y, moved: false, wasFirst: wasFirst };
+    lastDragF = -1;
+    if (canvas.setPointerCapture) { try { canvas.setPointerCapture(e.pointerId); } catch (err) {} }
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (!pDown) return;
+    var p = evPos(e);
+    var dx = p.x - pDown.x, dy = p.y - pDown.y;
+    if (!pDown.moved && Math.sqrt(dx * dx + dy * dy) > 7) pDown.moved = true;
+    if (pDown.moved) {
+      var f = xToFreq(p.x);
+      if (Math.abs(f - lastDragF) > 0.1) {
+        pushSegment(pieceT(), 'manual', f);
+        lastDragF = f;
+      }
+    }
+  });
+  function endPointer(e) {
+    if (!pDown) return;
+    var t = pieceT();
+    if (!pDown.moved && t - pDown.t < 0.35) {
+      // a tap
+      if (t - lastTapUp < 0.35) {
+        pushSegment(t, 'sweep', 0);     // double-tap: back to the auto sweep
+        lastTapUp = -10;
+      } else {
+        lastTapUp = t;
+        if (!pDown.wasFirst) {
+          if (segAt(t).kind === 'fixed') pushSegment(t, 'sweep', 0);
+          else pushSegment(t, 'fixed', 20);
+        }
+      }
+    }
+    pDown = null;
+  }
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', endPointer);
+
+  // ---------- run ----------
+  resize();
+  if (window.visualViewport) window.visualViewport.addEventListener('resize', resize);
+  window.addEventListener('resize', resize);
+
+  draw(0); // frame one: synchronous, silent, sweep at 4 Hz, lamp mid-brightness
+
+  if (typeof requestAnimationFrame === 'function') {
+    var loop = function () {
+      draw(pieceT());
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>

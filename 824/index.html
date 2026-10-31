@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Flicker Engine</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #000000; height: 100%; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<script>
+'use strict';
+
+/* The Flicker Engine (Tony Conrad, The Flicker, 1966, rebuilt as a render loop).
+   Five frames only: WARNING, TONY CONRAD PRESENTS, THE FLICKER, BLACK, WHITE.
+   No imagery ever enters the flicker. The frame on screen is a closed-form
+   function of (screening clock, seeded block map, pointer-x speed factor,
+   reduced-motion state). Frame one is the warning card at t = 0. */
+
+var canvas = document.getElementById('stage');
+var ctx = canvas.getContext('2d');
+
+/* ---------- seeded RNG: mulberry32 ---------- */
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/* ---------- block map ----------
+   Perceived flicker frequency of an alternating black/white block pair is
+   f = 1000 / (blackMs + whiteMs) Hz (one full cycle = one black + one white).
+   Hard cap: every block is >= 42 ms, so the shortest possible pair is 84 ms,
+   f <= 11.90 Hz BEFORE speed modulation. The fastest modulation product is
+   arc 1.10 x pointer 1.20 = 1.32, and 11.90 x 1.32 = 15.7 > 14, so the
+   effective speed is clamped per pair at draw time:
+     effSpeed <= 14 * pairMs / 1000  =>  fastest pair never exceeds 14 Hz.
+   Base pairs are generated in the 6-11 Hz band; longer black on odd cycles;
+   black/white totals stay balanced per cycle (equal counts, matched sums). */
+var BLOCK_MIN_MS = 42;
+var CAP_HZ = 14;
+
+function buildCycleMap(seed) {
+  var rnd = mulberry32(seed);
+  var cycles = [];
+  for (var c = 0; c < 47; c++) {            // Conrad's 47 test variations
+    var pairs = 4 + Math.floor(rnd() * 5);  // 4..8 pairs per cycle
+    var blocks = [];
+    for (var p = 0; p < pairs; p++) {
+      var base = 40 + rnd() * 75;           // 40..115 ms -> pairs ~84..230 ms, perceived rate centered on the 6-14 Hz band across the arc
+      var bias = (c % 2 === 1) ? (6 + rnd() * 16) : (rnd() * 8 - 4); // longer black on odd cycles
+      var b = Math.max(BLOCK_MIN_MS, Math.round(base + bias));
+      var w = Math.max(BLOCK_MIN_MS, Math.round(base - bias));
+      blocks.push(b); blocks.push(w);
+    }
+    // balance: append one compensating pair so black total == white total
+    var sb = 0, sw = 0;
+    for (var i = 0; i < blocks.length; i += 2) { sb += blocks[i]; sw += blocks[i + 1]; }
+    if (sb !== sw) {
+      var d = Math.abs(sb - sw);
+      if (sb < sw) { blocks.push(d + BLOCK_MIN_MS); blocks.push(BLOCK_MIN_MS); }
+      else { blocks.push(BLOCK_MIN_MS); blocks.push(d + BLOCK_MIN_MS); }
+    }
+    var total = 0;
+    for (var j = 0; j < blocks.length; j++) total += blocks[j];
+    cycles.push({ blocks: blocks, total: total });
+  }
+  return cycles;
+}
+
+/* ---------- screening arc ----------
+   The original runs 30 minutes; compressed to a 6-minute screening
+   (ratio 5:1) so the whole shape is experienceable in the gallery.
+   Arc phases (screening seconds): accelerate 0-90 (speed .55 -> 1.10),
+   dwell 90-240 (1.10), decelerate 240-330 (1.10 -> .45), abrupt stop
+   at 330, hold black 4 s, screening ends at 334; the warning card
+   returns and a new screening begins (map reseeded per screening). */
+var SCREEN_S = 334, STOP_S = 330;
+function arcSpeed(s) {
+  if (s < 90) return 0.55 + (1.10 - 0.55) * (s / 90);
+  if (s < 240) return 1.10;
+  if (s < 330) return 1.10 + (0.45 - 1.10) * ((s - 240) / 90);
+  return 0;
+}
+
+/* Timeline within one screening (screening seconds):
+   0-3 warning card, 3-5 TONY CONRAD PRESENTS, 5-7 THE FLICKER,
+   7-330 block cycles, 330-334 held black. */
+var CARD_END = 3, TITLE1_END = 5, TITLE2_END = 7;
+
+/* ---------- state ---------- */
+var state = {
+  seed: 19660116,
+  map: null,
+  screeningStart: 0,      // piece-clock time at which current screening began
+  lastTapT: -10, lastTapX: 0, lastTapY: 0,
+  pointerFactor: 1,       // 0.833..1.20 from pointer x
+  reduced: false,         // visitor toggle (top-right corner tap)
+  sysReduced: false       // prefers-reduced-motion
+};
+state.map = buildCycleMap(state.seed);
+
+if (typeof window !== 'undefined' && typeof window.matchMedia === 'function') {
+  try { state.sysReduced = !!window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (e) { state.sysReduced = false; }
+}
+function reducedOn() { return state.reduced || state.sysReduced; }
+
+/* ---------- viewport / phone ---------- */
+var W = 0, H = 0, isPhone = false;
+function resize() {
+  var vv = (typeof window !== 'undefined' && window.visualViewport) ? window.visualViewport : null;
+  W = vv ? vv.width : window.innerWidth;
+  H = vv ? vv.height : window.innerHeight;
+  canvas.width = Math.max(1, Math.round(W));
+  canvas.height = Math.max(1, Math.round(H));
+  var sw = (window.screen && window.screen.width) ? window.screen.width : W;
+  var sh = (window.screen && window.screen.height) ? window.screen.height : H;
+  isPhone = Math.min(sw, sh) < 700 || H > W * 1.15;
+}
+if (typeof window !== 'undefined') {
+  if (window.visualViewport && typeof window.visualViewport.addEventListener === 'function') {
+    window.visualViewport.addEventListener('resize', function () { resize(); draw(lastT); });
+  }
+  if (typeof window.addEventListener === 'function') {
+    window.addEventListener('resize', function () { resize(); draw(lastT); });
+  }
+}
+
+/* ---------- field lookup: closed form in screening time ----------
+   The map is flattened once per build into pair tables with cumulative
+   starts, so locating the pair under a map position is a binary search.
+   Consumption is advanced by an incremental WALKER: it splits the span
+   since the last frame at the arc knots and at pointer-segment
+   boundaries, then subdivides into substeps of at most 0.1 s. Within a
+   substep the consumption speed is
+   eff = min(maxArcInSubstep * pointerFactor, capForPairUnderPlayhead),
+   so the walk's instantaneous rate can never exceed the pair's 14 Hz
+   cap: the cap holds by construction, not by approximation. The walker
+   only moves forward within a screening; a reseed or a screening
+   rollover bumps walkerEpoch and the walker restarts at the flicker
+   start. The field at any s is therefore a deterministic function of
+   (screening clock, block map, pointer segments, reduced state).
+   Pointer history is recorded as segments: {s, f} = from screening
+   time s onward the pointer factor is f. */
+var pointerSegments = [{ s: 0, f: 1 }];
+
+function flattenMap(map) {
+  var starts = [], black = [], dur = [], acc = 0;
+  for (var c = 0; c < map.length; c++) {
+    var blocks = map[c].blocks;
+    for (var i = 0; i + 1 < blocks.length; i += 2) {
+      var bS = blocks[i] / 1000, pS = (blocks[i] + blocks[i + 1]) / 1000;
+      starts.push(acc); black.push(bS); dur.push(pS);
+      acc += pS;
+    }
+  }
+  return { starts: starts, black: black, dur: dur, len: acc };
+}
+var flat = flattenMap(state.map);
+
+function pairAt(pos) {
+  // binary search: largest pair index whose start <= pos (pos in [0, len))
+  var lo = 0, hi = flat.starts.length - 1, idx = 0;
+  while (lo <= hi) {
+    var mid = (lo + hi) >> 1;
+    if (flat.starts[mid] <= pos) { idx = mid; lo = mid + 1; } else { hi = mid - 1; }
+  }
+  return { pairMs: flat.dur[idx] * 1000, blackS: flat.black[idx], offS: pos - flat.starts[idx], endS: flat.starts[idx] + flat.dur[idx] };
+}
+
+var walkerEpoch = 0;
+var walker = { epoch: -1, s: TITLE2_END, mapPos: 0 };
+
+function fieldColorAt(s) {
+  if (walker.epoch !== walkerEpoch || s < walker.s) {
+    walker.epoch = walkerEpoch;
+    walker.s = TITLE2_END;
+    walker.mapPos = 0;
+  }
+  var target = s;
+  while (walker.s < target) {
+    // next boundary: arc knot, pointer-segment start, or target
+    var next = target;
+    var knots = [90, 240, 330];
+    for (var k = 0; k < knots.length; k++) {
+      if (knots[k] > walker.s && knots[k] < next) next = knots[k];
+    }
+    for (var p = 0; p < pointerSegments.length; p++) {
+      var ps = pointerSegments[p].s;
+      if (ps > walker.s && ps < next) next = ps;
+    }
+    var f = 1;
+    for (var q = 0; q < pointerSegments.length; q++) if (pointerSegments[q].s <= walker.s) f = pointerSegments[q].f;
+    var cursor = walker.s;
+    while (cursor < next) {
+      var stepEnd = Math.min(next, cursor + 0.1);
+      // arc is linear between knots, so its max on the substep is at an end
+      var speed = Math.max(arcSpeed(cursor), arcSpeed(stepEnd)) * f;
+      var remain = stepEnd - cursor;
+      var guard = 0;
+      while (remain > 0 && guard++ < 10000) {
+        // walker.mapPos is kept wrapped in [0, flat.len): at wrapped
+        // magnitudes float increments never vanish, and a boundary snap
+        // (leftInPair ~ 0) crosses the pair line exactly instead of
+        // relying on epsilon accumulation.
+        var pr = pairAt(walker.mapPos);
+        var leftInPair = pr.endS - walker.mapPos;
+        if (leftInPair <= 1e-9) {
+          walker.mapPos = pr.endS >= flat.len ? 0 : pr.endS;
+          continue;
+        }
+        var cap = CAP_HZ * pr.pairMs / 1000;    // max consumption speed for this pair
+        var eff = Math.min(speed, cap);
+        if (eff <= 0) { remain = 0; break; }
+        var consume = leftInPair / eff;
+        if (consume >= remain) {
+          walker.mapPos += remain * eff;
+          remain = 0;
+        } else {
+          walker.mapPos += leftInPair;
+          remain -= consume;
+        }
+        if (walker.mapPos >= flat.len) walker.mapPos -= flat.len;
+      }
+      cursor = stepEnd;
+    }
+    walker.s = next;
+  }
+  var cur = pairAt(walker.mapPos);
+  return cur.offS < cur.blackS ? '#000000' : '#FFFFFF';
+}
+
+/* ---------- drawing ---------- */
+var lastT = 0;
+function drawTextCard(lines, big) {
+  ctx.fillStyle = '#000000';
+  ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#FFFFFF';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  var size = big ? Math.max(15, Math.min(W, H) * 0.052) : Math.max(12, Math.min(W, H) * 0.034);
+  ctx.font = size + 'px sans-serif';
+  var lh = size * 1.5;
+  var y0 = H / 2 - (lines.length - 1) * lh / 2;
+  for (var i = 0; i < lines.length; i++) ctx.fillText(lines[i], W / 2, y0 + i * lh);
+}
+
+var WARNING_LINES = [
+  'WARNING',
+  'This film may be especially unsuitable for epileptics',
+  'or others with a sensitivity to light',
+  'A physician should be in attendance'
+];
+
+function draw(t) {
+  lastT = t;
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  var s = t - state.screeningStart;
+  if (s < 0) s = 0;
+  if (s >= SCREEN_S) { // previous screening ended: restart with warning
+    s = s % SCREEN_S;
+    state.screeningStart = t - s;
+    pointerSegments = [{ s: 0, f: state.pointerFactor }];
+    walkerEpoch++;
+  }
+  if (s < CARD_END) { drawTextCard(WARNING_LINES, false); return; }
+  if (s < TITLE1_END) { drawTextCard(['TONY CONRAD PRESENTS'], true); return; }
+  if (s < TITLE2_END) { drawTextCard(['THE FLICKER'], true); return; }
+  if (reducedOn()) {
+    // 1 Hz fades: one full black-white-black cycle per 2 s (0.5 Hz cycle,
+    // luminance crossing each second), value from a triangle wave.
+    var ph = ((s - TITLE2_END) % 2) / 2;         // 0..1 over 2 s
+    var tri = ph < 0.5 ? ph * 2 : 2 - ph * 2;    // 0..1..0
+    var v = Math.round(255 * tri);
+    ctx.fillStyle = 'rgb(' + v + ',' + v + ',' + v + ')';
+    ctx.fillRect(0, 0, W, H);
+    return;
+  }
+  if (s >= STOP_S) { ctx.fillStyle = '#000000'; ctx.fillRect(0, 0, W, H); return; }
+  ctx.fillStyle = fieldColorAt(s);
+  ctx.fillRect(0, 0, W, H);
+}
+
+/* ---------- interaction ---------- */
+function pieceNow() {
+  // piece clock in seconds; starts at 0 on load, advanced only by rAF
+  return lastT;
+}
+function handleTap(x, y) {
+  var t = pieceNow();
+  // top-right corner zone: 15% of width/height (documented soften toggle)
+  if (x >= W * 0.85 && y <= H * 0.15) {
+    state.reduced = !state.reduced;
+    draw(lastT);
+    return;
+  }
+  // double-tap: reseed cycle map and restart the screening
+  if (t - state.lastTapT < 0.35 && Math.abs(x - state.lastTapX) < 60 && Math.abs(y - state.lastTapY) < 60) {
+    state.seed = (state.seed * 1103515245 + 12345) % 2147483648;
+    state.map = buildCycleMap(state.seed);
+    flat = flattenMap(state.map);
+    walkerEpoch++;
+    state.screeningStart = t;
+    pointerSegments = [{ s: 0, f: state.pointerFactor }];
+    state.lastTapT = -10;
+    draw(lastT);
+    return;
+  }
+  state.lastTapT = t; state.lastTapX = x; state.lastTapY = y;
+  // a plain tap anywhere else does nothing
+}
+function handleMove(x) {
+  if (W <= 0) return;
+  var f = 0.833 + (Math.max(0, Math.min(1, x / W))) * (1.20 - 0.833);
+  if (Math.abs(f - state.pointerFactor) > 0.001) {
+    state.pointerFactor = f;
+    var s = pieceNow() - state.screeningStart;
+    pointerSegments.push({ s: s, f: f });
+  }
+}
+if (canvas && typeof canvas.addEventListener === 'function') {
+  canvas.addEventListener('pointerdown', function (e) { handleTap(e.clientX || 0, e.clientY || 0); });
+  canvas.addEventListener('pointermove', function (e) { handleMove(e.clientX || 0); });
+  canvas.addEventListener('touchstart', function (e) {
+    if (e.touches && e.touches[0]) handleTap(e.touches[0].clientX, e.touches[0].clientY);
+  });
+  canvas.addEventListener('mousemove', function (e) { handleMove(e.clientX || 0); });
+}
+
+/* ---------- run ---------- */
+resize();
+draw(0);
+if (typeof requestAnimationFrame === 'function') {
+  var startStamp = null;
+  var loop = function (stamp) {
+    if (startStamp === null) startStamp = stamp;
+    draw((stamp - startStamp) / 1000);
+    requestAnimationFrame(loop);
+  };
+  requestAnimationFrame(loop);
+}
+</script>
+</body>
+</html>

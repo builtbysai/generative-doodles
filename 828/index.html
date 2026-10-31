@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Four Square</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #000000; height: 100%; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- Seeded RNG (mulberry32) ----------
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- Conductor schedule (fixed function of segment-local time) ----------
+  // 90 s cycle: drift (0-55), ease into sync (55-70), hold sync (70-78), release (78-90).
+  var SYNC_PERIOD = 90, RISE_A = 55, RISE_B = 70, HOLD_B = 78;
+  function smooth(u) { return u * u * (3 - 2 * u); }
+  function smoothInt(u) { return u * u * u - 0.5 * u * u * u * u; } // integral of smooth, 0..u
+  function kOf(t) {
+    var u = ((t % SYNC_PERIOD) + SYNC_PERIOD) % SYNC_PERIOD;
+    if (u < RISE_A) return 0;
+    if (u < RISE_B) return smooth((u - RISE_A) / (RISE_B - RISE_A));
+    if (u < HOLD_B) return 1;
+    return 1 - smooth((u - HOLD_B) / (SYNC_PERIOD - HOLD_B));
+  }
+  var K_CYCLE = 7.5 + 8 + 6; // integral of k over one full 90 s cycle = 21.5
+  function kInt(t) {
+    if (t <= 0) return 0;
+    var cycles = Math.floor(t / SYNC_PERIOD);
+    var rem = t - cycles * SYNC_PERIOD;
+    var acc = cycles * K_CYCLE;
+    if (rem <= RISE_A) return acc;
+    if (rem <= RISE_B) return acc + (RISE_B - RISE_A) * smoothInt((rem - RISE_A) / (RISE_B - RISE_A));
+    acc += 7.5;
+    if (rem <= HOLD_B) return acc + (rem - RISE_B);
+    acc += 8;
+    var u = (rem - HOLD_B) / (SYNC_PERIOD - HOLD_B);
+    return acc + (SYNC_PERIOD - HOLD_B) * (u - smoothInt(u));
+  }
+  function wrap01(x) { return x - Math.floor(x + 0.5); } // wrap to [-0.5, 0.5)
+
+  // ---------- Block maps ----------
+  // Each panel: 6 alternating segments (segment 0 = black), fractions of one map cycle.
+  // Fractions are generated in [0.145, 0.19] and normalised with a floor of 0.14, so the
+  // shortest segment at the fastest rate still lasts >= 0.14 / 1.22 = 0.115 s:
+  // colour alternations never exceed ~8.7 per second, under the 12 Hz design cap
+  // and the 14 Hz study cap.
+  var BASE_RATES = [0.90, 0.80, 1.05, 1.20]; // map cycles per second, panel 1 is the master
+  var FIXED_DELTAS = [0, 0.22, 0.47, 0.72];   // starting phases for the opening segment
+
+  function makeParams(seed, useFixedDeltas) {
+    var rng = mulberry32(seed);
+    var panels = [];
+    for (var i = 0; i < 4; i++) {
+      var fr = null, j, sum, min;
+      do {
+        fr = []; sum = 0;
+        for (j = 0; j < 6; j++) { var v = 0.145 + rng() * 0.045; fr.push(v); sum += v; }
+        min = Infinity;
+        for (j = 0; j < 6; j++) { fr[j] /= sum; if (fr[j] < min) min = fr[j]; }
+      } while (min < 0.14);
+      var rate = BASE_RATES[i] * (0.94 + rng() * 0.12);
+      if (rate > 1.22) rate = 1.22;
+      if (rate < 0.70) rate = 0.70;
+      panels.push({
+        fr: fr,
+        rate: rate,
+        delta: useFixedDeltas ? FIXED_DELTAS[i] : rng()
+      });
+    }
+    return panels;
+  }
+
+  // ---------- State: segments (reseeds) + nudge events ----------
+  var INITIAL_SEED = 828001;
+  var segments = [{ t0: 0, panels: makeParams(INITIAL_SEED, true) }];
+  var nudges = []; // {seg, t, panel, dphi} with t segment-local
+  var reseedCount = 0;
+
+  function currentSegment(t) {
+    var s = segments[0], idx = 0;
+    for (var i = 0; i < segments.length; i++) {
+      if (segments[i].t0 <= t) { s = segments[i]; idx = i; } else break;
+    }
+    return { seg: s, idx: idx };
+  }
+  function nudgeSum(segIdx, panel, tau) {
+    var s = 0;
+    for (var i = 0; i < nudges.length; i++) {
+      var ev = nudges[i];
+      if (ev.seg === segIdx && ev.panel === panel && ev.t <= tau) s += ev.dphi;
+    }
+    return s;
+  }
+  // Base phase (map cycles) of a panel at segment-local time tau, before the conductor pull.
+  function basePhase(segIdx, panels, panel, tau) {
+    var p = panels[panel], rm = panels[0].rate;
+    var base = p.rate * tau + (rm - p.rate) * kInt(tau) + p.delta;
+    return base + nudgeSum(segIdx, panel, tau);
+  }
+  function panelPhase(segIdx, panels, panel, tau) {
+    if (panel === 0) return basePhase(segIdx, panels, 0, tau);
+    var k = kOf(tau);
+    if (k === 0) return basePhase(segIdx, panels, panel, tau);
+    var w = Math.floor(tau / SYNC_PERIOD);
+    var t1 = w * SYNC_PERIOD + RISE_B; // end of this cycle's rise: pull target locked here
+    var pull = wrap01(basePhase(segIdx, panels, 0, t1) - basePhase(segIdx, panels, panel, t1));
+    return basePhase(segIdx, panels, panel, tau) + k * pull;
+  }
+  function panelFractions(panels, panel, tau) {
+    if (panel === 0) return panels[0].fr;
+    var k = kOf(tau), fm = panels[0].fr, fi = panels[panel].fr, out = [];
+    for (var j = 0; j < 6; j++) out.push(fi[j] + k * (fm[j] - fi[j]));
+    return out;
+  }
+  function panelIsWhite(segIdx, panels, panel, tau) {
+    var fr = panelFractions(panels, panel, tau);
+    var ph = panelPhase(segIdx, panels, panel, tau);
+    var frac = ((ph % 1) + 1) % 1;
+    var acc = 0;
+    for (var j = 0; j < 6; j++) {
+      acc += fr[j];
+      if (frac < acc) return j % 2 === 1;
+    }
+    return false;
+  }
+
+  // ---------- Reduced motion ----------
+  var reduced = false;
+  try {
+    if (typeof window !== 'undefined' && window.matchMedia &&
+        window.matchMedia('(prefers-reduced-motion: reduce)').matches) reduced = true;
+  } catch (e) {}
+
+  // ---------- Canvas / viewport ----------
+  var canvas = document.getElementById('stage');
+  var ctx = canvas.getContext('2d');
+  var cssW = 0, cssH = 0, dpr = 1;
+
+  function viewportSize() {
+    var w, h;
+    if (typeof window !== 'undefined' && window.visualViewport) {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    } else if (typeof window !== 'undefined') {
+      w = window.innerWidth; h = window.innerHeight;
+    } else { w = 720; h = 720; }
+    return { w: w, h: h };
+  }
+  function resize() {
+    var s = viewportSize();
+    cssW = s.w; cssH = s.h;
+    dpr = 1;
+    if (typeof window !== 'undefined' && window.devicePixelRatio) {
+      dpr = Math.min(window.devicePixelRatio, 2);
+    }
+    canvas.width = Math.round(cssW * dpr);
+    canvas.height = Math.round(cssH * dpr);
+  }
+  function isPhone() {
+    var smallScreen = false;
+    if (typeof screen !== 'undefined' && screen) {
+      smallScreen = Math.min(screen.width, screen.height) < 700;
+    }
+    return smallScreen || cssH > cssW * 1.15;
+  }
+  function gridRect() {
+    var side = Math.min(cssW, cssH) * (isPhone() ? 0.96 : 0.92);
+    return { x: (cssW - side) / 2, y: (cssH - side) / 2, side: side };
+  }
+
+  // ---------- Drawing ----------
+  var NUMERALS = ['1', '2', '3', '4'];
+  function draw(t) {
+    canvas.style.width = cssW + 'px';
+    canvas.style.height = cssH + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = '#000000';
+    ctx.fillRect(0, 0, cssW, cssH);
+
+    var g = gridRect();
+    var half = g.side / 2;
+    var cs = currentSegment(t);
+    var tau = t - cs.seg.t0;
+    var panels = cs.seg.panels;
+
+    for (var i = 0; i < 4; i++) {
+      var px = g.x + (i % 2) * half;
+      var py = g.y + Math.floor(i / 2) * half;
+      if (reduced) {
+        // Slow fade instead of strobing: 0.2 Hz brightness wave per panel.
+        var v = 0.5 - 0.5 * Math.cos(2 * Math.PI * 0.2 * tau + i * Math.PI / 2);
+        ctx.fillStyle = '#000000';
+        ctx.fillRect(px, py, half, half);
+        ctx.globalAlpha = v;
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillRect(px, py, half, half);
+        ctx.globalAlpha = 1;
+      } else {
+        ctx.fillStyle = panelIsWhite(cs.idx, panels, i, tau) ? '#FFFFFF' : '#000000';
+        ctx.fillRect(px, py, half, half);
+      }
+    }
+
+    // Hairline dividers.
+    ctx.fillStyle = '#222222';
+    ctx.fillRect(g.x + half - 1, g.y, 2, g.side);
+    ctx.fillRect(g.x, g.y + half - 1, g.side, 2);
+
+    // Corner numerals at the outer edges (white with a black underlay so they
+    // stay legible on both black and white panels).
+    var fs = Math.max(12, Math.round(g.side * 0.028));
+    ctx.font = '600 ' + fs + 'px sans-serif';
+    ctx.textBaseline = 'middle';
+    var inset = fs * 0.85;
+    var pos = [
+      { x: g.x + inset, y: g.y + inset, a: 'left' },
+      { x: g.x + g.side - inset, y: g.y + inset, a: 'right' },
+      { x: g.x + inset, y: g.y + g.side - inset, a: 'left' },
+      { x: g.x + g.side - inset, y: g.y + g.side - inset, a: 'right' }
+    ];
+    for (var n = 0; n < 4; n++) {
+      ctx.textAlign = pos[n].a;
+      ctx.fillStyle = '#000000';
+      ctx.fillText(NUMERALS[n], pos[n].x + 1.5, pos[n].y + 1.5);
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillText(NUMERALS[n], pos[n].x, pos[n].y);
+    }
+  }
+
+  // ---------- Interaction ----------
+  var tNow = 0;
+  var drag = null;      // {panel, lastX, lastY, moved, startT, corner}
+  var lastTap = null;   // {t}
+
+  function piecePos(evt) {
+    var r = canvas.getBoundingClientRect();
+    return { x: evt.clientX - r.left, y: evt.clientY - r.top };
+  }
+  function panelAt(x, y) {
+    var g = gridRect(), half = g.side / 2;
+    if (x < g.x || y < g.y || x >= g.x + g.side || y >= g.y + g.side) return -1;
+    var col = x < g.x + half ? 0 : 1;
+    var row = y < g.y + half ? 0 : 1;
+    return row * 2 + col;
+  }
+  function inCornerZone(x, y) {
+    return x > cssW - 76 && y < 76;
+  }
+
+  canvas.addEventListener('pointerdown', function (evt) {
+    var p = piecePos(evt);
+    drag = {
+      panel: panelAt(p.x, p.y),
+      lastX: p.x, lastY: p.y,
+      moved: 0, startT: tNow,
+      corner: inCornerZone(p.x, p.y)
+    };
+    if (canvas.setPointerCapture) { try { canvas.setPointerCapture(evt.pointerId); } catch (e) {} }
+  });
+  canvas.addEventListener('pointermove', function (evt) {
+    if (!drag || drag.panel < 0 || drag.corner) return;
+    var p = piecePos(evt);
+    var dx = p.x - drag.lastX;
+    drag.moved += Math.abs(dx) + Math.abs(p.y - drag.lastY);
+    drag.lastX = p.x; drag.lastY = p.y;
+    if (dx !== 0) {
+      var g = gridRect();
+      var cs = currentSegment(tNow);
+      nudges.push({
+        seg: cs.idx, t: tNow - cs.seg.t0, panel: drag.panel,
+        dphi: (dx / (g.side / 2)) * 0.75
+      });
+    }
+  });
+  canvas.addEventListener('pointerup', function (evt) {
+    if (!drag) return;
+    var p = piecePos(evt);
+    var quick = (tNow - drag.startT) < 0.3;
+    var still = drag.moved < 8;
+    if (drag.corner && quick && still && inCornerZone(p.x, p.y)) {
+      reduced = !reduced;
+      lastTap = null;
+    } else if (quick && still && drag.panel >= 0) {
+      if (lastTap && (tNow - lastTap.t) < 0.32) {
+        // Double-tap: reseed all four block maps (new segment).
+        reseedCount++;
+        segments.push({ t0: tNow, panels: makeParams(INITIAL_SEED + reseedCount * 7919, false) });
+        lastTap = null;
+      } else {
+        lastTap = { t: tNow };
+      }
+    }
+    drag = null;
+  });
+  canvas.addEventListener('pointercancel', function () { drag = null; });
+
+  // ---------- Main loop ----------
+  resize();
+  if (typeof window !== 'undefined') {
+    window.addEventListener('resize', resize);
+    if (window.visualViewport) window.visualViewport.addEventListener('resize', resize);
+  }
+  draw(0); // deterministic frame one: synchronous draw at t = 0
+  if (typeof requestAnimationFrame === 'function') {
+    var epoch = null;
+    var loop = function (ts) {
+      if (epoch === null) epoch = ts;
+      tNow = (ts - epoch) / 1000;
+      draw(tNow);
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Straight and Narrow</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #000000; height: 100%; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  var BLACK = '#000000';
+  var WHITE = '#FFFFFF';
+
+  var BASE_SEED = 826003;
+  var RATE_DEFAULT = 7;      // field alternations per second
+  var RATE_MIN = 2;
+  var RATE_MAX = 10;         // hard cap: alternation at or below 10 Hz, full cycle at or below 5 Hz
+  var RUN_SECONDS = 600;     // 10-minute structure, like the original film
+  var STOP_SECONDS = 5;      // hard stop to black, then restart
+  var CYCLE_SECONDS = RUN_SECONDS + STOP_SECONDS;
+  var OVERLAY_SCALE = 1.03;  // second bar set at 1.03x, the moire crawl source
+  var OVERLAY_ALPHA = 0.35;
+  var OVERLAY_DRIFT = 1.5;   // overlay offset drift, 1080-units per second
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+  function mod(a, n) { return ((a % n) + n) % n; }
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  function viewSize() {
+    var w, h;
+    if (typeof window !== 'undefined' && window.visualViewport &&
+        typeof window.visualViewport.width === 'number') {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    } else if (typeof window !== 'undefined' && typeof window.innerWidth === 'number') {
+      w = window.innerWidth; h = window.innerHeight;
+    } else { w = 720; h = 720; }
+    return { w: Math.max(1, Math.round(w)), h: Math.max(1, Math.round(h)) };
+  }
+
+  var W = 0, H = 0;
+  function fit() {
+    var s = viewSize();
+    if (s.w !== W || s.h !== H) {
+      W = s.w; H = s.h;
+      canvas.width = W; canvas.height = H;
+    }
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+  }
+
+  function isPhone() {
+    var minDim = null;
+    if (typeof window !== 'undefined' && window.screen &&
+        typeof window.screen.width === 'number') {
+      minDim = Math.min(window.screen.width, window.screen.height);
+    }
+    if (minDim !== null && minDim < 700) return true;
+    return H > W * 1.15;
+  }
+
+  function prefersReduced() {
+    try {
+      if (typeof window !== 'undefined' && typeof window.matchMedia === 'function') {
+        var mq = window.matchMedia('(prefers-reduced-motion: reduce)');
+        return !!(mq && mq.matches);
+      }
+    } catch (e) { /* no media query support: default to full motion */ }
+    return false;
+  }
+
+  // ---- Recorded state. Every drawn quantity is a closed-form function of
+  // ---- (t, these recorded segments). Nothing is accumulated frame to frame.
+
+  // Rate control points: phase integrates the piecewise-constant rate.
+  var rateCPs = [{ t: 0, phase: 0, rate: RATE_DEFAULT }];
+  // Bar-width factor control points: value lerps between neighbours.
+  var widthCPs = [{ t: 0, f: 1 }];
+  // Pattern reseeds (double-tap): each entry selects a seeded parameter set.
+  var reseeds = [{ t: 0, idx: 0 }];
+  // Reduced-motion toggle events.
+  var reducedEvents = [{ t: 0, on: prefersReduced() }];
+
+  function phaseAt(t) {
+    var cp = rateCPs[0];
+    for (var i = 0; i < rateCPs.length; i++) {
+      if (rateCPs[i].t <= t) cp = rateCPs[i]; else break;
+    }
+    return cp.phase + (t - cp.t) * cp.rate;
+  }
+
+  function addRateCP(t, rate) {
+    rateCPs.push({ t: t, phase: phaseAt(t), rate: rate });
+    if (rateCPs.length > 600) rateCPs.splice(1, rateCPs.length - 300);
+  }
+
+  function widthAt(t) {
+    var cps = widthCPs;
+    if (t <= cps[0].t) return cps[0].f;
+    for (var i = 0; i < cps.length - 1; i++) {
+      var a = cps[i], b = cps[i + 1];
+      if (t >= a.t && t <= b.t) {
+        if (b.t === a.t) return b.f;
+        return a.f + (b.f - a.f) * ((t - a.t) / (b.t - a.t));
+      }
+    }
+    return cps[cps.length - 1].f;
+  }
+
+  function patternAt(t) {
+    var idx = reseeds[0].idx;
+    for (var i = 0; i < reseeds.length; i++) {
+      if (reseeds[i].t <= t) idx = reseeds[i].idx; else break;
+    }
+    var rng = mulberry32(BASE_SEED + idx * 7919);
+    var bw = 9 + rng() * 6;                    // 9..15 px at 1080 scale
+    var off = rng() * bw * 2;                  // stripe phase offset
+    var oPhase = rng() * 24;                   // overlay phase offset
+    var oDir = rng() < 0.5 ? -1 : 1;           // overlay crawl direction
+    return { bw: bw, off: off, oPhase: oPhase, oDir: oDir };
+  }
+
+  function reducedAt(t) {
+    var on = reducedEvents[0].on;
+    for (var i = 0; i < reducedEvents.length; i++) {
+      if (reducedEvents[i].t <= t) on = reducedEvents[i].on; else break;
+    }
+    return on;
+  }
+
+  // ---- Drawing ------------------------------------------------------------
+
+  // One bar field. vertical=true draws bars running vertically (stripes step
+  // along x). With alpha >= 1 the fast path fills white then black bars;
+  // below 1 both bar colours are stroked in at the given alpha so the field
+  // can be layered over another field (crossfade / overlay).
+  function drawField(vertical, bw, offset, alpha) {
+    var limit = vertical ? W : H;
+    var period = 2 * bw;
+    var start = mod(offset, period) - period;
+    var x, y;
+    ctx.globalAlpha = alpha;
+    if (alpha >= 1) {
+      ctx.fillStyle = WHITE;
+      ctx.fillRect(0, 0, W, H);
+      ctx.fillStyle = BLACK;
+      for (var p = start; p < limit; p += period) {
+        if (vertical) ctx.fillRect(p + bw, 0, bw, H);
+        else ctx.fillRect(0, p + bw, W, bw);
+      }
+    } else {
+      for (var q = start; q < limit; q += period) {
+        ctx.fillStyle = WHITE;
+        if (vertical) ctx.fillRect(q, 0, bw, H); else ctx.fillRect(0, q, W, bw);
+        ctx.fillStyle = BLACK;
+        if (vertical) ctx.fillRect(q + bw, 0, bw, H); else ctx.fillRect(0, q + bw, W, bw);
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function draw(t) {
+    fit();
+    var rt = mod(t, CYCLE_SECONDS);
+    if (rt >= RUN_SECONDS) {
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = BLACK;
+      ctx.fillRect(0, 0, W, H);
+      return;
+    }
+
+    var pat = patternAt(t);
+    var s = Math.min(W, H) / 1080;                 // 1080p bar-width scaling
+    var bw = Math.max(3, pat.bw * s * widthAt(t));
+    var off = pat.off * s;
+    var bwO = bw * OVERLAY_SCALE;
+    var offO = (pat.oPhase + pat.oDir * t * OVERLAY_DRIFT) * s;
+
+    if (reducedAt(t)) {
+      // Slow 1 Hz crossfade between the two fields instead of strobing.
+      var blend = 0.5 + 0.5 * Math.sin(2 * Math.PI * 1 * t - Math.PI / 2);
+      drawField(false, bw, off, 1);
+      drawField(true, bw, off, blend);
+      drawField(blend >= 0.5, bwO, offO, OVERLAY_ALPHA * 0.5);
+    } else {
+      var vertical = (Math.floor(phaseAt(t)) % 2) !== 0;
+      drawField(vertical, bw, off, 1);
+      drawField(vertical, bwO, offO, OVERLAY_ALPHA);
+    }
+  }
+
+  // ---- Clock --------------------------------------------------------------
+
+  var hasPerf = (typeof performance !== 'undefined' && typeof performance.now === 'function');
+  var t0 = hasPerf ? performance.now() : 0;
+  function nowT() { return hasPerf ? (performance.now() - t0) / 1000 : 0; }
+
+  draw(0); // frame one: synchronous, horizontal bar field at t = 0
+
+  if (typeof requestAnimationFrame === 'function') {
+    var rafLoop = function () {
+      draw(nowT());
+      requestAnimationFrame(rafLoop);
+    };
+    requestAnimationFrame(rafLoop);
+  }
+
+  // ---- Interaction --------------------------------------------------------
+
+  var down = null;   // {x, y, t, startRate, startF, dragging}
+  var lastTap = null;
+
+  function evtPos(e) {
+    var r = { x: 0, y: 0 };
+    if (typeof e.clientX === 'number') { r.x = e.clientX; r.y = e.clientY; }
+    return r;
+  }
+
+  function onDown(e) {
+    var p = evtPos(e);
+    down = {
+      x: p.x, y: p.y, t: nowT(),
+      startRate: rateCPs[rateCPs.length - 1].rate,
+      startF: widthAt(nowT()),
+      dragging: false
+    };
+    if (typeof canvas.setPointerCapture === 'function' && typeof e.pointerId !== 'undefined') {
+      try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* capture is optional */ }
+    }
+  }
+
+  function onMove(e) {
+    if (!down) return;
+    var p = evtPos(e);
+    var dx = p.x - down.x;
+    var dy = p.y - down.y;
+    if (!down.dragging && Math.sqrt(dx * dx + dy * dy) > 6) down.dragging = true;
+    if (!down.dragging) return;
+    var t = nowT();
+    var rate = clamp(down.startRate + dx * 0.02, RATE_MIN, RATE_MAX);
+    addRateCP(t, rate);
+    var f = clamp(down.startF * Math.exp(dy / 260), 0.55, 1.9);
+    widthCPs.push({ t: t, f: f });
+    if (widthCPs.length > 600) widthCPs.splice(1, widthCPs.length - 300);
+  }
+
+  function onUp(e) {
+    if (!down) return;
+    var p = evtPos(e);
+    var t = nowT();
+    var wasDrag = down.dragging;
+    var dur = t - down.t;
+    down = null;
+    if (wasDrag || dur > 0.3) { lastTap = null; return; }
+    // A tap. Top-right corner zone toggles reduced motion.
+    if (p.x > W * 0.82 && p.y < H * 0.18) {
+      reducedEvents.push({ t: t, on: !reducedAt(t) });
+      lastTap = null;
+      return;
+    }
+    if (lastTap && (t - lastTap.t) < 0.35) {
+      var idx = reseeds[reseeds.length - 1].idx + 1;
+      reseeds.push({ t: t, idx: idx });
+      lastTap = null;
+    } else {
+      lastTap = { t: t };
+    }
+  }
+
+  if (typeof canvas.addEventListener === 'function') {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', function () { down = null; });
+  }
+
+  function onResize() { fit(); draw(nowT()); }
+  if (typeof window !== 'undefined' && window.visualViewport &&
+      typeof window.visualViewport.addEventListener === 'function') {
+    window.visualViewport.addEventListener('resize', onResize);
+  }
+  if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    window.addEventListener('resize', onResize);
+  }
+})();
+</script>
+</body>
+</html>
