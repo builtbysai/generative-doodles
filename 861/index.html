@@ -1,0 +1,525 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Gritty and Drippy</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #060607; height: 100%; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- palette (strict) ----------
+  var BG    = '#060607';   // void black
+  var CHALK = '#ECE8DC';   // chalk white
+  var DRIP  = '#9A958A';   // drip grey
+  var DEEP  = '#101418';   // deep shadow blue (flat wash)
+
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+
+  // ---------- seeded RNG (mulberry32) ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ---------- layout ----------
+  var W = 0, H = 0, DPR = 1, S = 1, isPhone = false;
+
+  function viewSize() {
+    var vv = window.visualViewport;
+    if (vv && vv.width) return { w: vv.width, h: vv.height };
+    return { w: window.innerWidth || 0, h: window.innerHeight || 0 };
+  }
+
+  function layout() {
+    var s = viewSize();
+    W = s.w; H = s.h;
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    var sw = (window.screen && window.screen.width) ? Math.min(window.screen.width, window.screen.height) : 9999;
+    isPhone = sw < 700 || H > W * 1.15;
+    S = Math.min(W, H) || 1;
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+  }
+
+  // ---------- glyph generation ----------
+  // A glyph is a cursive-adjacent scribble: 3-7 quadratic segments sampled into a
+  // polyline, in local units where the glyph body height is 1 and y=0 is the
+  // baseline (negative y rises). It never resolves into a letter: segment ends
+  // wander freely and control points swing wide.
+  function genGlyph(rng) {
+    var segs = 3 + Math.floor(rng() * 5);          // 3..7
+    var w = 0.72 + rng() * 0.62;                   // width in height units
+    var temper = 0.55 + rng() * 0.6;               // per-glyph vertical temperament
+    var pts = [];
+    var x = 0, y = (rng() - 0.5) * 0.16;
+    pts.push([x, y]);
+    var step = w / segs;
+    for (var i = 0; i < segs; i++) {
+      var nx = x + step * (0.8 + rng() * 0.45);
+      // endpoint heights random-walk from the previous one (cursive flow,
+      // not independent zigzag) with rare ascender / descender jumps
+      var ny = y + (rng() - 0.5) * 1.05;
+      var r = rng();
+      if (r < 0.13) ny = -(0.55 + rng() * 0.5);        // ascender swing
+      else if (r < 0.21) ny = 0.5 + rng() * 0.4;       // descender dip
+      ny = clamp(ny * temper, -1.1, 1.0);
+      var cx = x + step * 0.5;
+      var cy = (y + ny) * 0.5 + (rng() - 0.5) * 0.6;
+      for (var s = 1; s <= 5; s++) {
+        var u = s / 5, iu = 1 - u;
+        pts.push([
+          iu * iu * x + 2 * iu * u * cx + u * u * nx,
+          iu * iu * y + 2 * iu * u * cy + u * u * ny
+        ]);
+      }
+      x = nx; y = ny;
+      if (rng() < 0.16) {                              // a closed loop, like a hasty "e"
+        var lcx = x, lcy = y - 0.16, lr = step * (0.30 + rng() * 0.2);
+        for (var k = 1; k <= 8; k++) {
+          var la = (k / 8) * Math.PI * 2;
+          pts.push([lcx + Math.cos(la) * lr, lcy + Math.sin(la) * lr * 1.25]);
+        }
+      }
+    }
+    var strokes = [pts];
+    if (rng() < 0.30) {                              // a stray flick or dot-stroke
+      var fx = rng() * w, fy = -(0.35 + rng() * 0.5);
+      var f = [];
+      for (var k = 0; k <= 4; k++) {
+        f.push([fx + k * 0.055, fy + Math.sin(k * 1.2) * 0.06 - k * 0.012]);
+      }
+      strokes.push(f);
+    }
+    // chalk passes: pre-seeded jitter offsets so every frame replays identically
+    var passes = [];
+    for (var p = 0; p < 3; p++) {
+      passes.push([(rng() - 0.5) * 0.10, (rng() - 0.5) * 0.10]);
+    }
+    return { strokes: strokes, w: w, passes: passes };
+  }
+
+  // ---------- field ----------
+  // Clusters are lines of glyphs grouped into loose "pages" so the field reads
+  // as handwriting on sheets, never as scattered stars. Three depth layers.
+  var LAYERS = [
+    { par: 0.30, gh: 0.021, alpha: 0.34, pages: 5, lines: 3 },
+    { par: 0.60, gh: 0.036, alpha: 0.55, pages: 4, lines: 3 },
+    { par: 1.00, gh: 0.060, alpha: 0.85, pages: 3, lines: 2 }
+  ];
+
+  var clusters = [];   // {layer, bx, by, ang, ghF, glyphs:[{g, dx}], wF, bobPh, tremDir}
+  var epoch = 0;
+
+  function inSparseZone(x, y) {
+    var dx = (x - 0.36) / 0.30, dy = (y - 0.50) / 0.32;
+    return dx * dx + dy * dy < 1;
+  }
+
+  function genField() {
+    var rng = mulberry32(861022 + epoch * 7919);
+    clusters = [];
+    var gs = isPhone ? 1.18 : 1.0;
+    for (var li = 0; li < LAYERS.length; li++) {
+      var L = LAYERS[li];
+      var anchors = [];
+      for (var pg = 0; pg < L.pages; pg++) {
+        // rejection-sampled anchor: pages in one layer keep their distance,
+        // so a layer reads as separate sheets instead of one stacked pile
+        var ax = 0, ay = 0, bestD = -1;
+        for (var tries = 0; tries < 10; tries++) {
+          var tx = 0.04 + rng() * 0.84, ty = 0.05 + rng() * 0.74;
+          var md = 99;
+          for (var ai = 0; ai < anchors.length; ai++) {
+            var ddx = tx - anchors[ai][0], ddy = ty - anchors[ai][1];
+            var dd = Math.sqrt(ddx * ddx + ddy * ddy);
+            if (dd < md) md = dd;
+          }
+          if (md > bestD) { bestD = md; ax = tx; ay = ty; }
+          if (md > 0.27) break;
+        }
+        anchors.push([ax, ay]);
+        var pageAng = (rng() - 0.5) * 0.10;
+        var lines = L.lines + (rng() < 0.4 ? 1 : 0);
+        for (var ln = 0; ln < lines; ln++) {
+          var bx = ax + (rng() - 0.5) * 0.03;
+          var by = ay + ln * L.gh * 2.6 * (H ? (S / H) : 1);
+          if (inSparseZone(bx, by) && rng() < 0.75) continue;   // center-left stays sparse
+          var n = 3 + Math.floor(rng() * 5);                    // glyphs per line: 3..7
+          var glyphs = [];
+          var cursor = 0;
+          for (var gi = 0; gi < n; gi++) {
+            var g = genGlyph(rng);
+            glyphs.push({ g: g, dx: cursor });
+            cursor += g.w + 0.16 + rng() * 0.22;
+          }
+          clusters.push({
+            layer: li, par: L.par, alpha: L.alpha,
+            bx: bx, by: by,
+            ang: pageAng + (rng() - 0.5) * 0.05,
+            ghF: L.gh * gs * (0.88 + rng() * 0.28),             // glyph height, fraction of S
+            glyphs: glyphs,
+            wU: cursor,                                          // width in height units
+            bobPh: rng() * Math.PI * 2,
+            tremA: rng() * Math.PI * 2
+          });
+        }
+      }
+    }
+  }
+
+  // ---------- interaction state (recorded events; draw is a closed form of them) ----------
+  var dragSegs = [];   // {t0, t1, off0x, off0y, sx, sy, pts:[{t,dx,dy}]}  dx,dy in W/H fractions from seg start
+  var taps = [];       // {t, x, y}  normalized
+  var drips = [];      // {t0, x, y} px at spawn; closed-form fall
+  var grits = [];      // {t0, x, y, vx, vy} px, px/s; closed-form
+  var liveRng = mulberry32(424243);
+  var pointer = { down: false, x: 0, y: 0, nx: 0, ny: 0 };
+  var downInfo = null; // {t, x, y, moved}
+  var lastTap = null;  // {t, x, y}
+  var speedSm = 0;     // smoothed flight speed, px/s (audio + drip spawning only)
+
+  function offsetAt(t) {
+    // cumulative flight offset (W/H fractions): direct follow during a drag,
+    // exponential settle after release. Pure function of the recorded segments.
+    var ox = 0, oy = 0;
+    for (var i = 0; i < dragSegs.length; i++) {
+      var sg = dragSegs[i];
+      if (t < sg.t0) break;
+      if (sg.t1 === null || t <= sg.t1) {
+        var dx = 0, dy = 0;
+        for (var j = 0; j < sg.pts.length; j++) {
+          if (sg.pts[j].t <= t) { dx = sg.pts[j].dx; dy = sg.pts[j].dy; }
+          else break;
+        }
+        return { x: sg.off0x + dx, y: sg.off0y + dy };
+      }
+      var last = sg.pts[sg.pts.length - 1];
+      var ex = sg.off0x + (last ? last.dx : 0);
+      var ey = sg.off0y + (last ? last.dy : 0);
+      var dec = Math.exp(-(t - sg.t1) / 3.0);
+      ox = ex * dec; oy = ey * dec;
+      // a later segment's off0 already contains this value at its t0; keep scanning
+      if (i === dragSegs.length - 1) return { x: ox, y: oy };
+    }
+    return { x: ox, y: oy };
+  }
+
+  function nowS() { return performance.now() / 1000 - T0; }
+  var T0 = 0;
+
+  function clusterPos(c, t, off) {
+    var driftX = -(0.0035 + 0.005 * c.par) * t;
+    var fx = c.bx + driftX + off.x * c.par;
+    var fy = c.by + off.y * c.par + Math.sin(t * 0.11 + c.bobPh) * 0.0022;
+    var wx = ((fx + 0.3) % 1.6 + 1.6) % 1.6 - 0.3;
+    var wy = ((fy + 0.2) % 1.4 + 1.4) % 1.4 - 0.2;
+    return { x: wx * W, y: wy * H, fx: wx, fy: wy };
+  }
+
+  function trembleFor(c, cx, cy, t) {
+    var ox = 0, oy = 0;
+    var start = Math.max(0, taps.length - 4);
+    for (var i = start; i < taps.length; i++) {
+      var tp = taps[i];
+      var age = t - tp.t;
+      if (age < 0 || age > 1.2) continue;
+      var d = Math.sqrt((cx - tp.x * W) * (cx - tp.x * W) + (cy - tp.y * H) * (cy - tp.y * H));
+      var R = 0.24 * S;
+      if (d >= R) continue;
+      var amp = 0.006 * S * (1 - d / R) * Math.exp(-age * 3.0) * Math.sin(age * 38);
+      ox += Math.cos(c.tremA) * amp;
+      oy += Math.sin(c.tremA) * amp;
+    }
+    return { x: ox, y: oy };
+  }
+
+  // ---------- drawing ----------
+  function strokePath(pts, gh, ox, oy, cosA, sinA) {
+    ctx.beginPath();
+    for (var i = 0; i < pts.length; i++) {
+      var lx = pts[i][0] * gh, ly = pts[i][1] * gh;
+      var px = ox + lx * cosA - ly * sinA;
+      var py = oy + lx * sinA + ly * cosA;
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.stroke();
+  }
+
+  function drawCluster(c, t, off) {
+    var pos = clusterPos(c, t, off);
+    var gh = c.ghF * S;
+    var tr = trembleFor(c, pos.x, pos.y, t);
+    var ox = pos.x + tr.x, oy = pos.y + tr.y;
+    var cosA = Math.cos(c.ang), sinA = Math.sin(c.ang);
+    ctx.strokeStyle = CHALK;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    for (var gi = 0; gi < c.glyphs.length; gi++) {
+      var item = c.glyphs[gi], g = item.g;
+      var gx = ox + item.dx * gh * cosA, gy = oy + item.dx * gh * sinA;
+      for (var p = 0; p < g.passes.length; p++) {
+        var po = g.passes[p];
+        var jx = gx + po[0] * gh, jy = gy + po[1] * gh;
+        // wide dust pass, then the body passes: chalk is built from weak strokes
+        ctx.globalAlpha = c.alpha * (p === 0 ? 0.10 : 0.15 + p * 0.11);
+        ctx.lineWidth = Math.max(0.6, gh * (p === 0 ? 0.30 : 0.085 + p * 0.03));
+        for (var si = 0; si < g.strokes.length; si++) {
+          strokePath(g.strokes[si], gh, jx, jy, cosA, sinA);
+        }
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawParticles(t) {
+    var i, a;
+    // drips: chalk tears that fall and fade
+    ctx.strokeStyle = DRIP;
+    ctx.lineCap = 'round';
+    for (i = 0; i < drips.length; i++) {
+      var d = drips[i];
+      a = t - d.t0;
+      if (a < 0 || a > 1.7) continue;
+      var fall = 0.5 * 0.55 * S * a * a;
+      var len = Math.min(0.035 * S, 3 + a * 0.045 * S);
+      ctx.globalAlpha = 0.75 * (1 - a / 1.7);
+      ctx.lineWidth = Math.max(1, S * 0.0022);
+      ctx.beginPath();
+      ctx.moveTo(d.x, d.y + fall);
+      ctx.lineTo(d.x, d.y + fall + len);
+      ctx.stroke();
+    }
+    // grit: tiny dots burst on a pressure wave
+    ctx.fillStyle = CHALK;
+    for (i = 0; i < grits.length; i++) {
+      var q = grits[i];
+      a = t - q.t0;
+      if (a < 0 || a > 0.95) continue;
+      var px = q.x + q.vx * a;
+      var py = q.y + q.vy * a + 0.5 * 0.18 * S * a * a;
+      ctx.globalAlpha = 0.8 * (1 - a / 0.95);
+      ctx.fillRect(px, py, Math.max(1, S * 0.0024), Math.max(1, S * 0.0024));
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = BG;
+    ctx.fillRect(0, 0, W, H);
+    // flat deep wash behind the field: one offset sheet of shadow blue, no gradient
+    ctx.fillStyle = DEEP;
+    ctx.fillRect(-0.05 * W, 0.045 * H, 1.03 * W, 0.88 * H);
+    var off = offsetAt(t);
+    for (var li = 0; li < LAYERS.length; li++) {
+      for (var ci = 0; ci < clusters.length; ci++) {
+        if (clusters[ci].layer === li) drawCluster(clusters[ci], t, off);
+      }
+    }
+    drawParticles(t);
+  }
+
+  // ---------- audio (lazy, guarded; noise only, no tones) ----------
+  var AC = null, noiseGain = null, noiseFilter = null, audioOK = false;
+  function ensureAudio() {
+    if (audioOK) return;
+    audioOK = true;   // try once
+    try {
+      var Ctor = window.AudioContext || window.webkitAudioContext;
+      if (!Ctor) return;
+      AC = new Ctor();
+      var len = 2 * AC.sampleRate;
+      var buf = AC.createBuffer(1, len, AC.sampleRate);
+      var data = buf.getChannelData(0);
+      var r = mulberry32(99173);
+      for (var i = 0; i < len; i++) data[i] = r() * 2 - 1;
+      var src = AC.createBufferSource();
+      src.buffer = buf; src.loop = true;
+      noiseFilter = AC.createBiquadFilter();
+      noiseFilter.type = 'lowpass';
+      noiseFilter.frequency.value = 320;
+      noiseGain = AC.createGain();
+      noiseGain.gain.value = 0.0;
+      src.connect(noiseFilter);
+      noiseFilter.connect(noiseGain);
+      noiseGain.connect(AC.destination);
+      src.start();
+    } catch (e) { AC = null; }
+  }
+
+  function scratchBurst() {
+    if (!AC) return;
+    try {
+      var dur = 0.28;
+      var src = AC.createBufferSource();
+      var len = Math.floor(dur * AC.sampleRate);
+      var buf = AC.createBuffer(1, len, AC.sampleRate);
+      var data = buf.getChannelData(0);
+      var r = mulberry32((Math.random() * 1e9) | 0);
+      for (var i = 0; i < len; i++) data[i] = (r() * 2 - 1) * (1 - i / len);
+      src.buffer = buf;
+      var bp = AC.createBiquadFilter();
+      bp.type = 'bandpass'; bp.frequency.value = 1900; bp.Q.value = 0.8;
+      var g = AC.createGain();
+      g.gain.value = 0.14;
+      src.connect(bp); bp.connect(g); g.connect(AC.destination);
+      src.start();
+    } catch (e) { /* audio is decorative; stay silent */ }
+  }
+
+  // ---------- pointer ----------
+  function normPos(e) {
+    var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    var x = (e.clientX - r.left), y = (e.clientY - r.top);
+    return { x: x, y: y, nx: W ? x / W : 0, ny: H ? y / H : 0 };
+  }
+
+  function onDown(e) {
+    ensureAudio();
+    if (AC && AC.resume) { try { AC.resume(); } catch (err) {} }
+    var p = normPos(e);
+    pointer.down = true; pointer.x = p.x; pointer.y = p.y; pointer.nx = p.nx; pointer.ny = p.ny;
+    downInfo = { t: nowS(), x: p.x, y: p.y, moved: 0 };
+    var off = offsetAt(nowS());
+    dragSegs.push({ t0: nowS(), t1: null, off0x: off.x, off0y: off.y, sx: p.nx, sy: p.ny, pts: [{ t: nowS(), dx: 0, dy: 0 }] });
+    if (dragSegs.length > 24) dragSegs.splice(0, dragSegs.length - 24);
+  }
+
+  function onMove(e) {
+    if (!pointer.down) return;
+    var p = normPos(e);
+    if (downInfo) {
+      downInfo.moved += Math.abs(p.x - pointer.x) + Math.abs(p.y - pointer.y);
+    }
+    pointer.x = p.x; pointer.y = p.y; pointer.nx = p.nx; pointer.ny = p.ny;
+    var sg = dragSegs[dragSegs.length - 1];
+    if (sg && sg.t1 === null) {
+      sg.pts.push({ t: nowS(), dx: p.nx - sg.sx, dy: p.ny - sg.sy });
+      if (sg.pts.length > 400) sg.pts.splice(1, sg.pts.length - 400);
+    }
+  }
+
+  function onUp(e) {
+    if (!pointer.down) return;
+    pointer.down = false;
+    var sg = dragSegs[dragSegs.length - 1];
+    if (sg && sg.t1 === null) sg.t1 = nowS();
+    var p = normPos(e);
+    var t = nowS();
+    var isTap = downInfo && (t - downInfo.t) < 0.35 && downInfo.moved < 0.012 * S;
+    downInfo = null;
+    if (!isTap) return;
+    // double-tap: reseed the field
+    if (lastTap && (t - lastTap.t) < 0.32 && Math.abs(p.x - lastTap.x) < 0.06 * S && Math.abs(p.y - lastTap.y) < 0.06 * S) {
+      epoch++;
+      genField();
+      drips.length = 0; grits.length = 0; taps.length = 0;
+      lastTap = null;
+      draw(t);
+      return;
+    }
+    lastTap = { t: t, x: p.x, y: p.y };
+    // pressure wave: tremble + grit burst
+    taps.push({ t: t, x: p.nx, y: p.ny });
+    if (taps.length > 12) taps.splice(0, taps.length - 12);
+    var n = 14 + Math.floor(liveRng() * 9);
+    for (var i = 0; i < n; i++) {
+      var a = liveRng() * Math.PI * 2;
+      var sp = (0.03 + liveRng() * 0.16) * S;
+      grits.push({ t0: t, x: p.x, y: p.y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 0.03 * S });
+    }
+    if (grits.length > 260) grits.splice(0, grits.length - 260);
+    scratchBurst();
+  }
+
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', function () {
+      pointer.down = false;
+      var sg = dragSegs[dragSegs.length - 1];
+      if (sg && sg.t1 === null) sg.t1 = nowS();
+    });
+  }
+
+  // ---------- drips from fast flight ----------
+  function maybeDrips(t) {
+    if (!pointer.down || speedSm < 0.85 * S) return;
+    var spawned = 0;
+    for (var i = 0; i < clusters.length && spawned < 2; i++) {
+      var c = clusters[i];
+      var pos = clusterPos(c, t, offsetAt(t));
+      var dx = pos.x - pointer.x, dy = pos.y - pointer.y;
+      if (dx * dx + dy * dy > (0.20 * S) * (0.20 * S)) continue;
+      if (liveRng() < 0.45) continue;
+      var gi = Math.floor(liveRng() * c.glyphs.length);
+      var item = c.glyphs[gi];
+      var gh = c.ghF * S;
+      var lx = (item.dx + liveRng() * item.g.w) * gh;
+      drips.push({ t0: t, x: pos.x + lx, y: pos.y + (liveRng() - 0.3) * gh });
+      spawned++;
+    }
+    if (drips.length > 240) drips.splice(0, drips.length - 240);
+  }
+
+  // ---------- run ----------
+  T0 = performance.now() / 1000;
+  layout();
+  genField();
+  draw(0);
+
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { layout(); draw(nowS()); });
+  }
+  window.addEventListener('resize', function () { layout(); draw(nowS()); });
+
+  if (typeof requestAnimationFrame === 'function') {
+    var last = performance.now() / 1000;
+    var prevOff = offsetAt(0);
+    var frame = function () {
+      var now = performance.now() / 1000;
+      var t = now - T0;
+      var dt = Math.min(now - last, 0.06);
+      last = now;
+      var off = offsetAt(t);
+      if (dt > 0) {
+        var sp = Math.sqrt((off.x * W - prevOff.x * W) * (off.x * W - prevOff.x * W) +
+                           (off.y * H - prevOff.y * H) * (off.y * H - prevOff.y * H)) / dt;
+        speedSm += (sp - speedSm) * 0.18;
+      }
+      prevOff = off;
+      maybeDrips(t);
+      if (AC && noiseGain && noiseFilter) {
+        try {
+          var sn = clamp(speedSm / (1.6 * S), 0, 1);
+          noiseFilter.frequency.setTargetAtTime(300 + sn * 2400, AC.currentTime, 0.08);
+          noiseGain.gain.setTargetAtTime(pointer.down ? 0.02 + sn * 0.075 : 0.012, AC.currentTime, 0.12);
+        } catch (e) {}
+      }
+      draw(t);
+      requestAnimationFrame(frame);
+    };
+    requestAnimationFrame(frame);
+  }
+})();
+</script>
+</body>
+</html>

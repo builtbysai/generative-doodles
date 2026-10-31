@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Silence Remembers</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #040405; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- utilities ----------
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+  function lerp(a, b, t) { return a + (b - a) * t; }
+  function mix3(c1, c2, t) {
+    return [Math.round(lerp(c1[0], c2[0], t)), Math.round(lerp(c1[1], c2[1], t)), Math.round(lerp(c1[2], c2[2], t))];
+  }
+  function rgba(c, a) { return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a.toFixed(3) + ')'; }
+
+  // ---------- palette (strict) ----------
+  var COL = {
+    bg:    [4, 4, 5],        // #040405
+    wire:  [138, 147, 160],  // #8A93A0
+    vert:  [216, 210, 196],  // #D8D2C4
+    glow:  [232, 160, 32],   // #E8A020
+    drift: [58, 64, 72],     // #3A4048
+    crim:  [176, 48, 48]     // #B03030
+  };
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0, DPR = 1;
+
+  function viewSize() {
+    var vv = (typeof window !== 'undefined') ? window.visualViewport : null;
+    var w = vv ? vv.width : window.innerWidth;
+    var h = vv ? vv.height : window.innerHeight;
+    return { w: w, h: h };
+  }
+  function isPhoneLayout(w, h) {
+    var sw = (window.screen && window.screen.width) || w;
+    var sh = (window.screen && window.screen.height) || h;
+    var minDim = Math.min(sw, sh);
+    if (minDim < 700) return true;
+    return h > w * 1.15;
+  }
+  function resize() {
+    var s = viewSize();
+    W = s.w; H = s.h;
+    DPR = window.devicePixelRatio || 1;
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+  }
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', resize);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // ---------- clock ----------
+  function nowStamp() {
+    if (typeof performance !== 'undefined' && performance.now) return performance.now();
+    return 0;
+  }
+  var epoch = nowStamp();
+  function elapsed() { return (nowStamp() - epoch) / 1000; }
+
+  // ---------- sustain model (closed form over recorded activity windows) ----------
+  // Pointer movement is coalesced into activity windows. Sustain S(t):
+  //   inside a window (and for GRACE seconds after it ends) S rises toward 1
+  //   with a per-window time constant (faster movement, faster rise);
+  //   outside windows S decays toward 0 with tau = 8 s.
+  // The load itself counts as a window at t = 0, so the tower begins held
+  // at S = 1 and only starts decaying after the standard 2 s of stillness.
+  var GRACE = 2.0, TAU_DECAY = 8.0;
+  var windows = [];
+  function initialWindow() { return { start: 0, end: 0, strength: 1, tauUp: 1.0 }; }
+  windows.push(initialWindow());
+
+  function sustainAt(t) {
+    var S = 1, cur = 0, i, w, end;
+    for (i = 0; i < windows.length; i++) {
+      w = windows[i];
+      if (w.start > t) break;
+      if (w.start > cur) {
+        S = S * Math.exp(-(Math.min(w.start, t) - cur) / TAU_DECAY);
+        cur = Math.min(w.start, t);
+        if (cur >= t) return S;
+      }
+      end = Math.min(w.end + GRACE, t);
+      if (end > cur) {
+        S = 1 - (1 - S) * Math.exp(-(end - cur) / w.tauUp);
+        cur = end;
+        if (cur >= t) return S;
+      }
+    }
+    if (t > cur) S = S * Math.exp(-(t - cur) / TAU_DECAY);
+    return S;
+  }
+  // Instantaneous hum: strength of recent movement, fast decay. Audio only.
+  function humAt(t) {
+    var best = 0, i, w, age, v;
+    for (i = 0; i < windows.length; i++) {
+      w = windows[i];
+      if (w.start > t) break;
+      age = Math.max(0, t - w.end);
+      v = w.strength * Math.exp(-age / 0.45);
+      if (v > best) best = v;
+    }
+    return best;
+  }
+
+  // ---------- tower generation ----------
+  var LEVELS = 18, PER = 15;
+  var NV = LEVELS * PER;
+  var hx = new Float32Array(NV);    // horizontal home, -1..1 (cos * radius)
+  var hyN = new Float32Array(NV);   // vertical home, 0..1 up the tower
+  var dep = new Float32Array(NV);   // depth home, -1..1 (sin * radius)
+  var dvx = new Float32Array(NV);   // drift vector, fractions of min(W,H)
+  var dvy = new Float32Array(NV);
+  var tauDrift = new Float32Array(NV);
+  var tauReturn = new Float32Array(NV);
+  var pulseFall = new Float32Array(NV);
+  var driftAmt = new Float32Array(NV);
+  var edges = [];
+  var keystone = 0;
+
+  function buildTower(seed) {
+    var rng = mulberry32(seed);
+    var phase = rng() * Math.PI * 2;
+    var twist = (rng() - 0.5) * 0.22;
+    var i, k, idx, ang, rad, prof, ny;
+    var bestScore = -2;
+    for (k = 0; k < LEVELS; k++) {
+      ny = k / (LEVELS - 1);
+      prof = (1 - 0.38 * ny) * (1 + 0.16 * Math.sin(ny * 4.6 + phase)) * (0.72 + 0.28 * Math.sin(ny * Math.PI));
+      for (i = 0; i < PER; i++) {
+        idx = k * PER + i;
+        ang = k * twist + (i / PER) * Math.PI * 2 + (rng() - 0.5) * 0.10;
+        rad = prof * (1 + (rng() - 0.5) * 0.20);
+        hx[idx] = Math.cos(ang) * rad;
+        dep[idx] = Math.sin(ang) * rad;
+        hyN[idx] = clamp(ny + (rng() - 0.5) * 0.012, 0, 1);
+        var da = rng() * Math.PI * 2;
+        var dm = 0.03 + rng() * 0.11;
+        dvx[idx] = Math.cos(da) * dm;
+        dvy[idx] = Math.sin(da) * dm - 0.018; // slight downward bias, slow snow
+        tauDrift[idx] = 5 + rng() * 6;
+        tauReturn[idx] = 2.5 + rng() * 2.5;
+        if (k === LEVELS - 2) {
+          var score = dep[idx] - Math.abs(hx[idx]) * 0.4;
+          if (score > bestScore) { bestScore = score; keystone = idx; }
+        }
+      }
+    }
+    // keystone: drifts last, returns first
+    tauDrift[keystone] = 22;
+    tauReturn[keystone] = 0.7;
+    dvx[keystone] *= 0.6; dvy[keystone] *= 0.6;
+    // pulse falloff by home distance to the keystone
+    for (i = 0; i < NV; i++) {
+      var dx = hx[i] - hx[keystone];
+      var dy = (hyN[i] - hyN[keystone]) * 1.6;
+      var d = Math.sqrt(dx * dx + dy * dy);
+      var f = clamp(1 - d / 0.55, 0, 1);
+      pulseFall[i] = f * f;
+    }
+    // edges: ring neighbours, verticals, diagonals
+    edges = [];
+    for (k = 0; k < LEVELS; k++) {
+      for (i = 0; i < PER; i++) {
+        var a = k * PER + i;
+        var b = k * PER + ((i + 1) % PER);
+        edges.push(a, b);
+        if (k < LEVELS - 1) {
+          edges.push(a, a + PER);
+          edges.push(a, (k + 1) * PER + ((i + 1) % PER));
+        }
+      }
+    }
+    driftAmt = new Float32Array(NV);
+  }
+
+  // ---------- physics: light fixed-timestep lag integration ----------
+  // Frame one is exact (all drift amounts are 0 and sustain is 1 at t = 0).
+  // After that, each vertex's drift amount follows the dissolution target
+  // (1 - sustain) through a first-order lag with asymmetric time constants:
+  // slow to drift away, quicker to return; the keystone lags most on the
+  // way out and least on the way back.
+  var simLast = 0;
+  var pulseT = -1;
+  function stepPhysics(dt, tAbs) {
+    var S = sustainAt(tAbs);
+    var target = 1 - S;
+    var pulseAge = (pulseT >= 0) ? (tAbs - pulseT) : 99;
+    var pulseEnv = (pulseAge < 3) ? Math.exp(-pulseAge / 0.6) : 0;
+    var i, d, tg, tau;
+    for (i = 0; i < NV; i++) {
+      tg = target;
+      if (pulseEnv > 0 && pulseFall[i] > 0) tg = target * (1 - pulseFall[i] * pulseEnv);
+      d = driftAmt[i];
+      tau = (tg > d) ? tauDrift[i] : tauReturn[i];
+      driftAmt[i] = d + (tg - d) * (1 - Math.exp(-dt / tau));
+    }
+  }
+  function simulateTo(t) {
+    var STEP = 1 / 30;
+    var guard = 0;
+    while (simLast < t && guard < 4000) {
+      var dt = Math.min(STEP, t - simLast);
+      simLast += dt;
+      stepPhysics(dt, simLast);
+      guard++;
+    }
+  }
+
+  // ---------- audio (lazy, gesture-gated, guarded) ----------
+  var AC = null, aFilter = null, aDroneGain = null, aNoiseGain = null;
+  function ensureAudio() {
+    if (AC) { if (AC.resume) AC.resume(); return; }
+    var Ctor = null;
+    if (typeof AudioContext !== 'undefined') Ctor = AudioContext;
+    else if (typeof webkitAudioContext !== 'undefined') Ctor = webkitAudioContext;
+    if (!Ctor) return;
+    try {
+      AC = new Ctor();
+      var master = AC.createGain(); master.gain.value = 0.9; master.connect(AC.destination);
+      aFilter = AC.createBiquadFilter(); aFilter.type = 'lowpass'; aFilter.frequency.value = 160; aFilter.Q.value = 0.4;
+      aDroneGain = AC.createGain(); aDroneGain.gain.value = 0;
+      aFilter.connect(aDroneGain); aDroneGain.connect(master);
+      var freqs = [54, 54 * 1.007, 81.3];
+      for (var i = 0; i < freqs.length; i++) {
+        var o = AC.createOscillator(); o.type = 'triangle'; o.frequency.value = freqs[i];
+        var g = AC.createGain(); g.gain.value = i === 2 ? 0.35 : 0.6;
+        o.connect(g); g.connect(aFilter); o.start();
+      }
+      var len = AC.sampleRate * 2;
+      var buf = AC.createBuffer(1, len, AC.sampleRate);
+      var data = buf.getChannelData(0);
+      var r = mulberry32(863);
+      for (var j = 0; j < len; j++) data[j] = r() * 2 - 1;
+      var noise = AC.createBufferSource(); noise.buffer = buf; noise.loop = true;
+      var bp = AC.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 420; bp.Q.value = 0.6;
+      aNoiseGain = AC.createGain(); aNoiseGain.gain.value = 0;
+      noise.connect(bp); bp.connect(aNoiseGain); aNoiseGain.connect(master);
+      noise.start();
+    } catch (e) { AC = null; }
+  }
+  function updateAudio(t) {
+    if (!AC || !aFilter) return;
+    var S = sustainAt(t);
+    var hum = humAt(t);
+    var ct = AC.currentTime;
+    aFilter.frequency.setTargetAtTime(140 + 760 * hum, ct, 0.08);
+    aDroneGain.gain.setTargetAtTime(0.13 * S * (0.35 + 0.65 * hum), ct, 0.1);
+    aNoiseGain.gain.setTargetAtTime(0.06 * (1 - S) * Math.min(1, S * 6), ct, 0.15);
+  }
+
+  // ---------- input ----------
+  var lastSample = null;   // {t, x, y}
+  var downInfo = null;     // {t, x, y}
+  var lastTapT = -10;
+  var reseedCount = 0;
+
+  function recordMove(t, x, y) {
+    if (lastSample) {
+      var dt = t - lastSample.t;
+      var dx = x - lastSample.x, dy = y - lastSample.y;
+      var dist = Math.sqrt(dx * dx + dy * dy);
+      if (dt > 0.005 && dist > 2) {
+        var speed = dist / dt; // px per second
+        var norm = speed / (0.9 * Math.min(W, H));
+        var strength = clamp(norm / 1.8, 0, 1);
+        var last = windows[windows.length - 1];
+        if (last && t - last.end < 0.3 && last.start > 0) {
+          last.end = t;
+          if (strength > last.strength) { last.strength = strength; last.tauUp = 1.7 - 1.15 * strength; }
+        } else {
+          windows.push({ start: t, end: t, strength: strength, tauUp: 1.7 - 1.15 * strength });
+          if (windows.length > 600) windows.splice(1, windows.length - 600);
+        }
+      }
+    }
+    lastSample = { t: t, x: x, y: y };
+  }
+  function reseed(t) {
+    reseedCount++;
+    buildTower(863000 + reseedCount * 104729);
+    windows = [initialWindow()];
+    pulseT = -1;
+    lastTapT = -10;
+    lastSample = null;
+    simLast = 0;
+    epoch = nowStamp();
+  }
+  function onDown(e) {
+    ensureAudio();
+    var t = elapsed();
+    downInfo = { t: t, x: e.clientX, y: e.clientY };
+    lastSample = { t: t, x: e.clientX, y: e.clientY };
+  }
+  function onMove(e) {
+    recordMove(elapsed(), e.clientX, e.clientY);
+  }
+  function onUp(e) {
+    var t = elapsed();
+    if (downInfo) {
+      var dx = e.clientX - downInfo.x, dy = e.clientY - downInfo.y;
+      var dist = Math.sqrt(dx * dx + dy * dy);
+      if (t - downInfo.t < 0.3 && dist < 12) {
+        if (t - lastTapT < 0.35) { reseed(t); }
+        else { pulseT = t; lastTapT = t; }
+      }
+    }
+    downInfo = null;
+  }
+  canvas.addEventListener('pointerdown', onDown);
+  window.addEventListener('pointermove', onMove);
+  window.addEventListener('pointerup', onUp);
+
+  // ---------- draw ----------
+  var sx = new Float32Array(NV), sy = new Float32Array(NV);
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = rgba(COL.bg, 1);
+    ctx.fillRect(0, 0, W, H);
+
+    var phone = isPhoneLayout(W, H);
+    var u = Math.min(W, H);
+    var cx = W / 2;
+    var baseY = H * 0.88;
+    var towerH = H * 0.60;
+    var halfW = u * (phone ? 0.30 : 0.21);
+    var S = sustainAt(t);
+
+    var i, d;
+    for (i = 0; i < NV; i++) {
+      d = driftAmt[i];
+      sx[i] = cx + hx[i] * halfW + dvx[i] * u * d;
+      sy[i] = baseY - hyN[i] * towerH + dep[i] * 0.045 * u + dvy[i] * u * d;
+    }
+    // edges
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (i = 0; i < edges.length; i += 2) {
+      var a = edges[i], b = edges[i + 1];
+      var avgD = (driftAmt[a] + driftAmt[b]) * 0.5;
+      var front = ((dep[a] + dep[b]) * 0.5 + 1) * 0.5;
+      var col = mix3(mix3(COL.wire, COL.glow, S * 0.55), COL.drift, avgD);
+      ctx.strokeStyle = rgba(col, (0.16 + 0.62 * front) * (1 - 0.55 * avgD));
+      ctx.beginPath();
+      ctx.moveTo(sx[a], sy[a]);
+      ctx.lineTo(sx[b], sy[b]);
+      ctx.stroke();
+    }
+    // vertices
+    var vr = phone ? 2.0 : 1.6;
+    for (i = 0; i < NV; i++) {
+      d = driftAmt[i];
+      var fr = (dep[i] + 1) * 0.5;
+      var vc = mix3(COL.vert, COL.drift, d);
+      ctx.fillStyle = rgba(vc, 0.95 * (1 - 0.45 * d) * (0.45 + 0.55 * fr));
+      ctx.beginPath();
+      ctx.arc(sx[i], sy[i], vr, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    // keystone
+    var pulseAge = (pulseT >= 0) ? (t - pulseT) : 99;
+    var penv = (pulseAge < 2.5) ? Math.exp(-pulseAge / 0.6) : 0;
+    ctx.fillStyle = rgba(COL.crim, 0.65 + 0.35 * penv);
+    ctx.beginPath();
+    ctx.arc(sx[keystone], sy[keystone], 3.4 + 1.6 * penv, 0, Math.PI * 2);
+    ctx.fill();
+    if (penv > 0.02) {
+      ctx.strokeStyle = rgba(COL.crim, penv * 0.8);
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      ctx.arc(sx[keystone], sy[keystone], 5 + 16 * (1 - penv), 0, Math.PI * 2);
+      ctx.stroke();
+    }
+  }
+
+  // ---------- boot ----------
+  buildTower(863000);
+  // QA hook: the headless renderer may pass ?seed=<seconds> to view a later
+  // state (for example deep dissolution). Inert in normal viewing.
+  var bootT = 0;
+  try {
+    var m = /[?&]seed=([0-9.]+)/.exec((typeof location !== 'undefined' && location.search) || '');
+    if (m) bootT = parseFloat(m[1]);
+  } catch (e) { bootT = 0; }
+  simulateTo(bootT);
+  draw(bootT);
+
+  if (typeof requestAnimationFrame === 'function' && bootT === 0) {
+    var loop = function () {
+      var t = elapsed();
+      simulateTo(t);
+      draw(t);
+      updateAudio(t);
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>

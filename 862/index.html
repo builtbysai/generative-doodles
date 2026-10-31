@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Folded From Pixels</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #04060A; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- Palette (strict) ----------
+  var NIGHT = '#04060A';
+  var BODY  = '#0E141C';
+  var CREASE = '#4DD8C8';
+  var GOLD  = '#C9962E';
+  var MOON  = '#D8DCE2';
+
+  // ---------- Seeded RNG (mulberry32) ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  var W = 0, H = 0, U = 0; // U = min dimension unit
+  var isPhone = false;
+
+  function detectPhone(w, h) {
+    var sw = (window.screen && window.screen.width) || w;
+    var sh = (window.screen && window.screen.height) || h;
+    if (Math.min(sw, sh) < 700) return true;
+    return h > w * 1.15;
+  }
+
+  function resize() {
+    var vv = window.visualViewport;
+    var w = vv ? vv.width : window.innerWidth;
+    var h = vv ? vv.height : window.innerHeight;
+    W = w; H = h; U = Math.min(w, h);
+    canvas.width = w; canvas.height = h;
+    isPhone = detectPhone(w, h);
+  }
+
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { resize(); draw(simT); });
+  }
+  window.addEventListener('resize', function () { resize(); draw(simT); });
+
+  // ---------- Flock state ----------
+  var BASE_SEED = 862105;
+  var flock = [];        // crane objects
+  var epoch = 0;         // increments on reseed
+  var simT = 0;          // simulation clock (seconds), fixed-step driven
+  var pulseCount = 0;    // fold-pulses already fired in this epoch
+  var pulsePerm = [];    // seeded order in which the pulse visits cranes
+  var gust = null;       // {x, y, t} active/recent drag gust
+
+  var FLOCK_N = 60;
+  var MAX_CRANES = 120;
+  var PULSE_FIRST = 14;      // first fold-pulse at t=14s
+  var PULSE_PERIOD = 40;     // then every ~40s
+  var PULSE_STEP = 0.085;    // delay per crane as the pulse travels
+  var PULSE_DUR = 2.4;       // fold + unfold duration per crane
+
+  function makeCrane(rng, x, y, vx, vy, born) {
+    return {
+      x: x, y: y, vx: vx, vy: vy,
+      heading: Math.atan2(vy, vx),
+      flapPhase: rng() * Math.PI * 2,
+      flapRate: 1.5 + rng() * 0.7,
+      scale: 0.75 + rng() * 0.55,
+      gold: false,
+      born: born,
+      seedJitter: rng() * 1000
+    };
+  }
+
+  function seedFlock(seed) {
+    var rng = mulberry32(seed);
+    flock = [];
+    pulsePerm = [];
+    pulseCount = 0;
+    // Coherent turning flock: an arc of cranes mid-bank in the middle band,
+    // headings tangent to a gentle left turn so frame one reads as one body banking.
+    var cx = W * 0.44, cy = H * 0.46;
+    var turnR = U * 0.30;
+    var baseA = -0.5; // arc center angle
+    for (var i = 0; i < FLOCK_N; i++) {
+      var a = baseA + (rng() - 0.5) * 1.9;
+      var r = turnR * (0.45 + rng() * 1.05);
+      var x = cx + Math.cos(a) * r + (rng() - 0.5) * U * 0.09;
+      var y = cy + Math.sin(a) * r * 0.66 + (rng() - 0.5) * U * 0.09;
+      x = Math.max(U * 0.08, Math.min(W - U * 0.08, x));
+      y = Math.max(U * 0.08, Math.min(H * 0.68, y));
+      // tangent velocity for a counterclockwise bank, plus jitter
+      var sp = U * (0.055 + rng() * 0.03);
+      var ta = a - Math.PI / 2 + (rng() - 0.5) * 0.35;
+      var vx = Math.cos(ta) * sp, vy = Math.sin(ta) * sp;
+      var c = makeCrane(rng, x, y, vx, vy, -10);
+      c.gold = (i % 20 === 7); // about one in twenty carries a gold wing-tip
+      flock.push(c);
+      pulsePerm.push(i);
+    }
+    // Seeded shuffle of the pulse visiting order
+    for (var j = pulsePerm.length - 1; j > 0; j--) {
+      var k = Math.floor(rng() * (j + 1));
+      var tmp = pulsePerm[j]; pulsePerm[j] = pulsePerm[k]; pulsePerm[k] = tmp;
+    }
+  }
+
+  // Shared banking target: closed-form wander in sim time, middle band only.
+  function targetAt(t) {
+    return {
+      x: W * (0.5 + 0.26 * Math.sin(t * 0.11) + 0.08 * Math.sin(t * 0.043 + 1.7)),
+      y: H * (0.44 + 0.10 * Math.sin(t * 0.083 + 0.6) + 0.04 * Math.sin(t * 0.19))
+    };
+  }
+
+  // ---------- Fold model ----------
+  // fold f in [0,1]: 0 = wings spread in flight, 1 = folded flat against the body.
+  function foldOf(c, idx, t) {
+    var f = 0;
+    // Birth fold: a released crane unfolds into being over 1.4 s
+    if (c.born > -5) {
+      var ba = (t - c.born) / 1.4;
+      if (ba < 1) {
+        var s = ba < 0 ? 0 : ba;
+        f = Math.max(f, 1 - (s * s * (3 - 2 * s)));
+      }
+    }
+    // Fold-pulse: ripples through the flock in seeded order
+    var k = Math.floor((t - PULSE_FIRST) / PULSE_PERIOD);
+    if (k >= 0) {
+      var start = PULSE_FIRST + k * PULSE_PERIOD;
+      var rank = pulsePerm.indexOf(idx);
+      var local = t - start - rank * PULSE_STEP;
+      if (local > 0 && local < PULSE_DUR) {
+        var u = local / PULSE_DUR;
+        var bump = Math.sin(Math.PI * u);
+        f = Math.max(f, bump * bump * 0.97);
+      }
+    }
+    return f;
+  }
+
+  function pulseActiveAt(t) {
+    return t >= PULSE_FIRST && Math.floor((t - PULSE_FIRST) / PULSE_PERIOD) >= 0 &&
+      (t - PULSE_FIRST) % PULSE_PERIOD < flock.length * PULSE_STEP + PULSE_DUR;
+  }
+
+  // ---------- Simulation (fixed timestep) ----------
+  var DT = 1 / 60;
+  var turnRateSmooth = 0;
+
+  function step(dt, t) {
+    var tgt = targetAt(t);
+    var n = flock.length;
+    // centroid + mean heading
+    var cx = 0, cy = 0, shx = 0, shy = 0;
+    for (var i = 0; i < n; i++) { cx += flock[i].x; cy += flock[i].y; shx += Math.cos(flock[i].heading); shy += Math.sin(flock[i].heading); }
+    cx /= n; cy /= n;
+    var meanH = Math.atan2(shy, shx);
+
+    for (i = 0; i < n; i++) {
+      var c = flock[i];
+      var ax = 0, ay = 0;
+      // cohesion / alignment / separation (boids-lite, neighbor sample)
+      var nx = 0, ny = 0, nvx = 0, nvy = 0, cnt = 0, sx = 0, sy = 0;
+      var R = U * 0.16, R2 = R * R;
+      for (var j = 0; j < n; j++) {
+        if (j === i) continue;
+        var o = flock[j];
+        var dx = o.x - c.x, dy = o.y - c.y;
+        var d2 = dx * dx + dy * dy;
+        if (d2 < R2) {
+          nx += o.x; ny += o.y; nvx += o.vx; nvy += o.vy; cnt++;
+          var d = Math.sqrt(d2) || 1;
+          var minD = U * 0.045;
+          if (d < minD) { var push = (minD - d) / minD; sx -= (dx / d) * push; sy -= (dy / d) * push; }
+        }
+      }
+      if (cnt > 0) {
+        ax += ((nx / cnt) - c.x) * 0.35;
+        ay += ((ny / cnt) - c.y) * 0.35;
+        ax += ((nvx / cnt) - c.vx) * 0.9;
+        ay += ((nvy / cnt) - c.vy) * 0.9;
+      }
+      ax += sx * U * 0.9; ay += sy * U * 0.9;
+      // shared target pull (the banking body)
+      ax += (tgt.x - c.x) * 0.55 + (cx - c.x) * 0.12;
+      ay += (tgt.y - c.y) * 0.55 + (cy - c.y) * 0.12;
+      // wind gust: flock bends around the drag path, then settles
+      if (gust) {
+        var gx = c.x - gust.x, gy = c.y - gust.y;
+        var gd = Math.sqrt(gx * gx + gy * gy) || 1;
+        var gr = U * 0.30;
+        if (gd < gr) {
+          var gf = (1 - gd / gr) * gust.strength;
+          ax += (gx / gd) * gf * U * 1.4;
+          ay += (gy / gd) * gf * U * 1.4 - gf * U * 0.25;
+        }
+      }
+      // soft bounds: steer back into the sky, keep the lower third mostly empty
+      var m = U * 0.10;
+      if (c.x < m) ax += (m - c.x) * 2.2;
+      if (c.x > W - m) ax -= (c.x - (W - m)) * 2.2;
+      if (c.y < m * 0.7) ay += (m * 0.7 - c.y) * 2.2;
+      if (c.y > H * 0.72) ay -= (c.y - H * 0.72) * 1.6;
+
+      c.vx += ax * dt; c.vy += ay * dt;
+      // speed clamp
+      var sp = Math.sqrt(c.vx * c.vx + c.vy * c.vy) || 1;
+      var minSp = U * 0.045, maxSp = U * 0.13;
+      var cl = sp < minSp ? minSp / sp : (sp > maxSp ? maxSp / sp : 1);
+      c.vx *= cl; c.vy *= cl;
+      var prevH = c.heading;
+      c.x += c.vx * dt; c.y += c.vy * dt;
+      c.heading = Math.atan2(c.vy, c.vx);
+      var dh = c.heading - prevH;
+      while (dh > Math.PI) dh -= Math.PI * 2;
+      while (dh < -Math.PI) dh += Math.PI * 2;
+      c.bank = dh / Math.max(dt, 0.001);
+      c.flapPhase += c.flapRate * dt * (1 + Math.min(Math.abs(c.bank), 1.5) * 0.6);
+    }
+    // flock turn rate (for the wing-rush audio + banking read)
+    var dhM = meanH - (step._pm === undefined ? meanH : step._pm);
+    while (dhM > Math.PI) dhM -= Math.PI * 2;
+    while (dhM < -Math.PI) dhM += Math.PI * 2;
+    step._pm = meanH;
+    turnRateSmooth += (Math.abs(dhM / dt) - turnRateSmooth) * 0.03;
+    if (gust && t > gust.until) gust = null;
+  }
+
+  // ---------- Drawing ----------
+  function poly(points, fill, stroke, lw) {
+    ctx.beginPath();
+    ctx.moveTo(points[0][0], points[0][1]);
+    for (var i = 1; i < points.length; i++) ctx.lineTo(points[i][0], points[i][1]);
+    ctx.closePath();
+    if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+    if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = lw; ctx.stroke(); }
+  }
+
+  function drawCrane(c, idx, t) {
+    var s = U * 0.00105 * c.scale * (isPhone ? 1.3 : 1);
+    var fold = foldOf(c, idx, t);
+    // wingbeat spread: wings project wide then narrow; fold overrides toward flat
+    var beat = 0.5 + 0.5 * Math.sin(c.flapPhase);
+    var spread = (0.22 + 0.78 * beat) * (1 - fold * 0.92);
+    var bank = Math.max(-0.6, Math.min(0.6, (c.bank || 0) * 0.35));
+    var nearLift = spread * (1 - bank * 0.45);
+    var farLift = spread * (1 + bank * 0.45);
+
+    ctx.save();
+    ctx.translate(c.x, c.y);
+    ctx.rotate(c.heading);
+    ctx.scale(s, s);
+
+    var lw = 1.1;
+    // far wing (behind body): broad triangle swept back from the body
+    poly([[6, 2], [-13, 1], [-17, 5 + 30 * farLift]], BODY, CREASE, lw);
+    // tail fan
+    poly([[-13, 0], [-26, -5], [-22, 0], [-26, 5]], BODY, CREASE, lw);
+    // near wing
+    poly([[6, -2], [-17, -5 - 30 * nearLift], [-13, -1]], BODY, CREASE, lw);
+    if (c.gold && nearLift > 0.35) {
+      poly([[-17, -5 - 30 * nearLift], [-10, -3.5 - 19 * nearLift], [-13, -1]], GOLD, null, 0);
+    }
+    // body diamond + center crease
+    poly([[-16, 0], [5, -3.2], [18, 0], [5, 3.2]], BODY, CREASE, lw);
+    // neck + head
+    poly([[13, -1.2], [25, -2.4], [28, -0.4], [15, 1]], BODY, CREASE, lw);
+    ctx.beginPath();
+    ctx.moveTo(-16, 0); ctx.lineTo(28, -0.4);
+    ctx.strokeStyle = CREASE; ctx.lineWidth = lw; ctx.stroke();
+    ctx.restore();
+  }
+
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.fillStyle = NIGHT;
+    ctx.fillRect(0, 0, W, H);
+    // moon: one flat disc, upper-right
+    ctx.beginPath();
+    ctx.arc(W * 0.83, H * 0.15, U * 0.045, 0, Math.PI * 2);
+    ctx.fillStyle = MOON;
+    ctx.fill();
+    for (var i = 0; i < flock.length; i++) drawCrane(flock[i], i, t);
+  }
+
+  // ---------- Audio (lazy, gesture-gated, guarded) ----------
+  var AC = null, noiseGain = null, noiseFilter = null, audioOn = false;
+  function ensureAudio() {
+    if (audioOn) return;
+    var Ctor = window.AudioContext || window.webkitAudioContext;
+    if (typeof Ctor !== 'function') return;
+    try {
+      AC = new Ctor();
+      var len = AC.sampleRate * 2;
+      var buf = AC.createBuffer(1, len, AC.sampleRate);
+      var d = buf.getChannelData(0);
+      var r = mulberry32(4242);
+      for (var i = 0; i < len; i++) d[i] = r() * 2 - 1;
+      var src = AC.createBufferSource();
+      src.buffer = buf; src.loop = true;
+      noiseFilter = AC.createBiquadFilter();
+      noiseFilter.type = 'bandpass'; noiseFilter.frequency.value = 600; noiseFilter.Q.value = 0.6;
+      noiseGain = AC.createGain(); noiseGain.gain.value = 0;
+      src.connect(noiseFilter); noiseFilter.connect(noiseGain); noiseGain.connect(AC.destination);
+      src.start();
+      audioOn = true;
+    } catch (e) { AC = null; }
+  }
+  function audioFrame() {
+    if (!audioOn || !AC) return;
+    var target = Math.min(0.16, 0.02 + turnRateSmooth * 0.10);
+    noiseGain.gain.setTargetAtTime(target, AC.currentTime, 0.25);
+    noiseFilter.frequency.setTargetAtTime(450 + turnRateSmooth * 500, AC.currentTime, 0.3);
+  }
+  function paperClick() {
+    if (!audioOn || !AC) return;
+    try {
+      var dur = 0.07, sr = AC.sampleRate;
+      var buf = AC.createBuffer(1, Math.floor(sr * dur), sr);
+      var d = buf.getChannelData(0);
+      var r = mulberry32(777);
+      for (var i = 0; i < d.length; i++) d[i] = (r() * 2 - 1) * (1 - i / d.length);
+      var src = AC.createBufferSource(); src.buffer = buf;
+      var f = AC.createBiquadFilter(); f.type = 'highpass'; f.frequency.value = 1800;
+      var g = AC.createGain(); g.gain.value = 0.12;
+      src.connect(f); f.connect(g); g.connect(AC.destination);
+      src.start();
+    } catch (e) {}
+  }
+
+  // ---------- Interaction ----------
+  var downAt = 0, downX = 0, downY = 0, dragging = false, pendingTap = null;
+
+  function toLocal(e) {
+    var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    return { x: (e.clientX || 0) - r.left, y: (e.clientY || 0) - r.top };
+  }
+
+  function doTap(x, y) {
+    if (flock.length >= MAX_CRANES) return;
+    var rng = mulberry32(BASE_SEED + epoch * 100003 + flock.length * 131 + ((simT * 60) | 0));
+    var tgt = targetAt(simT);
+    var vx = (tgt.x - x) * 0.35, vy = (tgt.y - y) * 0.35;
+    var sp = Math.sqrt(vx * vx + vy * vy) || 1;
+    var want = U * 0.07;
+    var c = makeCrane(rng, x, y, vx / sp * want, vy / sp * want, simT);
+    c.gold = (flock.length % 20 === 7);
+    flock.push(c);
+    // extend the pulse order with the new crane at a seeded position
+    var pos = Math.floor(rng() * (pulsePerm.length + 1));
+    var np = [];
+    for (var i = 0; i < pulsePerm.length; i++) np.push(pulsePerm[i] >= flock.length - 1 ? pulsePerm[i] : pulsePerm[i]);
+    np.splice(pos, 0, flock.length - 1);
+    pulsePerm = np;
+  }
+
+  function doReseed() {
+    epoch++;
+    simT = 0;
+    pulseCount = 0;
+    gust = null;
+    seedFlock(BASE_SEED + epoch * 7919);
+    draw(0);
+  }
+
+  canvas.addEventListener('pointerdown', function (e) {
+    ensureAudio();
+    if (AC && AC.resume) AC.resume();
+    var p = toLocal(e);
+    downAt = simT; downX = p.x; downY = p.y; dragging = false;
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    var p = toLocal(e);
+    var dx = p.x - downX, dy = p.y - downY;
+    if (Math.sqrt(dx * dx + dy * dy) > U * 0.02) dragging = true;
+    if (dragging) {
+      gust = { x: p.x, y: p.y, strength: 1, until: simT + 0.45 };
+    }
+  });
+  canvas.addEventListener('pointerup', function (e) {
+    if (dragging) { dragging = false; return; }
+    var p = toLocal(e);
+    if (pendingTap) {
+      // second tap close behind: double-tap reseed
+      pendingTap = null;
+      doReseed();
+    } else {
+      var pt = { x: p.x, y: p.y, at: simT };
+      pendingTap = pt;
+      setTimeout(function () {
+        if (pendingTap === pt) { pendingTap = null; doTap(pt.x, pt.y); }
+      }, 260);
+    }
+  });
+
+  // ---------- Boot + main loop ----------
+  resize();
+  seedFlock(BASE_SEED);
+  draw(0);
+
+  if (typeof requestAnimationFrame === 'function') {
+    var lastNow = null, acc = 0, lastPulseK = -1;
+    var frame = function (now) {
+      if (lastNow === null) lastNow = now;
+      var elapsed = (now - lastNow) / 1000;
+      lastNow = now;
+      if (elapsed > 0.25) elapsed = 0.25;
+      acc += elapsed;
+      while (acc >= DT) {
+        simT += DT;
+        step(DT, simT);
+        acc -= DT;
+        var k = Math.floor((simT - PULSE_FIRST) / PULSE_PERIOD);
+        if (k >= 0 && k !== lastPulseK) { lastPulseK = k; paperClick(); }
+      }
+      audioFrame();
+      draw(simT);
+      requestAnimationFrame(frame);
+    };
+    requestAnimationFrame(frame);
+  }
+})();
+</script>
+</body>
+</html>
