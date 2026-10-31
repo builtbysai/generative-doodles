@@ -1,0 +1,29 @@
+# No.670 "Mujerave" — EXPANSION #81 jose-perez-de-arce, block 6
+
+## Concept
+
+LA MUJER CHAMANA, from Pérez de Arce's mujerave drawing: "con su vestido de aire colorido, vuela enlazando mundos" — with her dress of colored air, she flies linking worlds. A small robed woman crosses a vast night ground on a slow course, in no hurry. Her dress is not cloth and is never drawn as cloth: it is the air itself, four colored streams pouring from her hem and braiding through the lower frame. The interaction is the brief's own: drag tears and redirects the airflow, and it always re-settles; tap gives her a new route. No wings, no cloth mesh, no sparkles, no text.
+
+## Construction
+
+- **Figure.** A parametric robed silhouette in paper-skin #E8DCC3 at low key: a draped robe path with a scalloped trailing hem, two quiet night fold lines, one extended tapered arm with a small hand, a face disc with two eye dots and a dark hair cap (she is old). She tilts gently with her horizontal velocity (clamped ±0.2 rad) and bobs on a 3.7 s cycle. Figure height is 0.17 of the field height; she stays small against the night.
+- **Route.** Her position is a pure function of figure time: a 1:2 Lissajous course (50 s period) across the upper region, centered at (0.5 FW, 0.27 FH). Routes are rolled from a mulberry32 seed (phases, amplitude multipliers, direction). A tap appends a new route stamped with the current figure time, and the position function blends from the old course to the new over 2.5 s with smoothstep easing, so she glides onto the new route and never jumps.
+- **Air streams.** 800 particles on desktop, 560 on phone. Each particle spawns at a seeded point along her robe's hem, takes stream id = spawn index mod 4 (turquoise #7FC4BD, coral #E2725B, gold #D9A441, violet #8E7CC3), and lives 9–17 s before respawning at the hem. Advection is a fixed-step (1/30 s) sim on an anchored clock: velocity = curl of a two-octave seeded value-noise field, plus a 0.028 units/s downward settle, plus the particle's decaying drag-disturbance velocity. Each particle samples the field at its own seeded offset (±0.85 units), so the four streams disperse and braid across the lower frame instead of following one laminar ribbon out of the hem; the field itself also drifts over time. Particles are drawn as short velocity-aligned streaks, alpha ramping in over 0.6 s and out over the last 1.8 s of life, peak 0.55.
+- **Drag.** Pointer samples are recorded with anchored figure-clock times and applied exactly once at the first sim step at or after their time: particles within radius 0.17 get a radial push plus a swirl impulse. The disturbance velocity decays by 0.93 per step, so a tear visibly re-settles in about four seconds.
+- **Tap versus drag.** A press released within 0.32 s with under 0.035 units of travel is a tap and reseeds the route; anything longer or further is a drag. Never click-to-reload.
+- **Determinism.** Frame one is the synchronous draw at figure time 0, after a fixed pre-roll of 22 s of particle steps run with the figure held at her course start, so the air is already established behind and below her while she sits exactly at her start point. No frame-one state derives from Date.now(); the clock is anchored performance.now() elapsed, the sim advances only in fixed DT steps toward it, and a `?seed=tNN` hook exists for QA forced states (unused in normal viewing). rAF is typeof-guarded.
+- **House rules.** Visual Viewport API sizing with resize listeners on both visualViewport and window; canvas CSS size pinned in px inside draw() every frame; phone detection via window.screen minimum dimension < 700 px with the aspect fallback; phone boots a tall field (0.95 × 1.5) and fewer particles; page ground is the night tone. Canvas 2D only, no offscreen canvas, no ctx.filter, no audio, no microphone, no external assets, no visible text besides the title.
+
+## QA log
+
+- Rendered with `node ~/workspace/tools/render-piece.js` at 1280×900 (qa-desktop.png), 390×844 (qa-mobile.png), 720×720 (thumb.png).
+- Determinism gate: thumb.png rendered twice and `cmp` byte-compared — identical (second render deleted). Re-verified after each tuning round.
+- Round 1 readback: the figure read well, but the air formed a single laminar ribbon trailing right and never filled the lower frame. Fixed by giving each particle its own offset copy of the curl field, lengthening particle life (6–11 s → 9–17 s), raising the downward settle and field speed, and lengthening the streaks.
+- Round 2 readback: dispersion worked but frame one still leaned right of the fixed course start. Widened the per-particle field offsets (±0.5 → ±0.85), sped the field's own drift, and extended the pre-roll (16 s → 22 s). Frame one now shows a broad fan of air pouring from her hem through the lower frame.
+- Forced state check at t=25 (via the ?seed hook, throwaway render, deleted): she has crossed to the left of the frame with a wide braided four-color wake filling the right two-thirds and sweeping down to the bottom edge — the streams read as moving air, not fabric.
+- Mobile readback: same composition refit to the tall field, figure in the upper area, air widening below her, nothing clipped.
+- Grep check: no Date.now() call (one comment names the rule), no Math.random, no createElement, no AudioContext, no external URLs, no em dashes in the file.
+
+## Deviations
+
+- None against the brief. Two implementation choices worth noting: (1) the dress dispersal uses per-particle field offsets, a construction detail the brief leaves open ("advected by a curl-noise field"), chosen because a single shared field produces one laminar ribbon that cannot fill the lower two-thirds; (2) the tap's route change blends over 2.5 s rather than switching instantly, so the reseed reads as her choosing a new course instead of teleporting — the route itself is fully reseeded, as specced.
