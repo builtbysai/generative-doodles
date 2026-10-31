@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Opposites Mix</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #F5F1E8; height: 100%; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded RNG (mulberry32) ----------
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- palette (strict) ----------
+  var BLUE = '#1E4D8C';    // silence
+  var ORANGE = '#E2725B';  // noise
+  var VIOLET = '#7A4E8C';  // mix hue 1
+  var EMBER = '#C9562E';   // mix hue 2
+  var ROSE = '#C98A72';    // mix hue 3
+  var PAPER = '#F5F1E8';
+
+  function hexRgb(hex) {
+    return [parseInt(hex.slice(1, 3), 16), parseInt(hex.slice(3, 5), 16), parseInt(hex.slice(5, 7), 16)];
+  }
+  // Same pigment at another strength (tone family, no new hue).
+  function shade(hex, f) {
+    var c = hexRgb(hex), i, v;
+    var out = '#';
+    for (i = 0; i < 3; i++) {
+      v = Math.round(c[i] * f);
+      if (v > 255) v = 255;
+      out += (v < 16 ? '0' : '') + v.toString(16);
+    }
+    return out;
+  }
+  var BLUE_TONES = [shade(BLUE, 0.84), BLUE, shade(BLUE, 1.13)];
+  var ORANGE_TONES = [shade(ORANGE, 0.86), ORANGE, shade(ORANGE, 1.10)];
+  var WHALE_COL = shade(BLUE, 0.52);
+  var PARROT_COL = shade(ORANGE, 0.60);
+  var PARROT_WING = shade(ORANGE, 0.78);
+
+  var BASE_SEED = 626002;
+
+  // ---------- precomputed value-noise grids (data, no offscreen canvas) ----------
+  var GN = 32;
+  function makeGrid(seed) {
+    var rng = mulberry32(seed), g = [], i;
+    for (i = 0; i < GN * GN; i++) g.push(rng());
+    return g;
+  }
+  var gridB = makeGrid(BASE_SEED + 101);
+  var gridO = makeGrid(BASE_SEED + 202);
+  function sample(g, u, v) {
+    var x = ((u % GN) + GN) % GN, y = ((v % GN) + GN) % GN;
+    var x0 = Math.floor(x), y0 = Math.floor(y);
+    var fx = x - x0, fy = y - y0;
+    var x1 = (x0 + 1) % GN, y1 = (y0 + 1) % GN;
+    var sx = fx * fx * (3 - 2 * fx), sy = fy * fy * (3 - 2 * fy);
+    var a = g[y0 * GN + x0], b = g[y0 * GN + x1], c = g[y1 * GN + x0], d = g[y1 * GN + x1];
+    return (a + (b - a) * sx) + ((c + (d - c) * sx) - (a + (b - a) * sx)) * sy;
+  }
+
+  // ---------- parrot hop sequence (seeded, fixed start upper-right) ----------
+  var HOPS = [{ fx: 0.855, fy: 0.235 }];
+  (function () {
+    var rng = mulberry32(BASE_SEED + 303);
+    for (var i = 0; i < 23; i++) HOPS.push({ fx: 0.70 + rng() * 0.235, fy: 0.13 + rng() * 0.33 });
+  })();
+  var HOP_PERIOD = 0.9;
+  function parrotPos(t) {
+    var seg = Math.floor(t / HOP_PERIOD);
+    var ph = (t - seg * HOP_PERIOD) / HOP_PERIOD;
+    var a = HOPS[seg % HOPS.length], b = HOPS[(seg + 1) % HOPS.length];
+    var k = ph < 0.55 ? (1 - Math.pow(1 - ph / 0.55, 3)) : 1; // quick dart, then rest
+    return {
+      fx: a.fx + (b.fx - a.fx) * k,
+      fy: a.fy + (b.fy - a.fy) * k - Math.sin(Math.min(ph / 0.55, 1) * Math.PI) * 0.03,
+      tilt: (b.fx - a.fx) * k * 1.4 + Math.sin(t * 7) * 0.03
+    };
+  }
+
+  // ---------- hybrids (live only inside the band) ----------
+  var HYBRIDS = [
+    { kind: 0, col: VIOLET, yFrac: 0.30, period: 26, off: 0.30, drift: 0.21, dph: 0.0 },
+    { kind: 1, col: ROSE,   yFrac: 0.58, period: 34, off: 0.55, drift: 0.16, dph: 2.1 },
+    { kind: 0, col: EMBER,  yFrac: 0.76, period: 21, off: 0.92, drift: 0.26, dph: 4.2 }
+  ];
+
+  // ---------- state ----------
+  var perfT = 0;
+  var bandFrom = 0.5, bandTarget = 0.5, bandChangeT = 0; // fractions of field width
+  var stormStart = -10;
+  function bandPosAt(t) {
+    var k = 1 - Math.exp(-(t - bandChangeT) * 3.2);
+    if (k < 0) k = 0; if (k > 1) k = 1;
+    return bandFrom + (bandTarget - bandFrom) * k;
+  }
+  function stormAt(t) {
+    var dt = t - stormStart;
+    if (dt < 0 || dt > 2.5) return 0;
+    if (dt < 0.35) { var a = dt / 0.35; return a * a * (3 - 2 * a); }
+    if (dt < 1.2) return 1;
+    var d = (dt - 1.2) / 1.3; return 1 - d * d * (3 - 2 * d);
+  }
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 300, H = 300, PHONE = false;
+
+  function measure() {
+    var vv = window.visualViewport;
+    var w = vv && vv.width ? vv.width : window.innerWidth;
+    var h = vv && vv.height ? vv.height : window.innerHeight;
+    W = w; H = h;
+    var scr = window.screen || { width: w, height: h };
+    var minScr = Math.min(scr.width || w, scr.height || h);
+    PHONE = minScr < 700 || (h > w * 1.15 && Math.min(w, h) < 700);
+  }
+
+  // ---------- creature drawing (silhouettes, no faces) ----------
+  function whalePath(u) {
+    // body, nose at +x, fluke at -x; unit: half-length u
+    ctx.beginPath();
+    ctx.ellipse(0, 0, u, u * 0.40, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(-u * 0.82, 0);
+    ctx.lineTo(-u * 1.22, -u * 0.34);
+    ctx.lineTo(-u * 1.10, 0);
+    ctx.lineTo(-u * 1.22, u * 0.34);
+    ctx.closePath(); ctx.fill();
+    // pectoral fin
+    ctx.beginPath();
+    ctx.moveTo(u * 0.05, u * 0.30);
+    ctx.lineTo(-u * 0.22, u * 0.62);
+    ctx.lineTo(u * 0.30, u * 0.38);
+    ctx.closePath(); ctx.fill();
+  }
+  function parrotTail(u) {
+    ctx.beginPath();
+    ctx.moveTo(-u * 0.45, u * 0.10);
+    ctx.lineTo(-u * 1.25, u * 0.85);
+    ctx.lineTo(-u * 0.95, u * 0.95);
+    ctx.lineTo(-u * 0.15, u * 0.30);
+    ctx.closePath(); ctx.fill();
+  }
+  function parrotBody(u, colBody, colWing) {
+    ctx.fillStyle = colBody;
+    parrotTail(u);
+    ctx.beginPath();
+    ctx.ellipse(0, 0, u * 0.62, u * 0.42, -0.25, 0, Math.PI * 2);
+    ctx.fill();
+    // head
+    ctx.beginPath();
+    ctx.ellipse(u * 0.52, -u * 0.30, u * 0.30, u * 0.27, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // beak (hooked, no face)
+    ctx.beginPath();
+    ctx.moveTo(u * 0.74, -u * 0.42);
+    ctx.lineTo(u * 1.06, -u * 0.28);
+    ctx.lineTo(u * 0.78, -u * 0.10);
+    ctx.lineTo(u * 0.70, -u * 0.26);
+    ctx.closePath(); ctx.fill();
+    // wing
+    ctx.fillStyle = colWing;
+    ctx.beginPath();
+    ctx.ellipse(-u * 0.05, -u * 0.02, u * 0.40, u * 0.20, -0.5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  function flukeTail(u) {
+    ctx.beginPath();
+    ctx.moveTo(-u * 0.55, 0);
+    ctx.lineTo(-u * 1.05, -u * 0.30);
+    ctx.lineTo(-u * 0.92, 0);
+    ctx.lineTo(-u * 1.05, u * 0.30);
+    ctx.closePath(); ctx.fill();
+  }
+
+  // ---------- main draw ----------
+  function draw(t) {
+    measure();
+    canvas.width = W; canvas.height = H;
+    canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+
+    ctx.fillStyle = PAPER;
+    ctx.fillRect(0, 0, W, H);
+
+    var m = Math.max(10, Math.min(W, H) * 0.045);
+    var x0 = m, y0 = m, x1 = W - m, y1 = H - m;
+    var FW = x1 - x0, FH = y1 - y0;
+    var S = Math.min(FW, FH);
+
+    var storm = stormAt(t);
+    var churnB = 1 + 1.2 * storm, churnO = 1 + 2.4 * storm;
+    var bandCx = x0 + bandPosAt(t) * FW;
+    var bandHW = FW * (1 / 6) * (1 + 0.5 * storm);
+    var bandL = bandCx - bandHW, bandR = bandCx + bandHW;
+
+    // base fills under the mosaic
+    ctx.fillStyle = BLUE;
+    ctx.fillRect(x0, y0, Math.max(0, bandL - x0), FH);
+    ctx.fillStyle = ROSE;
+    ctx.fillRect(bandL, y0, bandR - bandL, FH);
+    ctx.fillStyle = ORANGE;
+    ctx.fillRect(bandR, y0, Math.max(0, x1 - bandR), FH);
+
+    // textured noise mosaic: pure tones at the edges, quantized mix in the band
+    var cs = Math.max(10, Math.min(18, FW / 46));
+    var cols = Math.ceil(FW / cs), rows = Math.ceil(FH / cs);
+    var breathe = 0.15 * Math.sin(t * 0.4);
+    var ci, cj, cx, cy, nB, nO, v, idx;
+    for (cj = 0; cj < rows; cj++) {
+      cy = y0 + cj * cs;
+      for (ci = 0; ci < cols; ci++) {
+        cx = x0 + ci * cs;
+        var ccx = cx + cs / 2, ccy = cy + cs / 2;
+        nB = sample(gridB, ccx * 0.055 + t * 0.010 * churnB, ccy * 0.055 + t * 0.016 * churnB);
+        if (ccx < bandL) {
+          idx = Math.floor(nB * 3 + breathe);
+          ctx.fillStyle = BLUE_TONES[idx < 0 ? 0 : (idx > 2 ? 2 : idx)];
+        } else if (ccx > bandR) {
+          nO = sample(gridO, ccx * 0.075 - t * 0.050 * churnO, ccy * 0.075 + t * 0.030 * churnO);
+          idx = Math.floor(nO * 3 + breathe);
+          ctx.fillStyle = ORANGE_TONES[idx < 0 ? 0 : (idx > 2 ? 2 : idx)];
+        } else {
+          nO = sample(gridO, ccx * 0.075 - t * 0.050 * churnO, ccy * 0.075 + t * 0.030 * churnO);
+          var posFrac = (ccx - bandL) / (bandR - bandL);
+          v = posFrac * 0.75 + ((nB + nO) / 2 - 0.5) * 0.7 + 0.125;
+          if (v < 0) v = 0; if (v > 1) v = 1;
+          ctx.fillStyle = v < 0.36 ? VIOLET : (v < 0.64 ? ROSE : EMBER);
+        }
+        ctx.fillRect(cx, cy, cs + 1, cs + 1);
+      }
+    }
+
+    // hybrids: only inside the band, drifting and dissolving
+    var hi, hb, hp, ha;
+    for (hi = 0; hi < HYBRIDS.length; hi++) {
+      hb = HYBRIDS[hi];
+      hp = (t / hb.period + hb.off) % 1;
+      ha = Math.pow(Math.sin(hp * Math.PI), 1.5) * 0.92;
+      if (ha < 0.02) continue;
+      var hx = bandCx + Math.sin(t * hb.drift + hb.dph) * bandHW * 0.52;
+      var hy = y0 + FH * hb.yFrac + Math.sin(t * 0.3 + hb.dph * 2) * FH * 0.02;
+      ctx.save();
+      ctx.translate(hx, hy);
+      ctx.rotate(Math.sin(t * 0.23 + hb.dph) * 0.10);
+      ctx.globalAlpha = ha;
+      ctx.fillStyle = hb.col;
+      if (hb.kind === 0) {
+        // whale body, parrot beak and long parrot tail
+        var hu = S * 0.105;
+        whalePathBodyOnly(hu);
+        ctx.beginPath();
+        ctx.moveTo(hu * 0.86, -hu * 0.16);
+        ctx.lineTo(hu * 1.24, -hu * 0.04);
+        ctx.lineTo(hu * 0.88, hu * 0.10);
+        ctx.closePath(); ctx.fill();
+        ctx.save();
+        ctx.translate(-hu * 0.55, hu * 0.05);
+        ctx.scale(0.85, 0.85);
+        parrotTail(hu);
+        ctx.restore();
+      } else {
+        // parrot body grown large, fluke instead of tail feathers
+        var pu = S * 0.115;
+        ctx.beginPath();
+        ctx.ellipse(0, 0, pu * 0.78, pu * 0.50, -0.2, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.beginPath();
+        ctx.ellipse(pu * 0.62, -pu * 0.34, pu * 0.34, pu * 0.30, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.beginPath();
+        ctx.moveTo(pu * 0.88, -pu * 0.46);
+        ctx.lineTo(pu * 1.24, -pu * 0.30);
+        ctx.lineTo(pu * 0.92, -pu * 0.10);
+        ctx.closePath(); ctx.fill();
+        flukeTail(pu);
+      }
+      ctx.restore();
+    }
+    ctx.globalAlpha = 1;
+
+    // whale: slow figure in the silence field
+    var wx = x0 + FW * 0.205 + Math.sin(t * 0.11) * FW * 0.045;
+    var wy = y0 + FH * 0.52 + Math.sin(t * 0.073 + 1.3) * FH * 0.055;
+    ctx.save();
+    ctx.translate(wx, wy);
+    ctx.rotate(Math.sin(t * 0.09) * 0.06);
+    ctx.fillStyle = WHALE_COL;
+    whalePath(S * 0.155);
+    ctx.restore();
+
+    // parrot: quick seeded hops in the noise field
+    var pp = parrotPos(t);
+    ctx.save();
+    ctx.translate(x0 + pp.fx * FW, y0 + pp.fy * FH);
+    ctx.rotate(pp.tilt);
+    parrotBody(S * 0.095, PARROT_COL, PARROT_WING);
+    ctx.restore();
+  }
+  function whalePathBodyOnly(u) {
+    ctx.beginPath();
+    ctx.ellipse(0, 0, u, u * 0.40, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(u * 0.05, u * 0.30);
+    ctx.lineTo(-u * 0.22, u * 0.62);
+    ctx.lineTo(u * 0.30, u * 0.38);
+    ctx.closePath(); ctx.fill();
+  }
+
+  // ---------- interaction ----------
+  var downPos = null, downT = 0, dragging = false;
+  function evtPos(e) {
+    var r = canvas.getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  }
+  function fieldFracX(px) {
+    var m = Math.max(10, Math.min(W, H) * 0.045);
+    var f = (px - m) / (W - 2 * m);
+    return f < 0.26 ? 0.26 : (f > 0.74 ? 0.74 : f);
+  }
+  function onDown(e) {
+    var p = evtPos(e);
+    downPos = p; downT = perfT; dragging = false;
+  }
+  function onMove(e) {
+    if (!downPos) return;
+    var p = evtPos(e);
+    var dx = p.x - downPos.x, dy = p.y - downPos.y;
+    if (dx * dx + dy * dy > 36) dragging = true;
+    if (dragging) {
+      bandFrom = bandPosAt(perfT);
+      bandChangeT = perfT;
+      bandTarget = fieldFracX(p.x);
+    }
+  }
+  function onUp(e) {
+    if (!downPos) return;
+    var wasDrag = dragging;
+    downPos = null; dragging = false;
+    if (!wasDrag && perfT - downT < 0.45) stormStart = perfT; // tap: mixing storm
+  }
+  canvas.addEventListener('pointerdown', onDown);
+  canvas.addEventListener('pointermove', onMove);
+  canvas.addEventListener('pointerup', onUp);
+
+  function onResize() { draw(perfT); }
+  if (window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', onResize);
+  window.addEventListener('resize', onResize);
+
+  // ---------- frame one + loop ----------
+  draw(0);
+  if (typeof requestAnimationFrame === 'function') {
+    var t0 = null;
+    var loop = function (ts) {
+      if (t0 === null) t0 = ts;
+      perfT = (ts - t0) / 1000;
+      draw(perfT);
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
