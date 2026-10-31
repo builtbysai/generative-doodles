@@ -1,0 +1,561 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Magic Pencil</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #EFE7D3; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+// No.639 "Magic Pencil" - EXPANSION #77 seba-ilabaca, block 7 "Tuesday Night Automation".
+// One continuous pencil line per page: precomputed seeded polyline, revealed by arc length.
+// The line never lifts. One ink accent per page, cycling rust, moss, dusk blue.
+
+var PAPER = '#EFE7D3';
+var GRAPHITE = '#3A3A38';
+var ACCENTS = ['#B4572E', '#5C7A4D', '#3A4E6B'];
+var FAMILIES = ['spiral', 'owl', 'cocoon', 'leaf']; // tap cycle order
+
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var W = 300, H = 300, dpr = 1, phone = false;
+
+function fit() {
+  var vv = window.visualViewport;
+  var w = vv ? vv.width : window.innerWidth;
+  var h = vv ? vv.height : window.innerHeight;
+  W = w; H = h;
+  dpr = Math.min(2, window.devicePixelRatio || 1);
+  canvas.width = Math.round(w * dpr);
+  canvas.height = Math.round(h * dpr);
+  var sw = (window.screen && window.screen.width) || w;
+  var sh = (window.screen && window.screen.height) || h;
+  phone = Math.min(sw, sh) < 700 || h > w * 1.15;
+}
+fit();
+if (window.visualViewport && window.visualViewport.addEventListener) {
+  window.visualViewport.addEventListener('resize', function () { fit(); draw(); });
+}
+window.addEventListener('resize', function () { fit(); draw(); });
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    var t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+// ---------- path storage ----------
+var PX = [], PY = [], PG = [], CL = [];
+var totalLen = 0;
+var switches = [];        // arc lengths where pigment changes (dip pauses)
+var motifs = [];          // {family, startIdx, endIdx, startLen, endLen}
+var slots = [];           // {cx, cy, R} per motif slot on the current page
+var penX = 0, penY = 0;
+
+function pushPt(x, y, pig) {
+  var n = PX.length;
+  if (n > 0) {
+    var dx = x - PX[n - 1], dy = y - PY[n - 1];
+    totalLen += Math.sqrt(dx * dx + dy * dy);
+    CL.push(totalLen);
+    if (pig !== PG[n - 1]) switches.push(totalLen);
+  } else {
+    CL.push(0);
+  }
+  PX.push(x); PY.push(y); PG.push(pig);
+  penX = x; penY = y;
+}
+
+// Append raw points [x, y, pig] with smoothed hand wobble; wobble is zero at both
+// ends so joins between meander and motif stay exact (the line never lifts).
+function emit(raw, rng, amp) {
+  var n = raw.length, sx = 0, sy = 0, i, env;
+  for (i = 0; i < n; i++) {
+    sx += (rng() * 2 - 1) * 0.4; sx *= 0.90;
+    sy += (rng() * 2 - 1) * 0.4; sy *= 0.90;
+    env = n === 1 ? 0 : Math.sin(Math.PI * i / (n - 1));
+    pushPt(raw[i][0] + sx * amp * env, raw[i][1] + sy * amp * env, raw[i][2]);
+  }
+}
+
+function rotPts(pts, cx, cy, ang) {
+  var c = Math.cos(ang), s = Math.sin(ang), out = [], i, dx, dy;
+  for (i = 0; i < pts.length; i++) {
+    dx = pts[i][0] - cx; dy = pts[i][1] - cy;
+    out.push([cx + dx * c - dy * s, cy + dx * s + dy * c, pts[i][2]]);
+  }
+  return out;
+}
+
+function quad(a, c, b, n) {
+  var pts = [], i, t, u;
+  for (i = 0; i <= n; i++) {
+    t = i / n; u = 1 - t;
+    pts.push([u * u * a[0] + 2 * u * t * c[0] + t * t * b[0],
+              u * u * a[1] + 2 * u * t * c[1] + t * t * b[1]]);
+  }
+  return pts;
+}
+
+function tag(pts, pig) {
+  return pts.map(function (p) { return [p[0], p[1], pig]; });
+}
+
+// ---------- meander: connective vine stitch from A to B, with one loop ----------
+// The stitch bows away from the target motif's center so it never cuts
+// across the motif it is about to draw.
+function meanderPts(ax, ay, bx, by, rng, avoidX, avoidY) {
+  var dx = bx - ax, dy = by - ay;
+  var dist = Math.sqrt(dx * dx + dy * dy);
+  var n = Math.max(10, Math.round(dist / 0.004));
+  var px = -dy / (dist || 1), py = dx / (dist || 1);
+  var mx = (ax + bx) / 2, my = (ay + by) / 2;
+  var dPlus = (mx + px - avoidX) * (mx + px - avoidX) + (my + py - avoidY) * (my + py - avoidY);
+  var dMinus = (mx - px - avoidX) * (mx - px - avoidX) + (my - py - avoidY) * (my - py - avoidY);
+  var bowSign = dPlus >= dMinus ? 1 : -1;
+  var bow = (0.20 * dist + 0.008) * bowSign;
+  var waveAmp = 0.006 + rng() * 0.006;
+  var loopR = Math.min(0.016 + rng() * 0.008, dist * 0.20);
+  var doLoop = dist > 0.10;
+  var loopDir = rng() < 0.5 ? 1 : -1;
+  var pts = [], i, t, u, off, lr, la;
+  for (i = 0; i <= n; i++) {
+    t = i / n;
+    off = Math.sin(t * Math.PI) * bow + Math.sin(t * Math.PI * 3) * waveAmp * Math.sin(t * Math.PI);
+    var x = ax + dx * t + px * off;
+    var y = ay + dy * t + py * off;
+    if (doLoop && t > 0.34 && t < 0.66) {
+      // loop detour: radius swells from zero and back, angle sweeps a full turn,
+      // so the detour leaves and rejoins the line at the same moving point
+      u = (t - 0.34) / 0.32;
+      lr = loopR * Math.sin(Math.PI * u);
+      la = loopDir * (u * Math.PI * 2) - Math.PI / 2;
+      x += Math.cos(la) * lr;
+      y += Math.sin(la) * lr;
+    }
+    pts.push([x, y, 0]);
+  }
+  pts[0] = [ax, ay, 0];
+  pts[n] = [bx, by, 0];
+  return pts;
+}
+
+// ---------- motif generators (raw points, first point = entry) ----------
+
+function genSpiral(cx, cy, R, rng, entryAng) {
+  var turns = 3.9 + rng() * 0.9;
+  var chir = rng() < 0.5 ? -1 : 1;
+  var a0 = (typeof entryAng === 'number') ? entryAng : Math.PI; // entry on the side facing the pen
+  var N = 240, pts = [], i, s, ang, r;
+  for (i = 0; i <= N; i++) {
+    s = i / N;
+    ang = a0 + chir * s * turns * Math.PI * 2;
+    r = R * (1 - 0.90 * s);
+    pts.push([cx + r * Math.cos(ang), cy + r * Math.sin(ang), s > 0.85 ? 1 : 0]);
+  }
+  return pts;
+}
+
+function genOwl(cx, cy, R, rng) {
+  var pts = [], i, s, a, rr, d;
+  var wide = 0.92 + rng() * 0.16;
+  // head outline with two ear tuft spikes near the top
+  var N = 150;
+  for (i = 0; i <= N; i++) {
+    s = i / N;
+    a = -Math.PI / 2 + s * Math.PI * 2;
+    rr = R;
+    d = Math.abs(((a + Math.PI / 2 + Math.PI) % (Math.PI * 2)) - Math.PI); // not used for tufts
+    void d;
+    var fromTop = Math.atan2(Math.sin(a + Math.PI / 2), Math.cos(a + Math.PI / 2));
+    var t1 = Math.max(0, 1 - Math.abs(Math.abs(fromTop) - 0.55) / 0.20);
+    rr = R * (1 + 0.20 * t1);
+    pts.push([cx + rr * wide * Math.cos(a), cy + rr * Math.sin(a), 0]);
+  }
+  var lex = cx - 0.38 * R, rex = cx + 0.38 * R, ey = cy - 0.10 * R, er = 0.20 * R;
+  // connector from top of head to left eye, hugging the inside of the outline
+  var conn = quad([pts[pts.length - 1][0], pts[pts.length - 1][1]], [cx - 0.52 * R, cy - 0.74 * R], [cx - 0.80 * R, cy - 0.28 * R], 10);
+  pts = pts.concat(tag(conn.slice(1), 0));
+  conn = quad([pts[pts.length - 1][0], pts[pts.length - 1][1]], [cx - 0.74 * R, cy + 0.02 * R], [lex, ey - er], 10);
+  pts = pts.concat(tag(conn.slice(1), 0));
+  // left eye ring (accent)
+  for (i = 0; i <= 40; i++) {
+    a = -Math.PI / 2 + (i / 40) * Math.PI * 2;
+    pts.push([lex + er * Math.cos(a), ey + er * Math.sin(a), 1]);
+  }
+  pts.push([lex + er * 0.7, ey + er * 0.7, 1]);
+  // pupil dot spiral, graphite, tiny
+  for (i = 0; i <= 16; i++) {
+    s = i / 16; a = s * Math.PI * 3;
+    rr = er * 0.34 * (1 - s);
+    pts.push([lex + rr * Math.cos(a), ey + rr * Math.sin(a), 0]);
+  }
+  // connector across to right eye
+  conn = quad([pts[pts.length - 1][0], pts[pts.length - 1][1]], [cx, ey - 0.34 * R], [rex, ey - er], 16);
+  pts = pts.concat(tag(conn.slice(1), 0));
+  for (i = 0; i <= 40; i++) {
+    a = -Math.PI / 2 + (i / 40) * Math.PI * 2;
+    pts.push([rex + er * Math.cos(a), ey + er * Math.sin(a), 1]);
+  }
+  pts.push([rex - er * 0.7, ey + er * 0.7, 1]);
+  for (i = 0; i <= 16; i++) {
+    s = i / 16; a = s * Math.PI * 3;
+    rr = er * 0.34 * (1 - s);
+    pts.push([rex + rr * Math.cos(a), ey + rr * Math.sin(a), 0]);
+  }
+  // down the right interior to the beak: small triangle
+  conn = quad([pts[pts.length - 1][0], pts[pts.length - 1][1]], [cx + 0.55 * R, cy + 0.28 * R], [cx, cy + 0.16 * R], 10);
+  pts = pts.concat(tag(conn.slice(1), 0));
+  pts.push([cx + 0.15 * R, cy + 0.32 * R, 0]);
+  pts.push([cx - 0.15 * R, cy + 0.32 * R, 0]);
+  pts.push([cx, cy + 0.16 * R, 0]);
+  // scallop feather arcs across the lower head
+  var k, arc;
+  for (k = -1; k <= 1; k++) {
+    var scx = cx + k * 0.36 * R, scy = cy + 0.58 * R, sr = 0.17 * R;
+    var start = [pts[pts.length - 1][0], pts[pts.length - 1][1]];
+    conn = quad(start, [(start[0] + scx - sr) / 2, (start[1] + scy) / 2 + 0.05 * R], [scx - sr, scy], 8);
+    pts = pts.concat(tag(conn.slice(1), 0));
+    for (i = 0; i <= 14; i++) {
+      a = Math.PI - (i / 14) * Math.PI;
+      arc = [scx + sr * Math.cos(a), scy - sr * Math.sin(a) * 0.8];
+      pts.push([arc[0], arc[1], 0]);
+    }
+  }
+  return pts;
+}
+
+function genCocoon(cx, cy, R, rng) {
+  var pts = [], i, s, a, r;
+  var tight = 1.8 + rng() * 0.9;
+  var top = [cx, cy - 0.92 * R];
+  var bot = [cx, cy + 0.92 * R];
+  // tendril: a small curl spiral above and left of the cocoon, then a stem to its top
+  var tcx = cx - 0.52 * R, tcy = cy - 1.18 * R, tN = 70;
+  for (i = 0; i <= tN; i++) {
+    s = i / tN;
+    a = Math.PI + s * Math.PI * 2 * 1.6;
+    r = 0.30 * R * (1 - s) + 0.04 * R;
+    pts.push([tcx + r * Math.cos(a), tcy + r * Math.sin(a), 0]);
+  }
+  var stem = quad([pts[pts.length - 1][0], pts[pts.length - 1][1]], [cx - 0.25 * R, cy - 1.05 * R], top, 12);
+  pts = pts.concat(tag(stem.slice(1), 0));
+  // cocoon body: one continuous teardrop outline starting and ending at the top
+  var N = 90;
+  for (i = 1; i <= N; i++) {
+    s = i / N;
+    a = s * Math.PI * 2;
+    pts.push([cx + 0.80 * R * Math.sin(a) * (0.80 + 0.20 * Math.cos(a)),
+              cy - 0.92 * R * Math.cos(a) * (1 - 0.18 * Math.sin(a)), 0]);
+  }
+  // drop inside to the inner curl: straight down the middle, like a seam,
+  // meeting the inner spiral at its top point
+  var conn = quad(top, [cx + 0.03 * R, cy - 0.65 * R], [cx, cy - 0.40 * R], 12);
+  pts = pts.concat(tag(conn.slice(1), 0));
+  // inner spiral (accent): the cocoon curl core, starting at its top
+  var M = 110;
+  for (i = 0; i <= M; i++) {
+    s = i / M;
+    a = -Math.PI / 2 + s * tight * Math.PI * 2;
+    r = 0.45 * R * (1 - s) + 0.03 * R;
+    pts.push([cx + r * Math.cos(a), cy + 0.05 * R + r * Math.sin(a), 1]);
+  }
+  // exit hook to the bottom tip
+  conn = quad([pts[pts.length - 1][0], pts[pts.length - 1][1]], [cx + 0.2 * R, cy + 0.6 * R], bot, 12);
+  pts = pts.concat(tag(conn.slice(1), 0));
+  return pts;
+}
+
+function genLeaf(cx, cy, R, rng) {
+  var pts = [], i, s;
+  var tilt = (rng() - 0.5) * 0.35 * R;
+  var base = [cx, cy + R * 0.92];
+  var tip = [cx + tilt, cy - R * 0.95];
+  // outline: up the left side, down the right side, back to base
+  var left = quad(base, [cx - R * 1.15, cy - R * 0.05], tip, 36);
+  pts = pts.concat(tag(left, 0));
+  var right = quad(tip, [cx + R * 1.15, cy - R * 0.05], base, 36);
+  pts = pts.concat(tag(right.slice(1), 0));
+  // midrib with side veins, base to tip
+  var stations = [0.22, 0.42, 0.62, 0.80];
+  var prev = base;
+  var mid = function (u) {
+    var w = 1 - u;
+    return [w * w * base[0] + 2 * w * u * (cx + tilt * 0.4) + u * u * tip[0],
+            w * w * base[1] + 2 * w * u * cy + u * u * tip[1]];
+  };
+  for (var k = 0; k < stations.length; k++) {
+    var u = stations[k];
+    var mp = mid(u);
+    var seg = quad(prev, [(prev[0] + mp[0]) / 2, (prev[1] + mp[1]) / 2], mp, 8);
+    pts = pts.concat(tag(seg.slice(1), 0));
+    // vein out to one side and back with a slight offset (sketchy double line)
+    var side = k % 2 === 0 ? -1 : 1;
+    var edge = [cx + side * R * 0.44 * (1 - u * 0.30), mp[1] - R * 0.10];
+    var out = quad(mp, [(mp[0] + edge[0]) / 2, (mp[1] + edge[1]) / 2 - R * 0.05], edge, 8);
+    pts = pts.concat(tag(out.slice(1), 0));
+    var back = quad(edge, [(edge[0] + mp[0]) / 2 + 0.02 * R, (edge[1] + mp[1]) / 2 + 0.03 * R], mp, 8);
+    pts = pts.concat(tag(back.slice(1), 0));
+    prev = mp;
+  }
+  var tail = quad(prev, [(prev[0] + tip[0]) / 2, (prev[1] + tip[1]) / 2], tip, 8);
+  pts = pts.concat(tag(tail.slice(1), 0));
+  // accent hatches inside the right half, zigzag down from near the tip
+  var hx = cx + R * 0.26, hy = cy - R * 0.42;
+  var conn = quad(tip, [cx + R * 0.38, cy - R * 0.52], [hx, hy], 8);
+  pts = pts.concat(tag(conn.slice(1), 1));
+  for (i = 0; i < 3; i++) {
+    pts.push([hx - R * 0.20, hy + R * 0.10, 1]);
+    pts.push([hx + R * 0.02, hy + R * 0.24, 1]);
+    hx -= R * 0.03; hy += R * 0.24;
+  }
+  return pts;
+}
+
+var GEN = { spiral: genSpiral, owl: genOwl, cocoon: genCocoon, leaf: genLeaf };
+
+// ---------- page construction ----------
+
+var pageIdx = 0;
+var pageSeed = 0;
+var accent = ACCENTS[0];
+var speed = 0.02; // normalised units per second
+
+function genMotifInto(slot, family, rng) {
+  var entryAng = Math.atan2(penY - slot.cy, penX - slot.cx);
+  var raw = GEN[family](slot.cx, slot.cy, slot.R, rng, entryAng);
+  var ang = (rng() - 0.5) * 0.35;
+  if (family === 'spiral') ang = 0; // entry angle already faces the pen; do not rotate it away
+  raw = rotPts(raw, slot.cx, slot.cy, ang);
+  // stitch from the pen to the motif entry, bowing away from the motif center
+  var meand = meanderPts(penX, penY, raw[0][0], raw[0][1], rng, slot.cx, slot.cy);
+  emit(meand, rng, 0.0012);
+  var startIdx = PX.length - 1;
+  var startLen = totalLen;
+  emit(raw, rng, 0.0020);
+  motifs.push({ family: family, startIdx: startIdx, endIdx: PX.length - 1, startLen: startLen, endLen: totalLen });
+}
+
+function pickFamily(rng, avoid) {
+  var f;
+  do { f = FAMILIES[Math.floor(rng() * 4)]; } while (f === avoid);
+  return f;
+}
+
+function buildPage(idx, firstFamily) {
+  PX = []; PY = []; PG = []; CL = []; switches = []; motifs = []; slots = [];
+  totalLen = 0;
+  pageSeed = 639000 + idx * 7919;
+  accent = ACCENTS[idx % 3];
+  var rng = mulberry32(pageSeed);
+  var n = 5 + Math.floor(rng() * 3); // 5-7 motifs
+  var cols = 3, rows = Math.ceil(n / cols);
+  var order = [], r, c, i;
+  for (r = 0; r < rows; r++) {
+    var rowIdx = [];
+    for (c = 0; c < cols; c++) rowIdx.push(r * cols + c);
+    if (r % 2 === 1) rowIdx.reverse();
+    order = order.concat(rowIdx);
+  }
+  order = order.slice(0, n);
+  for (i = 0; i < n; i++) {
+    var cell = order[i];
+    var cc = cell % cols, cr = Math.floor(cell / cols);
+    slots.push({
+      cx: (cc + 0.5) / cols + (rng() - 0.5) * 0.05,
+      cy: (cr + 0.5) / rows + (rng() - 0.5) * 0.05,
+      R: Math.min(0.5 / cols, 0.5 / rows) * (0.60 + rng() * 0.16)
+    });
+  }
+  // pen start: just left of the first slot, at its entry height
+  var s0 = slots[0];
+  pushPt(s0.cx - s0.R - 0.055, s0.cy + 0.012, 0);
+  var fam = firstFamily || pickFamily(rng, null);
+  for (i = 0; i < n; i++) {
+    genMotifInto(slots[i], fam, rng);
+    fam = pickFamily(rng, fam);
+  }
+  speed = totalLen / 56; // about 60 s per page including dip pauses
+}
+
+// Rebuild the not-yet-drawn suffix after a tap: motifs after index m are
+// regenerated in the same slots, the first with the forced family.
+function regenSuffix(m, forcedFamily, rng) {
+  var keep = motifs[m].endIdx;
+  PX.length = keep + 1; PY.length = keep + 1; PG.length = keep + 1; CL.length = keep + 1;
+  totalLen = CL[keep];
+  switches = switches.filter(function (L) { return L < totalLen; });
+  motifs.length = m + 1;
+  penX = PX[keep]; penY = PY[keep];
+  var fam = forcedFamily;
+  for (var i = m + 1; i < slots.length; i++) {
+    genMotifInto(slots[i], fam, rng);
+    fam = pickFamily(rng, fam);
+  }
+}
+
+// ---------- animation state ----------
+
+var headLen = 0;
+var pauseLeft = 0;
+var hurryTarget = -1, hurryRate = 0;
+var fading = 0;
+var tapCount = 0;
+
+function initialHead() {
+  var m0 = motifs[0];
+  return m0.startLen + 0.40 * (m0.endLen - m0.startLen);
+}
+
+var seedParam = '';
+try {
+  var locObj = (typeof location !== 'undefined' && location) ? location : (window.location || null);
+  seedParam = (locObj && locObj.search) || '';
+} catch (e) { seedParam = ''; }
+
+buildPage(0, 'spiral');
+headLen = initialHead();
+if (seedParam.indexOf('late80') >= 0) headLen = totalLen * 0.80;
+
+function nextPage() {
+  pageIdx++;
+  buildPage(pageIdx, null);
+  headLen = 0;
+  pauseLeft = 0;
+  hurryTarget = -1;
+}
+
+function update(dt) {
+  if (fading > 0) {
+    fading += dt / 2;
+    if (fading >= 1) { fading = 0; nextPage(); }
+    return;
+  }
+  if (pauseLeft > 0) { pauseLeft -= dt; return; }
+  var rate = speed;
+  if (hurryTarget > headLen) rate = Math.max(rate, hurryRate);
+  var target = headLen + rate * dt;
+  // dip pause: stop exactly at the next pigment switch
+  for (var i = 0; i < switches.length; i++) {
+    if (switches[i] > headLen + 1e-9 && switches[i] <= target) {
+      target = switches[i];
+      pauseLeft = 0.45;
+      break;
+    }
+  }
+  headLen = target;
+  if (hurryTarget > 0 && headLen >= hurryTarget) hurryTarget = -1;
+  if (headLen >= totalLen) { headLen = totalLen; fading = 0.0001; }
+}
+
+function onTap() {
+  if (fading > 0) return;
+  var m = -1, i;
+  for (i = 0; i < motifs.length; i++) {
+    if (motifs[i].endLen > headLen + 1e-9) { m = i; break; }
+  }
+  if (m < 0) return;
+  tapCount++;
+  var famIdx = FAMILIES.indexOf(motifs[m].family);
+  var forced = FAMILIES[(famIdx + 1) % FAMILIES.length];
+  var rng = mulberry32(pageSeed * 31 + tapCount * 104729 + 17);
+  if (m + 1 < slots.length) regenSuffix(m, forced, rng);
+  // current motif finishes its local stroke within about half a second
+  hurryTarget = motifs[m].endLen;
+  hurryRate = (hurryTarget - headLen) / 0.5;
+  pauseLeft = 0;
+}
+canvas.addEventListener('pointerdown', onTap);
+
+// ---------- drawing ----------
+
+function pageTransform() {
+  var margin = phone ? 0.07 : 0.11;
+  var s = Math.min(W * (1 - 2 * margin), H * (1 - 2 * margin));
+  return { ox: (W - s) / 2, oy: (H - s) / 2, s: s };
+}
+
+function draw() {
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = PAPER;
+  ctx.fillRect(0, 0, W, H);
+  var tr = pageTransform();
+  var baseW = Math.max(1.1, tr.s / 330);
+  function X(x) { return tr.ox + x * tr.s; }
+  function Y(y) { return tr.oy + y * tr.s; }
+  // locate head
+  var hl = Math.min(headLen, totalLen);
+  var lo = 0, hi = CL.length - 1;
+  while (lo < hi) {
+    var mid = (lo + hi) >> 1;
+    if (CL[mid] < hl) lo = mid + 1; else hi = mid;
+  }
+  var idx = lo; // first point at or beyond headLen
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  var i;
+  for (i = 1; i <= idx && i < PX.length; i++) {
+    var segEnd = Math.min(CL[i], hl);
+    if (segEnd <= CL[i - 1]) continue;
+    var f = (segEnd - CL[i - 1]) / ((CL[i] - CL[i - 1]) || 1);
+    var ex = PX[i - 1] + (PX[i] - PX[i - 1]) * f;
+    var ey = PY[i - 1] + (PY[i] - PY[i - 1]) * f;
+    var wob = 0.5 + 0.5 * Math.sin(CL[i] * 42 + 1.7);
+    ctx.strokeStyle = PG[i] === 1 ? accent : GRAPHITE;
+    ctx.lineWidth = baseW * (0.55 + 0.80 * wob);
+    ctx.beginPath();
+    ctx.moveTo(X(PX[i - 1]), Y(PY[i - 1]));
+    ctx.lineTo(X(ex), Y(ey));
+    ctx.stroke();
+  }
+  // pencil tip dot riding the line head
+  var hx, hy;
+  if (idx === 0) { hx = PX[0]; hy = PY[0]; }
+  else if (idx >= PX.length) { hx = PX[PX.length - 1]; hy = PY[PY.length - 1]; }
+  else {
+    var f2 = (hl - CL[idx - 1]) / ((CL[idx] - CL[idx - 1]) || 1);
+    hx = PX[idx - 1] + (PX[idx] - PX[idx - 1]) * f2;
+    hy = PY[idx - 1] + (PY[idx] - PY[idx - 1]) * f2;
+  }
+  ctx.fillStyle = GRAPHITE;
+  ctx.beginPath();
+  ctx.arc(X(hx), Y(hy), Math.max(1.8, baseW * 1.45), 0, Math.PI * 2);
+  ctx.fill();
+  // page turn fade: paper overlay in steps
+  if (fading > 0) {
+    var a = Math.min(1, Math.floor(fading * 8) / 8);
+    ctx.globalAlpha = a * 0.995;
+    ctx.fillStyle = PAPER;
+    ctx.fillRect(0, 0, W, H);
+    ctx.globalAlpha = 1;
+  }
+}
+
+draw();
+
+if (typeof requestAnimationFrame === 'function') {
+  var lastTs = null;
+  var frame = function (ts) {
+    if (lastTs === null) lastTs = ts;
+    var dt = Math.min(0.05, (ts - lastTs) / 1000);
+    lastTs = ts;
+    update(dt);
+    draw();
+    requestAnimationFrame(frame);
+  };
+  requestAnimationFrame(frame);
+}
+</script>
+</body>
+</html>
