@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Moor</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #101013; height: 100%; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+
+// Moor (EXPANSION #87 janine-antoni, block 7)
+// A long rope braided across the frame, and it is not made of fiber: its
+// three strands carry a stream of gifted tokens, abstract glyphs in four
+// kinds and four tones. Tokens fly in from the edges and braid themselves
+// onto the growing rope end; the finished rope sways; then it unbraids
+// from the far end and the cycle begins again.
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+var COL = {
+  bg: '#101013',
+  braid: '#6B5B43',
+  flower: '#C96F8E',
+  bead: '#3E5C76',
+  light: '#F2D38A',
+  cord: '#2E3440'
+};
+var KIND_COL = [COL.flower, COL.bead, COL.light, COL.cord];
+
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var W = 0, H = 0, isPhone = false;
+var curT = 0;
+
+var CYCLE = 60;         // full grow / hold / unbraid loop, seconds
+var GROW_END = 40;      // rope grows until here
+var HOLD_END = 48;      // full rope sways until here
+var UNBRAID_END = 57;   // far end unbraids until here, then rest
+var L0 = 0.10;          // finished fraction at frame one and at rest
+var TWISTS = 14;        // braid turns along the full spine
+var BASE_SEED = 718087;
+
+function easeInOut(u) { return u < 0.5 ? 2 * u * u : 1 - Math.pow(-2 * u + 2, 2) / 2; }
+function easeOut(u) { return 1 - Math.pow(1 - u, 3); }
+function clamp01(v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
+
+// Finished rope fraction at cycle time tc (closed form, monotonic in the
+// growth window so token deposit times can be inverted from it).
+function ropeLength(tc) {
+  if (tc < GROW_END) return L0 + (1 - L0) * easeInOut(tc / GROW_END);
+  if (tc < HOLD_END) return 1;
+  if (tc < UNBRAID_END) return 1 - (1 - L0) * easeInOut((tc - HOLD_END) / (UNBRAID_END - HOLD_END));
+  return L0;
+}
+// Inverse of the growth branch: cycle time at which the front reaches s.
+function reachTime(s) {
+  if (s <= L0) return 0;
+  var target = (s - L0) / (1 - L0), lo = 0, hi = 1, i, mid;
+  for (i = 0; i < 40; i++) { mid = (lo + hi) / 2; if (easeInOut(mid) < target) lo = mid; else hi = mid; }
+  return ((lo + hi) / 2) * GROW_END;
+}
+
+// ---------------------------------------------------------------------------
+// Spine: a quadratic bezier running diagonally, lower-left to upper-right.
+// The whole spine sways gently: the control point breathes on two slow
+// sines, so every point of the rope (and everything riding it) is a closed
+// form of time.
+// ---------------------------------------------------------------------------
+function spinePoint(s, t, out) {
+  var sw = Math.min(W, H);
+  var cx = 0.44 * W + sw * 0.010 * Math.sin(2 * Math.PI * t / 17.0);
+  var cy = 0.34 * H + sw * 0.014 * Math.sin(2 * Math.PI * t / 13.0 + 1.1);
+  var x0 = 0.06 * W, y0 = 0.88 * H, x2 = 0.94 * W, y2 = 0.12 * H;
+  var u = 1 - s;
+  out.x = u * u * x0 + 2 * u * s * cx + s * s * x2;
+  out.y = u * u * y0 + 2 * u * s * cy + s * s * y2;
+  // Tangent by finite difference, then the unit normal.
+  var e = 0.002, ax = {}, bx = {};
+  spineRaw(Math.max(0, s - e), cx, cy, ax);
+  spineRaw(Math.min(1, s + e), cx, cy, bx);
+  var dx = bx.x - ax.x, dy = bx.y - ax.y, m = Math.hypot(dx, dy) || 1;
+  out.tx = dx / m; out.ty = dy / m;
+  out.nx = -dy / m; out.ny = dx / m;
+  return out;
+}
+function spineRaw(s, cx, cy, out) {
+  var x0 = 0.06 * W, y0 = 0.88 * H, x2 = 0.94 * W, y2 = 0.12 * H, u = 1 - s;
+  out.x = u * u * x0 + 2 * u * s * cx + s * s * x2;
+  out.y = u * u * y0 + 2 * u * s * cy + s * s * y2;
+}
+
+// Point on strand k at spine parameter s: the spine point swung around the
+// rope axis by the braid phase. off = sine (perpendicular offset), z = cosine
+// (depth proxy used for draw order and shading).
+function strandPoint(k, s, t, out) {
+  var base = spinePoint(s, t, out);
+  var A = Math.min(W, H) * 0.016;
+  var ph = TWISTS * 2 * Math.PI * s + k * (2 * Math.PI / 3);
+  var off = A * Math.sin(ph);
+  out.x = base.x + base.nx * off;
+  out.y = base.y + base.ny * off;
+  out.z = Math.cos(ph);
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Token schedule for one cycle: seeded slots along each strand. Each token
+// flies in from a seeded point on a canvas edge and lands just before the
+// growth front reaches its slot. Kinds: 0 flower (circle cluster),
+// 1 bead (single circle), 2 light (spark diamond), 3 cord (lozenge).
+// ---------------------------------------------------------------------------
+function buildSchedule(cycleIdx) {
+  var rng = mulberry32(BASE_SEED + cycleIdx * 7919);
+  var toks = [];
+  for (var k = 0; k < 3; k++) {
+    var s = 0.035 + rng() * 0.02;
+    while (s < 0.985) {
+      var edge = Math.floor(rng() * 4), ep = rng();
+      var ex = edge === 1 ? 1 : edge === 3 ? 0 : ep;
+      var ey = edge === 0 ? 0 : edge === 2 ? 1 : ep;
+      var dur = 1.0 + rng() * 0.5;
+      toks.push({
+        strand: k, s: s, kind: Math.floor(rng() * 4),
+        size: 0.8 + rng() * 0.5,
+        ex: ex, ey: ey, dur: dur,
+        start: reachTime(s) - dur,
+        bow: (rng() - 0.5) * 0.16,
+        driftA: rng() * Math.PI * 2
+      });
+      s += 0.048 + rng() * 0.03;
+    }
+  }
+  return toks;
+}
+var schedCache = { cycle: -1, toks: [] };
+function scheduleFor(cycleIdx) {
+  if (schedCache.cycle !== cycleIdx) {
+    schedCache = { cycle: cycleIdx, toks: buildSchedule(cycleIdx) };
+  }
+  return schedCache.toks;
+}
+
+// Tap bursts: recorded events only. Each burst is generated at tap time
+// from its own seeded stream and belongs to the cycle it was tapped in.
+var bursts = [];
+var burstCount = 0;
+function addBurst(tc, cycleIdx, frontL) {
+  var rng = mulberry32(BASE_SEED * 7 + burstCount * 131 + cycleIdx * 17);
+  burstCount++;
+  var toks = [], n = 9 + Math.floor(rng() * 4);
+  for (var i = 0; i < n; i++) {
+    var edge = Math.floor(rng() * 4), ep = rng();
+    toks.push({
+      strand: Math.floor(rng() * 3),
+      s: 0.04 + rng() * Math.max(0.06, frontL - 0.04),
+      kind: Math.floor(rng() * 4),
+      size: 0.8 + rng() * 0.5,
+      ex: edge === 1 ? 1 : edge === 3 ? 0 : ep,
+      ey: edge === 0 ? 0 : edge === 2 ? 1 : ep,
+      dur: 0.9 + rng() * 0.5,
+      start: tc + rng() * 0.5,
+      bow: (rng() - 0.5) * 0.16,
+      driftA: rng() * Math.PI * 2
+    });
+  }
+  bursts.push({ cycle: cycleIdx, toks: toks });
+  if (bursts.length > 6) bursts.shift();
+}
+
+// ---------------------------------------------------------------------------
+// Drawing.
+// ---------------------------------------------------------------------------
+function drawTokenGlyph(tok, x, y, tx, ty, r, alpha) {
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = KIND_COL[tok.kind];
+  var i, a;
+  if (tok.kind === 1) {                       // bead: one circle
+    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+  } else if (tok.kind === 0) {                // flower: small circle cluster
+    ctx.beginPath(); ctx.arc(x, y, r * 0.42, 0, Math.PI * 2); ctx.fill();
+    for (i = 0; i < 5; i++) {
+      a = (i / 5) * Math.PI * 2 + 0.5;
+      ctx.beginPath();
+      ctx.arc(x + Math.cos(a) * r * 0.72, y + Math.sin(a) * r * 0.72, r * 0.40, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  } else if (tok.kind === 2) {                // light: spark diamond
+    ctx.beginPath();
+    ctx.moveTo(x, y - r * 1.45);
+    ctx.lineTo(x + r * 0.38, y);
+    ctx.lineTo(x, y + r * 1.45);
+    ctx.lineTo(x - r * 0.38, y);
+    ctx.closePath(); ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(x - r * 0.95, y);
+    ctx.lineTo(x, y + r * 0.26);
+    ctx.lineTo(x + r * 0.95, y);
+    ctx.lineTo(x, y - r * 0.26);
+    ctx.closePath(); ctx.fill();
+  } else {                                    // cord: lozenge along the strand
+    ctx.beginPath();
+    ctx.moveTo(x + tx * r * 1.35, y + ty * r * 1.35);
+    ctx.lineTo(x - ty * r * 0.48, y + tx * r * 0.48);
+    ctx.lineTo(x - tx * r * 1.35, y - ty * r * 1.35);
+    ctx.lineTo(x + ty * r * 0.48, y - tx * r * 0.48);
+    ctx.closePath(); ctx.fill();
+  }
+  ctx.restore();
+}
+
+// One token at cycle time tc, given the current finished length L.
+function drawToken(tok, tc, L, tAbs) {
+  if (tc < tok.start) return;
+  var u = clamp01((tc - tok.start) / tok.dur);
+  var dep = strandPoint(tok.strand, tok.s, tAbs, {});
+  var rBase = Math.min(W, H) * 0.011 * tok.size;
+  if (u < 1) {
+    var e = easeOut(u);
+    var ex = tok.ex * W, ey = tok.ey * H;
+    var bx = -Math.sin(tok.driftA), by = Math.cos(tok.driftA);
+    var bowOff = Math.sin(Math.PI * u) * tok.bow * Math.min(W, H);
+    var x = ex + (dep.x - ex) * e + bx * bowOff;
+    var y = ey + (dep.y - ey) * e + by * bowOff;
+    drawTokenGlyph(tok, x, y, dep.tx, dep.ty, rBase * (0.7 + 0.3 * e), 0.35 + 0.65 * e);
+    return;
+  }
+  // Landed. During unbraid, slots past the retracting front disperse.
+  if (tok.s > L) {
+    var d = clamp01((tok.s - L) / 0.08);
+    if (d >= 1) return;
+    var dx = Math.cos(tok.driftA) * d * Math.min(W, H) * 0.05;
+    var dy = Math.sin(tok.driftA) * d * Math.min(W, H) * 0.05 - d * Math.min(W, H) * 0.02;
+    drawTokenGlyph(tok, dep.x + dx, dep.y + dy, dep.tx, dep.ty, rBase * (1 - 0.4 * d), 1 - d);
+    return;
+  }
+  drawTokenGlyph(tok, dep.x, dep.y, dep.tx, dep.ty, rBase, 1);
+}
+
+function draw(t) {
+  if (W === 0 || H === 0) return;
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  ctx.fillStyle = COL.bg;
+  ctx.fillRect(0, 0, W, H);
+
+  var cycleIdx = Math.floor(t / CYCLE);
+  var tc = t - cycleIdx * CYCLE;
+  var L = ropeLength(tc);
+  var sw = Math.min(W, H);
+
+  // Braid: sample every strand, stroke segment by segment back-to-front so
+  // the over-under weave reads. Only the finished length is drawn.
+  var STEP = 0.004;
+  var segs = [];
+  var k, s, p0, p1;
+  for (k = 0; k < 3; k++) {
+    p0 = strandPoint(k, 0, t, {});
+    for (s = STEP; s <= L + 1e-6; s += STEP) {
+      var ss = Math.min(s, L);
+      p1 = strandPoint(k, ss, t, {});
+      segs.push({ x0: p0.x, y0: p0.y, x1: p1.x, y1: p1.y, z: (p0.z + p1.z) / 2 });
+      p0 = p1;
+      if (ss >= L) break;
+    }
+  }
+  segs.sort(function (a, b) { return a.z - b.z; });
+  ctx.strokeStyle = COL.braid;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.lineWidth = Math.max(1.2, sw * 0.0105);
+  for (var i = 0; i < segs.length; i++) {
+    var sg = segs[i];
+    ctx.globalAlpha = 0.62 + 0.38 * ((sg.z + 1) / 2);
+    ctx.beginPath();
+    ctx.moveTo(sg.x0, sg.y0);
+    ctx.lineTo(sg.x1, sg.y1);
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+
+  // Tokens: this cycle's schedule, then this cycle's tap bursts.
+  var toks = scheduleFor(cycleIdx);
+  for (i = 0; i < toks.length; i++) drawToken(toks[i], tc, L, t);
+  for (i = 0; i < bursts.length; i++) {
+    if (bursts[i].cycle !== cycleIdx) continue;
+    var bt = bursts[i].toks;
+    for (var j = 0; j < bt.length; j++) drawToken(bt[j], tc, L, t);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Tap: a burst of extra tokens streams in toward the finished rope.
+// ---------------------------------------------------------------------------
+if (canvas.addEventListener) {
+  canvas.addEventListener('pointerdown', function () {
+    var cycleIdx = Math.floor(curT / CYCLE);
+    var tc = curT - cycleIdx * CYCLE;
+    addBurst(tc, cycleIdx, ropeLength(tc));
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Sizing: Visual Viewport API, listeners on visualViewport AND window.
+// ---------------------------------------------------------------------------
+function resize() {
+  var vw = (window.visualViewport && window.visualViewport.width) || window.innerWidth;
+  var vh = (window.visualViewport && window.visualViewport.height) || window.innerHeight;
+  W = Math.round(vw);
+  H = Math.round(vh);
+  canvas.width = W;
+  canvas.height = H;
+  var sw = window.screen && window.screen.width;
+  var sh = window.screen && window.screen.height;
+  if (sw && sh) isPhone = Math.min(sw, sh) < 700;
+  else isPhone = H > W * 1.15;
+  draw(curT);
+}
+if (window.visualViewport && window.visualViewport.addEventListener) {
+  window.visualViewport.addEventListener('resize', resize);
+}
+if (window.addEventListener) window.addEventListener('resize', resize);
+
+// ---------------------------------------------------------------------------
+// Boot: frame one is the synchronous draw at cycle t = 0. The loop, when a
+// browser provides rAF, is anchored as elapsed-since-load added to 0.
+// An inert ?seed=tNN hook (QA only) pins the first frame to a fixed phase.
+// ---------------------------------------------------------------------------
+var startStamp = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+(function () {
+  var m = /[?&]seed=t(\d+(?:\.\d+)?)/.exec((typeof location !== 'undefined' && location.search) || '');
+  if (m) curT = parseFloat(m[1]);
+})();
+resize();
+if (typeof requestAnimationFrame === 'function') {
+  var loop = function () {
+    curT = (performance.now() - startStamp) / 1000;
+    draw(curT);
+    requestAnimationFrame(loop);
+  };
+  requestAnimationFrame(loop);
+}
+</script>
+</body>
+</html>
