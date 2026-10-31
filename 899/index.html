@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Phy/s[a]/ru.'m</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #ECEAE6; overflow: hidden; height: 100%; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded RNG (mulberry32) ----------
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(89960);
+  var audioRng = mulberry32(4243);
+
+  // ---------- palette (strict, pale grey discipline) ----------
+  var GROUND = [236, 234, 230];  // #ECEAE6
+  var TUBE   = [138, 136, 127];  // #8A887F
+  var CORE   = [245, 244, 240];  // #F5F4F0
+  var PUFF   = [196, 194, 186];  // #C4C2BA
+  var GRAIN  = [165, 163, 154];  // #A5A39A
+  var GROUND_CSS = '#ECEAE6';
+  var PUFF_CSS = '#C4C2BA';
+
+  // tone LUT: deposit level 0..1 -> rgb string.
+  // stops: ground -> grain (0..0.20) -> tube (0.20..0.58) -> core (0.58..1)
+  function lerpC(a, b, t) { return Math.round(a + (b - a) * t); }
+  var LUT = [];
+  (function buildLUT() {
+    for (var i = 0; i <= 64; i++) {
+      var d = i / 64, r, g, b, t;
+      if (d < 0.20) {
+        t = d / 0.20;
+        r = lerpC(GROUND[0], GRAIN[0], t); g = lerpC(GROUND[1], GRAIN[1], t); b = lerpC(GROUND[2], GRAIN[2], t);
+      } else if (d < 0.58) {
+        t = (d - 0.20) / 0.38;
+        r = lerpC(GRAIN[0], TUBE[0], t); g = lerpC(GRAIN[1], TUBE[1], t); b = lerpC(GRAIN[2], TUBE[2], t);
+      } else {
+        t = (d - 0.58) / 0.42;
+        r = lerpC(TUBE[0], CORE[0], t); g = lerpC(TUBE[1], CORE[1], t); b = lerpC(TUBE[2], CORE[2], t);
+      }
+      LUT.push('rgb(' + r + ',' + g + ',' + b + ')');
+    }
+  })();
+  var SPECKLE = 'rgb(' + lerpC(GROUND[0], GRAIN[0], 0.55) + ',' + lerpC(GROUND[1], GRAIN[1], 0.55) + ',' + lerpC(GROUND[2], GRAIN[2], 0.55) + ')';
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 720, H = 720, DPR = 1;
+
+  function isPhone() {
+    var sw = 0, sh = 0;
+    if (typeof window !== 'undefined' && window.screen) {
+      sw = window.screen.width || 0; sh = window.screen.height || 0;
+    }
+    var mn = Math.min(sw, sh);
+    if (mn > 0) return mn < 700;
+    return H > W * 1.15;
+  }
+
+  function resize() {
+    var w = 0, h = 0;
+    if (typeof window !== 'undefined' && window.visualViewport) {
+      w = window.visualViewport.width || 0; h = window.visualViewport.height || 0;
+    }
+    if (!w || !h) {
+      w = (typeof window !== 'undefined' && window.innerWidth) || 720;
+      h = (typeof window !== 'undefined' && window.innerHeight) || 720;
+    }
+    W = Math.round(w); H = Math.round(h);
+    DPR = 1;
+    if (typeof window !== 'undefined' && window.devicePixelRatio) {
+      DPR = Math.min(window.devicePixelRatio, 2);
+    }
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+  }
+  resize(); // size now so the deposit grid can match the frame aspect
+  var GW0 = 220;
+  var GH0 = Math.max(100, Math.min(400, Math.round(GW0 * H / W)));
+
+  // ---------- physarum model ----------
+  var GW = GW0, GH = GH0, NCELL = GW * GH;
+  var grid = new Float32Array(NCELL);
+  var scratch = new Float32Array(NCELL);
+  var grainF = new Float32Array(NCELL); // per-cell granular factor, static
+  (function buildGrain() {
+    for (var i = 0; i < NCELL; i++) grainF[i] = rng();
+  })();
+
+  var BASE_AGENTS = isPhone() ? 1500 : 2500;
+  var MAX_AGENTS = isPhone() ? 2100 : 3400;
+  var agents = []; // {x, y, a} in grid units
+  var SD = 4.6;        // sense distance (cells)
+  var SA = 0.45;       // sense angle (rad)
+  var TA = 0.38;       // turn angle (rad)
+  var STEP = 1.5;      // move per step (cells)
+  var DEP = 0.20;      // deposit per agent-step at full feed
+  var CAP = 1.3;       // deposit cap per cell
+
+  var feed = 1;            // 1 = fed, drains over ~55 s
+  var depositScale = 1;    // derived from feed each live step
+  var meanDeposit = 0;
+  var puffAmount = 0;
+  var simTime = 0;
+
+  function spawnCluster(gx, gy, count, spread) {
+    for (var i = 0; i < count; i++) {
+      if (agents.length >= MAX_AGENTS) return;
+      var x = gx + (rng() + rng() + rng() - 1.5) * spread;
+      var y = gy + (rng() + rng() + rng() - 1.5) * spread;
+      x = ((x % GW) + GW) % GW;
+      y = ((y % GH) + GH) % GH;
+      agents.push({ x: x, y: y, a: rng() * Math.PI * 2 });
+    }
+  }
+
+  function seedInitial() {
+    agents = [];
+    var per = Math.floor(BASE_AGENTS / 3);
+    spawnCluster(GW * (0.28 + rng() * 0.08), GH * (0.30 + rng() * 0.08), per, 10);
+    spawnCluster(GW * (0.62 + rng() * 0.08), GH * (0.52 + rng() * 0.08), per, 10);
+    spawnCluster(GW * (0.42 + rng() * 0.08), GH * (0.72 + rng() * 0.08), BASE_AGENTS - 2 * per, 10);
+  }
+
+  function reseed() {
+    grid.fill(0);
+    agents = [];
+    spawnCluster(GW * (0.32 + rng() * 0.36), GH * (0.32 + rng() * 0.36), BASE_AGENTS, 10);
+    feed = 1;
+  }
+
+  function sense(x, y, ang) {
+    var sx = x + Math.cos(ang) * SD;
+    var sy = y + Math.sin(ang) * SD;
+    var ix = ((Math.floor(sx) % GW) + GW) % GW;
+    var iy = ((Math.floor(sy) % GH) + GH) % GH;
+    return grid[iy * GW + ix];
+  }
+
+  // one fixed sim step: diffuse + decay the field, then agents sense/move/deposit
+  function simStep(starving) {
+    var decay = starving ? 0.988 : 0.993;
+    var x, y, i, sum = 0;
+    for (y = 0; y < GH; y++) {
+      var yu = ((y - 1 + GH) % GH) * GW, yc = y * GW, yd = ((y + 1) % GH) * GW;
+      for (x = 0; x < GW; x++) {
+        var xl = (x - 1 + GW) % GW, xr = (x + 1) % GW;
+        var blur = (grid[yc + x] * 4 +
+                    grid[yc + xl] * 2 + grid[yc + xr] * 2 +
+                    grid[yu + x] * 2 + grid[yd + x] * 2 +
+                    grid[yu + xl] + grid[yu + xr] + grid[yd + xl] + grid[yd + xr]) / 16;
+        var v = (grid[yc + x] + (blur - grid[yc + x]) * 0.12) * decay;
+        scratch[yc + x] = v;
+        sum += v;
+      }
+    }
+    var tmp = grid; grid = scratch; scratch = tmp;
+    meanDeposit = sum / NCELL;
+
+    for (i = 0; i < agents.length; i++) {
+      var ag = agents[i];
+      var sC = sense(ag.x, ag.y, ag.a);
+      var sL = sense(ag.x, ag.y, ag.a - SA);
+      var sR = sense(ag.x, ag.y, ag.a + SA);
+      if (sC >= sL && sC >= sR) {
+        // hold course, small wander
+        ag.a += (rng() - 0.5) * 0.14;
+      } else if (sL > sR) {
+        ag.a -= TA;
+      } else if (sR > sL) {
+        ag.a += TA;
+      } else {
+        ag.a += (rng() < 0.5 ? -TA : TA);
+      }
+      ag.x += Math.cos(ag.a) * STEP;
+      ag.y += Math.sin(ag.a) * STEP;
+      if (ag.x < 0) ag.x += GW; else if (ag.x >= GW) ag.x -= GW;
+      if (ag.y < 0) ag.y += GH; else if (ag.y >= GH) ag.y -= GH;
+      if (depositScale > 0) {
+        var idx = ((ag.y | 0) * GW) + (ag.x | 0);
+        var nv = grid[idx] + DEP * depositScale;
+        grid[idx] = nv > CAP ? CAP : nv;
+      }
+    }
+  }
+
+  // ---------- dissolution puffs (corner-biased, seeded) ----------
+  var puffs = [];
+  (function buildPuffs() {
+    var corners = [[0.10, 0.10], [0.90, 0.10], [0.10, 0.90], [0.90, 0.90],
+                   [0.06, 0.48], [0.94, 0.52], [0.48, 0.06], [0.52, 0.94]];
+    for (var i = 0; i < 14; i++) {
+      var c = corners[i % corners.length];
+      puffs.push({
+        fx: Math.min(0.97, Math.max(0.03, c[0] + (rng() - 0.5) * 0.13)),
+        fy: Math.min(0.97, Math.max(0.03, c[1] + (rng() - 0.5) * 0.13)),
+        r: 0.07 + rng() * 0.11 // fraction of min dimension
+      });
+    }
+  })();
+
+  // ---------- init + deterministic pre-roll ----------
+  var PREROLL = 80; // fixed steps at full feed before frame one
+  seedInitial();
+  depositScale = 1;
+  for (var pr = 0; pr < PREROLL; pr++) simStep(false);
+
+  // ---------- metabolism (live step) ----------
+  var pendingSeeds = []; // {gx, gy, at}
+  function liveStep(dt) {
+    simTime += dt;
+    feed = Math.max(0, feed - dt / 55);
+    var starving = feed <= 0.001;
+    depositScale = starving ? 0 : 0.35 + 0.65 * feed;
+    simStep(starving);
+    // puffs gather as the network melts
+    var target = starving ? Math.min(1, Math.max(0, 1 - meanDeposit / 0.07)) : 0;
+    puffAmount += (target - puffAmount) * Math.min(1, dt * 0.6);
+    // deferred tap seeds (a double-tap can cancel them)
+    for (var i = pendingSeeds.length - 1; i >= 0; i--) {
+      if (simTime >= pendingSeeds[i].at) {
+        spawnCluster(pendingSeeds[i].gx, pendingSeeds[i].gy, 220, 4);
+        pendingSeeds.splice(i, 1);
+      }
+    }
+    // full dissolution: the mold reseeds itself from one seed
+    if (starving && meanDeposit < 0.006) reseed();
+  }
+
+  // ---------- audio (lazy, first gesture only): bubbling grains ----------
+  var AC = null, master = null, grainBuf = null, nextGrain = 0;
+  function ensureAudio() {
+    if (AC) { if (AC.resume) AC.resume(); return; }
+    try {
+      var Ctor = null;
+      if (typeof AudioContext !== 'undefined') Ctor = AudioContext;
+      else if (typeof webkitAudioContext !== 'undefined') Ctor = webkitAudioContext;
+      if (!Ctor) return;
+      AC = new Ctor();
+      master = AC.createGain();
+      master.gain.value = 0.55;
+      master.connect(AC.destination);
+      var len = Math.floor(AC.sampleRate * 0.09);
+      grainBuf = AC.createBuffer(1, len, AC.sampleRate);
+      var d = grainBuf.getChannelData(0);
+      for (var i = 0; i < len; i++) {
+        var env = Math.sin(Math.PI * i / len);
+        d[i] = (audioRng() * 2 - 1) * env * env;
+      }
+      nextGrain = AC.currentTime + 0.1;
+    } catch (e) { AC = null; }
+  }
+  function audioUpdate() {
+    if (!AC || !grainBuf) return;
+    try {
+      var activity = Math.min(1, meanDeposit / 0.09);
+      var horizon = AC.currentTime + 0.2;
+      var guard = 0;
+      while (nextGrain < horizon && guard < 12) {
+        guard++;
+        if (audioRng() < 0.15 + 0.85 * activity) {
+          var src = AC.createBufferSource();
+          src.buffer = grainBuf;
+          src.playbackRate.value = 0.7 + audioRng() * 0.9;
+          var bp = AC.createBiquadFilter();
+          bp.type = 'bandpass';
+          bp.frequency.value = 320 + audioRng() * 950 * (0.55 + 0.75 * activity);
+          bp.Q.value = 6;
+          var g = AC.createGain();
+          g.gain.value = 0.02 + 0.15 * activity * (0.4 + 0.6 * audioRng());
+          src.connect(bp); bp.connect(g); g.connect(master);
+          src.start(nextGrain);
+        }
+        nextGrain += (0.42 + (0.07 - 0.42) * activity) * (0.7 + 0.6 * audioRng());
+      }
+      if (nextGrain < AC.currentTime) nextGrain = AC.currentTime + 0.05;
+    } catch (e) {}
+  }
+
+  // ---------- draw ----------
+  function draw() {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = GROUND_CSS;
+    ctx.fillRect(0, 0, W, H);
+
+    var cw = W / GW, ch = H / GH;
+    var lastFill = '';
+    for (var y = 0; y < GH; y++) {
+      var row = y * GW;
+      var py = y * ch - 0.3;
+      for (var x = 0; x < GW; x++) {
+        var i = row + x;
+        var d = grid[i];
+        if (d < 0.045) {
+          // empty ground, with sparse granular speckle
+          if (grainF[i] > 0.94) {
+            if (lastFill !== SPECKLE) { ctx.fillStyle = SPECKLE; lastFill = SPECKLE; }
+            ctx.fillRect(x * cw - 0.3, py, cw + 0.6, ch + 0.6);
+          }
+          continue;
+        }
+        var eff = d * (0.78 + 0.45 * grainF[i]);
+        if (eff > 1) eff = 1;
+        var col = LUT[(eff * 64) | 0];
+        if (col !== lastFill) { ctx.fillStyle = col; lastFill = col; }
+        ctx.fillRect(x * cw - 0.3, py, cw + 0.6, ch + 0.6);
+      }
+    }
+
+    if (puffAmount > 0.01) {
+      var s = Math.min(W, H);
+      ctx.fillStyle = PUFF_CSS;
+      for (var p = 0; p < puffs.length; p++) {
+        var pf = puffs[p];
+        var px = pf.fx * W, py2 = pf.fy * H, pr2 = pf.r * s;
+        ctx.globalAlpha = 0.05 * puffAmount;
+        ctx.beginPath(); ctx.arc(px, py2, pr2, 0, Math.PI * 2); ctx.fill();
+        ctx.globalAlpha = 0.07 * puffAmount;
+        ctx.beginPath(); ctx.arc(px, py2, pr2 * 0.68, 0, Math.PI * 2); ctx.fill();
+        ctx.globalAlpha = 0.09 * puffAmount;
+        ctx.beginPath(); ctx.arc(px, py2, pr2 * 0.44, 0, Math.PI * 2); ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  // ---------- interaction ----------
+  var dragging = false, lastX = 0, lastY = 0, downT = 0, downX = 0, downY = 0, moved = 0;
+  var lastTapT = -10, lastTapX = 0, lastTapY = 0;
+
+  function pos(e) {
+    var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    return { x: (e.clientX || 0) - r.left, y: (e.clientY || 0) - r.top };
+  }
+  function layNutrient(x0, y0, x1, y1) {
+    // feed: deposit nutrient along the drag path, in grid units
+    var gx0 = x0 / W * GW, gy0 = y0 / H * GH;
+    var gx1 = x1 / W * GW, gy1 = y1 / H * GH;
+    var dist = Math.sqrt((gx1 - gx0) * (gx1 - gx0) + (gy1 - gy0) * (gy1 - gy0));
+    var steps = Math.max(1, Math.ceil(dist));
+    for (var s = 0; s <= steps; s++) {
+      var cx = gx0 + (gx1 - gx0) * s / steps;
+      var cy = gy0 + (gy1 - gy0) * s / steps;
+      for (var oy = -3; oy <= 3; oy++) {
+        for (var ox = -3; ox <= 3; ox++) {
+          if (ox * ox + oy * oy > 10) continue;
+          var ix = Math.floor(cx) + ox, iy = Math.floor(cy) + oy;
+          if (ix < 0 || iy < 0 || ix >= GW || iy >= GH) continue;
+          var idx = iy * GW + ix;
+          var nv = grid[idx] + 0.45;
+          grid[idx] = nv > CAP ? CAP : nv;
+        }
+      }
+    }
+    var pxDist = Math.sqrt((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0));
+    feed = Math.min(1, feed + pxDist * 0.0012);
+  }
+  function onDown(e) {
+    ensureAudio();
+    var q = pos(e);
+    dragging = true; moved = 0;
+    lastX = downX = q.x; lastY = downY = q.y;
+    downT = simTime;
+    if (e.preventDefault) e.preventDefault();
+  }
+  function onMove(e) {
+    if (!dragging) return;
+    var q = pos(e);
+    var dx = q.x - lastX, dy = q.y - lastY;
+    moved += Math.sqrt(dx * dx + dy * dy);
+    if (dx !== 0 || dy !== 0) layNutrient(lastX, lastY, q.x, q.y);
+    lastX = q.x; lastY = q.y;
+  }
+  function onUp(e) {
+    if (!dragging) return;
+    dragging = false;
+    var dur = simTime - downT;
+    if (dur < 0.3 && moved < 8) {
+      if (simTime - lastTapT < 0.38 && Math.abs(downX - lastTapX) < 40 && Math.abs(downY - lastTapY) < 40) {
+        // double-tap: starve it; full dissolution, then regrowth from one seed
+        pendingSeeds.length = 0;
+        feed = 0;
+        lastTapT = -10;
+      } else {
+        pendingSeeds.push({ gx: downX / W * GW, gy: downY / H * GH, at: simTime + 0.35 });
+        lastTapT = simTime; lastTapX = downX; lastTapY = downY;
+      }
+    }
+  }
+
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+  }
+
+  // ---------- boot ----------
+  resize();
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', function () { resize(); draw(); });
+    }
+    if (window.addEventListener) {
+      window.addEventListener('resize', function () { resize(); draw(); });
+    }
+  }
+
+  draw(); // frame one: the pre-rolled network, synchronous
+
+  var lastStamp = -1, acc = 0;
+  var DT = 1 / 30;
+  function frame(stamp) {
+    if (lastStamp < 0) lastStamp = stamp;
+    var elapsed = (stamp - lastStamp) / 1000;
+    lastStamp = stamp;
+    if (elapsed > 0.25) elapsed = 0.25;
+    acc += elapsed;
+    var n = 0;
+    while (acc >= DT && n < 5) { liveStep(DT); acc -= DT; n++; }
+    draw();
+    audioUpdate();
+    if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(frame);
+  }
+  if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

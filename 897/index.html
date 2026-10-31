@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>F_o.'r y[o]u, m_us.'e</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #FAFAF7; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded RNG (mulberry32) ----------
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(897058);
+
+  // ---------- palette (strict: black on white only) ----------
+  var GROUND = '#FAFAF7';
+  var INK    = '#111111';   // fractal black
+  var CORE   = '#000000';   // dense core
+  var BAND   = '#C8C8C4';   // hairline margin bands
+  var SHADE  = '#2A2A28';   // frond mid-tone (branchlets)
+  function clamp(x, lo, hi) { return x < lo ? lo : (x > hi ? hi : x); }
+  function lerp(a, b, u) { return a + (b - a) * u; }
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 300, H = 300, PHONE = false;
+
+  function measure() {
+    var w, h;
+    if (typeof window !== 'undefined' && window.visualViewport) {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    } else {
+      w = window.innerWidth; h = window.innerHeight;
+    }
+    W = Math.max(50, Math.round(w));
+    H = Math.max(50, Math.round(h));
+    var sw = 100000, sh = 100000;
+    if (typeof window !== 'undefined' && window.screen) {
+      sw = window.screen.width || 100000;
+      sh = window.screen.height || 100000;
+    }
+    PHONE = Math.min(sw, sh) < 700 || (h > w * 1.15 && Math.min(w, h) < 700);
+    canvas.width = W;
+    canvas.height = H;
+  }
+  function onResize() { measure(); draw(currentT()); }
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', onResize);
+    }
+    if (window.addEventListener) window.addEventListener('resize', onResize);
+  }
+
+  // ---------- the breath: one growth parameter G ----------
+  // Asymmetric cycle: 14 s slow bloom (ease-in-out rise), 3 s quick contract.
+  // Phase offset chosen so G(0) = 0.55 on the rising limb:
+  // rise G = 0.5 - 0.5*cos(pi*u); G = 0.55 at u = acos(-0.1)/pi = 0.5319 -> 7.446 s in.
+  var BLOOM_S = 14, CONTRACT_S = 3, CYCLE_S = BLOOM_S + CONTRACT_S;
+  var T_OFF = 7.446;
+  function cycleG(t) {
+    var tc = ((t + T_OFF) % CYCLE_S + CYCLE_S) % CYCLE_S;
+    if (tc < BLOOM_S) {
+      var u = tc / BLOOM_S;
+      return 0.04 + 0.94 * (0.5 - 0.5 * Math.cos(Math.PI * u));
+    }
+    var v = (tc - BLOOM_S) / CONTRACT_S;      // the gasp: fast fall, slight ease
+    var e = 1 - Math.pow(1 - v, 2.2);
+    return 0.98 - 0.94 * e;
+  }
+  function inBloomPhase(t) {
+    var tc = ((t + T_OFF) % CYCLE_S + CYCLE_S) % CYCLE_S;
+    return tc < BLOOM_S;
+  }
+
+  // ---------- recorded gesture events ----------
+  var snaps = [];   // {t} tap: sharp contraction envelope
+  var holds = [];   // {t0, t1} double-tap: medallion held shut
+  function growthAt(t) {
+    var g = cycleG(t);
+    // holds win: G pinned near shut, with a 0.9 s blend back out on release
+    for (var i = 0; i < holds.length; i++) {
+      var hd = holds[i];
+      if (t >= hd.t0 && t <= hd.t1) {
+        var inU = clamp((t - hd.t0) / 0.25, 0, 1);
+        g = lerp(g, 0.04, inU);
+      } else if (t > hd.t1 && t <= hd.t1 + 0.9) {
+        var outU = (t - hd.t1) / 0.9;
+        g = lerp(0.04, g, outU * outU * (3 - 2 * outU));
+      }
+    }
+    // snaps: eye snaps shut at the tap instant, then recovers toward the cycle
+    for (var j = 0; j < snaps.length; j++) {
+      var dt = t - snaps[j].t;
+      if (dt >= 0) {
+        var f = Math.exp(-dt / 0.8);
+        g = g * (1 - f) + 0.03 * f;
+      }
+    }
+    return clamp(g, 0.02, 1);
+  }
+
+  // ---------- seeded frond data ----------
+  // Each frond: base angle, length, curl into the medallion, per-step bend and
+  // wobble, plus precomputed 2-level branchlets. All irregular on purpose.
+  var NFROND = 240;
+  var FRONDS = [];
+  for (var fi = 0; fi < NFROND; fi++) {
+    var baseAng = (fi / NFROND) * Math.PI * 2 + (rng() - 0.5) * 0.11;
+    // clumping: a few seeded gaps and clusters so it never reads as a diagram
+    baseAng += Math.sin(fi * 0.37 + 1.3) * 0.05 + (rng() - 0.5) * 0.05;
+    var fr = {
+      ang: baseAng,
+      r0: Math.pow(rng(), 1.6) * 0.85,          // start radius, fraction of core radius
+      len: 0.55 + Math.pow(rng(), 1.3) * 0.5,   // 0.55 .. 1.05
+      curl: 1.15 + rng() * 0.45,                // tangential lean at G=0 (pinwheel sense shared)
+      bend: 0.16 + rng() * 0.13,                // per-step heading change at G=0
+      wob: (rng() - 0.5) * 0.16,                // residual wobble at G=1
+      wobF: 1.1 + rng() * 1.8,
+      wobP: rng() * Math.PI * 2,
+      turn: 0.18 + rng() * 0.34,                // rotation gained while blooming
+      alpha: 0.82 + rng() * 0.18,
+      branches: []
+    };
+    // branchlets off stem steps 2..5 (level 1), some with a sub-branchlet (level 2)
+    for (var st = 2; st <= 5; st++) {
+      if (rng() < 0.62) {
+        var br = {
+          step: st,
+          side: rng() < 0.5 ? -1 : 1,
+          ang: 0.45 + rng() * 0.5,              // spread from the stem heading
+          lenF: 0.26 + rng() * 0.26,            // fraction of remaining stem length
+          bend: (0.10 + rng() * 0.16) * (rng() < 0.72 ? 1 : -1),
+          sub: null
+        };
+        if (rng() < 0.55) {
+          br.sub = {
+            step: 1 + Math.floor(rng() * 2),  // off branchlet step 1 or 2
+            side: rng() < 0.5 ? -1 : 1,
+            ang: 0.4 + rng() * 0.45,
+            lenF: 0.4 + rng() * 0.3
+          };
+        }
+        fr.branches.push(br);
+      }
+    }
+    FRONDS.push(fr);
+  }
+
+  // ---------- hairline margin bands (seeded, static) ----------
+  var BANDS = [];
+  for (var bi = 0; bi < 150; bi++) {
+    BANDS.push({
+      x: rng(),                                 // fraction of width
+      top: bi % 2 === 0,
+      len: 0.35 + rng() * 0.65,                 // fraction of band depth
+      a: 0.18 + rng() * 0.45,
+      wob: (rng() - 0.5) * 3
+    });
+  }
+
+  // ---------- drawing ----------
+  function drawBands() {
+    var depth = Math.min(W, H) * 0.085;
+    ctx.strokeStyle = BAND;
+    ctx.lineWidth = 1;
+    ctx.lineCap = 'butt';
+    for (var i = 0; i < BANDS.length; i++) {
+      var b = BANDS[i];
+      var x = b.x * W;
+      var L = depth * b.len;
+      ctx.globalAlpha = b.a;
+      ctx.beginPath();
+      if (b.top) { ctx.moveTo(x, -2); ctx.lineTo(x + b.wob, L); }
+      else { ctx.moveTo(x, H + 2); ctx.lineTo(x + b.wob, H - L); }
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // walk one strand: returns points + headings; pure function of params and G
+  function walk(x, y, h0, ds, steps, bendPer, wob, wobF, wobP) {
+    var pts = [{ x: x, y: y }], hs = [h0], h = h0;
+    for (var k = 1; k <= steps; k++) {
+      h += bendPer + Math.sin(k * wobF + wobP) * wob;
+      x += Math.cos(h) * ds;
+      y += Math.sin(h) * ds;
+      pts.push({ x: x, y: y });
+      hs.push(h);
+    }
+    return { pts: pts, hs: hs };
+  }
+
+  function strokeTaper(pts, w0, w1, color, alpha) {
+    ctx.strokeStyle = color;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.globalAlpha = alpha;
+    var n = pts.length - 1;
+    for (var k = 0; k < n; k++) {
+      var u = n === 1 ? 0 : k / (n - 1);
+      ctx.lineWidth = Math.max(0.4, lerp(w0, w1, u));
+      ctx.beginPath();
+      ctx.moveTo(pts[k].x, pts[k].y);
+      ctx.lineTo(pts[k + 1].x, pts[k + 1].y);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawFrond(fr, G, cx, cy, R, coreR, scale) {
+    // direction interpolates: tangential curl (medallion) -> radial (burst),
+    // and the whole frond gains rotation as it blooms.
+    var tang = (1 - G) * fr.curl;
+    var h0 = fr.ang + tang + G * fr.turn;
+    var sx = cx + Math.cos(fr.ang) * fr.r0 * coreR;
+    var sy = cy + Math.sin(fr.ang) * fr.r0 * coreR;
+    var Rlen = R * (0.30 + 0.70 * G) * fr.len;
+    var steps = 6;
+    var ds = Rlen / steps;
+    var bendPer = lerp(fr.bend, fr.wob * 0.4, G);
+    var main = walk(sx, sy, h0, ds, steps, bendPer, fr.wob * (1 - G * 0.5), fr.wobF, fr.wobP);
+    strokeTaper(main.pts, 4 * scale, 0.5, INK, fr.alpha);
+
+    // level 1 branchlets, then level 2 sub-branchlets
+    for (var i = 0; i < fr.branches.length; i++) {
+      var br = fr.branches[i];
+      var bp = main.pts[br.step], bh = main.hs[br.step];
+      var bSteps = 3;
+      var bDs = ds * br.lenF * (steps / bSteps) * 0.62;
+      var bWalk = walk(bp.x, bp.y, bh + br.side * br.ang, bDs, bSteps,
+                       br.bend * (1 - G * 0.4), fr.wob * 0.7, fr.wobF * 1.3, fr.wobP + br.step);
+      strokeTaper(bWalk.pts, 1.9 * scale, 0.4, SHADE, fr.alpha * 0.92);
+      if (br.sub) {
+        var sp = bWalk.pts[br.sub.step], sh = bWalk.hs[br.sub.step];
+        var sWalk = walk(sp.x, sp.y, sh + br.sub.side * br.sub.ang,
+                         bDs * br.sub.lenF * 0.8, 2,
+                         br.bend * 0.8, fr.wob * 0.5, fr.wobF * 1.6, fr.wobP + 2.1);
+        strokeTaper(sWalk.pts, 0.8 * scale, 0.35, SHADE, fr.alpha * 0.8);
+      }
+    }
+  }
+
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.fillStyle = GROUND;
+    ctx.fillRect(0, 0, W, H);
+
+    var G = growthAt(t);
+    var S = Math.min(W, H);
+    var cx = W / 2, cy = H / 2;
+    var R = S * 0.46;
+    var coreR = S * 0.045 * (1 - G * 0.25);
+    var scale = clamp(S / 720, 0.55, 1.4);
+
+    drawBands();
+
+    // the organism
+    for (var i = 0; i < FRONDS.length; i++) {
+      drawFrond(FRONDS[i], G, cx, cy, R, coreR, scale);
+    }
+
+    // dense core drawn last so frond bases sink into it
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = CORE;
+    ctx.beginPath();
+    ctx.arc(cx, cy, Math.max(2.5, coreR), 0, Math.PI * 2);
+    ctx.fill();
+    // a few short core strokes to break the disc edge
+    ctx.strokeStyle = CORE;
+    ctx.lineCap = 'round';
+    for (var k = 0; k < 26; k++) {
+      var a = (k / 26) * Math.PI * 2 + Math.sin(k * 2.7) * 0.2;
+      var r1 = coreR * (0.75 + 0.35 * Math.abs(Math.sin(k * 1.93)));
+      ctx.lineWidth = Math.max(0.6, 1.6 * scale);
+      ctx.beginPath();
+      ctx.moveTo(cx + Math.cos(a) * coreR * 0.5, cy + Math.sin(a) * coreR * 0.5);
+      ctx.lineTo(cx + Math.cos(a) * r1, cy + Math.sin(a) * r1);
+      ctx.stroke();
+    }
+  }
+
+  // ---------- clock ----------
+  var startStamp = null;
+  function nowSec() {
+    if (typeof performance !== 'undefined' && performance.now) {
+      return performance.now() / 1000;
+    }
+    return 0;
+  }
+  function currentT() {
+    if (startStamp === null) return 0;
+    return nowSec() - startStamp;
+  }
+
+  // ---------- audio (lazy, gesture-gated, guarded) ----------
+  // Airy wash of filtered-noise voices; voice count follows G. Contraction = inhale.
+  var AC = null, voiceGains = [], washGain = null, noiseBuf = null, audioOK = false;
+  function initAudio() {
+    if (audioOK) return;
+    audioOK = true;
+    try {
+      var Ctor = (typeof window !== 'undefined') &&
+        (window.AudioContext || window.webkitAudioContext);
+      if (!Ctor || typeof Ctor !== 'function') return;
+      AC = new Ctor();
+      var master = AC.createGain(); master.gain.value = 0.85;
+      master.connect(AC.destination);
+
+      var len = AC.sampleRate * 2;
+      noiseBuf = AC.createBuffer(1, len, AC.sampleRate);
+      var data = noiseBuf.getChannelData(0);
+      var arng = mulberry32(5813);
+      for (var i = 0; i < len; i++) data[i] = arng() * 2 - 1;
+
+      // base wash: lowpassed noise, always present once enabled
+      var src0 = AC.createBufferSource(); src0.buffer = noiseBuf; src0.loop = true;
+      var lp = AC.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 700; lp.Q.value = 0.4;
+      washGain = AC.createGain(); washGain.gain.value = 0;
+      src0.connect(lp); lp.connect(washGain); washGain.connect(master);
+      src0.start();
+
+      // layered voices: bandpassed noise at rising frequencies, gain follows G
+      var freqs = [520, 880, 1420, 2250];
+      for (var v = 0; v < freqs.length; v++) {
+        var src = AC.createBufferSource(); src.buffer = noiseBuf; src.loop = true;
+        src.playbackRate.value = 0.85 + v * 0.13;
+        var bp = AC.createBiquadFilter(); bp.type = 'bandpass';
+        bp.frequency.value = freqs[v]; bp.Q.value = 0.9;
+        var g = AC.createGain(); g.gain.value = 0;
+        src.connect(bp); bp.connect(g); g.connect(master);
+        src.start();
+        voiceGains.push(g);
+      }
+    } catch (e) {
+      AC = null;
+    }
+  }
+  var inhaleCount = 0;
+  function inhale() {
+    if (!AC || !noiseBuf) return;
+    try {
+      var ct = AC.currentTime;
+      inhaleCount++;
+      var src = AC.createBufferSource(); src.buffer = noiseBuf; src.loop = false;
+      var bp = AC.createBiquadFilter(); bp.type = 'bandpass'; bp.Q.value = 1.1;
+      bp.frequency.setValueAtTime(1500, ct);
+      bp.frequency.exponentialRampToValueAtTime(260, ct + 0.85);
+      var g = AC.createGain();
+      g.gain.setValueAtTime(0.0001, ct);
+      g.gain.exponentialRampToValueAtTime(0.11, ct + 0.12);
+      g.gain.exponentialRampToValueAtTime(0.0001, ct + 0.95);
+      src.connect(bp); bp.connect(g); g.connect(AC.destination);
+      src.start(ct, (inhaleCount * 0.37) % 0.6, 1.1);
+      src.stop(ct + 1.1);
+    } catch (e) { /* decorative */ }
+  }
+  function updateAudio(t) {
+    if (!AC) return;
+    try {
+      var G = growthAt(t);
+      var ct = AC.currentTime;
+      if (washGain) washGain.gain.setTargetAtTime(0.020 + 0.030 * G, ct, 0.25);
+      for (var v = 0; v < voiceGains.length; v++) {
+        var on = clamp((G - 0.12 - v * 0.20) / 0.30, 0, 1);
+        voiceGains[v].gain.setTargetAtTime(0.028 * on, ct, 0.3);
+      }
+      if (AC.state === 'suspended' && typeof AC.resume === 'function') AC.resume();
+    } catch (e) { /* audio is decorative; visuals never depend on it */ }
+  }
+
+  // ---------- pointer interaction (tap / double-tap only) ----------
+  var downT = 0, downX = 0, downY = 0, moved = false, isDown = false;
+  var lastTapT = -10, wasInBloom = true;
+  function onDown(e) {
+    initAudio();
+    isDown = true; moved = false;
+    downT = currentT(); downX = e.clientX; downY = e.clientY;
+  }
+  function onMove(e) {
+    if (!isDown) return;
+    if (Math.abs(e.clientX - downX) + Math.abs(e.clientY - downY) > 8) moved = true;
+  }
+  function onUp(e) {
+    if (!isDown) return;
+    isDown = false;
+    var t = currentT();
+    if (moved || t - downT >= 0.35) return;
+    if (t - lastTapT < 0.38) {
+      // double-tap: hold the medallion shut for 6 s
+      holds.push({ t0: t, t1: t + 6 });
+      if (holds.length > 6) holds.splice(0, holds.length - 6);
+      lastTapT = -10;
+      inhale();
+    } else {
+      // tap: the eye snaps shut for an instant
+      snaps.push({ t: t });
+      if (snaps.length > 24) snaps.splice(0, snaps.length - 24);
+      lastTapT = t;
+      inhale();
+    }
+  }
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('pointerdown', onDown);
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
+  }
+
+  // ---------- run ----------
+  measure();
+  draw(0); // deterministic frame one, synchronous
+
+  if (typeof requestAnimationFrame === 'function') {
+    startStamp = nowSec();
+    var loop = function () {
+      var t = currentT();
+      // the cycle's own contraction also breathes in (audio only)
+      var ib = inBloomPhase(t);
+      if (wasInBloom && !ib) inhale();
+      wasInBloom = ib;
+      draw(t);
+      updateAudio(t);
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>

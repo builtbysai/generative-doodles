@@ -1,0 +1,587 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Coll/[i]s/io.'n</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #030304;
+    overflow: hidden;
+    height: 100%;
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- palette (strict) ----------
+  var GROUND = '#030304';
+  var SPIKE = '#EDEDED';
+  var GLOW = '#CFE8FF';
+  var DARKCORE = '#1A1A1C';
+  var SHADE = '#9A9AA0';
+
+  // ---------- seeded RNG (mulberry32) ----------
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a = (a + 0x6D2B79F5) >>> 0;
+      var t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(0x898C011);
+
+  // ---------- viewport ----------
+  var canvas = document.getElementById('stage');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0, DPR = 1;
+
+  function isPhone() {
+    var sw = 0, sh = 0;
+    if (typeof window !== 'undefined' && window.screen) {
+      sw = window.screen.width || 0;
+      sh = window.screen.height || 0;
+    }
+    var mn = Math.min(sw, sh);
+    if (mn > 0) return mn < 700;
+    return H > W * 1.15;
+  }
+
+  function resize() {
+    var w, h;
+    if (typeof window !== 'undefined' && window.visualViewport) {
+      w = window.visualViewport.width;
+      h = window.visualViewport.height;
+    } else if (typeof window !== 'undefined' && window.innerWidth) {
+      w = window.innerWidth;
+      h = window.innerHeight;
+    } else {
+      w = 720; h = 720;
+    }
+    DPR = 1;
+    if (typeof window !== 'undefined' && window.devicePixelRatio) {
+      DPR = Math.min(2, window.devicePixelRatio || 1);
+    }
+    W = Math.round(w);
+    H = Math.round(h);
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+  }
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', resize);
+  }
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('resize', resize);
+  }
+  resize();
+
+  // ---------- the E model (closed form) ----------
+  // E is the urchin's expansion / polarity state: 0 = dark spore state,
+  // 1 = bright exploded state. Everything below is a pure function of
+  // (seeded schedules, recorded gesture events, t). Frame one: t = 0,
+  // E = 0.45 on the rise, no events recorded.
+  //
+  // Base breath: 26 s LFO. Phase chosen so E_lfo(0) = 0.45 exactly and
+  // rising: 0.5 + 0.5*sin(PHI0) = 0.45  =>  sin(PHI0) = -0.1, cos > 0.
+  var LFO_PERIOD = 26;
+  var PHI0 = Math.asin(-0.1);
+  var SNAP_MIN_GAP = 2.5;   // hard rate limit: at most one snap per 2.5 s
+  var HOLD_LEN = 4;         // double-tap bright hold, seconds
+  var HOLD_E = 0.97;
+  var EXCITE_TAU = 1.1;     // fast-drag excitation decay, seconds
+  var BEND_TAU = 0.8;       // flinch regrow: ~2 s to settle
+  var TAP_COMMIT = 0.33;    // tap deferral so a double-tap can pre-empt
+
+  // Deterministic auto-snap schedule, seeded once. Gaps 6 to 19 s, so
+  // the schedule itself always respects the 2.5 s rate limit.
+  var autoSnaps = [];
+  (function () {
+    var r = mulberry32(0xA07059A9);
+    var t = 5 + r() * 4;
+    while (t < 7200) {
+      autoSnaps.push(t);
+      t += 6 + r() * 13;
+    }
+  })();
+
+  var tapSnaps = [];    // committed tap strike times {t}
+  var holds = [];       // {start}
+  var exciteEvents = []; // {t, a} from fast drags
+  var dragPoints = [];  // {x, y, t} pointer path while dragging (unit space)
+  var pendingTap = null; // {t} uncommitted tap awaiting the double-tap window
+
+  function clamp01(v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
+
+  function lfoE(t) {
+    return 0.5 + 0.5 * Math.sin((2 * Math.PI * t / LFO_PERIOD) + PHI0);
+  }
+
+  // Count accepted snaps at or before t. Events are scanned in time
+  // order; any snap (auto or tap) falling inside SNAP_MIN_GAP after the
+  // previously accepted snap is ignored. This makes the 2.5 s rate
+  // limit a property of the function, not of the callers.
+  function snapCount(t) {
+    var count = 0;
+    var last = -Infinity;
+    var i = 0, j = 0;
+    while (true) {
+      var ta = i < autoSnaps.length ? autoSnaps[i] : Infinity;
+      var tt = j < tapSnaps.length ? tapSnaps[j].t : Infinity;
+      var ev = ta < tt ? ta : tt;
+      if (ev === Infinity || ev > t) break;
+      if (ta <= tt) i++; else j++;
+      if (ev - last >= SNAP_MIN_GAP) { count++; last = ev; }
+    }
+    return count;
+  }
+
+  function lastSnapBefore(t) {
+    var last = -Infinity;
+    var i = 0, j = 0;
+    while (true) {
+      var ta = i < autoSnaps.length ? autoSnaps[i] : Infinity;
+      var tt = j < tapSnaps.length ? tapSnaps[j].t : Infinity;
+      var ev = ta < tt ? ta : tt;
+      if (ev === Infinity || ev > t) break;
+      if (ta <= tt) i++; else j++;
+      if (ev - last >= SNAP_MIN_GAP) last = ev;
+    }
+    return last;
+  }
+
+  // Polarity pulse: LFO mirrored after every accepted snap (hard cut,
+  // no fade; the cut is the punch).
+  function pulseE(t) {
+    var e = lfoE(t);
+    return (snapCount(t) % 2 === 1) ? 1 - e : e;
+  }
+
+  function exciteAt(t) {
+    var s = 0;
+    for (var i = 0; i < exciteEvents.length; i++) {
+      var ev = exciteEvents[i];
+      if (ev.t > t) continue;
+      s += ev.a * Math.exp(-(t - ev.t) / EXCITE_TAU);
+    }
+    return s > 0.85 ? 0.85 : s;
+  }
+
+  function expansionAt(t) {
+    var i, hd;
+    // Inside a bright hold: E pinned.
+    for (i = 0; i < holds.length; i++) {
+      hd = holds[i];
+      if (t >= hd.start && t <= hd.start + HOLD_LEN) return HOLD_E;
+    }
+    var e = pulseE(t);
+    // Just after a hold: collapse back to the pulse value fast.
+    for (i = 0; i < holds.length; i++) {
+      hd = holds[i];
+      var end = hd.start + HOLD_LEN;
+      if (t > end && t <= end + 0.6) {
+        return e + (HOLD_E - e) * Math.exp(-(t - end) / 0.18);
+      }
+    }
+    var ex = exciteAt(t);
+    if (ex > 0) e = clamp01(e + ex * (1 - e));
+    return e;
+  }
+
+  // ---------- the urchin (seeded once) ----------
+  var N_SPIKES = 360;
+  var spikes = [];
+  (function () {
+    for (var i = 0; i < N_SPIKES; i++) {
+      var segJit = [];
+      var nSeg = 3 + Math.floor(rng() * 3); // 3..5
+      for (var k = 0; k <= nSeg; k++) segJit.push(rng() * 2 - 1);
+      spikes.push({
+        ang: (i / N_SPIKES) * Math.PI * 2 + (rng() - 0.5) * 0.012,
+        lenF: 0.42 + rng() * 0.70,          // never equal: 0.42..1.12
+        shadeF: rng(),                       // mix of SHADE and SPIKE
+        nSeg: nSeg,
+        jit: segJit,
+        wF1: 0.03 + rng() * 0.07,            // writhe frequencies, Hz
+        wF2: 0.05 + rng() * 0.11,
+        wP1: rng() * Math.PI * 2,
+        wP2: rng() * Math.PI * 2,
+        sway: 0.008 + rng() * 0.022,         // angular sway amplitude
+        curl: (rng() - 0.5) * 2              // tendril curl direction
+      });
+    }
+  })();
+
+  // Writhe: slow seeded length breathing per spike, pure in (spike, t).
+  function writhe(sp, t) {
+    return 0.84
+      + 0.16 * Math.sin(2 * Math.PI * sp.wF1 * t + sp.wP1)
+      + 0.10 * Math.sin(2 * Math.PI * sp.wF2 * t + sp.wP2);
+  }
+
+  // Flinch: bend offset for a spike whose mid point sits at (mx, my) in
+  // unit space (frame units, center at 0,0). Sum over recorded drag
+  // points: gaussian falloff in angle and radius around each point,
+  // decaying with age so the spike regrows over ~2 s. Direction is away
+  // from the finger.
+  function bendAt(mx, my, t) {
+    var bx = 0, by = 0;
+    var rho = Math.sqrt(mx * mx + my * my);
+    var th = Math.atan2(my, mx);
+    for (var i = 0; i < dragPoints.length; i++) {
+      var p = dragPoints[i];
+      if (p.t > t) continue;
+      var age = t - p.t;
+      if (age > 3) continue;
+      var pr = Math.sqrt(p.x * p.x + p.y * p.y);
+      var pth = Math.atan2(p.y, p.x);
+      var dth = th - pth;
+      while (dth > Math.PI) dth -= Math.PI * 2;
+      while (dth < -Math.PI) dth += Math.PI * 2;
+      var wa = Math.exp(-(dth * dth) / (0.38 * 0.38));
+      var dr = (rho - pr) / 0.30;
+      var wr = Math.exp(-dr * dr);
+      var w = wa * wr * Math.exp(-age / BEND_TAU);
+      if (w < 0.003) continue;
+      var dx = mx - p.x, dy = my - p.y;
+      var dl = Math.sqrt(dx * dx + dy * dy) || 1;
+      bx += (dx / dl) * w;
+      by += (dy / dl) * w;
+    }
+    return { x: bx, y: by };
+  }
+
+  // ---------- audio (lazy, gesture-gated, guarded) ----------
+  var AC = null, masterGain = null, noiseBuf = null, audioOn = false;
+  var audioRng = mulberry32(0xA0D10);
+  var nextBeat = 0;
+
+  function initAudio() {
+    if (audioOn) return;
+    audioOn = true;
+    try {
+      var Ctor = null;
+      if (typeof window !== 'undefined') {
+        Ctor = window.AudioContext || window.webkitAudioContext || null;
+      }
+      if (!Ctor) return;
+      AC = new Ctor();
+      masterGain = AC.createGain();
+      masterGain.gain.value = 0.5;
+      masterGain.connect(AC.destination);
+      var len = AC.sampleRate;
+      noiseBuf = AC.createBuffer(1, len, AC.sampleRate);
+      var d = noiseBuf.getChannelData(0);
+      var r = mulberry32(0x0B17C0DE);
+      for (var i = 0; i < len; i++) d[i] = r() * 2 - 1;
+    } catch (e) {
+      AC = null;
+    }
+  }
+
+  function thump(t, vol) {
+    if (!AC || !masterGain) return;
+    try {
+      var o = AC.createOscillator();
+      var g = AC.createGain();
+      o.type = 'sine';
+      o.frequency.value = 52;
+      var t0 = AC.currentTime;
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.exponentialRampToValueAtTime(vol, t0 + 0.015);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.38);
+      o.connect(g); g.connect(masterGain);
+      o.start(t0); o.stop(t0 + 0.42);
+    } catch (e) { /* audio is garnish */ }
+  }
+
+  function grain(t) {
+    if (!AC || !masterGain || !noiseBuf) return;
+    try {
+      var src = AC.createBufferSource();
+      src.buffer = noiseBuf;
+      src.playbackRate.value = 0.7 + audioRng() * 0.6;
+      var f = AC.createBiquadFilter();
+      f.type = 'bandpass';
+      f.frequency.value = 1800 + audioRng() * 3200;
+      f.Q.value = 6;
+      var g = AC.createGain();
+      var t0 = AC.currentTime;
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.exponentialRampToValueAtTime(0.05 + audioRng() * 0.05, t0 + 0.012);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.09);
+      src.connect(f); f.connect(g); g.connect(masterGain);
+      src.start(t0, audioRng() * 0.8, 0.12);
+      src.stop(t0 + 0.12);
+    } catch (e) { /* audio is garnish */ }
+  }
+
+  function crack() {
+    if (!AC || !masterGain || !noiseBuf) return;
+    try {
+      var t0 = AC.currentTime;
+      var src = AC.createBufferSource();
+      src.buffer = noiseBuf;
+      var f = AC.createBiquadFilter();
+      f.type = 'highpass';
+      f.frequency.value = 2800;
+      var g = AC.createGain();
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.exponentialRampToValueAtTime(0.22, t0 + 0.006);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.16);
+      src.connect(f); f.connect(g); g.connect(masterGain);
+      src.start(t0, audioRng() * 0.5, 0.2);
+      src.stop(t0 + 0.2);
+      var o = AC.createOscillator();
+      var og = AC.createGain();
+      o.type = 'sine';
+      o.frequency.setValueAtTime(2500, t0);
+      o.frequency.exponentialRampToValueAtTime(1400, t0 + 0.15);
+      og.gain.setValueAtTime(0.0001, t0);
+      og.gain.exponentialRampToValueAtTime(0.07, t0 + 0.008);
+      og.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.18);
+      o.connect(og); og.connect(masterGain);
+      o.start(t0); o.stop(t0 + 0.2);
+    } catch (e) { /* audio is garnish */ }
+  }
+
+  var lastE = 0.45;
+  function audioTick(t) {
+    if (!AC) return;
+    if (AC.state === 'suspended' && AC.resume) { try { AC.resume(); } catch (e) {} }
+    if (t >= nextBeat) {
+      thump(t, 0.12 + 0.30 * lastE);
+      nextBeat = t + (1.7 - 0.85 * lastE);
+    }
+    if (audioRng() < lastE * 0.07) grain(t);
+  }
+
+  // ---------- clock ----------
+  function nowMs() {
+    if (typeof performance !== 'undefined' && performance.now) return performance.now();
+    return 0;
+  }
+  var startStamp = nowMs();
+  function nowSec() { return (nowMs() - startStamp) / 1000; }
+
+  // ---------- draw ----------
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+    var E = expansionAt(t);
+    lastE = E;
+    var S = Math.min(W, H);
+    var cx = W / 2, cy = H / 2;
+    var coreR = S * 0.045;
+    var reach = S * (0.14 + 0.36 * E); // spike length scale for lenF = 1
+    var lw = Math.max(1, S / 620);
+
+    ctx.fillStyle = GROUND;
+    ctx.fillRect(0, 0, W, H);
+
+    // Core glow: layered flat-alpha discs, no gradients. Subtle at
+    // E = 0.45, blazing only near E = 1.
+    var gi;
+    for (gi = 7; gi >= 1; gi--) {
+      var gf = gi / 7;
+      var gr = coreR * (1.1 + 3.4 * E * gf + 0.5 * gf);
+      ctx.globalAlpha = 0.02 + E * 0.11 * (1 - gf);
+      ctx.fillStyle = GLOW;
+      ctx.beginPath();
+      ctx.arc(cx, cy, gr, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // Spikes, shade pass first, then bright pass.
+    for (var pass = 0; pass < 2; pass++) {
+      ctx.lineWidth = lw;
+      ctx.lineCap = 'round';
+      for (var i = 0; i < N_SPIKES; i++) {
+        var sp = spikes[i];
+        var bright = sp.shadeF > 0.45;
+        if ((pass === 1) !== bright) continue;
+
+        var wr = writhe(sp, t);
+        var L = reach * sp.lenF * wr;
+        if (L < coreR * 0.8) L = coreR * 0.8;
+        var swayA = sp.sway * Math.sin(2 * Math.PI * sp.wF1 * t + sp.wP2);
+
+        // Bend sampled at the spike's mid point (unit frame coords).
+        var midR = coreR + (L - coreR) * 0.55;
+        var mx = (Math.cos(sp.ang) * midR) / S;
+        var my = (Math.sin(sp.ang) * midR) / S;
+        var bend = bendAt(mx, my, t);
+        var bendMag = S * 0.085;
+        var bx = bend.x * bendMag, by = bend.y * bendMag;
+
+        ctx.strokeStyle = bright ? SPIKE : SHADE;
+        ctx.globalAlpha = (0.30 + 0.70 * E) * (0.45 + 0.55 * sp.shadeF);
+        ctx.beginPath();
+        var nSeg = sp.nSeg;
+        // Tendrils: at high E the longest spikes grow wispy continuations
+        // out of their own tips. Same polyline, extra points, not a layer.
+        var tendril = (E > 0.62 && sp.lenF > 0.80) ? (E - 0.62) / 0.38 : 0;
+        var total = nSeg + (tendril > 0 ? 2 : 0);
+        for (var k = 0; k <= total; k++) {
+          var frac, r, perp;
+          if (k <= nSeg) {
+            frac = k / nSeg;
+            r = coreR * 0.55 + (L - coreR * 0.55) * frac;
+            perp = sp.jit[k] * S * 0.010 * (0.4 + 0.6 * frac)
+              * (0.7 + 0.3 * Math.sin(2 * Math.PI * sp.wF2 * t + sp.wP1 + k));
+          } else {
+            var tk = k - nSeg; // 1..2 beyond the tip
+            frac = 1 + tk * 0.16 * tendril + tk * 0.05;
+            r = coreR * 0.55 + (L - coreR * 0.55) * frac;
+            perp = sp.jit[nSeg] * S * 0.010
+              + sp.curl * tk * tk * S * 0.012 * tendril;
+          }
+          var a = sp.ang + swayA * frac;
+          var ca = Math.cos(a), sa = Math.sin(a);
+          var px = cx + ca * r - sa * perp + bx * Math.pow(frac > 1 ? 1 : frac, 1.5);
+          var py = cy + sa * r + ca * perp + by * Math.pow(frac > 1 ? 1 : frac, 1.5);
+          if (k === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+        }
+        ctx.stroke();
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    // Dark spore core on top; it shrinks a little as the glow takes over.
+    ctx.fillStyle = DARKCORE;
+    ctx.beginPath();
+    ctx.arc(cx, cy, coreR * (1.06 - 0.36 * E), 0, Math.PI * 2);
+    ctx.fill();
+
+    // Hot center point, scaled by E.
+    ctx.globalAlpha = 0.20 + 0.60 * E;
+    ctx.fillStyle = GLOW;
+    ctx.beginPath();
+    ctx.arc(cx, cy, coreR * 0.42, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- gestures ----------
+  var dragging = false;
+  var downT = 0, downX = 0, downY = 0, lastX = 0, lastY = 0, lastMoveT = 0;
+  var movedFar = false;
+  var lastTapUpT = -10;
+
+  function toUnit(x, y) {
+    var S = Math.min(W, H) || 1;
+    return { x: (x - W / 2) / S, y: (y - H / 2) / S };
+  }
+
+  function pruneEvents(t) {
+    while (dragPoints.length && dragPoints[0].t < t - 4) dragPoints.shift();
+    if (dragPoints.length > 120) dragPoints.splice(0, dragPoints.length - 120);
+    while (exciteEvents.length && exciteEvents[0].t < t - 6) exciteEvents.shift();
+    if (exciteEvents.length > 240) exciteEvents.splice(0, exciteEvents.length - 240);
+    while (holds.length && holds[0].start < t - HOLD_LEN - 2) holds.shift();
+    while (tapSnaps.length && tapSnaps[0].t < t - 90) tapSnaps.shift();
+  }
+
+  function commitPendingTap() {
+    if (!pendingTap) return;
+    var ct = pendingTap.t + TAP_COMMIT;
+    if (nowSec() < ct) return;
+    pendingTap = null;
+    tapSnaps.push({ t: ct });
+    // The crack sounds only if the rate limiter accepts this snap.
+    if (ct - lastSnapBefore(ct - 0.001) >= SNAP_MIN_GAP - 0.001) crack();
+  }
+
+  function onDown(e) {
+    initAudio();
+    var t = nowSec();
+    dragging = true;
+    movedFar = false;
+    downT = t;
+    downX = lastX = (e && e.clientX) || 0;
+    downY = lastY = (e && e.clientY) || 0;
+    lastMoveT = t;
+    var u = toUnit(downX, downY);
+    dragPoints.push({ x: u.x, y: u.y, t: t });
+    pruneEvents(t);
+  }
+
+  function onMove(e) {
+    if (!dragging) return;
+    var t = nowSec();
+    var x = (e && e.clientX) || 0;
+    var y = (e && e.clientY) || 0;
+    var dx = x - lastX, dy = y - lastY;
+    var dist = Math.sqrt(dx * dx + dy * dy);
+    var dt = Math.max(0.008, t - lastMoveT);
+    var speed = dist / dt;
+    if (Math.abs(x - downX) + Math.abs(y - downY) > 12) movedFar = true;
+    var u = toUnit(x, y);
+    dragPoints.push({ x: u.x, y: u.y, t: t });
+    if (speed > 500) {
+      var a = Math.min(1, speed / 1500) * 0.5;
+      exciteEvents.push({ t: t, a: a });
+    }
+    lastX = x; lastY = y; lastMoveT = t;
+    pruneEvents(t);
+  }
+
+  function onUp(e) {
+    if (!dragging) return;
+    dragging = false;
+    var t = nowSec();
+    var dur = t - downT;
+    if (dur < 0.3 && !movedFar) {
+      // Tap family. A second tap inside the commit window converts the
+      // pending strike into the double-tap bright hold.
+      if (pendingTap && t - pendingTap.t < TAP_COMMIT + 0.05) {
+        pendingTap = null;
+        holds.push({ start: t });
+        thump(t, 0.2);
+      } else {
+        pendingTap = { t: t };
+      }
+      lastTapUpT = t;
+    }
+    pruneEvents(t);
+  }
+
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', function () { dragging = false; });
+  }
+
+  // ---------- frame one + loop ----------
+  draw(0);
+  var lastAudioE = lastE;
+  if (typeof requestAnimationFrame === 'function') {
+    var loop = function () {
+      commitPendingTap();
+      var t = nowSec();
+      draw(t);
+      audioTick(t);
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
