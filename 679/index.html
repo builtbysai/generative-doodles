@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sotar Condi</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0B0A09; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- palette (strict) ----------
+  var GROUND = '#0B0A09';
+  var SHARD = '#4A3428';
+  var SHARD_EDGE = '#6E4F3A';
+  var BIRD = '#3A4A44';
+  var WING = '#9AA8A4';
+  var EMBER = '#C25E2E';
+
+  // ---------- seeded RNG (mulberry32) ----------
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  var W = 0, H = 0, PHONE = false;
+
+  function resize() {
+    var w, h;
+    if (window.visualViewport) {
+      w = window.visualViewport.width;
+      h = window.visualViewport.height;
+    } else {
+      w = window.innerWidth;
+      h = window.innerHeight;
+    }
+    W = w; H = h;
+    canvas.width = Math.max(1, Math.round(w));
+    canvas.height = Math.max(1, Math.round(h));
+    var sw = window.screen ? window.screen.width : 0;
+    var sh = window.screen ? window.screen.height : 0;
+    var minDim = Math.min(sw, sh);
+    PHONE = (minDim > 0 && minDim < 700) || (h > w * 1.15);
+  }
+  if (window.visualViewport) window.visualViewport.addEventListener('resize', resize);
+  window.addEventListener('resize', resize);
+  resize();
+
+  // ---------- static scene data (seeded, built once) ----------
+  // Each shard: a broken arc segment of an implied bell rim.
+  // Geometry stored in unit space (x: 0..1 of width, y: 0..1 of height),
+  // scaled at draw time so resize keeps the layout.
+  var shards = [];
+  (function buildShards() {
+    var rnd = mulberry32(679001);
+    var defs = [
+      { x: 0.16, y: 0.74, r: 0.085, a0: -0.4, a1: 1.9, rot: 0.3 },
+      { x: 0.34, y: 0.83, r: 0.105, a0: 2.6, a1: 5.1, rot: -0.2 },
+      { x: 0.50, y: 0.70, r: 0.070, a0: 0.6, a1: 2.6, rot: 0.9 },
+      { x: 0.60, y: 0.86, r: 0.120, a0: 3.4, a1: 5.9, rot: 0.1 },
+      { x: 0.76, y: 0.76, r: 0.080, a0: -1.2, a1: 1.0, rot: -0.6 },
+      { x: 0.26, y: 0.885, r: 0.095, a0: 2.2, a1: 4.4, rot: 0.5 },
+      { x: 0.88, y: 0.88, r: 0.068, a0: 0.2, a1: 2.1, rot: 1.2 },
+      { x: 0.45, y: 0.895, r: 0.078, a0: 3.9, a1: 5.8, rot: -0.9 },
+      { x: 0.68, y: 0.915, r: 0.055, a0: 1.1, a1: 3.0, rot: 0.2 }
+    ];
+    for (var i = 0; i < defs.length; i++) {
+      var d = defs[i];
+      // rough broken edge: radial jitter samples along the arc
+      var rough = [];
+      var n = 14;
+      for (var k = 0; k <= n; k++) rough.push(0.90 + rnd() * 0.20);
+      var roughIn = [];
+      for (var k2 = 0; k2 <= n; k2++) roughIn.push(0.88 + rnd() * 0.22);
+      // chip notches at the two broken ends
+      shards.push({
+        x: d.x, y: d.y, r: d.r, a0: d.a0, a1: d.a1, rot: d.rot,
+        thick: 0.30 + rnd() * 0.14,
+        rough: rough, roughIn: roughIn,
+        seed: rnd() * 1000
+      });
+    }
+  })();
+
+  // Ember flicker: seeded noise table sampled by phase (deterministic).
+  var flickTable = [];
+  (function buildFlick() {
+    var rnd = mulberry32(679777);
+    for (var i = 0; i < 256; i++) flickTable.push(rnd());
+  })();
+  function flick(t) {
+    // smooth periodic flicker from the seeded table
+    var period = 7.3;
+    var p = (t % period) / period * 256;
+    var i0 = Math.floor(p) % 256, i1 = (i0 + 1) % 256;
+    var f = p - Math.floor(p);
+    var v = flickTable[i0] * (1 - f) + flickTable[i1] * f;
+    // a second slower swell
+    var slow = 0.5 + 0.5 * Math.sin(t * 0.43 + 1.7);
+    return 0.55 + 0.30 * v + 0.15 * slow;
+  }
+
+  // ---------- time: anchored clock, never frame one from Date.now ----------
+  var T0 = null;
+  function elapsed(now) {
+    if (T0 === null) T0 = now;
+    return (now - T0) / 1000;
+  }
+
+  // ---------- audio (lazy, gesture-gated) ----------
+  var AC = null;
+  var audioUnlocked = false;
+  function ensureAudio() {
+    if (typeof window === 'undefined') return null;
+    var Ctor = window.AudioContext || window.webkitAudioContext;
+    if (typeof Ctor !== 'function') return null;
+    if (!AC) {
+      try { AC = new Ctor(); } catch (e) { AC = null; }
+    }
+    if (AC && AC.state === 'suspended') {
+      try { AC.resume(); } catch (e) {}
+    }
+    if (AC) audioUnlocked = true;
+    return AC;
+  }
+
+  // dull dead ceramic thud: short low-passed noise burst, ~200 ms
+  function thud() {
+    var ac = ensureAudio();
+    if (!ac) return;
+    var t = ac.currentTime;
+    var dur = 0.22;
+    var len = Math.floor(ac.sampleRate * dur);
+    var buf = ac.createBuffer(1, len, ac.sampleRate);
+    var data = buf.getChannelData(0);
+    for (var i = 0; i < len; i++) {
+      var env = Math.exp(-i / (len * 0.28));
+      data[i] = (Math.random() * 2 - 1) * env;
+    }
+    var src = ac.createBufferSource();
+    src.buffer = buf;
+    var lp = ac.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.value = 420;
+    lp.Q.value = 0.6;
+    var g = ac.createGain();
+    g.gain.setValueAtTime(0.5, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    src.connect(lp); lp.connect(g); g.connect(ac.destination);
+    src.start(t);
+    src.stop(t + dur + 0.05);
+    // a faint low body knock under the noise
+    var osc = ac.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(118, t);
+    osc.frequency.exponentialRampToValueAtTime(64, t + 0.16);
+    var og = ac.createGain();
+    og.gain.setValueAtTime(0.18, t);
+    og.gain.exponentialRampToValueAtTime(0.001, t + 0.18);
+    osc.connect(og); og.connect(ac.destination);
+    osc.start(t);
+    osc.stop(t + 0.2);
+  }
+
+  // the cry: thin rising sine, ~2.5 kHz, vibrato, slow attack, very quiet
+  var cryDoneForLoop = -1;
+  function cry(loopIndex) {
+    if (cryDoneForLoop === loopIndex) return;
+    cryDoneForLoop = loopIndex;
+    if (!audioUnlocked || !AC) return; // silent pass; throat pulse still shows
+    var ac = AC;
+    if (ac.state === 'suspended') {
+      try { ac.resume(); } catch (e) { return; }
+    }
+    var t = ac.currentTime;
+    var osc = ac.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(1980, t);
+    osc.frequency.exponentialRampToValueAtTime(2560, t + 1.15);
+    osc.frequency.exponentialRampToValueAtTime(2380, t + 1.5);
+    var vib = ac.createOscillator();
+    vib.type = 'sine';
+    vib.frequency.value = 6.4;
+    var vibG = ac.createGain();
+    vibG.gain.value = 22;
+    vib.connect(vibG); vibG.connect(osc.frequency);
+    var g = ac.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.055, t + 0.55); // very quiet
+    g.gain.setValueAtTime(0.055, t + 1.0);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 1.5);
+    osc.connect(g); g.connect(ac.destination);
+    osc.start(t); vib.start(t);
+    osc.stop(t + 1.55); vib.stop(t + 1.55);
+  }
+
+  // ---------- interaction: taps recorded with anchored times ----------
+  var taps = []; // {x, y, t} in unit space + elapsed seconds
+  var lastNow = 0;
+  function pointFromEvent(e) {
+    var rect = canvas.getBoundingClientRect();
+    var cx = (e.clientX !== undefined) ? e.clientX : (e.touches && e.touches[0] ? e.touches[0].clientX : 0);
+    var cy = (e.clientY !== undefined) ? e.clientY : (e.touches && e.touches[0] ? e.touches[0].clientY : 0);
+    return { x: (cx - rect.left) / (rect.width || 1), y: (cy - rect.top) / (rect.height || 1) };
+  }
+  function onTap(e) {
+    var p = pointFromEvent(e);
+    var t = elapsed(lastNow);
+    taps.push({ x: p.x, y: p.y, t: t });
+    ensureAudio(); // first gesture unlocks audio (cry gating)
+    // hit test against shards (generous radius); a hit sounds the thud
+    for (var i = 0; i < shards.length; i++) {
+      var s = shards[i];
+      var dx = (p.x - s.x) * (W / Math.max(W, H));
+      var dy = p.y - s.y;
+      var rr = s.r * 1.35;
+      if (dx * dx + dy * dy < rr * rr) { thud(); break; }
+    }
+  }
+  canvas.addEventListener('pointerdown', onTap);
+  canvas.addEventListener('touchstart', function (e) { onTap(e); }, { passive: true });
+
+  // ---------- drawing ----------
+  function drawShard(s, unit) {
+    var cx = s.x * W, cy = s.y * H;
+    var R = s.r * unit;
+    var thick = R * s.thick;
+    var n = s.rough.length - 1;
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(s.rot);
+    // outer broken edge
+    ctx.beginPath();
+    for (var k = 0; k <= n; k++) {
+      var a = s.a0 + (s.a1 - s.a0) * (k / n);
+      var rr = R * s.rough[k];
+      var px = Math.cos(a) * rr, py = Math.sin(a) * rr;
+      if (k === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    // inner edge back
+    for (var k2 = n; k2 >= 0; k2--) {
+      var a2 = s.a0 + (s.a1 - s.a0) * (k2 / n);
+      var rr2 = (R - thick) * (0.96 + (s.roughIn[k2] - 0.99) * 0.5) + thick * 0.12 * s.roughIn[k2];
+      var qx = Math.cos(a2) * Math.max(rr2, R - thick), qy = Math.sin(a2) * Math.max(rr2, R - thick);
+      ctx.lineTo(qx, qy);
+    }
+    ctx.closePath();
+    ctx.fillStyle = SHARD;
+    ctx.fill();
+    // broken rim edge line along the outer edge
+    ctx.beginPath();
+    for (var k3 = 0; k3 <= n; k3++) {
+      var a3 = s.a0 + (s.a1 - s.a0) * (k3 / n);
+      var rr3 = R * s.rough[k3];
+      var px3 = Math.cos(a3) * rr3, py3 = Math.sin(a3) * rr3;
+      if (k3 === 0) ctx.moveTo(px3, py3); else ctx.lineTo(px3, py3);
+    }
+    ctx.strokeStyle = SHARD_EDGE;
+    ctx.lineWidth = Math.max(1, R * 0.045);
+    ctx.stroke();
+    // faint fracture hairline across the shard
+    ctx.beginPath();
+    var am = (s.a0 + s.a1) / 2;
+    ctx.moveTo(Math.cos(am) * (R - thick) * 0.99, Math.sin(am) * (R - thick) * 0.99);
+    ctx.lineTo(Math.cos(am + 0.12) * R * 0.97, Math.sin(am + 0.12) * R * 0.97);
+    ctx.strokeStyle = SHARD_EDGE;
+    ctx.globalAlpha = 0.35;
+    ctx.lineWidth = Math.max(0.6, R * 0.02);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    ctx.restore();
+  }
+
+  function drawBird(t, unit) {
+    // slow Lissajous hover in the upper third
+    var bx = W * (0.52 + 0.16 * Math.sin(t * 0.21 + 0.8));
+    var by = H * (0.26 + 0.055 * Math.sin(t * 0.34 + 2.1));
+    var bob = Math.sin(t * 2.3) * unit * 0.0035;
+    by += bob;
+    var s = unit * (PHONE ? 0.030 : 0.034); // body scale
+    var tilt = 0.14 * Math.sin(t * 0.21 + 0.8 + Math.PI / 2);
+
+    // cry moment: once per 26 s loop, at loop phase 0.52, lasting 1.5 s
+    var LOOP = 26;
+    var loopIndex = Math.floor(t / LOOP);
+    var phase = (t % LOOP) / LOOP;
+    var cryPhase = (phase - 0.52) * LOOP; // seconds into the cry window
+    var inCry = cryPhase >= 0 && cryPhase <= 1.5;
+    if (inCry && cryPhase < 0.6) cry(loopIndex);
+    var throatPulse = 0;
+    if (inCry) {
+      var cp = cryPhase / 1.5;
+      throatPulse = Math.sin(cp * Math.PI); // 0..1..0 swell
+    }
+
+    ctx.save();
+    ctx.translate(bx, by);
+    ctx.rotate(tilt);
+
+    // wing blur: several ghost arc positions, high frequency, low alpha
+    var wingF = 30; // Hz-ish phase speed for the blur oscillation
+    for (var g = 0; g < 6; g++) {
+      var ph = t * wingF + g * (Math.PI / 5.2);
+      var lift = Math.sin(ph) * 0.9;
+      ctx.save();
+      ctx.globalAlpha = 0.05 + 0.028 * (1 - g / 6);
+      ctx.strokeStyle = WING;
+      ctx.lineWidth = Math.max(1, s * 0.16);
+      ctx.beginPath();
+      // upper wing arc sweeping back and up
+      ctx.moveTo(-s * 0.1, -s * 0.15);
+      ctx.quadraticCurveTo(-s * 1.15, -s * (0.9 + lift * 0.55), -s * 2.05, -s * (0.35 + lift * 0.95));
+      ctx.stroke();
+      ctx.beginPath();
+      // far wing, shorter and fainter
+      ctx.moveTo(s * 0.15, -s * 0.1);
+      ctx.quadraticCurveTo(-s * 0.55, -s * (0.75 - lift * 0.4), -s * 1.25, -s * (0.2 - lift * 0.7));
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // tail fan
+    ctx.fillStyle = BIRD;
+    ctx.beginPath();
+    ctx.moveTo(-s * 0.85, s * 0.1);
+    ctx.lineTo(-s * 1.7, s * 0.55);
+    ctx.lineTo(-s * 1.55, s * 0.05);
+    ctx.lineTo(-s * 1.75, -s * 0.25);
+    ctx.closePath();
+    ctx.globalAlpha = 0.85;
+    ctx.fill();
+    ctx.globalAlpha = 1;
+
+    // body ellipse
+    ctx.beginPath();
+    ctx.ellipse(0, 0, s * 1.05, s * 0.52, -0.12, 0, Math.PI * 2);
+    ctx.fillStyle = BIRD;
+    ctx.fill();
+
+    // head
+    var hx = s * 0.95, hy = -s * 0.28;
+    ctx.beginPath();
+    ctx.ellipse(hx, hy, s * 0.42, s * 0.36, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // throat pulse during the cry moment (visible even when silent)
+    if (throatPulse > 0.01) {
+      ctx.beginPath();
+      ctx.ellipse(hx - s * 0.05, hy + s * 0.32, s * (0.16 + 0.10 * throatPulse), s * (0.12 + 0.08 * throatPulse), 0, 0, Math.PI * 2);
+      ctx.fillStyle = WING;
+      ctx.globalAlpha = 0.16 + 0.20 * throatPulse;
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    // long bill
+    ctx.strokeStyle = BIRD;
+    ctx.lineWidth = Math.max(1, s * 0.11);
+    ctx.beginPath();
+    ctx.moveTo(hx + s * 0.3, hy + s * 0.02);
+    ctx.lineTo(hx + s * 1.6, hy + s * 0.38);
+    ctx.stroke();
+
+    // eye: a single dim point
+    ctx.beginPath();
+    ctx.arc(hx + s * 0.12, hy - s * 0.06, Math.max(0.8, s * 0.055), 0, Math.PI * 2);
+    ctx.fillStyle = WING;
+    ctx.globalAlpha = 0.55;
+    ctx.fill();
+    ctx.globalAlpha = 1;
+
+    ctx.restore();
+  }
+
+  function drawEmber(t, unit) {
+    var ex = W * 0.865, ey = H * 0.90;
+    var f = flick(t);
+    var base = unit * 0.0042;
+    // layered low-alpha discs for the glow (no shadowBlur)
+    var layers = [
+      { r: base * 5.2, a: 0.05 },
+      { r: base * 3.1, a: 0.09 },
+      { r: base * 1.8, a: 0.16 }
+    ];
+    ctx.fillStyle = EMBER;
+    for (var i = 0; i < layers.length; i++) {
+      ctx.globalAlpha = layers[i].a * (0.7 + 0.5 * f);
+      ctx.beginPath();
+      ctx.arc(ex, ey, layers[i].r * (0.9 + 0.25 * f), 0, Math.PI * 2);
+      ctx.fill();
+    }
+    // the point itself, slightly elongated like a candle ember
+    ctx.globalAlpha = 0.75 + 0.25 * f;
+    ctx.beginPath();
+    ctx.ellipse(ex, ey - base * 0.3 * f, base * (0.85 + 0.2 * f), base * (1.15 + 0.35 * f), 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    var unit = Math.min(W, H);
+    ctx.fillStyle = GROUND;
+    ctx.fillRect(0, 0, W, H);
+    for (var i = 0; i < shards.length; i++) drawShard(shards[i], unit);
+    drawBird(t, unit);
+    drawEmber(t, unit);
+  }
+
+  // frame one: synchronous draw at loop t = 0 (constant phase)
+  draw(0);
+
+  function frame(now) {
+    lastNow = now;
+    draw(elapsed(now));
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+  }
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
