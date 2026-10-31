@@ -1,0 +1,36 @@
+# No.669 "Cien Pesos"
+
+EXPANSION #81 jose-perez-de-arce, prompt block 5 "Cien Pesos".
+
+## Concept
+
+The coin story. In 1999 a man from the Casa de Moneda came to Jose Perez de Arce and asked permission to use one of his drawings as the model for the 100-peso coin. His comment, quoted in the study: "Quiza cuantos millones de reproducciones se han hecho" (who knows how many millions of reproductions have been made). The piece takes that sentence literally. A woman's portrait, built entirely from engraved contour lines in flat silver on near-black, turns slowly inside a thin copper rim like a struck medallion. Drag horizontally and you spin it yourself. Every completed full rotation stamps one faint copy of the portrait, which drifts backward, shrinks, and fades: the minting, endlessly repeated. No coin imagery is copied, no currency symbols appear, and the face is generated linework from a parametric kit, never a traced photograph.
+
+## Construction
+
+Palette, strict: near-black #0E0E10 ground, silver #C9C9CE for every engraved line, copper #A86B3C for the rim only. No gradients anywhere; the metal is suggested by line density alone.
+
+The landmark kit. The portrait is defined once as sparse landmark polylines in a unit space where the rim radius is 1: hair mass outline, face oval, brow arcs, eyelid pairs with iris centres, nose bridge lines, nose base curve, nostril ticks, mouth line with cupid-bow upper lip and fuller lower lip, ear arcs, neck lines, a necklace of eleven beads with a flat pendant, earring rings with trapezoid pendants, shoulder lines, a neckline, and three woven garment bands. Landmarks are smoothed with Catmull-Rom sampling into the stroke table at build time (page load), so rendering is a fixed table of polylines.
+
+The offset-contour method. Each feature is expanded into a family of nested contour lines by scaling its landmarks about the feature's own centre. Density follows curvature, as the prompt demands: the nose base gets two tight echoes (scale steps of about 1.13 and 1.27), the lips get two enclosing rings (vertical stretch up to 1.70, because a mouth's relief is mostly vertical), the eyelids get one echo each, the face oval gets two relief echoes that shift slightly downward as they shrink, and the hair mass gets the loosest echoes (0.93 and 0.86 of the outline). Brows are the boldest strokes; pupils are the only filled shapes in the portrait.
+
+Relief layers and the turn. Every stroke carries a depth z: hair at -0.9, garment at -0.3, face at 0, brows and eyes at +0.3 to +0.35, lips at +0.45, nose at +0.5. For a coin angle theta, a point renders at x * cos(theta - z * 0.10) + sin(theta) * z * 0.055, so front features lead and back features lag, and at 90 degrees everything collapses into the sliver between the two copper rim ellipses (the second rim is offset by sin(theta) to suggest the coin's edge). Past 90 degrees the portrait continues through the turn mirrored, the way a relief reads as it comes around.
+
+Simulation. Rotation integrates at a fixed step of 1/120 s from an anchored clock (performance.now minus the load timestamp; frame one is the synchronous draw at angle 0 and never touches the wall clock). Idle spin is one full turn per 22 s. Angular velocity relaxes back to the idle rate with a 1.6 s time constant, which is what gives a released fling its inertia. Pointer events (down, move, up) are recorded with their anchored times and consumed by the fixed steps they fall inside; a horizontal drag maps 0.8 canvas widths to one full turn, and the release velocity is an exponential blend of recent drag velocities, clamped to plus or minus 9 rad/s.
+
+The stamp model. The simulation accumulates signed rotation; each time the accumulation crosses a multiple of 2 pi in either direction, one stamp is minted. A stamp is pure data: birth time, the coin angle at minting, a drift direction and a seed, all drawn from a seeded mulberry32 stream. It is redrawn parametrically on every frame at low alpha (peak 0.34), shrinking to 55 percent, sliding backward along its drift vector, its own angle creeping at 0.3 times the idle rate, and it is dropped after 30 s. At most 12 stamps live at once, oldest dropped first. There is no offscreen canvas and no cached bitmap anywhere in the piece.
+
+House rules. Canvas size comes from the Visual Viewport API with resize listeners on both visualViewport and window; the canvas style size is pinned in pixels inside draw() on every frame. Phone detection uses window.screen (minimum dimension under 700 px), with the aspect test only as a fallback; on phones the medallion refits to 92 percent of the width. requestAnimationFrame is typeof-guarded, so the headless QA renderer (no rAF) still gets the exact frame one. The only RNG use is mulberry32 with fixed seeds, for hair-strand jitter and stamp drift data.
+
+## QA log
+
+- Rendered with node ~/workspace/tools/render-piece.js at 1280x900 (qa-desktop.png), 390x844 (qa-mobile.png), and 720x720 (thumb.png). All three read back: frame one is the medallion face-front at angle 0, silver engraving in the copper rim on black, no stamps yet; the face reads as a dignified portrait at full size and at thumb size; on mobile the medallion refits to the phone width, centred, nothing clipped.
+- Determinism: thumb.png rendered twice and byte-compared with cmp: identical. The second render was deleted. Grep confirms no Date.now, no Math.random, no createElement, no AudioContext, no offscreen canvas, no ctx.filter, no external URLs, no em dashes in the file.
+- Tuning pass during QA: the first build's forehead was flat-topped and the nested echoes stacked into squarish, helmet-like rectangles; the hair strands also bowed outward and crossed each other, and the garment bands ran nearly the full rim width like ruled lines. Fixed by doming the face-oval landmarks, pulling the strand paths inside the hair silhouette, raising the necklace so the pendant hangs from the bead arc, and bounding the garment bands to the bust width with a deeper sag. All renders redone and the byte-compare re-run.
+- Edge-on verification: a state-forced throwaway render at a pinned 85-degree angle (via the piece's inert ?seed=a85 QA hook) showed the coin collapsed to a thin sliver, the portrait relief compressed inside with the parallax layers still separating, and the paired copper rim ellipses reading as the coin's edge. The throwaway was deleted after the read-back.
+
+## Deviations
+
+- The prompt's stamp copies are described as "cached snapshots"; they are implemented as parametric redraws from stored data instead, because the house renderer rule forbids offscreen canvases. The visual result is the same: a faint copy that recedes and fades.
+- Past a half turn, the portrait is shown mirrored rather than replaced by an invented reverse design. The prompt specifies no reverse, and inventing one would add imagery the coin story does not name; the mirrored relief keeps the turn continuous and honest.
+- A beaded necklace and trapezoid pendants were added to the landmark kit. They are Jose's subject's traditional jewellery, drawn from the study context rather than the prompt's feature list; they are small, flat linework in the same silver, and they carry the portrait's dignity at thumbnail size.

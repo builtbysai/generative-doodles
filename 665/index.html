@@ -1,0 +1,661 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Humo Adentro</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #EFE9DB; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // No.665 "Humo Adentro" (EXPANSION #81 jose-perez-de-arce, block 1).
+  // El viaje humo adentro: a face inside smoke, looking out at us across
+  // the line between his world and today. The smoke is a live simulated
+  // field, never a looped texture. The face is built from parameters at
+  // every reseed, drawn in directional pencil hatch, and its visibility
+  // is modulated by the local density of the very smoke it sits in: the
+  // smoke never fully clears and the face never fully arrives.
+
+  // Palette (strict, nothing else).
+  var PAPER = '#EFE9DB';
+  var GRAPHITE = '#26262A';
+  var SMOKE = '#8A857C';
+  var EMBER = '#C25E2E';
+
+  // Composition space: FW x FH abstract units, contain-fit onto the
+  // viewport with generous paper margins.
+  var FW = 1.6, FH = 1.0;
+  var FACE_X = 0.80, FACE_Y = 0.50;
+  var EMBER_X = 0.27, EMBER_Y = 0.79;
+
+  var FACE_SEED0 = 665001;
+  var SMOKE_SEED0 = 665501;
+
+  // Sim: fixed-step particle smoke on an anchored clock.
+  var DT = 1 / 30;
+  var PREROLL = 8;            // seconds of smoke history behind frame one
+  var NPART = 400;
+  var AMBIENT = 60;           // ambient veil cycle, seconds
+
+  // Density / strain grids over composition space (data only, drawn
+  // directly, no offscreen canvas).
+  var CELL = 0.025, GW = Math.ceil(FW / CELL), GH = Math.ceil(FH / CELL);
+  var DENS_DECAY = 0.95, DENS_ADD = 0.30;
+  var STRAIN_DECAY = 0.985;
+
+  // Seeded RNG (mulberry32)
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function lerp(a, b, t) { return a + (b - a) * t; }
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // Forced-state hook for QA renders: ?seed=tNN draws at ambient time NN.
+  var forcedT = -1;
+  try {
+    var sm = /seed=t(\d+(?:\.\d+)?)/.exec((typeof location !== 'undefined' && location.search) || '');
+    if (sm) forcedT = parseFloat(sm[1]);
+  } catch (err) { forcedT = -1; }
+
+  // ------------------------------------------------------------------
+  // Anchored clock. Frame timing never derives from Date.now(); the
+  // synchronous first frame is drawn after a fixed pre-roll.
+  // ------------------------------------------------------------------
+  var t0 = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+  function elapsed() {
+    if (typeof performance !== 'undefined' && performance.now) return (performance.now() - t0) / 1000;
+    return 0;
+  }
+
+  // ------------------------------------------------------------------
+  // Value noise (seeded integer lattice hash) and its curl.
+  // ------------------------------------------------------------------
+  function hash2(ix, iy) {
+    var h = Math.imul(ix | 0, 374761393) + Math.imul(iy | 0, 668265263);
+    h = Math.imul(h ^ (h >>> 13), 1274126177);
+    return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+  }
+  function vnoise(x, y) {
+    var ix = Math.floor(x), iy = Math.floor(y);
+    var fx = x - ix, fy = y - iy;
+    var sx = fx * fx * (3 - 2 * fx), sy = fy * fy * (3 - 2 * fy);
+    var a = hash2(ix, iy), b = hash2(ix + 1, iy);
+    var c = hash2(ix, iy + 1), d = hash2(ix + 1, iy + 1);
+    return lerp(lerp(a, b, sx), lerp(c, d, sx), sy);
+  }
+  var noiseT = 0; // smoke clock for the field (runs ahead by the pre-roll)
+  function psi(x, y) {
+    return vnoise(x * 2.1 + noiseT * 0.010, y * 2.1 - noiseT * 0.007) * 0.65
+         + vnoise(x * 4.3 - noiseT * 0.013, y * 4.3 + noiseT * 0.009) * 0.35;
+  }
+  function curl(x, y, out) {
+    var e = 0.02;
+    var dpy = psi(x, y + e) - psi(x, y - e);
+    var dpx = psi(x + e, y) - psi(x - e, y);
+    var vx = dpy / (2 * e), vy = -dpx / (2 * e);
+    vx *= 0.055; vy *= 0.055;
+    var sp = Math.sqrt(vx * vx + vy * vy);
+    if (sp > 0.10) { vx = vx / sp * 0.10; vy = vy / sp * 0.10; }
+    out.x = vx; out.y = vy;
+  }
+
+  // ------------------------------------------------------------------
+  // Smoke state.
+  // ------------------------------------------------------------------
+  var parts = [];
+  var dens = new Float32Array(GW * GH);
+  var strain = new Float32Array(GW * GH);
+  var ambT = 0;               // ambient clock (veil cycle, ember pulse)
+  var faceSeed = FACE_SEED0, smokeSeed = SMOKE_SEED0;
+
+  function initSmoke(seed) {
+    var rng = mulberry32(seed);
+    parts = [];
+    for (var i = 0; i < NPART; i++) {
+      parts.push({ x: rng() * FW, y: rng() * FH, dvx: 0, dvy: 0 });
+    }
+    dens = new Float32Array(GW * GH);
+    strain = new Float32Array(GW * GH);
+    noiseT = -PREROLL;
+  }
+  function cellIdx(x, y) {
+    var cx = clamp(Math.floor(x / CELL), 0, GW - 1);
+    var cy = clamp(Math.floor(y / CELL), 0, GH - 1);
+    return cy * GW + cx;
+  }
+  function sampleGrid(g, x, y) {
+    var gx = clamp(x / CELL - 0.5, 0, GW - 1.001);
+    var gy = clamp(y / CELL - 0.5, 0, GH - 1.001);
+    var ix = Math.floor(gx), iy = Math.floor(gy);
+    var fx = gx - ix, fy = gy - iy;
+    var i00 = iy * GW + ix, i10 = i00 + 1, i01 = i00 + GW, i11 = i01 + 1;
+    return lerp(lerp(g[i00], g[i10], fx), lerp(g[i01], g[i11], fx), fy);
+  }
+
+  // Drag samples recorded with anchored times; each is applied exactly
+  // once, at the first sim step at or after its time.
+  var dragSamples = [];       // {ta, x, y}
+  var cv = { x: 0, y: 0 };
+
+  function stepSim(advanceAmbient) {
+    var i, p;
+    if (advanceAmbient) ambT += DT;
+    noiseT += DT;
+
+    // Apply due drag samples: radial push plus swirl around the point,
+    // and a strain deposit that locally suppresses the face while the
+    // smoke is torn (it reforms as the strain decays, about 4 s).
+    for (i = 0; i < dragSamples.length; i++) {
+      var s = dragSamples[i];
+      if (s.done || s.ta > ambT) continue;
+      s.done = true;
+      strain[cellIdx(s.x, s.y)] += 0.9;
+      for (var j = 0; j < NPART; j++) {
+        p = parts[j];
+        var dx = p.x - s.x, dy = p.y - s.y;
+        var d2 = dx * dx + dy * dy, R = 0.17;
+        if (d2 < R * R) {
+          var d = Math.sqrt(d2) || 0.001;
+          var f = 1 - d / R;
+          var ux = dx / d, uy = dy / d;
+          p.dvx += (ux * 0.55 - uy * 0.38) * f;
+          p.dvy += (uy * 0.55 + ux * 0.38) * f;
+        }
+      }
+    }
+
+    // Decay fields.
+    for (i = 0; i < dens.length; i++) { dens[i] *= DENS_DECAY; strain[i] *= STRAIN_DECAY; }
+
+    // Density tide: a slow body of thicker smoke drifts through the
+    // face on the ambient cycle. At ambient t=0 the tide is at its peak
+    // over the face (frame one is a veiled moment); half a cycle later
+    // it has moved on and the face comes as close to arriving as it
+    // ever does.
+    var tide = 0.5 + 0.5 * Math.cos(2 * Math.PI * ambT / AMBIENT);
+    if (tide > 0.02) {
+      var gx0 = Math.floor((FACE_X - 0.30) / CELL), gx1 = Math.ceil((FACE_X + 0.30) / CELL);
+      var gy0 = Math.floor((FACE_Y - 0.34) / CELL), gy1 = Math.ceil((FACE_Y + 0.34) / CELL);
+      for (var gy = Math.max(0, gy0); gy < Math.min(GH, gy1); gy++) {
+        for (var gx = Math.max(0, gx0); gx < Math.min(GW, gx1); gx++) {
+          var wx = (gx + 0.5) * CELL - FACE_X, wy = (gy + 0.5) * CELL - FACE_Y;
+          var fall = Math.exp(-(wx * wx / 0.055 + wy * wy / 0.075));
+          dens[gy * GW + gx] += tide * 0.055 * fall;
+        }
+      }
+    }
+
+    // Advect particles on the curl field plus their disturbance
+    // velocity (which itself decays), and deposit density.
+    for (i = 0; i < NPART; i++) {
+      p = parts[i];
+      curl(p.x, p.y, cv);
+      p.x += (cv.x + p.dvx) * DT;
+      p.y += (cv.y + p.dvy - 0.004) * DT; // a breath of rise
+      p.dvx *= 0.94; p.dvy *= 0.94;
+      if (p.x < -0.05) p.x += FW + 0.10; else if (p.x > FW + 0.05) p.x -= FW + 0.10;
+      if (p.y < -0.05) p.y += FH + 0.10; else if (p.y > FH + 0.05) p.y -= FH + 0.10;
+      var idx = cellIdx(p.x, p.y);
+      dens[idx] += DENS_ADD * 0.6;
+      var cx = idx % GW, cy = (idx / GW) | 0;
+      if (cx > 0) dens[idx - 1] += DENS_ADD * 0.1;
+      if (cx < GW - 1) dens[idx + 1] += DENS_ADD * 0.1;
+      if (cy > 0) dens[idx - GW] += DENS_ADD * 0.1;
+      if (cy < GH - 1) dens[idx + GW] += DENS_ADD * 0.1;
+    }
+  }
+
+  function veilEnv() { return 0.5 + 0.5 * Math.cos(2 * Math.PI * ambT / AMBIENT); }
+
+  // Face visibility at a composition point: local smoke density and
+  // local drag strain suppress it; the ambient veil presses it down at
+  // the cycle peak. Floored and capped: never gone, never arrived.
+  function visAt(x, y) {
+    var d = sampleGrid(dens, x, y);
+    var s = sampleGrid(strain, x, y);
+    var v = 1.15 - d * 0.20;
+    v *= 1 - 0.40 * veilEnv();
+    v *= 1 - 0.75 * clamp(s, 0, 1);
+    return clamp(v, 0.10, 0.92);
+  }
+
+  // ------------------------------------------------------------------
+  // The face, built from parameters. Local frame: u right, v down, in
+  // units of the face half-width / half-height. Every feature is a set
+  // of short directional hatch strokes that follow the form. A reseed
+  // re-rolls every proportion inside dignified human ranges, so the
+  // face is constructed fresh, never recalled from an image.
+  // ------------------------------------------------------------------
+  var F = null;      // parameters
+  var strokes = [];  // {pts:[[x,y]..], a: baseAlpha, w: widthUnits, cx, cy}
+
+  function buildFace(seed) {
+    var rng = mulberry32(seed);
+    var phone = isPhone();
+    F = {
+      hw: 0.185 + rng() * 0.035,          // half width, comp units
+      hh: (0.265 + rng() * 0.030) * (phone ? 1.10 : 1.0),
+      browLift: 0.05 + rng() * 0.04,
+      browV: 0,                            // set below
+      eyeU: 0.36 + rng() * 0.05,
+      eyeW: 0.30 + rng() * 0.06,
+      eyeH: 0.105 + rng() * 0.025,
+      eyeV: -0.16 + (rng() - 0.5) * 0.04,
+      noseTipV: 0.16 + rng() * 0.08,
+      noseW: 0.13 + rng() * 0.04,
+      lipV: 0.46 + rng() * 0.05,
+      lipW: 0.34 + rng() * 0.08,
+      lipFull: 0.05 + rng() * 0.03,
+      jawTaper: 0.14 + rng() * 0.08,
+      asym: (rng() - 0.5) * 0.03
+    };
+    F.browV = F.eyeV - 0.17;
+    strokes = [];
+
+    function P(u, v) { return [FACE_X + u * F.hw, FACE_Y + v * F.hh]; }
+    function addStroke(pts, a, w) {
+      var sx = 0, sy = 0;
+      for (var i = 0; i < pts.length; i++) { sx += pts[i][0]; sy += pts[i][1]; }
+      strokes.push({ pts: pts, a: a, w: w, cx: sx / pts.length, cy: sy / pts.length });
+    }
+    function curve(fn, n) { var pts = []; for (var i = 0; i <= n; i++) pts.push(fn(i / n)); return pts; }
+
+    // Head outline: an oval narrowed toward the chin, drawn as short
+    // overlapping segments, stronger on the shadow (right) side and
+    // fainter at the jaw, where it is only a suggestion.
+    function outlinePt(a) {
+      var u0 = Math.sin(a), v0 = -Math.cos(a);
+      var w = 1 - F.jawTaper * Math.pow(Math.max(0, v0), 1.5) - 0.05 * Math.max(0, -v0);
+      return P(u0 * w + F.asym * v0, v0 * (1 + 0.03 * Math.max(0, v0)));
+    }
+    var NO = 84, ring = [];
+    for (i = 0; i < NO; i++) ring.push(outlinePt(i / NO * Math.PI * 2));
+    var orng = mulberry32(seed ^ 0x9e3779b9);
+    for (var i = 0; i < NO; i++) {
+      var p0 = ring[i], p1 = ring[(i + 1) % NO], p2 = ring[(i + 2) % NO];
+      var side = Math.sin(i / NO * Math.PI * 2); // +1 at right
+      var low = Math.max(0, -Math.cos(i / NO * Math.PI * 2));
+      // The ring is a suggestion, not a closed egg: seeded gaps,
+      // widest at the jaw.
+      if (orng() < 0.14 + 0.22 * low) continue;
+      var aOut = 0.27 + 0.21 * Math.max(0, side) - 0.08 * low;
+      addStroke([p0, p1, p2], aOut, 0.0042);
+    }
+
+    // Form hatch: diagonal pencil ticks on the shadow side of the form,
+    // denser low and right, kept out of the eye boxes.
+    function halfChord(v) {
+      return Math.sqrt(Math.max(0, 1 - v * v)) * (1 - F.jawTaper * Math.pow(Math.max(0, v), 1.5) - 0.05 * Math.max(0, -v));
+    }
+    for (var v = -0.92; v <= 0.93; v += 0.072) {
+      var ue = halfChord(v);
+      var thresh = 0.28 - 0.48 * v; // shadow boundary sweeps left as v grows
+      for (var u = Math.max(thresh, -ue + 0.06); u < ue - 0.05; u += 0.082) {
+        var inEye = Math.abs(v - F.eyeV) < 0.11 && Math.abs(Math.abs(u) - F.eyeU) < F.eyeW * 0.72;
+        var inLip = Math.abs(v - F.lipV) < 0.09 && Math.abs(u) < F.lipW + 0.05;
+        if (inEye || inLip) continue;
+        var deep = clamp((u - thresh) / Math.max(0.05, ue - thresh), 0, 1);
+        addStroke([P(u, v), P(u + 0.045, v + 0.058)], 0.13 + 0.13 * deep, 0.0032);
+      }
+    }
+    // Cheek shading, right stronger than left.
+    var cheek;
+    for (cheek = 0; cheek < 2; cheek++) {
+      var sg = cheek === 0 ? 1 : -1;
+      for (var k = 0; k < 4; k++) {
+        var cu = sg * (0.48 + k * 0.05), cvv = 0.16 + k * 0.045;
+        addStroke([P(cu, cvv), P(cu + 0.04, cvv + 0.05)], sg > 0 ? 0.20 : 0.12, 0.0032);
+      }
+    }
+
+    // Brows: an arc in three parallel passes, the pencil going over
+    // its own line.
+    for (var b = 0; b < 2; b++) {
+      var bs = b === 0 ? -1 : 1;
+      for (var pass = 0; pass < 3; pass++) {
+        (function (bs, pass) {
+          var pts = curve(function (t) {
+            var u = bs * (F.eyeU - F.eyeW * 0.62 + t * F.eyeW * 1.3);
+            var vv = F.browV - F.browLift * Math.sin(Math.PI * t) + pass * 0.020;
+            return P(u, vv);
+          }, 10);
+          addStroke(pts, 0.72 - pass * 0.22, 0.0042);
+        })(bs, pass);
+      }
+    }
+
+    // Eye outlines (almond): upper lid arched, lower lid shallow. The
+    // iris and pupils are drawn live in draw() so the gaze can track.
+    for (var e = 0; e < 2; e++) {
+      var es = e === 0 ? -1 : 1;
+      (function (es) {
+        var cxu = es * F.eyeU;
+        var upper = curve(function (t) {
+          var u = cxu + (t - 0.5) * F.eyeW;
+          var vv = F.eyeV - F.eyeH * 0.52 * Math.sin(Math.PI * t);
+          return P(u, vv);
+        }, 10);
+        addStroke(upper, 0.80, 0.0040);
+        var lower = curve(function (t) {
+          var u = cxu + (t - 0.5) * F.eyeW;
+          var vv = F.eyeV + F.eyeH * 0.34 * Math.sin(Math.PI * t);
+          return P(u, vv);
+        }, 10);
+        addStroke(lower, 0.45, 0.0034);
+      })(es);
+    }
+
+    // Nose: two bridge curves down from the inner brow, a tip arc,
+    // nostril ticks, and a short shadow hatch along the right bridge.
+    for (var ns = 0; ns < 2; ns++) {
+      var nsg = ns === 0 ? -1 : 1;
+      (function (nsg) {
+        var pts = curve(function (t) {
+          var u = nsg * (0.055 + (F.noseW * 0.55 - 0.055) * t * t);
+          var vv = (F.eyeV + 0.03) + (F.noseTipV - 0.05 - F.eyeV) * t;
+          return P(u, vv);
+        }, 8);
+        addStroke(pts, nsg > 0 ? 0.55 : 0.38, 0.0036);
+      })(nsg);
+    }
+    var tip = curve(function (t) {
+      var u = -F.noseW + 2 * F.noseW * t;
+      var vv = F.noseTipV + 0.028 * Math.sin(Math.PI * t);
+      return P(u, vv);
+    }, 8);
+    addStroke(tip, 0.55, 0.0036);
+    for (var nt = 0; nt < 2; nt++) {
+      var nts = nt === 0 ? -1 : 1;
+      addStroke([P(nts * F.noseW * 0.78, F.noseTipV + 0.012), P(nts * F.noseW * 0.98, F.noseTipV - 0.006)], 0.5, 0.0034);
+    }
+    for (var nh = 0; nh < 4; nh++) {
+      var hu = 0.075 + nh * 0.012, hv = -0.02 + nh * 0.055;
+      addStroke([P(hu, hv), P(hu + 0.03, hv + 0.045)], 0.18, 0.0030);
+    }
+
+    // Lips: a center line with the two peaks of the upper lip, an
+    // upper outline, a fuller lower arc, and hatch beneath the lower
+    // lip.
+    var center = curve(function (t) {
+      var u = -F.lipW + 2 * F.lipW * t;
+      var dip = Math.exp(-Math.pow((t - 0.5) / 0.10, 2));
+      var peak = Math.exp(-Math.pow((Math.abs(t - 0.5) - 0.22) / 0.11, 2));
+      var vv = F.lipV - F.lipFull * (0.42 * peak - 0.10 * dip);
+      return P(u, vv);
+    }, 14);
+    addStroke(center, 0.70, 0.0038);
+    var upperLip = curve(function (t) {
+      var u = -F.lipW * 0.96 + 2 * F.lipW * 0.96 * t;
+      var vv = F.lipV - F.lipFull * (0.55 + 0.65 * Math.sin(Math.PI * t));
+      return P(u, vv);
+    }, 12);
+    addStroke(upperLip, 0.42, 0.0032);
+    var lowerLip = curve(function (t) {
+      var u = -F.lipW * 0.92 + 2 * F.lipW * 0.92 * t;
+      var vv = F.lipV + F.lipFull * (0.35 + 0.85 * Math.sin(Math.PI * t));
+      return P(u, vv);
+    }, 12);
+    addStroke(lowerLip, 0.50, 0.0034);
+    for (var lh = 0; lh < 4; lh++) {
+      var lu = -0.09 + lh * 0.06;
+      addStroke([P(lu, F.lipV + F.lipFull + 0.055), P(lu + 0.035, F.lipV + F.lipFull + 0.10)], 0.16, 0.0030);
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Viewport.
+  // ------------------------------------------------------------------
+  var W = 0, H = 0, SCALE = 1, ORGX = 0, ORGY = 0, DPR = 1;
+  function isPhone() {
+    var sw = 0, sh = 0;
+    if (typeof window !== 'undefined' && window.screen) { sw = window.screen.width || 0; sh = window.screen.height || 0; }
+    var mn = Math.min(sw || 1e9, sh || 1e9);
+    if (mn < 700) return true;
+    return H > 0 && W > 0 && H > W * 1.15;
+  }
+  function resize() {
+    var vv = (typeof window !== 'undefined' && window.visualViewport) ? window.visualViewport : null;
+    var w = vv ? vv.width : ((typeof window !== 'undefined' && window.innerWidth) || 300);
+    var h = vv ? vv.height : ((typeof window !== 'undefined' && window.innerHeight) || 300);
+    DPR = (typeof window !== 'undefined' && window.devicePixelRatio) || 1;
+    W = w; H = h;
+    canvas.width = Math.round(w * DPR);
+    canvas.height = Math.round(h * DPR);
+    canvas.style.width = w + 'px';
+    canvas.style.height = h + 'px';
+    SCALE = Math.min(w / FW, h / FH);
+    ORGX = (w - FW * SCALE) / 2;
+    ORGY = (h - FH * SCALE) / 2;
+  }
+  function PX(x) { return ORGX + x * SCALE; }
+  function PY(y) { return ORGY + y * SCALE; }
+
+  // ------------------------------------------------------------------
+  // Pointer: gaze target always; drag disturbs the smoke; double-tap
+  // reseeds the face and the smoke. Single taps do nothing.
+  // ------------------------------------------------------------------
+  var gaze = null;            // composition coords or null (straight ahead)
+  var dragging = false;
+  var lastTapT = -10, lastTapX = 0, lastTapY = 0;
+
+  function pointerComp(e) {
+    if (!e || typeof e.clientX !== 'number') return null;
+    var r = null;
+    try { r = canvas.getBoundingClientRect(); } catch (err) { r = null; }
+    var px = e.clientX - (r ? r.left : 0), py = e.clientY - (r ? r.top : 0);
+    return [(px - ORGX) / SCALE, (py - ORGY) / SCALE];
+  }
+  function onMove(e) {
+    var u = pointerComp(e);
+    if (!u) return;
+    gaze = u;
+    if (dragging) dragSamples.push({ ta: elapsed(), x: clamp(u[0], 0, FW), y: clamp(u[1], 0, FH), done: false });
+  }
+  function onDown(e) {
+    var u = pointerComp(e);
+    if (!u) return;
+    gaze = u;
+    dragging = true;
+    dragSamples.push({ ta: elapsed(), x: clamp(u[0], 0, FW), y: clamp(u[1], 0, FH), done: false });
+    var now = elapsed();
+    if (now - lastTapT < 0.35) {
+      var dx = u[0] - lastTapX, dy = u[1] - lastTapY;
+      if (dx * dx + dy * dy < 0.02) { reseed(); lastTapT = -10; return; }
+    }
+    lastTapT = now; lastTapX = u[0]; lastTapY = u[1];
+  }
+  function onUp() { dragging = false; }
+
+  function reseed() {
+    faceSeed = (faceSeed + 7919) | 0;
+    smokeSeed = (smokeSeed + 104729) | 0;
+    buildFace(faceSeed);
+    initSmoke(smokeSeed);
+    dragSamples = [];
+    // Rebuild the smoke history behind the new face, as at load.
+    for (var i = 0; i < PREROLL / DT; i++) stepSim(false);
+    draw();
+  }
+
+  // ------------------------------------------------------------------
+  // Draw.
+  // ------------------------------------------------------------------
+  function draw(forceTarget) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    // Advance the sim, in fixed steps, to the anchored clock. The boot
+    // draw passes an explicit target of 0 so frame one never depends
+    // on how much wall time the pre-roll happened to take.
+    var target;
+    if (typeof forceTarget === 'number') target = forceTarget;
+    else if (forcedT >= 0) target = forcedT;
+    else target = elapsed();
+    var guard = 0;
+    while (ambT < target - 1e-9 && guard < 60 * 120) { stepSim(true); guard++; }
+
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = PAPER;
+    ctx.fillRect(0, 0, W, H);
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+
+    var i, p;
+
+    // Smoke is clipped to the composition field: particles idling in
+    // the wrap margin would otherwise stack into smudges on the paper
+    // margins.
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(PX(0), PY(0), FW * SCALE, FH * SCALE);
+    ctx.clip();
+
+    // Smoke behind the face (even-indexed particles).
+    ctx.strokeStyle = SMOKE;
+    ctx.lineWidth = Math.max(1, 0.0042 * SCALE);
+    for (i = 0; i < NPART; i += 2) {
+      p = parts[i];
+      curl(p.x, p.y, cv);
+      ctx.globalAlpha = 0.095;
+      ctx.beginPath();
+      ctx.moveTo(PX(p.x - cv.x * 0.28), PY(p.y - cv.y * 0.28));
+      ctx.lineTo(PX(p.x + cv.x * 0.28), PY(p.y + cv.y * 0.28));
+      ctx.stroke();
+    }
+
+    // Face hatch, each stroke's alpha modulated by the smoke at its
+    // own midpoint.
+    ctx.strokeStyle = GRAPHITE;
+    for (i = 0; i < strokes.length; i++) {
+      var st = strokes[i];
+      var vis = visAt(st.cx, st.cy);
+      if (vis * st.a < 0.012) continue;
+      ctx.globalAlpha = vis * st.a;
+      ctx.lineWidth = Math.max(0.7, st.w * SCALE);
+      ctx.beginPath();
+      ctx.moveTo(PX(st.pts[0][0]), PY(st.pts[0][1]));
+      for (var k = 1; k < st.pts.length; k++) ctx.lineTo(PX(st.pts[k][0]), PY(st.pts[k][1]));
+      ctx.stroke();
+    }
+
+    // Eyes, live: iris and pupil offset toward the pointer, clamped,
+    // so the face looks out at whoever is there. With no pointer the
+    // gaze rests straight ahead.
+    var irisR = F.eyeW * F.hw * 0.30;
+    var gdx = 0, gdy = 0;
+    if (gaze) {
+      var vx = gaze[0] - FACE_X, vy = gaze[1] - FACE_Y;
+      var vd = Math.sqrt(vx * vx + vy * vy);
+      if (vd > 1e-4) {
+        var m = Math.min(1, vd / 0.45);
+        gdx = vx / vd * m; gdy = vy / vd * m;
+      }
+    }
+    for (var e2 = 0; e2 < 2; e2++) {
+      var es2 = e2 === 0 ? -1 : 1;
+      var ecx = FACE_X + es2 * F.eyeU * F.hw, ecy = FACE_Y + F.eyeV * F.hh;
+      var evis = visAt(ecx, ecy);
+      var ix = ecx + gdx * irisR * 0.42, iy = ecy + gdy * irisR * 0.42;
+      ctx.globalAlpha = 0.85 * evis;
+      ctx.fillStyle = GRAPHITE;
+      ctx.beginPath();
+      ctx.ellipse(PX(ix), PY(iy), irisR * SCALE, irisR * SCALE * 0.92, 0, 0, Math.PI * 2);
+      ctx.fill();
+      var px2 = ecx + gdx * irisR * 0.62, py2 = ecy + gdy * irisR * 0.62;
+      ctx.globalAlpha = 0.95 * evis;
+      ctx.beginPath();
+      ctx.ellipse(PX(px2), PY(py2), irisR * 0.48 * SCALE, irisR * 0.48 * SCALE, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 0.9 * evis;
+      ctx.fillStyle = PAPER;
+      ctx.beginPath();
+      ctx.ellipse(PX(px2 - irisR * 0.16), PY(py2 - irisR * 0.18), irisR * 0.15 * SCALE, irisR * 0.15 * SCALE, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = GRAPHITE;
+    }
+
+    // Smoke in front of the face (odd-indexed particles).
+    ctx.strokeStyle = SMOKE;
+    ctx.lineWidth = Math.max(1, 0.0042 * SCALE);
+    for (i = 1; i < NPART; i += 2) {
+      p = parts[i];
+      curl(p.x, p.y, cv);
+      ctx.globalAlpha = 0.095;
+      ctx.beginPath();
+      ctx.moveTo(PX(p.x - cv.x * 0.28), PY(p.y - cv.y * 0.28));
+      ctx.lineTo(PX(p.x + cv.x * 0.28), PY(p.y + cv.y * 0.28));
+      ctx.stroke();
+    }
+
+    // The one ember, low-left: a point and its faint halo, breathing.
+    var pulse = 0.75 + 0.25 * Math.sin(ambT * 0.8);
+    ctx.fillStyle = EMBER;
+    ctx.strokeStyle = EMBER;
+    var er = 0.0062 * SCALE;
+    var ringR = [0.013, 0.021, 0.030], ringA = [0.22, 0.13, 0.07];
+    for (var r2 = 0; r2 < 3; r2++) {
+      ctx.globalAlpha = ringA[r2] * pulse;
+      ctx.lineWidth = Math.max(0.7, 0.0022 * SCALE);
+      ctx.beginPath();
+      ctx.ellipse(PX(EMBER_X), PY(EMBER_Y), ringR[r2] * SCALE, ringR[r2] * SCALE, 0, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 0.92 * pulse;
+    ctx.beginPath();
+    ctx.ellipse(PX(EMBER_X), PY(EMBER_Y), er, er, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
+  // ------------------------------------------------------------------
+  // Boot: size, build the first face, pre-roll the smoke a fixed
+  // number of steps, and draw frame one synchronously. The pre-roll
+  // advances only the smoke clock; the ambient clock (and with it the
+  // veil peak) sits at t=0, so frame one is the veiled moment.
+  // ------------------------------------------------------------------
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+  }
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('resize', function () { resize(); draw(); });
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', function () { resize(); draw(); });
+    }
+  }
+
+  resize();
+  buildFace(faceSeed);
+  initSmoke(smokeSeed);
+  for (var b = 0; b < PREROLL / DT; b++) stepSim(false);
+  // Frame one: synchronous, at the constant ambient phase 0. A forced
+  // QA state (?seed=tNN) draws at that ambient time instead.
+  draw(forcedT >= 0 ? forcedT : 0);
+
+  if (typeof requestAnimationFrame === 'function' && forcedT < 0) {
+    var loop = function () { draw(); requestAnimationFrame(loop); };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>

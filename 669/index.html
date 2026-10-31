@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Cien Pesos</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #0E0E10; overflow: hidden; }
+  canvas { display: block; touch-action: none; cursor: grab; }
+  canvas:active { cursor: grabbing; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // Palette (strict): flat lines on black, no metallic gradients.
+  var GROUND = '#0E0E10';
+  var SILVER = '#C9C9CE';
+  var COPPER = '#A86B3C';   // the rim only
+
+  var TAU = Math.PI * 2;
+  var OMEGA0 = TAU / 22;          // idle spin: one full turn in 22 s
+  var DT = 1 / 120;               // fixed simulation step
+  var STAMP_LIFE = 30;            // seconds a stamped copy lives
+  var STAMP_CAP = 12;
+  var FORCE_ANG = -1;             // QA hook: degrees, -1 = live simulation
+
+  // QA seed hook: ?seed=aNN pins the coin angle in degrees (headless renderer).
+  try {
+    if (typeof location !== 'undefined' && location.search) {
+      var qm = /[?&]seed=a([0-9]+(?:\.[0-9]+)?)/.exec(location.search);
+      if (qm) FORCE_ANG = parseFloat(qm[1]);
+    }
+  } catch (e) { /* live mode */ }
+
+  // Seeded RNG (mulberry32). Used ONLY for hair-strand jitter and the
+  // per-stamp drift directions, so the portrait itself is stable data.
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(669001);
+
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+  function smooth(x) { x = clamp(x, 0, 1); return x * x * (3 - 2 * x); }
+
+  // ------------------------------------------------------------------
+  // Curve helpers. Landmarks are sparse point lists in portrait space
+  // (rim radius = 1, x right, y DOWN, face centre near origin).
+  // ------------------------------------------------------------------
+  function catmull(pts, closed, per) {
+    per = per || 6;
+    var out = [];
+    var n = pts.length;
+    var seg = closed ? n : n - 1;
+    for (var i = 0; i < seg; i++) {
+      var p0 = pts[(i - 1 + n) % n], p1 = pts[i % n];
+      var p2 = pts[(i + 1) % n], p3 = pts[(i + 2) % n];
+      if (!closed) {
+        if (i === 0) p0 = p1;
+        if (i === seg - 1) p3 = p2;
+      }
+      for (var j = 0; j < per; j++) {
+        var t = j / per, t2 = t * t, t3 = t2 * t;
+        out.push([
+          0.5 * ((2 * p1[0]) + (-p0[0] + p2[0]) * t + (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2 + (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3),
+          0.5 * ((2 * p1[1]) + (-p0[1] + p2[1]) * t + (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2 + (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3)
+        ]);
+      }
+    }
+    if (!closed) out.push([pts[n - 1][0], pts[n - 1][1]]);
+    return out;
+  }
+  function circlePts(cx, cy, r, n) {
+    var out = [];
+    for (var i = 0; i < n; i++) {
+      var a = (i / n) * TAU;
+      out.push([cx + r * Math.cos(a), cy + r * Math.sin(a)]);
+    }
+    return out;
+  }
+  function mirror(pts) { // right-half landmarks -> left half, order reversed
+    var out = [];
+    for (var i = pts.length - 1; i >= 0; i--) out.push([-pts[i][0], pts[i][1]]);
+    return out;
+  }
+  function scaled(pts, cx, cy, sx, sy) {
+    var out = [];
+    for (var i = 0; i < pts.length; i++) out.push([cx + (pts[i][0] - cx) * sx, cy + (pts[i][1] - cy) * sy]);
+    return out;
+  }
+  function shifted(pts, dx, dy) {
+    var out = [];
+    for (var i = 0; i < pts.length; i++) out.push([pts[i][0] + dx, pts[i][1] + dy]);
+    return out;
+  }
+  function jitter(pts, amt) {
+    var out = [];
+    for (var i = 0; i < pts.length; i++) {
+      if (i === 0 || i === pts.length - 1) { out.push(pts[i]); continue; }
+      out.push([pts[i][0] + (rng() * 2 - 1) * amt, pts[i][1] + (rng() * 2 - 1) * amt]);
+    }
+    return out;
+  }
+
+  // ------------------------------------------------------------------
+  // THE LANDMARK KIT. A dignified woman's portrait, generated, never
+  // traced. Every feature is a sparse landmark list; the engraving is
+  // built by expanding features into offset contour families (below).
+  // Layers: z is relief depth for the coin-turn parallax
+  // (hair back -0.9, face 0, nose/lips front +0.5).
+  // ------------------------------------------------------------------
+  var HAIR = [
+    [0, -0.74], [0.22, -0.725], [0.40, -0.63], [0.50, -0.44], [0.545, -0.18],
+    [0.55, 0.10], [0.535, 0.36], [0.50, 0.56], [0.34, 0.635], [0.12, 0.66],
+    [-0.12, 0.66], [-0.34, 0.635], [-0.50, 0.56], [-0.535, 0.36], [-0.55, 0.10],
+    [-0.545, -0.18], [-0.50, -0.44], [-0.40, -0.63], [-0.22, -0.725]
+  ];
+  var FACE = [
+    [0, -0.575], [0.14, -0.568], [0.245, -0.525], [0.315, -0.42], [0.345, -0.26],
+    [0.362, -0.08], [0.372, 0.02], [0.355, 0.16], [0.305, 0.29], [0.225, 0.395],
+    [0.125, 0.458], [0, 0.488], [-0.125, 0.458], [-0.225, 0.395], [-0.305, 0.29],
+    [-0.355, 0.16], [-0.372, 0.02], [-0.362, -0.08], [-0.345, -0.26], [-0.315, -0.42],
+    [-0.245, -0.525], [-0.14, -0.568]
+  ];
+  var BROW_R = [[0.055, -0.20], [0.12, -0.238], [0.20, -0.248], [0.275, -0.222]];
+  var EYE_C_R = [0.16, -0.093];
+  var LID_UP_R = [[0.085, -0.095], [0.13, -0.125], [0.185, -0.122], [0.235, -0.092]];
+  var LID_LO_R = [[0.09, -0.088], [0.135, -0.062], [0.19, -0.063], [0.23, -0.086]];
+  var BRIDGE_R = [[0.036, -0.145], [0.040, -0.03], [0.048, 0.075]];
+  var BRIDGE_L = [[-0.036, -0.06], [-0.041, 0.02], [-0.047, 0.075]];
+  var NOSE_BASE = [
+    [0.052, 0.078], [0.086, 0.108], [0.088, 0.148], [0.055, 0.170], [0.02, 0.180],
+    [0, 0.183], [-0.02, 0.180], [-0.055, 0.170], [-0.088, 0.148], [-0.086, 0.108], [-0.052, 0.078]
+  ];
+  var NOSTRIL_R = [[0.024, 0.150], [0.040, 0.142], [0.056, 0.152]];
+  var NOSE_TIP = [[-0.03, 0.128], [0, 0.138], [0.03, 0.128]];
+  var MOUTH = [[-0.105, 0.295], [-0.04, 0.288], [0, 0.292], [0.04, 0.288], [0.105, 0.295]];
+  var LIP_UP = [[-0.105, 0.295], [-0.055, 0.272], [-0.018, 0.280], [0, 0.274], [0.018, 0.280], [0.055, 0.272], [0.105, 0.295]];
+  var LIP_LO = [[-0.095, 0.30], [-0.05, 0.332], [0, 0.34], [0.05, 0.332], [0.095, 0.30]];
+  var CHIN_ARC = [[-0.055, 0.372], [0, 0.384], [0.055, 0.372]];
+  var EAR_R = [[0.372, -0.075], [0.402, -0.045], [0.408, 0.005], [0.392, 0.055], [0.366, 0.072]];
+  var EAR_IN_R = [[0.384, -0.03], [0.394, 0.0], [0.384, 0.032]];
+  var NECK_R = [[0.145, 0.435], [0.155, 0.545], [0.175, 0.665]];
+  var NECKLINE = [[-0.205, 0.655], [-0.10, 0.71], [0, 0.725], [0.10, 0.71], [0.205, 0.655]];
+  var SHOULDER_R = [[0.205, 0.655], [0.42, 0.71], [0.60, 0.78]];
+
+  // ------------------------------------------------------------------
+  // STROKE TABLE. Each entry: sampled polyline, layer z, width (rim
+  // units), alpha, closed flag. Offset contour families are built by
+  // scaling a feature's landmarks about its own centre: tight steps
+  // on high-curvature features (nose, lips), loose on the hair mass.
+  // ------------------------------------------------------------------
+  var STROKES = [];
+  function S(pts, z, w, a, closed, per) {
+    STROKES.push({ p: catmull(pts, !!closed, per || 6), z: z, w: w, a: a, closed: !!closed });
+  }
+  function SRaw(pts, z, w, a, closed) {
+    STROKES.push({ p: pts, z: z, w: w, a: a, closed: !!closed });
+  }
+
+  // Hair: outline, two loose echoes, parting, flowing strands.
+  S(HAIR, -0.9, 0.0042, 0.80, true);
+  S(scaled(HAIR, 0, -0.05, 0.93, 0.93), -0.9, 0.0032, 0.38, true);
+  S(scaled(HAIR, 0, -0.05, 0.86, 0.86), -0.9, 0.0030, 0.26, true);
+  S([[0, -0.735], [0.005, -0.60], [-0.005, -0.50]], -0.8, 0.0030, 0.50, false, 4);
+  for (var hs = 0; hs < 2; hs++) {
+    var side = hs === 0 ? 1 : -1;
+    for (var k = 0; k < 5; k++) {
+      var strand = [
+        [side * 0.05 * k, -0.725 + 0.026 * k],
+        [side * (0.26 + 0.05 * k), -0.60 + 0.04 * k],
+        [side * (0.50 - 0.01 * k), -0.10 + 0.04 * k],
+        [side * (0.465 - 0.015 * k), 0.52 - 0.04 * k]
+      ];
+      S(jitter(strand, 0.004), -0.75, 0.0030, 0.48, false, 7);
+    }
+  }
+
+  // Face: outline and two relief echoes following the whole oval.
+  S(FACE, 0, 0.0048, 0.95, true);
+  S(shifted(scaled(FACE, 0, 0.02, 0.925, 0.925), 0, 0.012), 0, 0.0032, 0.42, true);
+  S(shifted(scaled(FACE, 0, 0.02, 0.85, 0.85), 0, 0.024), 0, 0.0030, 0.28, true);
+
+  // Brows: bold, with one echo above.
+  S(BROW_R, 0.3, 0.0062, 0.95); S(mirror(BROW_R), 0.3, 0.0062, 0.95);
+  S(shifted(BROW_R, 0, -0.017), 0.3, 0.0030, 0.38); S(shifted(mirror(BROW_R), 0, -0.017), 0.3, 0.0030, 0.38);
+
+  // Eyes: lids, iris ring, lid echoes. Pupils are filled separately.
+  S(LID_UP_R, 0.35, 0.0044, 0.95); S(mirror(LID_UP_R), 0.35, 0.0044, 0.95);
+  S(LID_LO_R, 0.35, 0.0036, 0.85); S(mirror(LID_LO_R), 0.35, 0.0036, 0.85);
+  SRaw(circlePts(EYE_C_R[0], EYE_C_R[1], 0.030, 22), 0.35, 0.0034, 0.90, true);
+  SRaw(circlePts(-EYE_C_R[0], EYE_C_R[1], 0.030, 22), 0.35, 0.0034, 0.90, true);
+  S(scaled(LID_UP_R, EYE_C_R[0], EYE_C_R[1], 1.16, 1.30), 0.35, 0.0028, 0.32);
+  S(scaled(mirror(LID_UP_R), -EYE_C_R[0], EYE_C_R[1], 1.16, 1.30), 0.35, 0.0028, 0.32);
+  S(scaled(LID_LO_R, EYE_C_R[0], EYE_C_R[1], 1.14, 1.35), 0.35, 0.0026, 0.26);
+  S(scaled(mirror(LID_LO_R), -EYE_C_R[0], EYE_C_R[1], 1.14, 1.35), 0.35, 0.0026, 0.26);
+  var PUPILS = [[EYE_C_R[0], EYE_C_R[1]], [-EYE_C_R[0], EYE_C_R[1]]];
+
+  // Nose: the densest family. Bridge, base, two tight echoes, nostrils, tip.
+  S(BRIDGE_R, 0.5, 0.0040, 0.85); S(BRIDGE_L, 0.5, 0.0036, 0.55);
+  S(NOSE_BASE, 0.5, 0.0045, 0.95);
+  S(scaled(NOSE_BASE, 0, 0.128, 1.13, 1.12), 0.5, 0.0032, 0.45);
+  S(scaled(NOSE_BASE, 0, 0.128, 1.27, 1.24), 0.5, 0.0028, 0.30);
+  S(NOSTRIL_R, 0.5, 0.0034, 0.80, false, 4); S(mirror(NOSTRIL_R), 0.5, 0.0034, 0.80, false, 4);
+  S(NOSE_TIP, 0.5, 0.0030, 0.50, false, 4);
+
+  // Lips: mouth line, cupid bow, lower lip, two enclosing echo rings.
+  S(LIP_UP, 0.45, 0.0044, 0.95); S(MOUTH, 0.45, 0.0040, 0.90); S(LIP_LO, 0.45, 0.0044, 0.95);
+  S(scaled(LIP_UP, 0, 0.302, 1.12, 1.35), 0.45, 0.0030, 0.40);
+  S(scaled(LIP_LO, 0, 0.302, 1.12, 1.35), 0.45, 0.0030, 0.40);
+  S(scaled(LIP_UP, 0, 0.302, 1.24, 1.70), 0.45, 0.0026, 0.26);
+  S(scaled(LIP_LO, 0, 0.302, 1.24, 1.70), 0.45, 0.0026, 0.26);
+  S(CHIN_ARC, 0.3, 0.0030, 0.35, false, 4);
+
+  // Ears and earrings (ring + flat pendant), the right ear fully drawn,
+  // the left plainer where the hair falls.
+  S(EAR_R, -0.15, 0.0038, 0.70); S(EAR_IN_R, -0.15, 0.0030, 0.50, false, 4);
+  S(mirror(EAR_R), -0.15, 0.0038, 0.55);
+  SRaw(circlePts(0.388, 0.098, 0.015, 14), -0.15, 0.0032, 0.85, true);
+  SRaw(circlePts(-0.388, 0.098, 0.015, 14), -0.15, 0.0032, 0.85, true);
+  S([[0.372, 0.118], [0.404, 0.118], [0.398, 0.168], [0.378, 0.168]], -0.15, 0.0036, 0.85, true, 2);
+  S([[-0.372, 0.118], [-0.404, 0.118], [-0.398, 0.168], [-0.378, 0.168]], -0.15, 0.0036, 0.85, true, 2);
+  S([[0.388, 0.124], [0.388, 0.162]], -0.15, 0.0026, 0.50, false, 1);
+  S([[-0.388, 0.124], [-0.388, 0.162]], -0.15, 0.0026, 0.50, false, 1);
+
+  // Neck, chin shadow, necklace of beads with a pendant, garment.
+  S(NECK_R, -0.1, 0.0040, 0.80); S(mirror(NECK_R), -0.1, 0.0040, 0.80);
+  S([[-0.09, 0.475], [0, 0.50], [0.09, 0.475]], -0.1, 0.0028, 0.30, false, 4);
+  for (var b = 0; b <= 10; b++) {
+    var bt = b / 10;
+    SRaw(circlePts(-0.21 + 0.42 * bt, 0.588 + 0.07 * Math.sin(Math.PI * bt), 0.0135, 10), -0.05, 0.0028, 0.80, true);
+  }
+  S([[-0.028, 0.66], [0.028, 0.66], [0.02, 0.72], [-0.02, 0.72]], -0.05, 0.0034, 0.85, true, 2);
+  S([[0, 0.667], [0, 0.713]], -0.05, 0.0024, 0.50, false, 1);
+  S(NECKLINE, -0.3, 0.0042, 0.80);
+  S(SHOULDER_R, -0.3, 0.0038, 0.60); S(mirror(SHOULDER_R), -0.3, 0.0038, 0.60);
+  [0.795, 0.865, 0.93].forEach(function (yy) {
+    var xe = Math.min(Math.sqrt(Math.max(0.05, 1 - (yy + 0.015) * (yy + 0.015))) * 0.99, 0.56);
+    S([[-xe, yy], [0, yy + 0.028], [xe, yy]], -0.3, 0.0036, 0.55, false, 8);
+  });
+  for (var tk = -4; tk <= 4; tk++) {
+    if (tk === 0) continue;
+    S([[tk * 0.09, 0.870], [tk * 0.09, 0.896]], -0.3, 0.0024, 0.32, false, 1);
+  }
+
+  // ------------------------------------------------------------------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0, isPhone = false;
+  var CX = 0, CY = 0, RAD = 0;
+  var lastElapsed = 0;
+
+  function layout() {
+    CX = W / 2; CY = H / 2;
+    RAD = 0.5 * (isPhone ? W * 0.92 : Math.min(W, H) * 0.70);
+  }
+  function resize() {
+    var vv = window.visualViewport;
+    W = vv ? vv.width : window.innerWidth;
+    H = vv ? vv.height : window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    if (window.screen) {
+      isPhone = Math.min(window.screen.width, window.screen.height) < 700;
+    } else {
+      isPhone = H > W * 1.15;
+    }
+    layout();
+    draw(lastElapsed);
+  }
+
+  // ------------------------------------------------------------------
+  // Portrait rendering. A coin angle gives each relief layer its own
+  // compression: sx = cos(angle - z * lag), plus a parallax shift
+  // sin(angle) * z. At 90 degrees every layer collapses to the sliver.
+  // ------------------------------------------------------------------
+  function layerX(x, z, ang) {
+    return x * Math.cos(ang - z * 0.10) + Math.sin(ang) * z * 0.055;
+  }
+  function drawPortrait(cx, cy, R, ang, alphaMul) {
+    var i, j, st, c;
+    // Rim: copper, the only copper. Two ellipses, the second offset by
+    // the turn, suggest the coin's edge; plus one inner silver ring.
+    var cr = Math.cos(ang), sr = Math.sin(ang);
+    var rx = R * Math.max(Math.abs(cr), 0.02);
+    ctx.lineWidth = Math.max(0.8, 0.016 * R);
+    ctx.strokeStyle = COPPER;
+    ctx.globalAlpha = 0.45 * alphaMul;
+    ctx.beginPath(); ctx.ellipse(cx + sr * 0.03 * R, cy, rx, R, 0, 0, TAU); ctx.stroke();
+    ctx.globalAlpha = 0.95 * alphaMul;
+    ctx.beginPath(); ctx.ellipse(cx, cy, rx, R, 0, 0, TAU); ctx.stroke();
+    ctx.strokeStyle = SILVER;
+    ctx.lineWidth = Math.max(0.6, 0.0025 * R);
+    ctx.globalAlpha = 0.30 * alphaMul;
+    var rx2 = R * 0.962 * Math.max(Math.abs(cr), 0.02);
+    ctx.beginPath(); ctx.ellipse(cx, cy, rx2, R * 0.962, 0, 0, TAU); ctx.stroke();
+
+    // Engraved strokes, back layers first.
+    ctx.strokeStyle = SILVER;
+    for (i = 0; i < STROKES.length; i++) {
+      st = STROKES[i];
+      c = Math.cos(ang - st.z * 0.10);
+      ctx.globalAlpha = st.a * alphaMul;
+      ctx.lineWidth = Math.max(0.55, st.w * R * (0.35 + 0.65 * Math.abs(c)));
+      ctx.beginPath();
+      for (j = 0; j < st.p.length; j++) {
+        var X = cx + layerX(st.p[j][0], st.z, ang) * R;
+        var Y = cy + st.p[j][1] * R;
+        if (j === 0) ctx.moveTo(X, Y); else ctx.lineTo(X, Y);
+      }
+      if (st.closed) ctx.closePath();
+      ctx.stroke();
+    }
+    // Pupils: small filled dots, the only fills in the portrait.
+    ctx.fillStyle = SILVER;
+    for (i = 0; i < PUPILS.length; i++) {
+      var pz = 0.35;
+      var px = cx + layerX(PUPILS[i][0], pz, ang) * R;
+      var py = cy + PUPILS[i][1] * R;
+      var pr = Math.max(0.7, 0.0125 * R * Math.max(Math.abs(Math.cos(ang - pz * 0.10)), 0.15));
+      ctx.globalAlpha = 0.92 * alphaMul;
+      ctx.beginPath(); ctx.ellipse(px, py, pr, 0.0125 * R, 0, 0, TAU); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ------------------------------------------------------------------
+  // Simulation. Fixed-step integration from an anchored clock. Pointer
+  // events are recorded with anchored times and consumed by the steps
+  // they fall in, so the state is a function of elapsed + events.
+  // A stamp is pure data (birth time, frozen start angle, drift seed);
+  // it is redrawn parametrically every frame, never cached as pixels.
+  // ------------------------------------------------------------------
+  var sim = {
+    th: 0, om: OMEGA0, acc: 0, nextPos: TAU, nextNeg: -TAU,
+    stamps: [], dragging: false, vel: 0, lastX: 0, lastMoveT: 0, stepped: 0
+  };
+  var events = [];
+  var stampRng = mulberry32(669077);
+
+  function addStamp(t) {
+    var a = stampRng() * TAU;
+    sim.stamps.push({ birth: t, ang0: sim.th, dx: Math.cos(a), dy: Math.sin(a) - 0.55, seed: stampRng() });
+    while (sim.stamps.length > STAMP_CAP) sim.stamps.shift();
+  }
+  function checkStamps(t) {
+    while (sim.acc >= sim.nextPos) { addStamp(t); sim.nextPos += TAU; }
+    while (sim.acc <= sim.nextNeg) { addStamp(t); sim.nextNeg -= TAU; }
+  }
+  function applyEvent(ev) {
+    if (ev.type === 'down') {
+      sim.dragging = true; sim.lastX = ev.x; sim.vel = 0; sim.lastMoveT = ev.t;
+    } else if (ev.type === 'move' && sim.dragging) {
+      var dth = (ev.x - sim.lastX) * (TAU / (0.8 * Math.max(W, 1)));
+      sim.th += dth; sim.acc += dth;
+      var dtEv = Math.max(ev.t - sim.lastMoveT, 1 / 240);
+      sim.vel = 0.7 * sim.vel + 0.3 * (dth / dtEv);
+      sim.lastX = ev.x; sim.lastMoveT = ev.t;
+      checkStamps(ev.t);
+    } else if (ev.type === 'up') {
+      if (sim.dragging) sim.om = clamp(sim.vel, -9, 9);
+      sim.dragging = false;
+    }
+  }
+  function stepTo(elapsed) {
+    var guard = 0;
+    while (sim.stepped + DT <= elapsed && guard < 20000) {
+      guard++;
+      var stepEnd = sim.stepped + DT;
+      while (events.length && events[0].t <= stepEnd) applyEvent(events.shift());
+      if (!sim.dragging) {
+        sim.om += (OMEGA0 - sim.om) * (1 - Math.exp(-DT / 1.6));
+        var dth = sim.om * DT;
+        sim.th += dth; sim.acc += dth;
+        checkStamps(stepEnd);
+      }
+      sim.stepped = stepEnd;
+    }
+  }
+
+  function draw(elapsed) {
+    lastElapsed = elapsed;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.fillStyle = GROUND;
+    ctx.globalAlpha = 1;
+    ctx.fillRect(0, 0, W, H);
+
+    if (FORCE_ANG >= 0) {           // QA: a pinned angle, no stamps
+      drawPortrait(CX, CY, RAD, FORCE_ANG * Math.PI / 180, 1);
+      return;
+    }
+    stepTo(elapsed);
+    // Stamped copies, oldest first, receding and fading behind the coin.
+    for (var i = sim.stamps.length - 1; i >= 0; i--) {
+      var s = sim.stamps[i];
+      var age = elapsed - s.birth;
+      if (age > STAMP_LIFE) { sim.stamps.splice(i, 1); continue; }
+      var u = age / STAMP_LIFE;
+      var sc = 1 - 0.45 * smooth(u);
+      var drift = 0.30 * Math.pow(u, 1.2);
+      var aMul = 0.34 * smooth(age / 0.5) * (1 - smooth((age - STAMP_LIFE + 12) / 12));
+      if (aMul < 0.004) continue;
+      drawPortrait(CX + s.dx * drift * RAD, CY + s.dy * drift * RAD,
+                   RAD * sc, s.ang0 + OMEGA0 * 0.3 * age, aMul);
+    }
+    drawPortrait(CX, CY, RAD, sim.th, 1);
+  }
+
+  // ------------------------------------------------------------------
+  var t0 = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+  function elapsedNow() {
+    if (typeof performance !== 'undefined' && performance.now) return (performance.now() - t0) / 1000;
+    return lastElapsed;
+  }
+  function record(type) {
+    return function (ev) {
+      var x = (typeof ev.clientX === 'number') ? ev.clientX : sim.lastX;
+      events.push({ type: type, x: x, t: elapsedNow() });
+      if (ev.preventDefault) ev.preventDefault();
+    };
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', record('down'));
+    canvas.addEventListener('pointermove', record('move'));
+    canvas.addEventListener('pointerup', record('up'));
+  }
+  if (window.addEventListener) window.addEventListener('pointerup', record('up'));
+
+  resize();
+  draw(0);
+
+  if (typeof window.requestAnimationFrame === 'function') {
+    var raf = function () {
+      draw(elapsedNow());
+      window.requestAnimationFrame(raf);
+    };
+    window.requestAnimationFrame(raf);
+  }
+
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', resize);
+  }
+  window.addEventListener('resize', resize);
+})();
+</script>
+</body>
+</html>
