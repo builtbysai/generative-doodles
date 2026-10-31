@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Homebound</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0E0E10; height: 100%; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+
+// Homebound (EXPANSION #86 mona-hatoum, block 8)
+// A dark room of reduced domestic outlines wired together with red wire.
+// Current pulses travel the wires; now and then one object buzzes.
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+var COL = {
+  bg: '#0E0E10',
+  outline: '#5A5A60',
+  wire: '#8A1F16',
+  pulse: '#FF5A3C',
+  buzz: '#FF8A5C',
+  floor: '#1E1E22'
+};
+
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var W = 0, H = 0, isPhone = false;
+var curT = 0;
+
+// ---------------------------------------------------------------------------
+// Scene graph: nodes are wire connection points in a 1000x1000 design space.
+// Node order: 0 bed, 1 lamp, 2 bulb hub, 3 cup, 4 table, 5 chair.
+// ---------------------------------------------------------------------------
+var NODES = [
+  { x: 231, y: 668 },  // bed anchor
+  { x: 385, y: 452 },  // lamp anchor (shade)
+  { x: 520, y: 300 },  // bulb hub
+  { x: 505, y: 614 },  // cup anchor
+  { x: 520, y: 642 },  // table anchor
+  { x: 785, y: 652 }   // chair anchor
+];
+var EDGES = [
+  [0, 1], // bed - lamp
+  [1, 2], // lamp - hub
+  [2, 3], // hub - cup
+  [3, 4], // cup - table (short drop)
+  [2, 4], // hub - table
+  [4, 5], // table - chair
+  [0, 4]  // bed - table (low, along the floor)
+];
+
+// Domestic objects as stroke primitives in design coordinates.
+// kind 'l': line x1 y1 x2 y2. kind 'a': arc cx cy r a0 a1.
+var OBJECTS = [
+  { name: 'bed', node: 0, phase: 1.7, prims: [
+    { k: 'l', p: [110, 555, 110, 725] },
+    { k: 'l', p: [126, 640, 188, 640] },
+    { k: 'l', p: [188, 640, 188, 664] },
+    { k: 'l', p: [188, 664, 126, 664] },
+    { k: 'l', p: [126, 664, 126, 640] },
+    { k: 'l', p: [110, 668, 352, 668] },
+    { k: 'l', p: [352, 628, 352, 725] },
+    { k: 'l', p: [110, 725, 352, 725] },
+    { k: 'l', p: [128, 725, 128, 758] },
+    { k: 'l', p: [334, 725, 334, 758] }
+  ] },
+  { name: 'lamp', node: 1, phase: 4.2, prims: [
+    { k: 'l', p: [385, 474, 385, 772] },
+    { k: 'l', p: [358, 772, 412, 772] },
+    { k: 'l', p: [366, 428, 404, 428] },
+    { k: 'l', p: [366, 428, 352, 476] },
+    { k: 'l', p: [404, 428, 418, 476] },
+    { k: 'l', p: [352, 476, 418, 476] }
+  ] },
+  { name: 'cup', node: 3, phase: 2.6, prims: [
+    { k: 'l', p: [484, 598, 490, 630] },
+    { k: 'l', p: [490, 630, 520, 630] },
+    { k: 'l', p: [520, 630, 526, 598] },
+    { k: 'l', p: [484, 598, 526, 598] },
+    { k: 'a', p: [532, 614, 9, -1.15, 1.15] },
+    { k: 'l', p: [478, 638, 532, 638] }
+  ] },
+  { name: 'table', node: 4, phase: 5.5, prims: [
+    { k: 'l', p: [428, 642, 612, 642] },
+    { k: 'l', p: [446, 642, 446, 772] },
+    { k: 'l', p: [594, 642, 594, 772] },
+    { k: 'l', p: [446, 668, 594, 668] }
+  ] },
+  { name: 'chair', node: 5, phase: 0.9, prims: [
+    { k: 'l', p: [742, 532, 742, 772] },
+    { k: 'l', p: [742, 532, 798, 532] },
+    { k: 'l', p: [742, 585, 798, 585] },
+    { k: 'l', p: [770, 532, 770, 652] },
+    { k: 'l', p: [742, 652, 828, 652] },
+    { k: 'l', p: [828, 652, 828, 772] },
+    { k: 'l', p: [742, 716, 828, 716] }
+  ] }
+];
+
+// Adjacency: for each node, list of {edge, atStart} for tap pulse emission.
+var ADJ = NODES.map(function () { return []; });
+EDGES.forEach(function (e, i) {
+  ADJ[e[0]].push({ edge: i, atStart: true });
+  ADJ[e[1]].push({ edge: i, atStart: false });
+});
+
+// ---------------------------------------------------------------------------
+// Buzz schedule: seeded, one object every 10-20 s, buzzing for 3 s.
+// ---------------------------------------------------------------------------
+var BUZZ_EVENTS = [];
+var SCHED_LEN = 0;
+(function buildSchedule() {
+  var rng = mulberry32(0xB022);
+  var t = 7 + rng() * 5;
+  while (t < 900) {
+    BUZZ_EVENTS.push({ t0: t, obj: Math.floor(rng() * OBJECTS.length) });
+    t += 10 + rng() * 10;
+  }
+  SCHED_LEN = t;
+})();
+
+function buzzAt(t) {
+  var te = t % SCHED_LEN;
+  for (var i = 0; i < BUZZ_EVENTS.length; i++) {
+    var e = BUZZ_EVENTS[i];
+    if (te >= e.t0 && te < e.t0 + 3) return { obj: e.obj, p: (te - e.t0) / 3 };
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Base current pulses: seeded phases on each wire, travelling continuously.
+// ---------------------------------------------------------------------------
+var BASE_PULSES = [];
+(function buildPulses() {
+  var rng = mulberry32(71186);
+  EDGES.forEach(function (e, i) {
+    var a = NODES[e[0]], b = NODES[e[1]];
+    var len = Math.hypot(b.x - a.x, b.y - a.y) * 1.05;
+    var count = len > 300 ? 2 : 1;
+    for (var j = 0; j < count; j++) {
+      BASE_PULSES.push({
+        edge: i,
+        phase: rng(),
+        speed: 70 + rng() * 50,
+        dir: (i + j) % 2 === 0 ? 1 : -1
+      });
+    }
+  });
+})();
+
+// Tap pulses: recorded events only; each is a pure function of tap time.
+var tapPulses = [];
+
+// ---------------------------------------------------------------------------
+// Wire geometry (rebuilt per frame from current viewport; design coords).
+// ---------------------------------------------------------------------------
+function buildWire(a, b) {
+  var dx = b.x - a.x, dy = b.y - a.y;
+  var len0 = Math.hypot(dx, dy) || 1;
+  var mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+  var sag = len0 * 0.16;
+  var cxp = mx + (-dy / len0) * len0 * 0.03;
+  var cyp = my + sag + (dx / len0) * len0 * 0.03;
+  var pts = [], cum = [0], total = 0, prev = null;
+  var STEPS = 64;
+  for (var i = 0; i <= STEPS; i++) {
+    var u = i / STEPS, v = 1 - u;
+    var x = v * v * a.x + 2 * v * u * cxp + u * u * b.x;
+    var y = v * v * a.y + 2 * v * u * cyp + u * u * b.y;
+    if (prev) total += Math.hypot(x - prev.x, y - prev.y);
+    pts.push({ x: x, y: y });
+    cum.push(total);
+    prev = { x: x, y: y };
+  }
+  return { pts: pts, cum: cum, len: total };
+}
+
+function wirePoint(w, s) {
+  if (s <= 0) return w.pts[0];
+  if (s >= w.len) return w.pts[w.pts.length - 1];
+  var i = 1;
+  while (w.cum[i] < s) i++;
+  var s0 = w.cum[i - 1], s1 = w.cum[i];
+  var f = s1 > s0 ? (s - s0) / (s1 - s0) : 0;
+  var p0 = w.pts[i - 1], p1 = w.pts[i];
+  return { x: p0.x + (p1.x - p0.x) * f, y: p0.y + (p1.y - p0.y) * f };
+}
+
+// ---------------------------------------------------------------------------
+// Drawing helpers.
+// ---------------------------------------------------------------------------
+var U = 1, OX = 0, OY = 0; // design-unit scale and origin, set per frame
+function px(x) { return OX + x * U; }
+function py(y) { return OY + y * U; }
+
+function strokePath(build, color, width, alpha) {
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = Math.max(0.6, width * U);
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.beginPath();
+  build();
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawWirePath(w) {
+  ctx.moveTo(px(w.pts[0].x), py(w.pts[0].y));
+  for (var i = 1; i < w.pts.length; i++) ctx.lineTo(px(w.pts[i].x), py(w.pts[i].y));
+}
+
+function drawPulse(w, s, halfLen, strong) {
+  var hl = Math.min(halfLen, w.len * 0.45);
+  var a = Math.max(0, s - hl), b = Math.min(w.len, s + hl);
+  if (b - a < 1) return;
+  function path() {
+    var steps = Math.max(2, Math.ceil((b - a) / 7));
+    for (var i = 0; i <= steps; i++) {
+      var p = wirePoint(w, a + (b - a) * (i / steps));
+      if (i === 0) ctx.moveTo(px(p.x), py(p.y)); else ctx.lineTo(px(p.x), py(p.y));
+    }
+  }
+  if (strong) {
+    strokePath(path, COL.pulse, 11, 0.10);
+    strokePath(path, COL.pulse, 7, 0.24);
+    strokePath(path, COL.pulse, 4, 0.55);
+    strokePath(path, COL.pulse, 2.2, 1.0);
+  } else {
+    strokePath(path, COL.pulse, 8, 0.08);
+    strokePath(path, COL.pulse, 4.5, 0.20);
+    strokePath(path, COL.pulse, 2.4, 0.55);
+    strokePath(path, COL.pulse, 1.4, 0.9);
+  }
+}
+
+function drawObject(obj, jx, jy, buzzEnv) {
+  function prims(color, width, alpha) {
+    strokePath(function () {
+      obj.prims.forEach(function (pr) {
+        if (pr.k === 'l') {
+          ctx.moveTo(px(pr.p[0] + jx), py(pr.p[1] + jy));
+          ctx.lineTo(px(pr.p[2] + jx), py(pr.p[3] + jy));
+        } else {
+          ctx.moveTo(px(pr.p[0] + jx) + pr.p[2] * U, py(pr.p[1] + jy));
+          ctx.arc(px(pr.p[0] + jx), py(pr.p[1] + jy), pr.p[2] * U, pr.p[3], pr.p[4]);
+        }
+      });
+    }, color, width, alpha);
+  }
+  if (buzzEnv > 0) {
+    prims(COL.buzz, 8, 0.14 * buzzEnv);
+    prims(COL.buzz, 4.5, 0.28 * buzzEnv);
+  }
+  prims(COL.outline, 2.2, 1);
+  if (buzzEnv > 0) prims(COL.buzz, 1.6, 0.8 * buzzEnv);
+}
+
+function draw(t) {
+  if (W === 0 || H === 0) return;
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+
+  var unit = Math.min(W, H);
+  U = unit / 1000;
+  OX = (W - unit) / 2;
+  OY = (H - unit) / 2;
+
+  ctx.fillStyle = COL.bg;
+  ctx.fillRect(0, 0, W, H);
+
+  var wires = EDGES.map(function (e) { return buildWire(NODES[e[0]], NODES[e[1]]); });
+
+  // Floor line.
+  strokePath(function () {
+    ctx.moveTo(px(40), py(790));
+    ctx.lineTo(px(960), py(790));
+  }, COL.floor, 2, 1);
+
+  // Hub cord from the top edge down to the bulb node.
+  strokePath(function () {
+    ctx.moveTo(px(NODES[2].x), py(30));
+    ctx.lineTo(px(NODES[2].x), py(NODES[2].y - 11));
+  }, COL.wire, 2, 1);
+
+  // Wires.
+  wires.forEach(function (w) {
+    strokePath(function () { drawWirePath(w); }, COL.wire, 2, 1);
+  });
+
+  // Base current pulses.
+  BASE_PULSES.forEach(function (p) {
+    var w = wires[p.edge];
+    var frac = (p.phase + (t * p.speed) / w.len) % 1;
+    var s = p.dir > 0 ? frac * w.len : (1 - frac) * w.len;
+    drawPulse(w, s, 15, false);
+  });
+
+  // Tap pulses (functions of recorded tap times).
+  tapPulses = tapPulses.filter(function (tp) {
+    return t - tp.t0 < 4 && tp.s + tp.dir * tp.speed * (t - tp.t0) > -30 &&
+           tp.s + tp.dir * tp.speed * (t - tp.t0) < wires[tp.edge].len + 30;
+  });
+  tapPulses.forEach(function (tp) {
+    var w = wires[tp.edge];
+    drawPulse(w, tp.s + tp.dir * tp.speed * (t - tp.t0), 22, true);
+  });
+
+  // Bulb hub node: ring plus a gently breathing core dot.
+  var hub = NODES[2];
+  ctx.save();
+  ctx.strokeStyle = COL.wire;
+  ctx.lineWidth = Math.max(0.8, 2.2 * U);
+  ctx.beginPath();
+  ctx.arc(px(hub.x), py(hub.y), 10 * U, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.globalAlpha = 0.55 + 0.25 * Math.sin(t * 2);
+  ctx.fillStyle = COL.pulse;
+  ctx.beginPath();
+  ctx.arc(px(hub.x), py(hub.y), 3.4 * U, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+
+  // Objects, with buzz jitter and glow when the schedule fires.
+  var buzz = buzzAt(t);
+  OBJECTS.forEach(function (obj, i) {
+    var jx = 0, jy = 0, env = 0;
+    if (buzz && buzz.obj === i) {
+      env = Math.sin(Math.PI * buzz.p);
+      jx = env * 2.6 * Math.sin(53 * t + obj.phase * 13) * Math.cos(37 * t + obj.phase * 7);
+      jy = env * 2.0 * Math.sin(61 * t + obj.phase * 19);
+    }
+    drawObject(obj, jx, jy, env);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Tap: send a strong pulse through the network from the tapped point.
+// ---------------------------------------------------------------------------
+function handleTap(dx, dy) {
+  var t = curT;
+  var wires = EDGES.map(function (e) { return buildWire(NODES[e[0]], NODES[e[1]]); });
+
+  // Nearest object anchor first: emit along every wire touching that node.
+  var bestNode = -1, bestNodeD = 70;
+  NODES.forEach(function (n, i) {
+    var d = Math.hypot(n.x - dx, n.y - dy);
+    if (d < bestNodeD) { bestNodeD = d; bestNode = i; }
+  });
+
+  function emitFromNode(nodeIdx, t0) {
+    ADJ[nodeIdx].forEach(function (a) {
+      var w = wires[a.edge];
+      tapPulses.push({
+        edge: a.edge,
+        s: a.atStart ? 0 : w.len,
+        dir: a.atStart ? 1 : -1,
+        t0: t0,
+        speed: 300
+      });
+    });
+  }
+
+  if (bestNode >= 0) {
+    emitFromNode(bestNode, t);
+  } else {
+    // Nearest point on any wire.
+    var bestEdge = -1, bestS = 0, bestD = 46;
+    wires.forEach(function (w, ei) {
+      for (var i = 0; i < w.pts.length; i++) {
+        var d = Math.hypot(w.pts[i].x - dx, w.pts[i].y - dy);
+        if (d < bestD) { bestD = d; bestEdge = ei; bestS = w.cum[i]; }
+      }
+    });
+    if (bestEdge < 0) return;
+    var w = wires[bestEdge];
+    tapPulses.push({ edge: bestEdge, s: bestS, dir: 1, t0: t, speed: 300 });
+    tapPulses.push({ edge: bestEdge, s: bestS, dir: -1, t0: t, speed: 300 });
+    // The pulse front reaches the nearer end node, then spills onto its wires.
+    var e = EDGES[bestEdge];
+    var toStart = bestS, toEnd = w.len - bestS;
+    var nearNode = toStart <= toEnd ? e[0] : e[1];
+    var delay = Math.min(toStart, toEnd) / 300;
+    ADJ[nearNode].forEach(function (a) {
+      if (a.edge === bestEdge) return;
+      var w2 = wires[a.edge];
+      tapPulses.push({
+        edge: a.edge,
+        s: a.atStart ? 0 : w2.len,
+        dir: a.atStart ? 1 : -1,
+        t0: t + delay,
+        speed: 300
+      });
+    });
+  }
+  if (tapPulses.length > 40) tapPulses.splice(0, tapPulses.length - 40);
+}
+
+if (canvas.addEventListener) {
+  canvas.addEventListener('pointerdown', function (ev) {
+    var rect = canvas.getBoundingClientRect();
+    var unit = Math.min(W, H);
+    if (!unit) return;
+    var dx = ((ev.clientX - rect.left) - (W - unit) / 2) / (unit / 1000);
+    var dy = ((ev.clientY - rect.top) - (H - unit) / 2) / (unit / 1000);
+    handleTap(dx, dy);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Sizing and main loop.
+// ---------------------------------------------------------------------------
+function resize() {
+  var vw = (window.visualViewport && window.visualViewport.width) || window.innerWidth;
+  var vh = (window.visualViewport && window.visualViewport.height) || window.innerHeight;
+  W = Math.round(vw);
+  H = Math.round(vh);
+  canvas.width = W;
+  canvas.height = H;
+  var sw = (window.screen && window.screen.width) || 9999;
+  var sh = (window.screen && window.screen.height) || 9999;
+  isPhone = Math.min(sw, sh) < 700 || H > W * 1.15;
+  draw(curT);
+}
+
+if (window.visualViewport && window.visualViewport.addEventListener) {
+  window.visualViewport.addEventListener('resize', resize);
+}
+if (window.addEventListener) window.addEventListener('resize', resize);
+
+// Frame one: synchronous draw at t=0 (deterministic; never clock-derived).
+resize();
+
+var startStamp = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+if (typeof requestAnimationFrame === 'function') {
+  var loop = function () {
+    curT = (performance.now() - startStamp) / 1000;
+    draw(curT);
+    requestAnimationFrame(loop);
+  };
+  requestAnimationFrame(loop);
+}
+</script>
+</body>
+</html>

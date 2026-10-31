@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Impenetrable</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #101014;
+    overflow: hidden;
+    height: 100%;
+  }
+  canvas {
+    display: block;
+    touch-action: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ---------- seeded RNG (mulberry32) ----------
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- palette (strict) ----------
+  var COL_BG = '#101014';
+  var COL_FAR = '#7A7F88';    // wire seen from far: the cloud
+  var COL_NEAR = '#B9BEC7';   // wire resolved up close
+  var COL_GLINT = '#E8EAEE';  // pale catch of light on a barb
+  var COL_SHADOW = '#000000'; // alpha-managed only
+
+  // ---------- state ----------
+  var BASE_SEED = 70986;
+  var epoch = 0;
+  var barbs = [];            // layout for current epoch, in square-local fractions
+  var W = 0, H = 0;
+  var S = 0;                 // square side in px (~60% of smaller dimension)
+  var isPhone = false;
+
+  var bootTime = (typeof performance !== 'undefined' && performance.now)
+    ? performance.now() : 0;
+
+  function elapsed() {
+    if (typeof performance !== 'undefined' && performance.now) {
+      return (performance.now() - bootTime) / 1000;
+    }
+    return 0;
+  }
+
+  // ---------- barb field ----------
+  // Each barb: a short stem with two prongs angled off the upper stem, the
+  // classic two-prong barb reduced to three strokes. Positions, angles and
+  // lengths are fractions of the square side, so the field survives resizes.
+  function buildField(ep) {
+    var rnd = mulberry32(BASE_SEED + ep * 7919);
+    var count = isPhone ? 1500 : 2000;
+    barbs = [];
+    for (var i = 0; i < count; i++) {
+      barbs.push({
+        u: (rnd() * 2 - 1) * 0.482,
+        v: (rnd() * 2 - 1) * 0.482,
+        ang: rnd() * Math.PI * 2,
+        len: 0.011 + rnd() * 0.010,       // fraction of S
+        spread: 0.62 + rnd() * 0.35,      // prong angle, radians from stem
+        crisp: rnd() < 0.38,              // in the sparse crisp subset at rest
+        glint: rnd()                      // hash: top few % can glint up close
+      });
+    }
+  }
+
+  // ---------- layout ----------
+  function fit() {
+    var vv = window.visualViewport;
+    W = vv ? vv.width : window.innerWidth;
+    H = vv ? vv.height : window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+    var sw = 0, sh = 0;
+    if (window.screen) { sw = window.screen.width || 0; sh = window.screen.height || 0; }
+    isPhone = (Math.min(sw, sh) > 0 && Math.min(sw, sh) < 700) || (H > W * 1.15);
+    S = Math.min(W, H) * 0.60;
+  }
+
+  // ---------- drift and drag follow ----------
+  // Drift: a tiny closed-form pendulum wander of the square's center.
+  function drift(t) {
+    return {
+      x: S * 0.013 * Math.sin(t * (Math.PI * 2 / 47) + 1.3),
+      y: S * 0.010 * Math.sin(t * (Math.PI * 2 / 34) + 0.4)
+    };
+  }
+
+  // Drag follow: a chain of segments, each an underdamped spring in closed
+  // form from the offset recorded when the segment began toward its target.
+  // While dragging the target is the pointer; on release it is home (0,0),
+  // so the square swings back with a laggy pendulum overshoot.
+  var SPRING_W = Math.PI * 2 / 1.7;   // ~1.7 s swing
+  var SPRING_Z = 0.22;                // underdamped
+  var seg = { t0: 0, fx: 0, fy: 0, tx: 0, ty: 0 };
+
+  function followOffset(t) {
+    var tau = t - seg.t0;
+    if (tau <= 0) return { x: seg.fx, y: seg.fy };
+    var wd = SPRING_W * Math.sqrt(1 - SPRING_Z * SPRING_Z);
+    var decay = Math.exp(-SPRING_Z * SPRING_W * tau);
+    var k = (Math.cos(wd * tau) + (SPRING_Z * SPRING_W / wd) * Math.sin(wd * tau)) * decay;
+    return {
+      x: seg.tx + (seg.fx - seg.tx) * k,
+      y: seg.ty + (seg.fy - seg.ty) * k
+    };
+  }
+
+  function startSegment(t, tx, ty) {
+    var cur = followOffset(t);
+    seg = { t0: t, fx: cur.x, fy: cur.y, tx: tx, ty: ty };
+  }
+
+  // ---------- pointer field ----------
+  // The pointer leaves decaying "pings" as it moves; while it is inside the
+  // canvas it also counts directly. Proximity for a point is a pure function
+  // of the recorded samples and the current time: spatial falloff times an
+  // exponential decay for pings, so the field softens back into cloud on its
+  // own after the pointer leaves.
+  var pings = [];             // {x, y, t}
+  var pointerIn = false;
+  var pointerX = 0, pointerY = 0;
+  var PING_TAU = 0.9;         // seconds for a ping to fade
+
+  function falloff(d, R) {
+    if (d >= R) return 0;
+    var q = 1 - d / R;
+    return q * q * (3 - 2 * q); // smoothstep
+  }
+
+  function proximity(x, y, t, R) {
+    var best = 0, i, p, s;
+    if (pointerIn) {
+      var dx = x - pointerX, dy = y - pointerY;
+      best = falloff(Math.sqrt(dx * dx + dy * dy), R);
+    }
+    for (i = 0; i < pings.length; i++) {
+      p = pings[i];
+      var age = t - p.t;
+      if (age < 0) continue;
+      var dec = Math.exp(-age / PING_TAU);
+      if (dec < 0.02) continue;
+      var ddx = x - p.x, ddy = y - p.y;
+      s = falloff(Math.sqrt(ddx * ddx + ddy * ddy), R) * dec;
+      if (s > best) best = s;
+    }
+    return best;
+  }
+
+  // ---------- barb geometry ----------
+  // Adds one barb (stem + two prongs) to the current path, centered at
+  // (cx, cy), stem length L px, rotated by ang, prongs at +/- spread.
+  function traceBarb(cx, cy, L, ang, spread) {
+    var ca = Math.cos(ang), sa = Math.sin(ang);
+    var tx = cx + ca * L, ty = cy + sa * L;             // stem tip
+    var bx = cx + ca * L * 0.62, by = cy + sa * L * 0.62; // prong root
+    var pl = L * 0.58;
+    var a1 = ang + spread, a2 = ang - spread;
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(tx, ty);
+    ctx.moveTo(bx, by);
+    ctx.lineTo(bx + Math.cos(a1) * pl, by + Math.sin(a1) * pl);
+    ctx.moveTo(bx, by);
+    ctx.lineTo(bx + Math.cos(a2) * pl, by + Math.sin(a2) * pl);
+  }
+
+  // ---------- draw ----------
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+
+    ctx.fillStyle = COL_BG;
+    ctx.fillRect(0, 0, W, H);
+
+    var dr = drift(t);
+    var fo = followOffset(t);
+    var cx = W / 2 + dr.x + fo.x;
+    var cy = H / 2 + dr.y + fo.y;
+    var x0 = cx - S / 2, y0 = cy - S / 2;
+    var i, b, bx, by;
+
+    // Soft shadow: stacked offsets of pure black at low alpha fake the blur
+    // the renderer cannot do; the square floats a little off the dark.
+    ctx.fillStyle = COL_SHADOW;
+    for (i = 4; i >= 1; i--) {
+      ctx.globalAlpha = 0.05;
+      var grow = i * S * 0.006;
+      ctx.fillRect(x0 - grow + S * 0.018, y0 - grow + S * 0.034, S + grow * 2, S + grow * 2);
+    }
+    ctx.globalAlpha = 1;
+
+    // Cloud body: nested fills of the far tone, cumulative toward the
+    // center, so the square's edge is feathered instead of hard.
+    ctx.fillStyle = COL_FAR;
+    for (i = 3; i >= 0; i--) {
+      ctx.globalAlpha = 0.024;
+      var inset = i * S * 0.02;
+      ctx.fillRect(x0 + inset, y0 + inset, S - inset * 2, S - inset * 2);
+    }
+    ctx.globalAlpha = 1;
+
+    // Pass 1, the soft underlay: every barb stroked wide and faint in the
+    // far tone, all in one batched path. At reading distance the strokes
+    // merge into a continuous gray haze; nothing individual survives.
+    ctx.strokeStyle = COL_FAR;
+    ctx.globalAlpha = 0.08;
+    ctx.lineWidth = Math.max(1.6, S * 0.0055);
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    for (i = 0; i < barbs.length; i++) {
+      b = barbs[i];
+      traceBarb(cx + b.u * S, cy + b.v * S, b.len * S, b.ang, b.spread);
+    }
+    ctx.stroke();
+
+    // Pass 2, the sparse crisp subset: a minority of barbs drawn thin in the
+    // near tone at low alpha. Up close they suggest the barbs; at thumbnail
+    // size they vanish into the underlay and the cloud stays soft.
+    ctx.strokeStyle = COL_NEAR;
+    ctx.globalAlpha = 0.16;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (i = 0; i < barbs.length; i++) {
+      b = barbs[i];
+      if (!b.crisp) continue;
+      traceBarb(cx + b.u * S, cy + b.v * S, b.len * S, b.ang, b.spread);
+    }
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    // Pass 3, proximity resolution: barbs near the pointer (or its recent
+    // pings) sharpen, lengthen and brighten; a few catch a pale glint.
+    // Pings older than ~4 s can no longer lift any barb above threshold.
+    while (pings.length && t - pings[0].t > 4) pings.shift();
+    if (pointerIn || pings.length) {
+      var R = S * 0.30;
+      var reach = R + S * 0.03;
+      ctx.lineWidth = 1.1;
+      for (i = 0; i < barbs.length; i++) {
+        b = barbs[i];
+        bx = cx + b.u * S; by = cy + b.v * S;
+        // cheap reject against the pointer and the freshest ping
+        var nearSome = false;
+        if (pointerIn && Math.abs(bx - pointerX) < reach && Math.abs(by - pointerY) < reach) nearSome = true;
+        if (!nearSome && pings.length) {
+          var lp = pings[pings.length - 1];
+          if (Math.abs(bx - lp.x) < reach && Math.abs(by - lp.y) < reach) nearSome = true;
+        }
+        if (!nearSome) continue;
+        var s = proximity(bx, by, t, R);
+        if (s < 0.03) continue;
+        var isGlint = b.glint > 0.93 && s > 0.55;
+        ctx.strokeStyle = isGlint ? COL_GLINT : COL_NEAR;
+        ctx.globalAlpha = 0.15 + 0.75 * s;
+        ctx.beginPath();
+        traceBarb(bx, by, b.len * S * (1 + 0.35 * s), b.ang, b.spread);
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    // Faint border: the square's edge, barely there, in the far tone.
+    ctx.strokeStyle = COL_FAR;
+    ctx.globalAlpha = 0.26;
+    ctx.lineWidth = 1;
+    ctx.strokeRect(x0 + 0.5, y0 + 0.5, S - 1, S - 1);
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- pointer events ----------
+  var downX = 0, downY = 0, downT = 0, dragging = false;
+
+  function evtPos(e) {
+    return { x: e.clientX, y: e.clientY };
+  }
+
+  canvas.addEventListener('pointerdown', function (e) {
+    var p = evtPos(e);
+    downX = p.x; downY = p.y; downT = elapsed();
+    dragging = false;
+    pointerIn = true; pointerX = p.x; pointerY = p.y;
+  });
+
+  canvas.addEventListener('pointermove', function (e) {
+    var p = evtPos(e);
+    var t = elapsed();
+    pointerIn = true; pointerX = p.x; pointerY = p.y;
+    pings.push({ x: p.x, y: p.y, t: t });
+    if (pings.length > 24) pings.shift();
+    if (downT > 0 || dragging) {
+      var moved = Math.abs(p.x - downX) + Math.abs(p.y - downY);
+      if (dragging || moved > 8) {
+        dragging = true;
+        // The square's center chases the pointer, relative to home center.
+        startSegment(t, p.x - W / 2, p.y - H / 2);
+      }
+    }
+  });
+
+  function endPointer(e) {
+    var t = elapsed();
+    if (dragging) {
+      startSegment(t, 0, 0); // release: pendulum back home
+    } else if (downT > 0 && t - downT < 0.35) {
+      // TAP: reseed the barb field. New epoch, new layout; never a reload.
+      epoch++;
+      buildField(epoch);
+    }
+    downT = 0; dragging = false;
+  }
+
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', endPointer);
+  canvas.addEventListener('pointerleave', function () {
+    pointerIn = false;
+    if (downT > 0) endPointer();
+  });
+
+  // ---------- boot ----------
+  function onResize() {
+    var wasPhone = isPhone;
+    fit();
+    if (isPhone !== wasPhone && barbs.length) buildField(epoch);
+    draw(elapsed());
+  }
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', onResize);
+  }
+  window.addEventListener('resize', onResize);
+
+  fit();
+  buildField(0);
+  draw(0); // frame one: synchronous, drift phase 0, no pointer, rest softness
+
+  if (typeof requestAnimationFrame === 'function') {
+    var loop = function () {
+      draw(elapsed());
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
