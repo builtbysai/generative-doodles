@@ -1,0 +1,489 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Tacitas</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #0A0A0B; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // Palette (strict). RIM is the study granite, the slab tone lightened,
+  // used only for the cupule rim arc that catches the light.
+  var GROUND = '#0A0A0B';
+  var SLAB = '#3A3A3D';
+  var EMPTY = '#1A1A1C';
+  var WATER = '#7FB3C8';
+  var GOLD = '#D9A441';
+  var RIM = '#8A8A8C';
+
+  var BASE_SEED = 651001;
+
+  // Cycle timeline (seconds): sweep, rest full, drain, repeat.
+  var T_SWEEP = 40, T_REST = 8, T_DRAIN = 10;
+  var T_CYCLE = T_SWEEP + T_REST + T_DRAIN; // 58
+
+  // Star catalog: bright southern stars, schematic chart coordinates
+  // (x right, y down, 0..1) after a standard south-facing star chart,
+  // with visual magnitudes. Cupule positions come from this table only,
+  // never from scatter. Radius grows with brightness (lower magnitude).
+  // [name (internal only), x, y, mag]
+  var STARS = [
+    ['Acrux',        0.455, 0.580,  0.8],
+    ['Mimosa',       0.385, 0.420,  1.3],
+    ['Gacrux',       0.475, 0.300,  1.6],
+    ['Imai',         0.545, 0.400,  2.8],
+    ['Ginan',        0.500, 0.500,  3.6],
+    ['Alpha Cen',    0.200, 0.630, -0.3],
+    ['Hadar',        0.280, 0.550,  0.6],
+    ['Canopus',      0.860, 0.180, -0.7],
+    ['Miaplacidus',  0.780, 0.380,  1.7],
+    ['Avior',        0.900, 0.400,  1.9],
+    ['Atria',        0.300, 0.780,  1.9],
+    ['Peacock',      0.420, 0.880,  1.9],
+    ['Al Nair',      0.620, 0.850,  1.7],
+    ['Fomalhaut',    0.740, 0.680,  1.2],
+    ['Achernar',     0.950, 0.720,  0.5],
+    ['Antares',      0.100, 0.220,  1.1],
+    ['Shaula',       0.060, 0.380,  1.6],
+    ['Kaus Aust',    0.180, 0.100,  1.9],
+    ['Alphard S',    0.660, 0.120,  2.2],
+    ['Delta Vel',    0.700, 0.520,  2.0],
+    ['Regor',        0.580, 0.660,  1.8]
+  ];
+
+  // Seeded RNG (mulberry32)
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function clamp01(v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
+  function lerp(a, b, t) { return a + (b - a) * t; }
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  var W = 0, H = 0, isPhone = false;
+
+  // Constellation state. Cupules are stored in chart space (cx, cy in
+  // 0..1 after the seeded transform, rN = radius as a fraction of the
+  // map size); pixel positions are derived per frame from the layout.
+  var cupules = [];      // {cx, cy, rN, fillT0 (abs time or -1), seq}
+  var patches = [];      // flat stone shading polygons, chart space
+  var constIndex = 0;
+
+  // Simulation state (all times are anchored elapsed seconds).
+  var cycleStart = 0;    // elapsed time at which the current cycle began
+  var fillSeq = [];      // cupule indices in the order they filled
+  var ripples = [];      // {ci, t0}
+  var bandManual = null; // {x (px), until} drag override for the band
+  var simT = 0;          // last simulated time
+
+  function buildConstellation(idx) {
+    var rng = mulberry32(BASE_SEED + idx * 7919);
+
+    // Flat stone shading: a few irregular polygons hugging the edges,
+    // drawn later at very low alpha. Seeded, fixed per constellation.
+    patches = [];
+    var np = 5 + Math.floor(rng() * 3);
+    for (var p = 0; p < np; p++) {
+      // A small irregular blob hugging one edge: a center near the
+      // edge, vertices on a rough ring around it in angular order.
+      var edge = Math.floor(rng() * 4);
+      var along = 0.08 + rng() * 0.84, off = rng() * 0.05;
+      var ccx, ccy;
+      if (edge === 0) { ccx = along; ccy = off; }
+      else if (edge === 1) { ccx = along; ccy = 1 - off; }
+      else if (edge === 2) { ccx = off; ccy = along; }
+      else { ccx = 1 - off; ccy = along; }
+      var rad = 0.05 + rng() * 0.08;
+      var pts = [];
+      var n = 5 + Math.floor(rng() * 3);
+      var a0 = rng() * Math.PI * 2;
+      for (var k = 0; k < n; k++) {
+        var ang = a0 + (k / n) * Math.PI * 2;
+        var rr = rad * (0.55 + rng() * 0.7);
+        pts.push([ccx + Math.cos(ang) * rr, ccy + Math.sin(ang) * rr]);
+      }
+      patches.push({ pts: pts, light: rng() < 0.6 });
+    }
+
+    // Seeded catalog transform: quarter-turn rotation plus a small
+    // angle, optional mirror, a subset of the catalog, small jitter.
+    var rot = Math.floor(rng() * 4) * Math.PI / 2 + (rng() - 0.5) * 0.16;
+    var mirror = rng() < 0.5 ? -1 : 1;
+    var order = [];
+    for (var i = 0; i < STARS.length; i++) order.push(i);
+    for (var s = order.length - 1; s > 0; s--) {
+      var j = Math.floor(rng() * (s + 1));
+      var tmp = order[s]; order[s] = order[j]; order[j] = tmp;
+    }
+    var take = 17 + Math.floor(rng() * 5); // 17..21 cupules
+    var cosr = Math.cos(rot), sinr = Math.sin(rot);
+
+    cupules = [];
+    for (var q = 0; q < take; q++) {
+      var st = STARS[order[q]];
+      var dx = (st[1] - 0.5) * mirror, dy = st[2] - 0.5;
+      var rx = dx * cosr - dy * sinr, ry = dx * sinr + dy * cosr;
+      var cx = 0.5 + rx * 0.92 + (rng() - 0.5) * 0.016;
+      var cy = 0.5 + ry * 0.92 + (rng() - 0.5) * 0.016;
+      // Radius from magnitude: brightest (Canopus, -0.7) largest.
+      var bright = (3.9 - st[3]) / 4.6; // 1.0 .. 0.065
+      var rN = 0.014 + 0.020 * bright;
+      cupules.push({ cx: cx, cy: cy, rN: rN, fillT0: -1, seq: -1 });
+    }
+    fillSeq = [];
+    ripples = [];
+  }
+
+  function resize() {
+    var vv = window.visualViewport;
+    W = vv ? vv.width : window.innerWidth;
+    H = vv ? vv.height : window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+    var sw = window.screen ? Math.min(window.screen.width, window.screen.height) : 9999;
+    isPhone = sw < 700 || H > W * 1.15;
+  }
+
+  // Layout: the square star map is fitted into the frame, centered,
+  // with a small margin. The slab itself fills the whole frame.
+  function layout() {
+    var m = Math.min(W, H);
+    var size = m * 0.94;
+    return { ox: (W - size) / 2, oy: (H - size) / 2, size: size };
+  }
+  function cupXY(c, L) { return [L.ox + c.cx * L.size, L.oy + c.cy * L.size]; }
+
+  function phaseAt(t) {
+    var ct = t - cycleStart;
+    if (ct < T_SWEEP) return { name: 'sweep', ct: ct };
+    if (ct < T_SWEEP + T_REST) return { name: 'rest', ct: ct };
+    return { name: 'drain', ct: ct };
+  }
+
+  // Auto band center x (px) during the sweep.
+  function bandAutoX(ct) {
+    var bw = W * 0.11;
+    return lerp(-bw * 0.35, W + bw * 0.35, ct / T_SWEEP);
+  }
+  function bandXAt(t) {
+    if (bandManual && t <= bandManual.until) return bandManual.x;
+    var ph = phaseAt(t);
+    if (ph.name !== 'sweep') return null;
+    return bandAutoX(ph.ct);
+  }
+
+  // Advance the simulation from simT to t in small substeps so fill
+  // moments are consistent between the live loop and forced renders.
+  function update(t) {
+    var step = 0.05;
+    while (simT < t - 1e-9) {
+      var nt = Math.min(simT + step, t);
+      stepOnce(nt);
+      simT = nt;
+    }
+  }
+
+  function stepOnce(t) {
+    // Cycle wrap: reset and begin again.
+    if (t - cycleStart >= T_CYCLE) {
+      cycleStart += T_CYCLE * Math.floor((t - cycleStart) / T_CYCLE);
+      for (var i = 0; i < cupules.length; i++) { cupules[i].fillT0 = -1; cupules[i].seq = -1; }
+      fillSeq = [];
+      ripples = [];
+    }
+    var ph = phaseAt(t);
+    if (ph.name === 'sweep') {
+      var bx = bandXAt(t);
+      if (bx !== null) {
+        var L = layout();
+        for (var k = 0; k < cupules.length; k++) {
+          var c = cupules[k];
+          if (c.fillT0 < 0) {
+            var xy = cupXY(c, L);
+            if (bx >= xy[0]) { // wet edge (band center) has passed
+              c.fillT0 = t;
+              c.seq = fillSeq.length;
+              fillSeq.push(k);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Water fraction 0..1 for a cupule at time t.
+  function fillFrac(c, t) {
+    if (c.fillT0 < 0) return 0;
+    var ph = phaseAt(t);
+    if (ph.name === 'drain' && c.seq >= 0) {
+      var n = Math.max(fillSeq.length, 1);
+      var rev = n - 1 - c.seq; // reverse fill order
+      var start = T_SWEEP + T_REST + (rev / n) * (T_DRAIN - 1.0);
+      var ct = t - cycleStart;
+      if (ct >= start) return 1 - clamp01((ct - start) / 0.6);
+      return clamp01((t - c.fillT0) / 1.0);
+    }
+    return clamp01((t - c.fillT0) / 1.0);
+  }
+  function isFilling(c, t) {
+    return c.fillT0 >= 0 && (t - c.fillT0) < 1.0 && phaseAt(t).name === 'sweep';
+  }
+
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+
+    // Slab fills the frame edge to edge over the ground tone.
+    ctx.fillStyle = GROUND;
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = SLAB;
+    ctx.fillRect(0, 0, W, H);
+
+    var L = layout();
+
+    // Flat stone shading near the edges (polygon shading, no gradients).
+    for (var p = 0; p < patches.length; p++) {
+      var pa = patches[p];
+      ctx.globalAlpha = pa.light ? 0.055 : 0.10;
+      ctx.fillStyle = pa.light ? RIM : EMPTY;
+      ctx.beginPath();
+      for (var k = 0; k < pa.pts.length; k++) {
+        var X = L.ox + pa.pts[k][0] * L.size, Y = L.oy + pa.pts[k][1] * L.size;
+        if (k === 0) ctx.moveTo(X, Y); else ctx.lineTo(X, Y);
+      }
+      ctx.closePath();
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // Rain band (sweep phase only, or while dragged).
+    var bx = bandXAt(t);
+    var ph = phaseAt(t);
+    if (bx !== null && (ph.name === 'sweep' || (bandManual && t <= bandManual.until))) {
+      var bw = W * 0.11;
+      var env = 1;
+      if (ph.name === 'sweep' && !bandManual) {
+        env = 0.55 + 0.45 * clamp01(ph.ct / 1.5);
+        if (ph.ct > T_SWEEP - 1.5) env *= 0.3 + 0.7 * clamp01((T_SWEEP - ph.ct) / 1.5);
+      }
+      ctx.globalAlpha = 0.13 * env;
+      ctx.fillStyle = WATER;
+      ctx.fillRect(bx - bw / 2, 0, bw, H);
+      ctx.globalAlpha = 0.22 * env;
+      ctx.fillRect(bx - bw / 2, 0, 1.5, H);
+      ctx.fillRect(bx + bw / 2 - 1.5, 0, 1.5, H);
+      // Faint rain streaks inside the band.
+      ctx.globalAlpha = 0.10 * env;
+      for (var sLine = -2; sLine <= 2; sLine++) {
+        ctx.fillRect(bx + sLine * bw / 5 - 0.75, 0, 1.5, H);
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    // Cupules.
+    for (var i = 0; i < cupules.length; i++) {
+      var c = cupules[i];
+      var xy = cupXY(c, L);
+      var x = xy[0], y = xy[1], r = c.rN * L.size;
+      var frac = fillFrac(c, t);
+
+      // Bowl: dark disc.
+      ctx.fillStyle = EMPTY;
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Water held in the bowl.
+      if (frac > 0) {
+        ctx.fillStyle = WATER;
+        ctx.beginPath();
+        ctx.arc(x, y, r * 0.78 * frac, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      // Rim arc: light catching the upper-left lip of the carving.
+      ctx.strokeStyle = RIM;
+      ctx.globalAlpha = 0.85;
+      ctx.lineWidth = Math.max(1.2, r * 0.16);
+      ctx.beginPath();
+      ctx.arc(x, y, r * 0.92, Math.PI * 0.72, Math.PI * 1.52);
+      ctx.stroke();
+      // Shadow lip, lower right, inside the bowl.
+      ctx.strokeStyle = GROUND;
+      ctx.globalAlpha = 0.55;
+      ctx.lineWidth = Math.max(1, r * 0.12);
+      ctx.beginPath();
+      ctx.arc(x, y, r * 0.80, -Math.PI * 0.28, Math.PI * 0.34);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+
+      // Gold ring while this cupule is the one filling.
+      if (isFilling(c, t)) {
+        ctx.strokeStyle = GOLD;
+        ctx.lineWidth = Math.max(1.5, r * 0.14);
+        ctx.beginPath();
+        ctx.arc(x, y, r * 1.04, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    }
+
+    // Ripples on filled cupules: one flat expanding ring.
+    for (var rp = ripples.length - 1; rp >= 0; rp--) {
+      var rip = ripples[rp];
+      var age = t - rip.t0;
+      if (age < 0 || age > 1.6) { if (age > 1.6) ripples.splice(rp, 1); continue; }
+      var rc = cupules[rip.ci];
+      if (!rc) continue;
+      var rxy = cupXY(rc, L);
+      var rr = rc.rN * L.size;
+      var pr = age / 1.6;
+      ctx.strokeStyle = WATER;
+      ctx.globalAlpha = 0.75 * (1 - pr);
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(rxy[0], rxy[1], rr * (0.8 + 1.5 * pr), 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  // Anchored elapsed clock from rAF timestamps. Frame one is drawn
+  // synchronously at t = 0 (all cupules empty, band entering).
+  var t0 = null;
+  var lastTs = null;
+
+  function elapsed(tsMs) { return (tsMs - t0) / 1000; }
+  function nowT() { return (lastTs !== null && t0 !== null) ? elapsed(lastTs) : 0; }
+
+  function frame(ts) {
+    if (t0 === null) t0 = ts;
+    lastTs = ts;
+    var t = elapsed(ts);
+    update(t);
+    draw(t);
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+  }
+
+  function redraw() {
+    var t = nowT();
+    update(t);
+    draw(t);
+  }
+
+  // Pointer interaction: drag sweeps the band, tap ripples a filled
+  // cupule, double-tap reseeds the constellation.
+  var pDown = null; // {x, y, ts, dragged}
+  var lastTapAt = -1e9, lastTapX = 0, lastTapY = 0;
+
+  function ptrPos(ev) {
+    var rct = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    return [ev.clientX - rct.left, ev.clientY - rct.top];
+  }
+
+  canvas.addEventListener('pointerdown', function (ev) {
+    var p = ptrPos(ev);
+    pDown = { x: p[0], y: p[1], ts: ev.timeStamp, dragged: false };
+  });
+
+  canvas.addEventListener('pointermove', function (ev) {
+    if (!pDown) return;
+    var p = ptrPos(ev);
+    if (Math.abs(p[0] - pDown.x) > 6 || Math.abs(p[1] - pDown.y) > 6) pDown.dragged = true;
+    if (pDown.dragged) {
+      bandManual = { x: p[0], until: nowT() + 3.0 };
+      redraw();
+    }
+  });
+
+  function endPointer(ev) {
+    if (!pDown) return;
+    var wasDrag = pDown.dragged;
+    var p = ptrPos(ev);
+    var dur = ev.timeStamp - pDown.ts;
+    pDown = null;
+    if (wasDrag) {
+      // Band stays where it was left briefly, then the sweep resumes.
+      bandManual = { x: p[0], until: nowT() + 3.0 };
+      redraw();
+      return;
+    }
+    if (dur > 400) return;
+    // A tap.
+    var t = nowT();
+    if (ev.timeStamp - lastTapAt < 350 &&
+        Math.abs(p[0] - lastTapX) < 40 && Math.abs(p[1] - lastTapY) < 40) {
+      // Double-tap: reseed the constellation, restart the cycle.
+      constIndex++;
+      buildConstellation(constIndex);
+      cycleStart = t;
+      bandManual = null;
+      simT = t;
+      for (var i = 0; i < cupules.length; i++) { cupules[i].fillT0 = -1; cupules[i].seq = -1; }
+      lastTapAt = -1e9;
+      redraw();
+      return;
+    }
+    lastTapAt = ev.timeStamp; lastTapX = p[0]; lastTapY = p[1];
+    // Ripple a filled cupule, if the tap landed on one.
+    var L = layout();
+    for (var k = 0; k < cupules.length; k++) {
+      var c = cupules[k];
+      var xy = cupXY(c, L);
+      var rr = c.rN * L.size;
+      var dx = p[0] - xy[0], dy = p[1] - xy[1];
+      if (dx * dx + dy * dy <= (rr * 1.25) * (rr * 1.25) && fillFrac(c, t) >= 1) {
+        ripples.push({ ci: k, t0: t });
+        break;
+      }
+    }
+    redraw();
+  }
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', function () { pDown = null; });
+
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { resize(); redraw(); });
+  }
+  window.addEventListener('resize', function () { resize(); redraw(); });
+
+  // QA hooks: ?seed=t<seconds> (or ?t=<seconds>) freezes the synchronous
+  // frame at that elapsed time after running the simulation to it;
+  // ?seed=<n> starts from constellation n. Inert in normal viewing.
+  var qaT = null, qaConst = 0;
+  if (typeof location !== 'undefined' && location.search) {
+    var mt = /t=?([0-9.]+)/.exec(location.search);
+    if (mt) qaT = parseFloat(mt[1]);
+    var mc = /seed=([0-9]+)/.exec(location.search);
+    if (mc) qaConst = parseInt(mc[1], 10);
+  }
+
+  constIndex = qaConst;
+  buildConstellation(constIndex);
+  resize();
+
+  if (qaT !== null) {
+    simT = 0;
+    update(qaT);
+    draw(qaT);
+  } else {
+    draw(0); // frame one: slab, empty cupules, band entering at the left
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+  }
+})();
+</script>
+</body>
+</html>
