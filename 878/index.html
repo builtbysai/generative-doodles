@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Deep Inside the Board</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #060606; overflow: hidden; height: 100%; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  "use strict";
+
+  // Seeded RNG (mulberry32). All initial state comes from this stream.
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(878107);
+
+  var BG = "#060606";
+  var TRACE = "#1E3A24";
+  var GHOST = [232, 232, 224];   // #E8E8E0
+  var WOKEN = [51, 255, 102];    // #33FF66
+  var SCARED = "#020203";
+
+  var canvas = document.getElementById("c");
+  var ctx = canvas.getContext("2d");
+  var W = 0, H = 0, phone = false;
+
+  function computeSize() {
+    var vv = window.visualViewport;
+    var w = vv ? vv.width : window.innerWidth;
+    var h = vv ? vv.height : window.innerHeight;
+    var sw = 0, sh = 0;
+    if (window.screen) { sw = window.screen.width || 0; sh = window.screen.height || 0; }
+    var minScreen = Math.min(sw, sh);
+    if (minScreen > 0) phone = minScreen < 700;
+    else phone = h > w * 1.15;
+    W = Math.max(50, Math.floor(w));
+    H = Math.max(50, Math.floor(h));
+    canvas.width = W;
+    canvas.height = H;
+  }
+  computeSize();
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener("resize", function () { computeSize(); draw(perfT()); });
+  }
+  window.addEventListener("resize", function () { computeSize(); draw(perfT()); });
+
+  // ---------- Traces: hand-drawn bezier circuit ----------
+  var SAMPLES = 110;
+  var paths = [];
+  function makePaths() {
+    paths = [];
+    var n = phone ? 20 : 24;
+    for (var i = 0; i < n; i++) {
+      // Wander a chain of two cubic segments across the unit square.
+      var x = rng() * 0.9 + 0.05, y = rng() * 0.9 + 0.05;
+      var ang = rng() * Math.PI * 2;
+      var pts = [];
+      var segs = 2 + Math.floor(rng() * 2);
+      var px = x, py = y;
+      pts.push([px, py]);
+      for (var s = 0; s < segs; s++) {
+        ang += (rng() - 0.5) * 1.7;
+        var len = 0.28 + rng() * 0.3;
+        var ex = px + Math.cos(ang) * len;
+        var ey = py + Math.sin(ang) * len * 0.8;
+        var c1x = px + Math.cos(ang + (rng() - 0.5) * 0.9) * len * 0.4;
+        var c1y = py + Math.sin(ang + (rng() - 0.5) * 0.9) * len * 0.4;
+        var c2x = ex - Math.cos(ang + (rng() - 0.5) * 0.9) * len * 0.4;
+        var c2y = ey - Math.sin(ang + (rng() - 0.5) * 0.9) * len * 0.4;
+        for (var k = 1; k <= SAMPLES / segs; k++) {
+          var t = k / (SAMPLES / segs);
+          var mt = 1 - t;
+          var bx = mt * mt * mt * px + 3 * mt * mt * t * c1x + 3 * mt * t * t * c2x + t * t * t * ex;
+          var by = mt * mt * mt * py + 3 * mt * mt * t * c1y + 3 * mt * t * t * c2y + t * t * t * ey;
+          // slight hand jitter, fixed by the seed
+          bx += (rng() - 0.5) * 0.0016;
+          by += (rng() - 0.5) * 0.0016;
+          pts.push([bx, by]);
+        }
+        px = ex; py = ey;
+      }
+      paths.push({ pts: pts, dark: [] }); // dark: scare events {sC, sR, t0}
+    }
+  }
+  makePaths();
+
+  function pathPoint(p, s) {
+    var pts = paths[p].pts;
+    var f = Math.max(0, Math.min(0.99999, s)) * (pts.length - 1);
+    var i = Math.floor(f), fr = f - i;
+    var a = pts[i], b = pts[Math.min(pts.length - 1, i + 1)];
+    return [a[0] + (b[0] - a[0]) * fr, a[1] + (b[1] - a[1]) * fr];
+  }
+  function nearestOnPath(p, x, y) {
+    var pts = paths[p].pts, best = 0, bd = Infinity;
+    for (var i = 0; i < pts.length; i++) {
+      var dx = pts[i][0] - x, dy = pts[i][1] - y;
+      var d = dx * dx + dy * dy;
+      if (d < bd) { bd = d; best = i; }
+    }
+    return { s: best / (pts.length - 1), d: Math.sqrt(bd) };
+  }
+
+  // ---------- Ghosts ----------
+  var REST_WAKE = 0.08;
+  var ghosts = [];
+  function makeGhosts() {
+    ghosts = [];
+    var n = phone ? 26 : 34;
+    for (var i = 0; i < n; i++) {
+      ghosts.push({
+        path: Math.floor(rng() * paths.length),
+        s: rng(),
+        dir: rng() < 0.5 ? 1 : -1,
+        rate: 0.0035 + rng() * 0.0075,   // path-fraction per second, very slow
+        wake: REST_WAKE,
+        driveUntil: -1,
+        scaredUntil: -1,
+        flareT: -10,
+        freq: 2000 + rng() * 4000,       // whisper tone 2-6 kHz
+        size: 0.8 + rng() * 0.5
+      });
+    }
+  }
+  makeGhosts();
+
+  // ---------- Interaction state ----------
+  var pointerDown = false;
+  var lastX = 0, lastY = 0, lastMoveT = 0, downT = 0, downX = 0, downY = 0, moved = 0;
+  var lastTapT = -10, lastTapX = 0, lastTapY = 0;
+  var gather = null; // {t0, targets: [sStar per ghost]}
+  var GATHER_IN = 3.0, GATHER_HOLD = 2.2, GATHER_OUT = 3.2;
+  var GATHER_TOTAL = GATHER_IN + GATHER_HOLD + GATHER_OUT;
+  var SLOW_V = 0.12;  // fraction of frame width per second
+  var FAST_V = 0.55;
+
+  var t0ms = (typeof performance !== "undefined" && performance.now) ? performance.now() : 0;
+  function perfT() {
+    if (typeof performance !== "undefined" && performance.now) return (performance.now() - t0ms) / 1000;
+    return 0;
+  }
+  function smooth(u) { return u <= 0 ? 0 : u >= 1 ? 1 : u * u * (3 - 2 * u); }
+
+  function gatherEnv(t) {
+    if (!gather) return 0;
+    var dt = t - gather.t0;
+    if (dt < 0 || dt > GATHER_TOTAL) return 0;
+    if (dt < GATHER_IN) return smooth(dt / GATHER_IN);
+    if (dt < GATHER_IN + GATHER_HOLD) return 1;
+    return 1 - smooth((dt - GATHER_IN - GATHER_HOLD) / GATHER_OUT);
+  }
+
+  function ghostPos(g, t) {
+    var s = g.s;
+    var env = gatherEnv(t);
+    if (env > 0 && gather) {
+      var target = gather.targets[ghosts.indexOf(g)];
+      s = s + (target - s) * env;
+    }
+    return pathPoint(g.path, s);
+  }
+
+  function scareAt(x, y, t) {
+    var R = 0.17 * Math.min(W, H);
+    var hit = false;
+    for (var i = 0; i < ghosts.length; i++) {
+      var g = ghosts[i];
+      var p = ghostPos(g, t);
+      var dx = p[0] * W - x, dy = p[1] * H - y;
+      if (dx * dx + dy * dy < R * R) {
+        g.wake = 0;
+        g.driveUntil = -1;
+        g.scaredUntil = t + 2.5;
+        paths[g.path].dark.push({ sC: g.s, sR: 0.16, t0: t });
+        if (paths[g.path].dark.length > 6) paths[g.path].dark.shift();
+        hit = true;
+      }
+    }
+    if (hit) scareSound();
+  }
+
+  function wakeNear(x, y, t) {
+    var R = 0.17 * Math.min(W, H);
+    for (var i = 0; i < ghosts.length; i++) {
+      var g = ghosts[i];
+      if (t < g.scaredUntil) continue;
+      var p = ghostPos(g, t);
+      var dx = p[0] * W - x, dy = p[1] * H - y;
+      if (dx * dx + dy * dy < R * R) g.driveUntil = t + 0.35;
+    }
+  }
+
+  function nearestGhost(x, y, t) {
+    var best = null, bd = Infinity;
+    for (var i = 0; i < ghosts.length; i++) {
+      var p = ghostPos(ghosts[i], t);
+      var dx = p[0] * W - x, dy = p[1] * H - y;
+      var d = dx * dx + dy * dy;
+      if (d < bd) { bd = d; best = ghosts[i]; }
+    }
+    return best;
+  }
+
+  function startGather(x, y) {
+    var targets = [];
+    var nx = x / W, ny = y / H;
+    for (var i = 0; i < ghosts.length; i++) {
+      targets.push(nearestOnPath(ghosts[i].path, nx, ny).s);
+    }
+    gather = { t0: perfT(), targets: targets };
+  }
+
+  function onDown(x, y) {
+    ensureAudio();
+    pointerDown = true;
+    moved = 0;
+    downT = perfT(); downX = x; downY = y;
+    lastX = x; lastY = y; lastMoveT = downT;
+  }
+  function onMove(x, y) {
+    if (!pointerDown) return;
+    var t = perfT();
+    var dt = Math.max(0.001, t - lastMoveT);
+    var dist = Math.sqrt((x - lastX) * (x - lastX) + (y - lastY) * (y - lastY));
+    moved += dist;
+    var v = (dist / Math.max(1, W)) / dt; // fraction of frame width per second
+    if (v > FAST_V) scareAt(x, y, t);
+    else if (v < SLOW_V) wakeNear(x, y, t);
+    lastX = x; lastY = y; lastMoveT = t;
+  }
+  function onUp(x, y) {
+    if (!pointerDown) return;
+    pointerDown = false;
+    var t = perfT();
+    var isTap = (t - downT) < 0.3 && moved < 8;
+    if (!isTap) return;
+    if (t - lastTapT < 0.35) {
+      startGather(x, y);
+      lastTapT = -10;
+    } else {
+      var g = nearestGhost(x, y, t);
+      if (g) { g.flareT = t; if (t >= g.scaredUntil) g.wake = Math.max(g.wake, 0.55); }
+      lastTapT = t; lastTapX = x; lastTapY = y;
+    }
+  }
+  canvas.addEventListener("pointerdown", function (e) { onDown(e.clientX, e.clientY); });
+  canvas.addEventListener("pointermove", function (e) { onMove(e.clientX, e.clientY); });
+  window.addEventListener("pointerup", function (e) { onUp(e.clientX, e.clientY); });
+  canvas.addEventListener("touchstart", function (e) { if (e.touches.length) onDown(e.touches[0].clientX, e.touches[0].clientY); }, { passive: true });
+  canvas.addEventListener("touchmove", function (e) { if (e.touches.length) onMove(e.touches[0].clientX, e.touches[0].clientY); }, { passive: true });
+  canvas.addEventListener("touchend", function (e) { onUp(lastX, lastY); }, { passive: true });
+
+  // ---------- Simulation step (live only; frame one is the seeded state) ----------
+  var lastStepT = 0;
+  function step(t) {
+    var dt = Math.min(0.05, Math.max(0, t - lastStepT));
+    lastStepT = t;
+    if (dt <= 0) return;
+    var env = gatherEnv(t);
+    if (gather && t - gather.t0 > GATHER_TOTAL) gather = null;
+    for (var i = 0; i < ghosts.length; i++) {
+      var g = ghosts[i];
+      // wake dynamics
+      if (t < g.driveUntil && t >= g.scaredUntil) {
+        g.wake += (1 - g.wake) * Math.min(1, dt * 1.4);
+      } else if (env > 0.4) {
+        g.wake += (0.9 - g.wake) * Math.min(1, dt * 0.8);
+      } else if (t >= g.scaredUntil) {
+        g.wake += (REST_WAKE - g.wake) * Math.min(1, dt * 0.10);
+      }
+      // drift along the trace, a little quicker when woken
+      g.s += g.dir * g.rate * (1 + 1.3 * g.wake) * dt;
+      if (g.s > 1) { g.s = 1; g.dir = -1; }
+      if (g.s < 0) { g.s = 0; g.dir = 1; }
+    }
+  }
+
+  // ---------- Draw ----------
+  function mixColor(w) {
+    var r = Math.round(GHOST[0] + (WOKEN[0] - GHOST[0]) * w);
+    var g = Math.round(GHOST[1] + (WOKEN[1] - GHOST[1]) * w);
+    var b = Math.round(GHOST[2] + (WOKEN[2] - GHOST[2]) * w);
+    return "rgb(" + r + "," + g + "," + b + ")";
+  }
+  function flareEnv(g, t) {
+    var d = t - g.flareT;
+    if (d < 0 || d > 1.4) return 0;
+    return Math.exp(-d * 2.6);
+  }
+  function draw(t) {
+    canvas.style.width = W + "px";
+    canvas.style.height = H + "px";
+    ctx.fillStyle = BG;
+    ctx.fillRect(0, 0, W, H);
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+
+    // traces
+    for (var p = 0; p < paths.length; p++) {
+      var pts = paths[p].pts;
+      ctx.strokeStyle = TRACE;
+      ctx.globalAlpha = 0.55;
+      ctx.lineWidth = phone ? 1.4 : 1.2;
+      ctx.beginPath();
+      for (var i = 0; i < pts.length; i++) {
+        var X = pts[i][0] * W, Y = pts[i][1] * H;
+        if (i === 0) ctx.moveTo(X, Y); else ctx.lineTo(X, Y);
+      }
+      ctx.stroke();
+      // scared segments: redrawn toward the scared-dark tone, fading over ~10 s
+      var darks = paths[p].dark;
+      for (var d = 0; d < darks.length; d++) {
+        var ev = darks[d];
+        var age = t - ev.t0;
+        if (age < 0 || age > 10) continue;
+        var strength = age < 0.3 ? age / 0.3 : 1 - (age - 0.3) / 9.7;
+        ctx.strokeStyle = SCARED;
+        ctx.globalAlpha = 0.9 * strength;
+        ctx.lineWidth = (phone ? 2.2 : 2.0);
+        ctx.beginPath();
+        var started = false;
+        for (var j = 0; j < pts.length; j++) {
+          var sJ = j / (pts.length - 1);
+          if (Math.abs(sJ - ev.sC) <= ev.sR) {
+            var X2 = pts[j][0] * W, Y2 = pts[j][1] * H;
+            if (!started) { ctx.moveTo(X2, Y2); started = true; } else ctx.lineTo(X2, Y2);
+          }
+        }
+        if (started) ctx.stroke();
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    // ghosts
+    for (var i = 0; i < ghosts.length; i++) {
+      var g = ghosts[i];
+      var pos = ghostPos(g, t);
+      var fl = flareEnv(g, t);
+      var level = Math.max(g.wake, fl);
+      var col = mixColor(Math.min(1, level));
+      var x = pos[0] * W, y = pos[1] * H;
+      var r = (phone ? 2.1 : 1.8) * g.size * (1 + 0.5 * level);
+      ctx.fillStyle = col;
+      ctx.globalAlpha = 0.05 + 0.10 * level;
+      ctx.beginPath(); ctx.arc(x, y, r * 3.2, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = 0.16 + 0.84 * level;
+      ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- Audio (lazy, gesture-gated, near threshold) ----------
+  var AC = null, bedGain = null, voices = [], masterGain = null;
+  function ensureAudio() {
+    if (AC) { if (AC.resume) AC.resume(); return; }
+    var Ctor = (typeof window !== "undefined") ? (window.AudioContext || window.webkitAudioContext) : null;
+    if (typeof Ctor !== "function") return;
+    try {
+      AC = new Ctor();
+      masterGain = AC.createGain();
+      masterGain.gain.value = 0.6;
+      masterGain.connect(AC.destination);
+      // whisper bed: looped noise through a bandpass
+      var len = 2 * AC.sampleRate;
+      var buf = AC.createBuffer(1, len, AC.sampleRate);
+      var data = buf.getChannelData(0);
+      var arng = mulberry32(4242);
+      for (var i = 0; i < len; i++) data[i] = arng() * 2 - 1;
+      var src = AC.createBufferSource();
+      src.buffer = buf; src.loop = true;
+      var bp = AC.createBiquadFilter();
+      bp.type = "bandpass"; bp.frequency.value = 700; bp.Q.value = 0.6;
+      bedGain = AC.createGain(); bedGain.gain.value = 0.0;
+      src.connect(bp); bp.connect(bedGain); bedGain.connect(masterGain);
+      src.start();
+      // ghost voices
+      voices = [];
+      for (var v = 0; v < 12; v++) {
+        var osc = AC.createOscillator();
+        osc.type = "sine"; osc.frequency.value = 3000;
+        var og = AC.createGain(); og.gain.value = 0;
+        var lfo = AC.createOscillator();
+        lfo.type = "sine"; lfo.frequency.value = 4 + v * 0.37;
+        var lfoGain = AC.createGain(); lfoGain.gain.value = 18;
+        lfo.connect(lfoGain); lfoGain.connect(osc.frequency);
+        osc.connect(og); og.connect(masterGain);
+        osc.start(); lfo.start();
+        voices.push({ osc: osc, gain: og });
+      }
+    } catch (e) {
+      AC = null;
+    }
+  }
+  function scareSound() {
+    if (!AC) return;
+    try {
+      var t = AC.currentTime;
+      var osc = AC.createOscillator();
+      osc.type = "sine";
+      osc.frequency.setValueAtTime(760, t);
+      osc.frequency.exponentialRampToValueAtTime(170, t + 0.9);
+      var g = AC.createGain();
+      g.gain.setValueAtTime(0.0, t);
+      g.gain.linearRampToValueAtTime(0.022, t + 0.08);
+      g.gain.linearRampToValueAtTime(0.0, t + 0.95);
+      osc.connect(g); g.connect(masterGain);
+      osc.start(t); osc.stop(t + 1.0);
+      if (bedGain) bedGain.gain.setTargetAtTime(0.0, t, 0.15);
+    } catch (e) { /* silence is fine */ }
+  }
+  var lastAudioT = 0;
+  function updateAudio(t) {
+    if (!AC) return;
+    if (t - lastAudioT < 0.12) return;
+    lastAudioT = t;
+    try {
+      var sum = 0;
+      var scored = [];
+      for (var i = 0; i < ghosts.length; i++) {
+        var lv = Math.max(ghosts[i].wake, flareEnv(ghosts[i], t));
+        sum += lv;
+        if (lv > 0.3) scored.push({ lv: lv, freq: ghosts[i].freq });
+      }
+      scored.sort(function (a, b) { return b.lv - a.lv; });
+      var avg = sum / ghosts.length;
+      if (bedGain) bedGain.gain.setTargetAtTime(0.004 + 0.030 * Math.min(1, avg * 3), AC.currentTime, 0.3);
+      for (var v = 0; v < voices.length; v++) {
+        var vc = voices[v];
+        if (v < scored.length) {
+          vc.osc.frequency.setTargetAtTime(scored[v].freq, AC.currentTime, 0.2);
+          vc.gain.gain.setTargetAtTime(scored[v].lv * 0.013, AC.currentTime, 0.25);
+        } else {
+          vc.gain.gain.setTargetAtTime(0.0, AC.currentTime, 0.25);
+        }
+      }
+    } catch (e) { /* silence is fine */ }
+  }
+
+  // ---------- Main loop ----------
+  draw(0); // frame one: the seeded state, exactly
+  function loop() {
+    var t = perfT();
+    step(t);
+    draw(t);
+    updateAudio(t);
+    if (typeof requestAnimationFrame === "function") requestAnimationFrame(loop);
+  }
+  if (typeof requestAnimationFrame === "function") requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
