@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Halo</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #04060A; overflow: hidden; height: 100%; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded RNG ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function lerp(a, b, t) { return a + (b - a) * t; }
+  function smootherstep(t) { t = clamp(t, 0, 1); return t * t * t * (t * (t * 6 - 15) + 10); }
+  function wrapAngle(a) {
+    while (a > Math.PI) a -= Math.PI * 2;
+    while (a < -Math.PI) a += Math.PI * 2;
+    return a;
+  }
+  function rgba(c, a) { return 'rgba(' + c + ',' + clamp(a, 0, 1).toFixed(4) + ')'; }
+
+  // ---------- constants ----------
+  var BASE_SEED = 11392041;
+  var CYCLE = 180;                 // one compressed day, seconds
+  var P0 = 0.16;                   // first-frame cycle progress: morning, sun low
+  var T0 = CYCLE * P0;             // fixed first-frame phase (piece seconds)
+  var AZ_MAX = 1.134;              // sun azimuth sweep, +/-65 deg
+  var EL_MAX = 1.082;              // sun elevation at noon, 62 deg
+  var LAG = 0.3;                   // petal servo lag, seconds (first-order, as phase offset)
+  var N_PETALS = 24;
+  var N_SEG = 64;
+
+  var BG = '#04060A';
+  var RING = '223,243,255';        // #DFF3FF
+  var BEAM = '184,220,245';        // #B8DCF5
+  var MIST = '22,34,46';           // #16222E
+  var PETAL_BODY = '#101820';
+  var PETAL_EDGE = '26,43,61';     // #1A2B3D
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  var W = 0, H = 0, U = 1;
+  var PHONE = false;
+  var pieceTime = T0;
+
+  // ---------- layout state (seeded, deterministic) ----------
+  var rng = mulberry32(BASE_SEED);
+  var petals = [];
+  var i;
+  for (i = 0; i < N_PETALS; i++) {
+    var frac = (i + 0.5) / N_PETALS;
+    var targetA = -Math.PI / 2 + (frac - 0.5) * 4.4 + (rng() - 0.5) * 0.3;
+    petals.push({
+      frac: frac,
+      targetA: targetA,
+      xJit: (rng() - 0.5) * 0.09,
+      yJit: (rng() - 0.5) * 0.022,
+      elPref: 0.21 + rng() * 0.45,          // preferred sun elevation, 12..38 deg
+      scatterOff: (rng() - 0.5) * 2,
+      mistPh: rng() * Math.PI * 2,
+      homeNu: 0                              // filled after geometry helpers exist
+    });
+  }
+  var mists = [];
+  for (i = 0; i < 14; i++) {
+    mists.push({
+      nx: rng(), ny: 0.15 + rng() * 0.7,
+      r: 0.16 + rng() * 0.3,
+      ph: rng() * Math.PI * 2,
+      sp: 0.008 + rng() * 0.014,
+      amp: 0.012 + rng() * 0.02
+    });
+  }
+
+  // ---------- sun + mirror geometry ----------
+  function sunAngles(p) {
+    p = clamp(p, 0, 1);
+    return {
+      az: -AZ_MAX + 2 * AZ_MAX * p,
+      el: EL_MAX * Math.sin(Math.PI * p)
+    };
+  }
+  function sunDir(az, el) {
+    return { x: Math.sin(az) * Math.cos(el), y: -Math.sin(el) };
+  }
+  // required mirror-normal angle at petal P to reflect sun (az, el) onto ring point T
+  function requiredNu(px, py, tx, ty, az, el) {
+    var sd = sunDir(az, el);
+    var dinx = -sd.x, diny = -sd.y;
+    var ox = tx - px, oy = ty - py;
+    var ol = Math.sqrt(ox * ox + oy * oy) || 1;
+    ox /= ol; oy /= ol;
+    var nx = dinx - ox, ny = diny - oy;
+    return Math.atan2(ny, nx);
+  }
+
+  // petal home normals: the normal that works for a reference mid-morning sun,
+  // computed in normalized ring-relative geometry (unit circle, petal below).
+  (function () {
+    var ref = sunAngles(0.30);
+    for (var j = 0; j < N_PETALS; j++) {
+      var pt = petals[j];
+      var tx = Math.cos(pt.targetA), ty = Math.sin(pt.targetA);
+      var px = tx * 1.0 + pt.xJit * 2.0;          // matches the real layout: petal under its target
+      var py = 1.37 + pt.yJit * 3.0;              // ~1.37 ring radii below center
+      pt.homeNu = requiredNu(px, py, tx, ty, ref.az, ref.el);
+    }
+  })();
+
+  // ---------- cycle phase anchoring (recorded events only) ----------
+  var anchor = { p: P0, t: T0 };
+  var drag = { active: false, p: P0, hist: [] };   // hist: [{t, az}] pointer samples
+
+  function cycleP(t) {
+    if (drag.active) return drag.p;
+    var p = anchor.p + (t - anchor.t) / CYCLE;
+    return p - Math.floor(p);
+  }
+  function laggedP(t) {
+    if (drag.active && drag.hist.length) {
+      var want = t - LAG, s = drag.hist[0], k;
+      for (k = 0; k < drag.hist.length; k++) {
+        if (drag.hist[k].t <= want) s = drag.hist[k]; else break;
+      }
+      return clamp((s.az + AZ_MAX) / (2 * AZ_MAX), 0, 1);
+    }
+    return cycleP(t - LAG);
+  }
+
+  // ---------- audio (Franke rule: lazy, gesture-gated, typeof-guarded, very quiet) ----------
+  var AC = null;
+  if (typeof AudioContext !== 'undefined') AC = AudioContext;
+  else if (typeof webkitAudioContext !== 'undefined') AC = webkitAudioContext;
+  var audio = null;
+  function initAudio() {
+    if (!AC || audio) return;
+    try {
+      var ac = new AC();
+      var master = ac.createGain();
+      master.gain.value = 0;
+      master.connect(ac.destination);
+      var o1 = ac.createOscillator(); o1.type = 'sine';
+      var o2 = ac.createOscillator(); o2.type = 'sine';
+      var g1 = ac.createGain(); g1.gain.value = 0.5;
+      var g2 = ac.createGain(); g2.gain.value = 0.22;
+      o1.connect(g1); o2.connect(g2);
+      g1.connect(master); g2.connect(master);
+      o1.start(); o2.start();
+      master.gain.setTargetAtTime(0.016, ac.currentTime, 1.5);
+      audio = { ac: ac, master: master, o1: o1, o2: o2, lastClick: 0 };
+    } catch (e) { audio = null; }
+  }
+  function servoClick() {
+    if (!audio) return;
+    var now = pieceTime;
+    if (now - audio.lastClick < 0.35) return;
+    audio.lastClick = now;
+    try {
+      var ac = audio.ac, t0 = ac.currentTime;
+      var o = ac.createOscillator(); o.type = 'triangle';
+      o.frequency.setValueAtTime(1500, t0);
+      o.frequency.exponentialRampToValueAtTime(700, t0 + 0.03);
+      var g = ac.createGain();
+      g.gain.setValueAtTime(0.012, t0);
+      g.gain.exponentialRampToValueAtTime(0.0004, t0 + 0.035);
+      o.connect(g); g.connect(audio.master);
+      o.start(t0); o.stop(t0 + 0.04);
+    } catch (e) { /* silent */ }
+  }
+  function audioTick(elNorm) {
+    if (!audio) return;
+    try {
+      var f = 92 + elNorm * 78;
+      var t0 = audio.ac.currentTime;
+      audio.o1.frequency.setTargetAtTime(f, t0, 0.4);
+      audio.o2.frequency.setTargetAtTime(f * 1.5 + 1.5, t0, 0.4);
+    } catch (e) { /* silent */ }
+  }
+
+  // ---------- sizing ----------
+  function isPhone(w, h) {
+    var sw = 0, sh = 0;
+    if (typeof window !== 'undefined' && window.screen) {
+      sw = window.screen.width || 0; sh = window.screen.height || 0;
+    }
+    var mn = Math.min(sw, sh);
+    if (mn > 0 && mn < 700) return true;
+    return h > w * 1.15;
+  }
+  function fit() {
+    var vv = (typeof window !== 'undefined' && window.visualViewport) ? window.visualViewport : null;
+    var w = vv ? vv.width : (window.innerWidth || 300);
+    var h = vv ? vv.height : (window.innerHeight || 300);
+    var dpr = 1;
+    if (typeof window !== 'undefined' && window.devicePixelRatio) dpr = Math.min(window.devicePixelRatio, 2);
+    W = w; H = h; U = Math.min(w, h);
+    PHONE = isPhone(w, h);
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+    canvas.style.width = w + 'px';
+    canvas.style.height = h + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { fit(); draw(pieceTime); });
+  }
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('resize', function () { fit(); draw(pieceTime); });
+  }
+
+  // ---------- drawing ----------
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+
+    var p = cycleP(t);
+    var pL = laggedP(t);
+    var sunL = sunAngles(pL);
+    var sd = sunDir(sunL.az, sunL.el);
+    var horizon = smootherstep(sunL.el / 0.17);
+    var scatter = smootherstep((p - 0.93) / 0.07);
+    var endFade = 1 - 0.85 * smootherstep((p - 0.975) / 0.025);
+
+    var cx = W / 2, cy = H * 0.46;
+    var R = U * 0.30;
+    var ringW = Math.max(2, U * (PHONE ? 0.0075 : 0.0058));
+
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.fillStyle = BG;
+    ctx.fillRect(0, 0, W, H);
+
+    // mist: layered flat-alpha blobs behind everything (no gradients)
+    var mi, k;
+    for (mi = 0; mi < mists.length; mi++) {
+      var m = mists[mi];
+      var mx = (m.nx + m.amp * Math.sin(t * m.sp * 6.28 + m.ph)) * W;
+      var my = (m.ny + m.amp * 0.6 * Math.cos(t * m.sp * 4.9 + m.ph * 1.7)) * H;
+      var mr = m.r * U;
+      for (k = 0; k < 3; k++) {
+        var rr = mr * (1 - k * 0.26);
+        ctx.beginPath();
+        ctx.moveTo(mx + rr, my);
+        ctx.ellipse(mx, my, rr, rr * 0.62, 0, 0, Math.PI * 2);
+        ctx.fillStyle = rgba(MIST, 0.024 + 0.016 * (2 - k));
+        ctx.fill();
+      }
+    }
+
+    // petal pixel positions + contributions
+    var P = [], C = [], NU = [], TX = [], TY = [];
+    for (i = 0; i < N_PETALS; i++) {
+      var pt = petals[i];
+      var txr = cx + R * Math.cos(pt.targetA);
+      var px = clamp(txr + pt.xJit * W, W * 0.05, W * 0.95);
+      var py = H * (0.885 - 0.035 * Math.sin(Math.PI * pt.frac)) + pt.yJit * H;
+      var aT = pt.targetA + pt.scatterOff * scatter * 1.3;
+      var tx = cx + R * Math.cos(aT), ty = cy + R * Math.sin(aT);
+      var nuReq = requiredNu(px, py, tx, ty, sunL.az, sunL.el);
+      var dNu = wrapAngle(nuReq - pt.homeNu);
+      var align = Math.exp(-(dNu * dNu) / (2 * 0.20 * 0.20));
+      var dEl = sunL.el - pt.elPref;
+      var gate = Math.exp(-(dEl * dEl) / (2 * 0.30 * 0.30));
+      var c = align * gate * horizon * (1 - 0.45 * scatter);
+      P.push(px); C.push(py); NU.push(pt.homeNu + clamp(dNu, -0.6, 0.6));
+      TX.push(tx); TY.push(ty);
+      petals[i]._c = c;
+    }
+
+    // beams: petal -> its ring segment, in the mist
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.lineWidth = 1;
+    for (i = 0; i < N_PETALS; i++) {
+      var cc = petals[i]._c;
+      if (cc < 0.02) continue;
+      ctx.beginPath();
+      ctx.moveTo(P[i], C[i]);
+      ctx.lineTo(TX[i], TY[i]);
+      ctx.strokeStyle = rgba(BEAM, cc * 0.35 * endFade);
+      ctx.stroke();
+    }
+
+    // ring: 64 segments, alpha from nearby petal contributions x mist density
+    var avgC = 0;
+    for (i = 0; i < N_PETALS; i++) avgC += petals[i]._c;
+    avgC /= N_PETALS;
+    var segA = [];
+    for (var j = 0; j < N_SEG; j++) {
+      var aj = (j + 0.5) / N_SEG * Math.PI * 2;
+      var sum = 0;
+      for (i = 0; i < N_PETALS; i++) {
+        var da = wrapAngle(aj - (petals[i].targetA + petals[i].scatterOff * scatter * 1.3));
+        sum += petals[i]._c * Math.exp(-(da * da) / (2 * 0.48 * 0.48));
+      }
+      var mistD = 0.6 + 0.4 * Math.sin(3 * aj + t * 0.05 + 1.3) * Math.sin(2 * aj - t * 0.033 + 4.1);
+      var a = clamp(sum * 0.55, 0, 1) * (0.55 + 0.45 * mistD);
+      // mist scatters a little of the total burn everywhere the ring hangs
+      var floorA = 0.17 * avgC * (0.5 + 0.5 * mistD);
+      if (a < floorA) a = floorA;
+      if (scatter > 0) {
+        var glint = 0.35 + 0.65 * (0.5 + 0.5 * Math.sin(t * 2.6 + j * 2.399));
+        a = lerp(a, a * glint * 1.5, scatter);
+      }
+      segA.push(clamp(a, 0, 1) * endFade);
+    }
+    var pass;
+    for (pass = 0; pass < 2; pass++) {
+      ctx.lineWidth = pass === 0 ? ringW * 3.0 : ringW;
+      for (j = 0; j < N_SEG; j++) {
+        var a0 = j / N_SEG * Math.PI * 2 - 0.012;
+        var a1 = (j + 1) / N_SEG * Math.PI * 2 + 0.012;
+        ctx.beginPath();
+        ctx.moveTo(cx + R * Math.cos(a0), cy + R * Math.sin(a0));
+        ctx.arc(cx, cy, R, a0, a1);
+        ctx.strokeStyle = rgba(RING, segA[j] * (pass === 0 ? 0.16 : 0.8));
+        ctx.stroke();
+      }
+    }
+
+    // petals: near-black quads, one bright edge when contributing
+    ctx.globalCompositeOperation = 'source-over';
+    for (i = 0; i < N_PETALS; i++) {
+      var nu = NU[i];
+      var ux = Math.cos(nu + Math.PI / 2), uy = Math.sin(nu + Math.PI / 2);
+      var vx = Math.cos(nu), vy = Math.sin(nu);
+      var hl = U * 0.016, ht = U * 0.0042;
+      var x = P[i], y = C[i];
+      ctx.beginPath();
+      ctx.moveTo(x - ux * hl - vx * ht, y - uy * hl - vy * ht);
+      ctx.lineTo(x + ux * hl - vx * ht, y + uy * hl - vy * ht);
+      ctx.lineTo(x + ux * hl + vx * ht, y + uy * hl + vy * ht);
+      ctx.lineTo(x - ux * hl + vx * ht, y - uy * hl + vy * ht);
+      ctx.closePath();
+      ctx.fillStyle = PETAL_BODY;
+      ctx.fill();
+      ctx.strokeStyle = rgba(PETAL_EDGE, 0.55);
+      ctx.lineWidth = 1;
+      ctx.stroke();
+      // stem down into the dark
+      ctx.beginPath();
+      ctx.moveTo(x, y + ht);
+      ctx.lineTo(x, H * 0.985);
+      ctx.strokeStyle = rgba(MIST, 0.35);
+      ctx.stroke();
+      // sun-facing edge highlight
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.beginPath();
+      ctx.moveTo(x - ux * hl + vx * ht, y - uy * hl + vy * ht);
+      ctx.lineTo(x + ux * hl + vx * ht, y + uy * hl + vy * ht);
+      ctx.strokeStyle = rgba(RING, 0.12 + 0.78 * petals[i]._c * endFade);
+      ctx.lineWidth = Math.max(1, U * 0.0016);
+      ctx.stroke();
+      ctx.globalCompositeOperation = 'source-over';
+    }
+
+    audioTick(clamp(sunL.el / EL_MAX, 0, 1));
+  }
+
+  // ---------- interaction ----------
+  var lastDown = -10;
+  function pointerPos(e) {
+    var r = canvas.getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  }
+  canvas.addEventListener('pointerdown', function (e) {
+    initAudio();
+    if (audio && audio.ac && audio.ac.resume) { try { audio.ac.resume(); } catch (err) {} }
+    var pos = pointerPos(e);
+    if (pieceTime - lastDown < 0.32) {
+      // double-tap: solar noon reset
+      anchor.p = 0.5; anchor.t = pieceTime;
+      drag.active = false; drag.hist = [];
+      servoClick();
+      lastDown = -10;
+      return;
+    }
+    lastDown = pieceTime;
+    var az = -AZ_MAX + 2 * AZ_MAX * clamp(pos.x / W, 0, 1);
+    drag.active = true;
+    drag.p = clamp((az + AZ_MAX) / (2 * AZ_MAX), 0.02, 0.98);
+    drag.hist = [{ t: pieceTime, az: az }];
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (!drag.active) return;
+    var pos = pointerPos(e);
+    var az = -AZ_MAX + 2 * AZ_MAX * clamp(pos.x / W, 0, 1);
+    drag.p = clamp((az + AZ_MAX) / (2 * AZ_MAX), 0.02, 0.98);
+    drag.hist.push({ t: pieceTime, az: az });
+    if (drag.hist.length > 240) drag.hist.shift();
+    servoClick();
+  });
+  function endDrag() {
+    if (!drag.active) return;
+    anchor.p = drag.p;               // cycle resumes from the dragged position
+    anchor.t = pieceTime;
+    drag.active = false;
+    drag.hist = [];
+    servoClick();
+  }
+  canvas.addEventListener('pointerup', endDrag);
+  canvas.addEventListener('pointercancel', endDrag);
+
+  // ---------- run ----------
+  fit();
+  draw(pieceTime);
+  if (typeof requestAnimationFrame === 'function') {
+    var startNow = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+    var tick = function () {
+      var now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+      pieceTime = T0 + (now - startNow) / 1000;
+      draw(pieceTime);
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }
+})();
+</script>
+</body>
+</html>

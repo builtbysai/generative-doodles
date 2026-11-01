@@ -1,0 +1,583 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Light Barrier</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #000000; overflow: hidden; height: 100%; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded rng ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(1138);
+  // random-access hash rng for per-(shard, segment) retune offsets
+  function hashRand(i, k) {
+    var s = (1138 ^ Math.imul(i + 1, 0x9E3779B9) ^ Math.imul(k + 1, 0x85EBCA6B)) | 0;
+    return mulberry32(s)();
+  }
+
+  // ---------- palette (monochrome blue-white on black) ----------
+  var VOID = '#000000';
+  var BEAM = [191, 227, 255];    // #BFE3FF
+  var PHANTOM = [234, 246, 255]; // #EAF6FF
+  var STRIKE = [255, 255, 255];  // #FFFFFF
+  var SHARD = '#0D141B';
+  var HAZE = [20, 30, 40];       // #141E28
+  function rgba(c, a) { return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a + ')'; }
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0, DPR = 1;
+
+  function isPhone() {
+    var sw = (window.screen && window.screen.width) || 0;
+    var sh = (window.screen && window.screen.height) || 0;
+    var mn = Math.min(sw, sh);
+    if (mn > 0 && mn < 700) return true;
+    return H > W * 1.15;
+  }
+
+  function fit() {
+    var vv = window.visualViewport;
+    var w = vv ? vv.width : window.innerWidth;
+    var h = vv ? vv.height : window.innerHeight;
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = w; H = h;
+    canvas.width = Math.round(w * DPR);
+    canvas.height = Math.round(h * DPR);
+    canvas.style.width = w + 'px';
+    canvas.style.height = h + 'px';
+  }
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', fit);
+  }
+  window.addEventListener('resize', fit);
+  fit();
+
+  // Geometry space: x in [0, A], y in [0, 1], y down, isotropic.
+  // Pixel map: px = gx * H, py = gy * H  (A = W / H).
+  function aspect() { return H > 0 ? W / H : 1; }
+
+  var PHASE = 137.0; // fixed phase: frame one, mid-segment, phantoms condensed
+  var RETUNE_PERIOD = 30;
+
+  // ---------- shards ----------
+  var N_SHARDS = 40;
+  var shards = [];
+  function triRand() { return (rng() + rng() + rng() - 1.5) / 1.5; } // -1..1, center-heavy
+  for (var i = 0; i < N_SHARDS; i++) {
+    var cx = 0, cy = 0, ok = false, tries = 0;
+    while (!ok && tries < 12) {
+      tries++;
+      cx = 0.5 + triRand() * 0.44;      // fraction of A, central 80%
+      cy = 0.5 + triRand() * 0.46;      // denser in the middle band
+      ok = true;
+      for (var j = 0; j < shards.length; j++) {
+        var ddx = (cx - shards[j].fx) * 1.6, ddy = cy - shards[j].cy;
+        if (ddx * ddx + ddy * ddy < 0.008) { ok = false; break; }
+      }
+    }
+    var nv = rng() < 0.5 ? 3 : 4;
+    var verts = [];
+    for (var v = 0; v < nv; v++) {
+      verts.push({
+        rel: (v / nv) * Math.PI * 2 + (rng() - 0.5) * 0.7,
+        rr: 0.7 + rng() * 0.55
+      });
+    }
+    // incoming projector direction (unit, pointing toward the shard)
+    var dinA;
+    var sidePick = rng();
+    if (sidePick < 0.62) dinA = Math.PI / 2 + (rng() - 0.5) * 1.5;        // from above
+    else if (sidePick < 0.81) dinA = 0 + (rng() - 0.5) * 1.3;             // from the left
+    else dinA = Math.PI + (rng() - 0.5) * 1.3;                            // from the right
+    shards.push({
+      fx: cx, cy: cy,
+      r: 0.02 + rng() * 0.026,
+      verts: verts,
+      baseNormal: rng() * Math.PI * 2,
+      dinA: dinA,
+      a1: 0.16 + rng() * 0.09, w1: (Math.PI * 2) / (26 + rng() * 30), p1: rng() * 6.2832,
+      a2: 0.08 + rng() * 0.07, w2: (Math.PI * 2) / (42 + rng() * 45), p2: rng() * 6.2832
+    });
+  }
+
+  // ---------- haze blobs ----------
+  var blobs = [];
+  for (var b = 0; b < 7; b++) {
+    blobs.push({
+      fx: 0.14 + rng() * 0.72, fy: 0.15 + rng() * 0.7,
+      rx: 0.22 + rng() * 0.26, ry: 0.16 + rng() * 0.22,
+      drift: 0.012 + rng() * 0.02, ph: rng() * 6.2832
+    });
+  }
+
+  // ---------- interaction state (recorded events only) ----------
+  var dragEvents = [];   // {t, x, y, ang, mag} in geometry coords
+  var retuneEvents = []; // times of manual double-tap re-tunes
+
+  // ---------- time ----------
+  var startStamp = null;
+  function perfElapsed() {
+    if (typeof performance !== 'undefined' && performance.now) {
+      var n = performance.now() / 1000;
+      if (startStamp === null) startStamp = n;
+      return n - startStamp;
+    }
+    return 0;
+  }
+  function clockNow() { return PHASE + perfElapsed(); }
+
+  // ---------- retune segments ----------
+  function segInfo(t) {
+    var bounds = [0];
+    var start = Math.max(0, Math.floor(t / RETUNE_PERIOD) - 1) * RETUNE_PERIOD;
+    for (var k = start + RETUNE_PERIOD; k <= t; k += RETUNE_PERIOD) bounds.push(k);
+    if (start > 0) bounds.push(start);
+    for (var i = 0; i < retuneEvents.length; i++) {
+      var e = retuneEvents[i];
+      if (e > 0 && e <= t && e > t - RETUNE_PERIOD * 2) bounds.push(e);
+    }
+    bounds.sort(function (a, b2) { return a - b2; });
+    // dedupe near-equal boundaries
+    var clean = [bounds[0]];
+    for (var m = 1; m < bounds.length; m++) {
+      if (bounds[m] - clean[clean.length - 1] > 0.05) clean.push(bounds[m]);
+    }
+    var idx = 0;
+    for (var q = 0; q < clean.length; q++) { if (clean[q] <= t) idx = q; }
+    return { start: clean[idx], prevStart: idx > 0 ? clean[idx - 1] : clean[idx], index: idx };
+  }
+  function segKey(segStart) { return Math.round(segStart * 4); }
+  function retuneOffset(shardIdx, t) {
+    var si = segInfo(t);
+    var cur = (hashRand(shardIdx, segKey(si.start)) - 0.5) * 1.0;
+    var age = t - si.start;
+    if (si.prevStart === si.start || age >= 1.5) return cur;
+    var prev = (hashRand(shardIdx, segKey(si.prevStart)) - 0.5) * 1.0;
+    var u = age / 1.5;
+    var s = u * u * (3 - 2 * u);
+    return prev + (cur - prev) * s;
+  }
+  function normalAngle(shard, idx, t) {
+    return shard.baseNormal
+      + shard.a1 * Math.sin(shard.w1 * t + shard.p1)
+      + shard.a2 * Math.sin(shard.w2 * t + shard.p2)
+      + retuneOffset(idx, t);
+  }
+
+  // ---------- beams ----------
+  var BEAM_LEN = 3.2;
+  function beamsAt(t) {
+    var A = aspect();
+    var out = [];
+    for (var i = 0; i < shards.length; i++) {
+      var sh = shards[i];
+      var ox = sh.fx * A, oy = sh.cy;
+      var na = normalAngle(sh, i, t);
+      var nx = Math.cos(na), ny = Math.sin(na);
+      var dix = Math.cos(sh.dinA), diy = Math.sin(sh.dinA);
+      var dot = dix * nx + diy * ny;
+      var rx = dix - 2 * dot * nx, ry = diy - 2 * dot * ny;
+      var ang = Math.atan2(ry, rx) + bendFor(ox, oy, rx, ry, t);
+      var dx = Math.cos(ang), dy = Math.sin(ang);
+      out.push({
+        ox: ox, oy: oy, dx: dx, dy: dy,
+        ex: ox + dx * BEAM_LEN, ey: oy + dy * BEAM_LEN,
+        nx: nx, ny: ny, dix: dix, diy: diy, na: na, shard: sh
+      });
+    }
+    return out;
+  }
+  function bendFor(ox, oy, dx, dy, t) {
+    var bend = 0;
+    var beamAng = Math.atan2(dy, dx);
+    for (var i = 0; i < dragEvents.length; i++) {
+      var e = dragEvents[i];
+      var age = t - e.t;
+      if (age < 0 || age > 6) continue;
+      var px = e.x - ox, py = e.y - oy;
+      var along = px * dx + py * dy;
+      if (along < 0 || along > BEAM_LEN) continue;
+      var perp = Math.abs(px * -dy + py * dx);
+      var w = Math.exp(-perp / 0.16) * Math.exp(-age / 1.35);
+      bend += w * 0.5 * e.mag * Math.sin(e.ang - beamAng);
+    }
+    if (bend > 0.65) bend = 0.65;
+    if (bend < -0.65) bend = -0.65;
+    return bend;
+  }
+
+  // ---------- crossings & phantoms ----------
+  function segInt(ax, ay, bx, by, cx, cy, dx, dy) {
+    var rX = bx - ax, rY = by - ay;
+    var sX = dx - cx, sY = dy - cy;
+    var den = rX * sY - rY * sX;
+    if (Math.abs(den) < 1e-12) return null;
+    var t = ((cx - ax) * sY - (cy - ay) * sX) / den;
+    var u = ((cx - ax) * rY - (cy - ay) * rX) / den;
+    if (t > 0.001 && t < 0.999 && u > 0.001 && u < 0.999) {
+      return [ax + t * rX, ay + t * rY];
+    }
+    return null;
+  }
+  function crossingsAt(t) {
+    var beams = beamsAt(t);
+    var pts = [];
+    for (var i = 0; i < beams.length; i++) {
+      for (var j = i + 1; j < beams.length; j++) {
+        var p = segInt(beams[i].ox, beams[i].oy, beams[i].ex, beams[i].ey,
+                       beams[j].ox, beams[j].oy, beams[j].ex, beams[j].ey);
+        if (p && p[0] >= -0.05 && p[0] <= aspect() + 0.05 && p[1] >= -0.05 && p[1] <= 1.05) pts.push(p);
+      }
+    }
+    return pts;
+  }
+  var CLUSTER_R = 0.075;
+  function countNear(pts, x, y, r) {
+    var n = 0, r2 = r * r;
+    for (var i = 0; i < pts.length; i++) {
+      var dx = pts[i][0] - x, dy = pts[i][1] - y;
+      if (dx * dx + dy * dy < r2) n++;
+    }
+    return n;
+  }
+  function phantomsAt(t) {
+    var pts = cutsCache(t);
+    // greedy clustering of current crossings
+    var clusters = [];
+    for (var i = 0; i < pts.length; i++) {
+      var p = pts[i], placed = false;
+      for (var c = 0; c < clusters.length; c++) {
+        var cl = clusters[c];
+        var mx = cl.sx / cl.n, my = cl.sy / cl.n;
+        var ddx = p[0] - mx, ddy = p[1] - my;
+        if (ddx * ddx + ddy * ddy < CLUSTER_R * CLUSTER_R) {
+          cl.sx += p[0]; cl.sy += p[1]; cl.n++; placed = true; break;
+        }
+      }
+      if (!placed) clusters.push({ sx: p[0], sy: p[1], n: 1 });
+    }
+    // smoothed density from closed-form history samples
+    var hist = null;
+    var out = [];
+    for (var k = 0; k < clusters.length; k++) {
+      var cl2 = clusters[k];
+      if (cl2.n < 2) continue;
+      var cx = cl2.sx / cl2.n, cy = cl2.sy / cl2.n;
+      if (!hist) {
+        hist = [crossingsAt(t - 0.9), crossingsAt(t - 1.8), crossingsAt(t - 2.7)];
+      }
+      var d = 0.4 * cl2.n
+        + 0.25 * countNear(hist[0], cx, cy, CLUSTER_R)
+        + 0.2 * countNear(hist[1], cx, cy, CLUSTER_R)
+        + 0.15 * countNear(hist[2], cx, cy, CLUSTER_R);
+      var alpha = (d - 2.6) / 3.2;
+      if (alpha < 0.03) continue;
+      if (alpha > 1) alpha = 1;
+      var ph = hashRand(Math.round(cx * 24), Math.round(cy * 24)) * 6.2832;
+      out.push({
+        x: cx, y: cy, n: d, alpha: alpha * (0.82 + 0.18 * Math.sin(0.6 * t + ph)),
+        r: 0.034 + 0.007 * Math.min(d, 8), ph: ph,
+        key: Math.round(cx / 0.05) + ':' + Math.round(cy / 0.05)
+      });
+    }
+    return out;
+  }
+  var _cutsT = null, _cuts = null;
+  function cutsCache(t) {
+    if (_cutsT === t && _cuts) return _cuts;
+    _cutsT = t; _cuts = crossingsAt(t);
+    return _cuts;
+  }
+
+  // ---------- audio (Franke rule: lazy, gesture-gated, typeof-guarded, very quiet) ----------
+  var AC = null, masterGain = null, audioTried = false;
+  function ensureAudio() {
+    if (audioTried) return;
+    audioTried = true;
+    try {
+      var Ctor = (typeof window !== 'undefined') ? (window.AudioContext || window.webkitAudioContext) : null;
+      if (!Ctor || typeof Ctor !== 'function') return;
+      AC = new Ctor();
+      masterGain = AC.createGain();
+      masterGain.gain.value = 0.045;
+      masterGain.connect(AC.destination);
+      var lp = AC.createBiquadFilter();
+      lp.type = 'lowpass'; lp.frequency.value = 240;
+      var dg = AC.createGain(); dg.gain.value = 0.4;
+      var o1 = AC.createOscillator(); o1.type = 'sine'; o1.frequency.value = 55;
+      var o2 = AC.createOscillator(); o2.type = 'sine'; o2.frequency.value = 82.41;
+      var o3 = AC.createOscillator(); o3.type = 'triangle'; o3.frequency.value = 110.2;
+      var g3 = AC.createGain(); g3.gain.value = 0.22;
+      o1.connect(lp); o2.connect(lp); o3.connect(g3); g3.connect(lp);
+      lp.connect(dg); dg.connect(masterGain);
+      o1.start(); o2.start(); o3.start();
+    } catch (e) { AC = null; }
+  }
+  var CHIMES = [523.25, 587.33, 659.25, 783.99, 880.0];
+  var chimeIdx = 0;
+  function chime() {
+    if (!AC || !masterGain) return;
+    try {
+      var t0 = AC.currentTime;
+      var o = AC.createOscillator(); o.type = 'sine';
+      o.frequency.value = CHIMES[chimeIdx % CHIMES.length]; chimeIdx++;
+      var g = AC.createGain();
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.exponentialRampToValueAtTime(0.5, t0 + 0.03);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + 1.9);
+      o.connect(g); g.connect(masterGain);
+      o.start(t0); o.stop(t0 + 2.0);
+    } catch (e) { /* silent */ }
+  }
+  function retuneSweep() {
+    if (!AC || !masterGain) return;
+    try {
+      var t0 = AC.currentTime;
+      var len = Math.floor(AC.sampleRate * 1.2);
+      var buf = AC.createBuffer(1, len, AC.sampleRate);
+      var data = buf.getChannelData(0);
+      var rr = mulberry32(99);
+      for (var i = 0; i < len; i++) data[i] = rr() * 2 - 1;
+      var src = AC.createBufferSource(); src.buffer = buf;
+      var bp = AC.createBiquadFilter(); bp.type = 'bandpass'; bp.Q.value = 1.4;
+      bp.frequency.setValueAtTime(280, t0);
+      bp.frequency.exponentialRampToValueAtTime(1500, t0 + 1.1);
+      var g = AC.createGain();
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.exponentialRampToValueAtTime(0.22, t0 + 0.25);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + 1.2);
+      src.connect(bp); bp.connect(g); g.connect(masterGain);
+      src.start(t0); src.stop(t0 + 1.25);
+    } catch (e) { /* silent */ }
+  }
+
+  // ---------- interaction ----------
+  var pointer = { down: false, lx: 0, ly: 0 };
+  var lastTap = null;
+  function evtGeom(e) {
+    var x = (e.clientX !== undefined) ? e.clientX : 0;
+    var y = (e.clientY !== undefined) ? e.clientY : 0;
+    var s = H > 0 ? H : 1;
+    return [x / s, y / s];
+  }
+  function onDown(e) {
+    ensureAudio();
+    var p = evtGeom(e);
+    var t = clockNow();
+    if (lastTap && (t - lastTap.t) < 0.38 &&
+        Math.hypot(p[0] - lastTap.x, p[1] - lastTap.y) < 48 / (H > 0 ? H : 1)) {
+      lastTap = null;
+      retuneEvents.push(t);
+      retuneSweep();
+      pointer.down = false;
+      return;
+    }
+    lastTap = { t: t, x: p[0], y: p[1] };
+    pointer.down = true; pointer.lx = p[0]; pointer.ly = p[1];
+    if (e.preventDefault) e.preventDefault();
+  }
+  function onMove(e) {
+    if (!pointer.down) return;
+    var p = evtGeom(e);
+    var t = clockNow();
+    var dx = p[0] - pointer.lx, dy = p[1] - pointer.ly;
+    var dist = Math.hypot(dx, dy);
+    if (dist > 0.008) {
+      var mag = dist * 14; if (mag > 1) mag = 1; if (mag < 0.25) mag = 0.25;
+      dragEvents.push({ t: t, x: p[0], y: p[1], ang: Math.atan2(dy, dx), mag: mag });
+      if (dragEvents.length > 420) dragEvents.splice(0, dragEvents.length - 420);
+      pointer.lx = p[0]; pointer.ly = p[1];
+    }
+  }
+  function onUp() { pointer.down = false; }
+  canvas.addEventListener('pointerdown', onDown);
+  window.addEventListener('pointermove', onMove);
+  window.addEventListener('pointerup', onUp);
+  canvas.addEventListener('dblclick', function () {
+    retuneEvents.push(clockNow());
+    retuneSweep();
+  });
+
+  // ---------- drawing ----------
+  function X(gx) { return gx * H; }
+  function Y(gy) { return gy * H; }
+
+  function drawHaze(t) {
+    var A = aspect();
+    for (var i = 0; i < blobs.length; i++) {
+      var bl = blobs[i];
+      var cx = (bl.fx * A) + bl.drift * Math.sin(0.05 * t + bl.ph);
+      var cy = bl.fy + bl.drift * 0.6 * Math.cos(0.043 * t + bl.ph * 1.7);
+      var layers = [[1.0, 0.05], [0.68, 0.045], [0.42, 0.04]];
+      for (var L = 0; L < layers.length; L++) {
+        var rx = bl.rx * layers[L][0], ry = bl.ry * layers[L][0];
+        ctx.beginPath();
+        ctx.moveTo(X(cx) + rx * H, Y(cy));
+        ctx.ellipse(X(cx), Y(cy), rx * H, ry * H, 0, 0, 6.283185307179586);
+        ctx.fillStyle = rgba(HAZE, layers[L][1]);
+        ctx.fill();
+      }
+    }
+  }
+
+  function drawShardBody(bm) {
+    var sh = bm.shard;
+    var cx = X(bm.ox), cy = Y(bm.oy);
+    ctx.beginPath();
+    for (var v = 0; v < sh.verts.length; v++) {
+      var a = bm.na + sh.verts[v].rel;
+      var rr = sh.r * sh.verts[v].rr * H;
+      var px = cx + Math.cos(a) * rr, py = cy + Math.sin(a) * rr;
+      if (v === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.closePath();
+    ctx.fillStyle = SHARD;
+    ctx.globalAlpha = 0.92;
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  function drawTetra(cx, cy, rPx, rot, alpha) {
+    var V = [[1, 1, 1], [1, -1, -1], [-1, 1, -1], [-1, -1, 1]];
+    var E = [[0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3]];
+    var cy1 = Math.cos(rot), sy1 = Math.sin(rot);
+    var cx1 = Math.cos(rot * 0.7 + 1.1), sx1 = Math.sin(rot * 0.7 + 1.1);
+    var P = [];
+    for (var i = 0; i < 4; i++) {
+      var x = V[i][0], y = V[i][1], z = V[i][2];
+      var x2 = x * cy1 + z * sy1, z2 = -x * sy1 + z * cy1;
+      var y2 = y * cx1 - z2 * sx1;
+      P.push([cx + x2 * rPx * 0.62, cy + y2 * rPx * 0.62]);
+    }
+    ctx.beginPath();
+    for (var e = 0; e < E.length; e++) {
+      ctx.moveTo(P[E[e][0]][0], P[E[e][0]][1]);
+      ctx.lineTo(P[E[e][1]][0], P[E[e][1]][1]);
+    }
+    ctx.strokeStyle = rgba(PHANTOM, alpha);
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+    ctx.fillStyle = VOID;
+    ctx.fillRect(0, 0, W, H);
+
+    drawHaze(t);
+
+    var beams = beamsAt(t);
+
+    // shard bodies (near-black ghosts)
+    for (var i = 0; i < beams.length; i++) drawShardBody(beams[i]);
+
+    ctx.globalCompositeOperation = 'lighter';
+
+    // faint incoming projector rays
+    ctx.lineWidth = 1;
+    for (var a = 0; a < beams.length; a++) {
+      var bm0 = beams[a];
+      ctx.beginPath();
+      ctx.moveTo(X(bm0.ox - bm0.dix * BEAM_LEN), Y(bm0.oy - bm0.diy * BEAM_LEN));
+      ctx.lineTo(X(bm0.ox), Y(bm0.oy));
+      ctx.strokeStyle = rgba(BEAM, 0.055);
+      ctx.stroke();
+    }
+    // outgoing beams: wide faint pass, then crisp pass
+    ctx.lineWidth = Math.max(3, H * 0.004);
+    for (var b2 = 0; b2 < beams.length; b2++) {
+      var bm1 = beams[b2];
+      ctx.beginPath();
+      ctx.moveTo(X(bm1.ox), Y(bm1.oy));
+      ctx.lineTo(X(bm1.ex), Y(bm1.ey));
+      ctx.strokeStyle = rgba(BEAM, 0.05);
+      ctx.stroke();
+    }
+    ctx.lineWidth = Math.max(1.2, H * 0.0018);
+    for (var c = 0; c < beams.length; c++) {
+      var bm2 = beams[c];
+      ctx.beginPath();
+      ctx.moveTo(X(bm2.ox), Y(bm2.oy));
+      ctx.lineTo(X(bm2.ex), Y(bm2.ey));
+      ctx.strokeStyle = rgba(BEAM, 0.3);
+      ctx.stroke();
+    }
+    // strike lines across the facets
+    ctx.lineWidth = Math.max(1.4, H * 0.002);
+    for (var d = 0; d < beams.length; d++) {
+      var bm3 = beams[d];
+      var facing = Math.abs(bm3.dix * bm3.nx + bm3.diy * bm3.ny);
+      var half = bm3.shard.r * 0.95;
+      var sx = Math.cos(bm3.na + Math.PI / 2), sy = Math.sin(bm3.na + Math.PI / 2);
+      ctx.beginPath();
+      ctx.moveTo(X(bm3.ox - sx * half), Y(bm3.oy - sy * half));
+      ctx.lineTo(X(bm3.ox + sx * half), Y(bm3.oy + sy * half));
+      ctx.strokeStyle = rgba(STRIKE, 0.16 + 0.4 * facing);
+      ctx.stroke();
+    }
+    // phantoms where beams cross
+    var phs = phantomsAt(t);
+    for (var p = 0; p < phs.length; p++) {
+      var ph = phs[p];
+      var cxp = X(ph.x), cyp = Y(ph.y), rp = ph.r * H;
+      var layers = [[1.0, 0.13], [0.64, 0.2], [0.36, 0.3]];
+      for (var L2 = 0; L2 < layers.length; L2++) {
+        ctx.beginPath();
+        ctx.moveTo(cxp + rp * layers[L2][0], cyp);
+        ctx.arc(cxp, cyp, rp * layers[L2][0], 0, 6.283185307179586);
+        ctx.fillStyle = rgba(PHANTOM, ph.alpha * layers[L2][1]);
+        ctx.fill();
+      }
+      drawTetra(cxp, cyp, rp, 0.15 * t + ph.ph, ph.alpha * 0.55);
+    }
+
+    ctx.globalCompositeOperation = 'source-over';
+    return phs;
+  }
+
+  // ---------- run ----------
+  draw(PHASE); // synchronous fixed-phase first frame
+  var prevPhantomKeys = {};
+  var prevSegStart = segInfo(PHASE).start;
+  function frame() {
+    var t = clockNow();
+    var phs = draw(t);
+    // chime when a new phantom condenses (browser only; visuals complete silent)
+    if (AC) {
+      var keys = {};
+      for (var i = 0; i < phs.length; i++) {
+        keys[phs[i].key] = true;
+        if (!prevPhantomKeys[phs[i].key] && phs[i].alpha > 0.3) chime();
+      }
+      prevPhantomKeys = keys;
+      var ss = segInfo(t).start;
+      if (ss !== prevSegStart) { prevSegStart = ss; retuneSweep(); }
+    }
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+  }
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

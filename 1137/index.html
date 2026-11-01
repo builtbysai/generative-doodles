@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>483 Lines</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #050507; overflow: hidden; height: 100%; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded RNG ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function lerp(a, b, t) { return a + (b - a) * t; }
+  function smootherstep(t) { t = clamp(t, 0, 1); return t * t * t * (t * (t * 6 - 15) + 10); }
+
+  // ---------- constants ----------
+  var BASE_SEED = 11372014;
+  var T0 = 26.0;               // fixed first-frame phase (piece seconds)
+  var NLINES = 483;            // NTSC's 483 visible scanlines, honored exactly
+  var NPTS = 73;               // polyline points per line
+  var GUARD = 0.105;           // guard threads beyond each edge, as a fraction
+                               // of W: the physical thread matrix is wider
+                               // than the aperture, so the field stays
+                               // full-bleed while the waves displace it.
+                               // The 483 core lines span the frame at rest.
+  var SWEEP_PERIOD = 45;       // field-sweep re-tune interval (s)
+  var SWEEP_DUR = 4.2;         // sweep band travel time (s)
+  var HOLD_LEN = 5;            // tap-hold freeze length (s)
+  var TAU = Math.PI * 2;
+
+  var LINE_RGB = '207,228,255';  // #CFE4FF phosphor white-blue
+  var WARM_RGB = '255,244,224';  // #FFF4E0 sweep band
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  var W = 0, H = 0;
+  var PHONE = false;
+  var pieceTime = T0;
+  var lastGlow = 0;
+
+  // ---------- wave configurations (seeded sequence, cycled) ----------
+  // Each config: two standing waves in y whose amplitudes are modulated
+  // across x, one broad travelling fold in x, and one roaming ridge where
+  // the field compresses and the lines bloom.
+  function makeConfig(rng, hand) {
+    if (hand) {
+      return {
+        a1: 0.0115, k1: 2.3, r1: 0.62, ph1: 0.8, pm1: 1.15,
+        a2: 0.0070, k2: 5.1, r2: 0.45, ph2: 2.4, pm2: 0.9,
+        m1g: 1.3, m1q: 0.6, m1a: 0.38,
+        m2g: 2.1, m2q: 3.1, m2a: 0.34,
+        a3: 0.021, r3: 0.20, ph3: 1.2,
+        rb: 0.029, rx: 0.57, rs: 0.032, rk: 1.15, rr: 0.11, rp: -4.90,
+        rw: 0.045, rwk: 0.55, rwr: 0.09, rwp: 0.7
+      };
+    }
+    return {
+      a1: 0.008 + rng() * 0.007, k1: 1.7 + rng() * 1.4, r1: 0.45 + rng() * 0.35, ph1: rng() * TAU, pm1: 0.7 + rng() * 0.8,
+      a2: 0.004 + rng() * 0.006, k2: 3.8 + rng() * 2.6, r2: 0.32 + rng() * 0.32, ph2: rng() * TAU, pm2: 0.6 + rng() * 0.7,
+      m1g: 0.9 + rng() * 1.1, m1q: rng() * TAU, m1a: 0.28 + rng() * 0.18,
+      m2g: 1.5 + rng() * 1.4, m2q: rng() * TAU, m2a: 0.24 + rng() * 0.18,
+      a3: 0.014 + rng() * 0.013, r3: 0.13 + rng() * 0.15, ph3: rng() * TAU,
+      rb: 0.020 + rng() * 0.012, rx: 0.22 + rng() * 0.56, rs: 0.026 + rng() * 0.016,
+      rk: 0.8 + rng() * 0.9, rr: 0.07 + rng() * 0.1, rp: rng() * TAU,
+      rw: 0.03 + rng() * 0.03, rwk: 0.4 + rng() * 0.5, rwr: 0.06 + rng() * 0.07, rwp: rng() * TAU
+    };
+  }
+  var CONFIGS = [];
+  (function () {
+    var rng = mulberry32(BASE_SEED);
+    CONFIGS.push(makeConfig(rng, true));
+    for (var i = 1; i < 6; i++) CONFIGS.push(makeConfig(rng, false));
+  })();
+
+  // ---------- field ----------
+  // D: horizontal displacement (px). dD: dD/dx (dimensionless; compression
+  // is -dD, positive where the field squeezes lines together).
+  function field(cfg, x, y, t, out) {
+    var yn = y / H, xn = x / W;
+    var g1 = TAU * cfg.m1g * xn + cfg.m1q;
+    var g2 = TAU * cfg.m2g * xn + cfg.m2q;
+    var u1 = TAU * cfg.k1 * yn + cfg.ph1 + cfg.r1 * t + cfg.pm1 * Math.sin(g1);
+    var u2 = TAU * cfg.k2 * yn + cfg.ph2 + cfg.r2 * t + cfg.pm2 * Math.sin(g2);
+    var s1 = Math.sin(u1), s2 = Math.sin(u2);
+    var M1 = 0.72 + cfg.m1a * Math.sin(g1);
+    var M2 = 0.78 + cfg.m2a * Math.sin(g2);
+    var u3 = TAU * xn + cfg.ph3 + cfg.r3 * t;
+    var shape = 0.45 + 0.55 * Math.sin(TAU * cfg.rk * yn + cfg.rp + cfg.rr * t);
+    var ridgeX = (cfg.rx + cfg.rw * Math.sin(TAU * cfg.rwk * yn + cfg.rwp + cfg.rwr * t)) * W;
+    var z = (x - ridgeX) / (cfg.rs * W);
+    var th = Math.tanh(z);
+    var sech2 = 1 - th * th;
+    out.D = cfg.a1 * W * s1 * M1
+          + cfg.a2 * W * s2 * M2
+          + cfg.a3 * W * Math.sin(u3)
+          - cfg.rb * W * th * shape;
+    out.dD = cfg.a1 * TAU * cfg.m1g * Math.cos(g1) * (cfg.pm1 * M1 * Math.cos(u1) + cfg.m1a * s1)
+           + cfg.a2 * TAU * cfg.m2g * Math.cos(g2) * (cfg.pm2 * M2 * Math.cos(u2) + cfg.m2a * s2)
+           + cfg.a3 * TAU * Math.cos(u3)
+           - (cfg.rb / cfg.rs) * sech2 * shape;
+  }
+
+  // ---------- interaction / schedule state ----------
+  var curCfg = 0;              // index of the live configuration
+  var sweep = null;            // {start (eff-time), from, to}
+  var nextAutoSweep = SWEEP_PERIOD;  // in effective time
+  var forceSweep = false;      // set by double-tap, consumed in draw
+  var holds = [];              // {start, end} in real time, ordered, non-overlapping
+  var pendingTap = null;       // {t, x, y} real time, may become a hold
+  var samples = [];            // drag-fold samples {x, y, t} real time
+
+  // Effective (phase) time: real time minus held durations. During a hold
+  // the phases freeze where they were when the hold began. Holds are few
+  // (one per deliberate tap), so the list is walked whole every frame.
+  function effTime(t) {
+    var acc = 0;
+    for (var i = 0; i < holds.length; i++) {
+      var h = holds[i];
+      if (t <= h.start) break;
+      if (t < h.end) return h.start - acc;
+      acc += (h.end - h.start);
+    }
+    return t - acc;
+  }
+
+  function startSweep(te) {
+    sweep = { start: te, from: curCfg, to: (curCfg + 1) % CONFIGS.length };
+  }
+
+  // Advance the sweep schedule to effective time te (called from draw;
+  // te is monotonic while the piece runs).
+  function advanceSchedule(te) {
+    if (forceSweep) {
+      forceSweep = false;
+      if (!sweep) startSweep(te);
+    }
+    if (!sweep && te >= nextAutoSweep) startSweep(te);
+    if (sweep && te >= sweep.start + SWEEP_DUR) {
+      curCfg = sweep.to;
+      nextAutoSweep = sweep.start + SWEEP_DUR + SWEEP_PERIOD;
+      sweep = null;
+    }
+  }
+
+  // Promote a pending tap to a hold once the double-tap window has passed.
+  // A hold never overlaps the previous one: it queues behind it.
+  function promoteTap(t) {
+    if (pendingTap && t >= pendingTap.t + 0.35) {
+      var start = pendingTap.t + 0.35;
+      if (holds.length && start < holds[holds.length - 1].end) {
+        start = holds[holds.length - 1].end;
+      }
+      holds.push({ start: start, end: start + HOLD_LEN });
+      pendingTap = null;
+    }
+  }
+
+  // ---------- sizing ----------
+  function isPhone(w, h) {
+    var sw = 0, sh = 0;
+    if (typeof window !== 'undefined' && window.screen) {
+      sw = window.screen.width || 0;
+      sh = window.screen.height || 0;
+    }
+    var minScreen = Math.min(sw, sh);
+    if (minScreen > 0) return minScreen < 700;
+    return h > w * 1.15;
+  }
+
+  function fit() {
+    var w, h;
+    if (typeof window !== 'undefined' && window.visualViewport) {
+      w = window.visualViewport.width;
+      h = window.visualViewport.height;
+    } else {
+      w = window.innerWidth;
+      h = window.innerHeight;
+    }
+    W = Math.max(50, Math.floor(w));
+    H = Math.max(50, Math.floor(h));
+    canvas.width = W;
+    canvas.height = H;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    PHONE = isPhone(W, H);
+  }
+
+  // ---------- audio (Franke rule: silent until a visitor gesture) ----------
+  var AC = null, noiseGain = null;
+  function ensureAudio() {
+    if (AC) return;
+    try {
+      if (typeof window === 'undefined') return;
+      var Ctor = window.AudioContext || window.webkitAudioContext;
+      if (!Ctor) return;
+      AC = new Ctor();
+      // NTSC line frequency folded down: 15734 Hz / 10 = 1573.4 Hz.
+      var osc = AC.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.value = 1573.4;
+      var og = AC.createGain();
+      og.gain.value = 0.008;
+      osc.connect(og); og.connect(AC.destination);
+      osc.start();
+      // Filtered noise bed, brightness-driven.
+      var len = 2 * AC.sampleRate;
+      var buf = AC.createBuffer(1, len, AC.sampleRate);
+      var d = buf.getChannelData(0);
+      for (var i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+      var src = AC.createBufferSource();
+      src.buffer = buf; src.loop = true;
+      var bp = AC.createBiquadFilter();
+      bp.type = 'bandpass'; bp.frequency.value = 720; bp.Q.value = 1.1;
+      noiseGain = AC.createGain();
+      noiseGain.gain.value = 0.0;
+      src.connect(bp); bp.connect(noiseGain); noiseGain.connect(AC.destination);
+      src.start();
+    } catch (e) { AC = null; noiseGain = null; }
+  }
+  var audioTick = 0;
+  function updateAudio() {
+    if (!AC || !noiseGain) return;
+    if ((audioTick++ & 7) !== 0) return;
+    try {
+      noiseGain.gain.setTargetAtTime(0.003 + 0.016 * lastGlow, AC.currentTime, 0.25);
+    } catch (e) {}
+  }
+
+  // ---------- draw ----------
+  var F1 = { D: 0, dD: 0 }, F2 = { D: 0, dD: 0 };
+
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    promoteTap(t);
+    var te = effTime(t);
+    advanceSchedule(te);
+
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.fillStyle = '#050507';
+    ctx.fillRect(0, 0, W, H);
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.lineCap = 'round';
+
+    // Sweep band position (in effective time).
+    var sweeping = !!sweep;
+    var bandY = -1e9, bandSig = 0.085 * H;
+    if (sweeping) {
+      var sw = smootherstep((te - sweep.start) / SWEEP_DUR);
+      bandY = lerp(-0.08 * H, 1.08 * H, sw);
+    }
+
+    var cfgA = CONFIGS[sweeping ? sweep.from : curCfg];
+    var cfgB = sweeping ? CONFIGS[sweep.to] : cfgA;
+
+    // Live drag samples (real time), pruned.
+    var liveSamples = [];
+    for (var si = 0; si < samples.length; si++) {
+      if (t - samples[si].t < 2.8) liveSamples.push(samples[si]);
+    }
+
+    var LEVELS = 22;
+    var mainBuckets = [], bloomBuckets = [], bandBuckets = [];
+    var b;
+    for (b = 0; b < LEVELS; b++) { mainBuckets.push(null); bloomBuckets.push(null); bandBuckets.push(null); }
+
+    var spacing = W / NLINES;
+    var nGuard = Math.ceil(GUARD * W / spacing) + 1;
+    var yStep = H / (NPTS - 1);
+    var glowSum = 0, glowN = 0;
+    var dragB = 0.026 * W, dragSx = 0.030 * W, dragSy = 0.13 * H;
+
+    for (var j = -nGuard; j < NLINES + nGuard; j++) {
+      var bx = (j + 0.5) * spacing;
+      var prevX = 0, prevY = 0;
+      for (var i = 0; i < NPTS; i++) {
+        var y = i * yStep;
+        field(cfgA, bx, y, te, F1);
+        var D = F1.D, dD = F1.dD;
+        if (sweeping) {
+          field(cfgB, bx, y, te, F2);
+          // Behind the band (above it, already swept) the new config rules.
+          var wgt = smootherstep((bandY - y) / (0.055 * H) + 0.5);
+          D = lerp(F1.D, F2.D, wgt);
+          dD = lerp(F1.dD, F2.dD, wgt);
+        }
+        // Drag fold: recorded pointer path pulls a local ridge.
+        for (var s2 = 0; s2 < liveSamples.length; s2++) {
+          var sm = liveSamples[s2];
+          var age = t - sm.t;
+          var amp = (1 - Math.exp(-age / 0.09)) * Math.exp(-Math.max(0, age - 0.15) / 1.5);
+          if (amp < 0.02) continue;
+          var dy = (y - sm.y) / dragSy;
+          if (dy > 2.6 || dy < -2.6) continue;
+          var gy = Math.exp(-dy * dy);
+          var zx = (bx - sm.x) / dragSx;
+          var thx = Math.tanh(zx);
+          D += -dragB * amp * thx * gy;
+          dD += -(dragB / dragSx) * amp * (1 - thx * thx) * gy;
+        }
+        var x = bx + D;
+        if (i > 0) {
+          var ym = (prevY + y) * 0.5;
+          var c = -dD; // compression at this x (segment start approx.)
+          var sN = clamp((c + 0.06) / 0.60, 0, 1);
+          var alpha = 0.07 + 0.28 * Math.pow(sN, 1.25);
+          var li = Math.round((alpha / 0.36) * (LEVELS - 1));
+          if (!mainBuckets[li]) mainBuckets[li] = [];
+          mainBuckets[li].push(prevX, prevY, x, y);
+          if (c > 0.34) {
+            var ba = clamp((c - 0.34) * 0.7, 0, 0.4);
+            var bl = Math.round((ba / 0.4) * (LEVELS - 1));
+            if (!bloomBuckets[bl]) bloomBuckets[bl] = [];
+            bloomBuckets[bl].push(prevX, prevY, x, y);
+          }
+          if (sweeping) {
+            var bd = (ym - bandY) / bandSig;
+            if (bd > -3 && bd < 3) {
+              var bf = Math.exp(-bd * bd);
+              var wa = bf * 0.30;
+              var wl = Math.round((wa / 0.32) * (LEVELS - 1));
+              if (!bandBuckets[wl]) bandBuckets[wl] = [];
+              bandBuckets[wl].push(prevX, prevY, x, y);
+            }
+          }
+          glowSum += sN; glowN++;
+        }
+        prevX = x; prevY = y;
+      }
+    }
+    lastGlow = glowN ? glowSum / glowN : 0;
+
+    var lw = PHONE ? 1 : 1.15;
+    var bucket, k;
+    ctx.lineWidth = lw;
+    for (b = 0; b < LEVELS; b++) {
+      bucket = mainBuckets[b];
+      if (!bucket) continue;
+      ctx.strokeStyle = 'rgba(' + LINE_RGB + ',' + (0.36 * b / (LEVELS - 1)).toFixed(3) + ')';
+      ctx.beginPath();
+      for (k = 0; k < bucket.length; k += 4) {
+        ctx.moveTo(bucket[k], bucket[k + 1]);
+        ctx.lineTo(bucket[k + 2], bucket[k + 3]);
+      }
+      ctx.stroke();
+    }
+    ctx.lineWidth = lw * 1.5;
+    for (b = 0; b < LEVELS; b++) {
+      bucket = bloomBuckets[b];
+      if (!bucket) continue;
+      ctx.strokeStyle = 'rgba(255,255,255,' + (0.4 * b / (LEVELS - 1)).toFixed(3) + ')';
+      ctx.beginPath();
+      for (k = 0; k < bucket.length; k += 4) {
+        ctx.moveTo(bucket[k], bucket[k + 1]);
+        ctx.lineTo(bucket[k + 2], bucket[k + 3]);
+      }
+      ctx.stroke();
+    }
+    ctx.lineWidth = lw * 1.4;
+    for (b = 0; b < LEVELS; b++) {
+      bucket = bandBuckets[b];
+      if (!bucket) continue;
+      ctx.strokeStyle = 'rgba(' + WARM_RGB + ',' + (0.32 * b / (LEVELS - 1)).toFixed(3) + ')';
+      ctx.beginPath();
+      for (k = 0; k < bucket.length; k += 4) {
+        ctx.moveTo(bucket[k], bucket[k + 1]);
+        ctx.lineTo(bucket[k + 2], bucket[k + 3]);
+      }
+      ctx.stroke();
+    }
+    updateAudio();
+  }
+
+  // ---------- pointer ----------
+  function pointerPos(e) {
+    var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    return { x: (e.clientX || 0) - r.left, y: (e.clientY || 0) - r.top };
+  }
+  var dragging = false, dragMoved = 0, lastX = 0, lastY = 0, downT = 0, lastSampleT = -1;
+  var lastTapT = -10, lastTapX = 0, lastTapY = 0;
+
+  canvas.addEventListener('pointerdown', function (e) {
+    ensureAudio();
+    if (AC && AC.resume) { try { AC.resume(); } catch (err) {} }
+    var p = pointerPos(e);
+    dragging = true; dragMoved = 0; lastX = p.x; lastY = p.y; downT = pieceTime;
+    samples.push({ x: p.x, y: p.y, t: pieceTime });
+    lastSampleT = pieceTime;
+    if (canvas.setPointerCapture && e.pointerId !== undefined) {
+      try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+    }
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (!dragging) return;
+    var p = pointerPos(e);
+    dragMoved += Math.abs(p.x - lastX) + Math.abs(p.y - lastY);
+    lastX = p.x; lastY = p.y;
+    if (pieceTime - lastSampleT >= 0.045) {
+      samples.push({ x: p.x, y: p.y, t: pieceTime });
+      if (samples.length > 16) samples.splice(0, samples.length - 16);
+      lastSampleT = pieceTime;
+    }
+  });
+  function endPointer(e) {
+    if (!dragging) return;
+    dragging = false;
+    var p = pointerPos(e);
+    var quick = (pieceTime - downT) < 0.45;
+    if (dragMoved <= 10 && quick) {
+      // a tap: either the second half of a double-tap, or a hold-to-come
+      var dt = pieceTime - lastTapT;
+      var dx = p.x - lastTapX, dy = p.y - lastTapY;
+      if (dt > 0 && dt < 0.35 && dx * dx + dy * dy < 1600) {
+        pendingTap = null;      // cancel the hold the first tap would make
+        forceSweep = true;      // double-tap: re-tune now
+        lastTapT = -10;
+      } else {
+        pendingTap = { t: pieceTime, x: p.x, y: p.y };
+        lastTapT = pieceTime; lastTapX = p.x; lastTapY = p.y;
+      }
+    } else {
+      lastTapT = -10;
+    }
+    draw(pieceTime);
+  }
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', endPointer);
+
+  // ---------- run ----------
+  fit();
+  draw(T0);
+  pieceTime = T0;
+
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener('resize', function () { fit(); draw(pieceTime); });
+    }
+    window.addEventListener('resize', function () { fit(); draw(pieceTime); });
+  }
+
+  var startStamp = null;
+  function frame(now) {
+    if (startStamp === null) startStamp = now;
+    pieceTime = T0 + (now - startStamp) / 1000;
+    draw(pieceTime);
+    if (typeof requestAnimationFrame !== 'undefined') {
+      requestAnimationFrame(frame);
+    }
+  }
+  if (typeof requestAnimationFrame !== 'undefined') {
+    requestAnimationFrame(frame);
+  }
+})();
+</script>
+</body>
+</html>
