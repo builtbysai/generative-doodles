@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Eleven Years of Invoices</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0A1020; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+/* Eleven Years of Invoices -- No.927
+   Two layers only. Strings: four gold ribbons whose note lengths are the
+   average invoice payment speed of each quarter. Electronic: a steady
+   120 BPM pulse-grid, the metronome of global trade. */
+
+// ---------- seeded RNG (mulberry32) ----------
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+var rng = mulberry32(92788);
+
+// ---------- palette (strict) ----------
+var GROUND = '#0A1020';
+var GOLD = ['#D4AF37', '#C9A227', '#E3C766', '#8A6D2F']; // violin I, violin II, viola, cello
+var BOW = '#F2EDE0';
+var PULSE = '#00E5FF';
+var CAPTION = '#7A8AA0';
+
+// ---------- data: 44 quarters, Q1 2015 .. Q1 2026 ----------
+// Payment speed in days. Base curve: ~28 day mean, a slow stretch of
+// 40+ days across 2020 (quarter indices 20..23), faster recent quarters
+// near 22 days. Per-instrument jitter applied per note.
+var NQ = 44;
+var QSEC = 180 / NQ; // seconds per quarter in the sweep
+var quarterDays = [];
+for (var q = 0; q < NQ; q++) {
+  var base = 28 + 3.5 * Math.sin(q * 0.55) + (rng() - 0.5) * 3.0;
+  if (q >= 19 && q <= 24) base += 13.5 * Math.exp(-Math.pow(q - 21.5, 2) / 4.5); // the slow stretch
+  if (q >= 36) base -= (q - 35) * 0.85; // recent quarters pay faster
+  if (q < 4) base += 2.0;
+  quarterDays.push(Math.max(19, Math.min(47, base)));
+}
+// notes[inst][q] = payment days for that instrument that quarter
+var notes = [];
+for (var inst = 0; inst < 4; inst++) {
+  var row = [];
+  for (var qq = 0; qq < NQ; qq++) {
+    row.push(Math.max(17, Math.min(49, quarterDays[qq] + (rng() - 0.5) * 4.0)));
+  }
+  notes.push(row);
+}
+// pitch index per note (diatonic steps within each instrument's register)
+var pitchIdx = [];
+for (var i2 = 0; i2 < 4; i2++) {
+  var prow = [];
+  for (var q2 = 0; q2 < NQ; q2++) prow.push(Math.floor(rng() * 8));
+  pitchIdx.push(prow);
+}
+var BASEFREQ = [293.66, 220.0, 174.61, 130.81]; // D4, A3, F3, C3
+var SCALE = [0, 2, 4, 5, 7, 9, 11, 12];
+
+// ---------- events: everything interactive is a recorded event ----------
+// rateSegs: {t, rate} sweep-rate segments (rate multiplies sweep seconds)
+// taps: layer-cycle taps {t, state} ; dbls: pulse-alone windows {t}
+var rateSegs = [{ t: 0, rate: 1 }];
+var tapEvents = [];   // {t, from:{s,p}, to:{s,p}}
+var dblEvents = [];   // {t}
+var dragState = null; // {startX, x, t0} while dragging
+var lastTap = null;   // {t, x, y}
+var downInfo = null;
+
+var SWEEP0 = 72; // frame one: the sweep opens at 40% of the 180 s loop
+
+function sweepTime(t) {
+  var s = SWEEP0;
+  for (var i = 0; i < rateSegs.length; i++) {
+    var t0 = rateSegs[i].t;
+    var t1 = (i + 1 < rateSegs.length) ? rateSegs[i + 1].t : t;
+    if (t <= t0) break;
+    s += rateSegs[i].rate * (Math.min(t, t1) - t0);
+    if (t <= t1) break;
+  }
+  return s;
+}
+function layerAt(t) {
+  // returns {s, p} alpha targets for strings / pulse, closed-form over events
+  var cur = { s: 1, p: 1 }, prev = { s: 1, p: 1 }, tc = -10;
+  for (var i = 0; i < tapEvents.length; i++) {
+    if (tapEvents[i].t <= t) { prev = tapEvents[i].from; cur = tapEvents[i].to; tc = tapEvents[i].t; }
+    else break;
+  }
+  var k = Math.min(1, Math.max(0, (t - tc) / 0.6));
+  var sA = prev.s + (cur.s - prev.s) * k;
+  var pA = prev.p + (cur.p - prev.p) * k;
+  for (var j = 0; j < dblEvents.length; j++) {
+    var dt = t - dblEvents[j].t;
+    if (dt >= 0 && dt < 8) { // pulse alone for 8 s, smooth in/out
+      var kin = Math.min(1, dt / 0.5), kout = Math.min(1, (8 - dt) / 0.5);
+      var kk = Math.min(kin, kout);
+      sA = sA * (1 - kk) + 0.03 * kk;
+      pA = pA * (1 - kk) + 1 * kk;
+    }
+  }
+  return { s: sA, p: pA };
+}
+function currentTargets(t) {
+  var cur = { s: 1, p: 1 };
+  for (var i = 0; i < tapEvents.length; i++) {
+    if (tapEvents[i].t <= t) cur = tapEvents[i].to; else break;
+  }
+  return cur;
+}
+function stretchAt(t) {
+  // note-length stretch near the playhead while a drag is held: 1 .. 2.5
+  if (!dragState) return 1;
+  var d = Math.abs(dragState.x - dragState.startX);
+  return 1 + 1.5 * Math.min(1, d / 320);
+}
+
+// ---------- audio: lazy, gesture-born, dry ----------
+var AC = null, masterGain = null, pulseGain = null, strGain = null;
+function ensureAudio() {
+  if (AC) { if (AC.resume) AC.resume(); return; }
+  if (typeof AudioContext === 'undefined' && typeof webkitAudioContext === 'undefined') return;
+  try {
+    var Ctor = (typeof AudioContext !== 'undefined') ? AudioContext : webkitAudioContext;
+    AC = new Ctor();
+    masterGain = AC.createGain(); masterGain.gain.value = 0.9;
+    masterGain.connect(AC.destination);
+    strGain = AC.createGain(); strGain.gain.value = 0.5; strGain.connect(masterGain);
+    pulseGain = AC.createGain(); pulseGain.gain.value = 0.16; pulseGain.connect(masterGain);
+  } catch (e) { AC = null; }
+}
+function playNote(inst, qi, days, when) {
+  if (!AC) return;
+  var f = BASEFREQ[inst] * Math.pow(2, SCALE[pitchIdx[inst][qi]] / 12);
+  var dur = Math.max(0.7, (days / 28) * QSEC * 0.92);
+  var o = AC.createOscillator(); o.type = 'sawtooth'; o.frequency.value = f;
+  var fl = AC.createBiquadFilter(); fl.type = 'lowpass';
+  fl.frequency.value = 700 + inst * 160; fl.Q.value = 0.4;
+  var g = AC.createGain();
+  g.gain.setValueAtTime(0.0001, when);
+  g.gain.linearRampToValueAtTime(0.16, when + Math.min(0.45, dur * 0.3)); // slow attack
+  g.gain.setValueAtTime(0.16, when + dur * 0.72);
+  g.gain.linearRampToValueAtTime(0.0001, when + dur);
+  o.connect(fl); fl.connect(g); g.connect(strGain);
+  o.start(when); o.stop(when + dur + 0.05);
+}
+function playTick(when) {
+  if (!AC) return;
+  var o = AC.createOscillator(); o.type = 'sine'; o.frequency.value = 1180;
+  var fl = AC.createBiquadFilter(); fl.type = 'bandpass'; fl.frequency.value = 1180; fl.Q.value = 6;
+  var g = AC.createGain();
+  g.gain.setValueAtTime(0.5, when);
+  g.gain.exponentialRampToValueAtTime(0.001, when + 0.07);
+  o.connect(fl); fl.connect(g); g.connect(pulseGain);
+  o.start(when); o.stop(when + 0.09);
+}
+var lastSweep = null, lastBeat = -1;
+function audioFrame(t, sT) {
+  if (!AC) return;
+  var lay = layerAt(t);
+  strGain.gain.value = 0.5 * lay.s;
+  pulseGain.gain.value = 0.16 * lay.p;
+  if (lastSweep !== null && sT >= lastSweep) {
+    // note onsets crossed since last frame (in sweep seconds, mod loop)
+    for (var inst = 0; inst < 4; inst++) {
+      for (var q = 0; q < NQ; q++) {
+        var onset = q * QSEC;
+        var crossed = false;
+        if (sT - lastSweep < 180) {
+          var a = lastSweep % 180, b = sT % 180;
+          if (a <= b) crossed = (onset > a && onset <= b);
+          else crossed = (onset > a || onset <= b);
+        }
+        if (crossed && lay.s > 0.25) playNote(inst, q, notes[inst][q], AC.currentTime + 0.02);
+      }
+    }
+  }
+  lastSweep = sT;
+  var beat = Math.floor(t * 2); // 120 BPM in real time
+  if (beat !== lastBeat) { lastBeat = beat; if (lay.p > 0.25) playTick(AC.currentTime + 0.01); }
+}
+
+// ---------- canvas / viewport ----------
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var W = 720, H = 720, PHONE = false;
+function resize() {
+  var vv = (typeof window !== 'undefined' && window.visualViewport) ? window.visualViewport : null;
+  W = vv ? vv.width : (window.innerWidth || 720);
+  H = vv ? vv.height : (window.innerHeight || 720);
+  var sw = (window.screen && window.screen.width) || W;
+  var sh = (window.screen && window.screen.height) || H;
+  PHONE = Math.min(sw, sh) < 700 || H > W * 1.15;
+  canvas.width = Math.round(W); canvas.height = Math.round(H);
+}
+if (typeof window !== 'undefined') {
+  if (window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', resize);
+  if (window.addEventListener) window.addEventListener('resize', resize);
+}
+resize();
+
+function rrect(x, y, w, h, r) {
+  r = Math.min(r, h / 2, w / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y); ctx.arcTo(x + w, y, x + w, y + r, r);
+  ctx.lineTo(x + w, y + h - r); ctx.arcTo(x + w, y + h, x + w - r, y + h, r);
+  ctx.lineTo(x + r, y + h); ctx.arcTo(x, y + h, x, y + h - r, r);
+  ctx.lineTo(x, y + r); ctx.arcTo(x, y, x + r, y, r);
+  ctx.closePath();
+}
+
+// ---------- draw ----------
+function draw(t) {
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  ctx.fillStyle = GROUND;
+  ctx.fillRect(0, 0, W, H);
+
+  var sT = sweepTime(t);
+  var sMod = ((sT % 180) + 180) % 180;
+  var lay = layerAt(t);
+  var stretch = stretchAt(t);
+
+  var marginX = PHONE ? W * 0.05 : W * 0.06;
+  var fieldW = W - marginX * 2;
+  var colW = fieldW / NQ;
+  var capY = PHONE ? H * 0.045 : H * 0.05;
+  var topY = H * 0.13, botY = H * 0.635; // strings band: upper two-thirds
+  var pulseTop = H * 0.70, pulseBot = H * 0.94;
+  var playX = marginX + (sMod / 180) * fieldW;
+  var curQ = Math.min(NQ - 1, Math.floor(sMod / QSEC));
+
+  // doctrine caption (the only visible text)
+  ctx.fillStyle = CAPTION;
+  ctx.font = (PHONE ? 10 : 12) + 'px ui-monospace, Menlo, Consolas, monospace';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText('no artistic license was applied to the underlying metrics.', W / 2, capY);
+
+  // ----- layer two: the pulse-grid (drawn first, beneath) -----
+  if (lay.p > 0.01) {
+    var tickGap = PHONE ? 17 : 24;
+    var cols = Math.floor(fieldW / tickGap);
+    var beat = Math.floor(t * 2);
+    var rows = 4;
+    for (var c = 0; c < cols; c++) {
+      var bd = (beat - c) % 24; if (bd < 0) bd += 24;
+      var glow = Math.max(0, 1 - bd / 6);
+      ctx.fillStyle = PULSE;
+      for (var r = 0; r < rows; r++) {
+        var ty = pulseTop + (pulseBot - pulseTop) * (r + 0.5) / rows;
+        ctx.globalAlpha = lay.p * (0.10 + 0.55 * glow * (r === 1 || r === 2 ? 1 : 0.55));
+        ctx.fillRect(marginX + c * tickGap + tickGap * 0.36, ty - (PHONE ? 9 : 12), PHONE ? 2 : 2.6, PHONE ? 18 : 24);
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ----- layer one: the string ribbons -----
+  var ribGap = (botY - topY) / 4;
+  var noteH = Math.max(7, ribGap * 0.34);
+  for (var inst = 0; inst < 4; inst++) {
+    var cy = topY + ribGap * (inst + 0.5);
+    // the ribbon line itself
+    ctx.strokeStyle = GOLD[inst];
+    ctx.globalAlpha = lay.s * 0.34;
+    ctx.lineWidth = 1.4;
+    ctx.beginPath(); ctx.moveTo(marginX, cy); ctx.lineTo(marginX + fieldW, cy); ctx.stroke();
+    // notes
+    for (var q = 0; q < NQ; q++) {
+      var days = notes[inst][q];
+      var frac = 0.24 + 0.72 * ((days - 17) / 32); // days 17..49 -> column fraction
+      var qx = marginX + q * colW;
+      var nw = colW * frac;
+      // drag stretch: lengths swell around the playhead
+      var distQ = Math.abs(q - curQ);
+      var sf = 1 + (stretch - 1) * Math.max(0, 1 - distQ / 7);
+      nw = Math.min(colW * 1.9, nw * sf);
+      var played = q < curQ, current = (q === curQ);
+      var a = current ? 1.0 : (played ? 0.52 : 0.82);
+      ctx.globalAlpha = lay.s * a;
+      ctx.fillStyle = GOLD[inst];
+      rrect(qx + (colW - nw) / 2, cy - noteH / 2, nw, noteH, noteH / 2);
+      ctx.fill();
+      // bow stroke at the current note's onset
+      if (current) {
+        var prog = (sMod - q * QSEC) / QSEC; // 0..1 across the quarter
+        var bp = Math.min(1, prog / 0.22);   // the stroke lands in the first fifth
+        var bx = qx + colW * 0.5;
+        var bl = noteH * 1.5;
+        var ang = -0.7 + 0.9 * bp;
+        ctx.globalAlpha = lay.s * (0.35 + 0.65 * bp);
+        ctx.strokeStyle = BOW;
+        ctx.lineWidth = Math.max(1.4, noteH * 0.16);
+        ctx.beginPath();
+        ctx.moveTo(bx - Math.cos(ang) * bl / 2, cy - Math.sin(ang) * bl / 2 - noteH * 0.4);
+        ctx.lineTo(bx + Math.cos(ang) * bl / 2, cy + Math.sin(ang) * bl / 2 - noteH * 0.4);
+        ctx.stroke();
+      }
+    }
+  }
+  ctx.globalAlpha = 1;
+
+  // playhead
+  ctx.strokeStyle = BOW;
+  ctx.globalAlpha = 0.30;
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(playX, topY - ribGap * 0.32); ctx.lineTo(playX, pulseBot); ctx.stroke();
+  ctx.globalAlpha = 1;
+}
+
+// ---------- interaction ----------
+function evT(e) { return (performanceNow() - T0) / 1000; }
+var T0 = Date.now();
+function performanceNow() { return Date.now(); }
+function setRate(t, rate) {
+  rateSegs.push({ t: t, rate: rate });
+}
+function onDown(e) {
+  ensureAudio();
+  var t = evT(e);
+  var x = (e.clientX !== undefined) ? e.clientX : W / 2;
+  var y = (e.clientY !== undefined) ? e.clientY : H / 2;
+  downInfo = { t: t, x: x, y: y, moved: false };
+  dragState = null;
+}
+function onMove(e) {
+  if (!downInfo) return;
+  var t = evT(e);
+  var x = (e.clientX !== undefined) ? e.clientX : downInfo.x;
+  var y = (e.clientY !== undefined) ? e.clientY : downInfo.y;
+  var dx = x - downInfo.x, dy = y - downInfo.y;
+  if (!dragState && Math.sqrt(dx * dx + dy * dy) > 9) {
+    dragState = { startX: downInfo.x, x: x, t0: t };
+    downInfo.moved = true;
+  }
+  if (dragState) {
+    dragState.x = x;
+    var d = Math.abs(x - dragState.startX);
+    var rate = 1 - 0.8 * Math.min(1, d / 320); // down to 0.2x
+    var last = rateSegs[rateSegs.length - 1];
+    if (Math.abs(last.rate - rate) > 0.03 || t - last.t > 0.12) setRate(t, rate);
+  }
+}
+function onUp(e) {
+  if (!downInfo) return;
+  var t = evT(e);
+  var wasDrag = !!dragState;
+  dragState = null;
+  if (wasDrag) { setRate(t, 1); downInfo = null; return; }
+  // a tap
+  if (lastTap && t - lastTap.t < 0.35) {
+    dblEvents.push({ t: t });
+    lastTap = null;
+  } else {
+    lastTap = { t: t };
+    // layer lesson: both -> strings alone -> pulse alone -> both
+    var cur = currentTargets(t);
+    var nxt;
+    if (cur.s > 0.5 && cur.p > 0.5) nxt = { s: 1, p: 0.03 };
+    else if (cur.s > 0.5) nxt = { s: 0.03, p: 1 };
+    else nxt = { s: 1, p: 1 };
+    tapEvents.push({ t: t, from: cur, to: nxt });
+  }
+  downInfo = null;
+}
+if (canvas.addEventListener) {
+  canvas.addEventListener('pointerdown', onDown);
+  canvas.addEventListener('pointermove', onMove);
+  canvas.addEventListener('pointerup', onUp);
+  canvas.addEventListener('pointercancel', onUp);
+}
+
+// ---------- run ----------
+draw(0);
+if (typeof requestAnimationFrame === 'function') {
+  var loop = function () {
+    var t = (Date.now() - T0) / 1000;
+    draw(t);
+    audioFrame(t, sweepTime(t));
+    requestAnimationFrame(loop);
+  };
+  requestAnimationFrame(loop);
+}
+</script>
+</body>
+</html>
