@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>The Model Watches</title>
+<style>
+  html, body { margin:0; padding:0; background:#07080C; height:100%; overflow:hidden; }
+  canvas { display:block; touch-action:none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // No.998 "The Model Watches" - a simulated learning loop, honestly faked.
+  // Left: an archive wall of seeded scribbles, one new mark per second.
+  // Right: a "model" (layer bars) whose generations redraw real archive
+  // strokes, corrupted by noise that falls as a closed-form loss curve falls.
+  // Everything is a function of piece time plus recorded visitor events.
+
+  var T0 = 38; // frame one: 38 scribbles archived, pass 9 mid-flight, 1 checkpoint pinned
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  var ROOM = '#07080C', SCRIB = '#8A8D84', BARFILL = '#14161C', EDGE = '#3A3D46',
+      ACTIVE = '#4FD6FF', GEN_EARLY = [255, 79, 216], GEN_LATE = [125, 249, 198],
+      LOSS_C = '#FFFFFF', CKPT = '#FFD93B', STRIP = '#0E1118';
+
+  // ---------- deterministic helpers ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  function ihash(n) {
+    var x = Math.imul((n | 0) ^ 0x9E3779B9, 0x85EBCA6B);
+    x ^= x >>> 13; x = Math.imul(x, 0xC2B2AE35); x ^= x >>> 16;
+    return (x >>> 0) / 4294967296;
+  }
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function lerp(a, b, f) { return a + (b - a) * f; }
+  function mixc(c1, c2, f) {
+    return 'rgb(' + Math.round(lerp(c1[0], c2[0], f)) + ',' +
+           Math.round(lerp(c1[1], c2[1], f)) + ',' +
+           Math.round(lerp(c1[2], c2[2], f)) + ')';
+  }
+
+  // ---------- visitor event state (recorded, never integrated) ----------
+  var resets = [];        // absolute piece times of double-tap model resets
+  var selectEvents = [];  // { t, cells:[archive indices] } from archive drags
+  var inspectUntil = -1;  // absolute time until which the generation fills the frame
+  var lastLayout = null;
+
+  function epochStartAt(t) {
+    var s = 0;
+    for (var i = 0; i < resets.length; i++) if (resets[i] <= t) s = resets[i];
+    return s;
+  }
+  function baseLoss(tm) {
+    if (tm <= 0) return 0.95;
+    return 0.95 * Math.exp(-0.02 * tm) * Math.pow(0.965, Math.floor(tm / 4));
+  }
+  function lossAt(t) {
+    var ms = epochStartAt(t), tm = t - ms, L = baseLoss(tm);
+    for (var i = 0; i < selectEvents.length; i++) {
+      if (selectEvents[i].t <= t && selectEvents[i].t >= ms) L *= 0.97; // curation helps, permanently
+    }
+    return clamp(L, 0.03, 0.98);
+  }
+  function selectedSetAt(t) {
+    var s = {};
+    for (var i = 0; i < selectEvents.length; i++) {
+      if (selectEvents[i].t <= t) {
+        var cs = selectEvents[i].cells;
+        for (var j = 0; j < cs.length; j++) s[cs[j]] = true;
+      }
+    }
+    return s;
+  }
+
+  // ---------- the archive: seeded scribble pool ----------
+  // Each scribble is an array of strokes; each stroke an array of [x,y] in a unit cell.
+  function scribbleStrokes(idx) {
+    var rnd = mulberry32(1234567 + idx * 7919);
+    var type = idx % 6, pts = [], i, a, r, f;
+    if (type === 0) {                       // spiral study
+      var turns = 2 + rnd() * 1.5, n = 26;
+      for (i = 0; i <= n; i++) { f = i / n; a = f * turns * Math.PI * 2; r = 0.06 + f * 0.4; pts.push([0.5 + Math.cos(a) * r, 0.5 + Math.sin(a) * r * 0.92]); }
+      return [pts];
+    }
+    if (type === 1) {                       // wave study
+      var ph = rnd() * 6.28, fr = 2 + Math.floor(rnd() * 3), amp = 0.12 + rnd() * 0.16, n1 = 22;
+      for (i = 0; i <= n1; i++) { f = i / n1; pts.push([0.08 + 0.84 * f, 0.5 + Math.sin(ph + f * fr * 6.28) * amp]); }
+      return [pts];
+    }
+    if (type === 2) {                       // zigzag study
+      var n2 = 7 + Math.floor(rnd() * 4), sgn = rnd() > 0.5 ? 1 : -1;
+      for (i = 0; i <= n2; i++) pts.push([0.1 + 0.8 * (i / n2), 0.5 + ((i % 2) ? -1 : 1) * sgn * (0.18 + rnd() * 0.14)]);
+      return [pts];
+    }
+    if (type === 3) {                       // noisy closed loop
+      var n3 = 20, r0 = 0.26 + rnd() * 0.1;
+      for (i = 0; i <= n3; i++) { a = (i / n3) * Math.PI * 2; r = r0 * (0.8 + ihash(idx * 331 + i) * 0.45); pts.push([0.5 + Math.cos(a) * r, 0.5 + Math.sin(a) * r * 0.9]); }
+      return [pts];
+    }
+    if (type === 4) {                       // wandering walk
+      var x = 0.2 + rnd() * 0.2, y = 0.3 + rnd() * 0.4, ang = rnd() * 6.28;
+      pts.push([x, y]);
+      for (i = 0; i < 16; i++) {
+        ang += (rnd() - 0.5) * 1.5;
+        x = clamp(x + Math.cos(ang) * 0.085, 0.08, 0.92);
+        y = clamp(y + Math.sin(ang) * 0.085, 0.08, 0.92);
+        pts.push([x, y]);
+      }
+      return [pts];
+    }
+    // hatch study: three parallel strokes
+    var out = [], base = 0.28 + rnd() * 0.1, tilt = (rnd() - 0.5) * 0.2;
+    for (var s = 0; s < 3; s++) {
+      var line = [];
+      for (i = 0; i <= 8; i++) { f = i / 8; line.push([0.14 + 0.72 * f, base + s * 0.18 + tilt * (f - 0.5)]); }
+      out.push(line);
+    }
+    return out;
+  }
+
+  // ---------- generations: archive strokes + loss-scaled corruption ----------
+  var GEN_SLOTS = [[0.26, 0.27], [0.63, 0.23], [0.42, 0.54], [0.76, 0.60], [0.19, 0.73], [0.58, 0.82], [0.86, 0.36]];
+  function generationFor(passIdx, epochStart) {
+    var passStartAbs = epochStart + passIdx * 4;
+    var Lp = lossAt(passStartAbs);
+    var skill = 1 - Lp;
+    var avail = Math.max(1, Math.floor(passStartAbs)); // scribbles archived by pass start
+    var sel = selectedSetAt(passStartAbs);
+    var rnd = mulberry32(555000 + passIdx * 131 + Math.round(epochStart * 10));
+    var picks = [], seen = {}, i, idx;
+    // curated scribbles first (visitor taste steers the training set)
+    var selList = [];
+    for (var k in sel) if (Object.prototype.hasOwnProperty.call(sel, k)) { idx = +k; if (idx < avail) selList.push(idx); }
+    selList.sort(function (a, b) { return a - b; });
+    for (i = 0; i < selList.length && picks.length < 4; i++) { picks.push(selList[i]); seen[selList[i]] = true; }
+    // then recent archive scribbles, seeded walk backwards
+    var guard = 0;
+    while (picks.length < 7 && guard < 200) {
+      guard++;
+      idx = avail - 1 - Math.floor(rnd() * Math.min(avail, 26));
+      if (idx < 0 || seen[idx]) continue;
+      seen[idx] = true; picks.push(idx);
+    }
+    var amp = Lp * 0.17;              // jitter amplitude in generation unit space
+    var breakP = Lp * 0.45;           // probability a segment is dropped
+    var strokes = [];
+    for (i = 0; i < picks.length; i++) {
+      var src = scribbleStrokes(picks[i]);
+      var slot = GEN_SLOTS[i % GEN_SLOTS.length];
+      var sc = 0.30 + rnd() * 0.15;
+      var seedBase = passIdx * 100000 + picks[i] * 977;
+      for (var s = 0; s < src.length; s++) {
+        var line = src[s], cur = [];
+        for (var p = 0; p < line.length; p++) {
+          var jx = (ihash(seedBase + s * 1000 + p * 7) - 0.5) * 2 * amp;
+          var jy = (ihash(seedBase + s * 1000 + p * 7 + 31337) - 0.5) * 2 * amp;
+          var pt = [slot[0] + (line[p][0] - 0.5) * sc + jx, slot[1] + (line[p][1] - 0.5) * sc + jy];
+          if (p > 0 && ihash(seedBase + s * 1000 + p * 13 + 777) < breakP) {
+            if (cur.length > 1) strokes.push(cur);
+            cur = [pt];
+          } else {
+            cur.push(pt);
+          }
+        }
+        if (cur.length > 1) strokes.push(cur);
+      }
+    }
+    // heavy early loss also sprays a few stray fragments (near-noise blobs)
+    if (Lp > 0.55) {
+      var extra = Math.floor((Lp - 0.5) * 22);
+      for (i = 0; i < extra; i++) {
+        var bx = ihash(passIdx * 7777 + i * 31), by = ihash(passIdx * 7777 + i * 31 + 999);
+        strokes.push([[bx, by], [bx + (ihash(i * 17 + passIdx) - 0.5) * 0.09, by + (ihash(i * 23 + passIdx) - 0.5) * 0.09]]);
+      }
+    }
+    return { strokes: strokes, skill: skill, loss: Lp, color: mixc(GEN_EARLY, GEN_LATE, clamp(skill, 0, 1)) };
+  }
+
+  function drawStrokes(strokes, x, y, size, color, lw) {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = lw;
+    ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    ctx.beginPath();
+    for (var s = 0; s < strokes.length; s++) {
+      var line = strokes[s];
+      if (line.length < 2) continue;
+      ctx.moveTo(x + line[0][0] * size, y + line[0][1] * size);
+      for (var p = 1; p < line.length; p++) ctx.lineTo(x + line[p][0] * size, y + line[p][1] * size);
+    }
+    ctx.stroke();
+  }
+
+  // checkpoints across all epochs: { epochStart, passIdx, time }
+  function checkpointsAt(t) {
+    var out = [], starts = [0].concat(resets);
+    for (var e = 0; e < starts.length; e++) {
+      var es = starts[e];
+      var end = (e + 1 < starts.length) ? starts[e + 1] : Infinity;
+      for (var k = 1; es + k * 30 < Math.min(t, end); k++) {
+        out.push({ epochStart: es, passIdx: Math.floor((k * 30) / 4), time: es + k * 30 });
+      }
+    }
+    return out;
+  }
+
+  // ---------- layout ----------
+  function computeLayout(w, h) {
+    var phone = false;
+    var sw = 0, sh = 0;
+    try { sw = window.screen.width; sh = window.screen.height; } catch (e) {}
+    var mind = Math.min(sw, sh);
+    phone = mind > 0 ? (mind < 700) : (h > w * 1.15);
+    var stripH = clamp(h * 0.085, 40, 80);
+    var mainH = h - stripH;
+    var midX = w / 2;
+    var margin = clamp(w * 0.014, 8, 18);
+    var rx = midX + margin, rw = w - midX - 2 * margin;
+    var chartH = Math.max(34, mainH * 0.15);
+    var chart = { x: rx, y: mainH - margin - chartH, w: rw, h: chartH };
+    var gAreaH = mainH - 2 * margin - chartH - 10;
+    var genSize = Math.min(rw * 0.64, gAreaH);
+    var gen = { x: rx, y: margin + (gAreaH - genSize) / 2, size: genSize };
+    var bw = clamp(rw - genSize - 14, 10, 30);
+    var bars = { x: gen.x + genSize + 8, y: gen.y, w: bw, h: genSize, n: 5, gap: 6 };
+    var arch = { x: margin, y: margin, w: midX - 2 * margin, h: mainH - 2 * margin, cols: 6 };
+    return { w: w, h: h, phone: phone, stripH: stripH, mainH: mainH, midX: midX, margin: margin,
+             arch: arch, gen: gen, bars: bars, chart: chart };
+  }
+
+  // ---------- scene ----------
+  function draw(t) {
+    var w = viewW, h = viewH;
+    canvas.style.width = w + 'px';
+    canvas.style.height = h + 'px';
+    var L = computeLayout(w, h);
+    lastLayout = L;
+    ctx.fillStyle = ROOM;
+    ctx.fillRect(0, 0, w, h);
+
+    var ms = epochStartAt(t), tm = t - ms;
+    var passIdx = Math.floor(tm / 4);
+    var gen = generationFor(passIdx, ms);
+    var selNow = selectedSetAt(t);
+
+    // ----- left: archive wall -----
+    var count = Math.floor(t);
+    var shown = Math.min(count, 72);
+    var startIdx = count - shown;
+    var rows = Math.max(1, Math.ceil(shown / L.arch.cols));
+    var cellW = L.arch.w / L.arch.cols;
+    var cellH = Math.min(cellW, L.arch.h / rows);
+    var gridH = cellH * rows;
+    var gy0 = L.arch.y + (L.arch.h - gridH) / 2;
+    ctx.strokeStyle = BARFILL; ctx.lineWidth = 1;
+    ctx.strokeRect(L.arch.x, gy0, L.arch.w, gridH);
+    var idx, r, c;
+    for (var vi = 0; vi < shown; vi++) {
+      idx = startIdx + vi;
+      r = Math.floor(vi / L.arch.cols); c = vi % L.arch.cols;
+      var cx = L.arch.x + c * cellW, cy = gy0 + r * cellH;
+      var age = count - idx;
+      ctx.globalAlpha = age > 48 ? 0.45 : (age > 24 ? 0.65 : 0.9);
+      var st = scribbleStrokes(idx);
+      for (var s = 0; s < st.length; s++) {
+        var line = st[s];
+        ctx.strokeStyle = SCRIB; ctx.lineWidth = Math.max(1, cellW * 0.022); ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+        ctx.beginPath();
+        ctx.moveTo(cx + line[0][0] * cellW, cy + line[0][1] * cellH);
+        for (var p = 1; p < line.length; p++) ctx.lineTo(cx + line[p][0] * cellW, cy + line[p][1] * cellH);
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+      if (selNow[idx]) { // curated: subtle amber tick at the cell corner
+        ctx.strokeStyle = CKPT; ctx.lineWidth = 1.6;
+        ctx.beginPath();
+        ctx.moveTo(cx + cellW - 7, cy + 3); ctx.lineTo(cx + cellW - 4.5, cy + 6.5); ctx.lineTo(cx + cellW - 1.5, cy + 2);
+        ctx.stroke();
+      }
+    }
+
+    // divider
+    ctx.strokeStyle = EDGE; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(L.midX, 0); ctx.lineTo(L.midX, L.mainH); ctx.stroke();
+
+    // ----- right: generation panel -----
+    ctx.fillStyle = STRIP;
+    ctx.fillRect(L.gen.x, L.gen.y, L.gen.size, L.gen.size);
+    ctx.strokeStyle = EDGE;
+    ctx.strokeRect(L.gen.x, L.gen.y, L.gen.size, L.gen.size);
+    drawStrokes(gen.strokes, L.gen.x, L.gen.y, L.gen.size, gen.color, Math.max(1.2, L.gen.size * 0.006));
+
+    // layer bars: light in sequence across each 4 s forward pass
+    var phase = (tm - passIdx * 4) / 4;
+    var bh = (L.bars.h - (L.bars.n - 1) * L.bars.gap) / L.bars.n;
+    for (var b = 0; b < L.bars.n; b++) {
+      var by = L.bars.y + b * (bh + L.bars.gap);
+      ctx.fillStyle = BARFILL;
+      ctx.fillRect(L.bars.x, by, L.bars.w, bh);
+      var lit = phase >= (b + 1) / L.bars.n, act = phase >= b / L.bars.n && !lit;
+      if (lit || act) {
+        ctx.globalAlpha = lit ? 0.45 : 1;
+        ctx.fillStyle = ACTIVE;
+        ctx.fillRect(L.bars.x, by, L.bars.w, bh);
+        ctx.globalAlpha = 1;
+      }
+      ctx.strokeStyle = EDGE;
+      ctx.strokeRect(L.bars.x, by, L.bars.w, bh);
+    }
+
+    // ----- loss curve (bottom of right half) -----
+    ctx.strokeStyle = EDGE;
+    ctx.strokeRect(L.chart.x, L.chart.y, L.chart.w, L.chart.h);
+    var range = Math.max(40, tm * 1.05);
+    ctx.strokeStyle = LOSS_C; ctx.lineWidth = 1.4; ctx.beginPath();
+    var steps = Math.max(2, Math.floor(L.chart.w / 4));
+    for (var i = 0; i <= steps; i++) {
+      var tmx = (i / steps) * Math.min(tm, range);
+      var lv = lossAt(ms + tmx);
+      var px = L.chart.x + (tmx / range) * L.chart.w;
+      var py = L.chart.y + L.chart.h - lv * (L.chart.h - 4) - 2;
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.stroke();
+
+    // ----- bottom gallery strip: checkpoints -----
+    ctx.fillStyle = STRIP;
+    ctx.fillRect(0, L.mainH, w, L.stripH);
+    ctx.strokeStyle = EDGE;
+    ctx.beginPath(); ctx.moveTo(0, L.mainH); ctx.lineTo(w, L.mainH); ctx.stroke();
+    var ck = checkpointsAt(t);
+    var th = L.stripH - 12;
+    for (var ci = 0; ci < ck.length; ci++) {
+      var tx = L.margin + ci * (th + 8);
+      if (tx + th > w - 4) break;
+      var cg = generationFor(ck[ci].passIdx, ck[ci].epochStart);
+      ctx.fillStyle = ROOM;
+      ctx.fillRect(tx, L.mainH + 6, th, th);
+      drawStrokes(cg.strokes, tx, L.mainH + 6, th, cg.color, 1);
+      ctx.strokeStyle = CKPT; ctx.lineWidth = 1.4;
+      ctx.strokeRect(tx, L.mainH + 6, th, th);
+    }
+
+    // ----- inspect overlay: the current generation, full frame -----
+    if (t < inspectUntil) {
+      ctx.fillStyle = ROOM;
+      ctx.fillRect(0, 0, w, h);
+      var fs = Math.min(w, h) - 2 * L.margin;
+      var fx = (w - fs) / 2, fy = (h - fs) / 2;
+      drawStrokes(gen.strokes, fx, fy, fs, gen.color, Math.max(1.4, fs * 0.006));
+      ctx.strokeStyle = EDGE;
+      ctx.strokeRect(fx, fy, fs, fs);
+    }
+  }
+
+  // ---------- audio (lazy, guarded, gesture-born only) ----------
+  var AC = null, masterGain = null;
+  function ensureAudio() {
+    if (AC) return;
+    try {
+      var Ctor = (typeof AudioContext !== 'undefined') ? AudioContext :
+                 (typeof webkitAudioContext !== 'undefined') ? webkitAudioContext : null;
+      if (!Ctor) return;
+      AC = new Ctor();
+      masterGain = AC.createGain();
+      masterGain.gain.value = 0.5;
+      masterGain.connect(AC.destination);
+    } catch (e) { AC = null; }
+  }
+  function tone(freq, dur, type, gain, freqEnd) {
+    if (!AC || !masterGain) return;
+    try {
+      var o = AC.createOscillator(), g = AC.createGain(), now = AC.currentTime;
+      o.type = type; o.frequency.setValueAtTime(freq, now);
+      if (freqEnd) o.frequency.exponentialRampToValueAtTime(freqEnd, now + dur);
+      g.gain.setValueAtTime(0, now);
+      g.gain.linearRampToValueAtTime(gain, now + 0.012);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+      o.connect(g); g.connect(masterGain);
+      o.start(now); o.stop(now + dur + 0.05);
+    } catch (e) {}
+  }
+  var snd = { scribble: -1, pass: -1, bar: -1, ckpt: -1 };
+  function updateSounds(t) {
+    if (!AC) return;
+    var ms = epochStartAt(t), tm = t - ms;
+    var sc = Math.floor(t);
+    if (snd.scribble < 0) snd.scribble = sc;
+    if (sc > snd.scribble) { tone(1700 + ihash(sc) * 500, 0.04, 'square', 0.03); snd.scribble = sc; }
+    var pi = Math.floor(tm / 4);
+    if (snd.pass < 0) snd.pass = pi;
+    if (pi !== snd.pass) {
+      var L = lossAt(t);
+      tone(300 + (1 - L) * 1400, 0.35, 'sine', 0.08); // chime clears as loss falls
+      snd.pass = pi;
+    }
+    var bi = Math.floor(((tm / 4) % 1) * 5);
+    if (snd.bar < 0) snd.bar = bi;
+    if (bi !== snd.bar) { tone(220 + bi * 70, 0.09, 'triangle', 0.05); snd.bar = bi; }
+    var cc = checkpointsAt(t).length;
+    if (snd.ckpt < 0) snd.ckpt = cc;
+    if (cc > snd.ckpt) { tone(880, 0.12, 'triangle', 0.09, 660); snd.ckpt = cc; }
+  }
+
+  // ---------- time ----------
+  var viewW = 1280, viewH = 900;
+  var startStamp = null;
+  function nowMs() {
+    if (typeof performance !== 'undefined' && performance.now) return performance.now();
+    return null;
+  }
+  function pieceTime() {
+    if (startStamp === null) return T0;
+    var n = nowMs();
+    if (n === null) return T0;
+    return T0 + (n - startStamp) / 1000;
+  }
+  var rafFn = (typeof requestAnimationFrame !== 'undefined') ? requestAnimationFrame : null;
+  function loop() {
+    var t = pieceTime();
+    draw(t);
+    updateSounds(t);
+    if (rafFn) rafFn(loop);
+  }
+
+  // ---------- sizing (Visual Viewport API) ----------
+  function resize() {
+    var w = 0, h = 0;
+    try {
+      if (window.visualViewport) { w = window.visualViewport.width; h = window.visualViewport.height; }
+    } catch (e) {}
+    if (!w || !h) { w = window.innerWidth || canvas.width || 1280; h = window.innerHeight || canvas.height || 900; }
+    viewW = Math.round(w); viewH = Math.round(h);
+    var dpr = 1;
+    try { dpr = Math.min(2, window.devicePixelRatio || 1); } catch (e) {}
+    canvas.width = Math.round(viewW * dpr);
+    canvas.height = Math.round(viewH * dpr);
+    canvas.style.width = viewW + 'px';
+    canvas.style.height = viewH + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  try {
+    if (window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', resize);
+  } catch (e) {}
+  if (window.addEventListener) window.addEventListener('resize', resize);
+
+  // ---------- interaction ----------
+  var pDown = null, dragCells = null, lastTap = { t: -10, x: 0, y: 0 };
+  function evtPos(ev) {
+    var r = { left: 0, top: 0 };
+    try { r = canvas.getBoundingClientRect(); } catch (e) {}
+    var cx = (ev.clientX !== undefined) ? ev.clientX : (ev.touches && ev.touches[0] ? ev.touches[0].clientX : 0);
+    var cy = (ev.clientY !== undefined) ? ev.clientY : (ev.touches && ev.touches[0] ? ev.touches[0].clientY : 0);
+    return { x: cx - r.left, y: cy - r.top };
+  }
+  function archiveIndexAt(x, y, t) {
+    if (!lastLayout) return -1;
+    var L = lastLayout, count = Math.floor(t), shown = Math.min(count, 72), startIdx = count - shown;
+    var rows = Math.max(1, Math.ceil(shown / L.arch.cols));
+    var cellW = L.arch.w / L.arch.cols;
+    var cellH = Math.min(cellW, L.arch.h / rows);
+    var gridH = cellH * rows, gy0 = L.arch.y + (L.arch.h - gridH) / 2;
+    var c = Math.floor((x - L.arch.x) / cellW), r = Math.floor((y - gy0) / cellH);
+    if (c < 0 || c >= L.arch.cols || r < 0 || r >= rows) return -1;
+    var vi = r * L.arch.cols + c;
+    if (vi >= shown) return -1;
+    return startIdx + vi;
+  }
+  function onDown(ev) {
+    ensureAudio();
+    if (AC && AC.state === 'suspended') { try { AC.resume(); } catch (e) {} }
+    var p = evtPos(ev);
+    pDown = { x: p.x, y: p.y, t: pieceTime(), moved: false };
+    dragCells = [];
+  }
+  function onMove(ev) {
+    if (!pDown) return;
+    var p = evtPos(ev), t = pieceTime();
+    if (Math.abs(p.x - pDown.x) + Math.abs(p.y - pDown.y) > 6) pDown.moved = true;
+    if (pDown.moved) {
+      var idx = archiveIndexAt(p.x, p.y, t);
+      if (idx >= 0 && dragCells.indexOf(idx) < 0) {
+        var s = selectedSetAt(t);
+        if (!s[idx]) dragCells.push(idx);
+      }
+    }
+  }
+  function onUp(ev) {
+    if (!pDown) return;
+    var t = pieceTime();
+    var p = evtPos(ev);
+    var wasDrag = pDown.moved;
+    if (wasDrag && dragCells && dragCells.length) {
+      selectEvents.push({ t: t, cells: dragCells.slice() });
+    }
+    if (!wasDrag) {
+      var dt = t - lastTap.t;
+      var dd = Math.abs(p.x - lastTap.x) + Math.abs(p.y - lastTap.y);
+      if (dt < 0.35 && dd < 48) {
+        resets.push(t);          // double-tap: new model, archive kept
+        inspectUntil = -1;
+        lastTap = { t: -10, x: 0, y: 0 };
+      } else {
+        lastTap = { t: t, x: p.x, y: p.y };
+        if (lastLayout) {
+          var g = lastLayout.gen;
+          if (p.x >= g.x && p.x <= g.x + g.size && p.y >= g.y && p.y <= g.y + g.size) inspectUntil = t + 10;
+        }
+      }
+    }
+    pDown = null; dragCells = null;
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+    canvas.addEventListener('mousedown', function (ev) { if (!window.PointerEvent) onDown(ev); });
+    canvas.addEventListener('mousemove', function (ev) { if (!window.PointerEvent) onMove(ev); });
+    canvas.addEventListener('mouseup', function (ev) { if (!window.PointerEvent) onUp(ev); });
+  }
+
+  // ---------- boot: one synchronous fixed-phase frame, then the loop ----------
+  resize();
+  draw(T0);
+  if (rafFn) {
+    startStamp = nowMs();
+    rafFn(loop);
+  }
+})();
+</script>
+</body>
+</html>
