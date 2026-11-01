@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Three Hundred and Ten</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #060708; height: 100%; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+
+/* Three Hundred and Ten
+   A field of identical domed shades on a dark rooftop, breathing one warm
+   light in slow traveling waves. One unit is faulty and honest about it:
+   it dims out of sequence, waits, and re-syncs. Everything on screen is a
+   closed-form function of piece time t (plus recorded pointer events), so
+   frame one is exactly reproducible. */
+
+var T0 = 14;            // frame one: fixed phase, seconds into the piece
+var LOOP = 55;          // seamless loop length, seconds
+var FAULT_PERIOD = 20;  // faulty unit dropout cycle, seconds
+
+var NIGHT  = [6, 7, 8];        // #060708
+var BODY   = [242, 240, 234];  // #F2F0EA
+var GLOW   = [255, 239, 208];  // #FFEFD0
+var CREST  = [255, 255, 255];  // #FFFFFF
+var FAULT  = [26, 27, 30];     // #1A1B1E
+
+function mulberry32(seed) {
+  var a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function mix(a, b, f) {
+  return [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f];
+}
+function shade(col, alpha) {
+  return 'rgba(' + Math.round(col[0]) + ',' + Math.round(col[1]) + ',' + Math.round(col[2]) + ',' + alpha + ')';
+}
+function clamp01(x) { return x < 0 ? 0 : (x > 1 ? 1 : x); }
+function smooth(a, b, x) { var f = clamp01((x - a) / (b - a)); return f * f * (3 - 2 * f); }
+
+/* ---------------- field geometry (seeded) ---------------- */
+
+var seedCounter = 0;
+var modules = [];       // {u, v, rn, depth} normalized coords, radius in min-dim units
+var faultyIdx = -1;
+
+function buildField(seed) {
+  var rng = mulberry32(seed);
+  modules = [];
+  var ROWS = 14;
+  for (var i = 0; i < ROWS; i++) {
+    var f = i / (ROWS - 1);                       // 0 near, 1 far
+    var v = 0.93 + (0.14 - 0.93) * (1 - Math.pow(1 - f, 1.6)); // rows crowd toward the horizon
+    var span = 0.88 + (0.55 - 0.88) * f;          // rows converge toward upper center
+    var count = Math.round(5 + 7 * f);            // 5 near ... 12 far
+    var rn = 0.034 * (1 + (0.26 - 1) * Math.pow(f, 1.1));
+    for (var j = 0; j < count; j++) {
+      var u = 0.5 + (count === 1 ? 0 : (j / (count - 1) - 0.5) * span);
+      modules.push({
+        u: u + (rng() - 0.5) * 0.012,
+        v: v + (rng() - 0.5) * 0.007,
+        rn: rn * (0.92 + rng() * 0.16),
+        depth: f,
+        row: i, col: j
+      });
+    }
+  }
+  // The faulty unit: a mid-field module, findable but not central.
+  var best = -1, bestScore = 1e9;
+  for (var k = 0; k < modules.length; k++) {
+    var m = modules[k];
+    if (m.depth < 0.3 || m.depth > 0.62) continue;
+    var score = Math.abs(m.u - 0.36) + Math.abs(m.depth - 0.45);
+    if (score < bestScore) { bestScore = score; best = k; }
+  }
+  faultyIdx = best;
+}
+buildField(310194);
+
+/* ---------------- wave + fault model (closed form) ---------------- */
+
+function waveBrightness(m, t) {
+  var p1 = Math.sin(2 * Math.PI * (1.3 * m.u + 0.9 * m.depth - 3 * t / LOOP));
+  var p2 = Math.sin(2 * Math.PI * (-0.8 * m.u + 1.4 * m.depth - 2 * t / LOOP + 0.3));
+  var w = 0.62 * p1 + 0.38 * p2;                  // about [-1, 1]
+  var s = 0.5 + 0.5 * w;
+  return 0.13 + 0.82 * Math.pow(s, 1.8);          // deep troughs, bright crests: the band reads
+}
+
+/* Faulty unit dropout: fully dark for t mod 20 in [13.2, 16.8], with a
+   0.6 s ease out and back in. At frame one (t = 14) it is mid-dropout. */
+function faultFactor(t) {
+  var p = ((t % FAULT_PERIOD) + FAULT_PERIOD) % FAULT_PERIOD;
+  var out = smooth(12.6, 13.2, p);
+  var back = 1 - smooth(16.8, 17.4, p);
+  return Math.min(out, back);                     // 1 = fully dropped out
+}
+
+/* ---------------- recorded interaction events ---------------- */
+
+var swells = [];        // {x, y, t0} normalized pointer positions, drag wind
+var snuffs = [];        // {idx, t0} tapped-out modules
+var dragging = false;
+var downAt = 0, downX = 0, downY = 0, lastTapAt = -10, lastTapIdx = -1, moved = false;
+
+function snuffFactor(idx, t) {
+  var f = 0;
+  for (var i = 0; i < snuffs.length; i++) {
+    if (snuffs[i].idx !== idx) continue;
+    var age = t - snuffs[i].t0;
+    if (age < 0 || age > 4.6) continue;
+    var e = Math.min(smooth(0, 0.25, age), 1 - smooth(3.8, 4.6, age));
+    if (e > f) f = e;
+  }
+  return f;
+}
+
+function moduleBrightness(m, idx, t) {
+  var b = waveBrightness(m, t);
+  for (var i = 0; i < swells.length; i++) {
+    var s = swells[i];
+    var age = t - s.t0;
+    if (age < 0 || age > 2.4) continue;
+    var dx = m.u - s.x, dy = (m.v - s.y) * 1.4;
+    var d2 = dx * dx + dy * dy;
+    b += 0.55 * Math.exp(-d2 / 0.012) * Math.exp(-age / 1.1) * smooth(0, 0.12, age);
+  }
+  var dark = 0;
+  if (idx === faultyIdx) dark = Math.max(dark, faultFactor(t));
+  dark = Math.max(dark, snuffFactor(idx, t));
+  return { b: clamp01(b) * (1 - dark), dark: dark };
+}
+
+/* ---------------- audio (lazy, gesture-gated, guarded) ---------------- */
+
+var AC = null, humOsc = null, humGain = null, prevFault = 0;
+function ensureAudio() {
+  if (AC) { if (AC.resume) AC.resume(); return; }
+  var Ctor = (typeof AudioContext !== 'undefined') ? AudioContext
+           : (typeof webkitAudioContext !== 'undefined') ? webkitAudioContext : null;
+  if (!Ctor) return;
+  try {
+    AC = new Ctor();
+    humOsc = AC.createOscillator();
+    humGain = AC.createGain();
+    humOsc.type = 'sine';
+    humOsc.frequency.value = 58;
+    humGain.gain.value = 0.0;
+    humOsc.connect(humGain); humGain.connect(AC.destination);
+    humOsc.start();
+    humGain.gain.linearRampToValueAtTime(0.035, AC.currentTime + 1.5);
+  } catch (e) { AC = null; }
+}
+function blip(freq, dur, vol, when) {
+  if (!AC) return;
+  try {
+    var o = AC.createOscillator(), g = AC.createGain();
+    o.type = 'sine'; o.frequency.value = freq;
+    var t0 = AC.currentTime + (when || 0);
+    g.gain.setValueAtTime(0, t0);
+    g.gain.linearRampToValueAtTime(vol, t0 + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    o.connect(g); g.connect(AC.destination);
+    o.start(t0); o.stop(t0 + dur + 0.05);
+  } catch (e) {}
+}
+
+/* ---------------- canvas + sizing ---------------- */
+
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var W = 0, H = 0, isPhone = false;
+
+function resize() {
+  var vv = (typeof window !== 'undefined' && window.visualViewport) ? window.visualViewport : null;
+  var w = vv ? vv.width : window.innerWidth;
+  var h = vv ? vv.height : window.innerHeight;
+  var dpr = (typeof window !== 'undefined' && window.devicePixelRatio) || 1;
+  canvas.width = Math.round(w * dpr);
+  canvas.height = Math.round(h * dpr);
+  W = w; H = h;
+  var sw = (window.screen && window.screen.width) || w;
+  var sh = (window.screen && window.screen.height) || h;
+  isPhone = Math.min(sw, sh) < 700 || h > w * 1.15;
+}
+if (typeof window !== 'undefined') {
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', resize);
+  }
+  window.addEventListener('resize', resize);
+}
+resize();
+
+/* ---------------- drawing ---------------- */
+
+function drawModule(m, idx, t) {
+  var minDim = Math.min(W, H);
+  var x = m.u * W, y = m.v * H, r = m.rn * minDim;
+  var st = moduleBrightness(m, idx, t);
+  var b = st.b;
+  var dark = st.dark;
+
+  // Diffused omnidirectional glow: layered flat-alpha ellipses, no beams.
+  if (b > 0.02) {
+    var layers = [[2.0, 0.06], [1.55, 0.09], [1.22, 0.14]];
+    for (var i = 0; i < layers.length; i++) {
+      ctx.fillStyle = shade(GLOW, layers[i][1] * b);
+      ctx.beginPath();
+      ctx.ellipse(x, y - r * 0.3, r * layers[i][0], r * layers[i][0] * 0.62, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+  // Glow pooling at the base.
+  ctx.fillStyle = shade(GLOW, 0.10 + 0.30 * b);
+  ctx.beginPath();
+  ctx.ellipse(x, y + r * 0.10, r * 1.15, r * 0.30, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Dome color: body warmed toward the glow, crests reaching pure white.
+  var crestAmt = smooth(0.86, 1.0, b);
+  var base = mix(mix(BODY, GLOW, 0.15 + 0.60 * b), CREST, crestAmt);
+  base = mix(base, FAULT, dark);
+  var top = mix(base, CREST, 0.10 * (1 - dark));
+  var mid = mix(base, NIGHT, 0.10);
+  var low = mix(base, NIGHT, 0.22);
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(x - r, y);
+  ctx.arc(x, y, r, Math.PI, 0);
+  ctx.closePath();
+  ctx.clip();
+  ctx.fillStyle = shade(top, 1); ctx.fillRect(x - r, y - r, 2 * r, r * 0.62);
+  ctx.fillStyle = shade(mid, 1); ctx.fillRect(x - r, y - r * 0.38, 2 * r, r * 0.52);
+  ctx.fillStyle = shade(low, 1); ctx.fillRect(x - r, y - r * 0.14, 2 * r, r * 0.30);
+  // Light from within: a soft flat-alpha core.
+  ctx.fillStyle = shade(GLOW, (0.16 + 0.5 * b) * (1 - dark));
+  ctx.beginPath();
+  ctx.ellipse(x, y - r * 0.30, r * 0.55, r * 0.42, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+
+  // Base line: the shade's product-finished rim.
+  ctx.fillStyle = shade(mix(base, NIGHT, 0.35), 1);
+  ctx.fillRect(x - r, y - Math.max(1, r * 0.05), 2 * r, Math.max(1, r * 0.07));
+}
+
+function draw(t) {
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  var dpr = (typeof window !== 'undefined' && window.devicePixelRatio) || 1;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = shade(NIGHT, 1);
+  ctx.fillRect(0, 0, W, H);
+  // Far rows first so near shades overlap the haze behind them.
+  for (var i = modules.length - 1; i >= 0; i--) drawModule(modules[i], i, t);
+}
+
+/* ---------------- pointer interaction ---------------- */
+
+var currentT = T0;
+function toNorm(e) {
+  var rect = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+  var cx = (e.clientX != null ? e.clientX : (e.touches && e.touches[0] ? e.touches[0].clientX : 0)) - rect.left;
+  var cy = (e.clientY != null ? e.clientY : (e.touches && e.touches[0] ? e.touches[0].clientY : 0)) - rect.top;
+  return { x: W ? cx / W : 0, y: H ? cy / H : 0 };
+}
+function nearestModule(p) {
+  var best = -1, bd = 1e9;
+  for (var i = 0; i < modules.length; i++) {
+    var dx = modules[i].u - p.x, dy = (modules[i].v - p.y) * 1.4;
+    var d = dx * dx + dy * dy;
+    if (d < bd) { bd = d; best = i; }
+  }
+  return best;
+}
+function onDown(e) {
+  ensureAudio();
+  var p = toNorm(e);
+  dragging = true; moved = false;
+  downAt = currentT; downX = p.x; downY = p.y;
+  swells.push({ x: p.x, y: p.y, t0: currentT });
+}
+function onMove(e) {
+  if (!dragging) return;
+  var p = toNorm(e);
+  if (Math.abs(p.x - downX) + Math.abs(p.y - downY) > 0.01) moved = true;
+  swells.push({ x: p.x, y: p.y, t0: currentT });
+  if (swells.length > 240) swells.splice(0, swells.length - 240);
+}
+function onUp(e) {
+  if (!dragging) return;
+  dragging = false;
+  var p = toNorm(e);
+  var quick = currentT - downAt < 0.4 && !moved;
+  if (!quick) return;
+  var idx = nearestModule(p);
+  // Double-tap: two quick taps in succession reseeds the array.
+  if (currentT - lastTapAt < 0.45) {
+    seedCounter++;
+    buildField(310194 + seedCounter * 7919);
+    snuffs = [];
+    lastTapAt = -10; lastTapIdx = -1;
+    blip(392, 0.5, 0.05, 0); blip(587, 0.7, 0.04, 0.08);
+    return;
+  }
+  snuffs.push({ idx: idx, t0: currentT });
+  if (snuffs.length > 24) snuffs.splice(0, snuffs.length - 24);
+  lastTapAt = currentT; lastTapIdx = idx;
+  blip(180, 0.15, 0.05, 0);
+}
+if (canvas.addEventListener) {
+  canvas.addEventListener('pointerdown', onDown);
+  canvas.addEventListener('pointermove', onMove);
+  canvas.addEventListener('pointerup', onUp);
+  canvas.addEventListener('pointercancel', function () { dragging = false; });
+  canvas.addEventListener('touchstart', function () { ensureAudio(); }, { passive: true });
+}
+
+/* ---------------- run ---------------- */
+
+draw(currentT);
+
+var startStamp = null;
+function frame(ts) {
+  if (startStamp === null) startStamp = ts;
+  currentT = T0 + (ts - startStamp) / 1000;
+  if (swells.length && currentT - swells[0].t0 > 3) {
+    swells = swells.filter(function (s) { return currentT - s.t0 <= 3; });
+  }
+  draw(currentT);
+  // Faulty-unit audio cues: tick on drop-out, resolving swell on re-sync.
+  var f = faultFactor(currentT);
+  if (AC) {
+    if (prevFault < 0.5 && f >= 0.5) blip(1250, 0.08, 0.06, 0);
+    if (prevFault >= 0.5 && f < 0.5) { blip(330, 0.6, 0.045, 0); blip(495, 0.8, 0.03, 0.1); }
+    if (humOsc) { try { humOsc.frequency.value = 54 + 10 * (0.5 + 0.5 * Math.sin(2 * Math.PI * 3 * currentT / LOOP)); } catch (e) {} }
+  }
+  prevFault = f;
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+}
+if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+</script>
+</body>
+</html>

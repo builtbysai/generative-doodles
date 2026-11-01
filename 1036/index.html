@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Shelf, Loaded</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0F1013; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+  var T0 = 10; // frame one: fixed phase, pass resting on the third unit
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ---------- seeded rng ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- palette ----------
+  var BENCH = '#0F1013';
+  var UNIT = '#17181C';
+  var FAULTY_BODY = '#0C0D0F';
+  var BEZEL = '#2A2D36';
+  var METAL = '#9AA0AE';
+  var WRAP = '#23262B';
+  var CONE = '#FFE9B8';
+  var LENS_HOT = '#FFFFFF';
+
+  // ---------- inventory (seeded) ----------
+  var DWELL = 4.0;        // seconds the light rests on each good unit
+  var FAULTY_EXTRA = 2.0; // extra seconds the row waits at the faulty unit
+  var seedBase = 1036197;
+  var seedOffset = 0;
+  var inv = null;
+
+  function buildInventory() {
+    var rng = mulberry32(seedBase + seedOffset * 7919);
+    var count = 9 + Math.floor(rng() * 4); // 9..12
+    var faulty = 4 + Math.floor(rng() * (count - 5)); // later in the row, never unit 3
+    var units = [];
+    for (var i = 0; i < count; i++) {
+      var scuffs = [];
+      var ns = Math.floor(rng() * 3);
+      for (var s = 0; s < ns; s++) {
+        scuffs.push({ x: 0.25 + rng() * 0.7, y: (rng() - 0.5) * 0.7, len: 0.04 + rng() * 0.08, a: 0.08 + rng() * 0.1 });
+      }
+      units.push({
+        wrap: rng() < 0.45,
+        faulty: i === faulty,
+        scuffs: scuffs,
+        knurlShift: Math.floor(rng() * 4)
+      });
+    }
+    var cycle = 0;
+    for (var j = 0; j < count; j++) cycle += DWELL + (units[j].faulty ? FAULTY_EXTRA : 0);
+    inv = { units: units, count: count, faulty: faulty, cycle: cycle };
+  }
+  buildInventory();
+
+  // ---------- pass schedule (closed form in piece time) ----------
+  function slotStart(i) {
+    var s = 0;
+    for (var j = 0; j < i; j++) s += DWELL + (inv.units[j].faulty ? FAULTY_EXTRA : 0);
+    return s;
+  }
+  function smooth(x) { x = Math.max(0, Math.min(1, x)); return x * x * (3 - 2 * x); }
+  // brightness of unit i from the row's own pass at time t (faulty unit: always 0)
+  function passBrightness(i, t) {
+    if (inv.units[i].faulty) return 0;
+    var tc = ((t % inv.cycle) + inv.cycle) % inv.cycle;
+    var local = tc - slotStart(i);
+    if (local < 0 || local >= DWELL) return 0;
+    var ramp = 0.7;
+    return Math.min(smooth(local / ramp), smooth((DWELL - local) / ramp));
+  }
+  function passSlot(t) { // index whose slot contains t (may be the faulty slot)
+    var tc = ((t % inv.cycle) + inv.cycle) % inv.cycle;
+    var s = 0;
+    for (var j = 0; j < inv.count; j++) {
+      var d = DWELL + (inv.units[j].faulty ? FAULTY_EXTRA : 0);
+      if (tc < s + d) return j;
+      s += d;
+    }
+    return inv.count - 1;
+  }
+
+  // ---------- interaction state (recorded events only) ----------
+  var pointer = { down: false, x: 0, y: 0 };
+  var hold = { index: -1, until: -1 };
+  var lastTap = { t: -10, x: 0, y: 0 };
+  var downInfo = { t: 0, x: 0, y: 0, moved: false };
+
+  // ---------- audio (lazy, guarded) ----------
+  var AC = null, humOsc = null, humGain = null, audioOn = false;
+  function ensureAudio() {
+    if (audioOn) return;
+    try {
+      var Ctor = (typeof window !== 'undefined' && (window.AudioContext || window.webkitAudioContext)) ||
+                 (typeof AudioContext !== 'undefined' ? AudioContext : null);
+      if (!Ctor) return;
+      AC = new Ctor();
+      humOsc = AC.createOscillator();
+      humOsc.type = 'sine';
+      humOsc.frequency.value = 96;
+      humGain = AC.createGain();
+      humGain.gain.value = 0;
+      humOsc.connect(humGain);
+      humGain.connect(AC.destination);
+      humOsc.start();
+      audioOn = true;
+    } catch (e) { AC = null; audioOn = false; }
+  }
+  function click() {
+    if (!audioOn || !AC) return;
+    try {
+      var o = AC.createOscillator(), g = AC.createGain();
+      o.type = 'square';
+      o.frequency.value = 1900;
+      var now = AC.currentTime;
+      g.gain.setValueAtTime(0.045, now);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + 0.035);
+      o.connect(g); g.connect(AC.destination);
+      o.start(now); o.stop(now + 0.04);
+    } catch (e) {}
+  }
+
+  // ---------- sizing ----------
+  var W = 0, H = 0, isPhone = false;
+  function resize() {
+    var vv = (typeof window !== 'undefined' && window.visualViewport) ? window.visualViewport : null;
+    W = vv ? vv.width : window.innerWidth;
+    H = vv ? vv.height : window.innerHeight;
+    var sw = (window.screen && window.screen.width) || W;
+    var sh = (window.screen && window.screen.height) || H;
+    isPhone = Math.min(sw, sh) < 700;
+    if (!isPhone && H > W * 1.15) isPhone = true;
+    var dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.round(W * dpr);
+    canvas.height = Math.round(H * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', function () { resize(); draw(nowT()); });
+    }
+    window.addEventListener('resize', function () { resize(); draw(nowT()); });
+  }
+
+  // ---------- layout ----------
+  function layout() {
+    var rows = [];
+    if (isPhone) {
+      var half = Math.ceil(inv.count / 2);
+      rows.push({ from: 0, to: half, cy: H * 0.30 });
+      rows.push({ from: half, to: inv.count, cy: H * 0.60 });
+      return { rows: rows, rowW: W * 0.94 };
+    }
+    rows.push({ from: 0, to: inv.count, cy: H * 0.42 });
+    return { rows: rows, rowW: W * 0.84 };
+  }
+  function unitGeom(lay) {
+    // returns array of {cx, cy, L, Hh} per unit index
+    var out = new Array(inv.count);
+    for (var r = 0; r < lay.rows.length; r++) {
+      var row = lay.rows[r];
+      var n = row.to - row.from;
+      var slot = lay.rowW / n;
+      var x0 = (W - lay.rowW) / 2;
+      var Hh = Math.max(30, Math.min(72, slot * 0.40));
+      var L = slot * 0.90;
+      for (var i = row.from; i < row.to; i++) {
+        out[i] = { cx: x0 + slot * (i - row.from + 0.5), cy: row.cy, L: L, Hh: Hh, slot: slot };
+      }
+    }
+    return out;
+  }
+
+  // ---------- drawing helpers ----------
+  function rrect(x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.lineTo(x + w - r, y);
+    ctx.arcTo(x + w, y, x + w, y + r, r);
+    ctx.lineTo(x + w, y + h - r);
+    ctx.arcTo(x + w, y + h, x + w - r, y + h, r);
+    ctx.lineTo(x + r, y + h);
+    ctx.arcTo(x, y + h, x, y + h - r, r);
+    ctx.lineTo(x, y + r);
+    ctx.arcTo(x, y, x + r, y, r);
+    ctx.closePath();
+  }
+  function ellipse(cx, cy, rx, ry) {
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+  }
+  function trap(x1, y1, x2, y2, x3, y3, x4, y4) {
+    ctx.beginPath();
+    ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.lineTo(x3, y3); ctx.lineTo(x4, y4);
+    ctx.closePath();
+  }
+
+  function drawCone(g, b) {
+    if (b <= 0.003) return;
+    var lensX = g.cx - g.L / 2 + g.L * 0.10;
+    var lensY = g.cy;
+    var len = g.Hh * 3.4;
+    var layers = [
+      { s: 1.0, a: 0.10 },
+      { s: 0.68, a: 0.13 },
+      { s: 0.40, a: 0.17 }
+    ];
+    ctx.fillStyle = CONE;
+    for (var k = 0; k < layers.length; k++) {
+      var topHalf = g.Hh * 0.30 * layers[k].s;
+      var botHalf = g.L * 0.46 * layers[k].s;
+      var l = len * (0.75 + 0.25 * layers[k].s);
+      ctx.globalAlpha = layers[k].a * b;
+      trap(lensX - topHalf * 0.4, lensY + g.Hh * 0.18,
+           lensX + topHalf, lensY + g.Hh * 0.18,
+           lensX + botHalf, lensY + l,
+           lensX - botHalf * 0.55, lensY + l);
+      ctx.fill();
+    }
+    // pool where the light lands
+    ctx.globalAlpha = 0.10 * b;
+    ellipse(lensX + g.L * 0.08, lensY + len * 0.98, g.L * 0.44, g.Hh * 0.30);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  function drawWrap(g) {
+    var x = g.cx - g.slot * 0.48, y = g.cy - g.Hh * 0.78;
+    var w = g.slot * 0.96, h = g.Hh * 1.56;
+    ctx.globalAlpha = 0.5;
+    ctx.fillStyle = WRAP;
+    rrect(x, y, w, h, 6);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = METAL;
+    ctx.lineWidth = 1;
+    var r = Math.max(3, g.Hh * 0.10);
+    for (var by = y + r + 3; by < y + h - r; by += r * 2 + 4) {
+      for (var bx = x + r + 3; bx < x + w - r; bx += r * 2 + 4) {
+        ctx.globalAlpha = 0.22;
+        ctx.beginPath();
+        ctx.arc(bx, by, r, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawUnit(g, u, b) {
+    var x0 = g.cx - g.L / 2, x1 = g.cx + g.L / 2;
+    var y0 = g.cy - g.Hh / 2, y1 = g.cy + g.Hh / 2;
+    var bezelW = g.L * 0.22;
+
+    // body
+    ctx.fillStyle = u.faulty ? FAULTY_BODY : UNIT;
+    rrect(x0, y0, g.L, g.Hh, g.Hh * 0.30);
+    ctx.fill();
+    ctx.strokeStyle = BEZEL;
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    // ribs along the body
+    ctx.strokeStyle = BEZEL;
+    ctx.globalAlpha = 0.85;
+    ctx.beginPath();
+    for (var rx = x0 + bezelW + g.L * 0.07; rx < x1 - g.L * 0.08; rx += Math.max(5, g.L * 0.045)) {
+      ctx.moveTo(rx, y0 + g.Hh * 0.14);
+      ctx.lineTo(rx, y1 - g.Hh * 0.14);
+    }
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    // scuffs
+    ctx.strokeStyle = METAL;
+    ctx.lineWidth = 1;
+    for (var s = 0; s < u.scuffs.length; s++) {
+      var sc = u.scuffs[s];
+      ctx.globalAlpha = sc.a;
+      ctx.beginPath();
+      ctx.moveTo(x0 + sc.x * g.L, g.cy + sc.y * g.Hh);
+      ctx.lineTo(x0 + (sc.x + sc.len) * g.L, g.cy + sc.y * g.Hh + 1.5);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+
+    // tail cap
+    ctx.fillStyle = BEZEL;
+    rrect(x1 - g.L * 0.055, y0 + g.Hh * 0.10, g.L * 0.055, g.Hh * 0.80, 3);
+    ctx.fill();
+
+    // bezel band
+    ctx.fillStyle = BEZEL;
+    rrect(x0, y0, bezelW, g.Hh, g.Hh * 0.30);
+    ctx.fill();
+    // knurl ticks on the bezel
+    ctx.strokeStyle = METAL;
+    ctx.lineWidth = 1.4;
+    ctx.globalAlpha = 0.75;
+    ctx.beginPath();
+    var tick = Math.max(4, bezelW / 7);
+    for (var kx = x0 + 3 + u.knurlShift; kx < x0 + bezelW - 2; kx += tick) {
+      ctx.moveTo(kx, y0 + 2);
+      ctx.lineTo(kx + 2, y0 + g.Hh * 0.20);
+      ctx.moveTo(kx, y1 - 2);
+      ctx.lineTo(kx + 2, y1 - g.Hh * 0.20);
+    }
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    // domed lens at the bezel face
+    var lensX = x0 + bezelW * 0.44, lensY = g.cy;
+    var lrx = g.Hh * 0.30, lry = g.Hh * 0.36;
+    if (b > 0.003) {
+      // halo of the lit lens
+      ctx.fillStyle = CONE;
+      ctx.globalAlpha = 0.20 * b;
+      ellipse(lensX, lensY, lrx * 2.1, lry * 2.1);
+      ctx.fill();
+      ctx.globalAlpha = 0.30 * b;
+      ellipse(lensX, lensY, lrx * 1.45, lry * 1.45);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = LENS_HOT;
+      ellipse(lensX, lensY, lrx, lry);
+      ctx.fill();
+    } else {
+      ctx.fillStyle = WRAP;
+      ellipse(lensX, lensY, lrx, lry);
+      ctx.fill();
+      ctx.fillStyle = BEZEL;
+      ellipse(lensX, lensY, lrx * 0.68, lry * 0.68);
+      ctx.fill();
+      ctx.strokeStyle = METAL;
+      ctx.globalAlpha = 0.55;
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      ctx.ellipse(lensX, lensY, lrx * 0.82, lry * 0.82, 0, Math.PI * 1.05, Math.PI * 1.55);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+
+    // screws
+    ctx.fillStyle = METAL;
+    ctx.globalAlpha = 0.8;
+    var sr = Math.max(1.3, g.Hh * 0.045);
+    var screwPts = [
+      [x0 + bezelW + g.L * 0.05, y0 + g.Hh * 0.20],
+      [x1 - g.L * 0.10, y1 - g.Hh * 0.20]
+    ];
+    for (var p = 0; p < screwPts.length; p++) {
+      ctx.beginPath();
+      ctx.arc(screwPts[p][0], screwPts[p][1], sr, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- frame ----------
+  function brightnessAt(i, t, geoms) {
+    var b = passBrightness(i, t);
+    if (hold.index === i && t < hold.until) b = Math.max(b, 0.95);
+    if (pointer.down && geoms) {
+      var g = geoms[i];
+      if (Math.abs(pointer.x - g.cx) < g.slot * 0.55 && Math.abs(pointer.y - g.cy) < g.Hh * 1.1) {
+        b = Math.max(b, 0.9);
+      }
+    }
+    return b;
+  }
+
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.fillStyle = BENCH;
+    ctx.fillRect(0, 0, W, H);
+    var lay = layout();
+    var geoms = unitGeom(lay);
+    var i, b;
+    var bright = new Array(inv.count);
+    var maxB = 0;
+    for (i = 0; i < inv.count; i++) {
+      bright[i] = brightnessAt(i, t, geoms);
+      if (bright[i] > maxB) maxB = bright[i];
+    }
+    for (i = 0; i < inv.count; i++) if (inv.units[i].wrap) drawWrap(geoms[i]);
+    for (i = 0; i < inv.count; i++) drawCone(geoms[i], bright[i]);
+    for (i = 0; i < inv.count; i++) drawUnit(geoms[i], inv.units[i], bright[i]);
+    if (audioOn && humGain && AC) {
+      try { humGain.gain.setTargetAtTime(0.05 * maxB, AC.currentTime, 0.08); } catch (e) {}
+    }
+    return maxB;
+  }
+
+  // ---------- time / loop ----------
+  var startStamp = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+  function nowT() {
+    if (typeof performance !== 'undefined' && performance.now) {
+      return T0 + (performance.now() - startStamp) / 1000;
+    }
+    return T0;
+  }
+  resize();
+  draw(T0);
+
+  var lastSlot = passSlot(T0);
+  if (typeof requestAnimationFrame === 'function') {
+    var loop = function () {
+      var t = nowT();
+      draw(t);
+      var s = passSlot(t);
+      if (s !== lastSlot) {
+        if (!inv.units[s].faulty) click(); // silence during the faulty wait
+        lastSlot = s;
+      }
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+
+  // ---------- pointer ----------
+  function posFromEvent(e) {
+    var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    var cx = (e.clientX !== undefined ? e.clientX : (e.touches && e.touches[0] ? e.touches[0].clientX : 0)) - r.left;
+    var cy = (e.clientY !== undefined ? e.clientY : (e.touches && e.touches[0] ? e.touches[0].clientY : 0)) - r.top;
+    return { x: cx, y: cy };
+  }
+  function hitUnit(x, y) {
+    var geoms = unitGeom(layout());
+    for (var i = 0; i < inv.count; i++) {
+      var g = geoms[i];
+      if (Math.abs(x - g.cx) < g.slot * 0.55 && Math.abs(y - g.cy) < g.Hh * 1.0) return i;
+    }
+    return -1;
+  }
+  function onDown(e) {
+    ensureAudio();
+    if (AC && AC.resume) { try { AC.resume(); } catch (err) {} }
+    var p = posFromEvent(e);
+    pointer.down = true; pointer.x = p.x; pointer.y = p.y;
+    downInfo = { t: nowT(), x: p.x, y: p.y, moved: false };
+    draw(nowT());
+  }
+  function onMove(e) {
+    if (!pointer.down) return;
+    var p = posFromEvent(e);
+    pointer.x = p.x; pointer.y = p.y;
+    if (Math.abs(p.x - downInfo.x) + Math.abs(p.y - downInfo.y) > 14) downInfo.moved = true;
+    draw(nowT());
+  }
+  function onUp(e) {
+    var wasDown = pointer.down;
+    pointer.down = false;
+    if (!wasDown) return;
+    var p = posFromEvent(e);
+    var t = nowT();
+    if (!downInfo.moved && t - downInfo.t < 0.6) {
+      // a tap
+      if (t - lastTap.t < 0.35 && Math.abs(p.x - lastTap.x) + Math.abs(p.y - lastTap.y) < 40) {
+        // double tap: new inventory
+        seedOffset++;
+        buildInventory();
+        hold.index = -1; hold.until = -1;
+        lastTap.t = -10;
+      } else {
+        lastTap = { t: t, x: p.x, y: p.y };
+        var idx = hitUnit(p.x, p.y);
+        if (idx >= 0 && !inv.units[idx].faulty) {
+          if (hold.index === idx && t < hold.until) { hold.index = -1; hold.until = -1; }
+          else { hold.index = idx; hold.until = t + 10; }
+        }
+      }
+    }
+    draw(nowT());
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', function () { pointer.down = false; });
+    canvas.addEventListener('touchstart', onDown, { passive: true });
+    canvas.addEventListener('touchmove', onMove, { passive: true });
+    canvas.addEventListener('touchend', onUp);
+  }
+})();
+</script>
+</body>
+</html>

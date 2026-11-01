@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Room, Moved</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #08090B; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded rng ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- palette (strict: white slabs, cool light, dark room) ----------
+  var GALLERY = '#08090B';
+  var GAP = '#0A0A0C';
+  var WALL = '#EEF0F4';
+  var BLUE = '#5A6FF0';
+  var VIOLET = '#8A5AF0';
+  var DANCER = '#0B0C0E';
+
+  // ---------- constants ----------
+  var BASE_SEED = 1034195;
+  var LOOP = 65;               // the whole room repeats every 65 s
+  var T0 = 18;                 // frame one: fixed phase, seconds into the loop
+  var STAGE = 100;             // stage width in units (mapped to full canvas width)
+  var DANCER_PERIOD = 32.5;    // one crossing; divides the loop (two crossings)
+  var HOLD_DUR = 3;            // tap-a-gap freeze, seconds
+
+  var seed = BASE_SEED;
+  var pieceTime = T0;
+  var booted = false;
+
+  // ---------- the score: canonical ferry routes ----------
+  // row: 0 = front, 1 = back. xA/xB: left-edge endpoints in stage units.
+  // P: route period (always a divisor of LOOP). Tt: one-way travel time.
+  // Dwell Td is derived: Td = (P - 2*Tt) / 2. phi: phase offset in seconds.
+  var SCORE = [
+    { row: 0, w: 13, xA: 2,  xB: 18, P: 16.25, Tt: 6.25, phi: 4.109375, wash: BLUE },
+    { row: 0, w: 14, xA: 38, xB: 54, P: 65 / 3, Tt: 8,   phi: 5.666667, wash: VIOLET },
+    { row: 0, w: 12, xA: 74, xB: 86, P: 13,    Tt: 5,    phi: 4,        wash: BLUE },
+    { row: 1, w: 15, xA: 6,  xB: 22, P: 32.5,  Tt: 13,   phi: 17.75,    wash: VIOLET },
+    { row: 1, w: 13, xA: 56, xB: 72, P: 65,    Tt: 26,   phi: 51.875,   wash: BLUE }
+  ];
+  var DANCER_PHI = 2;          // dancer phase offset in the canonical score
+
+  var walls = [];
+  var holds = [];              // [{t0, dur}] in piece time; walls run on route time
+  var dancerPhi = DANCER_PHI;
+
+  function build(s) {
+    var rng = mulberry32(s);
+    var canonical = (s === BASE_SEED);
+    walls = [];
+    holds = [];
+    for (var i = 0; i < SCORE.length; i++) {
+      var b = SCORE[i];
+      var w = {
+        row: b.row, w: b.w, xA: b.xA, xB: b.xB,
+        P: b.P, Tt: b.Tt, wash: b.wash,
+        epochs: [{ rt0: -1e12, kind: 'route', shift: b.phi }]
+      };
+      if (!canonical) {
+        // new room: jitter the endpoints inside their lanes, re-phase freely
+        var jA = (rng() * 5 - 2.5), jB = (rng() * 5 - 2.5);
+        w.xA = b.xA + jA; w.xB = b.xB + jB;
+        if (w.xB < w.xA + 4) w.xB = w.xA + 4;
+        w.epochs[0].shift = rng() * w.P;
+      }
+      walls.push(w);
+    }
+    dancerPhi = canonical ? DANCER_PHI : rng() * DANCER_PERIOD;
+  }
+
+  // ---------- route math (closed form; no easing anywhere) ----------
+  // A route is a triangle wave with dwells: travel at constant speed,
+  // stop dead, wait, return at the same speed, stop dead, wait.
+  function routePos(w, ph) {
+    var Td = (w.P - 2 * w.Tt) / 2;
+    var u = ((ph % w.P) + w.P) % w.P;
+    var v = (w.xB - w.xA) / w.Tt;
+    if (u < w.Tt) return { x: w.xA + v * u, vel: v };
+    if (u < w.Tt + Td) return { x: w.xB, vel: 0 };
+    if (u < 2 * w.Tt + Td) return { x: w.xB - v * (u - w.Tt - Td), vel: -v };
+    return { x: w.xA, vel: 0 };
+  }
+
+  // Wall state at route time rt. Epochs: a base route (phase shift), plus
+  // command transits: from the commanded position the wall runs at route
+  // speed to the commanded end, then rejoins the route at that end's dwell.
+  function wallState(w, rt) {
+    var ep = w.epochs[0];
+    for (var i = 0; i < w.epochs.length; i++) {
+      if (w.epochs[i].rt0 <= rt) ep = w.epochs[i];
+    }
+    if (ep.kind === 'transit') {
+      if (rt <= ep.rt1) {
+        return { x: ep.x0 + ep.dir * ep.speed * (rt - ep.rt0), vel: ep.dir * ep.speed };
+      }
+      return routePos(w, rt + ep.afterShift);
+    }
+    return routePos(w, rt + ep.shift);
+  }
+
+  function commandWall(w, dir, rt) {
+    var st = wallState(w, rt);
+    var xEnd = dir > 0 ? w.xB : w.xA;
+    var dist = (xEnd - st.x) * dir;
+    if (dist < 0.05) return; // already at the commanded end
+    var speed = Math.abs((w.xB - w.xA) / w.Tt);
+    var rt1 = rt + dist / speed;
+    var Td = (w.P - 2 * w.Tt) / 2;
+    var phaseAtEnd = dir > 0 ? w.Tt : 2 * w.Tt + Td; // dwell start at that end
+    w.epochs.push({
+      rt0: rt, kind: 'transit', x0: st.x, dir: dir, speed: speed,
+      rt1: rt1, afterShift: phaseAtEnd - rt1
+    });
+    commandSound();
+  }
+
+  // Route time: piece time minus the time swallowed by tap-holds.
+  function routeTime(t) {
+    var rt = t;
+    for (var i = 0; i < holds.length; i++) {
+      var hd = holds[i];
+      if (t > hd.t0 + hd.dur) rt -= hd.dur;
+      else if (t > hd.t0) rt -= (t - hd.t0);
+    }
+    return rt;
+  }
+
+  // ---------- the dancer ----------
+  function dancerState(t) {
+    var te = t + dancerPhi;
+    var k = Math.floor(te / DANCER_PERIOD);
+    var local = (te - k * DANCER_PERIOD) / DANCER_PERIOD;
+    var dir = (k % 2 === 0) ? 1 : -1;
+    var x = dir > 0 ? -5 + 110 * local : 105 - 110 * local;
+    return { x: x, dir: dir };
+  }
+
+  // front-row gaps at route time rt: sorted open intervals in stage units
+  function frontGaps(rt) {
+    var spans = [];
+    for (var i = 0; i < walls.length; i++) {
+      if (walls[i].row !== 0) continue;
+      var st = wallState(walls[i], rt);
+      spans.push([st.x, st.x + walls[i].w]);
+    }
+    spans.sort(function (a, b) { return a[0] - b[0]; });
+    var gaps = [], cur = 0;
+    for (var j = 0; j < spans.length; j++) {
+      if (spans[j][0] > cur) gaps.push([cur, spans[j][0]]);
+      if (spans[j][1] > cur) cur = spans[j][1];
+    }
+    if (cur < STAGE) gaps.push([cur, STAGE]);
+    return gaps;
+  }
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 720, H = 720, DPR = 1;
+
+  function isPhone() {
+    var sw = 0, sh = 0;
+    if (typeof window !== 'undefined' && window.screen) {
+      sw = window.screen.width || 0; sh = window.screen.height || 0;
+    }
+    var mn = Math.min(sw, sh);
+    if (mn > 0 && mn < 700) return true;
+    return H > W * 1.15; // aspect fallback only
+  }
+
+  function fit() {
+    var vv = (typeof window !== 'undefined') ? window.visualViewport : null;
+    if (vv && vv.width) { W = vv.width; H = vv.height; }
+    else if (typeof window !== 'undefined' && window.innerWidth) { W = window.innerWidth; H = window.innerHeight; }
+    DPR = (typeof window !== 'undefined' && window.devicePixelRatio) ? Math.min(window.devicePixelRatio, 2) : 1;
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    if (booted) draw();
+  }
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', function () { fit(); });
+    }
+    if (window.addEventListener) {
+      window.addEventListener('resize', function () { fit(); });
+    }
+  }
+
+  // ---------- audio (lazy, guarded; the room is audible) ----------
+  var AC = null, rumbleOsc = null, rumbleGain = null;
+  var lastThunkAt = 0, lastStepAt = 0;
+  function audio() {
+    if (AC) { if (AC.resume) { try { AC.resume(); } catch (e) {} } return AC; }
+    var Ctor = null;
+    if (typeof AudioContext !== 'undefined') Ctor = AudioContext;
+    else if (typeof window !== 'undefined' && window.webkitAudioContext) Ctor = window.webkitAudioContext;
+    if (!Ctor) return null;
+    try {
+      AC = new Ctor();
+      // the rumble bed: a low saw through a lowpass, gain follows wall speed
+      rumbleOsc = AC.createOscillator();
+      rumbleOsc.type = 'sawtooth';
+      rumbleOsc.frequency.value = 46;
+      var lp = AC.createBiquadFilter();
+      lp.type = 'lowpass'; lp.frequency.value = 140;
+      rumbleGain = AC.createGain();
+      rumbleGain.gain.value = 0;
+      rumbleOsc.connect(lp); lp.connect(rumbleGain); rumbleGain.connect(AC.destination);
+      rumbleOsc.start();
+    } catch (e) { AC = null; rumbleOsc = null; rumbleGain = null; }
+    return AC;
+  }
+  function thunkSound() {
+    if (!AC) return;
+    try {
+      var now = AC.currentTime;
+      if (now - lastThunkAt < 0.08) return;
+      lastThunkAt = now;
+      var o = AC.createOscillator(), g = AC.createGain();
+      o.type = 'sine';
+      o.frequency.setValueAtTime(72, now);
+      o.frequency.exponentialRampToValueAtTime(38, now + 0.13);
+      g.gain.setValueAtTime(0.14, now);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + 0.16);
+      o.connect(g); g.connect(AC.destination);
+      o.start(now); o.stop(now + 0.18);
+    } catch (e) {}
+  }
+  function stepSound() {
+    if (!AC) return;
+    try {
+      var now = AC.currentTime;
+      if (now - lastStepAt < 0.09) return;
+      lastStepAt = now;
+      var o = AC.createOscillator(), g = AC.createGain();
+      o.type = 'triangle';
+      o.frequency.value = 185;
+      g.gain.setValueAtTime(0.012, now);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + 0.035);
+      o.connect(g); g.connect(AC.destination);
+      o.start(now); o.stop(now + 0.05);
+    } catch (e) {}
+  }
+  function commandSound() {
+    if (!AC) return;
+    try {
+      var now = AC.currentTime;
+      var o = AC.createOscillator(), g = AC.createGain();
+      o.type = 'square';
+      o.frequency.value = 120;
+      g.gain.setValueAtTime(0.02, now);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + 0.05);
+      o.connect(g); g.connect(AC.destination);
+      o.start(now); o.stop(now + 0.06);
+    } catch (e) {}
+  }
+  var prevVels = null, prevStepIdx = null;
+  function audioFrame(states, dX) {
+    if (!AC || !rumbleGain) return;
+    try {
+      var sum = 0, i;
+      for (i = 0; i < states.length; i++) sum += Math.abs(states[i].vel);
+      var norm = Math.min(1, sum / 9);
+      rumbleGain.gain.setTargetAtTime(0.008 + 0.045 * norm, AC.currentTime, 0.12);
+      if (rumbleOsc) rumbleOsc.frequency.setTargetAtTime(42 + 14 * norm, AC.currentTime, 0.12);
+      // hard stops: a wall's velocity snapping to zero is a thunk
+      if (prevVels) {
+        for (i = 0; i < states.length; i++) {
+          if (prevVels[i] !== 0 && states[i].vel === 0) thunkSound();
+        }
+      }
+      prevVels = [];
+      for (i = 0; i < states.length; i++) prevVels.push(states[i].vel);
+      // the dancer's footfalls, on the step cycle
+      var idx = Math.floor((dX * 0.55 + 1.4) / Math.PI);
+      if (prevStepIdx !== null && idx !== prevStepIdx) stepSound();
+      prevStepIdx = idx;
+    } catch (e) {}
+  }
+
+  // ---------- drawing ----------
+  function drawWallBody(w, st, yT, yB, ux) {
+    var x = st.x * ux, ww = w.w * ux;
+    var rowF = w.row === 0 ? 1 : 0.55;
+    ctx.fillStyle = WALL;
+    ctx.fillRect(x, yT, ww, yB - yT);
+    // the wash, locked to the slab: flat alpha bands in wall-local coords
+    ctx.fillStyle = w.wash;
+    ctx.globalAlpha = 0.50 * rowF;
+    ctx.fillRect(x + ww * 0.06, yT, ww * 0.28, yB - yT);
+    ctx.globalAlpha = 0.30 * rowF;
+    ctx.fillRect(x + ww * 0.34, yT, ww * 0.16, yB - yT);
+    ctx.globalAlpha = 0.16 * rowF;
+    ctx.fillRect(x + ww * 0.50, yT, ww * 0.10, yB - yT);
+    // edge lines so two slabs never merge into one white
+    ctx.globalAlpha = 0.25 * rowF;
+    ctx.fillRect(x, yT, Math.max(1, ww * 0.012), yB - yT);
+    ctx.fillRect(x + ww - Math.max(1, ww * 0.012), yT, Math.max(1, ww * 0.012), yB - yT);
+    ctx.globalAlpha = 1;
+  }
+
+  function drawSpill(w, st, yT, yB, ux) {
+    // the walls' light falling into the gaps beside their faces
+    var x = st.x * ux, ww = w.w * ux;
+    ctx.fillStyle = w.wash;
+    ctx.globalAlpha = 0.10;
+    ctx.fillRect(x - 2.2 * ux, yT, 2.2 * ux, yB - yT);
+    ctx.fillRect(x + ww, yT, 2.2 * ux, yB - yT);
+    ctx.globalAlpha = 0.16;
+    ctx.fillRect(x - 1.1 * ux, yT, 1.1 * ux, yB - yT);
+    ctx.fillRect(x + ww, yT, 1.1 * ux, yB - yT);
+    ctx.globalAlpha = 1;
+  }
+
+  function drawDancer(t) {
+    var d = dancerState(t);
+    if (d.x < -6 || d.x > STAGE + 6) return;
+    var ux = W / STAGE;
+    var cx = d.x * ux;
+    var y0 = H * 0.95;
+    var hd = H * (isPhone() ? 0.085 : 0.075); // small on purpose: a scale figure
+    var ph = d.x * 0.55 + 1.4; // step phase from distance walked (+1.4: frame one lands mid-stride)
+    var s = Math.sin(ph), c = Math.cos(ph);
+    var hipX = cx, hipY = y0 - hd * 0.52;
+    var shX = cx + d.dir * hd * 0.06, shY = y0 - hd * 0.84;
+    ctx.strokeStyle = DANCER;
+    ctx.fillStyle = DANCER;
+    ctx.lineWidth = Math.max(1.6, hd * 0.05);
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    // legs
+    ctx.moveTo(hipX, hipY);
+    ctx.lineTo(cx + s * hd * 0.30, y0 - Math.max(0, c) * hd * 0.07);
+    ctx.moveTo(hipX, hipY);
+    ctx.lineTo(cx - s * hd * 0.30, y0 - Math.max(0, -c) * hd * 0.07);
+    // torso
+    ctx.moveTo(hipX, hipY);
+    ctx.lineTo(shX, shY);
+    // arms, swinging against the legs
+    ctx.moveTo(shX, shY);
+    ctx.lineTo(shX - s * hd * 0.22, y0 - hd * 0.55);
+    ctx.moveTo(shX, shY);
+    ctx.lineTo(shX + s * hd * 0.22, y0 - hd * 0.55);
+    ctx.stroke();
+    // head
+    ctx.beginPath();
+    ctx.arc(cx + d.dir * hd * 0.09, y0 - hd * 0.95, hd * 0.085, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  function currentStates(rt) {
+    var out = [];
+    for (var i = 0; i < walls.length; i++) out.push(wallState(walls[i], rt));
+    return out;
+  }
+
+  function draw() {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = GALLERY;
+    ctx.fillRect(0, 0, W, H);
+    var ux = W / STAGE;
+    var yT = H * 0.04, yB = H * 0.96;
+    // the slot the walls travel in: the gaps live here
+    ctx.fillStyle = GAP;
+    ctx.fillRect(0, yT, W, yB - yT);
+    var rt = routeTime(pieceTime);
+    var states = currentStates(rt);
+    var i;
+    // back row: spill, then bodies
+    for (i = 0; i < walls.length; i++) if (walls[i].row === 1) drawSpill(walls[i], states[i], yT, yB, ux);
+    for (i = 0; i < walls.length; i++) if (walls[i].row === 1) drawWallBody(walls[i], states[i], yT, yB, ux);
+    // front spill falls on the gap floor, under the dancer's feet
+    for (i = 0; i < walls.length; i++) if (walls[i].row === 0) drawSpill(walls[i], states[i], yT, yB, ux);
+    // the dancer: in front of the back row, behind the front row
+    drawDancer(pieceTime);
+    // front row occludes
+    for (i = 0; i < walls.length; i++) if (walls[i].row === 0) drawWallBody(walls[i], states[i], yT, yB, ux);
+    lastStates = states;
+  }
+  var lastStates = null;
+
+  // ---------- pointer interaction ----------
+  var downInfo = null;
+  var lastTapT = -10;
+
+  function ptr(e) {
+    var rect = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+  }
+  function wallAt(px, rt) {
+    var ux = W / STAGE;
+    var u = px / ux;
+    var i, st;
+    // front row first: it is what you see on top
+    for (i = 0; i < walls.length; i++) {
+      if (walls[i].row !== 0) continue;
+      st = wallState(walls[i], rt);
+      if (u >= st.x && u <= st.x + walls[i].w) return walls[i];
+    }
+    for (i = 0; i < walls.length; i++) {
+      if (walls[i].row !== 1) continue;
+      st = wallState(walls[i], rt);
+      if (u >= st.x && u <= st.x + walls[i].w) return walls[i];
+    }
+    return null;
+  }
+  function onDown(e) {
+    audio();
+    var p = ptr(e);
+    var rt = routeTime(pieceTime);
+    downInfo = {
+      x: p.x, y: p.y, t: pieceTime,
+      wall: wallAt(p.x, rt), commanded: false
+    };
+  }
+  function onMove(e) {
+    if (!downInfo || downInfo.commanded || !downInfo.wall) return;
+    var p = ptr(e);
+    var dx = p.x - downInfo.x;
+    if (Math.abs(dx) > 26) {
+      // drag along a wall: command it to ferry the way you dragged
+      commandWall(downInfo.wall, dx > 0 ? 1 : -1, routeTime(pieceTime));
+      downInfo.commanded = true;
+      draw();
+    }
+  }
+  function onUp(e) {
+    if (!downInfo) return;
+    var p = ptr(e);
+    var moved = Math.abs(p.x - downInfo.x) + Math.abs(p.y - downInfo.y);
+    var wasCommand = downInfo.commanded;
+    var downWall = downInfo.wall;
+    var downT = downInfo.t;
+    downInfo = null;
+    if (wasCommand) return;
+    if (moved > 10 || pieceTime - downT > 0.5) return;
+    // a tap
+    if (pieceTime - lastTapT < 0.35) {
+      // double tap: new room
+      seed = (seed * 1664525 + 1013904223) >>> 0;
+      build(seed);
+      prevVels = null; prevStepIdx = null;
+      lastTapT = -10;
+      draw();
+      return;
+    }
+    lastTapT = pieceTime;
+    if (!downWall) {
+      // tap in a gap: the whole room holds still for a breath
+      holds.push({ t0: pieceTime, dur: HOLD_DUR });
+      draw();
+    }
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', function () { downInfo = null; });
+  }
+
+  // ---------- boot: frame one at the fixed phase, then the live loop ----------
+  fit();
+  build(seed);
+  booted = true;
+  draw();
+
+  if (typeof requestAnimationFrame !== 'undefined') {
+    var lastMs = null;
+    var loop = function (ms) {
+      if (lastMs === null) lastMs = ms;
+      var elapsed = (ms - lastMs) / 1000;
+      lastMs = ms;
+      if (elapsed > 0.25) elapsed = 0.25;
+      if (elapsed < 0) elapsed = 0;
+      pieceTime += elapsed;
+      draw();
+      if (lastStates) audioFrame(lastStates, dancerState(pieceTime).x);
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>

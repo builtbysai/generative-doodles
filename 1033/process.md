@@ -1,0 +1,31 @@
+# No.1033 — Three Hundred and Ten
+
+Study #127 toshitaka-mochizuki, PP194 "Shade" (PixOrb / NEBULA, 310 units at SHIBUYA SKY).
+
+## Concept
+
+A dark rooftop at night holds a field of identical lighting modules: small domed shades, product-finished, each glowing from within with the same warm light. The array is one instrument. Slow waves of brightness travel across it, left to right and front to back, so the whole field breathes rather than performs — no strobes, no colors, no patterns, one warm light. One unit is faulty, and honest about it: every twenty seconds it dims out of sequence, sits dark for a breath, and re-syncs with the waves. The subject is the scale: 119 drawn modules standing in for 310, receding in perspective until the count reads as infinity.
+
+## Construction
+
+- **Geometry.** A seeded (mulberry32) perspective grid of 14 rows, 119 modules. Rows run from v = 0.93 (near) to v = 0.14 (far) with spacing compressed toward the horizon via `1 - (1 - f)^1.6`, so rows crowd as they recede. Row span narrows from 0.88 to 0.55 of the width toward an upper-center vanishing zone, and row counts rise from 5 (near) to 12 (far). Small seeded jitter keeps the array from looking machined. Far rows are drawn first.
+- **The shade.** Each module is a true hemisphere: an arc top with a flat base line and a thin rim bar, filled with three flat horizontal bands (no canvas gradients anywhere) so the dome has a product-like vertical falloff, plus a flat-alpha warm core ellipse for the light inside. The glow is omnidirectional: three layered flat-alpha ellipses behind the dome and a soft pool at its base. No beams, no spots.
+- **Wave model.** Brightness is closed-form in piece time t:
+  `b = 0.13 + 0.82 * s^1.8`, where `s = 0.5 + 0.5 * (0.62 * sin(2π(1.3u + 0.9d − 3t/55)) + 0.38 * sin(2π(−0.8u + 1.4d − 2t/55 + 0.3)))`, with `u` the module's horizontal position and `d` its depth. Both wave numbers are integers over the 55 s loop, so the loop is seamless. The first wave runs diagonally (across and into the field), the second counter-runs more shallowly; their sum gives deep troughs (b ≈ 0.13) and brief crests that tint the dome all the way to #FFFFFF via a smoothstep above b = 0.86. Verified numerically at t = 14: brightness spans 0.13 to 0.94, and the crest forms one diagonal line (1.3u + 0.9d ≈ 1.01) crossing mid-field around u ≈ 0.37, depth ≈ 0.58, continuing to the near-right corner.
+- **The faulty unit.** One module is chosen at build time by a fixed rule (depth 0.3–0.62, nearest to u = 0.36, depth 0.45), which lands it mid-field, left of center — in the frame-one renders it is the single dark dome just above vertical middle, about one third in from the left. Its dropout is a closed-form envelope on a 20 s cycle: eases out from 12.6 s, fully dark (#1A1B1E, no glow) from 13.2 s to 16.8 s, back in sync by 17.4 s. Frame one is t = 14 s, so the unit sits mid-dropout, dark and findable.
+- **Interaction.** All state is a closed-form function of t plus recorded pointer events. Dragging pushes a wind: each pointer position is recorded as a swell event that adds a radially-falling, exponentially-decaying brightness bump to nearby shades. A quick tap extinguishes the nearest shade for about 4 s (same honest dark as the faulty unit) before it re-syncs. A double-tap reseeds the field geometry and waves (seed advances by a counter, never a clock). The array's own waves always resume underneath.
+- **Sound.** Lazy, typeof-guarded AudioContext created on the first gesture only: a low sine hum (54–64 Hz) whose pitch follows the primary wave speed, a short high tick when the faulty unit drops out, and a soft two-note resolving swell when it re-syncs. Silent and complete with no audio.
+- **House rules.** Single self-contained canvas-2D file; sizing from the Visual Viewport API with resize listeners on both visualViewport and window; canvas CSS size pinned in px every draw; phone detection via window.screen (min dimension < 700) with the aspect fallback; strict palette (#060708, #F2F0EA, #FFEFD0, #FFFFFF, #1A1B1E); no gradients, shadowBlur, ctx.filter, offscreen canvas, microphone, external assets, or visible text beyond the title. Frame one is the synchronous draw at fixed phase t = 14 s; nothing is derived from Date.now().
+
+## QA log
+
+- Rendered with `render-piece.js` at 1280×900 (qa-desktop.png), 390×844 (qa-mobile.png), 720×720 (thumb.png); silent, no errors.
+- Determinism: thumb.png rendered twice and compared with `cmp` — byte-identical (repeated after the tuning round; duplicate deleted).
+- Read-back, desktop: a near-black field of 119 domed shades receding in perspective, rows separating in front and crowding toward the top; shades read as little hemispheres with rims and halo pools, never dots. One dark faulty dome sits mid-field left of center. The wave crest crosses mid-field as a brighter diagonal pair of rows continuing to the near-right corner (confirmed numerically, b up to 0.94 against troughs of 0.13).
+- Read-back, mobile (390×844): the whole field stays in frame with the vanishing zone upper-center; the faulty dome is still findable; nothing clipped.
+- Tuning round (before final renders): the first pass compressed the near rows on top of each other and clipped the nearest halos at the frame edges; the row-spacing curve was inverted (rows now crowd toward the horizon instead of the floor), the near-row span narrowed to 0.88, the outer glow layer reduced from 2.3r to 2.0r, and the wave contrast deepened (base 0.26→0.13, crest reach 0.88→0.95) so the traveling band reads clearly while staying a breath, not a show.
+
+## Deviations
+
+- 119 modules are drawn rather than 310: at 310 the far rows would collapse into unreadable dots at thumbnail size, breaking the "domes, never dots" rule. The perspective crowding is tuned so the count still reads as unbounded, and the title carries the true number.
+- The faulty unit's dropouts ride a 20 s cycle inside the 55 s master loop, so the full combined pattern repeats every 220 s rather than 55 s; the light waves themselves loop seamlessly at 55 s as specced. This keeps the fault from landing on the same wave phase every loop, which read as choreography instead of honesty.
