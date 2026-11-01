@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Echo Vest</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #050506; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ---------- palette (strict) ----------
+  var ROOM = '#050506';
+  var RING = [179, 136, 255];   // #B388FF
+  var WARM = [255, 242, 214];   // #FFF2D6
+  var BOUND = '#5A4A7A';
+  var PULSE = '#FFFFFF';
+
+  // ---------- model constants ----------
+  var T0 = 31;                  // fixed frame-one phase (seconds)
+  var CYCLE = 25;               // wearer cycle: move, pause, repeat
+  var EMIT = 1.2;               // normal emission interval (s)
+  var EMIT_PAUSE = 0.4;         // tightened interval during a pause (s)
+  var SPEED = 0.047;            // ring expansion speed (world units / s)
+  var MAXR = 1.6;               // radius where a ring has fully faded
+  var LIFE = MAXR / SPEED;      // ring lifetime (s)
+  var BOUND_R = 0.6;            // perception boundary radius (60% of frame radius)
+  var SEG = 5.5;                // waypoint segment duration in path-time (s)
+
+  // ---------- seeded rng ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- waypoints per seed (inner third of the frame) ----------
+  var wpCache = {};
+  function waypoints(seed) {
+    if (wpCache[seed]) return wpCache[seed];
+    var rnd = mulberry32(seed);
+    var pts = [];
+    var n = 7;
+    for (var i = 0; i < n; i++) {
+      var ang = rnd() * Math.PI * 2;
+      var rad = 0.10 + rnd() * 0.17;      // within the inner third
+      pts.push({ x: Math.cos(ang) * rad, y: Math.sin(ang) * rad });
+    }
+    wpCache[seed] = pts;
+    return pts;
+  }
+
+  // ---------- path time: trapezoid speed profile inside each cycle ----------
+  // speed 1 while moving, cosine ramp down at 21-22, held 0 at 22-24,
+  // cosine ramp up at 24-25. One cycle advances path time by exactly 22.
+  function cycleU(phi) {
+    if (phi < 21) return phi;
+    if (phi < 22) { var x = phi - 21; return 21 + 0.5 * x + 0.5 * Math.sin(Math.PI * x) / Math.PI; }
+    if (phi < 24) return 21.5;
+    var y = phi - 24; return 21.5 + 0.5 * y - 0.5 * Math.sin(Math.PI * y) / Math.PI;
+  }
+  function pathTime(t) {
+    var cyc = Math.floor(t / CYCLE);
+    return 22 * cyc + cycleU(t - CYCLE * cyc);
+  }
+  function isPaused(t) {
+    var phi = t - CYCLE * Math.floor(t / CYCLE);
+    return phi >= 22 && phi < 25;
+  }
+  function pauseIntensity(t) {
+    var phi = t - CYCLE * Math.floor(t / CYCLE);
+    if (phi < 22 || phi >= 25) return 0;
+    var s = Math.sin(Math.PI * (phi - 22) / 3);
+    return Math.pow(Math.max(0, s), 1.5);
+  }
+
+  // ---------- interaction events (empty before any input) ----------
+  var BASE_SEED = 1063001;
+  var reseeds = [];        // {t, seed}
+  var dragSegs = [];       // {t0, t1, samples:[{t,x,y}]}
+  var dragExtra = [];      // extra emissions recorded while drag-paused {tk,x,y}
+  var seedCounter = 0;
+
+  function seedFor(t) {
+    var s = BASE_SEED;
+    for (var i = 0; i < reseeds.length; i++) if (reseeds[i].t <= t) s = reseeds[i].seed;
+    return s;
+  }
+
+  // ---------- wearer position (pure function of t and recorded events) ----------
+  function pathPos(t) {
+    var pts = waypoints(seedFor(t));
+    var u = pathTime(t);
+    var idx = Math.floor(u / SEG);
+    var f = (u - idx * SEG) / SEG;
+    var e = f * f * (3 - 2 * f);
+    var a = pts[idx % pts.length];
+    var b = pts[(idx + 1) % pts.length];
+    return { x: a.x + (b.x - a.x) * e, y: a.y + (b.y - a.y) * e };
+  }
+  function wearerPos(t) {
+    for (var i = dragSegs.length - 1; i >= 0; i--) {
+      var sg = dragSegs[i];
+      if (t >= sg.t0 && t <= sg.t1) {
+        var sm = sg.samples;
+        if (!sm.length) return pathPos(t);
+        if (t <= sm[0].t) return { x: sm[0].x, y: sm[0].y };
+        for (var j = 1; j < sm.length; j++) {
+          if (t <= sm[j].t) {
+            var p0 = sm[j - 1], p1 = sm[j];
+            var f = (p1.t - p0.t) > 0 ? (t - p0.t) / (p1.t - p0.t) : 0;
+            return { x: p0.x + (p1.x - p0.x) * f, y: p0.y + (p1.y - p0.y) * f };
+          }
+        }
+        var last = sm[sm.length - 1];
+        return { x: last.x, y: last.y };
+      }
+    }
+    return pathPos(t);
+  }
+
+  // ---------- emission schedule (pure function of t) ----------
+  function emissions(t) {
+    var out = [];
+    var tMin = t - LIFE;
+    var c0 = Math.max(0, Math.floor(tMin / CYCLE) - 1);
+    var c1 = Math.floor(t / CYCLE);
+    for (var c = c0; c <= c1; c++) {
+      var base = CYCLE * c;
+      for (var k = 0; k <= 18; k++) {
+        var tk = base + EMIT * k;
+        if (tk >= tMin && tk <= t) out.push({ tk: tk, pause: false });
+      }
+      for (var j = 0; j <= 7; j++) {
+        var tp = base + 22 + EMIT_PAUSE * j;
+        if (tp >= tMin && tp <= t) out.push({ tk: tp, pause: true });
+      }
+    }
+    for (var i = 0; i < dragExtra.length; i++) {
+      var de = dragExtra[i];
+      if (de.tk >= tMin && de.tk <= t) out.push({ tk: de.tk, pause: true, x: de.x, y: de.y });
+    }
+    out.sort(function (a, b) { return b.tk - a.tk; }); // oldest (largest radius) first
+    return out;
+  }
+
+  function mix(a, b, f) {
+    return 'rgb(' + Math.round(a[0] + (b[0] - a[0]) * f) + ',' +
+                    Math.round(a[1] + (b[1] - a[1]) * f) + ',' +
+                    Math.round(a[2] + (b[2] - a[2]) * f) + ')';
+  }
+
+  // ---------- sizing (Visual Viewport API) ----------
+  var W = 720, H = 720;
+  function resize() {
+    var vv = (typeof window !== 'undefined' && window.visualViewport) ? window.visualViewport : null;
+    W = vv ? vv.width : (window.innerWidth || 720);
+    H = vv ? vv.height : (window.innerHeight || 720);
+    canvas.width = W;
+    canvas.height = H;
+  }
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', resize);
+  }
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('resize', resize);
+  }
+  resize();
+
+  function isPhone() {
+    var sm = 9999;
+    if (typeof window !== 'undefined' && window.screen) {
+      sm = Math.min(window.screen.width || 9999, window.screen.height || 9999);
+    }
+    return sm < 700 || H > W * 1.15;
+  }
+
+  // ---------- draw: pure function of piece time t ----------
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    var unit = Math.min(W, H) / 2;            // world unit = half the short side
+    var cx = W / 2, cy = H / 2;
+    var lw = Math.max(1.4, Math.min(3, 2.3 * (Math.min(W, H) / 720)));
+    if (isPhone()) lw = Math.max(lw, 1.8);
+
+    ctx.fillStyle = ROOM;
+    ctx.fillRect(0, 0, W, H);
+
+    // perception boundary: one faint fixed circle
+    ctx.beginPath();
+    ctx.arc(cx, cy, BOUND_R * unit, 0, Math.PI * 2);
+    ctx.strokeStyle = BOUND;
+    ctx.globalAlpha = 0.35;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    // rings, oldest first so the newest sit on top
+    var list = emissions(t);
+    for (var i = 0; i < list.length; i++) {
+      var em = list[i];
+      var r = SPEED * (t - em.tk);
+      if (r <= 0.004 || r > MAXR) continue;
+      var c = (typeof em.x === 'number') ? { x: em.x, y: em.y } : wearerPos(em.tk);
+      var fade = Math.pow(1 - r / MAXR, 1.15);
+      var a = 0.38 * fade * (em.pause ? 1.3 : 1);
+      var g = Math.exp(-Math.pow((r - BOUND_R) / 0.035, 2));   // sensing brightening
+      a *= (1 + 2.0 * g);
+      if (a > 0.85) a = 0.85;
+      if (a < 0.004) continue;
+      var warmF = Math.max(0, 1 - r / 0.4);                    // warm near the wearer
+      ctx.beginPath();
+      ctx.arc(cx + c.x * unit, cy + c.y * unit, r * unit, 0, Math.PI * 2);
+      ctx.strokeStyle = mix(RING, WARM, warmF);
+      ctx.globalAlpha = a;
+      ctx.lineWidth = lw * (1 + 0.35 * g);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+
+    // pulse point: the pause convergence, worn at the wearer
+    var pi = pauseIntensity(t);
+    var dragging = dragSegs.length && dragSegs[dragSegs.length - 1].t1 === Infinity;
+    var dragPauseI = 0, dragPausePos = null;
+    if (dragging && dragState.lastMoveT > 0) {
+      var still = t - dragState.lastMoveT;
+      if (still > 1.2) {
+        dragPauseI = Math.min(1, (still - 1.2) / 1.0);
+        dragPausePos = { x: dragState.x, y: dragState.y };
+      }
+    }
+    var inten = Math.max(pi, dragPauseI);
+    if (inten > 0.01) {
+      var pp = dragPauseI >= pi ? dragPausePos : wearerPos(t);
+      var px = cx + pp.x * unit, py = cy + pp.y * unit;
+      var layers = [[0.055, 0.10], [0.036, 0.18], [0.020, 0.32]];
+      for (var L = 0; L < layers.length; L++) {
+        ctx.beginPath();
+        ctx.arc(px, py, layers[L][0] * unit * (0.7 + 0.3 * inten), 0, Math.PI * 2);
+        ctx.fillStyle = PULSE;
+        ctx.globalAlpha = layers[L][1] * inten;
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  // ---------- interaction ----------
+  var dragState = { x: 0, y: 0, lastMoveT: -10, lastExtraT: 0 };
+  var startStamp = null;
+  var lastTapT = -10, lastTapClock = 0;
+
+  function pieceNow(nowMs) {
+    if (startStamp === null) startStamp = nowMs;
+    return T0 + (nowMs - startStamp) / 1000;
+  }
+  function toWorld(e) {
+    var unit = Math.min(W, H) / 2;
+    return { x: (e.clientX - W / 2) / unit, y: (e.clientY - H / 2) / unit };
+  }
+
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', function (e) {
+      var now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+      var t = pieceNow(now);
+      var p = toWorld(e);
+      // double-tap: reseed the drift path
+      if (now - lastTapClock < 320) {
+        seedCounter++;
+        reseeds.push({ t: t, seed: BASE_SEED + seedCounter * 7919 });
+        lastTapClock = 0;
+        return;
+      }
+      lastTapClock = now;
+      dragState.x = p.x; dragState.y = p.y;
+      dragState.lastMoveT = t; dragState.lastExtraT = t;
+      dragSegs.push({ t0: t, t1: Infinity, samples: [{ t: t, x: p.x, y: p.y }] });
+    });
+    canvas.addEventListener('pointermove', function (e) {
+      if (!dragSegs.length || dragSegs[dragSegs.length - 1].t1 !== Infinity) return;
+      var now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+      var t = pieceNow(now);
+      var p = toWorld(e);
+      if (Math.abs(p.x - dragState.x) > 0.002 || Math.abs(p.y - dragState.y) > 0.002) {
+        dragState.lastMoveT = t;
+      }
+      dragState.x = p.x; dragState.y = p.y;
+      dragSegs[dragSegs.length - 1].samples.push({ t: t, x: p.x, y: p.y });
+    });
+    function endDrag() {
+      if (dragSegs.length && dragSegs[dragSegs.length - 1].t1 === Infinity) {
+        var now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+        dragSegs[dragSegs.length - 1].t1 = pieceNow(now);
+      }
+    }
+    canvas.addEventListener('pointerup', endDrag);
+    canvas.addEventListener('pointercancel', endDrag);
+  }
+
+  // ---------- frame one + loop ----------
+  draw(T0);
+  if (typeof requestAnimationFrame === 'function') {
+    var raf = function (nowMs) {
+      var t = pieceNow(nowMs);
+      // while drag-paused, extra rings tighten out of the finger
+      if (dragSegs.length && dragSegs[dragSegs.length - 1].t1 === Infinity &&
+          t - dragState.lastMoveT > 1.2 && t - dragState.lastExtraT >= EMIT_PAUSE) {
+        dragState.lastExtraT = t;
+        dragExtra.push({ tk: t, x: dragState.x, y: dragState.y });
+      }
+      draw(t);
+      requestAnimationFrame(raf);
+    };
+    requestAnimationFrame(raf);
+  }
+})();
+</script>
+</body>
+</html>
