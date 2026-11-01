@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<!-- piece-9125-downtown-first -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Downtown First</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#04060d; overflow:hidden; }
+  canvas { display:block; width:100vw; height:100vh; touch-action:none; cursor:crosshair; }
+  #hint {
+    position:fixed; left:0; right:0; bottom:14px; text-align:center;
+    font:12px/1.4 -apple-system, "Segoe UI", sans-serif; letter-spacing:.12em;
+    color:rgba(255,255,255,.38); pointer-events:none; user-select:none;
+    transition:opacity 2.5s ease; text-transform:lowercase;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hint">drag to stir the windows, tap for a new night</div>
+<script>
+/* Piece 9125 driver core: pure functions, no DOM.
+   Shared verbatim between the node harness and the shipped index.html. */
+'use strict';
+
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// Build the city: buildings with window grids. w,h = viewport px, seed = int.
+function buildCity(w, h, seed) {
+  const rnd = mulberry32(seed);
+  const horizonY = Math.round(h * 0.94);
+  const maxBuildingH = Math.round(h * 0.78);
+  const buildings = [];
+  let x = -10;
+
+  // downtown core: random building anchor (normalized coords)
+  const coreNx = 0.25 + rnd() * 0.5;
+  const coreNy = 0.55 + rnd() * 0.30;
+
+  // rows: back layer (hazy), front layer (sharp)
+  const layers = [
+    { count: 0, shade: 0.55, blur: true },
+    { count: 1, shade: 1.0, blur: false },
+  ];
+
+  const all = [];
+  for (const layer of layers) {
+    x = -10 + (layer.count === 1 ? 14 : 0);
+    let bi = 0;
+    while (x < w + 10) {
+      const bw = 40 + rnd() * (w < 500 ? 34 : 70);       // building width
+      const bh = 90 + rnd() * rnd() * maxBuildingH;      // tall ones are rarer
+      const bx = x;
+      const by = horizonY - bh;
+      const gap = 4 + rnd() * 14;
+      const cx = bx + bw / 2, cy = by + bh / 2;
+
+      // distance from downtown core -> drives wake time
+      const nx = cx / w, ny = cy / h;
+      const dist = Math.hypot(nx - coreNx, ny - coreNy);
+
+      // window grid
+      const winW = 7, winH = 10, gx = 6, gy = 9;
+      const mx = 7, my = 10; // margins
+      const cols = Math.max(2, Math.floor((bw - mx * 2) / (winW + gx)));
+      const rows = Math.max(3, Math.floor((bh - my * 2) / (winH + gy)));
+      const winOX = bx + (bw - (cols * winW + (cols - 1) * gx)) / 2;
+      const winOY = by + my;
+
+      const windows = [];
+      const R = Math.hypot(1, 1);
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+          const wx = winOX + c * (winW + gx);
+          const wy = winOY + r * (winH + gy);
+          const wnx = (wx + winW / 2) / w, wny = (wy + winH / 2) / h;
+          const wdist = Math.hypot(wnx - coreNx, wny - coreNy) / R; // 0..~1
+          // dusk wavefront: radial from core. Full wakeover in ~75s.
+          const wakeTime = 4 + wdist * 62 + rnd() * 14;             // seconds
+          const never = rnd() < 0.06;   // some windows stay dark
+          const earlyOut = !never && rnd() < 0.05; // lit early, then goes dark late
+          const temp = 0.55 + rnd() * 0.45;        // color temperature 0..1
+          windows.push({
+            x: wx, y: wy, w: winW, h: winH,
+            wakeTime, never, earlyOut, temp,
+            disturbUntil: -1,      // drag disturbance timestamp
+            seedJ: rnd(),          // per-window jitter for flicker pattern
+          });
+        }
+      }
+
+      all.push({
+        x: bx, y: by, w: bw, h: bh, shade: layer.shade,
+        hazy: layer.blur, cx, cy, dist, windows,
+        beacon: bh > maxBuildingH * 0.82 && rnd() < 0.7,
+      });
+      x += bw + gap;
+      bi++;
+    }
+    layers[layer.count].count = bi;
+  }
+
+  const flat = [];
+  for (const b of all) for (const win of b.windows) flat.push({ b, win });
+  return { w, h, horizonY, buildings: all, flat, seed, coreNx, coreNy, t0: 0 };
+}
+
+const FLICKER_LEAD = 2.5;   // seconds of stutter before wakeTime
+const OUT_TIME = 95;        // earlyOut windows go dark after this
+
+// Window visual state at time t (seconds). Pure.
+function windowState(city, win, t) {
+  if (win.disturbUntil > t) return 'disturb';
+  if (win.never) return 'dark';
+  const wt = win.wakeTime;
+  if (t < wt - FLICKER_LEAD) return 'dark';
+  if (t < wt) return 'flicker';
+  if (win.earlyOut && t > OUT_TIME) {
+    if (t < OUT_TIME + FLICKER_LEAD) return 'flicker-out';
+    return 'dark';
+  }
+  return 'lit';
+}
+
+function litFraction(city, t) {
+  let lit = 0;
+  for (const { win } of city.flat) {
+    const s = windowState(city, win, t);
+    if (s === 'lit') lit++;
+  }
+  return lit / city.flat.length;
+}
+
+function flickerCount(city, t) {
+  let n = 0;
+  for (const { win } of city.flat) {
+    const s = windowState(city, win, t);
+    if (s === 'flicker' || s === 'flicker-out' || s === 'disturb') n++;
+  }
+  return n;
+}
+
+// Spatial wave check: near-core lit frac vs far lit frac.
+function spatialGap(city, t) {
+  let nearLit = 0, near = 0, farLit = 0, far = 0;
+  for (const { b, win } of city.flat) {
+    const nx = (win.x + win.w / 2) / city.w;
+    const ny = (win.y + win.h / 2) / city.h;
+    const d = Math.hypot(nx - city.coreNx, ny - city.coreNy);
+    if (d < 0.35) { near++; if (windowState(city, win, t) === 'lit') nearLit++; }
+    else if (d > 0.65) { far++; if (windowState(city, win, t) === 'lit') farLit++; }
+  }
+  if (!near || !far) return -1;
+  return nearLit / near - farLit / far;
+}
+
+// Disturb windows within radius r of each point in path (px). Returns # affected.
+function disturb(city, path, r, t) {
+  let n = 0;
+  for (const { win } of city.flat) {
+    const cx = win.x + win.w / 2, cy = win.y + win.h / 2;
+    for (const p of path) {
+      if (Math.hypot(cx - p.x, cy - p.y) < r) {
+        const before = windowState(city, win, t);
+        win.disturbUntil = t + 1.2 + win.seedJ * 1.8; // stutter 1.2..3s
+        const after = windowState(city, win, t);
+        if (after !== before) n++;
+        break;
+      }
+    }
+  }
+  return n;
+}
+
+// Divergence between two seeds: fraction of windows with different wakeTime.
+function seedDivergence(cityA, cityB) {
+  const n = Math.min(cityA.flat.length, cityB.flat.length);
+  let diff = 0;
+  for (let i = 0; i < n; i++) {
+    if (Math.abs(cityA.flat[i].win.wakeTime - cityB.flat[i].win.wakeTime) > 0.001) diff++;
+  }
+  return diff / n;
+}
+
+if (typeof module !== 'undefined') {
+  module.exports = {
+    mulberry32, buildCity, windowState, litFraction, flickerCount,
+    spatialGap, disturb, seedDivergence, FLICKER_LEAD, OUT_TIME,
+  };
+}
+
+</script>
+<script>
+(function () {
+  'use strict';
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  const hint = document.getElementById('hint');
+  setTimeout(() => { hint.style.opacity = '0'; }, 9000);
+
+  let W = 0, H = 0, DPR = 1;
+  let seed = (Math.random() * 1e9) | 0;
+  let city = null, stars = null;
+  let t0 = performance.now();
+
+  function now() { return (performance.now() - t0) / 1000; }
+
+  function build() {
+    city = buildCity(W, H, seed);
+    stars = makeStars(W, H, seed ^ 0x9e3779b9);
+  }
+
+  function makeStars(w, h, s) {
+    const rnd = mulberry32(s);
+    const arr = [];
+    const n = Math.round(w * h / 9000);
+    for (let i = 0; i < n; i++) {
+      arr.push({ x: rnd() * w, y: rnd() * h * 0.62, r: 0.4 + rnd() * 1.1,
+                 tw: 1.5 + rnd() * 3, ph: rnd() * 6.28, base: 0.25 + rnd() * 0.6 });
+    }
+    return arr;
+  }
+
+  function resize() {
+    DPR = Math.min(2, window.devicePixelRatio || 1);
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = Math.round(W * DPR); canvas.height = Math.round(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    build();
+  }
+  let rzT = null;
+  window.addEventListener('resize', () => { clearTimeout(rzT); rzT = setTimeout(resize, 200); });
+  resize();
+
+  // color helpers
+  function mix(a, b, k) {
+    return [a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k, a[2] + (b[2] - a[2]) * k];
+  }
+  function css(c, al) {
+    return 'rgba(' + (c[0]|0) + ',' + (c[1]|0) + ',' + (c[2]|0) + ',' + al + ')';
+  }
+
+  function draw(t) {
+    const dusk = Math.min(1, t / 70);          // 0 = early dusk, 1 = deep night
+    // sky
+    const topDay = [46, 38, 88], topNight = [4, 6, 13];
+    const horDay = [201, 106, 58], horNight = [30, 40, 72];
+    const top = mix(topDay, topNight, dusk), hor = mix(horDay, horNight, dusk);
+    const g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, css(top, 1));
+    g.addColorStop(0.72, css(mix(top, hor, 0.45), 1));
+    g.addColorStop(0.94, css(hor, 1));
+    g.addColorStop(1, css([3, 4, 10], 1));
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+
+    // warm city glow behind downtown core, fades as night deepens
+    const gx = city.coreNx * W, gy = (city.coreNy + 0.18) * H;
+    const gr = Math.max(W, H) * 0.55;
+    const glow = ctx.createRadialGradient(gx, gy, 0, gx, gy, gr);
+    glow.addColorStop(0, 'rgba(255,150,70,' + (0.30 * (1 - dusk * 0.75)) + ')');
+    glow.addColorStop(1, 'rgba(255,150,70,0)');
+    ctx.fillStyle = glow;
+    ctx.fillRect(0, 0, W, H);
+
+    // stars
+    for (const s of stars) {
+      const a = dusk * s.base * (0.55 + 0.45 * Math.sin(t * s.tw + s.ph));
+      if (a <= 0.01) continue;
+      ctx.fillStyle = 'rgba(235,240,255,' + a.toFixed(3) + ')';
+      ctx.fillRect(s.x, s.y, s.r, s.r);
+    }
+
+    // buildings, back layer first
+    const layers = [true, false]; // hazy first
+    for (const hazy of layers) {
+      for (const b of city.buildings) {
+        if (b.hazy !== hazy) continue;
+        ctx.fillStyle = hazy ? '#121730' : '#05070f';
+        ctx.fillRect(b.x, b.y, b.w, b.h);
+        // roof lip
+        ctx.fillStyle = hazy ? '#1b2140' : '#0a0d1c';
+        ctx.fillRect(b.x, b.y - 2, b.w, 2);
+        // antenna on tall front buildings
+        if (!hazy && b.h > H * 0.55) {
+          ctx.fillStyle = '#05070f';
+          ctx.fillRect(b.cx - 1, b.y - 22, 2, 22);
+        }
+      }
+      // windows for this layer
+      for (const b of city.buildings) {
+        if (b.hazy !== hazy) continue;
+        for (const win of b.windows) {
+          const st = windowState(city, win, t);
+          if (st === 'dark') {
+            ctx.fillStyle = hazy ? 'rgba(60,72,110,0.20)' : 'rgba(58,74,120,0.30)';
+            ctx.fillRect(win.x, win.y, win.w, win.h);
+          } else if (st === 'lit') {
+            ctx.fillStyle = litColor(win, 1, hazy);
+            ctx.fillRect(win.x, win.y, win.w, win.h);
+          } else {
+            // flicker / flicker-out / disturb : stutter
+            const remain = st === 'flicker' ? Math.max(0.05, (win.wakeTime - t) / FLICKER_LEAD)
+              : st === 'disturb' ? Math.max(0.05, (win.disturbUntil - t) / 3)
+              : 0.5; // flicker-out: half-faded stutter
+            const on = Math.sin(t * 43 + win.seedJ * 6.2831) > -0.15 + remain * 0.9;
+            const a = (on ? 1 : 0.12) * (st === 'flicker-out' ? (1 - remain * 0.4) : 1);
+            ctx.fillStyle = litColor(win, a, hazy);
+            ctx.fillRect(win.x, win.y, win.w, win.h);
+          }
+        }
+      }
+    }
+
+    // aircraft beacons on tallest towers
+    for (const b of city.buildings) {
+      if (!b.beacon) continue;
+      const blink = Math.sin(t * 2.6 + b.cx) > 0.55;
+      ctx.fillStyle = blink ? 'rgba(255,60,60,0.95)' : 'rgba(255,60,60,0.08)';
+      ctx.beginPath();
+      ctx.arc(b.cx, b.y - 24, 2.4, 0, 6.2832);
+      ctx.fill();
+    }
+
+    // street: dark strip at the base
+    ctx.fillStyle = '#02030a';
+    ctx.fillRect(0, city.horizonY, W, H - city.horizonY);
+    // a few passing headlights early in the dusk
+    if (t < 55) {
+      const rnd = mulberry32(seed ^ 0x51ab);
+      for (let i = 0; i < 7; i++) {
+        const laneY = city.horizonY + 6 + rnd() * (H - city.horizonY - 10);
+        const speed = (60 + rnd() * 140) * (i % 2 ? 1 : -1);
+        const x = ((rnd() * W + t * speed) % (W + 120) + W + 120) % (W + 120) - 60;
+        const fade = 1 - t / 55;
+        ctx.fillStyle = 'rgba(255,220,150,' + (0.5 * fade).toFixed(3) + ')';
+        ctx.fillRect(x, laneY, 14, 2);
+      }
+    }
+  }
+
+  function litColor(win, alpha, hazy) {
+    // warm amber, per-window temperature
+    const light = 52 + win.temp * 16;
+    const a = (hazy ? 0.55 : 1) * alpha;
+    return 'hsla(36, 95%, ' + light.toFixed(1) + '%, ' + a.toFixed(3) + ')';
+  }
+
+  // interaction: drag stirs, tap reseeds
+  let dragging = false, moved = 0, lastP = null;
+  const trail = [];
+  canvas.addEventListener('pointerdown', (e) => {
+    dragging = true; moved = 0; lastP = { x: e.clientX, y: e.clientY };
+    trail.length = 0;
+    canvas.setPointerCapture(e.pointerId);
+  });
+  canvas.addEventListener('pointermove', (e) => {
+    if (!dragging) return;
+    const p = { x: e.clientX, y: e.clientY };
+    moved += Math.hypot(p.x - lastP.x, p.y - lastP.y);
+    if (Math.hypot(p.x - lastP.x, p.y - lastP.y) > 6) {
+      trail.push(p); lastP = p;
+      if (trail.length > 40) trail.shift();
+      disturb(city, trail.slice(-12), 70, now());
+    }
+  });
+  canvas.addEventListener('pointerup', () => {
+    if (dragging && moved < 10) {
+      seed = (Math.random() * 1e9) | 0;   // tap: a new night
+      t0 = performance.now();
+      build();
+    }
+    dragging = false;
+  });
+  canvas.addEventListener('pointercancel', () => { dragging = false; });
+  window.addEventListener('contextmenu', (e) => e.preventDefault());
+
+  function frame() {
+    draw(now());
+    requestAnimationFrame(frame);
+  }
+  frame();
+})();
+</script>
+</body>
+</html>
