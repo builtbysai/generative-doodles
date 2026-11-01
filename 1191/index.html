@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Useful Radio (Duo)</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0D0D10; overflow: hidden; height: 100%; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- deterministic hashes (seeded only; no Math.random) ----------
+  function h2(a, b) {
+    var x = ((a * 374761393 + b * 668265263) ^ 0x5bf03635) >>> 0;
+    x = Math.imul(x ^ (x >>> 13), 1274126177) >>> 0;
+    return ((x ^ (x >>> 16)) >>> 0) / 4294967296;
+  }
+  function mulberry32(seed) {
+    var s = seed >>> 0;
+    return function () {
+      s = (s + 0x6D2B79F5) >>> 0;
+      var t = s;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- constants ----------
+  var T0 = 10.5;                 // fixed first-frame phase (seconds of piece time)
+  var LOOP = 50;                 // scripted score loop length
+  var BASE_STARTS = [2, 8, 14, 26, 34, 40];
+  var JITTER_SALT = 178;         // tuned so loop 0 reads correctly at T0
+  var K_DUR = 2.2, F_DUR = 2.6, GAP = 0.4;
+  var MARK_LIFE = 7;             // marks persist, fading, ~7 s
+  var RING_LIFE = 2.8;           // tower pulse ring expansion time
+
+  var COL = {
+    bg: '#0D0D10', divider: '#2A2A30',
+    k: '#00E5FF', kDot: '#FFFFFF',
+    f: '#FF2BD6', fDot: '#FFD6F5',
+    ghost: '#8A8A93', tower: '#FF6A00', gray: '#8A8A93'
+  };
+
+  // exchange start (absolute piece time) for loop L, exchange e
+  function exStart(L, e) {
+    var jit = (h2(JITTER_SALT + L * 57, e * 31 + 7) - 0.5) * 4; // +/-2 s
+    return L * LOOP + BASE_STARTS[e] + jit;
+  }
+  // shared rhythm sizes for an exchange: K note lengths mirror F droplet sizes
+  function rhythm(L, e, j) { return 0.35 + 0.65 * h2(L * 131 + 900, e * 57 + j * 11 + 3); }
+
+  // ghost static events: loop times ~20.5 (tail of the long silence) and ~45
+  function ghostStart(L, k) {
+    var base = k === 0 ? 20.5 : 45;
+    return L * LOOP + base + (h2(L * 77 + 5, 440 + k) - 0.5) * 1.5;
+  }
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('cv');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0, DPR = 1;
+
+  var isPhone = false;
+  if (typeof window !== 'undefined' && window.screen) {
+    isPhone = Math.min(window.screen.width || 9999, window.screen.height || 9999) < 700;
+  }
+  function fit() {
+    var vv = (typeof window !== 'undefined') ? window.visualViewport : null;
+    var w = vv ? vv.width : (window.innerWidth || 1280);
+    var h = vv ? vv.height : (window.innerHeight || 800);
+    if (!isPhone && h > w * 1.15) isPhone = true; // aspect fallback
+    DPR = Math.min((typeof window !== 'undefined' && window.devicePixelRatio) || 1, 2);
+    W = w; H = h;
+    canvas.width = Math.round(w * DPR);
+    canvas.height = Math.round(h * DPR);
+    canvas.style.width = w + 'px';   // pin CSS size in draw path
+    canvas.style.height = h + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  }
+  fit();
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', function () { fit(); draw(currentT()); });
+    }
+    window.addEventListener('resize', function () { fit(); draw(currentT()); });
+  }
+
+  // ---------- divider tuning (recorded drag events; closed-form offset) ----------
+  // segments: {downT, downPos, lastPos, upT|null, upOff}
+  var dragSegs = [];
+  function offsetAt(t) {
+    var off = 0;
+    for (var i = 0; i < dragSegs.length; i++) {
+      var s = dragSegs[i];
+      if (t < s.downT) break;
+      if (s.upT === null || t < s.upT) {
+        var span = portrait() ? H : W;
+        off = clamp((s.lastPos - s.downPos) / span, -0.1, 0.1);
+      } else {
+        off = s.upOff * Math.exp(-(t - s.upT) * 3.2); // spring snap-back
+        if (Math.abs(off) < 0.0004) off = 0;
+      }
+    }
+    return off;
+  }
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function portrait() { return H > W; }
+
+  function pieceNow() { return T0 + (performance.now() - startStamp) / 1000; }
+  var startStamp = (typeof performance !== 'undefined') ? performance.now() : 0;
+  function currentT() { return pieceNow(); }
+
+  if (typeof window !== 'undefined' && canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', function (ev) {
+      var pos = portrait() ? ev.clientY : ev.clientX;
+      dragSegs.push({ downT: pieceNow(), downPos: pos, lastPos: pos, upT: null, upOff: 0 });
+      if (dragSegs.length > 24) dragSegs.shift();
+    });
+    canvas.addEventListener('pointermove', function (ev) {
+      var s = dragSegs[dragSegs.length - 1];
+      if (s && s.upT === null) s.lastPos = portrait() ? ev.clientY : ev.clientX;
+    });
+    function endDrag() {
+      var s = dragSegs[dragSegs.length - 1];
+      if (s && s.upT === null) {
+        var t = pieceNow();
+        s.upOff = offsetAt(t);
+        s.upT = t;
+      }
+    }
+    canvas.addEventListener('pointerup', endDrag);
+    canvas.addEventListener('pointercancel', endDrag);
+    canvas.addEventListener('pointerleave', endDrag);
+  }
+
+  // ---------- stepped alpha helper ----------
+  function stepAlpha(x, steps) { // x in [0,1]
+    if (x <= 0) return 0;
+    return Math.ceil(x * steps) / steps;
+  }
+
+  // ---------- phrase instance collection ----------
+  // returns list of {start, voice:'K'|'F', L, e, role:'lead'|'answer'}
+  function phraseInstances(t) {
+    var L = Math.floor(t / LOOP);
+    var out = [];
+    for (var li = L - 1; li <= L; li++) {
+      if (li < 0) continue;
+      for (var e = 0; e < 6; e++) {
+        var st = exStart(li, e);
+        var kLeads = (e % 2 === 0);
+        var leadVoice = kLeads ? 'K' : 'F';
+        var ansVoice = kLeads ? 'F' : 'K';
+        var leadDur = kLeads ? K_DUR : F_DUR;
+        out.push({ start: st, voice: leadVoice, L: li, e: e, role: 'lead' });
+        out.push({ start: st + leadDur + GAP, voice: ansVoice, L: li, e: e, role: 'answer' });
+      }
+    }
+    return out;
+  }
+
+  function ghostActive(t) {
+    var L = Math.floor(t / LOOP);
+    for (var li = L - 1; li <= L; li++) {
+      if (li < 0) continue;
+      for (var k = 0; k < 2; k++) {
+        var g = ghostStart(li, k);
+        if (t >= g && t < g + 1.2) return true;
+      }
+    }
+    return false;
+  }
+
+  // ---------- drawing ----------
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    var port = portrait();
+    var off = offsetAt(t);
+    var frac = 0.5 + off;
+    var stretch = 1 + Math.abs(off) * 2;
+    var divX = port ? 0 : W * frac;
+    var divY = port ? H * frac : 0;
+    var ghost = ghostActive(t);
+    var step = Math.floor(t * 10);
+
+    ctx.fillStyle = COL.bg;
+    ctx.fillRect(0, 0, W, H);
+
+    // --- asymmetric side backgrounds ---
+    // K side: faint sharp diagonal hatch (angular)
+    ctx.save();
+    ctx.strokeStyle = COL.k;
+    ctx.globalAlpha = 0.05;
+    ctx.lineWidth = 1;
+    var i, x, y;
+    if (!port) {
+      for (i = 0; i < 7; i++) {
+        x = (i + 1) * divX / 8;
+        ctx.beginPath(); ctx.moveTo(x, H * 0.08); ctx.lineTo(x - H * 0.22, H * 0.92); ctx.stroke();
+      }
+    } else {
+      for (i = 0; i < 7; i++) {
+        y = (i + 1) * divY / 8;
+        ctx.beginPath(); ctx.moveTo(W * 0.06, y); ctx.lineTo(W * 0.94, y - W * 0.18); ctx.stroke();
+      }
+    }
+    ctx.restore();
+    // F side: faint drifting arcs (organic), closed-form drift
+    ctx.save();
+    ctx.strokeStyle = COL.f;
+    ctx.lineWidth = 1.5;
+    for (i = 0; i < 3; i++) {
+      var acx, acy;
+      if (!port) { acx = divX + (W - divX) * (0.3 + 0.2 * i); acy = H * (0.3 + 0.22 * i) + Math.sin(t * 0.13 + i * 2.1) * 14; }
+      else { acx = W * (0.3 + 0.2 * i) + Math.sin(t * 0.11 + i * 1.7) * 12; acy = divY + (H - divY) * (0.3 + 0.22 * i); }
+      ctx.globalAlpha = 0.055;
+      ctx.beginPath();
+      ctx.arc(acx, acy, 60 + i * 46, t * 0.05 + i * 2.0, t * 0.05 + i * 2.0 + 1.9);
+      ctx.stroke();
+    }
+    ctx.restore();
+
+    // --- anchors ---
+    var kCX, kCY, fCX, fCY;
+    if (!port) { kCX = divX / 2; kCY = H * 0.54; fCX = divX + (W - divX) / 2; fCY = H * 0.54; }
+    else { kCX = W / 2; kCY = divY / 2 + H * 0.03; fCX = W / 2; fCY = divY + (H - divY) / 2; }
+
+    // --- phrases ---
+    var phrases = phraseInstances(t);
+    for (i = 0; i < phrases.length; i++) {
+      var p = phrases[i];
+      if (t < p.start) continue;
+      var jx = (h2(p.L * 131 + 700, p.e * 17 + 21) - 0.5) * 44;
+      var jy = (h2(p.L * 131 + 701, p.e * 17 + 22) - 0.5) * 30;
+      if (p.voice === 'K') drawKPhrase(p, kCX + jx, kCY + jy, t, stretch, ghost, step);
+      else drawFPhrase(p, fCX + jx, fCY + jy, t, stretch, ghost, step);
+    }
+
+    // --- ghost static across the divider band ---
+    if (ghost) {
+      ctx.save();
+      ctx.fillStyle = COL.ghost;
+      for (i = 0; i < 90; i++) {
+        var gx, gy;
+        if (!port) { gx = divX + (h2(step, i * 3 + 1) - 0.5) * 76; gy = h2(step, i * 3 + 2) * H; }
+        else { gx = h2(step, i * 3 + 1) * W; gy = divY + (h2(step, i * 3 + 2) - 0.5) * 76; }
+        ctx.globalAlpha = 0.25 + 0.45 * h2(step, i * 3 + 3);
+        ctx.fillRect(gx, gy, 5 + h2(step, i * 3 + 4) * 12, 2);
+      }
+      ctx.restore();
+    }
+
+    // --- divider ---
+    ctx.save();
+    ctx.strokeStyle = COL.divider;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    if (!port) { ctx.moveTo(divX, 0); ctx.lineTo(divX, H); }
+    else { ctx.moveTo(0, divY); ctx.lineTo(W, divY); }
+    ctx.stroke();
+    ctx.restore();
+
+    // --- tower: pulse rings first, then glyph ---
+    var twX, twY; // tower tip position
+    if (!port) { twX = divX; twY = 26; }
+    else { twX = W / 2; twY = divY - 44; }
+    ctx.save();
+    ctx.strokeStyle = COL.tower;
+    ctx.lineWidth = 1.5;
+    for (i = 0; i < phrases.length; i++) {
+      var age = t - phrases[i].start;
+      if (age > 0 && age < RING_LIFE) {
+        var rr = 8 + (age / RING_LIFE) * 115;
+        ctx.globalAlpha = stepAlpha(0.55 * (1 - age / RING_LIFE), 5);
+        ctx.beginPath(); ctx.arc(twX, twY, rr, 0, Math.PI * 2); ctx.stroke();
+      }
+    }
+    ctx.restore();
+    drawTower(twX, twY, port);
+
+    // --- labels + footer ---
+    ctx.save();
+    ctx.font = '600 12px ui-monospace, Menlo, Consolas, monospace';
+    ctx.textBaseline = 'top';
+    ctx.globalAlpha = 0.9;
+    ctx.fillStyle = COL.k;
+    ctx.textAlign = 'left';
+    ctx.fillText('V O I C E - K', 16, 14);
+    ctx.fillStyle = COL.f;
+    if (!port) { ctx.textAlign = 'right'; ctx.fillText('V O I C E - F', W - 16, 14); }
+    else { ctx.textAlign = 'right'; ctx.fillText('V O I C E - F', W - 16, divY + 12); }
+    ctx.globalAlpha = 0.85;
+    ctx.fillStyle = COL.gray;
+    ctx.font = '11px ui-monospace, Menlo, Consolas, monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('radio voices, citizen listening.', W / 2, H - 22);
+    ctx.restore();
+  }
+
+  function drawTower(tipX, tipY, port) {
+    // mast stands below the tip; in portrait it stands on the divider
+    var baseY = port ? tipY + 44 : tipY + 52;
+    var halfW = 15;
+    ctx.save();
+    ctx.strokeStyle = COL.tower;
+    ctx.globalAlpha = 0.75;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(tipX - halfW, baseY); ctx.lineTo(tipX, tipY); ctx.lineTo(tipX + halfW, baseY);
+    ctx.moveTo(tipX - halfW * 0.62, tipY + (baseY - tipY) * 0.38);
+    ctx.lineTo(tipX + halfW * 0.62, tipY + (baseY - tipY) * 0.38);
+    ctx.moveTo(tipX - halfW * 0.34, tipY + (baseY - tipY) * 0.68);
+    ctx.lineTo(tipX + halfW * 0.34, tipY + (baseY - tipY) * 0.68);
+    ctx.moveTo(tipX, tipY); ctx.lineTo(tipX, baseY);
+    ctx.stroke();
+    ctx.fillStyle = COL.tower;
+    ctx.beginPath(); ctx.arc(tipX, tipY, 3, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  }
+
+  function stutter(ghost, step, id) {
+    if (!ghost) return { x: 0, y: 0 };
+    return { x: (h2(step, id * 7 + 1) - 0.5) * 6, y: (h2(step, id * 7 + 2) - 0.5) * 6 };
+  }
+
+  function drawKPhrase(p, cx, cy, t, stretch, ghost, step) {
+    var spacing = 40;
+    var totalW = spacing * 4;
+    // stave line
+    ctx.save();
+    ctx.strokeStyle = COL.k;
+    ctx.globalAlpha = 0.28;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(cx - totalW / 2 - 26 * stretch, cy);
+    ctx.lineTo(cx + totalW / 2 + 26 * stretch, cy);
+    ctx.stroke();
+    ctx.restore();
+
+    for (var j = 0; j < 5; j++) {
+      var born = p.start + j * 0.32;
+      var age = t - born;
+      if (age < 0 || age > MARK_LIFE) continue;
+      var fade = stepAlpha(1 - age / MARK_LIFE, 6);
+      var attack = age < 0.32 ? 1 : 0.72;
+      var len = (26 + 62 * rhythm(p.L, p.e, j)) * stretch;
+      var pitch = Math.floor(h2(p.L * 131 + 300, p.e * 41 + j * 13 + 5) * 5) - 2;
+      var nx = cx - totalW / 2 + j * spacing - len / 2 + spacing / 2 - 8;
+      var ny = cy + pitch * 15;
+      var st = stutter(ghost, step, p.e * 10 + j + (p.role === 'lead' ? 0 : 50));
+      ctx.save();
+      ctx.globalAlpha = fade * attack;
+      ctx.fillStyle = COL.k;
+      ctx.fillRect(nx + st.x, ny - 5 + st.y, len, 10); // sharp rectangle note
+      ctx.fillStyle = COL.kDot;
+      ctx.beginPath();
+      ctx.arc(nx + st.x, ny + st.y, 3.2, 0, Math.PI * 2); // white node dot
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  function drawFPhrase(p, cx, cy, t, stretch, ghost, step) {
+    var phase = t - p.start;
+    var R0 = 44;
+    var j, sepAge, ang, maxD, rj;
+
+    // droplet trails (fading arcs) + droplets, born as each separates
+    for (j = 0; j < 5; j++) {
+      sepAge = phase - j * 0.3;
+      if (sepAge < 0) continue;
+      var bornAbs = p.start + j * 0.3;
+      var mAge = t - bornAbs;
+      if (mAge > MARK_LIFE) continue;
+      ang = h2(p.L * 131 + 500, p.e * 23 + j * 7 + 1) * Math.PI * 2;
+      maxD = (64 + 74 * h2(p.L * 131 + 501, p.e * 23 + j * 7 + 2)) * stretch;
+      var trav = Math.min(1, sepAge / 1.1);
+      var ease = 1 - (1 - trav) * (1 - trav);
+      var d = maxD * ease;
+      rj = (8 + 10 * rhythm(p.L, p.e, j)) * (1 - 0.35 * trav);
+      var dx = cx + Math.cos(ang) * d;
+      var dy = cy + Math.sin(ang) * d;
+      var st = stutter(ghost, step, 200 + p.e * 10 + j + (p.role === 'lead' ? 0 : 50));
+      var fade = stepAlpha(1 - mAge / MARK_LIFE, 6);
+      // fading arc trail sweeping behind the droplet
+      ctx.save();
+      ctx.strokeStyle = COL.f;
+      ctx.globalAlpha = fade * 0.5;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(cx + st.x, cy + st.y, Math.max(d, 0.1), ang - 0.65, ang);
+      ctx.stroke();
+      // droplet
+      ctx.globalAlpha = fade;
+      ctx.fillStyle = COL.f;
+      ctx.beginPath();
+      ctx.arc(dx + st.x, dy + st.y, rj, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = COL.fDot;
+      ctx.beginPath();
+      ctx.arc(dx + st.x, dy + st.y, Math.max(1.6, rj * 0.26), 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+
+    // the blob itself, dissolving as droplets leave; exists for the phrase + a breath
+    var sepCount = 0;
+    for (j = 0; j < 5; j++) if (phase > j * 0.3) sepCount++;
+    if (phase < F_DUR + 0.9 && sepCount < 5 || (phase < F_DUR + 0.9 && sepCount >= 5 && phase < 1.9)) {
+      var blobFade = phase < 1.9 ? 1 : stepAlpha(1 - (phase - 1.9) / (F_DUR + 0.9 - 1.9), 5);
+      var R = R0 * (1 - 0.13 * sepCount);
+      if (R > 2 && blobFade > 0) {
+        var stb = stutter(ghost, step, 999);
+        ctx.save();
+        ctx.globalAlpha = 0.9 * blobFade;
+        ctx.fillStyle = COL.f;
+        ctx.beginPath();
+        var N = 14;
+        for (var k = 0; k <= N; k++) {
+          var a = (k / N) * Math.PI * 2;
+          var wob = 1 + 0.10 * Math.sin(a * 3 + p.start * 2 + phase * 1.7) + 0.06 * Math.sin(a * 5 - phase * 2.3);
+          var px = cx + stb.x + Math.cos(a) * R * wob;
+          var py = cy + stb.y + Math.sin(a) * R * wob;
+          if (k === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+        }
+        ctx.closePath();
+        ctx.fill();
+        ctx.fillStyle = COL.fDot;
+        ctx.beginPath(); ctx.arc(cx + stb.x, cy + stb.y, 3, 0, Math.PI * 2); ctx.fill();
+        ctx.restore();
+      }
+    }
+  }
+
+  // ---------- run ----------
+  draw(T0); // synchronous fixed-phase first frame
+  if (typeof requestAnimationFrame === 'function') {
+    var loopFn = function () {
+      draw(pieceNow());
+      requestAnimationFrame(loopFn);
+    };
+    requestAnimationFrame(loopFn);
+  }
+})();
+</script>
+</body>
+</html>
