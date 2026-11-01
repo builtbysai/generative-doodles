@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<!-- piece-9117-summit-first -->
+<title>Summit First</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #060a18; overflow: hidden; }
+  #c { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: manipulation; }
+  #hint {
+    position: fixed; left: 0; right: 0; bottom: 26px; text-align: center;
+    color: rgba(235, 240, 255, 0.55); font: 13px/1.4 system-ui, sans-serif;
+    letter-spacing: 0.12em; text-transform: lowercase; pointer-events: none;
+    transition: opacity 1.6s ease; user-select: none; -webkit-user-select: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hint">tap for a new dawn</div>
+<script>
+'use strict';
+/* Piece 9117 "Summit First" - pure driver core. No DOM. Shared by node harness and browser. */
+
+const W = 480, H = 320;
+const WATERLINE = 198;          // row where lake begins
+const THETA_MIN = 0.4, THETA_MAX = 8.0; // sun elevation sweep, degrees
+const SNOWLINE_FRAC = 0.70;     // snow above this fraction of peak max
+const RIPPLE_MAX = 2.5;         // px, hard bound on water displacement
+
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function makeNoise1d(rand) {
+  const N = 128, lat = new Float64Array(N);
+  for (let i = 0; i < N; i++) lat[i] = rand();
+  const at = (i) => lat[(((i % N) + N) % N)];
+  function noise(x) {
+    const i = Math.floor(x), f = x - i, u = f * f * (3 - 2 * f);
+    return at(i) * (1 - u) + at(i + 1) * u;
+  }
+  function fbm(x, oct) {
+    let s = 0, amp = 0.5, tot = 0, fr = 1;
+    for (let o = 0; o < oct; o++) { s += amp * noise(x * fr); tot += amp; amp *= 0.5; fr *= 2.03; }
+    return s / tot;
+  }
+  return { fbm };
+}
+
+function ridged(fbm, x) {
+  const v = fbm(x, 4), r = 1 - Math.abs(2 * v - 1);
+  return r * r;
+}
+function gauss(x, c, s) { const d = (x - c) / s; return Math.exp(-0.5 * d * d); }
+function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
+function lerp(a, b, t) { return a + (b - a) * t; }
+function mix3(c1, c2, t) {
+  return [lerp(c1[0], c2[0], t), lerp(c1[1], c2[1], t), lerp(c1[2], c2[2], t)];
+}
+
+// Terrain: dark eastern ridge (sun side, casts the shadow) + main peak.
+function buildTerrain(seed) {
+  const rand = mulberry32(seed);
+  const { fbm } = makeNoise1d(rand);
+  const eastH = new Float64Array(W), mainH = new Float64Array(W);
+  const maxRise = WATERLINE - 26;
+  const eastC = 0.07 + rand() * 0.04;    // eastern ridge hugs the left edge
+  const mainC = 0.62 + rand() * 0.10;    // main peak right of center
+  const eastAmp = 0.86 + rand() * 0.10;
+  const mainAmp = 0.78 + rand() * 0.08;
+  const rawE = new Float64Array(W), rawM = new Float64Array(W);
+  let rEmax = 0, rMmax = 0, sx = 0;
+  for (let x = 0; x < W; x++) {
+    const u = x / W;
+    const r1 = ridged(fbm, u * 9.0 + 3.1);
+    const r2 = ridged(fbm, u * 23.0 + 17.7);
+    const detail = 0.72 * r1 + 0.28 * r2;
+    // No clamping: the envelope keeps a rounded summit, never a flat mesa.
+    rawE[x] = detail * 0.60 + gauss(u, eastC, 0.075) * eastAmp;
+    rawM[x] = detail * 0.52 + gauss(u, mainC, 0.16) * mainAmp;
+    if (rawE[x] > rEmax) rEmax = rawE[x];
+    if (rawM[x] > rMmax) { rMmax = rawM[x]; sx = x; }
+  }
+  // Absolute scale: eastern crest sits just below the summit so the shadow line
+  // h*(theta) = eMax - dx*tan(theta) sweeps from the snowcap tip down the face.
+  const mMax = maxRise * (0.82 + rand() * 0.10);
+  // Anchor the shadow line compositionally: at theta=1deg it sits at 0.93*mMax,
+  // so every seed opens with first light on a small summit cap. The east ridge
+  // is scaled so its crest delivers exactly that.
+  let crestX = 0;
+  for (let x = 0; x < W; x++) if (rawE[x] > rawE[crestX]) crestX = x;
+  const dxEC = Math.max(sx - crestX, 40);
+  const eMaxTarget = 0.93 * mMax + dxEC * Math.tan(1 * Math.PI / 180);
+  const eMax = eMaxTarget;
+  for (let x = 0; x < W; x++) {
+    mainH[x] = rawM[x] / rMmax * mMax;
+    eastH[x] = rawE[x] / rEmax * eMaxTarget;
+  }
+  // Snowline wanders per column (no straight cut across the peak).
+  const snowRand = makeNoise1d(mulberry32((seed ^ 0x9e3779b9) >>> 0)).fbm;
+  const snowH = new Float64Array(W);
+  for (let x = 0; x < W; x++) {
+    snowH[x] = mMax * (SNOWLINE_FRAC + 0.10 * (snowRand(x * 0.02, 3) - 0.5));
+  }
+  return { eastH, mainH, summitX: sx, eMax, mMax, seed, ratio: eMax / mMax, snowH, crestX, dxEC };
+}
+
+// Retry sub-seeds until the composition holds (summit right of center).
+function pickTerrain(baseSeed) {
+  for (let k = 0; k < 12; k++) {
+    const t = buildTerrain(baseSeed + k * 101);
+    const f = t.summitX / W;
+    if (f >= 0.35 && f <= 0.75) return t;
+  }
+  return buildTerrain(baseSeed); // fallback, should not happen
+}
+
+// Per-column critical slope: column x is lit iff tan(theta) > slopes[x].
+// targetH = heights of the lit subject; skyH = occluding skyline to the sun side.
+function criticalSlopes(targetH, skyH) {
+  const slopes = new Float64Array(W);
+  for (let x = 0; x < W; x++) {
+    let sMax = -Infinity;
+    const hx = targetH[x];
+    for (let xp = 0; xp < x; xp++) {
+      const s = (skyH[xp] - hx) / (x - xp);
+      if (s > sMax) sMax = s;
+    }
+    slopes[x] = sMax;
+  }
+  return slopes;
+}
+
+// Box blur on a 1D array: models penumbra / finite ridge width, kills the
+// column-to-column striping that raw per-column shadow tests produce.
+function smooth1d(a, r) {
+  const n = a.length, out = new Float64Array(n);
+  for (let x = 0; x < n; x++) {
+    let s = 0, c = 0;
+    for (let k = -r; k <= r; k++) {
+      const j = x + k;
+      if (j >= 0 && j < n) { s += a[j]; c++; }
+    }
+    out[x] = s / c;
+  }
+  return out;
+}
+
+function skyline(eastH, mainH) {
+  const s = new Float64Array(W);
+  for (let x = 0; x < W; x++) s[x] = Math.max(eastH[x], mainH[x]);
+  return s;
+}
+
+function litFrac(slopes, targetH, thetaDeg) {
+  const tan = Math.tan(thetaDeg * Math.PI / 180);
+  let lit = 0, tot = 0;
+  for (let x = 0; x < W; x++) {
+    if (targetH[x] > 3) { tot++; if (slopes[x] < tan) lit++; }
+  }
+  return tot ? lit / tot : 0;
+}
+
+// Lit fraction over the upper mountain only (the peak massif, not the foothills:
+// low western bumps catch horizontal dawn rays physically, but the drama is aloft).
+function litFracPeak(slopes, targetH, mMax, thetaDeg) {
+  const tan = Math.tan(thetaDeg * Math.PI / 180);
+  let lit = 0, tot = 0;
+  for (let x = 0; x < W; x++) {
+    if (targetH[x] > 0.5 * mMax) { tot++; if (slopes[x] < tan) lit++; }
+  }
+  return tot ? lit / tot : 0;
+}
+
+// Sun color: deep ember at the horizon, warming pale as it climbs.
+function sunColor(thetaDeg) {
+  const t = clamp(thetaDeg / THETA_MAX, 0, 1);
+  return [255, lerp(92, 196, t), lerp(40, 130, t)];
+}
+function rgbHue([r, g, b]) {
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+  if (mx === mn) return 0;
+  const d = mx - mn;
+  let h = mx === r ? (g - b) / d : mx === g ? 2 + (b - r) / d : 4 + (r - g) / d;
+  return ((h * 60) % 360 + 360) % 360;
+}
+
+// Dawn sky palette as a function of sun elevation.
+function skyColors(thetaDeg) {
+  const t = clamp(thetaDeg / THETA_MAX, 0, 1);
+  return {
+    zenith: mix3([11, 16, 38], [39, 67, 107], t),
+    horizon: mix3([46, 32, 66], [203, 126, 76], t),
+    glow: 0.35 + 0.65 * t
+  };
+}
+
+// Near-still water: slow micro-ripples, bounded by RIPPLE_MAX.
+function ripple(x, y, t) {
+  return 1.4 * Math.sin(x * 0.05 + t * 0.35 + y * 0.03)
+       + 0.9 * Math.sin(x * 0.13 - t * 0.22 + 1.7);
+}
+
+function smoothstep(a, b, x) {
+  const t = clamp((x - a) / (b - a), 0, 1);
+  return t * t * (3 - 2 * t);
+}
+
+// Full frame render. Returns pixel buffer + stats. grainRand optional (null = no grain).
+function renderFrame(terrain, slopes, eastSlopes, thetaDeg, tSec, grainRand) {
+  const { eastH, mainH, snowH } = terrain;
+  const tan = Math.tan(thetaDeg * Math.PI / 180);
+  const sun = sunColor(thetaDeg), sky = skyColors(thetaDeg);
+  const data = new Uint8ClampedArray(W * H * 4);
+  const surfE = new Int32Array(W), surfM = new Int32Array(W);
+  for (let x = 0; x < W; x++) {
+    surfE[x] = Math.round(WATERLINE - eastH[x]);
+    surfM[x] = Math.round(WATERLINE - mainH[x]);
+  }
+
+  let litPx = 0, snowPx = 0, ridgePx = 0;
+  for (let y = 0; y < WATERLINE; y++) {
+    const v = Math.pow(y / WATERLINE, 1.25);
+    for (let x = 0; x < W; x++) {
+      let r, g, b;
+      // base sky
+      r = lerp(sky.zenith[0], sky.horizon[0], v);
+      g = lerp(sky.zenith[1], sky.horizon[1], v);
+      b = lerp(sky.zenith[2], sky.horizon[2], v);
+      // warm glow near the sun (off-screen left, at the waterline)
+      const dxg = x + 20, dyg = y - WATERLINE;
+      const glowAmt = Math.exp(-Math.sqrt(dxg * dxg + dyg * dyg) / 90) * sky.glow * 0.55;
+      r += sun[0] * glowAmt; g += sun[1] * glowAmt; b += sun[2] * glowAmt;
+
+      const inEast = y >= surfE[x], inMain = y >= surfM[x];
+      if (inEast || inMain) {
+        if (inMain) {
+          // main peak: drawn over the eastern ridge
+          ridgePx++;
+          const dy = y - surfM[x];
+          const elev = WATERLINE - y; // height above the lake
+          const snowK = smoothstep(snowH[x] - 6, snowH[x] + 6, elev); // soft wandering snowline
+          if (snowK > 0.5) snowPx++;
+          const rockBase = mix3([58, 63, 82], [20, 22, 33], Math.min(1, dy / 40));
+          const snowBase = mix3([172, 182, 204], [126, 136, 160], Math.min(1, dy / 24));
+          let base = mix3(rockBase, snowBase, snowK);
+          const soft = clamp((tan - slopes[x]) / 0.05, 0, 1);
+          if (soft > 0) {
+            litPx++;
+            // Light lives on the crest skin and dies with depth: no floor, so
+            // the shadow decision can never tint a whole column (striping).
+            const amt = soft * Math.exp(-dy / 6);
+            const rockLit = mix3(sun, [255, 214, 170], 0.25);
+            const snowLit = mix3(sun, [255, 244, 232], 0.45);
+            const litCol = mix3(rockLit, snowLit, snowK);
+            const litAmt = lerp(0.88, 0.95, snowK);
+            base = mix3(base, litCol, clamp(amt, 0, 1) * litAmt);
+          }
+          r = base[0]; g = base[1]; b = base[2];
+        } else {
+          // eastern ridge: backlit silhouette with a thin lit rim
+          const dy = y - surfE[x];
+          const dk = Math.min(1, dy / 60);
+          let base = mix3([15, 18, 32], [8, 10, 20], dk);
+          const rim = clamp((tan - eastSlopes[x]) / 0.05, 0, 1) * Math.exp(-dy / 3);
+          if (rim > 0.01) base = mix3(base, mix3(sun, [255, 220, 190], 0.3), rim * 0.6);
+          r = base[0]; g = base[1]; b = base[2];
+        }
+      }
+      if (grainRand) {
+        const n = (grainRand() - 0.5) * 3;
+        r += n; g += n; b += n;
+      }
+      const i = (y * W + x) * 4;
+      data[i] = r; data[i + 1] = g; data[i + 2] = b; data[i + 3] = 255;
+    }
+  }
+  // lake: vertical mirror with micro-ripple displacement, darkened with depth
+  for (let y = WATERLINE; y < H; y++) {
+    const my = WATERLINE - 1 - (y - WATERLINE);
+    const depthK = (y - WATERLINE) / (H - WATERLINE);
+    for (let x = 0; x < W; x++) {
+      const ox = Math.round(ripple(x, y, tSec));
+      const sx = clamp(x + ox, 0, W - 1);
+      const si = (my * W + sx) * 4, di = (y * W + x) * 4;
+      let r = data[si] * 0.80, g = data[si + 1] * 0.86, b = data[si + 2] * 0.94;
+      const dk = depthK * 0.35;
+      r = lerp(r, 10, dk); g = lerp(g, 16, dk); b = lerp(b, 34, dk);
+      if (grainRand) {
+        const n = (grainRand() - 0.5) * 3;
+        r += n; g += n; b += n;
+      }
+      data[di] = r; data[di + 1] = g; data[di + 2] = b; data[di + 3] = 255;
+    }
+  }
+  return { data, stats: { litPx, snowPx, ridgePx } };
+}
+
+// Cheap frame hash over a pixel sample (for reseed/determinism checks).
+function frameHash(data) {
+  let h = 2166136261;
+  for (let i = 0; i < data.length; i += 997 * 4) {
+    h ^= data[i] | (data[i + 1] << 8) | (data[i + 2] << 16);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0).toString(16);
+}
+function frameDiff(a, b, y0, y1) {
+  y0 = y0 || 0; y1 = y1 || H;
+  let diff = 0, n = 0;
+  for (let y = y0; y < y1; y++)
+    for (let i = (y * W) * 4; i < (y * W + W) * 4; i += 997 * 4) {
+      diff += Math.abs(a[i] - b[i]) + Math.abs(a[i + 1] - b[i + 1]) + Math.abs(a[i + 2] - b[i + 2]);
+      n++;
+    }
+  return diff / (n * 3 * 255);
+}
+
+if (typeof module !== 'undefined') {
+  module.exports = {
+    W, H, WATERLINE, THETA_MIN, THETA_MAX, SNOWLINE_FRAC, RIPPLE_MAX,
+    mulberry32, buildTerrain, pickTerrain, criticalSlopes, skyline,
+    litFrac, litFracPeak, sunColor, rgbHue, skyColors, ripple, smoothstep, smooth1d,
+    renderFrame, frameHash, frameDiff, clamp
+  };
+}
+
+</script>
+<script>
+(function () {
+  'use strict';
+  var cv = document.getElementById('c');
+  var ctx = cv.getContext('2d');
+  var hint = document.getElementById('hint');
+  var qs = new URLSearchParams(location.search);
+  var clockOffset = parseFloat(qs.get('t') || '0');
+  var seed = (parseInt(qs.get('seed') || '0', 10) || ((Math.random() * 1e9) | 0));
+  var LOOP = 100;
+
+  var terrain = pickTerrain(seed);
+  var slopes, eastSlopes;
+  function buildSlopes() {
+    var sky = smooth1d(skyline(terrain.eastH, terrain.mainH), 2);
+    slopes = criticalSlopes(terrain.mainH, sky);
+    eastSlopes = criticalSlopes(terrain.eastH, smooth1d(terrain.eastH, 2));
+  }
+  buildSlopes();
+
+  function reseed() {
+    seed = (Math.random() * 1e9) | 0;
+    terrain = pickTerrain(seed);
+    buildSlopes();
+  }
+
+  function thetaAt(p) {
+    if (p < 0.70) { var u = p / 0.70, e = u * u * (3 - 2 * u); return 0.4 + (8 - 0.4) * e; }
+    return 8;
+  }
+  function nightAlpha(p) {
+    if (p < 0.03) return 0.92 * (1 - p / 0.03);
+    if (p >= 0.85) return 0.92 * ((p - 0.85) / 0.15);
+    return 0;
+  }
+
+  var mode = 'play';   // play | toNight | toDawn
+  var fade = 0;        // 0 = clear, 1 = full night overlay
+  var hintGone = false;
+  function hideHint() { if (!hintGone) { hintGone = true; hint.style.opacity = '0'; } }
+  setTimeout(hideHint, 9000);
+
+  cv.addEventListener('pointerdown', function () {
+    hideHint();
+    if (mode === 'play') mode = 'toNight';
+  });
+
+  function resize() {
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    cv.width = Math.round(innerWidth * dpr);
+    cv.height = Math.round(innerHeight * dpr);
+  }
+  addEventListener('resize', resize);
+  resize();
+
+  var off = document.createElement('canvas');
+  off.width = W; off.height = H;
+  var octx = off.getContext('2d');
+
+  var img = octx.createImageData(W, H);
+  var lastRender = 0;
+  var NIGHT = [6, 10, 24];
+
+  function frame(now) {
+    requestAnimationFrame(frame);
+    if (now - lastRender < 33) return;
+    lastRender = now;
+    var p = (((now / 1000) + clockOffset) % LOOP + LOOP) % LOOP / LOOP;
+
+    if (mode === 'toNight') {
+      fade = Math.min(1, fade + 0.05);
+      if (fade >= 1) { reseed(); mode = 'toDawn'; }
+    } else if (mode === 'toDawn') {
+      fade = Math.max(0, fade - 0.04);
+      if (fade <= 0) mode = 'play';
+    } else {
+      fade = nightAlpha(p);
+    }
+
+    var theta = thetaAt(p);
+    var tSec = now / 1000 + clockOffset;
+    var out = renderFrame(terrain, slopes, eastSlopes, theta, tSec, Math.random);
+    var d = out.data, px = img.data;
+    // night overlay
+    if (fade > 0.003) {
+      var a = Math.min(1, fade);
+      for (var i = 0; i < d.length; i += 4) {
+        px[i]     = d[i]     + (NIGHT[0] - d[i])     * a;
+        px[i + 1] = d[i + 1] + (NIGHT[1] - d[i + 1]) * a;
+        px[i + 2] = d[i + 2] + (NIGHT[2] - d[i + 2]) * a;
+        px[i + 3] = 255;
+      }
+    } else {
+      px.set(d);
+    }
+    octx.putImageData(img, 0, 0);
+
+    // cover-fit upscale, biased to keep the summit framed on narrow screens
+    var vw = cv.width, vh = cv.height;
+    var s = Math.max(vw / W, vh / H);
+    var dw = W * s, dh = H * s;
+    var dx = (vw - dw) / 2, dy = (vh - dh) / 2;
+    if (dw > vw) {
+      // summit-anchored horizontal crop instead of a centered one
+      dx = vw * 0.5 - terrain.summitX * s;
+      dx = Math.max(vw - dw, Math.min(0, dx));
+    }
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(off, 0, 0, W, H, dx, dy, dw, dh);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
