@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hold the Line</title>
+<style>
+  html, body { margin:0; padding:0; background:#0D0B08; height:100%; overflow:hidden; }
+  canvas { display:block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function(){
+'use strict';
+var cv = document.getElementById('c');
+var ctx = cv.getContext('2d');
+
+/* ---------- palette (strict) ---------- */
+var GROUND = '#0D0B08';
+var COL = { human:'#FFD43B', natural:'#E8590C', unknown:'#8A8A8A' };
+var DAYLINE = '#2A2520';
+var STACK = '#FFB84D';
+var MTEXT = '#B8A88F';
+var RUM_DARK = [61,12,2], RUM_HOT = [232,89,12];
+
+/* ---------- seeded RNG (mulberry32) ---------- */
+function mulberry32(a){ return function(){ a|=0; a = a+0x6D2B79F5|0; var t = Math.imul(a^a>>>15, 1|a); t = t + Math.imul(t^t>>>7, 61|t) ^ t; return ((t^t>>>14)>>>0)/4294967296; }; }
+var rng = mulberry32(91374);
+function gauss(){ var u=0, v=0; while(!u) u=rng(); while(!v) v=rng(); return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v); }
+
+/* ---------- synthesized season dataset (all generated at init) ----------
+   240 days, April to November. Fire counts peak mid-season with exactly
+   one worst day (day 131, 226 fires; every other day clamped to <=150).
+   Causes per fire: 60% human, 25% natural, 15% unknown.
+   Burnt area per day: lognormal, mean rising through the season (heavier late). */
+var DAYS = 240, WORST = 131, DAY_SEC = 2.5;
+var counts = [], areas = [], cumEnd = [], firesByDay = [], bandCol = [], bandNorm = [];
+var maxArea = 0, totalArea = 0;
+(function buildData(){
+  var d, i;
+  for(d=0; d<DAYS; d++){
+    var peak = 6 + 55*Math.exp(-Math.pow((d-128)/62,2)) + 18*Math.exp(-Math.pow((d-185)/40,2));
+    var c = Math.max(0, Math.round(peak*(0.45+rng()*0.9) + gauss()*3));
+    if(c>150) c=150;
+    counts.push(c);
+  }
+  counts[WORST] = 226;
+  for(d=0; d<DAYS; d++){
+    var mu = Math.log(1400) + 0.9*(d/DAYS) + 0.5*Math.exp(-Math.pow((d-150)/50,2));
+    var a = Math.exp(gauss()*0.55 + mu - 0.15);
+    areas.push(a); totalArea += a; cumEnd.push(totalArea);
+    if(a>maxArea) maxArea = a;
+  }
+  for(d=0; d<DAYS; d++){
+    var arr = [];
+    for(i=0; i<counts[d]; i++){
+      var r = rng();
+      arr.push({ c: r<0.60 ? 'human' : (r<0.85 ? 'natural' : 'unknown'), f: rng() });
+    }
+    arr.sort(function(p,q){ return p.f-q.f; });
+    firesByDay.push(arr);
+    var n = areas[d]/maxArea; bandNorm.push(n);
+    var t = Math.pow(n, 0.9);
+    bandCol.push('rgb(' + Math.round(RUM_DARK[0]+(RUM_HOT[0]-RUM_DARK[0])*t) + ',' +
+                          Math.round(RUM_DARK[1]+(RUM_HOT[1]-RUM_DARK[1])*t) + ',' +
+                          Math.round(RUM_DARK[2]+(RUM_HOT[2]-RUM_DARK[2])*t) + ')');
+  }
+})();
+/* Note stack: one line per chunk of cumulative area, capped at 24.
+   Chunk is scaled so the stack reads 3 lines at the frame-one playhead (day 24). */
+var CHUNK = cumEnd[23]/3.05;
+var lineCross = []; /* dayFloat at which stack line k (1-based) is earned */
+(function(){
+  for(var k=1; k<=24; k++){
+    var target = k*CHUNK, df = DAYS;
+    for(var d=0; d<DAYS; d++){
+      if(cumEnd[d] >= target){
+        var prev = d>0 ? cumEnd[d-1] : 0;
+        df = d + (areas[d] > 0 ? (target-prev)/areas[d] : 0);
+        break;
+      }
+    }
+    lineCross.push(df);
+  }
+})();
+function cumAt(df){
+  if(df <= 0) return 0;
+  if(df >= DAYS) return totalArea;
+  var d = Math.floor(df), prev = d>0 ? cumEnd[d-1] : 0;
+  return prev + areas[d]*(df-d);
+}
+function linesAt(df){ var n = Math.floor(cumAt(df)/CHUNK); return n>24 ? 24 : n; }
+
+/* ---------- playback state: closed-form over recorded events ----------
+   mode 'play':   dayFloat = anchorDayU + (t-anchorT)/DAY_SEC (mod 240)
+   mode 'replay': dayFloat = repDay + frac((t-repStart)/DAY_SEC)
+   mode 'hold':   dayFloat = WORST + 0.999 (the worst day, held)
+   scrubbing overrides while the pointer is down and moving. */
+var PHASE0 = 24; /* frame one: season at day 24 */
+var mode = 'play', anchorT = 0, anchorDayU = PHASE0;
+var repDay = 0, repStart = 0;
+var scrubbing = false, scrubDF = PHASE0;
+var lastTapT = -10;
+function dayFloatAt(t){
+  if(scrubbing) return scrubDF;
+  if(mode === 'replay') return repDay + ((t-repStart)/DAY_SEC % 1);
+  if(mode === 'hold') return WORST + 0.999;
+  var df = (anchorDayU + (t-anchorT)/DAY_SEC) % DAYS;
+  return df < 0 ? df + DAYS : df;
+}
+
+/* ---------- clock ---------- */
+var T0 = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+function nowT(){ return (typeof performance !== 'undefined' && performance.now) ? (performance.now()-T0)/1000 : 0; }
+
+/* ---------- audio (lazy, gesture-gated, typeof-guarded) ---------- */
+var AC = null, rumbleGain = null, noiseBuf = null;
+function initAudio(){
+  if(AC){ try{ if(AC.resume) AC.resume(); }catch(e){} return; }
+  try{
+    var Ctor = (typeof window !== 'undefined') ? (window.AudioContext || window.webkitAudioContext) : null;
+    if(!Ctor) return;
+    AC = new Ctor();
+    var len = AC.sampleRate * 2, buf = AC.createBuffer(1, len, AC.sampleRate), ch = buf.getChannelData(0);
+    var last = 0;
+    for(var i=0; i<len; i++){ var w = rng()*2-1; last = (last + 0.02*w)/1.02; ch[i] = last*3.2; }
+    noiseBuf = AC.createBuffer(1, AC.sampleRate * 0.5, AC.sampleRate);
+    var nch = noiseBuf.getChannelData(0);
+    for(var j=0; j<nch.length; j++) nch[j] = rng()*2-1;
+    var src = AC.createBufferSource(); src.buffer = buf; src.loop = true;
+    var lp = AC.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 220;
+    rumbleGain = AC.createGain(); rumbleGain.gain.value = 0;
+    src.connect(lp); lp.connect(rumbleGain); rumbleGain.connect(AC.destination);
+    src.start();
+  }catch(e){ AC = null; rumbleGain = null; }
+}
+function env(g, peak, dur){ var t = AC.currentTime; g.gain.setValueAtTime(peak, t); g.gain.exponentialRampToValueAtTime(0.0001, t+dur); }
+function sndTing(){ if(!AC) return; try{ var o=AC.createOscillator(), g=AC.createGain(), hp=AC.createBiquadFilter(); o.type='square'; o.frequency.value=2500+rng()*600; hp.type='highpass'; hp.frequency.value=1500; env(g,0.07,0.07); o.connect(hp); hp.connect(g); g.connect(AC.destination); o.start(); o.stop(AC.currentTime+0.09); }catch(e){} }
+function sndCrackle(){ if(!AC) return; try{ var s=AC.createBufferSource(), g=AC.createGain(), bp=AC.createBiquadFilter(); s.buffer=noiseBuf; bp.type='bandpass'; bp.frequency.value=750; bp.Q.value=0.9; env(g,0.16,0.09); s.connect(bp); bp.connect(g); g.connect(AC.destination); s.start(); s.stop(AC.currentTime+0.1); }catch(e){} }
+function sndFlick(){ if(!AC) return; try{ var o=AC.createOscillator(), g=AC.createGain(); o.type='sine'; o.frequency.value=165; env(g,0.12,0.06); o.connect(g); g.connect(AC.destination); o.start(); o.stop(AC.currentTime+0.08); }catch(e){} }
+function sndBass(){ if(!AC) return; try{ var o=AC.createOscillator(), g=AC.createGain(), t=AC.currentTime; o.type='sine'; o.frequency.setValueAtTime(130,t); o.frequency.exponentialRampToValueAtTime(38,t+0.45); env(g,0.4,0.5); o.connect(g); g.connect(AC.destination); o.start(); o.stop(t+0.55); }catch(e){} }
+var PENTA = [0,3,5,7,10,12,15,17,19,22,24];
+function sndStack(k){ if(!AC) return; try{ var o=AC.createOscillator(), g=AC.createGain(); o.type='sine'; o.frequency.value = 196*Math.pow(2, PENTA[(k-1)%PENTA.length]/12); env(g,0.10,0.7); o.connect(g); g.connect(AC.destination); o.start(); o.stop(AC.currentTime+0.75); }catch(e){} }
+function fireSound(cause){ if(cause==='human') sndTing(); else if(cause==='natural') sndCrackle(); else sndFlick(); }
+
+/* audio scheduling derives from playhead crossings; visuals never depend on it */
+var audPrevPos = null, audPrevPhase = null, audPrevLines = -1;
+function fireRange(day, f0, f1, budget){
+  var arr = firesByDay[day], played = 0;
+  for(var i=0; i<arr.length; i++){
+    if(arr[i].f > f0 && arr[i].f <= f1 && played < budget){ fireSound(arr[i].c); played++; }
+  }
+  return played;
+}
+function audioTick(t){
+  if(!AC) return;
+  var df = dayFloatAt(t);
+  try{ if(rumbleGain) rumbleGain.gain.value = 0.015 + 0.30*bandNorm[Math.min(DAYS-1, Math.floor(df))]; }catch(e){}
+  var lines = linesAt(df);
+  if(audPrevLines >= 0 && lines > audPrevLines && !scrubbing && mode !== 'hold') sndStack(lines);
+  audPrevLines = lines;
+  if(mode === 'replay'){
+    var ph = ((t-repStart)/DAY_SEC) % 1;
+    if(audPrevPhase !== null){
+      if(ph < audPrevPhase){ fireRange(repDay, audPrevPhase, 1, 10); sndBass(); fireRange(repDay, 0, ph, 10); }
+      else fireRange(repDay, audPrevPhase, ph, 10);
+    }
+    audPrevPhase = ph; audPrevPos = null;
+    return;
+  }
+  audPrevPhase = null;
+  if(mode !== 'play' || scrubbing){ audPrevPos = null; return; }
+  var pos = anchorDayU + (t-anchorT)/DAY_SEC;
+  if(audPrevPos === null || pos < audPrevPos || pos - audPrevPos > 2){ audPrevPos = pos; return; }
+  var played = 0;
+  for(var p = audPrevPos; p < pos;){
+    var segEnd = Math.min(pos, Math.floor(p)+1);
+    var d = Math.floor(p) % DAYS; if(d < 0) d += DAYS;
+    if(p > audPrevPos && p === Math.floor(p)) sndBass();
+    played += fireRange(d, p - Math.floor(p), segEnd - Math.floor(p), 10 - played);
+    p = segEnd;
+  }
+  audPrevPos = pos;
+}
+
+/* ---------- layout + draw ---------- */
+function viewSize(){
+  var w = 0, h = 0;
+  try{ if(window.visualViewport){ w = window.visualViewport.width; h = window.visualViewport.height; } }catch(e){}
+  if(!w || !h){ w = window.innerWidth || 720; h = window.innerHeight || 720; }
+  return [w, h];
+}
+var MONTHS = ['APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV'];
+function draw(t){
+  var s = viewSize(), W = s[0], H = s[1];
+  if(cv.width !== W) cv.width = W;
+  if(cv.height !== H) cv.height = H;
+  cv.style.width = W + 'px';
+  cv.style.height = H + 'px';
+  var scrMin = 0;
+  try{ scrMin = Math.min(window.screen.width, window.screen.height); }catch(e){}
+  var phone = (scrMin > 0 && scrMin < 700) || (H > W*1.15);
+
+  var df = dayFloatAt(t);
+  var curDay = Math.min(DAYS-1, Math.floor(df)), phase = df - Math.floor(df);
+
+  var mX = W*0.045, plotL = mX, plotW = W - 2*mX, dayW = plotW/DAYS;
+  var axisY = H*0.52;
+  var stackBase = H*0.345, lineGap = Math.max(5, H*0.0078);
+  var tickTop = stackBase + 26;
+  var tickH = 3.2, pitchY = 3.8;
+  var maxRows = Math.max(6, Math.floor((axisY - 8 - tickTop)/pitchY));
+  var bandTop = axisY + 8, maxBand = H*0.15;
+
+  ctx.fillStyle = GROUND;
+  ctx.fillRect(0, 0, W, H);
+
+  /* month labels */
+  ctx.fillStyle = MTEXT;
+  ctx.font = (phone ? 9 : 11) + 'px Menlo, Consolas, monospace';
+  ctx.textBaseline = 'alphabetic';
+  for(var m=0; m<8; m++) ctx.fillText(MONTHS[m], plotL + m*30*dayW + 1, H*0.085);
+
+  /* rumble band: full season profile, played portion brighter */
+  for(var d=0; d<DAYS; d++){
+    var th = 1.5 + Math.pow(bandNorm[d], 1.3)*maxBand;
+    ctx.globalAlpha = d < curDay ? 0.95 : (d === curDay ? 0.95 : 0.30);
+    ctx.fillStyle = bandCol[d];
+    ctx.fillRect(plotL + d*dayW, bandTop, Math.max(1, dayW*0.92), th);
+  }
+  ctx.globalAlpha = 1;
+
+  /* note stack above the timeline */
+  ctx.fillStyle = STACK;
+  var nl = linesAt(df);
+  for(var k=1; k<=nl; k++){
+    var y = stackBase - (k-1)*lineGap;
+    var xEnd = plotL + Math.min(df, lineCross[k-1])*dayW;
+    ctx.globalAlpha = 0.85;
+    ctx.fillRect(plotL, y, Math.max(2, xEnd-plotL), 2);
+  }
+  ctx.globalAlpha = 1;
+
+  /* axis + month boundaries */
+  ctx.fillStyle = DAYLINE;
+  ctx.fillRect(plotL, axisY, plotW, 1.5);
+  for(var b=0; b<=8; b++){
+    var bx = plotL + Math.min(DAYS, b*30)*dayW;
+    ctx.fillRect(bx, axisY-4, 1, 9);
+  }
+
+  /* fire ticks: past days dimmer, current day full, future hidden */
+  var tickW = phone ? 1.2 : 1.5, colPitch = 1.9;
+  for(var dd=0; dd<=curDay; dd++){
+    var arr = firesByDay[dd], n = arr.length;
+    if(!n) continue;
+    var isCur = dd === curDay;
+    var cols = Math.min(10, Math.max(1, Math.ceil(n/maxRows)));
+    var cx = plotL + (dd+0.5)*dayW;
+    var x0 = cx - (cols-1)*colPitch/2;
+    var roar = (mode === 'hold' && dd === WORST) ? 0.85 + 0.15*Math.sin(t*6) : 1;
+    for(var i=0; i<n; i++){
+      var fr = arr[i];
+      var lit;
+      if(isCur){ if(fr.f > phase) continue; lit = 1; }
+      else lit = 0.5;
+      var row = Math.floor(i/cols), col = i % cols;
+      ctx.globalAlpha = lit * roar;
+      ctx.fillStyle = COL[fr.c];
+      ctx.fillRect(x0 + col*colPitch - tickW/2, axisY - 6 - row*pitchY - tickH, tickW, tickH);
+    }
+  }
+  ctx.globalAlpha = 1;
+
+  /* playhead */
+  var px = plotL + df*dayW;
+  ctx.globalAlpha = 0.75;
+  ctx.fillStyle = STACK;
+  ctx.fillRect(px, stackBase + 18, 1.5, axisY + 14 - stackBase - 18);
+  ctx.globalAlpha = 1;
+}
+
+/* ---------- interaction ---------- */
+function evtDayFrac(e){
+  var s = viewSize(), W = s[0];
+  var mX = W*0.045, plotW = W - 2*mX;
+  var x = (typeof e.clientX === 'number') ? e.clientX : 0;
+  var v = (x - mX)/plotW*DAYS;
+  return v < 0 ? 0 : (v > DAYS-0.001 ? DAYS-0.001 : v);
+}
+var pDown = null;
+function onDown(e){
+  initAudio();
+  pDown = { t: nowT(), x: (typeof e.clientX === 'number') ? e.clientX : 0, scrub: false };
+}
+function onMove(e){
+  if(!pDown) return;
+  var x = (typeof e.clientX === 'number') ? e.clientX : 0;
+  if(!pDown.scrub && Math.abs(x - pDown.x) > 7) pDown.scrub = true;
+  if(pDown.scrub){ scrubbing = true; scrubDF = evtDayFrac(e); }
+}
+function onUp(e){
+  if(!pDown) return;
+  var t = nowT();
+  if(pDown.scrub){
+    scrubbing = false;
+    mode = 'play'; anchorT = t; anchorDayU = scrubDF;
+  } else if(t - pDown.t < 0.5){
+    if(t - lastTapT < 0.35){
+      mode = 'hold'; lastTapT = -10;
+    } else {
+      mode = 'replay'; repDay = Math.floor(evtDayFrac(e)); repStart = t; lastTapT = t;
+    }
+  }
+  pDown = null;
+}
+if(cv.addEventListener){
+  cv.addEventListener('pointerdown', onDown);
+  cv.addEventListener('pointermove', onMove);
+  cv.addEventListener('pointerup', onUp);
+  cv.addEventListener('pointerleave', onUp);
+}
+
+/* ---------- run ---------- */
+draw(0);
+function onResize(){ draw(nowT()); }
+try{ if(window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', onResize); }catch(e){}
+try{ if(window.addEventListener) window.addEventListener('resize', onResize); }catch(e){}
+if(typeof requestAnimationFrame !== 'undefined'){
+  var step = function(){
+    var t = nowT();
+    draw(t);
+    audioTick(t);
+    requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+})();
+</script>
+</body>
+</html>

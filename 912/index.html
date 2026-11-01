@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Sforzinda</title>
+<style>
+  html, body { margin: 0; padding: 0; overflow: hidden; background: #FAFAF8; height: 100%; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded RNG ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- constants ----------
+  var PAPER = '#FAFAF8', INK = '#111111';
+  var PAPER_INV = '#0B0B0D', INK_INV = '#F2F0EB';
+  var DRAW_SECONDS = 20;
+  var FIRST_OFFSET = 12; // frame one is ~60% drawn: 12 / 20
+  var BASE_SEED = 91273;
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('cv');
+  var ctx = canvas.getContext('2d');
+  var W = 300, H = 300, S = 300, isPhone = false;
+
+  function measure() {
+    var vv = (typeof window !== 'undefined' && window.visualViewport) ? window.visualViewport : null;
+    var w = vv ? vv.width : (window.innerWidth || 300);
+    var h = vv ? vv.height : (window.innerHeight || 300);
+    W = Math.max(50, Math.round(w));
+    H = Math.max(50, Math.round(h));
+    S = Math.min(W, H);
+    var sw = 0;
+    if (typeof window !== 'undefined' && window.screen && window.screen.width) {
+      sw = Math.min(window.screen.width, window.screen.height || window.screen.width);
+    }
+    isPhone = sw ? (sw < 700) : (H > W * 1.15);
+    if (canvas.width !== W) canvas.width = W;
+    if (canvas.height !== H) canvas.height = H;
+  }
+  measure();
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { measure(); draw(now()); });
+  }
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('resize', function () { measure(); draw(now()); });
+  }
+
+  // ---------- clock (never Date.now for drawn state) ----------
+  var t0 = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+  function now() {
+    if (typeof performance !== 'undefined' && performance.now) return (performance.now() - t0) / 1000;
+    return 0;
+  }
+
+  // ---------- city generation (seeded, per generation) ----------
+  var cityCache = {};
+  function genCity(g) {
+    if (cityCache[g]) return cityCache[g];
+    var rng = mulberry32((BASE_SEED + g * 1013904223) >>> 0);
+    var n = 6 + Math.floor(rng() * 7); // 6..12 points
+    var step = (Math.PI * 2) / n;
+    var baseRot = rng() * Math.PI * 2;
+    var outer = [], inner = [], i, a, rf;
+    for (i = 0; i < n; i++) {
+      a = baseRot + i * step + (rng() - 0.5) * step * 0.55;
+      rf = 0.94 + rng() * 0.06;
+      outer.push({ ang: a, rf: rf });
+    }
+    for (i = 0; i < n; i++) {
+      a = baseRot + (i + 0.5) * step + (rng() - 0.5) * step * 0.4;
+      inner.push({ ang: a, rf: 0.43 + rng() * 0.04 });
+    }
+    // building blocks clustered near center, along streets
+    var blocks = [];
+    var nBlocks = isPhoneSeedCount(rng);
+    for (i = 0; i < nBlocks; i++) {
+      var useOuter = rng() < 0.6;
+      var src = useOuter ? outer[Math.floor(rng() * n)] : inner[Math.floor(rng() * n)];
+      var dist = 0.06 + Math.pow(rng(), 1.6) * 0.26; // fraction of R
+      var lat = (rng() - 0.5) * 0.055;
+      blocks.push({
+        ang: src.ang, dist: dist, lat: lat,
+        w: 0.010 + rng() * 0.016, h: 0.008 + rng() * 0.013,
+        rot: (rng() - 0.5) * 0.5,
+        at: 0.55 + 0.45 * ((i + 0.5) / nBlocks) + (rng() - 0.5) * 0.012
+      });
+    }
+    blocks.sort(function (p, q) { return p.at - q.at; });
+    // signature scribble (generative loops, not text)
+    var sig = [];
+    var sx = (rng() - 0.5) * 0.4;
+    for (i = 0; i < 46; i++) {
+      var ph = i / 45;
+      sig.push({
+        x: ph * 0.9 + Math.sin(ph * 9.0 + sx) * 0.10 + Math.sin(ph * 23.0) * 0.03,
+        y: 0.5 + Math.sin(ph * 12.0 + sx * 2.0) * 0.30 * (1 - ph * 0.4)
+      });
+    }
+    var city = { n: n, outer: outer, inner: inner, blocks: blocks, sig: sig };
+    cityCache[g] = city;
+    return city;
+  }
+  function isPhoneSeedCount(rng) { return 80 + Math.floor(rng() * 30); }
+
+  // ---------- event log (all state derives from this + t) ----------
+  var taps = [];        // {t}
+  var dragDeltas = [];  // {t, d}
+  var inertias = [];    // {t, v}
+
+  function deriveState(t) {
+    // generations: a tap confirms as a reseed 0.35s later unless a second
+    // tap lands within 0.35s, in which case the pair is an inversion.
+    var genStarts = [0];
+    var invStarts = [];
+    var pending = -1;
+    var sorted = taps.slice().sort(function (p, q) { return p.t - q.t; });
+    for (var i = 0; i < sorted.length; i++) {
+      var te = sorted[i].t;
+      if (te > t) break;
+      if (pending >= 0 && te - pending <= 0.35) {
+        invStarts.push(te);
+        pending = -1;
+      } else {
+        if (pending >= 0) genStarts.push(pending + 0.35);
+        pending = te;
+      }
+    }
+    if (pending >= 0 && t > pending + 0.35) genStarts.push(pending + 0.35);
+    var gen = 0, start = 0;
+    for (var j = 0; j < genStarts.length; j++) {
+      if (genStarts[j] <= t) { gen = j; start = genStarts[j]; }
+    }
+    var progress;
+    if (gen === 0) progress = Math.min(1, (t + FIRST_OFFSET) / DRAW_SECONDS);
+    else progress = Math.min(1, Math.max(0, (t - start) / DRAW_SECONDS));
+    var inverted = false;
+    for (var k = 0; k < invStarts.length; k++) {
+      if (invStarts[k] <= t && t < invStarts[k] + 8) inverted = true;
+    }
+    // rotation: recorded drag deltas + decaying inertia after release
+    var rot = 0;
+    for (var d = 0; d < dragDeltas.length; d++) {
+      if (dragDeltas[d].t <= t) rot += dragDeltas[d].d;
+    }
+    for (var m = 0; m < inertias.length; m++) {
+      var ev = inertias[m];
+      if (t > ev.t) rot += ev.v * 0.6 * (1 - Math.exp(-(t - ev.t) / 0.6));
+    }
+    return { gen: gen, progress: progress, inverted: inverted, rot: rot };
+  }
+
+  // ---------- drawing helpers ----------
+  function seg(x1, y1, x2, y2, f) {
+    if (f <= 0) return;
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x1 + (x2 - x1) * f, y1 + (y2 - y1) * f);
+    ctx.stroke();
+  }
+  function arcFrac(cx, cy, r, f) {
+    if (f <= 0) return;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, -Math.PI / 2, -Math.PI / 2 + f * Math.PI * 2);
+    ctx.stroke();
+  }
+  function win(p, a, b) {
+    if (p <= a) return 0;
+    if (p >= b) return 1;
+    return (p - a) / (b - a);
+  }
+
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    var st = deriveState(t);
+    var city = genCity(st.gen);
+    var ground = st.inverted ? PAPER_INV : PAPER;
+    var ink = st.inverted ? INK_INV : INK;
+    if (typeof document !== 'undefined' && document.body && document.body.style) {
+      document.body.style.background = ground;
+    }
+    ctx.fillStyle = ground;
+    ctx.fillRect(0, 0, W, H);
+
+    var cx = W / 2, cy = H / 2;
+    var R = S * 0.36;
+    var p = st.progress;
+    var lw = Math.max(1, S * 0.0016);
+    ctx.strokeStyle = ink;
+    ctx.fillStyle = ink;
+    ctx.lineWidth = lw;
+    ctx.lineCap = 'round';
+
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(st.rot);
+
+    var i, pt, x, y;
+    // center piazza (drawn first)
+    arcFrac(0, 0, R * 0.028, win(p, 0.0, 0.05));
+    if (p > 0.02) { ctx.beginPath(); ctx.arc(0, 0, Math.max(1.2, R * 0.006), 0, Math.PI * 2); ctx.fill(); }
+
+    // moat ring at 0.72R
+    arcFrac(0, 0, R * 0.72, win(p, 0.0, 0.18));
+    // inner gate circle
+    arcFrac(0, 0, R * 0.45, win(p, 0.05, 0.15));
+
+    // streets: center to every outer point and gate
+    var totalStreets = city.n * 2;
+    for (i = 0; i < city.n; i++) {
+      pt = city.outer[i];
+      x = Math.cos(pt.ang) * R * pt.rf; y = Math.sin(pt.ang) * R * pt.rf;
+      seg(0, 0, x, y, win(p, 0.10 + 0.28 * (i / totalStreets), 0.20 + 0.28 * (i / totalStreets)));
+      pt = city.inner[i];
+      x = Math.cos(pt.ang) * R * pt.rf; y = Math.sin(pt.ang) * R * pt.rf;
+      seg(0, 0, x, y, win(p, 0.10 + 0.28 * ((i + city.n) / totalStreets), 0.20 + 0.28 * ((i + city.n) / totalStreets)));
+    }
+
+    // star outline: outer -> inner -> outer ...
+    var outlineWin0 = 0.35, outlineWin1 = 0.60, segs = city.n * 2;
+    for (i = 0; i < segs; i++) {
+      var a1 = (i % 2 === 0) ? city.outer[i / 2] : city.inner[(i - 1) / 2];
+      var a2 = (i % 2 === 0) ? city.inner[i / 2] : city.outer[((i + 1) / 2) % city.n];
+      var x1 = Math.cos(a1.ang) * R * a1.rf, y1 = Math.sin(a1.ang) * R * a1.rf;
+      var x2 = Math.cos(a2.ang) * R * a2.rf, y2 = Math.sin(a2.ang) * R * a2.rf;
+      seg(x1, y1, x2, y2, clampSeg(p, outlineWin0, outlineWin1, i, segs));
+    }
+
+    // gates: small squares on the inner circle
+    for (i = 0; i < city.n; i++) {
+      if (p < 0.45 + 0.15 * (i / city.n)) continue;
+      pt = city.inner[i];
+      x = Math.cos(pt.ang) * R * pt.rf; y = Math.sin(pt.ang) * R * pt.rf;
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.rotate(pt.ang);
+      var gs = R * 0.020;
+      ctx.strokeRect(-gs / 2, -gs / 2, gs, gs);
+      ctx.restore();
+    }
+
+    // towers at outer points: small circle + radial tick
+    for (i = 0; i < city.n; i++) {
+      if (p < 0.50 + 0.15 * (i / city.n)) continue;
+      pt = city.outer[i];
+      x = Math.cos(pt.ang) * R * pt.rf; y = Math.sin(pt.ang) * R * pt.rf;
+      ctx.beginPath(); ctx.arc(x, y, Math.max(1.4, R * 0.010), 0, Math.PI * 2); ctx.stroke();
+      seg(x, y, Math.cos(pt.ang) * R * (pt.rf + 0.045), Math.sin(pt.ang) * R * (pt.rf + 0.045), 1);
+    }
+
+    // Porta labels at outer points
+    var fs = Math.max(9, S * (isPhone ? 0.020 : 0.016));
+    ctx.font = '600 ' + fs + 'px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    for (i = 0; i < city.n; i++) {
+      if (p < 0.50 + 0.18 * (i / city.n)) continue;
+      pt = city.outer[i];
+      x = Math.cos(pt.ang) * R * (pt.rf + 0.11); y = Math.sin(pt.ang) * R * (pt.rf + 0.11);
+      ctx.fillText('Porta', x, y);
+    }
+
+    // building blocks stamp in one by one
+    var stamped = 0;
+    for (i = 0; i < city.blocks.length; i++) {
+      var b = city.blocks[i];
+      if (p < b.at) continue;
+      stamped++;
+      var bx = Math.cos(b.ang) * R * b.dist - Math.sin(b.ang) * R * b.lat;
+      var by = Math.sin(b.ang) * R * b.dist + Math.cos(b.ang) * R * b.lat;
+      ctx.save();
+      ctx.translate(bx, by);
+      ctx.rotate(b.ang + b.rot);
+      ctx.fillRect(-R * b.w / 2, -R * b.h / 2, R * b.w, R * b.h);
+      ctx.restore();
+    }
+    ctx.restore();
+
+    // signature scribble, bottom-right of the sheet (screen space)
+    var sigW = S * 0.085, sigH = S * 0.045;
+    var sx0 = W - sigW - S * 0.045, sy0 = H - sigH - S * 0.035;
+    ctx.strokeStyle = ink;
+    ctx.lineWidth = Math.max(1, S * 0.0013);
+    ctx.beginPath();
+    for (i = 0; i < city.sig.length; i++) {
+      var sp = city.sig[i];
+      var px = sx0 + sp.x * sigW, py = sy0 + sp.y * sigH;
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.stroke();
+
+    // audio: pen taps for newly stamped blocks
+    if (audio.ctx) {
+      if (audio.lastGen !== st.gen) { audio.lastGen = st.gen; audio.lastStamp = 0; }
+      if (stamped > audio.lastStamp) {
+        var newOnes = Math.min(3, stamped - audio.lastStamp);
+        for (var q = 0; q < newOnes; q++) penTap(q * 0.03);
+        audio.lastStamp = stamped;
+      }
+      if (audio.servoGain) {
+        var target = (p < 1) ? 0.012 : 0.0;
+        try { audio.servoGain.gain.setTargetAtTime(target, audio.ctx.currentTime, 0.1); } catch (e) {}
+      }
+    }
+  }
+  function clampSeg(p, w0, w1, i, segs) {
+    var local = (p - w0) / (w1 - w0) * segs - i;
+    return local < 0 ? 0 : (local > 1 ? 1 : local);
+  }
+
+  // ---------- audio (lazy, gesture-gated, guarded) ----------
+  var audio = { ctx: null, servoGain: null, lastGen: -1, lastStamp: 0 };
+  function initAudio() {
+    if (audio.ctx) return;
+    var AC = (typeof window !== 'undefined') ? (window.AudioContext || window.webkitAudioContext) : null;
+    if (typeof AC !== 'function') return;
+    try {
+      var c = new AC();
+      var osc = c.createOscillator();
+      osc.type = 'sawtooth';
+      osc.frequency.value = 82;
+      var flt = c.createBiquadFilter();
+      flt.type = 'lowpass'; flt.frequency.value = 320;
+      var g = c.createGain(); g.gain.value = 0.0;
+      osc.connect(flt); flt.connect(g); g.connect(c.destination);
+      osc.start();
+      audio.ctx = c; audio.servoGain = g;
+    } catch (e) { audio.ctx = null; }
+  }
+  function noiseBuffer(dur) {
+    var c = audio.ctx;
+    var buf = c.createBuffer(1, Math.max(1, Math.floor(c.sampleRate * dur)), c.sampleRate);
+    var d = buf.getChannelData(0);
+    var r = mulberry32(4242);
+    for (var i = 0; i < d.length; i++) d[i] = r() * 2 - 1;
+    return buf;
+  }
+  function penTap(delay) {
+    if (!audio.ctx) return;
+    try {
+      var c = audio.ctx, t = c.currentTime + (delay || 0);
+      var src = c.createBufferSource(); src.buffer = noiseBuffer(0.03);
+      var bp = c.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 2100; bp.Q.value = 1.2;
+      var g = c.createGain();
+      g.gain.setValueAtTime(0.10, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.035);
+      src.connect(bp); bp.connect(g); g.connect(c.destination);
+      src.start(t); src.stop(t + 0.04);
+    } catch (e) {}
+  }
+  function paperRustle() {
+    if (!audio.ctx) return;
+    try {
+      var c = audio.ctx, t = c.currentTime;
+      var src = c.createBufferSource(); src.buffer = noiseBuffer(0.4);
+      var lp = c.createBiquadFilter(); lp.type = 'lowpass';
+      lp.frequency.setValueAtTime(900, t);
+      lp.frequency.exponentialRampToValueAtTime(2400, t + 0.12);
+      lp.frequency.exponentialRampToValueAtTime(500, t + 0.4);
+      var g = c.createGain();
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(0.06, t + 0.05);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.4);
+      src.connect(lp); lp.connect(g); g.connect(c.destination);
+      src.start(t); src.stop(t + 0.42);
+    } catch (e) {}
+  }
+
+  // ---------- pointer interaction ----------
+  var dragging = false, lastX = 0, lastY = 0, downT = 0, downX = 0, downY = 0, moved = 0, lastDeltaT = 0, lastVel = 0;
+  function ptrPos(e) {
+    var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    var px = (e.clientX !== undefined ? e.clientX : (e.touches && e.touches[0] ? e.touches[0].clientX : 0)) - r.left;
+    var py = (e.clientY !== undefined ? e.clientY : (e.touches && e.touches[0] ? e.touches[0].clientY : 0)) - r.top;
+    return { x: px, y: py };
+  }
+  function angDiff(a, b) {
+    var d = a - b;
+    while (d > Math.PI) d -= Math.PI * 2;
+    while (d < -Math.PI) d += Math.PI * 2;
+    return d;
+  }
+  canvas.addEventListener('pointerdown', function (e) {
+    initAudio();
+    if (audio.ctx && audio.ctx.resume) { try { audio.ctx.resume(); } catch (err) {} }
+    var pos = ptrPos(e);
+    dragging = true; moved = 0;
+    downT = now(); downX = lastX = pos.x; downY = lastY = pos.y;
+    lastVel = 0; lastDeltaT = downT;
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (!dragging) return;
+    var pos = ptrPos(e);
+    moved += Math.abs(pos.x - lastX) + Math.abs(pos.y - lastY);
+    var cx = W / 2, cy = H / 2;
+    var a0 = Math.atan2(lastY - cy, lastX - cx);
+    var a1 = Math.atan2(pos.y - cy, pos.x - cx);
+    var d = angDiff(a1, a0);
+    var t = now();
+    if (d !== 0) {
+      dragDeltas.push({ t: t, d: d });
+      var dt = t - lastDeltaT;
+      if (dt > 0.01) { lastVel = d / dt; lastDeltaT = t; }
+    }
+    lastX = pos.x; lastY = pos.y;
+  });
+  function endPointer() {
+    if (!dragging) return;
+    dragging = false;
+    var t = now();
+    if (t - lastDeltaT < 0.12 && Math.abs(lastVel) > 0.25) {
+      inertias.push({ t: t, v: lastVel });
+    }
+    if (t - downT < 0.4 && moved < 8) {
+      var before = deriveState(t).gen;
+      taps.push({ t: t });
+      // if this tap will confirm as a reseed (not part of a double), rustle soon after
+      setTimeout(function () {
+        var after = deriveState(now());
+        if (after.gen !== before) paperRustle();
+      }, 380);
+    }
+  }
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', endPointer);
+
+  // ---------- frame one + loop ----------
+  draw(0);
+  if (typeof requestAnimationFrame === 'function') {
+    var loop = function () {
+      draw(now());
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>

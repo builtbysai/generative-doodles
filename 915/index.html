@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UFO</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #050810; height: 100%; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+/*
+  UFO — the Station Oscillator (duncan_geere, PP76).
+  One Earth, one station, one slow voice. Everything on screen is a
+  closed-form function of the piece's own elapsed time t (seconds since
+  load) plus the recorded pointer events. Frame one is draw(0).
+*/
+
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+
+var SKY = '#050810', EARTH = '#0E1626', LIMB = '#1E3A5F',
+    RING = '#2A3A55', STATION = '#FFFFFF', CYAN = '#7DF9FF', TEXT = '#4A5A75';
+
+var W = 0, H = 0, S = 0, isPhone = false;
+
+function resize() {
+  var vv = window.visualViewport;
+  var w = vv ? vv.width : window.innerWidth;
+  var h = vv ? vv.height : window.innerHeight;
+  W = w; H = h; S = Math.min(w, h);
+  canvas.width = Math.round(w);
+  canvas.height = Math.round(h);
+  var sw = (typeof screen !== 'undefined') ? Math.min(screen.width || 9999, screen.height || 9999) : 9999;
+  isPhone = (sw < 700) || (h > w * 1.15);
+}
+if (window.visualViewport) window.visualViewport.addEventListener('resize', resize);
+window.addEventListener('resize', resize);
+resize();
+
+/* ---------------- telemetry (synthetic, closed-form) ----------------
+   Orbit period 92 s. Altitude runs one full cycle per half orbit (46 s):
+   alt = 408 + 8 sin(2 pi t / 46 + 0.9)  -> 400..416 km.
+   Velocity rides the same phase, offset: vel = 7.66 + 0.05 sin(phase + 1.1).
+   Audio frequency maps altitude 400..416 km -> 40..90 Hz.              */
+var ORBIT_PERIOD = 92;
+var THETA0 = -0.30 * Math.PI; /* frame one: station ~40% around the ring */
+
+function altAt(t) { return 408 + 8 * Math.sin((2 * Math.PI * t / 46) + 0.9); }
+function velAt(t) { return 7.66 + 0.05 * Math.sin((2 * Math.PI * t / 46) + 2.0); }
+function audioFreqAt(t) { return 40 + ((altAt(t) - 400) / 16) * 50; }
+
+/* ---------------- recorded events ---------------- */
+var taps = [];        /* {t, x, y} quick pointer releases */
+var drags = [];       /* {t0, t1 (null while active), pts:[{x,y}]} */
+var activeDrag = null;
+
+/* Passes and pings are derived from the tap list at draw time:
+   two taps within 0.35 s form a pass (fast-forward one revolution in 6 s);
+   a lone tap is a ping. */
+function deriveEvents() {
+  var pings = [], passes = [], used = {};
+  for (var i = 0; i < taps.length; i++) {
+    if (used[i]) continue;
+    if (i + 1 < taps.length && (taps[i + 1].t - taps[i].t) < 0.35) {
+      passes.push({ t: taps[i + 1].t, x: taps[i + 1].x, y: taps[i + 1].y });
+      used[i] = true; used[i + 1] = true; i++;
+    } else {
+      pings.push(taps[i]);
+    }
+  }
+  return { pings: pings, passes: passes };
+}
+function easeInOut(u) { return u < 0.5 ? 2 * u * u : 1 - Math.pow(-2 * u + 2, 2) / 2; }
+function passAngleAt(t, passes) {
+  var a = 0;
+  for (var i = 0; i < passes.length; i++) {
+    var u = (t - passes[i].t) / 6;
+    if (u > 0) a += 2 * Math.PI * easeInOut(Math.min(u, 1));
+  }
+  return a;
+}
+function passGlideAt(t, passes) { /* audio octave glide mirroring a live pass */
+  for (var i = 0; i < passes.length; i++) {
+    var u = (t - passes[i].t) / 6;
+    if (u > 0 && u < 1) return 1 + Math.sin(u * Math.PI);
+  }
+  return 1;
+}
+function thetaAt(t, passes) {
+  return THETA0 + (2 * Math.PI * t / ORBIT_PERIOD) + passAngleAt(t, passes);
+}
+
+/* ---------------- geometry ---------------- */
+function earthCenter() { return { x: W * 0.09, y: H * 0.74 }; }
+function earthRadius() { return 0.135 * S; }
+
+/* Warp ("gravity"): the most recent drag bends the ring toward the finger.
+   Weight ramps in during the drag and decays after release (tau 1.5 s). */
+function warpAt(t) {
+  var d = activeDrag || (drags.length ? drags[drags.length - 1] : null);
+  if (!d || !d.pts.length) return null;
+  var last = d.pts[d.pts.length - 1];
+  var weight;
+  if (d.t1 === null || d.t1 === undefined) {
+    weight = Math.min((t - d.t0) / 0.3, 1);
+  } else {
+    if (t < d.t1) weight = Math.min((t - d.t0) / 0.3, 1);
+    else weight = Math.exp(-(t - d.t1) / 1.5);
+  }
+  if (weight <= 0.001) return null;
+  return { x: last.x, y: last.y, w: weight };
+}
+function orbitPoint(theta, t) {
+  var c = earthCenter();
+  var rx = W * 0.46, ry = H * 0.30;
+  var x = c.x + rx * Math.cos(theta);
+  var y = c.y + ry * Math.sin(theta);
+  var warp = warpAt(t);
+  if (warp) {
+    var dx = warp.x - x, dy = warp.y - y;
+    var d2 = dx * dx + dy * dy;
+    var sigma = 0.35 * S;
+    var f = Math.exp(-d2 / (2 * sigma * sigma)) * 0.05 * S * warp.w;
+    var d = Math.sqrt(d2) || 1;
+    x += (dx / d) * f; y += (dy / d) * f;
+  }
+  return { x: x, y: y };
+}
+
+/* ---------------- audio (lazy, gesture-gated, guarded) ---------------- */
+var AC = null, osc = null, oscGain = null;
+function ensureAudio() {
+  if (AC) { if (AC.resume) AC.resume(); return; }
+  if (typeof window === 'undefined') return;
+  var Ctor = window.AudioContext || window.webkitAudioContext;
+  if (typeof Ctor !== 'function') return;
+  try {
+    AC = new Ctor();
+    osc = AC.createOscillator(); osc.type = 'sine';
+    oscGain = AC.createGain(); oscGain.gain.value = 0;
+    osc.connect(oscGain); oscGain.connect(AC.destination);
+    osc.start();
+  } catch (e) { AC = null; osc = null; oscGain = null; }
+}
+function pingSound() {
+  if (!AC || !osc) return;
+  try {
+    var t0 = AC.currentTime;
+    var o = AC.createOscillator(); o.type = 'sine';
+    o.frequency.setValueAtTime(920, t0);
+    o.frequency.exponentialRampToValueAtTime(520, t0 + 0.35);
+    var g = AC.createGain();
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(0.12, t0 + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.6);
+    var delay = AC.createDelay(1); delay.delayTime.value = 0.27;
+    var fb = AC.createGain(); fb.gain.value = 0.32;
+    var wet = AC.createGain(); wet.gain.value = 0.4;
+    o.connect(g); g.connect(AC.destination);
+    g.connect(delay); delay.connect(fb); fb.connect(delay);
+    delay.connect(wet); wet.connect(AC.destination);
+    o.start(t0); o.stop(t0 + 1.4);
+  } catch (e) { /* audio is garnish; the picture never depends on it */ }
+}
+function updateAudio(t, passes) {
+  if (!AC || !osc || !oscGain) return;
+  try {
+    var f = audioFreqAt(t) * passGlideAt(t, passes);
+    osc.frequency.setTargetAtTime(f, AC.currentTime, 0.1);
+    var vf = (velAt(t) - 7.61) / 0.10; /* 0..1 */
+    oscGain.gain.setTargetAtTime(0.03 + 0.03 * vf, AC.currentTime, 0.1);
+  } catch (e) { /* ignore */ }
+}
+
+/* ---------------- pointer ---------------- */
+function nowSec() {
+  return (typeof performance !== 'undefined' && performance.now) ? performance.now() / 1000 : Date.now() / 1000;
+}
+var tStart = nowSec();
+function evtT() { return nowSec() - tStart; }
+function posOf(e) {
+  var r = canvas.getBoundingClientRect();
+  return { x: e.clientX - r.left, y: e.clientY - r.top };
+}
+var downInfo = null;
+canvas.addEventListener('pointerdown', function (e) {
+  ensureAudio();
+  var p = posOf(e), t = evtT();
+  downInfo = { t: t, x: p.x, y: p.y, moved: false };
+  activeDrag = { t0: t, t1: null, pts: [p] };
+  if (canvas.setPointerCapture) { try { canvas.setPointerCapture(e.pointerId); } catch (err) {} }
+});
+canvas.addEventListener('pointermove', function (e) {
+  if (!activeDrag || !downInfo) return;
+  var p = posOf(e);
+  activeDrag.pts.push(p);
+  if (Math.abs(p.x - downInfo.x) + Math.abs(p.y - downInfo.y) > 6) downInfo.moved = true;
+});
+canvas.addEventListener('pointerup', function (e) {
+  var t = evtT();
+  if (activeDrag) { activeDrag.t1 = t; drags.push(activeDrag); activeDrag = null; }
+  if (downInfo && !downInfo.moved && (t - downInfo.t) < 0.3) {
+    var before = deriveEvents().pings.length;
+    taps.push({ t: t, x: downInfo.x, y: downInfo.y });
+    var ev = deriveEvents();
+    if (ev.pings.length > before) pingSound(); /* only a lone tap pings */
+  }
+  downInfo = null;
+});
+canvas.addEventListener('pointercancel', function () {
+  if (activeDrag) { activeDrag.t1 = evtT(); drags.push(activeDrag); activeDrag = null; }
+  downInfo = null;
+});
+
+/* ---------------- draw ---------------- */
+function draw(t) {
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  var ev = deriveEvents();
+  var theta = thetaAt(t, ev.passes);
+
+  ctx.fillStyle = SKY;
+  ctx.fillRect(0, 0, W, H);
+
+  /* waveform — bottom third, frequency/amplitude from telemetry */
+  var alt = altAt(t), vel = velAt(t);
+  var cycles = 2.5 + ((alt - 400) / 16) * 3;
+  var vf = (vel - 7.61) / 0.10;
+  var amp = H * 0.030 * (0.5 + 0.9 * vf);
+  var y0 = H * 0.86;
+  ctx.strokeStyle = CYAN;
+  ctx.globalAlpha = 0.85;
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  for (var x = 0; x <= W; x += 4) {
+    var ph = (2 * Math.PI * cycles * x / W) - (2 * Math.PI * t * 0.5);
+    var y = y0 + amp * Math.sin(ph);
+    if (x === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+
+  /* orbit ring */
+  ctx.strokeStyle = RING;
+  ctx.lineWidth = 1.2;
+  ctx.beginPath();
+  for (var i = 0; i <= 128; i++) {
+    var p = orbitPoint((i / 128) * 2 * Math.PI, t);
+    if (i === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+  }
+  ctx.stroke();
+
+  /* Earth — small partial disc, lower-left, drawn over ring and wave */
+  var c = earthCenter(), rE = earthRadius();
+  ctx.fillStyle = EARTH;
+  ctx.beginPath(); ctx.arc(c.x, c.y, rE, 0, 2 * Math.PI); ctx.fill();
+  ctx.strokeStyle = LIMB;
+  ctx.lineWidth = 2.5;
+  ctx.beginPath(); ctx.arc(c.x, c.y, rE - 1, -2.2, 0.9); ctx.stroke();
+  ctx.globalAlpha = 0.5;
+  ctx.lineWidth = 1.2;
+  ctx.beginPath(); ctx.arc(c.x, c.y, rE * 0.78, -1.9, 0.6); ctx.stroke();
+  ctx.globalAlpha = 1;
+
+  /* station trail — recent positions, closed-form behind the head */
+  var step = (2 * Math.PI / ORBIT_PERIOD) * 0.55;
+  ctx.lineCap = 'round';
+  for (var k = 14; k >= 1; k--) {
+    var p1 = orbitPoint(theta - k * step, t);
+    var p2 = orbitPoint(theta - (k - 1) * step, t);
+    ctx.strokeStyle = CYAN;
+    ctx.globalAlpha = 0.55 * (1 - k / 15);
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+
+  /* ping rings */
+  for (var j = 0; j < ev.pings.length; j++) {
+    var age = t - ev.pings[j].t;
+    if (age < 0 || age > 1.4) continue;
+    var sp = orbitPoint(thetaAt(ev.pings[j].t, ev.passes), ev.pings[j].t);
+    ctx.strokeStyle = CYAN;
+    ctx.globalAlpha = 0.8 * (1 - age / 1.4);
+    ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(sp.x, sp.y, 6 + age * 160, 0, 2 * Math.PI); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+
+  /* the station */
+  var st = orbitPoint(theta, t);
+  ctx.fillStyle = CYAN;
+  ctx.globalAlpha = 0.22;
+  ctx.beginPath(); ctx.arc(st.x, st.y, 8, 0, 2 * Math.PI); ctx.fill();
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = STATION;
+  ctx.beginPath(); ctx.arc(st.x, st.y, 3.2, 0, 2 * Math.PI); ctx.fill();
+
+  /* telemetry — the only text */
+  ctx.fillStyle = TEXT;
+  ctx.font = (isPhone ? 10 : 12) + 'px monospace';
+  ctx.textBaseline = 'top';
+  ctx.fillText('ALT ' + alt.toFixed(1) + ' KM \u00B7 VEL ' + vel.toFixed(2) + ' KM/S', 12, 10);
+
+  updateAudio(t, ev.passes);
+}
+
+draw(0);
+if (typeof requestAnimationFrame === 'function') {
+  var loop = function () {
+    draw(evtT());
+    requestAnimationFrame(loop);
+  };
+  requestAnimationFrame(loop);
+}
+</script>
+</body>
+</html>

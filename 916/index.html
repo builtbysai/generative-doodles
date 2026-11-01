@@ -1,0 +1,649 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Fused Grid</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0A0A0A; overflow: hidden; height: 100%; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+/*
+  No.916 "Fused Grid" (study #112 duncan_geere, PP77 "The Fused City").
+  Four diamond quadrants form one larger diamond. Each quadrant holds a
+  4x4 grid of modules; each module is a random rectilinear street tree
+  grown on a small lattice, folded back on itself with rotational
+  symmetry (order 2 or 4), with a few hatched blocks. Two avenues cross
+  the whole composition at double line weight. White ink on black.
+
+  The city PLOTS itself: segments reveal quadrant by quadrant over
+  about 24 s, then the finished board holds. There is no auto-loop of
+  the plot; a finished board stays until a tap re-fuses a new city.
+  Frame one is the synchronous draw at t = 0 with the plot clock
+  pre-advanced by PLOT_T0, so about one and a half quadrants and most
+  of both avenues are already on the paper.
+
+  Everything shown is a closed-form function of (t, the recorded
+  pointer logs). Street geometry is seeded data per generation
+  (mulberry32). No wall clock feeds the image. Sound starts on the
+  first gesture only: a plotter servo whine while plotting, an
+  electric hum under the drag tracer, a paper-feed burst on re-fuse.
+*/
+
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+
+/* ---------- seeded RNG (mulberry32) ---------- */
+function mulberry32(seed) {
+  var a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+var BASE_SEED = 91677;
+var PLOT_T0 = 8.6;        /* frame-one plot phase: ~1.5 quadrants drawn */
+var Q_START = 5.2;        /* seconds between quadrant plot starts */
+var Q_SPREAD = 6.4;       /* seconds a quadrant's segments spread over */
+var SEG_DUR = 0.4;        /* seconds one segment takes to draw */
+var PLOT_END = 3 * Q_START + Q_SPREAD + SEG_DUR; /* 22.4 s */
+
+/* ---------- viewport ---------- */
+var W = 0, H = 0, DPR = 1, isPhone = false;
+
+function viewportSize() {
+  var w, h;
+  if (typeof window !== 'undefined' && window.visualViewport &&
+      typeof window.visualViewport.width === 'number') {
+    w = window.visualViewport.width; h = window.visualViewport.height;
+  } else if (typeof window !== 'undefined' && typeof window.innerWidth === 'number') {
+    w = window.innerWidth; h = window.innerHeight;
+  } else {
+    w = 1280; h = 900;
+  }
+  return { w: Math.max(50, Math.round(w)), h: Math.max(50, Math.round(h)) };
+}
+
+function resize() {
+  var s = viewportSize();
+  W = s.w; H = s.h;
+  DPR = 1;
+  if (typeof window !== 'undefined' && typeof window.devicePixelRatio === 'number') {
+    DPR = Math.min(2, Math.max(1, window.devicePixelRatio));
+  }
+  canvas.width = Math.round(W * DPR);
+  canvas.height = Math.round(H * DPR);
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  var sw = 0, sh = 0;
+  if (typeof window !== 'undefined' && window.screen) {
+    sw = window.screen.width || 0; sh = window.screen.height || 0;
+  }
+  isPhone = (sw > 0 && sh > 0 && Math.min(sw, sh) < 700) || (H > W * 1.15);
+}
+
+/* ---------- recorded pointer events ---------- */
+/* taps: {t}. dragPts: {t, fx, fy} in frame fractions while dragging.
+   Everything the piece shows derives from these two logs and t. */
+var taps = [];
+var dragPts = [];
+var pDown = null; /* {t, x, y, moved} while a pointer is down */
+var nowSec = 0;
+
+function evtPos(e) {
+  var x = 0, y = 0;
+  if (e && typeof e.clientX === 'number') { x = e.clientX; y = e.clientY; }
+  else if (e && e.touches && e.touches[0]) { x = e.touches[0].clientX; y = e.touches[0].clientY; }
+  else if (e && e.changedTouches && e.changedTouches[0]) { x = e.changedTouches[0].clientX; y = e.changedTouches[0].clientY; }
+  return { x: x, y: y };
+}
+function onDown(e) {
+  ensureAudio();
+  var p = evtPos(e);
+  pDown = { t: nowSec, x: p.x, y: p.y, moved: 0 };
+  if (W > 0 && H > 0) dragPts.push({ t: nowSec, fx: p.x / W, fy: p.y / H });
+}
+function onMove(e) {
+  if (!pDown) return;
+  var p = evtPos(e);
+  pDown.moved += Math.abs(p.x - pDown.x) + Math.abs(p.y - pDown.y);
+  pDown.x = p.x; pDown.y = p.y;
+  if (W > 0 && H > 0) dragPts.push({ t: nowSec, fx: p.x / W, fy: p.y / H });
+}
+function onUp(e) {
+  if (!pDown) return;
+  var dur = nowSec - pDown.t;
+  if (dur < 0.35 && pDown.moved < 8) taps.push({ t: nowSec });
+  pDown = null;
+}
+if (canvas && typeof canvas.addEventListener === 'function') {
+  canvas.addEventListener('pointerdown', onDown);
+  canvas.addEventListener('pointermove', onMove);
+  canvas.addEventListener('pointerup', onUp);
+  canvas.addEventListener('pointercancel', onUp);
+}
+
+/* ---------- gesture derivation (closed form over the tap log) ---------- */
+/* Taps resolve 0.35 s after landing. Two taps inside the window pair
+   into one double-tap (an 8 s inversion). A lone tap, once resolved,
+   is a re-fuse: it births the next generation at its resolve time. */
+function deriveTaps() {
+  var sorted = taps.slice().sort(function (a, b) { return a.t - b.t; });
+  var singles = [], doubles = [], i = 0;
+  while (i < sorted.length) {
+    if (i + 1 < sorted.length && (sorted[i + 1].t - sorted[i].t) < 0.35) {
+      doubles.push(sorted[i + 1].t);
+      i += 2;
+    } else {
+      singles.push(sorted[i].t + 0.35);
+      i += 1;
+    }
+  }
+  return { singles: singles, doubles: doubles };
+}
+
+function stateAt(t) {
+  var d = deriveTaps();
+  var gen = 0;
+  while (gen < d.singles.length && d.singles[gen] <= t) gen += 1;
+  var birth = gen === 0 ? 0 : d.singles[gen - 1];
+  var plotT = (gen === 0 ? PLOT_T0 : 0) + (t - birth);
+  var inverted = false, i;
+  for (i = 0; i < d.doubles.length; i++) {
+    if (d.doubles[i] <= t && t - d.doubles[i] < 8) inverted = true;
+  }
+  return { gen: gen, plotT: plotT, inverted: inverted };
+}
+
+/* ---------- geometry: one fused city per generation ---------- */
+/* Composition space: the big diamond is |x| + |y| <= 1, centered.
+   Quadrants E, S, W, N are the four small diamonds of radius 0.5
+   centered on the axes; they tile the big diamond exactly. Each
+   quadrant has a local frame (a = radial, b = tangential), and its
+   4x4 module grid lives in (a, b) in [-1, 1]^2, clipped to the
+   quadrant diamond |a| + |b| <= 1. */
+
+var QDEFS = [
+  { e1: [1, 0],  e2: [0, 1] },   /* 0 E */
+  { e1: [0, 1],  e2: [-1, 0] },  /* 1 S */
+  { e1: [-1, 0], e2: [0, -1] },  /* 2 W */
+  { e1: [0, -1], e2: [1, 0] }    /* 3 N */
+];
+var PLOT_ORDER = [3, 0, 1, 2];   /* N, E, S, W */
+
+/* Clip a segment to the L1 ball |x| + |y| <= 1 (convex, so the kept
+   part is one interval). Candidate parameters are the segment ends,
+   the axis crossings (kinks of |x| + |y| along the segment) and the
+   four signed roots of +/-x(t) +/- y(t) = 1; between consecutive
+   candidates the inside/outside state cannot change, so a midpoint
+   test per elementary interval is exact. Returns [x1, y1, x2, y2]
+   or null. */
+function clipL1(x1, y1, x2, y2) {
+  var dx = x2 - x1, dy = y2 - y1;
+  var cand = [0, 1], i, tt, ai, bi, sx, sy, den, tm, mx, my, lo = -1, hi = -1;
+  if (dx !== 0) { tt = -x1 / dx; if (tt > 0 && tt < 1) cand.push(tt); }
+  if (dy !== 0) { tt = -y1 / dy; if (tt > 0 && tt < 1) cand.push(tt); }
+  var signs = [1, -1];
+  for (ai = 0; ai < 2; ai++) {
+    for (bi = 0; bi < 2; bi++) {
+      sx = signs[ai]; sy = signs[bi];
+      den = sx * dx + sy * dy;
+      if (den !== 0) {
+        tt = (1 - sx * x1 - sy * y1) / den;
+        if (tt > 0 && tt < 1) cand.push(tt);
+      }
+    }
+  }
+  cand.sort(function (a, b) { return a - b; });
+  for (i = 0; i < cand.length - 1; i++) {
+    tm = (cand[i] + cand[i + 1]) / 2;
+    mx = x1 + dx * tm; my = y1 + dy * tm;
+    if (Math.abs(mx) + Math.abs(my) <= 1 + 1e-9) {
+      if (lo < 0) lo = cand[i];
+      hi = cand[i + 1];
+    }
+  }
+  if (lo < 0) return null;
+  return [x1 + dx * lo, y1 + dy * lo, x1 + dx * hi, y1 + dy * hi];
+}
+
+function qPoint(q, a, b) {
+  var d = QDEFS[q];
+  var rx = 0.5 + 0.5 * a, ry = 0.5 * b;
+  return [d.e1[0] * rx + d.e2[0] * ry, d.e1[1] * rx + d.e2[1] * ry];
+}
+
+/* One module: a spanning tree grown by randomized DFS on a 5x5 node
+   lattice (cell units, nodes at multiples of 0.25), folded by
+   rotational symmetry, plus hatched blocks. Returns segment lists in
+   quadrant (a, b) space: {streets: [...], hatch: [...]}. */
+function buildModule(rng) {
+  var visited = {}, stack = [], edges = [], i, k, s, r, tmp;
+  var start = (rng() * 25) | 0;
+  visited[start] = true;
+  stack.push(start);
+  while (stack.length) {
+    var u = stack[stack.length - 1];
+    var ux = u % 5, uy = (u / 5) | 0;
+    var ns = [];
+    if (ux > 0) ns.push(u - 1);
+    if (ux < 4) ns.push(u + 1);
+    if (uy > 0) ns.push(u - 5);
+    if (uy < 4) ns.push(u + 5);
+    for (s = ns.length - 1; s > 0; s--) {
+      r = (rng() * (s + 1)) | 0; tmp = ns[s]; ns[s] = ns[r]; ns[r] = tmp;
+    }
+    var advanced = false;
+    for (k = 0; k < ns.length; k++) {
+      var v = ns[k];
+      if (!visited[v]) {
+        visited[v] = true;
+        edges.push([u, v]);
+        stack.push(v);
+        advanced = true;
+        break;
+      }
+    }
+    if (!advanced) stack.pop();
+  }
+  var sym = rng() < 0.5 ? 4 : 2;
+  var rots = sym === 4 ? [0, 1, 2, 3] : [0, 2];
+  function rot(x, y, k) {
+    if (k === 0) return [x, y];
+    if (k === 1) return [y, 1 - x];
+    if (k === 2) return [1 - x, 1 - y];
+    return [1 - y, x];
+  }
+  var seen = {}, streets = [];
+  for (i = 0; i < edges.length; i++) {
+    var ax = (edges[i][0] % 5) / 4, ay = ((edges[i][0] / 5) | 0) / 4;
+    var bx = (edges[i][1] % 5) / 4, by = ((edges[i][1] / 5) | 0) / 4;
+    for (k = 0; k < rots.length; k++) {
+      var p = rot(ax, ay, rots[k]), q2 = rot(bx, by, rots[k]);
+      var key = [Math.round(p[0] * 4), Math.round(p[1] * 4),
+                 Math.round(q2[0] * 4), Math.round(q2[1] * 4)];
+      if (key[0] > key[2] || (key[0] === key[2] && key[1] > key[3])) {
+        var sw = key[0]; key[0] = key[2]; key[2] = sw;
+        sw = key[1]; key[1] = key[3]; key[3] = sw;
+      }
+      var ks = key.join(',');
+      if (seen[ks]) continue;
+      seen[ks] = true;
+      streets.push([p[0], p[1], q2[0], q2[1]]);
+    }
+  }
+  /* hatched blocks: 0, 1 or 2 of the module's 16 lattice squares */
+  var roll = rng();
+  var nHatch = roll < 0.45 ? 0 : (roll < 0.8 ? 1 : 2);
+  var hatch = [], usedSq = {};
+  for (i = 0; i < nHatch; i++) {
+    var sq = (rng() * 16) | 0;
+    if (usedSq[sq]) continue;
+    usedSq[sq] = true;
+    var sx = (sq % 4) / 4, sy = ((sq / 4) | 0) / 4, d = 0.25;
+    var fr = [0.25, 0.5, 0.75], fi, f;
+    for (fi = 0; fi < 3; fi++) {
+      f = fr[fi];
+      hatch.push([sx + f * d, sy, sx, sy + f * d]);
+      hatch.push([sx + d, sy + d - f * d, sx + d - f * d, sy + d]);
+    }
+  }
+  return { streets: streets, hatch: hatch };
+}
+
+/* Build the whole city for generation idx. Segments come back in
+   composition coords with draw windows: {x1, y1, x2, y2, start, dur,
+   kind} with kind 0 street, 1 hatch, 2 avenue. Pure function of idx. */
+function buildCity(idx) {
+  var rng = mulberry32((BASE_SEED + idx * 7919) >>> 0);
+  var segs = [];
+  /* avenues first in the stream: seeded angle and offsets */
+  var alpha = (18 + rng() * 54) * Math.PI / 180;
+  var o1 = (rng() - 0.5) * 0.36, o2 = (rng() - 0.5) * 0.36;
+  var qi, col, row;
+  for (qi = 0; qi < 4; qi++) {
+    var q = PLOT_ORDER[qi];
+    var modules = [];
+    for (row = 0; row < 4; row++) {
+      for (col = 0; col < 4; col++) {
+        var a0 = -1 + col * 0.5, b0 = -1 + row * 0.5;
+        var mod = buildModule(rng);
+        var ac = a0 + 0.25, bc = b0 + 0.25;
+        modules.push({
+          a0: a0, b0: b0, mod: mod,
+          dist: Math.abs(ac) + Math.abs(bc), row: row, col: col
+        });
+      }
+    }
+    modules.sort(function (m1, m2) {
+      if (m1.dist !== m2.dist) return m1.dist - m2.dist;
+      if (m1.row !== m2.row) return m1.row - m2.row;
+      return m1.col - m2.col;
+    });
+    /* Modules plot center-out on heavily overlapping windows, so a
+       part-plotted quadrant reads as a density gradient across its
+       whole diamond rather than a finished miniature. Each module
+       spreads its own segments over MOD_SPAN seconds; module starts
+       stagger so the last module ends at Q_SPREAD + SEG_DUR. */
+    var qStart = qi * Q_START;
+    var MOD_SPAN = 4.6;
+    var stagger = (Q_SPREAD + SEG_DUR - MOD_SPAN) / (modules.length - 1);
+    var mi, si;
+    for (mi = 0; mi < modules.length; mi++) {
+      var m = modules[mi];
+      var modSegs = [];
+      var lists = [m.mod.streets, m.mod.hatch];
+      for (var li = 0; li < 2; li++) {
+        var list = lists[li];
+        for (si = 0; si < list.length; si++) {
+          var e = list[si];
+          var ca = clipL1(m.a0 + e[0] * 0.5, m.b0 + e[1] * 0.5,
+                          m.a0 + e[2] * 0.5, m.b0 + e[3] * 0.5);
+          if (!ca) continue;
+          var P1 = qPoint(q, ca[0], ca[1]);
+          var P2 = qPoint(q, ca[2], ca[3]);
+          modSegs.push({ x1: P1[0], y1: P1[1], x2: P2[0], y2: P2[1],
+                         start: 0, dur: SEG_DUR, kind: li });
+        }
+      }
+      var mStart = qStart + mi * stagger;
+      var mCount = modSegs.length;
+      for (si = 0; si < mCount; si++) {
+        modSegs[si].start = mStart +
+          (mCount <= 1 ? 0 : (si / (mCount - 1)) * (MOD_SPAN - SEG_DUR));
+        segs.push(modSegs[si]);
+      }
+    }
+  }
+  /* two avenues, double weight, drawn early like feeder roads */
+  var dirs = [[Math.cos(alpha), Math.sin(alpha)],
+              [Math.cos(alpha + Math.PI / 2), Math.sin(alpha + Math.PI / 2)]];
+  var offs = [o1, o2], starts = [1.0, 6.0], ai;
+  for (ai = 0; ai < 2; ai++) {
+    var dv = dirs[ai], nv = [-dv[1], dv[0]];
+    var cxp = nv[0] * offs[ai], cyp = nv[1] * offs[ai];
+    var cl = clipL1(cxp - dv[0] * 2, cyp - dv[1] * 2,
+                    cxp + dv[0] * 2, cyp + dv[1] * 2);
+    if (cl) {
+      segs.push({ x1: cl[0], y1: cl[1], x2: cl[2], y2: cl[3],
+                  start: starts[ai], dur: 3.2, kind: 2 });
+    }
+  }
+  return segs;
+}
+
+var genCache = { idx: -1, segs: null };
+function cityFor(idx) {
+  if (genCache.idx !== idx) genCache = { idx: idx, segs: buildCity(idx) };
+  return genCache.segs;
+}
+
+/* ---------- audio: the machine ---------- */
+var AC = null, audioTried = false;
+var servoOsc = null, servoGain = null, humOsc = null, humGain = null;
+var noiseBuf = null, audioGenSeen = -1;
+
+function ensureAudio() {
+  if (audioTried) return;
+  audioTried = true;
+  try {
+    var Ctor = null;
+    if (typeof window !== 'undefined') {
+      if (typeof window.AudioContext === 'function') Ctor = window.AudioContext;
+      else if (typeof window.webkitAudioContext === 'function') Ctor = window.webkitAudioContext;
+    }
+    if (!Ctor) return;
+    AC = new Ctor();
+    var filt = AC.createBiquadFilter();
+    filt.type = 'lowpass'; filt.frequency.value = 420; filt.Q.value = 2;
+    servoGain = AC.createGain(); servoGain.gain.value = 0;
+    servoOsc = AC.createOscillator();
+    servoOsc.type = 'sawtooth'; servoOsc.frequency.value = 52;
+    servoOsc.connect(filt); filt.connect(servoGain); servoGain.connect(AC.destination);
+    servoOsc.start();
+    humGain = AC.createGain(); humGain.gain.value = 0;
+    humOsc = AC.createOscillator();
+    humOsc.type = 'triangle'; humOsc.frequency.value = 110;
+    humOsc.connect(humGain); humGain.connect(AC.destination);
+    humOsc.start();
+    var len = AC.sampleRate | 0;
+    noiseBuf = AC.createBuffer(1, len, AC.sampleRate);
+    var data = noiseBuf.getChannelData(0);
+    var nrng = mulberry32(4161);
+    for (var i = 0; i < len; i++) data[i] = nrng() * 2 - 1;
+  } catch (err) {
+    AC = null; servoOsc = null; servoGain = null; humOsc = null; humGain = null;
+  }
+}
+
+function paperBurst() {
+  if (!AC || !noiseBuf) return;
+  try {
+    var t0 = AC.currentTime;
+    var src = AC.createBufferSource(); src.buffer = noiseBuf;
+    var bp = AC.createBiquadFilter();
+    bp.type = 'bandpass'; bp.frequency.value = 900; bp.Q.value = 0.8;
+    var g = AC.createGain();
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(0.09, t0 + 0.03);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.32);
+    src.connect(bp); bp.connect(g); g.connect(AC.destination);
+    src.start(t0); src.stop(t0 + 0.36);
+  } catch (err) { /* audio is garnish */ }
+}
+
+function dragSpeedAt(t) {
+  var dist = 0, i;
+  for (i = 1; i < dragPts.length; i++) {
+    var a = dragPts[i - 1], b = dragPts[i];
+    if (b.t > t - 0.3 && b.t <= t) {
+      var dx = (b.fx - a.fx) * W, dy = (b.fy - a.fy) * H;
+      dist += Math.sqrt(dx * dx + dy * dy);
+    }
+  }
+  return dist / 0.3; /* px per second */
+}
+
+function updateAudio(t, st) {
+  if (!AC) return;
+  try {
+    if (AC.state === 'suspended' && typeof AC.resume === 'function') AC.resume();
+    var tc = AC.currentTime;
+    if (audioGenSeen !== st.gen) {
+      if (audioGenSeen !== -1) paperBurst();
+      audioGenSeen = st.gen;
+    }
+    var plotting = st.plotT < PLOT_END;
+    if (servoGain && servoOsc) {
+      servoGain.gain.setTargetAtTime(plotting ? 0.014 : 0, tc, 0.12);
+      servoOsc.frequency.setTargetAtTime(52 + 9 * Math.sin(t * 1.7), tc, 0.1);
+    }
+    if (humGain) {
+      var sp = pDown ? dragSpeedAt(t) : 0;
+      var lvl = Math.min(0.05, sp / 6000);
+      humGain.gain.setTargetAtTime(lvl, tc, 0.06);
+    }
+  } catch (err) { /* the picture never depends on the sound */ }
+}
+
+/* ---------- tracer ---------- */
+/* Snap a composition-space point to the nearest plotted street or
+   avenue segment of the current city. Falls back to all streets when
+   nothing is plotted yet near the plot front. */
+function snapToStreet(segs, plotT, px, py) {
+  var best = null, bestD = Infinity, pass, i, s;
+  for (pass = 0; pass < 2 && !best; pass++) {
+    for (i = 0; i < segs.length; i++) {
+      s = segs[i];
+      if (s.kind === 1) continue;
+      if (pass === 0 && (plotT - s.start) < s.dur) continue;
+      var dx = s.x2 - s.x1, dy = s.y2 - s.y1;
+      var len2 = dx * dx + dy * dy;
+      var u = len2 > 0 ? ((px - s.x1) * dx + (py - s.y1) * dy) / len2 : 0;
+      if (u < 0) u = 0; if (u > 1) u = 1;
+      var ex = s.x1 + dx * u - px, ey = s.y1 + dy * u - py;
+      var d2 = ex * ex + ey * ey;
+      if (d2 < bestD) { bestD = d2; best = [s.x1 + dx * u, s.y1 + dy * u]; }
+    }
+  }
+  return best;
+}
+
+function drawTracer(t, segs, plotT, L, ink) {
+  while (dragPts.length && dragPts[0].t < t - 2) dragPts.shift();
+  if (dragPts.length > 600) dragPts.splice(0, dragPts.length - 600);
+  var pts = [], i, p;
+  for (i = 0; i < dragPts.length; i++) {
+    p = dragPts[i];
+    if (t - p.t <= 1.3) pts.push(p);
+  }
+  if (!pts.length) return;
+  var stride = pts.length > 48 ? Math.ceil(pts.length / 48) : 1;
+  var snapped = [];
+  for (i = 0; i < pts.length; i += stride) {
+    p = pts[i];
+    var cxp = (p.fx * W - L.cx) / L.R, cyp = (p.fy * H - L.cy) / L.R;
+    var sn = snapToStreet(segs, plotT, cxp, cyp);
+    if (sn) snapped.push({ x: sn[0], y: sn[1], t: p.t });
+  }
+  /* the freshest point always gets a head, at full rate */
+  var last = pts[pts.length - 1];
+  if (stride > 1) {
+    var hx = (last.fx * W - L.cx) / L.R, hy = (last.fy * H - L.cy) / L.R;
+    var hs = snapToStreet(segs, plotT, hx, hy);
+    if (hs) snapped.push({ x: hs[0], y: hs[1], t: last.t });
+  }
+  if (!snapped.length) return;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  var passes = [[5.5, 0.18], [2.6, 0.45], [1.3, 0.95]], pi, si;
+  for (pi = 0; pi < passes.length; pi++) {
+    ctx.strokeStyle = ink;
+    ctx.lineWidth = Math.max(1, passes[pi][0] * L.R / 414);
+    for (si = 1; si < snapped.length; si++) {
+      var age = t - (snapped[si - 1].t + snapped[si].t) / 2;
+      var a = 1 - age / 1.3;
+      if (a <= 0) continue;
+      ctx.globalAlpha = passes[pi][1] * a;
+      ctx.beginPath();
+      ctx.moveTo(L.cx + snapped[si - 1].x * L.R, L.cy + snapped[si - 1].y * L.R);
+      ctx.lineTo(L.cx + snapped[si].x * L.R, L.cy + snapped[si].y * L.R);
+      ctx.stroke();
+    }
+  }
+  var head = snapped[snapped.length - 1];
+  ctx.globalAlpha = Math.max(0, 1 - (t - head.t) / 1.3);
+  ctx.fillStyle = ink;
+  ctx.beginPath();
+  ctx.arc(L.cx + head.x * L.R, L.cy + head.y * L.R,
+          Math.max(1.6, L.R * 0.008), 0, Math.PI * 2);
+  ctx.fill();
+  ctx.globalAlpha = 1;
+}
+
+/* ---------- draw ---------- */
+function draw(t) {
+  if (!W || !H) resize();
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  var st = stateAt(t);
+  var ground = st.inverted ? '#FAFAF8' : '#0A0A0A';
+  var ink = st.inverted ? '#111111' : '#F5F5F2';
+  ctx.fillStyle = ground;
+  ctx.fillRect(0, 0, W, H);
+  try {
+    if (typeof document !== 'undefined' && document.body && document.body.style) {
+      document.body.style.background = ground;
+    }
+  } catch (err) { /* canvas fill already carries the ground */ }
+
+  var S = Math.min(W, H);
+  var L = { cx: W / 2, cy: H / 2, R: 0.46 * S };
+  var streetW = Math.max(1.0, S * 0.0016);
+  var hatchW = Math.max(0.8, streetW * 0.7);
+  var avenueW = streetW * 2.2;
+  var segs = cityFor(st.gen);
+  var plotT = st.plotT;
+  var i, s, p;
+
+  /* hatch pass, then street pass, both batched */
+  var kinds = [1, 0];
+  for (var ki = 0; ki < 2; ki++) {
+    var kind = kinds[ki];
+    ctx.strokeStyle = ink;
+    ctx.lineWidth = kind === 1 ? hatchW : streetW;
+    ctx.lineCap = 'square';
+    ctx.beginPath();
+    for (i = 0; i < segs.length; i++) {
+      s = segs[i];
+      if (s.kind !== kind) continue;
+      if (plotT - s.start >= s.dur) {
+        ctx.moveTo(L.cx + s.x1 * L.R, L.cy + s.y1 * L.R);
+        ctx.lineTo(L.cx + s.x2 * L.R, L.cy + s.y2 * L.R);
+      }
+    }
+    ctx.stroke();
+  }
+  /* avenues (full ones join the batch pass above their own width) */
+  ctx.strokeStyle = ink;
+  ctx.lineWidth = avenueW;
+  ctx.lineCap = 'square';
+  ctx.beginPath();
+  for (i = 0; i < segs.length; i++) {
+    s = segs[i];
+    if (s.kind !== 2) continue;
+    if (plotT - s.start >= s.dur) {
+      ctx.moveTo(L.cx + s.x1 * L.R, L.cy + s.y1 * L.R);
+      ctx.lineTo(L.cx + s.x2 * L.R, L.cy + s.y2 * L.R);
+    }
+  }
+  ctx.stroke();
+  /* segments mid-draw: the pen strokes, on top */
+  for (i = 0; i < segs.length; i++) {
+    s = segs[i];
+    p = (plotT - s.start) / s.dur;
+    if (p <= 0 || p >= 1) continue;
+    ctx.strokeStyle = ink;
+    ctx.lineWidth = s.kind === 2 ? avenueW : (s.kind === 1 ? hatchW : streetW);
+    ctx.lineCap = 'square';
+    ctx.beginPath();
+    ctx.moveTo(L.cx + s.x1 * L.R, L.cy + s.y1 * L.R);
+    ctx.lineTo(L.cx + (s.x1 + (s.x2 - s.x1) * p) * L.R,
+               L.cy + (s.y1 + (s.y2 - s.y1) * p) * L.R);
+    ctx.stroke();
+  }
+
+  drawTracer(t, segs, plotT, L, ink);
+  updateAudio(t, st);
+}
+
+/* ---------- run ---------- */
+resize();
+draw(0);
+var startStamp = null;
+function frame(ts) {
+  if (startStamp === null) startStamp = ts;
+  nowSec = (ts - startStamp) / 1000;
+  draw(nowSec);
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+}
+if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+  window.addEventListener('resize', function () { resize(); draw(nowSec); });
+}
+if (typeof window !== 'undefined' && window.visualViewport &&
+    typeof window.visualViewport.addEventListener === 'function') {
+  window.visualViewport.addEventListener('resize', function () { resize(); draw(nowSec); });
+}
+</script>
+</body>
+</html>
