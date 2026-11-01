@@ -1,0 +1,503 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Winch Ballet</title>
+<style>
+  html, body {
+    margin: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #0B0B10;
+  }
+  canvas {
+    display: block;
+    touch-action: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="piece"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  var canvas = document.getElementById('piece');
+  var ctx = canvas.getContext('2d');
+
+  var VOID = '#0B0B10';
+  var TUBING = '#E8E8E6';
+  var WIRE = '#3A3A40';
+  var CYAN = '#45F3D0';
+  var MAGENTA = '#FF4FD8';
+  var GLINT = '#FFFFFF';
+  var SHADOW = '#1A1A22';
+
+  var PHASE0 = 10;          // fixed first-frame phase: mid ambient canon, magenta wash up
+  var LOOP = 120;           // every period below divides 120 s: the canon is seamless
+  var RIG_Y = -0.8;         // implied rig lives far above the frame; wires exit the top edge
+
+  var W = 0;
+  var H = 0;
+  var DPR = 1;
+  var isPhone = false;
+
+  var startStamp = 0;
+  if (typeof performance !== 'undefined' && performance && typeof performance.now === 'function') {
+    startStamp = performance.now();
+  }
+
+  function clamp(v, a, b) {
+    return v < a ? a : (v > b ? b : v);
+  }
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0;
+      a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function elapsedNow() {
+    if (typeof performance !== 'undefined' && performance && typeof performance.now === 'function') {
+      return Math.max(0, (performance.now() - startStamp) / 1000);
+    }
+    return 0;
+  }
+
+  // ---- the three truss triangles -------------------------------------------
+  // Local corners: apex, bottom-left, bottom-right. Each corner hangs from
+  // its own wire anchored at the implied rig (RIG_Y, off-frame). A corner's
+  // position is anchor + wireDirection * wireLength(t): height is the mean
+  // length, pitch and roll are the length differentials, so every attitude
+  // change is literally the winches paying wire in and out.
+  var LOCAL = [
+    { lx: 0, ly: -0.66 },
+    { lx: -0.60, ly: 0.44 },
+    { lx: 0.60, ly: 0.44 }
+  ];
+
+  var tris = [];
+
+  function makeTris() {
+    var defs = [
+      { cx: 0.33, cy: 0.40, half: 0.190, depth: 1.00, seed: 10830411 },
+      { cx: 0.66, cy: 0.33, half: 0.155, depth: 0.84, seed: 10830527 },
+      { cx: 0.50, cy: 0.615, half: 0.128, depth: 0.68, seed: 10830643 }
+    ];
+    tris = [];
+    for (var i = 0; i < defs.length; i++) {
+      var d = defs[i];
+      var rand = mulberry32(d.seed);
+      var tri = {
+        cx: d.cx, cy: d.cy, half: d.half, depth: d.depth, idx: i,
+        hPh1: rand() * Math.PI * 2,
+        hPh2: rand() * Math.PI * 2,
+        swayPh: rand() * Math.PI * 2,
+        skewPh: rand() * Math.PI * 2,
+        corners: [],
+        event: null        // last released drag: { t0, dh, dskew }
+      };
+      for (var k = 0; k < 3; k++) {
+        var lc = LOCAL[k];
+        var ax = d.cx + lc.lx * d.half * 1.35;
+        var dirX = lc.lx * 0.16;
+        var dirY = Math.sqrt(1 - dirX * dirX);
+        var restY = d.cy + lc.ly * d.half;
+        tri.corners.push({
+          lx: lc.lx, ly: lc.ly,
+          ax: ax, dirX: dirX, dirY: dirY,
+          L0: (restY - RIG_Y) / dirY,
+          p1: rand() * Math.PI * 2,
+          p2: rand() * Math.PI * 2,
+          gPh: rand() * Math.PI * 2
+        });
+      }
+      tris.push(tri);
+    }
+  }
+
+  // ambient canon: gentle bob, plus a slow dip that visits each frame in
+  // turn (dip, tilt, recover in canon — one per 24 s, staggered by thirds)
+  function heightAt(tri, t) {
+    var bob = 0.012 * Math.sin(2 * Math.PI * t / 15 + tri.hPh1)
+            + 0.007 * Math.sin(2 * Math.PI * t / 10 + tri.hPh2);
+    var dipArg = Math.sin(2 * Math.PI * (t / 24 - tri.idx / 3));
+    var dip = 0.045 * (dipArg > 0 ? dipArg * dipArg : 0);
+    return bob + dip;
+  }
+
+  function cornerDLength(corner, t) {
+    return 0.016 * (0.6 * Math.sin(2 * Math.PI * t / 12 + corner.p1)
+                  + 0.4 * Math.sin(2 * Math.PI * t / 7.5 + corner.p2));
+  }
+
+  // drag response: ~2 s damped winch settle toward the nudged target, then
+  // a slow release back to the unattended canon
+  function dragEnvelope(dt) {
+    if (dt < 0) return 0;
+    var attack = 1 - Math.exp(-dt / 0.55);
+    var release = dt < 2.2 ? 1 : Math.exp(-(dt - 2.2) / 3.5);
+    return attack * release;
+  }
+
+  var liveDrag = null;   // { tri, t0, dh, dskew }
+
+  function dragOffsetFor(tri, t) {
+    var dh = 0;
+    var dskew = 0;
+    var env;
+    if (liveDrag && liveDrag.tri === tri) {
+      env = dragEnvelope(t - liveDrag.t0);
+      dh += liveDrag.dh * env;
+      dskew += liveDrag.dskew * env;
+    }
+    if (tri.event) {
+      env = dragEnvelope(t - tri.event.t0);
+      if (env > 0.001) {
+        dh += tri.event.dh * env;
+        dskew += tri.event.dskew * env;
+      }
+    }
+    return { dh: dh, dskew: dskew };
+  }
+
+  function cornerPos(tri, corner, t, dragOff) {
+    var L = corner.L0 + cornerDLength(corner, t) + heightAt(tri, t) + dragOff.dh;
+    var x = corner.ax + corner.dirX * L;
+    var y = RIG_Y + corner.dirY * L;
+    // pendulum sway of the whole suspended frame, growing with wire paid out
+    x += Math.sin(2 * Math.PI * t / 20 + tri.swayPh) * (y - RIG_Y) * 0.022;
+    // roll reads as a horizontal skew across the frame's own height
+    var skew = 0.05 * Math.sin(2 * Math.PI * t / 30 + tri.skewPh) + dragOff.dskew;
+    x += corner.ly * skew;
+    return { x: x, y: y };
+  }
+
+  function triCorners(tri, t) {
+    var dragOff = dragOffsetFor(tri, t);
+    var pts = [];
+    for (var k = 0; k < 3; k++) pts.push(cornerPos(tri, tri.corners[k], t, dragOff));
+    if (isPhone) {
+      // frames ride a little larger on small screens so the truss reads
+      for (var j = 0; j < 3; j++) {
+        pts[j] = {
+          x: tri.cx + (pts[j].x - tri.cx) * 1.12,
+          y: tri.cy + (pts[j].y - tri.cy) * 1.12
+        };
+      }
+    }
+    return pts;
+  }
+
+  // ---- slow strobe wash: cyan 6 s, magenta 6 s, raised-cosine, kept low ----
+  function washAt(t) {
+    var cyc = ((t % 12) + 12) % 12;
+    var color;
+    var u;
+    if (cyc < 6) { color = CYAN; u = cyc / 6; }
+    else { color = MAGENTA; u = (cyc - 6) / 6; }
+    var s = Math.sin(Math.PI * u);
+    return { color: color, amt: Math.pow(s, 1.5) };
+  }
+
+  function glintAt(corner, t) {
+    var s = Math.sin(2 * Math.PI * t / 6 + corner.gPh);
+    if (s <= 0) return 0;
+    return Math.pow(s, 8);
+  }
+
+  // ---- sizing ---------------------------------------------------------------
+  function resize() {
+    var vv = window.visualViewport;
+    var w = (vv && vv.width) ? vv.width : window.innerWidth;
+    var h = (vv && vv.height) ? vv.height : window.innerHeight;
+    var sw = (window.screen && window.screen.width) ? window.screen.width : w;
+    var sh = (window.screen && window.screen.height) ? window.screen.height : h;
+    W = Math.max(1, Math.round(w));
+    H = Math.max(1, Math.round(h));
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    isPhone = Math.min(sw, sh) < 700 || (Math.min(sw, sh) >= 700 && H > W * 1.15);
+  }
+
+  function geomNow() {
+    var unit = Math.min(W, H);
+    return { unit: unit, ox: (W - unit) / 2, oy: (H - unit) / 2 };
+  }
+
+  function toScreen(nx, ny, geom) {
+    return { x: geom.ox + nx * geom.unit, y: geom.oy + ny * geom.unit };
+  }
+
+  // ---- drawing ----------------------------------------------------------------
+  function polyPath(pts, geom) {
+    ctx.beginPath();
+    for (var i = 0; i < pts.length; i++) {
+      var p = toScreen(pts[i].x, pts[i].y, geom);
+      if (i === 0) ctx.moveTo(p.x, p.y);
+      else ctx.lineTo(p.x, p.y);
+    }
+    ctx.closePath();
+  }
+
+  function drawShadow(pts, geom) {
+    // floor projection: compressed toward a floor line, stretched lower-right
+    var floorY = 0.88;
+    var sp = [];
+    for (var i = 0; i < pts.length; i++) {
+      sp.push({
+        x: pts[i].x + 0.07 + (pts[i].y - 0.3) * 0.03,
+        y: floorY + (pts[i].y - floorY) * 0.30
+      });
+    }
+    ctx.fillStyle = SHADOW;
+    ctx.globalAlpha = 0.55;
+    polyPath(sp, geom);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  function drawWires(tri, pts, geom) {
+    ctx.strokeStyle = WIRE;
+    ctx.globalAlpha = 0.5;
+    ctx.lineWidth = Math.max(1, geom.unit * 0.0016);
+    ctx.beginPath();
+    for (var k = 0; k < 3; k++) {
+      var c = toScreen(pts[k].x, pts[k].y, geom);
+      var a = toScreen(tri.corners[k].ax, RIG_Y, geom);
+      ctx.moveTo(c.x, c.y);
+      ctx.lineTo(a.x, a.y);
+    }
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  function drawFrame(tri, pts, geom, wash) {
+    var unit = geom.unit;
+    var cen = {
+      x: (pts[0].x + pts[1].x + pts[2].x) / 3,
+      y: (pts[0].y + pts[1].y + pts[2].y) / 3
+    };
+    var inner = [];
+    var i;
+    for (i = 0; i < 3; i++) {
+      inner.push({
+        x: cen.x + (pts[i].x - cen.x) * 0.45,
+        y: cen.y + (pts[i].y - cen.y) * 0.45
+      });
+    }
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+
+    // truss webbing: struts corner-to-inner, then the inner triangle
+    ctx.strokeStyle = TUBING;
+    ctx.globalAlpha = 0.55 * tri.depth + 0.25;
+    ctx.lineWidth = Math.max(1, unit * 0.0032 * tri.depth);
+    ctx.beginPath();
+    for (i = 0; i < 3; i++) {
+      var a = toScreen(pts[i].x, pts[i].y, geom);
+      var b = toScreen(inner[(i + 1) % 3].x, inner[(i + 1) % 3].y, geom);
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x, b.y);
+      var c2 = toScreen(inner[(i + 2) % 3].x, inner[(i + 2) % 3].y, geom);
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(c2.x, c2.y);
+    }
+    ctx.stroke();
+    ctx.globalAlpha = 0.8 * tri.depth + 0.1;
+    ctx.lineWidth = Math.max(1, unit * 0.0028 * tri.depth);
+    polyPath(inner, geom);
+    ctx.stroke();
+
+    // main chords: the outer triangle, drawn as tubing
+    ctx.globalAlpha = 0.35 + 0.65 * tri.depth;
+    ctx.lineWidth = Math.max(1.6, unit * 0.0105 * tri.depth);
+    ctx.strokeStyle = TUBING;
+    polyPath(pts, geom);
+    ctx.stroke();
+    // the wash catches the tubing as it passes
+    if (wash.amt > 0.01) {
+      ctx.globalAlpha = 0.30 * wash.amt * (0.35 + 0.65 * tri.depth);
+      ctx.strokeStyle = wash.color;
+      polyPath(pts, geom);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+
+    // corner markers: a steady white point, with a sparkle as light catches it
+    for (i = 0; i < 3; i++) {
+      var p = toScreen(pts[i].x, pts[i].y, geom);
+      ctx.fillStyle = GLINT;
+      ctx.globalAlpha = 0.35 + 0.65 * tri.depth;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, Math.max(1.2, unit * 0.0052 * tri.depth), 0, Math.PI * 2);
+      ctx.fill();
+      var g = glintAt(tri.corners[i], drawT);
+      if (g > 0.02) {
+        var s = unit * (0.010 + 0.020 * g) * tri.depth;
+        ctx.strokeStyle = GLINT;
+        ctx.globalAlpha = g;
+        ctx.lineWidth = Math.max(1, unit * 0.0016);
+        ctx.beginPath();
+        ctx.moveTo(p.x - s, p.y);
+        ctx.lineTo(p.x + s, p.y);
+        ctx.moveTo(p.x, p.y - s);
+        ctx.lineTo(p.x, p.y + s);
+        ctx.stroke();
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  var drawT = PHASE0;
+
+  function drawAt(t) {
+    drawT = t;
+    var geom = geomNow();
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+    ctx.fillStyle = VOID;
+    ctx.fillRect(0, 0, W, H);
+
+    var wash = washAt(t);
+    // global tint wash over the whole void, alternating colour, kept gentle
+    if (wash.amt > 0.01) {
+      ctx.fillStyle = wash.color;
+      ctx.globalAlpha = 0.05 * wash.amt;
+      ctx.fillRect(0, 0, W, H);
+      ctx.globalAlpha = 1;
+    }
+
+    var all = [];
+    var i;
+    for (i = 0; i < tris.length; i++) all.push(triCorners(tris[i], t));
+
+    // far frames first: shadows, then wires, then the truss frames
+    var order = [2, 1, 0];
+    for (i = 0; i < order.length; i++) drawShadow(all[order[i]], geom);
+    for (i = 0; i < order.length; i++) drawWires(tris[order[i]], all[order[i]], geom);
+    for (i = 0; i < order.length; i++) drawFrame(tris[order[i]], all[order[i]], geom, wash);
+  }
+
+  // ---- interaction: drag a frame to re-target its winches --------------------
+  function eventPoint(e) {
+    var rect = { left: 0, top: 0 };
+    if (typeof canvas.getBoundingClientRect === 'function') rect = canvas.getBoundingClientRect();
+    return {
+      x: (e.clientX || 0) - rect.left,
+      y: (e.clientY || 0) - rect.top
+    };
+  }
+
+  function toNorm(px, py) {
+    var unit = Math.min(W, H);
+    return {
+      x: (px - (W - unit) / 2) / unit,
+      y: (py - (H - unit) / 2) / unit
+    };
+  }
+
+  var dragState = null;   // { triIdx, startX, startY }
+
+  function pickTri(nx, ny) {
+    var t = elapsedNow();
+    var best = -1;
+    var bestD = 0.24;
+    for (var i = 0; i < tris.length; i++) {
+      var tri = tris[i];
+      var pts = triCorners(tri, t);
+      var cx = (pts[0].x + pts[1].x + pts[2].x) / 3;
+      var cy = (pts[0].y + pts[1].y + pts[2].y) / 3;
+      var dx = nx - cx;
+      var dy = ny - cy;
+      var d = Math.sqrt(dx * dx + dy * dy);
+      if (d < bestD) { bestD = d; best = i; }
+    }
+    return best;
+  }
+
+  function onPointerDown(e) {
+    var p = eventPoint(e);
+    var n = toNorm(p.x, p.y);
+    var idx = pickTri(n.x, n.y);
+    if (idx < 0) return;
+    dragState = { triIdx: idx, startX: n.x, startY: n.y };
+    liveDrag = { tri: tris[idx], t0: elapsedNow(), dh: 0, dskew: 0 };
+    if (canvas.setPointerCapture && e.pointerId !== undefined) {
+      try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+    }
+    if (e.preventDefault) e.preventDefault();
+  }
+
+  function onPointerMove(e) {
+    if (!dragState || !liveDrag) return;
+    var p = eventPoint(e);
+    var n = toNorm(p.x, p.y);
+    // vertical drag pays wire out / hauls it in; horizontal drag re-rolls
+    liveDrag.dh = clamp((n.y - dragState.startY) * 0.6, -0.08, 0.08);
+    liveDrag.dskew = clamp((n.x - dragState.startX) * 0.5, -0.06, 0.06);
+    if (e.preventDefault) e.preventDefault();
+  }
+
+  function onPointerUp(e) {
+    if (!dragState || !liveDrag) return;
+    var tri = tris[dragState.triIdx];
+    tri.event = { t0: liveDrag.t0, dh: liveDrag.dh, dskew: liveDrag.dskew };
+    dragState = null;
+    liveDrag = null;
+    if (e && e.preventDefault) e.preventDefault();
+  }
+
+  function onPointerCancel() {
+    if (dragState && liveDrag) {
+      var tri = tris[dragState.triIdx];
+      tri.event = { t0: liveDrag.t0, dh: liveDrag.dh, dskew: liveDrag.dskew };
+    }
+    dragState = null;
+    liveDrag = null;
+  }
+
+  if (window.visualViewport && typeof window.visualViewport.addEventListener === 'function') {
+    window.visualViewport.addEventListener('resize', resize);
+  }
+  if (typeof window.addEventListener === 'function') {
+    window.addEventListener('resize', resize);
+  }
+  if (typeof canvas.addEventListener === 'function') {
+    canvas.addEventListener('pointerdown', onPointerDown);
+    canvas.addEventListener('pointermove', onPointerMove);
+    canvas.addEventListener('pointerup', onPointerUp);
+    canvas.addEventListener('pointercancel', onPointerCancel);
+  }
+
+  makeTris();
+  resize();
+  if (typeof performance !== 'undefined' && performance && typeof performance.now === 'function') {
+    startStamp = performance.now();
+  }
+  drawAt(PHASE0);
+
+  var raf = null;
+  if (typeof window.requestAnimationFrame === 'function') raf = window.requestAnimationFrame;
+  else if (typeof requestAnimationFrame === 'function') raf = requestAnimationFrame;
+
+  function loop() {
+    drawAt(PHASE0 + elapsedNow());
+    if (raf) raf(loop);
+  }
+  if (raf) raf(loop);
+})();
+</script>
+</body>
+</html>
