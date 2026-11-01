@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>What the Frame Carries</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #070708; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded rng ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  var T0 = 10;            // frame one: fixed offset, seconds
+  var LOOP = 50;          // frame glide/turn loop, seconds
+  var SPILL_PERIOD = 17, SPILL_LEN = 3;
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ---------- state ----------
+  var seed = 1026187;
+  var frameSeed = seed;      // frame proportions seed
+  var imgSeed = seed + 77;   // imagery seed
+  var modeOffset = 0;        // tap: advance mapping mode
+  var epoch = 0;             // double-tap: loop clock restart (piece-time)
+  var loadPerf = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+
+  var drag = null;           // {dx, dy, rot, t0} recorded drag event
+  var lastSpillIdx = -1;
+
+  // ---------- audio (lazy, gesture-gated, typeof-guarded) ----------
+  var AC = null, master = null, modeOsc = null, modeGain = null;
+  function ensureAudio() {
+    if (AC) return;
+    if (typeof window === 'undefined') return;
+    var Ctor = window.AudioContext || window.webkitAudioContext;
+    if (typeof Ctor !== 'function') return;
+    try {
+      AC = new Ctor();
+      master = AC.createGain(); master.gain.value = 0.0;
+      master.connect(AC.destination);
+      modeOsc = AC.createOscillator(); modeOsc.type = 'sine'; modeOsc.frequency.value = 196;
+      modeGain = AC.createGain(); modeGain.gain.value = 0.05;
+      var lp = AC.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 900;
+      modeOsc.connect(modeGain); modeGain.connect(lp); lp.connect(master);
+      modeOsc.start();
+      master.gain.linearRampToValueAtTime(0.16, AC.currentTime + 1.5);
+    } catch (e) { AC = null; }
+  }
+  function noiseBurst(dur, freq, gain) {
+    if (!AC) return;
+    try {
+      var n = Math.floor(AC.sampleRate * dur);
+      var buf = AC.createBuffer(1, n, AC.sampleRate);
+      var d = buf.getChannelData(0);
+      for (var i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / n);
+      var src = AC.createBufferSource(); src.buffer = buf;
+      var f = AC.createBiquadFilter(); f.type = 'bandpass'; f.frequency.value = freq; f.Q.value = 0.8;
+      var g = AC.createGain(); g.gain.value = gain;
+      src.connect(f); f.connect(g); g.connect(AC.destination);
+      src.start();
+    } catch (e) {}
+  }
+
+  // ---------- viewport ----------
+  function viewSize() {
+    var w, h;
+    if (typeof window !== 'undefined' && window.visualViewport) {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    } else {
+      w = window.innerWidth; h = window.innerHeight;
+    }
+    return { w: w, h: h };
+  }
+  function isPhone(w, h) {
+    var sw = (typeof window !== 'undefined' && window.screen) ? window.screen.width : w;
+    var sh = (typeof window !== 'undefined' && window.screen) ? window.screen.height : h;
+    if (Math.min(sw, sh) < 700) return true;
+    return h > w * 1.15;
+  }
+
+  // ---------- frame transform: closed-form in loop time ----------
+  // returns {cx, cy, rot, kx, ky, hw, hh} — hw/hh are local half extents
+  function frameAt(lt, W, H) {
+    var rng = mulberry32(frameSeed);
+    var aspect = 0.52 + rng() * 0.14;      // width / height of the frame
+    var fh = H * 0.70;
+    var fw = fh * aspect;
+    var swayX = Math.sin(lt * Math.PI * 2 / LOOP + 0.7) * W * 0.035;
+    var swayY = Math.sin(lt * Math.PI * 2 / LOOP * 2 + 2.1) * H * 0.018;
+    var rot = Math.sin(lt * Math.PI * 2 / LOOP) * 0.16
+            + Math.sin(lt * Math.PI * 2 / LOOP * 2 + 1.3) * 0.05;
+    var tilt = Math.sin(lt * Math.PI * 2 / LOOP + 2.4);   // -1..1 perspective
+    var kx = tilt * 0.30;                                  // horizontal shear
+    var ky = tilt * 0.10;                                  // slight vertical shear
+    // fit: scale down so the sheared+rotated corners stay inside the viewport
+    var cs = Math.cos(rot), sn = Math.sin(rot);
+    var maxX = 0, maxY = 0;
+    var corners = [[1, 1], [1, -1], [-1, 1], [-1, -1]];
+    for (var ci = 0; ci < 4; ci++) {
+      var lx = corners[ci][0] * fw / 2, ly = corners[ci][1] * fh / 2;
+      var sx = lx + kx * ly, sy = ky * lx + ly;
+      var rx = sx * cs - sy * sn, ry = sx * sn + sy * cs;
+      if (Math.abs(rx) > maxX) maxX = Math.abs(rx);
+      if (Math.abs(ry) > maxY) maxY = Math.abs(ry);
+    }
+    var availX = W / 2 - Math.abs(swayX) - 6, availY = H / 2 - Math.abs(swayY) - 6;
+    var fit = Math.min(1, availX / maxX, availY / maxY);
+    fw *= fit; fh *= fit;
+    var cx = W / 2 + swayX, cy = H / 2 + swayY;
+    // drag offset: ease in while dragging, spring back over ~5 s after release
+    if (drag) {
+      var age = lt - drag.t0;
+      var k;
+      if (drag.active) k = Math.min(1, age / 0.25);
+      else k = Math.exp(-Math.max(0, age - 0) / 1.6);      // ~gone by 5 s
+      if (k > 0.001) {
+        cx += drag.dx * k; cy += drag.dy * k; rot += drag.rot * k;
+      } else if (!drag.active) drag = null;
+    }
+    return { cx: cx, cy: cy, rot: rot, kx: kx, ky: ky, hw: fw / 2, hh: fh / 2 };
+  }
+
+  function modeAt(t) {
+    return ((Math.floor(t / 16) + modeOffset) % 3 + 3) % 3;
+  }
+  function spillAt(t) {
+    var ph = t % SPILL_PERIOD;
+    if (ph < SPILL_LEN) {
+      var u = ph / SPILL_LEN;
+      return Math.sin(u * Math.PI);          // 0..1..0 envelope
+    }
+    return 0;
+  }
+
+  // ---------- imagery: pure functions of LOCAL coords + t ----------
+  function drawImagery(t, hw, hh, scale, alphaMul) {
+    var mode = modeAt(t);
+    var inset = 0.045;                        // local units: frame is [-hw..hw]x[-hh..hh]; imagery inset as fraction of hw/hh
+    var x0 = -hw * (1 - inset) * scale, x1 = hw * (1 - inset) * scale;
+    var y0 = -hh * (1 - inset) * scale, y1 = hh * (1 - inset) * scale;
+    ctx.save();
+    ctx.beginPath(); ctx.rect(x0, y0, x1 - x0, y1 - y0); ctx.clip();
+    if (mode === 0) {
+      // contour lines: wavy horizontal curves from a seeded sine field
+      var rng = mulberry32(imgSeed);
+      var p1 = rng() * 6.28, p2 = rng() * 6.28, p3 = rng() * 6.28;
+      var n = 15;
+      ctx.strokeStyle = '#7FD4FF'; ctx.lineWidth = Math.max(1, hw * 0.006);
+      for (var i = 0; i < n; i++) {
+        var v = i / (n - 1);
+        var yc = y0 + (y1 - y0) * v;
+        ctx.globalAlpha = (0.25 + 0.5 * (0.5 + 0.5 * Math.sin(v * 5 + p3))) * alphaMul;
+        ctx.beginPath();
+        var steps = 40;
+        for (var s = 0; s <= steps; s++) {
+          var u = s / steps;
+          var x = x0 + (x1 - x0) * u;
+          var y = yc
+            + Math.sin(u * 5.1 + p1 + t * 0.35 + v * 3.0) * hh * 0.030
+            + Math.sin(u * 9.7 + p2 - t * 0.22 + v * 6.0) * hh * 0.014;
+          if (s === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+      }
+    } else if (mode === 1) {
+      // point field: seeded points drifting in local space (wrap)
+      var rng2 = mulberry32(imgSeed + 5);
+      var N = 130;
+      ctx.fillStyle = '#FFF3D6';
+      for (var j = 0; j < N; j++) {
+        var bx = rng2(), by = rng2(), sp = 0.008 + rng2() * 0.02, ph = rng2() * 6.28, sz = 0.8 + rng2() * 1.8;
+        var px = ((bx + t * sp) % 1);
+        var py = by + Math.sin(t * 0.3 + ph) * 0.012;
+        var X = x0 + (x1 - x0) * px, Y = y0 + (y1 - y0) * py;
+        ctx.globalAlpha = (0.35 + 0.55 * (0.5 + 0.5 * Math.sin(t * 0.8 + ph * 3))) * alphaMul;
+        ctx.beginPath(); ctx.arc(X, Y, sz * hw * 0.006, 0, 6.2832); ctx.fill();
+      }
+    } else {
+      // color washes: layered flat-alpha blobs drifting
+      var cols = ['#2A1E3F', '#0E2A3A'];
+      var rng3 = mulberry32(imgSeed + 11);
+      ctx.fillStyle = cols[0];
+      for (var k = 0; k < 9; k++) {
+        var cxp = rng3(), cyp = rng3(), rad = 0.25 + rng3() * 0.45, dr = rng3() * 6.28, dsp = 0.010 + rng3() * 0.016;
+        var wx = x0 + (x1 - x0) * (0.5 + (cxp - 0.5) * 0.9 + Math.sin(t * dsp * 6.28 + dr) * 0.06);
+        var wy = y0 + (y1 - y0) * (0.5 + (cyp - 0.5) * 0.9 + Math.cos(t * dsp * 5.0 + dr * 2) * 0.06);
+        ctx.fillStyle = cols[k % 2];
+        ctx.globalAlpha = 0.16 * alphaMul;
+        ctx.beginPath(); ctx.arc(wx, wy, rad * hw * scale, 0, 6.2832); ctx.fill();
+      }
+    }
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- draw ----------
+  function draw(t) {
+    var vs = viewSize();
+    var W = vs.w, H = vs.h;
+    canvas.width = W; canvas.height = H;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+
+    ctx.fillStyle = '#070708';
+    ctx.fillRect(0, 0, W, H);
+
+    var lt = ((t - epoch) % LOOP + LOOP) % LOOP;
+    var F = frameAt(lt, W, H);
+    var member = Math.max(3, F.hh * 0.035);   // member thickness, px in local space
+
+    ctx.save();
+    ctx.translate(F.cx, F.cy);
+    ctx.rotate(F.rot);
+    ctx.transform(1, F.ky, F.kx, 1, 0, 0);   // perspective skew from tilt
+
+    // glass fill
+    ctx.fillStyle = '#C9D2DD';
+    ctx.globalAlpha = 0.25;
+    ctx.fillRect(-F.hw, -F.hh, F.hw * 2, F.hh * 2);
+    ctx.globalAlpha = 1;
+
+    // spill: current imagery a few % larger, unclipped, low alpha (drawn first so frame sits over it)
+    var sp = spillAt(t);
+    if (sp > 0.01) {
+      drawImagery(t, F.hw, F.hh, 1.07, 0.15 * sp);   // the breath: same imagery, 7% larger, faint
+    }
+
+    // locked imagery: computed in local coords, clipped to inner rect, same transform
+    drawImagery(t, F.hw, F.hh, 1, 1);
+
+    // members: four bars with bright edge highlights
+    ctx.fillStyle = '#C9D2DD';
+    ctx.globalAlpha = 0.25;
+    ctx.fillRect(-F.hw, -F.hh, F.hw * 2, member);
+    ctx.fillRect(-F.hw, F.hh - member, F.hw * 2, member);
+    ctx.fillRect(-F.hw, -F.hh, member, F.hh * 2);
+    ctx.fillRect(F.hw - member, -F.hh, member, F.hh * 2);
+    ctx.globalAlpha = 0.6;
+    ctx.strokeStyle = '#FFFFFF';
+    ctx.lineWidth = Math.max(1, member * 0.22);
+    ctx.strokeRect(-F.hw, -F.hh, F.hw * 2, F.hh * 2);
+    ctx.strokeRect(-F.hw + member, -F.hh + member, (F.hw - member) * 2, (F.hh - member) * 2);
+    ctx.globalAlpha = 1;
+    ctx.restore();
+
+    // audio follow (only when live)
+    if (AC && modeOsc) {
+      var m = modeAt(t);
+      var target = m === 0 ? 196 : (m === 1 ? 262 : 147);
+      try { modeOsc.frequency.setTargetAtTime(target, AC.currentTime, 0.4); } catch (e) {}
+      var idx = Math.floor(t / SPILL_PERIOD);
+      if (sp > 0.05 && idx !== lastSpillIdx) { lastSpillIdx = idx; noiseBurst(0.7, 600, 0.05); }
+    }
+  }
+
+  // ---------- time ----------
+  function now() {
+    if (typeof performance !== 'undefined' && performance.now) {
+      return T0 + (performance.now() - loadPerf) / 1000;
+    }
+    return T0;
+  }
+
+  // frame one: synchronous, fixed offset
+  draw(T0);
+
+  if (typeof requestAnimationFrame === 'function') {
+    var raf = function () { draw(now()); requestAnimationFrame(raf); };
+    requestAnimationFrame(raf);
+  }
+
+  // ---------- interaction ----------
+  var taps = [];
+  function pt(e) {
+    var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    var x = (e.clientX !== undefined ? e.clientX : (e.touches && e.touches[0] ? e.touches[0].clientX : 0)) - r.left;
+    var y = (e.clientY !== undefined ? e.clientY : (e.touches && e.touches[0] ? e.touches[0].clientY : 0)) - r.top;
+    return { x: x, y: y };
+  }
+  var downAt = null, moved = false;
+  function onDown(e) {
+    ensureAudio();
+    downAt = pt(e); moved = false;
+    var t = now();
+    taps.push(t);
+    if (taps.length > 2) taps.shift();
+    if (taps.length === 2 && t - taps[0] < 0.35) {
+      // double-tap: new frame
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      frameSeed = seed; imgSeed = seed + 77;
+      epoch = t - (t % LOOP);
+      taps = [];
+    }
+  }
+  function onMove(e) {
+    if (!downAt) return;
+    var p = pt(e);
+    var dx = p.x - downAt.x, dy = p.y - downAt.y;
+    if (Math.abs(dx) + Math.abs(dy) > 8) {
+      moved = true;
+      var vs = viewSize();
+      drag = { dx: dx * 0.6, dy: dy * 0.6, rot: dx / Math.max(1, vs.w) * 0.9, t0: now(), active: true };
+    }
+  }
+  function onUp(e) {
+    if (downAt && !moved) {
+      // plain tap: new mapping (unless it was the second of a double-tap, handled above)
+      if (taps.length === 1) modeOffset = (modeOffset + 1) % 3;
+      if (taps.length) taps = taps.slice(-1);
+    }
+    if (drag) { drag.active = false; drag.t0 = now(); }
+    downAt = null; moved = false;
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('mousedown', onDown);
+    canvas.addEventListener('mousemove', onMove);
+    canvas.addEventListener('mouseup', onUp);
+  }
+  function onResize() { draw(now()); }
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', onResize);
+    if (window.addEventListener) window.addEventListener('resize', onResize);
+  }
+})();
+</script>
+</body>
+</html>

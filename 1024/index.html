@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>What the Blink Leaves</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #08080A; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded rng ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- constants ----------
+  var VOID = '#08080A';
+  var BALL = '#FFF6E0';
+  var GHOST = '#FFE9B8';
+  var FLARE = '#FFFFFF';
+  var STEP = 1 / 120;          // fixed sim step, seconds
+  var T0 = 15;                 // pre-roll length, seconds (frame one lives here)
+  var PREROLL = 1800;          // 15 s at 120 Hz
+  var ON_FRAC = 0.15;          // blink pulse occupies 15% of each period
+  var PEAK = ON_FRAC / 2;      // phase of pulse peak (ghost birth moment)
+  var GHOST_LIFE = 2.5;        // ghost fade, seconds
+  var GHOST_CAP = 600;
+
+  var BASE_SEED = 1024185;
+  var seed = BASE_SEED;
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 720, H = 720, DPR = 1;
+
+  function isPhone() {
+    var sw = 0, sh = 0;
+    if (typeof window !== 'undefined' && window.screen) {
+      sw = window.screen.width || 0; sh = window.screen.height || 0;
+    }
+    var mn = Math.min(sw, sh);
+    if (mn > 0 && mn < 700) return true;
+    return H > W * 1.15; // aspect fallback only
+  }
+
+  function fit() {
+    var vv = (typeof window !== 'undefined') ? window.visualViewport : null;
+    if (vv && vv.width) { W = vv.width; H = vv.height; }
+    else if (typeof window !== 'undefined' && window.innerWidth) { W = window.innerWidth; H = window.innerHeight; }
+    DPR = (typeof window !== 'undefined' && window.devicePixelRatio) ? Math.min(window.devicePixelRatio, 2) : 1;
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+  }
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', function () { fit(); draw(simTime); });
+    }
+    if (window.addEventListener) {
+      window.addEventListener('resize', function () { fit(); draw(simTime); });
+    }
+  }
+
+  // ---------- field construction ----------
+  var balls = [];
+  var ghosts = [];        // {x, y, t} in unit coords + piece time
+  var flareTimes = [];    // seeded global phase-alignment moments
+  var localFlares = [];   // {x, y, t0, ghosted} from taps
+  var simTime = 0;
+
+  function ballPos(b, t) {
+    return {
+      x: b.cx + b.ax * Math.sin(b.wx * t + b.px),
+      y: b.cy + b.ay * Math.sin(b.wy * t + b.py)
+    };
+  }
+
+  function buildField(s) {
+    var rng = mulberry32(s);
+    var phone = isPhone();
+    var total = phone ? 28 : 40;
+    balls = [];
+    ghosts = [];
+    localFlares = [];
+
+    // The knot: a tight off-center cluster on short intervals.
+    var knotX = 0.64 + rng() * 0.06, knotY = 0.34 + rng() * 0.06;
+    var knotN = phone ? 8 : 11;
+    var i, b;
+    for (i = 0; i < knotN; i++) {
+      b = {
+        cx: knotX + (rng() - 0.5) * 0.11,
+        cy: knotY + (rng() - 0.5) * 0.11,
+        ax: 0.015 + rng() * 0.035,
+        ay: 0.015 + rng() * 0.035,
+        wx: (0.25 + rng() * 0.35) * (rng() < 0.5 ? 1 : -1),
+        wy: (0.25 + rng() * 0.35) * (rng() < 0.5 ? 1 : -1),
+        px: rng() * Math.PI * 2,
+        py: rng() * Math.PI * 2,
+        period: 0.7 + rng() * 0.8,          // short clocks: dense knot
+        phase: rng(),
+        offset: 0, prevPhase: 0, lastTickCycle: -1
+      };
+      balls.push(b);
+    }
+    // Two slow wide balls: their sparse ghosts trace faint arcs.
+    for (i = 0; i < 2; i++) {
+      b = {
+        cx: 0.34 + i * 0.14 + (rng() - 0.5) * 0.05,
+        cy: 0.62 - i * 0.10 + (rng() - 0.5) * 0.05,
+        ax: 0.24 + rng() * 0.08,
+        ay: 0.13 + rng() * 0.06,
+        wx: (0.10 + rng() * 0.08) * (i ? -1 : 1),
+        wy: (0.16 + rng() * 0.10) * (i ? 1 : -1),
+        px: rng() * Math.PI * 2,
+        py: rng() * Math.PI * 2,
+        period: 3.6 + rng() * 0.6,          // long clocks: faint ghost-arc
+        phase: rng(),
+        offset: 0, prevPhase: 0, lastTickCycle: -1
+      };
+      balls.push(b);
+    }
+    // The rest: scattered across the field, private rhythms.
+    while (balls.length < total) {
+      b = {
+        cx: 0.16 + rng() * 0.68,
+        cy: 0.16 + rng() * 0.68,
+        ax: 0.03 + rng() * 0.13,
+        ay: 0.03 + rng() * 0.11,
+        wx: (0.12 + rng() * 0.30) * (rng() < 0.5 ? 1 : -1),
+        wy: (0.12 + rng() * 0.30) * (rng() < 0.5 ? 1 : -1),
+        px: rng() * Math.PI * 2,
+        py: rng() * Math.PI * 2,
+        period: 1.2 + rng() * 3.2,
+        phase: rng(),
+        offset: 0, prevPhase: 0, lastTickCycle: -1
+      };
+      balls.push(b);
+    }
+    // Seeded global alignments: the intervals fall into step, briefly.
+    flareTimes = [];
+    var ft = 33 + rng() * 9;
+    while (ft < 400) { flareTimes.push(ft); ft += 35 + rng() * 15; }
+
+    for (i = 0; i < balls.length; i++) {
+      balls[i].prevPhase = blinkPhase(balls[i], 0);
+    }
+  }
+
+  function blinkPhase(b, t) {
+    var p = ((t + b.offset) / b.period + b.phase) % 1;
+    return p < 0 ? p + 1 : p;
+  }
+
+  function pulse(b, t) {
+    var p = blinkPhase(b, t);
+    if (p >= ON_FRAC) return 0;
+    var u = p / ON_FRAC;
+    var s = Math.sin(Math.PI * u);
+    return Math.pow(s, 1.6);
+  }
+
+  function flareEnv(t) {
+    var e = 0, i, a;
+    for (i = 0; i < flareTimes.length; i++) {
+      a = t - flareTimes[i];
+      if (a >= 0 && a < 1.4) {
+        var s = Math.sin(Math.PI * a / 1.4);
+        e = Math.max(e, s * s);
+      }
+    }
+    return e;
+  }
+
+  function recordGhost(x, y, t) {
+    ghosts.push({ x: x, y: y, t: t });
+    if (ghosts.length > GHOST_CAP + 120) ghosts.splice(0, ghosts.length - GHOST_CAP);
+  }
+
+  // ---------- fixed-step simulation ----------
+  var flareGhostMark = {}; // flare index -> true once its bloom is recorded
+
+  function stepSim(t) {
+    var i, b, p, pos;
+    // clock offsets disturbed by dragging spring back to the seeded interval
+    for (i = 0; i < balls.length; i++) {
+      b = balls[i];
+      if (b.offset !== 0) {
+        b.offset *= Math.exp(-STEP / 1.6);
+        if (Math.abs(b.offset) < 0.0005) b.offset = 0;
+      }
+      p = blinkPhase(b, t);
+      if (b.prevPhase < PEAK && p >= PEAK && p < ON_FRAC) {
+        pos = ballPos(b, t);
+        recordGhost(pos.x, pos.y, t);
+      }
+      b.prevPhase = p;
+    }
+    // global flare: at its peak every ball leaves a ghost (the bloom)
+    for (i = 0; i < flareTimes.length; i++) {
+      var a = t - flareTimes[i];
+      if (a >= 0.7 && a < 0.7 + STEP && !flareGhostMark[i]) {
+        flareGhostMark[i] = true;
+        for (var j = 0; j < balls.length; j++) {
+          pos = ballPos(balls[j], t);
+          recordGhost(pos.x, pos.y, t);
+        }
+      }
+    }
+    // local tap flares: nearby balls pulse together, ghosts at the peak
+    for (i = 0; i < localFlares.length; i++) {
+      var lf = localFlares[i], age = t - lf.t0;
+      if (age >= 0.5 && !lf.ghosted) {
+        lf.ghosted = true;
+        for (var k = 0; k < balls.length; k++) {
+          pos = ballPos(balls[k], t);
+          var dx = pos.x - lf.x, dy = pos.y - lf.y;
+          if (dx * dx + dy * dy < lf.r * lf.r) recordGhost(pos.x, pos.y, t);
+        }
+      }
+    }
+    if (localFlares.length && t - localFlares[0].t0 > 2) {
+      localFlares = localFlares.filter(function (f) { return t - f.t0 <= 2; });
+    }
+    // prune dead ghosts
+    if (ghosts.length && t - ghosts[0].t > GHOST_LIFE + 0.5) {
+      ghosts = ghosts.filter(function (g) { return t - g.t <= GHOST_LIFE; });
+    }
+  }
+
+  function brightness(b, t) {
+    var base = 0.05 + 0.95 * pulse(b, t);
+    var fe = flareEnv(t);
+    if (fe > 0) base = Math.max(base, fe);
+    // local tap alignment
+    for (var i = 0; i < localFlares.length; i++) {
+      var lf = localFlares[i], age = t - lf.t0;
+      if (age >= 0 && age < 1.0) {
+        var pos = ballPos(b, t);
+        var dx = pos.x - lf.x, dy = pos.y - lf.y;
+        if (dx * dx + dy * dy < lf.r * lf.r) {
+          var s = Math.sin(Math.PI * age / 1.0);
+          base = Math.max(base, s * s);
+        }
+      }
+    }
+    return base;
+  }
+
+  // ---------- drawing ----------
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = VOID;
+    ctx.fillRect(0, 0, W, H);
+
+    var mn = Math.min(W, H);
+    var RS = mn < 500 ? 1.3 : 1; // small screens get slightly larger marks
+    var i, g, age, al, x, y;
+
+    // ghosts: what the blinks leave behind
+    for (i = 0; i < ghosts.length; i++) {
+      g = ghosts[i];
+      age = t - g.t;
+      if (age < 0 || age > GHOST_LIFE) continue;
+      al = Math.pow(1 - age / GHOST_LIFE, 1.5);
+      x = g.x * W; y = g.y * H;
+      ctx.globalAlpha = al * 0.26;
+      ctx.fillStyle = GHOST;
+      ctx.beginPath(); ctx.arc(x, y, mn * 0.013 * RS, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = al * 0.75;
+      ctx.beginPath(); ctx.arc(x, y, mn * 0.0052 * RS, 0, Math.PI * 2); ctx.fill();
+    }
+
+    // flare wash
+    var fe = flareEnv(t);
+    if (fe > 0) {
+      ctx.globalAlpha = fe * 0.09;
+      ctx.fillStyle = FLARE;
+      ctx.fillRect(0, 0, W, H);
+    }
+
+    // balls
+    for (i = 0; i < balls.length; i++) {
+      var b = balls[i];
+      var pos = ballPos(b, t);
+      var br = brightness(b, t);
+      x = pos.x * W; y = pos.y * H;
+      ctx.fillStyle = BALL;
+      ctx.globalAlpha = 0.03 + br * 0.10;
+      ctx.beginPath(); ctx.arc(x, y, mn * 0.020 * RS, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = 0.05 + br * 0.22;
+      ctx.beginPath(); ctx.arc(x, y, mn * 0.011 * RS, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = 0.10 + br * 0.45;
+      ctx.beginPath(); ctx.arc(x, y, mn * 0.006 * RS, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = 0.16 + br * 0.84;
+      ctx.beginPath(); ctx.arc(x, y, Math.max(1.3, mn * 0.0030 * RS), 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- audio (lazy, gesture-only, guarded) ----------
+  var AC = null, shimmerGain = null, audioOn = false, tickBudget = 0, lastTickReset = 0;
+  function ensureAudio() {
+    if (audioOn) return;
+    audioOn = true;
+    try {
+      var Ctor = (typeof AudioContext !== 'undefined') ? AudioContext :
+                 (typeof window !== 'undefined' && window.webkitAudioContext) ? window.webkitAudioContext : null;
+      if (!Ctor) return;
+      AC = new Ctor();
+      // granular shimmer bed for dragging
+      var len = AC.sampleRate * 1.5;
+      var buf = AC.createBuffer(1, len, AC.sampleRate);
+      var d = buf.getChannelData(0);
+      var r = mulberry32(777);
+      for (var i = 0; i < len; i++) d[i] = r() * 2 - 1;
+      var src = AC.createBufferSource();
+      src.buffer = buf; src.loop = true;
+      var bp = AC.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 2400; bp.Q.value = 0.8;
+      shimmerGain = AC.createGain(); shimmerGain.gain.value = 0;
+      src.connect(bp); bp.connect(shimmerGain); shimmerGain.connect(AC.destination);
+      src.start();
+    } catch (e) { AC = null; }
+  }
+  function tick(period) {
+    if (!AC) return;
+    var now = performanceNow();
+    if (now - lastTickReset > 90) { tickBudget = 0; lastTickReset = now; }
+    if (tickBudget >= 4) return; // only the loudest few, throttled
+    tickBudget++;
+    try {
+      var f = 320 + ((5 - Math.min(Math.max(period, 0.7), 5)) / 4.3) * 880;
+      var o = AC.createOscillator(), g = AC.createGain();
+      o.type = 'sine'; o.frequency.value = f;
+      g.gain.setValueAtTime(0.045, AC.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.0008, AC.currentTime + 0.09);
+      o.connect(g); g.connect(AC.destination);
+      o.start(); o.stop(AC.currentTime + 0.1);
+    } catch (e) {}
+  }
+  function chord() {
+    if (!AC) return;
+    try {
+      var freqs = [196, 247, 294], t = AC.currentTime;
+      for (var i = 0; i < freqs.length; i++) {
+        var o = AC.createOscillator(), g = AC.createGain();
+        o.type = 'sine'; o.frequency.value = freqs[i];
+        g.gain.setValueAtTime(0, t);
+        g.gain.linearRampToValueAtTime(0.05, t + 0.35);
+        g.gain.linearRampToValueAtTime(0, t + 1.5);
+        o.connect(g); g.connect(AC.destination);
+        o.start(t); o.stop(t + 1.6);
+      }
+    } catch (e) {}
+  }
+  function performanceNow() {
+    return (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+  }
+
+  // ---------- interaction ----------
+  var dragging = false, dragMoved = false, downX = 0, downY = 0, downT = 0, lastTapT = -10, lastTapX = 0, lastTapY = 0;
+  var stepIndex = 0;
+
+  function toUnit(e) {
+    var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    return { x: (e.clientX - r.left) / W, y: (e.clientY - r.top) / H };
+  }
+  function onDown(e) {
+    ensureAudio();
+    if (AC && AC.state === 'suspended' && AC.resume) AC.resume();
+    var p = toUnit(e);
+    dragging = true; dragMoved = false;
+    downX = p.x; downY = p.y; downT = simTime;
+  }
+  function onMove(e) {
+    if (!dragging) return;
+    var p = toUnit(e);
+    var dx = p.x - downX, dy = p.y - downY;
+    if (dx * dx + dy * dy > 0.0001) dragMoved = true;
+    // disturb the blink clocks under the finger: they stutter, then settle
+    for (var i = 0; i < balls.length; i++) {
+      var pos = ballPos(balls[i], simTime);
+      var ddx = pos.x - p.x, ddy = pos.y - p.y;
+      if (ddx * ddx + ddy * ddy < 0.014) {
+        balls[i].offset += Math.sin(stepIndex * 1.7 + i * 3.7) * 0.55 * STEP * 8;
+      }
+    }
+    if (shimmerGain && AC) {
+      try { shimmerGain.gain.setTargetAtTime(0.028, AC.currentTime, 0.08); } catch (err) {}
+    }
+  }
+  function onUp(e) {
+    if (!dragging) return;
+    dragging = false;
+    if (shimmerGain && AC) {
+      try { shimmerGain.gain.setTargetAtTime(0, AC.currentTime, 0.15); } catch (err) {}
+    }
+    if (dragMoved) return;
+    var p = toUnit(e);
+    // double-tap: a new field
+    if (simTime - lastTapT < 0.38 && Math.abs(p.x - lastTapX) < 0.08 && Math.abs(p.y - lastTapY) < 0.08) {
+      lastTapT = -10;
+      seed = BASE_SEED + 1 + Math.floor(simTime * 7) % 9973;
+      buildField(seed);
+      flareGhostMark = {};
+      simTime = 0;
+      for (var s = 0; s < PREROLL; s++) { simTime += STEP; stepSim(simTime); }
+      draw(simTime);
+      return;
+    }
+    lastTapT = simTime; lastTapX = p.x; lastTapY = p.y;
+    // tap: a local phase-alignment
+    localFlares.push({ x: p.x, y: p.y, r: 0.19, t0: simTime, ghosted: false });
+    chord();
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+  }
+
+  // ---------- boot: build, pre-roll, draw frame one synchronously ----------
+  buildField(seed);
+  fit();
+  simTime = 0;
+  for (var s0 = 0; s0 < PREROLL; s0++) { simTime += STEP; stepIndex++; stepSim(simTime); }
+  draw(simTime);
+
+  // ---------- live loop (guarded) ----------
+  var prevFlareIdx = -1;
+  if (typeof requestAnimationFrame !== 'undefined') {
+    var startStamp = performanceNow();
+    var startSim = simTime;
+    var acc = 0, lastStamp = startStamp;
+    var loop = function () {
+      var now = performanceNow();
+      var dt = (now - lastStamp) / 1000;
+      lastStamp = now;
+      if (dt > 0.25) dt = 0.25;
+      acc += dt;
+      var n = 0;
+      while (acc >= STEP && n < 30) { simTime += STEP; stepIndex++; stepSim(simTime); acc -= STEP; n++; }
+      // blink ticks + flare chord triggers
+      for (var i = 0; i < balls.length; i++) {
+        var b = balls[i];
+        var p = blinkPhase(b, simTime);
+        var cyc = Math.floor((simTime + b.offset) / b.period + b.phase);
+        if (p > 0.04 && p < 0.11 && b.lastTickCycle !== cyc) { b.lastTickCycle = cyc; tick(b.period); }
+      }
+      for (var f = 0; f < flareTimes.length; f++) {
+        if (simTime >= flareTimes[f] && prevFlareIdx < f) { prevFlareIdx = f; chord(); }
+      }
+      draw(simTime);
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>

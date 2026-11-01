@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Left Eye, Right Eye</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #050506; overflow: hidden; height: 100%; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded PRNG (mulberry32) ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(10270188);
+
+  // ---------- constants ----------
+  var T0 = 6.25;            // frame one: fixed offset, left eye at its warm peak
+  var FREQ = 0.8;           // envelope frequency, Hz (per-eye flash rate)
+  var OMEGA = 2 * Math.PI * FREQ;
+  var WARM = '#FFD9A0';
+  var COOL = '#A0C8FF';
+  var CONE = '#FFF8E7';
+  var BODY = '#F2F2F0';
+  var ROOM = '#050506';
+  var SEAM = '#1A1B1E';
+
+  // ---------- seeded stutter schedule ----------
+  // Each event flattens one eye's envelope toward its mean for about a second:
+  // a dropped (or doubled-feeling) pulse. The rhythm then re-locks on its own
+  // because the underlying phase is never disturbed.
+  var stutters = [];
+  (function () {
+    var t = 19 + rng() * 6;
+    for (var i = 0; i < 16; i++) {
+      stutters.push({ t: t, eye: rng() < 0.5 ? 0 : 1 });
+      t += 18 + rng() * 12;
+    }
+  })();
+
+  // ---------- interaction state (events only; state is a function of them + t) ----------
+  var objIndex = 0; // 0 sphere, 1 cube, 2 torus
+  var dragging = false;
+  var dragStartX = 0;
+  var dragBase = 0;
+  var dragDetune = 0;
+  var releaseEv = null;   // {t, val} : detune decays closed-form after release
+  var tapStutters = [];   // {t, eye}
+  var lastTapT = -10;
+  var relockArmed = false;
+
+  // ---------- canvas / view ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var view = { w: 0, h: 0 };
+  var phone = false;
+  var tStart = null;
+
+  function nowMs() {
+    if (typeof performance !== 'undefined' && performance && typeof performance.now === 'function') {
+      return performance.now();
+    }
+    return 0;
+  }
+  function pieceNow() {
+    if (tStart === null) return T0;
+    return T0 + (nowMs() - tStart) / 1000;
+  }
+
+  function resize() {
+    var w, h;
+    if (typeof window !== 'undefined' && window.visualViewport) {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    } else if (typeof window !== 'undefined') {
+      w = window.innerWidth; h = window.innerHeight;
+    } else { w = 720; h = 720; }
+    view.w = w; view.h = h;
+    var dpr = 1;
+    if (typeof window !== 'undefined' && window.devicePixelRatio) {
+      dpr = Math.min(window.devicePixelRatio, 2);
+    }
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+    if (ctx.setTransform) ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    var smallScreen = false;
+    if (typeof window !== 'undefined' && window.screen) {
+      smallScreen = Math.min(window.screen.width, window.screen.height) < 700;
+    }
+    phone = smallScreen || (h > w * 1.15);
+    draw(pieceNow());
+  }
+
+  // ---------- envelope math ----------
+  // Raised-cosine envelopes in strict anti-phase. Each eye peaks once per
+  // 1.25 s period, so the per-eye flash rate is exactly the envelope
+  // frequency: 0.8 flashes per second, far under the 3 per second ceiling.
+  // The cosine has no discontinuities: brightness crossfades smoothly and
+  // never switches instantaneously.
+  function bumpAt(t, tc, halfWidth) {
+    var u = (t - tc) / halfWidth;
+    if (u <= -1 || u >= 1) return 0;
+    return 0.5 + 0.5 * Math.cos(Math.PI * u);
+  }
+  function stutterBump(t, eye) {
+    var b = 0, i, v;
+    for (i = 0; i < stutters.length; i++) {
+      if (stutters[i].eye === eye) { v = bumpAt(t, stutters[i].t, 0.55); if (v > b) b = v; }
+    }
+    for (i = 0; i < tapStutters.length; i++) {
+      if (tapStutters[i].eye === eye) { v = bumpAt(t, tapStutters[i].t, 0.55); if (v > b) b = v; }
+    }
+    return b;
+  }
+  function detuneAt(t) {
+    if (dragging) return dragDetune;
+    if (releaseEv) {
+      var dt = t - releaseEv.t;
+      if (dt < 0) return releaseEv.val;
+      var v = releaseEv.val * Math.exp(-dt / 1.15);
+      return Math.abs(v) < 0.001 ? 0 : v;
+    }
+    return 0;
+  }
+  function envelopes(t) {
+    var det = detuneAt(t);
+    var ph = OMEGA * t;
+    var eL = 0.5 + 0.5 * Math.cos(ph);
+    var eR = 0.5 + 0.5 * Math.cos(ph + Math.PI + det);
+    var bL = stutterBump(t, 0);
+    var bR = stutterBump(t, 1);
+    eL += (0.5 - eL) * bL * 0.85;
+    eR += (0.5 - eR) * bR * 0.85;
+    return { L: eL, R: eR, bump: Math.max(bL, bR) };
+  }
+
+  // ---------- object placement ----------
+  function centerAt(t) {
+    var W = view.w, H = view.h;
+    return {
+      x: W / 2 + W * 0.010 * Math.sin(2 * Math.PI * t / 17 + 1.3),
+      y: H * 0.47 + H * 0.012 * Math.sin(2 * Math.PI * t / 11 + 0.5)
+    };
+  }
+
+  // ---------- drawing helpers ----------
+  function circle(x, y, r) {
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+  }
+
+  function drawCone(apexX, apexY, tx, ty, R, env, color) {
+    var dx = tx - apexX, dy = ty - apexY;
+    var len = Math.sqrt(dx * dx + dy * dy) || 1;
+    var px = -dy / len, py = dx / len;
+    var layers = [
+      { k: 1.25, a: 0.030 + 0.030 * env, col: CONE },
+      { k: 1.00, a: 0.045 + 0.125 * env, col: color },
+      { k: 0.72, a: 0.035 + 0.075 * env, col: CONE },
+      { k: 0.45, a: 0.030 + 0.085 * env, col: color }
+    ];
+    var i, L, hw;
+    for (i = 0; i < layers.length; i++) {
+      L = layers[i];
+      hw = R * 2.7 * L.k;
+      ctx.beginPath();
+      ctx.moveTo(apexX + px * 5 * L.k, apexY + py * 5 * L.k);
+      ctx.lineTo(tx + px * hw, ty + py * hw);
+      ctx.lineTo(tx - px * hw, ty - py * hw);
+      ctx.lineTo(apexX - px * 5 * L.k, apexY - py * 5 * L.k);
+      ctx.closePath();
+      ctx.globalAlpha = L.a;
+      ctx.fillStyle = L.col;
+      ctx.fill();
+    }
+    // landing pool where the cone meets the object
+    var pools = [2.6, 1.9, 1.3];
+    for (i = 0; i < pools.length; i++) {
+      circle(tx, ty, R * pools[i]);
+      ctx.globalAlpha = (0.028 + 0.06 * env) * (1 - i * 0.22);
+      ctx.fillStyle = color;
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function shadeSphere(x, y, R, env, color, litDx, litDy) {
+    var b = 0.25 + 0.75 * env;
+    circle(x, y, R);
+    ctx.globalAlpha = b;
+    ctx.fillStyle = BODY;
+    ctx.fill();
+    ctx.save();
+    circle(x, y, R); ctx.clip();
+    // eye-tinted light side (layered flat circles, no gradients)
+    circle(x + litDx * R * 0.42, y + litDy * R * 0.42, R * 0.95);
+    ctx.globalAlpha = 0.32 * b; ctx.fillStyle = color; ctx.fill();
+    circle(x + litDx * R * 0.55, y + litDy * R * 0.55, R * 0.55);
+    ctx.globalAlpha = 0.30 * b; ctx.fillStyle = '#FFFFFF'; ctx.fill();
+    // shadow limb opposite the light
+    circle(x - litDx * R * 0.55, y - litDy * R * 0.55, R * 0.9);
+    ctx.globalAlpha = 0.20; ctx.fillStyle = ROOM; ctx.fill();
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
+  function shadeCube(x, y, R, env, color, side) {
+    var b = 0.25 + 0.75 * env;
+    var ang = 0.12 * Math.sin(pieceNowRef / 9);
+    function rot(px, py) {
+      var ca = Math.cos(ang), sa = Math.sin(ang);
+      return [x + px * ca - py * sa, y + px * sa + py * ca];
+    }
+    var s = R * 0.92;
+    var T = rot(0, -s), UR = rot(0.87 * s, -0.5 * s), LR = rot(0.87 * s, 0.5 * s),
+        B = rot(0, s), LL = rot(-0.87 * s, 0.5 * s), UL = rot(-0.87 * s, -0.5 * s),
+        C = [x, y];
+    // side: -1 warm eye lights the left face, +1 cool eye lights the right face
+    var faces = [
+      { pts: [T, UR, C, UL], a: 0.95 },
+      { pts: [UL, C, B, LL], a: side < 0 ? 0.88 : 0.55 },
+      { pts: [C, UR, LR, B], a: side < 0 ? 0.55 : 0.88 }
+    ];
+    var i, j;
+    for (i = 0; i < faces.length; i++) {
+      ctx.beginPath();
+      ctx.moveTo(faces[i].pts[0][0], faces[i].pts[0][1]);
+      for (j = 1; j < 4; j++) ctx.lineTo(faces[i].pts[j][0], faces[i].pts[j][1]);
+      ctx.closePath();
+      ctx.globalAlpha = b * faces[i].a;
+      ctx.fillStyle = BODY;
+      ctx.fill();
+      ctx.globalAlpha = b * 0.16;
+      ctx.fillStyle = color;
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function shadeTorus(x, y, R, env, color, litDx, litDy) {
+    var b = 0.25 + 0.75 * env;
+    ctx.beginPath();
+    ctx.arc(x, y, R * 0.78, 0, Math.PI * 2);
+    ctx.globalAlpha = b;
+    ctx.fillStyle = BODY;
+    ctx.lineWidth = R * 0.44;
+    ctx.strokeStyle = BODY;
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(x, y, R * 0.78, 0, Math.PI * 2);
+    ctx.globalAlpha = b * 0.22;
+    ctx.strokeStyle = color;
+    ctx.stroke();
+    // highlight arc toward the light
+    var a0 = Math.atan2(litDy, litDx);
+    ctx.beginPath();
+    ctx.arc(x, y, R * 0.82, a0 - 0.7, a0 + 0.7);
+    ctx.globalAlpha = 0.45 * b;
+    ctx.lineWidth = R * 0.15;
+    ctx.strokeStyle = '#FFFFFF';
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  var pieceNowRef = T0;
+
+  function drawObject(x, y, R, env, color, side) {
+    // light direction: from the object toward this eye's top corner (the lamp)
+    var apexX = side < 0 ? view.w * 0.03 : view.w * 0.97;
+    var dx = apexX - x, dy = (-view.h * 0.02) - y;
+    var len = Math.sqrt(dx * dx + dy * dy) || 1;
+    var lx = dx / len, ly = dy / len;
+    if (objIndex === 0) shadeSphere(x, y, R, env, color, lx, ly);
+    else if (objIndex === 1) shadeCube(x, y, R, env, color, side);
+    else shadeTorus(x, y, R, env, color, lx, ly);
+  }
+
+  function drawEye(side, x0, x1, env, color, ox, oy, R) {
+    var W = view.w, H = view.h;
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(x0, 0, x1 - x0, H);
+    ctx.clip();
+    // ambient wash of this eye's light over its half
+    ctx.globalAlpha = 0.022 + 0.075 * env;
+    ctx.fillStyle = color;
+    ctx.fillRect(x0, 0, x1 - x0, H);
+    ctx.globalAlpha = 1;
+    var apexX = side < 0 ? W * 0.03 : W * 0.97;
+    drawCone(apexX, -H * 0.02, ox, oy, R, env, color);
+    drawObject(ox, oy, R, env, color, side);
+    ctx.restore();
+  }
+
+  function draw(t) {
+    pieceNowRef = t;
+    var W = view.w, H = view.h;
+    if (!W || !H) return;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.fillStyle = ROOM;
+    ctx.fillRect(0, 0, W, H);
+    var env = envelopes(t);
+    var c = centerAt(t);
+    var R = Math.min(W, H) * (phone ? 0.062 : 0.058);
+    // disparity: two genuine viewpoints, wobbling slightly while a stutter lasts
+    var d = W * 0.015 * (1 - 0.55 * env.bump);
+    drawEye(-1, 0, W / 2, env.L, WARM, c.x - d, c.y, R);
+    drawEye(1, W / 2, W, env.R, COOL, c.x + d, c.y, R);
+    // the seam between eyes
+    ctx.fillStyle = SEAM;
+    ctx.fillRect(W / 2 - 1, 0, 2, H);
+  }
+
+  // ---------- audio (lazy, guarded, gesture-born only) ----------
+  var AC = null, master = null;
+  function ensureAudio() {
+    try {
+      if (AC) { if (AC.resume) AC.resume(); return; }
+      var Ctor = null;
+      if (typeof window !== 'undefined') Ctor = window.AudioContext || window.webkitAudioContext;
+      if (!Ctor) return;
+      AC = new Ctor();
+      master = AC.createGain();
+      master.gain.value = 0.5;
+      master.connect(AC.destination);
+    } catch (e) { AC = null; }
+  }
+  function tick(freq, gain, dur) {
+    if (!AC || !master) return;
+    try {
+      var o = AC.createOscillator(), g = AC.createGain();
+      var t0 = AC.currentTime;
+      o.type = 'sine';
+      o.frequency.value = freq;
+      g.gain.setValueAtTime(gain, t0);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      o.connect(g); g.connect(master);
+      o.start(t0); o.stop(t0 + dur + 0.02);
+    } catch (e) { /* silent */ }
+  }
+  function chord() {
+    tick(220, 0.022, 0.8); tick(277, 0.018, 0.8); tick(330, 0.02, 0.9);
+  }
+
+  // ---------- main loop ----------
+  var lastHalf = null;
+  function animate() {
+    var t = pieceNow();
+    draw(t);
+    // tick-tock on envelope peaks; a stutter swallows its tick (skipped beat)
+    var k = Math.floor(OMEGA * t / Math.PI);
+    if (lastHalf === null) lastHalf = k;
+    if (k !== lastHalf) {
+      lastHalf = k;
+      var eye = (k % 2 === 0) ? 0 : 1;
+      if (AC && stutterBump(t, eye) < 0.4) {
+        tick(eye === 0 ? 185 : 305, 0.045, 0.09);
+      }
+    }
+    if (relockArmed && !dragging && Math.abs(detuneAt(t)) < 0.02) {
+      relockArmed = false;
+      chord();
+    }
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(animate);
+    }
+  }
+
+  // ---------- pointer interaction ----------
+  function onDown(e) {
+    ensureAudio();
+    var x = (e && typeof e.clientX === 'number') ? e.clientX : view.w / 2;
+    dragging = false;
+    dragStartX = x;
+    dragBase = detuneAt(pieceNow());
+    dragDetune = dragBase;
+    canvas._downX = x;
+    canvas._downT = pieceNow();
+    canvas._moved = false;
+  }
+  function onMove(e) {
+    if (canvas._downT === undefined) return;
+    var x = (e && typeof e.clientX === 'number') ? e.clientX : canvas._downX;
+    if (Math.abs(x - canvas._downX) > 6) canvas._moved = true;
+    if (canvas._moved) {
+      dragging = true;
+      var slip = (x - dragStartX) / Math.max(view.w, 1) * Math.PI * 1.5;
+      dragDetune = Math.max(-Math.PI, Math.min(Math.PI, dragBase + slip));
+    }
+  }
+  function onUp() {
+    if (canvas._downT === undefined) return;
+    var t = pieceNow();
+    if (dragging) {
+      releaseEv = { t: t, val: dragDetune };
+      if (Math.abs(dragDetune) > 0.4) relockArmed = true;
+      dragging = false;
+    } else {
+      // tap or double-tap
+      if (t - lastTapT < 0.35) {
+        objIndex = (objIndex + 1) % 3;
+        lastTapT = -10;
+      } else {
+        lastTapT = t;
+        // drop the next pulse, whichever eye it belongs to
+        var k = Math.floor(OMEGA * t / Math.PI) + 1;
+        tapStutters.push({ t: k * Math.PI / OMEGA, eye: (k % 2 === 0) ? 0 : 1 });
+      }
+    }
+    canvas._downT = undefined;
+    canvas._moved = false;
+    draw(t);
+  }
+
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+  }
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', resize);
+  }
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('resize', resize);
+  }
+
+  // ---------- go ----------
+  resize();          // sizes the canvas and draws frame one at the fixed T0
+  tStart = nowMs();  // the live loop runs from T0 onward; frame one never uses a clock
+  if (typeof requestAnimationFrame === 'function') {
+    requestAnimationFrame(animate);
+  }
+})();
+</script>
+</body>
+</html>

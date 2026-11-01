@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Machine, Placed</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #F4F3F0; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded rng ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function hashSeed() {
+    var h = 2166136261;
+    for (var i = 0; i < arguments.length; i++) {
+      h ^= (arguments[i] + 0x9E3779B9) | 0;
+      h = Math.imul(h, 16777619);
+    }
+    return h | 0;
+  }
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function smooth(v) { v = clamp(v, 0, 1); return v * v * (3 - 2 * v); }
+  function lerp(a, b, k) { return a + (b - a) * k; }
+
+  var BASE_SEED = 1028189;
+  var T0 = 20; // frame one: fixed piece-time offset, seconds
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0, DPR = 1;
+
+  function phoneMode() {
+    var sw = (window.screen && window.screen.width) || W;
+    var sh = (window.screen && window.screen.height) || H;
+    if (Math.min(sw, sh) < 700) return true;
+    return H > W * 1.15;
+  }
+
+  function resize() {
+    var vv = window.visualViewport;
+    var w = vv ? vv.width : (window.innerWidth || 300);
+    var h = vv ? vv.height : (window.innerHeight || 300);
+    DPR = window.devicePixelRatio || 1;
+    W = w; H = h;
+    canvas.width = Math.round(w * DPR);
+    canvas.height = Math.round(h * DPR);
+  }
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { resize(); draw(pieceTime()); });
+  }
+  if (window.addEventListener) {
+    window.addEventListener('resize', function () { resize(); draw(pieceTime()); });
+  }
+
+  // ---------- piece clock ----------
+  var startStamp = null;
+  function nowStamp() {
+    if (typeof performance !== 'undefined' && performance.now) return performance.now();
+    return Date.now();
+  }
+  function pieceTime() {
+    if (startStamp === null) return T0;
+    return T0 + (nowStamp() - startStamp) / 1000;
+  }
+
+  // ---------- interaction state (recorded events; visuals are closed-form over them) ----------
+  var wakeEvents = [];   // {start, end|null} drags across the cube
+  var tapDreams = [];    // piece-times of wall taps (new dream)
+  var machineSeed = 0;   // incremented by double-tap (new machine)
+  var eventsVersion = 0;
+
+  // ---------- breath phase ----------
+  // Breath period eases from 7 s toward 3.5 s as wake level rises.
+  // Phase is the integral of 1/period(w(t)) dt, computed by fixed-step
+  // integration over the recorded wake events, so it is a pure function
+  // of (events, t). Peaks (phase integers) are recorded during the scan.
+  var PHASE_OFF = 0.15; // puts the front face at full sheen at T0
+  var integ = { t: 0, phase: PHASE_OFF, peaks: [], version: -1 };
+
+  function wakeLevelAt(t) {
+    var w = 0;
+    for (var i = 0; i < wakeEvents.length; i++) {
+      var e = wakeEvents[i];
+      if (t < e.start) break;
+      var end = (e.end === null) ? t : Math.min(e.end, t);
+      if (t <= (e.end === null ? Infinity : e.end)) {
+        w = 1 - (1 - w) * Math.exp(-(t - e.start) / 0.8);
+      } else {
+        var wEnd = 1 - (1 - w) * Math.exp(-(end - e.start) / 0.8);
+        w = wEnd * Math.exp(-(t - end) / 2.7);
+      }
+    }
+    return clamp(w, 0, 1);
+  }
+
+  function integrateTo(t) {
+    if (integ.version !== eventsVersion || t < integ.t) {
+      integ.t = 0; integ.phase = PHASE_OFF; integ.peaks = []; integ.version = eventsVersion;
+    }
+    var dt = 1 / 30;
+    var prevFloor = Math.floor(integ.phase);
+    while (integ.t < t) {
+      var step = Math.min(dt, t - integ.t);
+      var w = wakeLevelAt(integ.t + step * 0.5);
+      var period = 7 - 3.5 * w;
+      integ.phase += step / period;
+      integ.t += step;
+      var f = Math.floor(integ.phase);
+      if (f > prevFloor) {
+        // peak time: linear interpolation inside this step
+        var frac = (f - (integ.phase - step / period)) / (step / period);
+        integ.peaks.push(integ.t - step + step * clamp(frac, 0, 1));
+        prevFloor = f;
+      }
+    }
+    return integ.phase;
+  }
+  function breathPulse(phase) { return 0.5 + 0.5 * Math.cos(2 * Math.PI * phase); }
+
+  // ---------- dream fields ----------
+  // A dream field is fully seeded by (machineSeed, fieldIndex).
+  function dreamField(idx) {
+    var rng = mulberry32(hashSeed(BASE_SEED, machineSeed * 7919, idx * 131 + 7));
+    var blobs = [];
+    var n = 13;
+    for (var i = 0; i < n; i++) {
+      var parts = [];
+      for (var k = 0; k < 4; k++) {
+        parts.push({
+          ox: rng() * 0.7 - 0.35,
+          oy: rng() * 0.7 - 0.35,
+          sc: 0.5 + rng() * 0.45,
+          am: 0.55 + rng() * 0.5
+        });
+      }
+      blobs.push({
+        ax: 0.06 + rng() * 0.88,
+        ay: 0.06 + rng() * 0.86,
+        rx: 0.04 + rng() * 0.11,
+        ry: 0.06 + rng() * 0.12,
+        ink: rng() < 0.5,
+        a: 0.06 + rng() * 0.09,
+        ph: rng() * Math.PI * 2,
+        sp: 0.03 + rng() * 0.05,
+        parts: parts
+      });
+    }
+    var contours = [];
+    for (var j = 0; j < 7; j++) {
+      contours.push({
+        base: (j + 0.5) / 7,
+        a1: 0.008 + rng() * 0.016,
+        f1: 0.8 + rng() * 1.4,
+        p1: rng() * Math.PI * 2,
+        s1: 0.02 + rng() * 0.05,
+        a2: 0.003 + rng() * 0.008,
+        f2: 2 + rng() * 2,
+        p2: rng() * Math.PI * 2,
+        s2: 0.03 + rng() * 0.06,
+        alpha: 0.34 + rng() * 0.30
+      });
+    }
+    return { blobs: blobs, contours: contours };
+  }
+
+  // Field index and crossfade at time t: change points are breath peaks
+  // plus wall taps. Blend runs 3 s after each change point.
+  function dreamState(t) {
+    var phase = integrateTo(t);
+    var changes = [];
+    var i;
+    for (i = 0; i < integ.peaks.length; i++) if (integ.peaks[i] <= t) changes.push(integ.peaks[i]);
+    for (i = 0; i < tapDreams.length; i++) if (tapDreams[i] <= t) changes.push(tapDreams[i]);
+    changes.sort(function (a, b) { return a - b; });
+    var idx = changes.length; // field 0 is the initial dream
+    var blend = 1;
+    if (changes.length) {
+      var since = t - changes[changes.length - 1];
+      blend = smooth(since / 3);
+    }
+    return { idx: idx, blend: blend, phase: phase };
+  }
+
+  function drawDreamField(field, region, t, weight, intensity) {
+    if (weight <= 0) return;
+    var x0 = region.x, y0 = region.y, w = region.w, h = region.h;
+    ctx.save();
+    // clip to the wall above the floor, not the anchor region, so washes
+    // are cut only by the frame edges and never by an invisible rectangle
+    ctx.beginPath(); ctx.rect(0, 0, W, H * 0.865); ctx.clip();
+    var i, j;
+    for (i = 0; i < field.blobs.length; i++) {
+      var b = field.blobs[i];
+      var cx = x0 + (b.ax + 0.03 * Math.sin(t * b.sp + b.ph)) * w;
+      var cy = y0 + (b.ay + 0.04 * Math.cos(t * b.sp * 0.8 + b.ph * 1.7)) * h;
+      var rx = b.rx * w, ry = b.ry * h;
+      ctx.fillStyle = b.ink ? '#1E3A5F' : '#7FA8C9';
+      for (j = 0; j < b.parts.length; j++) {
+        var p = b.parts[j];
+        ctx.globalAlpha = clamp(b.a * p.am * 1.5 * intensity * weight, 0, 1);
+        ctx.beginPath();
+        ctx.ellipse(cx + p.ox * rx, cy + p.oy * ry, rx * p.sc, ry * p.sc, 0, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    ctx.strokeStyle = '#D8E4EE';
+    ctx.lineWidth = Math.max(1, H * 0.0014);
+    for (i = 0; i < field.contours.length; i++) {
+      var c = field.contours[i];
+      ctx.globalAlpha = c.alpha * weight * (0.8 + 0.3 * intensity - 0.3);
+      ctx.beginPath();
+      var steps = 96;
+      for (j = 0; j <= steps; j++) {
+        var fx = j / steps;
+        var fy = c.base
+          + c.a1 * Math.sin(fx * c.f1 * Math.PI * 2 + c.p1 + t * c.s1 * Math.PI * 2)
+          + c.a2 * Math.sin(fx * c.f2 * Math.PI * 2 + c.p2 - t * c.s2 * Math.PI * 2);
+        var px = x0 + fx * w;
+        var py = y0 + fy * h;
+        if (j === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+      }
+      ctx.stroke();
+    }
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- cube shading ----------
+  function faceShade(pulse) {
+    var v = Math.round(lerp(11, 22, pulse));
+    return 'rgb(' + v + ',' + v + ',' + (v + 1) + ')';
+  }
+
+  // ---------- main draw ----------
+  function draw(t) {
+    if (!W) resize();
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    var phone = phoneMode();
+    var wake = wakeLevelAt(t);
+    var ds = dreamState(t);
+    var phase = ds.phase;
+    var intensity = 1 + 0.5 * wake;
+
+    // gallery wall: layered flat tones, lighter toward the top light
+    ctx.fillStyle = '#F4F3F0'; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#F7F6F2'; ctx.fillRect(0, 0, W, H * 0.72);
+    ctx.fillStyle = '#FAF9F6'; ctx.fillRect(0, 0, W, H * 0.42);
+    // floor band
+    var floorY = H * 0.865;
+    ctx.fillStyle = '#EFEDE8'; ctx.fillRect(0, floorY, W, H - floorY);
+    ctx.fillStyle = 'rgba(20,20,30,0.07)'; ctx.fillRect(0, floorY, W, 1);
+
+    // dream region: upper two-thirds of the wall
+    var region = { x: W * 0.045, y: H * 0.035, w: W * 0.91, h: H * 0.60 };
+    if (ds.blend < 1) drawDreamField(dreamField(ds.idx - 1), region, t, 1 - ds.blend, intensity);
+    drawDreamField(dreamField(ds.idx), region, t, ds.blend >= 1 ? 1 : ds.blend, intensity);
+
+    // plinth geometry
+    var S = Math.min(H * 0.25, W * (phone ? 0.52 : 0.34));
+    var depthX = S * 0.16, depthY = -S * 0.13;
+    var plinthTopY = H * 0.815;
+    var plinthW = Math.min(W * (phone ? 0.86 : 0.56), S * 2.6);
+    var plinthX = (W - plinthW) / 2;
+    var plinthH = H * 0.05;
+
+    // plinth floor shadow: layered flat-alpha ellipses
+    ctx.fillStyle = 'rgba(25,25,35,0.05)';
+    ctx.beginPath(); ctx.ellipse(W / 2, plinthTopY + plinthH + H * 0.012, plinthW * 0.55, H * 0.016, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = 'rgba(25,25,35,0.04)';
+    ctx.beginPath(); ctx.ellipse(W / 2, plinthTopY + plinthH + H * 0.010, plinthW * 0.44, H * 0.012, 0, 0, Math.PI * 2); ctx.fill();
+
+    // plinth: top face, front face, side shade
+    ctx.fillStyle = '#FBFAF8';
+    ctx.beginPath();
+    ctx.moveTo(plinthX, plinthTopY);
+    ctx.lineTo(plinthX + plinthW, plinthTopY);
+    ctx.lineTo(plinthX + plinthW + depthX * 0.7, plinthTopY + depthY * 0.7);
+    ctx.lineTo(plinthX + depthX * 0.7, plinthTopY + depthY * 0.7);
+    ctx.closePath(); ctx.fill();
+    ctx.fillRect(plinthX, plinthTopY, plinthW, plinthH);
+    ctx.fillStyle = 'rgba(20,20,30,0.05)';
+    ctx.beginPath();
+    ctx.moveTo(plinthX + plinthW, plinthTopY);
+    ctx.lineTo(plinthX + plinthW + depthX * 0.7, plinthTopY + depthY * 0.7);
+    ctx.lineTo(plinthX + plinthW + depthX * 0.7, plinthTopY + depthY * 0.7 + plinthH);
+    ctx.lineTo(plinthX + plinthW, plinthTopY + plinthH);
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle = 'rgba(20,20,30,0.06)';
+    ctx.fillRect(plinthX, plinthTopY + plinthH - 1, plinthW, 1);
+
+    // big cube placement: centered slightly left on the plinth
+    var cubeX = W / 2 - S * 0.62;
+    var cubeBase = plinthTopY;
+    var cubeY = cubeBase - S;
+
+    // contact shadow under the big cube
+    var shAlphas = [0.05, 0.045, 0.04];
+    var shScales = [1.25, 1.05, 0.88];
+    for (var si = 0; si < 3; si++) {
+      ctx.fillStyle = 'rgba(20,20,30,' + shAlphas[si] + ')';
+      ctx.beginPath();
+      ctx.ellipse(cubeX + S / 2 + depthX * 0.3, cubeBase + H * 0.004, S * 0.55 * shScales[si], H * 0.010 * shScales[si], 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // big cube: side, top, front. Total black, no detail: only the breath sheen.
+    var pFront = breathPulse(phase);
+    var pTop = breathPulse(phase - 0.18);
+    var pSide = breathPulse(phase - 0.36);
+    ctx.fillStyle = faceShade(pSide);
+    ctx.beginPath();
+    ctx.moveTo(cubeX + S, cubeY);
+    ctx.lineTo(cubeX + S + depthX, cubeY + depthY);
+    ctx.lineTo(cubeX + S + depthX, cubeBase + depthY);
+    ctx.lineTo(cubeX + S, cubeBase);
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle = faceShade(pTop);
+    ctx.beginPath();
+    ctx.moveTo(cubeX, cubeY);
+    ctx.lineTo(cubeX + depthX, cubeY + depthY);
+    ctx.lineTo(cubeX + S + depthX, cubeY + depthY);
+    ctx.lineTo(cubeX + S, cubeY);
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle = faceShade(pFront);
+    ctx.fillRect(cubeX, cubeY, S, S);
+
+    // small cube: the attendant, still, a tenth the size
+    var s2 = Math.max(9, S / 10);
+    var smX = cubeX + S + depthX + S * 0.22;
+    var smBase = cubeBase;
+    var smDepthX = s2 * 0.16, smDepthY = -s2 * 0.13;
+    ctx.fillStyle = 'rgba(20,20,30,0.05)';
+    ctx.beginPath(); ctx.ellipse(smX + s2 / 2, smBase + H * 0.003, s2 * 0.7, H * 0.004, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#0B0B0C';
+    ctx.beginPath();
+    ctx.moveTo(smX + s2, smBase - s2);
+    ctx.lineTo(smX + s2 + smDepthX, smBase - s2 + smDepthY);
+    ctx.lineTo(smX + s2 + smDepthX, smBase + smDepthY);
+    ctx.lineTo(smX + s2, smBase);
+    ctx.closePath(); ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(smX, smBase - s2);
+    ctx.lineTo(smX + smDepthX, smBase - s2 + smDepthY);
+    ctx.lineTo(smX + s2 + smDepthX, smBase - s2 + smDepthY);
+    ctx.lineTo(smX + s2, smBase - s2);
+    ctx.closePath(); ctx.fill();
+    ctx.fillRect(smX, smBase - s2, s2, s2);
+  }
+
+  // ---------- audio (lazy, gesture-gated, guarded) ----------
+  var AC = null, subGain = null, padGain = null;
+  function ensureAudio() {
+    if (AC) return;
+    var Ctor = (typeof window !== 'undefined') && (window.AudioContext || window.webkitAudioContext);
+    if (!Ctor) return;
+    try {
+      AC = new Ctor();
+      var master = AC.createGain(); master.gain.value = 0.6; master.connect(AC.destination);
+      var sub = AC.createOscillator(); sub.type = 'sine'; sub.frequency.value = 41;
+      subGain = AC.createGain(); subGain.gain.value = 0;
+      sub.connect(subGain); subGain.connect(master); sub.start();
+      padGain = AC.createGain(); padGain.gain.value = 0.012;
+      var lp = AC.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 420;
+      padGain.connect(lp); lp.connect(master);
+      [110, 164.81, 220.5].forEach(function (f, i) {
+        var o = AC.createOscillator(); o.type = 'triangle'; o.frequency.value = f;
+        o.detune.value = i * 4 - 4;
+        o.connect(padGain); o.start();
+      });
+    } catch (e) { AC = null; }
+  }
+  function tapTone() {
+    if (!AC) return;
+    try {
+      var o = AC.createOscillator(); o.type = 'sine'; o.frequency.value = 620;
+      var g = AC.createGain();
+      var t = AC.currentTime;
+      g.gain.setValueAtTime(0.10, t);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.9);
+      o.connect(g); g.connect(AC.destination);
+      o.start(t); o.stop(t + 0.95);
+    } catch (e) {}
+  }
+  function audioFrame(t) {
+    if (!AC || !subGain) return;
+    try {
+      var phase = integrateTo(t);
+      subGain.gain.value = 0.055 * breathPulse(phase);
+      padGain.gain.value = 0.010 + 0.006 * wakeLevelAt(t);
+    } catch (e) {}
+  }
+
+  // ---------- pointer interaction ----------
+  var pDown = null; // {x, y, t, wake:boolean}
+  var lastTap = null; // {t, x, y}
+
+  function piecePos(ev) {
+    var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    var x = (ev.clientX !== undefined ? ev.clientX : (ev.touches && ev.touches[0] ? ev.touches[0].clientX : 0)) - r.left;
+    var y = (ev.clientY !== undefined ? ev.clientY : (ev.touches && ev.touches[0] ? ev.touches[0].clientY : 0)) - r.top;
+    return { x: x, y: y };
+  }
+  function cubeHit(x, y) {
+    var S = Math.min(H * 0.25, W * (phoneMode() ? 0.52 : 0.34));
+    var cubeX = W / 2 - S * 0.62;
+    var cubeBase = H * 0.815;
+    var pad = S * 0.3;
+    return x >= cubeX - pad && x <= cubeX + S + S * 0.16 + pad &&
+           y >= cubeBase - S - S * 0.13 - pad && y <= cubeBase + pad;
+  }
+  function onDown(ev) {
+    ensureAudio();
+    if (AC && AC.resume) { try { AC.resume(); } catch (e) {} }
+    var p = piecePos(ev);
+    var t = pieceTime();
+    var wake = cubeHit(p.x, p.y);
+    pDown = { x: p.x, y: p.y, t: t, wake: wake, moved: false };
+    if (wake) {
+      wakeEvents.push({ start: t, end: null });
+      eventsVersion++;
+    }
+  }
+  function onMove(ev) {
+    if (!pDown) return;
+    var p = piecePos(ev);
+    if (Math.abs(p.x - pDown.x) + Math.abs(p.y - pDown.y) > 8) pDown.moved = true;
+  }
+  function onUp(ev) {
+    if (!pDown) return;
+    var p = piecePos(ev);
+    var t = pieceTime();
+    var wasWake = pDown.wake;
+    if (wasWake) {
+      var e = wakeEvents[wakeEvents.length - 1];
+      if (e && e.end === null) { e.end = t; eventsVersion++; }
+    }
+    var isTap = !pDown.moved && (t - pDown.t) < 0.45;
+    pDown = null;
+    if (!isTap) return;
+    if (lastTap && (t - lastTap.t) < 0.35) {
+      // double-tap: new machine
+      machineSeed++;
+      lastTap = null;
+      return;
+    }
+    lastTap = { t: t, x: p.x, y: p.y };
+    var self = lastTap;
+    var fire = function () {
+      if (lastTap === self) {
+        lastTap = null;
+        if (!cubeHit(p.x, p.y)) { tapDreams.push(t); tapTone(); }
+      }
+    };
+    if (typeof setTimeout === 'function') setTimeout(fire, 360);
+    else fire();
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+  }
+
+  // ---------- run ----------
+  resize();
+  draw(T0);
+  if (typeof requestAnimationFrame === 'function') {
+    startStamp = nowStamp();
+    var loop = function () {
+      var t = pieceTime();
+      draw(t);
+      audioFrame(t);
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
