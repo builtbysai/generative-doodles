@@ -1,0 +1,639 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Flock Obeys</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #07080C; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+/* No.979 The Flock Obeys. Daito Manabe, discrete figures: a dancer performs
+   seeded phrases, a drone flock obeys rule-based formations, and a database
+   doppelganger snaps to the nearest archived pose twice a second. */
+
+// ---------- seeded rng ----------
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+function lerp(a, b, t) { return a + (b - a) * t; }
+function dist2(ax, ay, bx, by) { var dx = ax - bx, dy = ay - by; return dx * dx + dy * dy; }
+
+// ---------- palette ----------
+var COL = {
+  stage: '#07080C', dancer: '#F5F2EA', rim: '#FFD88A',
+  drone: '#4FD6FF', rotor: '#B8E6FF', frame: '#3A3D46',
+  stick: '#7DF9C6', label: '#8A8D84'
+};
+
+// ---------- world ----------
+var BASE_SEED = 979140;
+var worldSeed = BASE_SEED;
+var HOME = { x: 0.40, y: 0.50 };
+var BOUND = { x0: 0.20, x1: 0.66, y0: 0.27, y1: 0.73 };
+var poseLibrary = [];   // 24 poses: {joints, tag:{spd,spin,vert,ext}}
+var cycles = [];        // choreography cycles, built lazily, continuous
+
+function buildPoseLibrary(seed) {
+  var rng = mulberry32(seed ^ 0x5053);
+  var lib = [];
+  for (var i = 0; i < 24; i++) {
+    var P = {
+      crouch: rng() * 0.65,
+      lean: (rng() * 2 - 1) * 0.6,
+      thL: (rng() * 2 - 1) * 2.8, phL: (rng() * 2 - 1) * 2.2,
+      thR: (rng() * 2 - 1) * 2.8, phR: (rng() * 2 - 1) * 2.2,
+      kL: (rng() * 2 - 1) * 1.2, fL: rng() * 1.6 - 0.2,
+      kR: (rng() * 2 - 1) * 1.2, fR: rng() * 1.6 - 0.2,
+      n1: rng(), n2: rng()
+    };
+    var arch = i % 6;
+    if (arch === 0) { P.thL = 2.9; P.thR = 2.7; P.phL = 0.3; P.phR = -0.4; }        // both arms up
+    if (arch === 1) { P.thL = 2.8; P.thR = 0.2; P.lean = 0.45; }                   // one up, one down
+    if (arch === 2) { P.crouch = 0.62; P.fL = 1.5; P.fR = 1.4; P.kL = -0.5; P.kR = 0.5; } // deep crouch
+    if (arch === 3) { P.kL = -0.85; P.kR = 0.85; P.fL = 0.1; P.fR = 0.1; }         // wide stance
+    if (arch === 4) { P.kL = -1.5; P.fL = 0.4; P.lean = -0.5; P.thR = 2.4; }       // kick and reach
+    if (arch === 5) { P.thL = 1.5; P.thR = -1.5; P.phL = -1.6; P.phR = 1.6; }      // arms crossed wide
+    var J = poseJoints(P);
+    var handSpan = Math.abs(J.haL.x - J.haR.x);
+    var footSpan = Math.abs(J.ftL.x - J.ftR.x);
+    var ext = clamp((handSpan + footSpan) / 1.9, 0, 1);
+    var bothUp = (J.ftL.y < 0 && J.ftR.y < 0) ? 0.3 : 0;
+    var vert = clamp(0.78 - P.crouch * 0.8 + bothUp, 0, 1);
+    var spd = clamp(0.12 + 0.5 * Math.abs(P.lean) + 0.35 * ext + P.n1 * 0.25, 0, 1);
+    var spin = clamp(P.n2 * 0.7 + (ext > 0.65 ? 0.3 : 0), 0, 1);
+    lib.push({ joints: J, tag: { spd: spd, spin: spin, vert: vert, ext: ext } });
+  }
+  return lib;
+}
+
+function poseJoints(P) {
+  var torso = 0.34, ua = 0.20, fa = 0.19, th = 0.28, sh = 0.28;
+  var pelvis = { x: 0, y: 0 };
+  var neck = { x: P.lean * 0.10, y: -torso + P.crouch * 0.10 };
+  var head = { x: neck.x + P.lean * 0.05, y: neck.y - 0.115 };
+  var shL = { x: neck.x - 0.105, y: neck.y + 0.015 };
+  var shR = { x: neck.x + 0.105, y: neck.y + 0.015 };
+  function arm(s, a, b) {
+    var el = { x: s.x + Math.sin(a) * ua, y: s.y + Math.cos(a) * ua };
+    var ha = { x: el.x + Math.sin(a + b) * fa, y: el.y + Math.cos(a + b) * fa };
+    return [el, ha];
+  }
+  var aL = arm(shL, P.thL, P.phL), aR = arm(shR, P.thR, P.phR);
+  var hipL = { x: -0.07, y: 0.02 }, hipR = { x: 0.07, y: 0.02 };
+  var cK = P.crouch * 0.55, cF = P.crouch * 1.1;
+  function leg(h, k, f) {
+    var kn = { x: h.x + Math.sin(k) * th, y: h.y + Math.cos(k) * th };
+    var ft = { x: kn.x + Math.sin(k + f) * sh, y: kn.y + Math.cos(k + f) * sh };
+    return [kn, ft];
+  }
+  var lL = leg(hipL, P.kL - cK, P.fL + cF), lR = leg(hipR, P.kR + cK, P.fR + cF);
+  return {
+    head: head, neck: neck, pelvis: pelvis, shL: shL, shR: shR,
+    elL: aL[0], haL: aL[1], elR: aR[0], haR: aR[1],
+    hipL: hipL, hipR: hipR, knL: lL[0], ftL: lL[1], knR: lR[0], ftR: lR[1]
+  };
+}
+var POSE_SEGS = [
+  ['neck', 'head'], ['neck', 'shL'], ['neck', 'shR'],
+  ['shL', 'elL'], ['elL', 'haL'], ['shR', 'elR'], ['elR', 'haR'],
+  ['neck', 'pelvis'], ['pelvis', 'hipL'], ['pelvis', 'hipR'],
+  ['hipL', 'knL'], ['knL', 'ftL'], ['hipR', 'knR'], ['knR', 'ftR']
+];
+
+// ---------- choreography: closed-form phrases on a 120 s cycle ----------
+var CYCLE_LEN = 120;
+function buildCycle(k, attempt) {
+  var rng = mulberry32((worldSeed ^ (k * 40503) ^ (attempt * 977)) >>> 0);
+  var start = (k === 0) ? { x: HOME.x, y: HOME.y } : cycles[k - 1].endPos;
+  var moves = [];
+  var cur = { x: start.x, y: start.y };
+  var t = 0, uid = k * 1000, phraseIn = 0, phraseStart = true;
+  function clampPt(p) {
+    return { x: clamp(p.x, BOUND.x0, BOUND.x1), y: clamp(p.y, BOUND.y0, BOUND.y1) };
+  }
+  while (t < CYCLE_LEN - 0.01) {
+    var r = rng();
+    var type, dur;
+    if (phraseIn === 0) { phraseStart = true; phraseIn = 2 + Math.floor(rng() * 3); }
+    if (r < 0.30) type = 'GLIDE'; else if (r < 0.52) type = 'LUNGE';
+    else if (r < 0.74) type = 'SPIN'; else if (r < 0.90) type = 'FREEZE'; else type = 'HOLD';
+    var mv = { uid: uid++, type: type, t0: t, phraseStart: phraseStart };
+    phraseStart = false; phraseIn--;
+    if (type === 'GLIDE') {
+      dur = 5 + rng() * 3;
+      var ang = rng() * Math.PI * 2, dst = 0.18 + rng() * 0.16;
+      var p1 = clampPt({ x: cur.x + Math.cos(ang) * dst, y: cur.y + Math.sin(ang) * dst * 0.8 });
+      if (Math.hypot(p1.x - cur.x, p1.y - cur.y) < 0.08) p1 = clampPt({ x: cur.x + 0.2, y: cur.y - 0.1 });
+      var mx = (cur.x + p1.x) / 2, my = (cur.y + p1.y) / 2;
+      var px = -(p1.y - cur.y), py = (p1.x - cur.x);
+      mv.p0 = { x: cur.x, y: cur.y }; mv.p1 = p1;
+      mv.cp = { x: mx + px * (rng() - 0.5) * 0.9, y: my + py * (rng() - 0.5) * 0.9 };
+      cur = p1;
+    } else if (type === 'LUNGE') {
+      dur = 1.4 + rng() * 0.8;
+      var a2 = rng() * Math.PI * 2, d2 = 0.20 + rng() * 0.14;
+      var q1 = clampPt({ x: cur.x + Math.cos(a2) * d2, y: cur.y + Math.sin(a2) * d2 * 0.8 });
+      if (Math.hypot(q1.x - cur.x, q1.y - cur.y) < 0.10) q1 = clampPt({ x: cur.x - (q1.x - cur.x), y: cur.y - (q1.y - cur.y) });
+      mv.p0 = { x: cur.x, y: cur.y }; mv.p1 = q1; mv.dirA = Math.atan2(q1.y - cur.y, q1.x - cur.x);
+      cur = q1;
+    } else if (type === 'SPIN') {
+      dur = 4 + rng() * 2;
+      mv.center = { x: cur.x, y: cur.y }; mv.a0 = rng() * Math.PI * 2;
+      mv.spinDir = rng() < 0.5 ? 1 : -1; mv.rad = 0.028;
+    } else if (type === 'FREEZE') {
+      dur = 2.5 + rng() * 1.5;
+      mv.at = { x: cur.x, y: cur.y }; mv.ext = 0.25 + rng() * 0.5;
+    } else { // HOLD
+      dur = 1 + rng() * 1.2;
+      mv.at = { x: cur.x, y: cur.y };
+    }
+    if (t + dur > CYCLE_LEN) dur = CYCLE_LEN - t;
+    mv.dur = dur; t += dur;
+    moves.push(mv);
+  }
+  return { moves: moves, endPos: cur };
+}
+function ensureCycle(k) {
+  while (cycles.length <= k) {
+    var idx = cycles.length;
+    var attempt = 0, cyc = buildCycle(idx, attempt);
+    if (idx === 0) {
+      // frame one (t = 20 s) must land mid-spin or mid-glide
+      while (attempt < 60) {
+        var mt = moveTypeAt(cyc, 20);
+        if (mt === 'SPIN' || mt === 'GLIDE') break;
+        attempt++; cyc = buildCycle(0, attempt);
+      }
+    }
+    cycles.push(cyc);
+  }
+}
+function moveTypeAt(cyc, lt) {
+  for (var i = 0; i < cyc.moves.length; i++) {
+    var m = cyc.moves[i];
+    if (lt >= m.t0 && lt < m.t0 + m.dur) return m.type;
+  }
+  return cyc.moves[cyc.moves.length - 1].type;
+}
+function moveAt(t) {
+  var k = Math.floor(t / CYCLE_LEN);
+  ensureCycle(k);
+  var lt = t - k * CYCLE_LEN, mv = null;
+  var list = cycles[k].moves;
+  for (var i = 0; i < list.length; i++) {
+    if (lt >= list[i].t0 && lt < list[i].t0 + list[i].dur) { mv = list[i]; break; }
+  }
+  if (!mv) mv = list[list.length - 1];
+  return { mv: mv, phase: clamp((lt - mv.t0) / mv.dur, 0, 1) };
+}
+function dancerRaw(t) {
+  var g = moveAt(t), m = g.mv, ph = g.phase, x, y;
+  if (m.type === 'GLIDE') {
+    var u = 1 - ph;
+    x = u * u * m.p0.x + 2 * u * ph * m.cp.x + ph * ph * m.p1.x;
+    y = u * u * m.p0.y + 2 * u * ph * m.cp.y + ph * ph * m.p1.y;
+  } else if (m.type === 'LUNGE') {
+    var e = 1 - Math.pow(1 - ph, 3); // fast dart, settling arrival
+    x = lerp(m.p0.x, m.p1.x, e); y = lerp(m.p0.y, m.p1.y, e);
+  } else if (m.type === 'SPIN') {
+    var ramp = clamp(ph / 0.15, 0, 1);
+    var a = m.a0 + m.spinDir * Math.PI * 4 * ph;
+    x = m.center.x + Math.cos(a) * m.rad * ramp - Math.cos(m.a0) * m.rad * 0; // center offset below
+    y = m.center.y + Math.sin(a) * m.rad * ramp;
+    // keep the whirl centred on the entry point
+    x = m.center.x + (Math.cos(a) - Math.cos(m.a0)) * m.rad * ramp;
+    y = m.center.y + (Math.sin(a) - Math.sin(m.a0)) * m.rad * ramp;
+  } else { x = m.at.x; y = m.at.y; }
+  return { x: x, y: y, type: m.type, phase: ph, mv: m };
+}
+function dancerAt(t) {
+  var d = dancerRaw(t);
+  var a = dancerRaw(Math.max(0, t - 0.02)), b = dancerRaw(t + 0.02);
+  d.vx = (b.x - a.x) / 0.04; d.vy = (b.y - a.y) / 0.04;
+  return d;
+}
+function dancerVector(d) {
+  var spd = clamp(Math.hypot(d.vx, d.vy) / 0.30, 0, 1);
+  var spin = d.type === 'SPIN' ? Math.sin(Math.PI * clamp(d.phase, 0, 1)) : 0;
+  var ext = d.type === 'LUNGE' ? 0.85 : d.type === 'SPIN' ? 0.55 :
+            d.type === 'GLIDE' ? 0.5 : d.type === 'FREEZE' ? d.mv.ext : 0.3;
+  return { spd: spd, spin: spin, vert: clamp(1 - d.y, 0, 1), ext: ext };
+}
+function nearestPose(vec) {
+  var best = 0, bd = 1e9;
+  for (var i = 0; i < poseLibrary.length; i++) {
+    var tg = poseLibrary[i].tag;
+    var dd = (tg.spd - vec.spd) * (tg.spd - vec.spd) +
+             (tg.spin - vec.spin) * (tg.spin - vec.spin) +
+             (tg.vert - vec.vert) * (tg.vert - vec.vert) +
+             (tg.ext - vec.ext) * (tg.ext - vec.ext);
+    if (dd < bd) { bd = dd; best = i; }
+  }
+  return best;
+}
+
+// ---------- sim ----------
+var DT = 1 / 120;
+var simTime = 0, stepCount = 0;
+var drones = [];
+var poseIdx = 0;
+var lastMoveUid = -1, lastMoveType = '';
+var scatterDirs = {};   // per lunge move uid: per-drone scatter angles
+var glideHeading = 0;
+var evQueue = [];
+var pendingReseed = false;
+var lead = { active: false, x: 0.4, y: 0.5, until: -1, dragging: false };
+var liveStarted = false;
+var phraseCount = 0;
+
+function initDrones(n) {
+  drones = [];
+  var d = dancerRaw(simTime);
+  for (var i = 0; i < n; i++) {
+    var a = (i / n) * Math.PI * 2;
+    drones.push({
+      x: d.x + Math.cos(a) * 0.125, y: d.y + Math.sin(a) * 0.125,
+      vx: 0, vy: 0, a0: a, trail: []
+    });
+  }
+}
+function resetSim() {
+  simTime = 0; stepCount = 0; evQueue = []; scatterDirs = {};
+  lastMoveUid = -1; poseIdx = 0; phraseCount = 0;
+  initDrones(8);
+  poseIdx = nearestPose(dancerVector(dancerAt(0)));
+}
+function buildWorld(seed) {
+  worldSeed = seed;
+  poseLibrary = buildPoseLibrary(seed);
+  cycles = [];
+  ensureCycle(0);
+  resetSim();
+}
+function droneTarget(i, dr, d) {
+  if (lead.active) {
+    var la = dr.a0 + simTime * 0.9;
+    return { x: lead.x + Math.cos(la) * 0.09, y: lead.y + Math.sin(la) * 0.09 };
+  }
+  var ty = d.type;
+  if (ty === 'SPIN') {
+    var a = dr.a0 + simTime * 2.2;
+    return { x: d.x + Math.cos(a) * 0.135, y: d.y + Math.sin(a) * 0.135 };
+  }
+  if (ty === 'FREEZE' || ty === 'HOLD') {
+    var a2 = dr.a0 + simTime * 0.05;
+    return { x: d.x + Math.cos(a2) * 0.125, y: d.y + Math.sin(a2) * 0.125 + 0.006 * Math.sin(simTime * 2 + i * 1.7) };
+  }
+  if (ty === 'LUNGE') {
+    var sd = scatterDirs[d.mv.uid];
+    var ang = sd ? sd[i % sd.length] : dr.a0;
+    return { x: d.x + Math.cos(ang) * 0.20, y: d.y + Math.sin(ang) * 0.20 };
+  }
+  // GLIDE: loose V trailing behind the dancer heading
+  if (i === 0) return { x: d.x - Math.cos(glideHeading) * 0.07, y: d.y - Math.sin(glideHeading) * 0.07 };
+  var row = Math.floor((i - 1) / 2) + 1, side = (i % 2 === 0) ? 1 : -1;
+  var bx = Math.cos(glideHeading), by = Math.sin(glideHeading);
+  return {
+    x: d.x - bx * (0.05 + 0.055 * row) + (-by) * side * 0.055 * row,
+    y: d.y - by * (0.05 + 0.055 * row) + (bx) * side * 0.055 * row
+  };
+}
+function onMoveChange(d) {
+  if (d.type === 'LUNGE') {
+    var rng = mulberry32((worldSeed ^ (d.mv.uid * 131)) >>> 0);
+    var arr = [];
+    for (var i = 0; i < 16; i++) arr.push(d.mv.dirA + Math.PI + (rng() - 0.5) * 2.4);
+    scatterDirs[d.mv.uid] = arr;
+    for (var j = 0; j < drones.length; j++) {
+      var dr = drones[j];
+      var ox = dr.x - d.x, oy = dr.y - d.y;
+      var ol = Math.hypot(ox, oy) || 1;
+      dr.vx += (ox / ol) * 0.85; dr.vy += (oy / ol) * 0.85;
+    }
+  }
+  if (liveStarted) {
+    if (d.mv.phraseStart) { phraseCount++; playNote(phraseCount); }
+    if (d.type !== lastMoveType) playSweep();
+  }
+  lastMoveType = d.type;
+}
+function applyEvent(ev) {
+  if (ev.type === 'tap') {
+    if (drones.length < 16) {
+      var rng = mulberry32((worldSeed ^ (stepCount * 31)) >>> 0);
+      var d = dancerRaw(simTime);
+      var a = rng() * Math.PI * 2;
+      drones.push({
+        x: d.x + Math.cos(a) * 0.05, y: d.y + Math.sin(a) * 0.05,
+        vx: 0, vy: 0, a0: rng() * Math.PI * 2, trail: []
+      });
+    }
+  } else if (ev.type === 'reseed') {
+    pendingReseed = true;
+  }
+}
+function stepSim() {
+  simTime += DT; stepCount++;
+  while (evQueue.length && evQueue[0].time <= simTime) applyEvent(evQueue.shift());
+  if (!lead.dragging && simTime > lead.until) lead.active = false;
+  var d = dancerAt(simTime);
+  if (d.mv.uid !== lastMoveUid) { lastMoveUid = d.mv.uid; onMoveChange(d); }
+  if (Math.hypot(d.vx, d.vy) > 0.02) {
+    var h = Math.atan2(d.vy, d.vx);
+    var dh = h - glideHeading;
+    while (dh > Math.PI) dh -= Math.PI * 2;
+    while (dh < -Math.PI) dh += Math.PI * 2;
+    glideHeading += dh * 0.08;
+  }
+  var i, j, dr, tg;
+  for (i = 0; i < drones.length; i++) {
+    dr = drones[i];
+    tg = droneTarget(i, dr, d);
+    var ax = (tg.x - dr.x) * 14 - dr.vx * 4.2;
+    var ay = (tg.y - dr.y) * 14 - dr.vy * 4.2;
+    var al = Math.hypot(ax, ay), amax = 3.2;
+    if (al > amax) { ax = ax / al * amax; ay = ay / al * amax; }
+    dr.vx += ax * DT; dr.vy += ay * DT;
+    var sp = Math.hypot(dr.vx, dr.vy), smax = 1.1;
+    if (sp > smax) { dr.vx = dr.vx / sp * smax; dr.vy = dr.vy / sp * smax; }
+    dr.x += dr.vx * DT; dr.y += dr.vy * DT;
+  }
+  // separation
+  for (i = 0; i < drones.length; i++) for (j = i + 1; j < drones.length; j++) {
+    var A = drones[i], B = drones[j];
+    var dx = B.x - A.x, dy = B.y - A.y, dd = Math.hypot(dx, dy);
+    if (dd > 0.0001 && dd < 0.028) {
+      var push = (0.028 - dd) / 2, ux = dx / dd, uy = dy / dd;
+      A.x -= ux * push; A.y -= uy * push; B.x += ux * push; B.y += uy * push;
+    }
+  }
+  if (stepCount % 4 === 0) {
+    for (i = 0; i < drones.length; i++) {
+      dr = drones[i];
+      dr.trail.push(dr.x, dr.y);
+      if (dr.trail.length > 132) dr.trail.splice(0, dr.trail.length - 132);
+    }
+  }
+  if (stepCount % 60 === 0) { // the database answers twice a second, by snap
+    var np = nearestPose(dancerVector(d));
+    if (np !== poseIdx) { poseIdx = np; if (liveStarted) playClick(); }
+  }
+}
+function advance(n) { for (var i = 0; i < n; i++) stepSim(); }
+
+// ---------- audio (lazy, guarded, first gesture only) ----------
+var AC = null, whirOsc = null, whirGain = null;
+function ensureAudio() {
+  if (AC) { if (AC.resume) AC.resume(); return; }
+  var Ctor = (typeof AudioContext !== 'undefined') ? AudioContext :
+             (typeof webkitAudioContext !== 'undefined') ? webkitAudioContext : null;
+  if (!Ctor) return;
+  try {
+    AC = new Ctor();
+    var master = AC.createGain(); master.gain.value = 0.9; master.connect(AC.destination);
+    AC._master = master;
+    // stage bed: looped noise through a low filter, very low
+    var len = 2 * AC.sampleRate, buf = AC.createBuffer(1, len, AC.sampleRate);
+    var ch = buf.getChannelData(0);
+    for (var i = 0; i < len; i++) ch[i] = Math.random() * 2 - 1;
+    var src = AC.createBufferSource(); src.buffer = buf; src.loop = true;
+    var lp = AC.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 220;
+    var bg = AC.createGain(); bg.gain.value = 0.012;
+    src.connect(lp); lp.connect(bg); bg.connect(master); src.start();
+    // rotor whir bus: pitch follows flock height in the live loop
+    whirOsc = AC.createOscillator(); whirOsc.type = 'sawtooth'; whirOsc.frequency.value = 82;
+    var wf = AC.createBiquadFilter(); wf.type = 'lowpass'; wf.frequency.value = 420;
+    whirGain = AC.createGain(); whirGain.gain.value = 0.016;
+    whirOsc.connect(wf); wf.connect(whirGain); whirGain.connect(master); whirOsc.start();
+  } catch (e) { AC = null; }
+}
+function tone(freq, dur, vol, type) {
+  if (!AC) return;
+  try {
+    var o = AC.createOscillator(), g = AC.createGain();
+    o.type = type || 'sine'; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, AC.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, AC.currentTime + dur);
+    o.connect(g); g.connect(AC._master); o.start(); o.stop(AC.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+var PENTA = [261.63, 293.66, 329.63, 392.0, 440.0, 523.25];
+function playNote(n) { tone(PENTA[n % PENTA.length], 0.55, 0.05, 'sine'); }
+function playClick() { tone(1600, 0.045, 0.028, 'square'); }
+function playSweep() {
+  if (!AC) return;
+  try {
+    var o = AC.createOscillator(), g = AC.createGain();
+    o.type = 'sine';
+    o.frequency.setValueAtTime(240, AC.currentTime);
+    o.frequency.exponentialRampToValueAtTime(660, AC.currentTime + 0.35);
+    g.gain.setValueAtTime(0.032, AC.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, AC.currentTime + 0.4);
+    o.connect(g); g.connect(AC._master); o.start(); o.stop(AC.currentTime + 0.45);
+  } catch (e) {}
+}
+
+// ---------- layout + draw ----------
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var cssW = 0, cssH = 0;
+function isPhone() {
+  var s = (typeof window !== 'undefined' && window.screen) ? window.screen : null;
+  if (s && Math.min(s.width, s.height) < 700) return true;
+  return cssH > cssW * 1.15;
+}
+function resize() {
+  var vv = (typeof window !== 'undefined') ? window.visualViewport : null;
+  var w = vv ? vv.width : window.innerWidth;
+  var h = vv ? vv.height : window.innerHeight;
+  cssW = Math.round(w); cssH = Math.round(h);
+  canvas.width = cssW; canvas.height = cssH;
+}
+if (typeof window !== 'undefined') {
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { resize(); draw(); });
+  }
+  window.addEventListener('resize', function () { resize(); draw(); });
+}
+function layout() {
+  var m = Math.max(10, cssW * 0.015);
+  var fw = isPhone() ? cssW * 0.26 : clamp(cssW * 0.19, 120, 230);
+  var fx1 = cssW - m, fx0 = fx1 - fw, fy0 = m, fy1 = cssH - m;
+  return { fx0: fx0, fy0: fy0, fx1: fx1, fy1: fy1, stageW: fx0 - 8, stageH: cssH };
+}
+function draw() {
+  canvas.style.width = cssW + 'px';
+  canvas.style.height = cssH + 'px';
+  var L = layout();
+  ctx.fillStyle = COL.stage;
+  ctx.fillRect(0, 0, cssW, cssH);
+  var i, j, dr;
+  // trails: fading cyan ribbons
+  ctx.lineWidth = 1.5; ctx.lineCap = 'round';
+  for (i = 0; i < drones.length; i++) {
+    dr = drones[i];
+    var n = dr.trail.length / 2;
+    for (j = 1; j < n; j++) {
+      ctx.globalAlpha = (j / n) * 0.5;
+      ctx.strokeStyle = COL.drone;
+      ctx.beginPath();
+      ctx.moveTo(dr.trail[(j - 1) * 2] * L.stageW, dr.trail[(j - 1) * 2 + 1] * L.stageH);
+      ctx.lineTo(dr.trail[j * 2] * L.stageW, dr.trail[j * 2 + 1] * L.stageH);
+      ctx.stroke();
+    }
+  }
+  ctx.globalAlpha = 1;
+  // drones: rotor blur streak + body dot
+  for (i = 0; i < drones.length; i++) {
+    dr = drones[i];
+    var x = dr.x * L.stageW, y = dr.y * L.stageH;
+    ctx.globalAlpha = 0.5; ctx.strokeStyle = COL.rotor; ctx.lineWidth = 1.4;
+    ctx.beginPath(); ctx.moveTo(x - 6, y - 2.5); ctx.lineTo(x + 6, y - 2.5); ctx.stroke();
+    ctx.globalAlpha = 1; ctx.fillStyle = COL.drone;
+    ctx.beginPath(); ctx.arc(x, y, 3.0, 0, Math.PI * 2); ctx.fill();
+  }
+  // dancer: warm halo, rim, core
+  var d = dancerRaw(simTime);
+  var dxp = d.x * L.stageW, dyp = d.y * L.stageH;
+  ctx.globalAlpha = 0.10; ctx.fillStyle = COL.rim;
+  ctx.beginPath(); ctx.arc(dxp, dyp, 16, 0, Math.PI * 2); ctx.fill();
+  ctx.globalAlpha = 0.55; ctx.strokeStyle = COL.rim; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.arc(dxp, dyp, 9.5, 0, Math.PI * 2); ctx.stroke();
+  ctx.globalAlpha = 1; ctx.fillStyle = COL.dancer;
+  ctx.beginPath(); ctx.arc(dxp, dyp, 4.6, 0, Math.PI * 2); ctx.fill();
+  // doppelganger frame
+  ctx.strokeStyle = COL.frame; ctx.lineWidth = 1;
+  ctx.strokeRect(L.fx0, L.fy0, L.fx1 - L.fx0, L.fy1 - L.fy0);
+  ctx.fillStyle = COL.label;
+  ctx.font = (isPhone() ? 8 : 10) + 'px monospace';
+  ctx.textBaseline = 'top';
+  ctx.fillText('NEAREST POSE', L.fx0 + 8, L.fy0 + 7);
+  // stick figure, snapped, never interpolated
+  var J = poseLibrary[poseIdx].joints;
+  var keys = ['head', 'neck', 'pelvis', 'shL', 'shR', 'elL', 'haL', 'elR', 'haR', 'hipL', 'hipR', 'knL', 'ftL', 'knR', 'ftR'];
+  var mnx = 1e9, mxx = -1e9, mny = 1e9, mxy = -1e9, k, p;
+  for (i = 0; i < keys.length; i++) {
+    p = J[keys[i]];
+    if (p.x < mnx) mnx = p.x; if (p.x > mxx) mxx = p.x;
+    if (p.y < mny) mny = p.y; if (p.y > mxy) mxy = p.y;
+  }
+  var iw = (L.fx1 - L.fx0) - 20, ih = (L.fy1 - L.fy0) - 44;
+  var sc = Math.min(iw / Math.max(0.05, mxx - mnx), ih / Math.max(0.05, mxy - mny));
+  var cx = (L.fx0 + L.fx1) / 2, cy = (L.fy0 + 22 + L.fy1) / 2;
+  function mapP(q) { return { x: cx + (q.x - (mnx + mxx) / 2) * sc, y: cy + (q.y - (mny + mxy) / 2) * sc }; }
+  ctx.strokeStyle = COL.stick; ctx.lineWidth = 2; ctx.lineJoin = 'round';
+  ctx.beginPath();
+  for (i = 0; i < POSE_SEGS.length; i++) {
+    var A = mapP(J[POSE_SEGS[i][0]]), B = mapP(J[POSE_SEGS[i][1]]);
+    ctx.moveTo(A.x, A.y); ctx.lineTo(B.x, B.y);
+  }
+  ctx.stroke();
+  var hp = mapP(J.head);
+  ctx.beginPath(); ctx.arc(hp.x, hp.y - 0.075 * sc, 0.075 * sc, 0, Math.PI * 2); ctx.stroke();
+  ctx.fillStyle = COL.stick;
+  for (i = 0; i < keys.length; i++) {
+    p = mapP(J[keys[i]]);
+    ctx.beginPath(); ctx.arc(p.x, p.y, 1.5, 0, Math.PI * 2); ctx.fill();
+  }
+}
+
+// ---------- interaction: events are stamped and consumed in step order ----------
+var lastTapStamp = -1e9, downInfo = null;
+function toStage(cx, cy) {
+  var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0, width: cssW, height: cssH };
+  var L = layout();
+  var px = (cx - r.left) * (cssW / (r.width || cssW));
+  var py = (cy - r.top) * (cssH / (r.height || cssH));
+  return { x: clamp(px / L.stageW, 0, 1), y: clamp(py / L.stageH, 0, 1) };
+}
+function onDown(e) {
+  ensureAudio();
+  var s = toStage(e.clientX, e.clientY);
+  downInfo = { x: s.x, y: s.y, dragging: false };
+  lead.x = s.x; lead.y = s.y;
+}
+function onMove(e) {
+  if (!downInfo) return;
+  var s = toStage(e.clientX, e.clientY);
+  if (Math.hypot(s.x - downInfo.x, s.y - downInfo.y) > 0.012) downInfo.dragging = true;
+  if (downInfo.dragging) {
+    lead.active = true; lead.dragging = true;
+    lead.x = s.x; lead.y = s.y;
+  }
+}
+function onUp(e) {
+  if (!downInfo) return;
+  var wasDrag = downInfo.dragging;
+  downInfo = null;
+  if (wasDrag) {
+    lead.dragging = false;
+    lead.until = simTime + 10; // the flock is yours for ten more seconds
+    return;
+  }
+  var stamp = (typeof e.timeStamp === 'number') ? e.timeStamp : 0;
+  if (stamp - lastTapStamp < 320) {
+    // double tap: a new phrase. Retract any queued single tap first.
+    evQueue = evQueue.filter(function (ev) { return ev.type !== 'tap'; });
+    evQueue.push({ type: 'reseed', time: simTime });
+    lastTapStamp = -1e9;
+  } else {
+    lastTapStamp = stamp;
+    evQueue.push({ type: 'tap', time: simTime + 0.32 });
+    evQueue.sort(function (a, b) { return a.time - b.time; });
+  }
+}
+if (canvas.addEventListener) {
+  canvas.addEventListener('pointerdown', onDown);
+  canvas.addEventListener('pointermove', onMove);
+  canvas.addEventListener('pointerup', onUp);
+  canvas.addEventListener('pointercancel', function () { downInfo = null; lead.dragging = false; });
+}
+
+// ---------- boot: frame one is the synchronous draw after exactly 2400 steps ----------
+resize();
+buildWorld(BASE_SEED);
+advance(2400);
+draw();
+liveStarted = true;
+
+// ---------- live loop (guarded; not part of frame one) ----------
+var lastNow = -1, acc = 0;
+function frame(now) {
+  if (lastNow < 0) lastNow = now;
+  var el = Math.min(0.1, Math.max(0, (now - lastNow) / 1000));
+  lastNow = now;
+  acc += el;
+  var steps = Math.floor(acc / DT);
+  if (steps > 16) steps = 16;
+  acc -= steps * DT;
+  if (steps > 0) advance(steps);
+  if (pendingReseed) {
+    pendingReseed = false;
+    buildWorld(worldSeed + 1013);
+    advance(2400);
+  }
+  if (AC && whirOsc && drones.length) {
+    var my = 0;
+    for (var i = 0; i < drones.length; i++) my += drones[i].y;
+    my /= drones.length;
+    try { whirOsc.frequency.value = 65 + (1 - my) * 55; } catch (e) {}
+  }
+  draw();
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+}
+if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+</script>
+</body>
+</html>

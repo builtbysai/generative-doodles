@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Played</title>
+<style>
+  html, body { margin:0; padding:0; background:#0A0B0E; height:100%; overflow:hidden; }
+  canvas { display:block; touch-action:none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function(){
+'use strict';
+
+// ---------- constants ----------
+var GROUND = '#0A0B0E';
+var FACE_LINE = '#3A3F4B';
+var TRACE_LINE = '#23262E';
+var REGION_WASH = '#8A4A3A';
+var SPARK = '#4FD6FF';
+var FLASH = '#FFC44F';
+var SENSOR = '#7DF9C6';
+
+var PERIOD = 24;        // etude loop length, seconds
+var TRAVEL = 0.35;      // spark travel time along a wire-trace, seconds
+var PT0 = 9;            // frame one sits 9 s into the pattern
+var BASE_SEED = 976137;
+
+// ---------- seeded rng ----------
+function mulberry32(a){
+  return function(){
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    var t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+// ---------- muscle regions ----------
+// stage coords: x right, y down, face centre at (0,0), stage spans [-1,1]
+var REGIONS = [
+  { name:'browL',  c:[-0.39,-0.38], r:0.30, freq:880, type:'sine',     gain:0.16 },
+  { name:'browR',  c:[ 0.39,-0.38], r:0.30, freq:932, type:'sine',     gain:0.16 },
+  { name:'eyeL',   c:[-0.55,-0.16], r:0.26, freq:440, type:'triangle', gain:0.22 },
+  { name:'eyeR',   c:[ 0.55,-0.16], r:0.26, freq:523, type:'triangle', gain:0.22 },
+  { name:'cheekL', c:[-0.58, 0.20], r:0.34, freq:349, type:'triangle', gain:0.18 },
+  { name:'cheekR', c:[ 0.58, 0.20], r:0.34, freq:415, type:'triangle', gain:0.18 },
+  { name:'mouthL', c:[-0.31, 0.56], r:0.26, freq:392, type:'sine',     gain:0.20 },
+  { name:'mouthR', c:[ 0.31, 0.56], r:0.26, freq:330, type:'sine',     gain:0.20 },
+  { name:'jaw',    c:[ 0.00, 0.90], r:0.42, freq:98,  type:'sine',     gain:0.50 }
+];
+var LEFT_REGIONS  = [0,2,4,6];
+var RIGHT_REGIONS = [1,3,5,7];
+
+// wire-traces: polylines from an origin at the frame edge to the region centre.
+// sparks travel origin -> region.
+var TRACES = [
+  [[-1.30,-1.05],[-0.85,-0.80],[-0.55,-0.52],[-0.39,-0.38]],
+  [[ 1.30,-1.05],[ 0.85,-0.80],[ 0.55,-0.52],[ 0.39,-0.38]],
+  [[-1.30,-0.30],[-0.95,-0.26],[-0.55,-0.16]],
+  [[ 1.30,-0.30],[ 0.95,-0.26],[ 0.55,-0.16]],
+  [[-1.30, 0.30],[-0.92, 0.26],[-0.58, 0.20]],
+  [[ 1.30, 0.30],[ 0.92, 0.26],[ 0.58, 0.20]],
+  [[-1.30, 1.02],[-0.80, 0.86],[-0.48, 0.68],[-0.31, 0.56]],
+  [[ 1.30, 1.05],[ 0.95, 0.92],[ 0.55, 0.70],[ 0.31, 0.56]],
+  [[ 0.10, 1.34],[ 0.05, 1.12],[ 0.00, 0.90]]
+];
+var TRACE_LEN = TRACES.map(function(tr){
+  var L = 0;
+  for (var i=1;i<tr.length;i++){
+    var dx = tr[i][0]-tr[i-1][0], dy = tr[i][1]-tr[i-1][1];
+    L += Math.sqrt(dx*dx+dy*dy);
+  }
+  return L;
+});
+function tracePoint(ti, u){
+  var tr = TRACES[ti], target = u * TRACE_LEN[ti], acc = 0;
+  for (var i=1;i<tr.length;i++){
+    var dx = tr[i][0]-tr[i-1][0], dy = tr[i][1]-tr[i-1][1];
+    var seg = Math.sqrt(dx*dx+dy*dy);
+    if (acc + seg >= target || i === tr.length-1){
+      var f = seg > 0 ? (target-acc)/seg : 0;
+      if (f < 0) f = 0; if (f > 1) f = 1;
+      return [tr[i-1][0] + dx*f, tr[i-1][1] + dy*f];
+    }
+    acc += seg;
+  }
+  return tr[tr.length-1];
+}
+
+var SENSOR_POS = [0.88, 0.84];
+
+// ---------- face contours (parametric model + seeded jitter) ----------
+function quad(p0, pc, p1, n){
+  var pts = [];
+  for (var i=0;i<=n;i++){
+    var t = i/n, a = (1-t)*(1-t), b = 2*(1-t)*t, c = t*t;
+    pts.push([a*p0[0]+b*pc[0]+c*p1[0], a*p0[1]+b*pc[1]+c*p1[1]]);
+  }
+  return pts;
+}
+function buildFace(rng){
+  var lines = [];
+  function jit(pts, amp){
+    return pts.map(function(p){
+      return [p[0] + (rng()-0.5)*amp, p[1] + (rng()-0.5)*amp];
+    });
+  }
+  // outer oval
+  var oval = [], i, a;
+  for (i=0;i<140;i++){
+    a = (i/140)*Math.PI*2;
+    oval.push([Math.cos(a)*1.07, Math.sin(a)*1.20 - 0.02]);
+  }
+  lines.push({ pts: jit(oval, 0.010), closed:true });
+  // brows
+  lines.push({ pts: jit(quad([-0.62,-0.335],[-0.39,-0.455],[-0.16,-0.375],16), 0.008), closed:false });
+  lines.push({ pts: jit(quad([ 0.16,-0.375],[ 0.39,-0.455],[ 0.62,-0.335],16), 0.008), closed:false });
+  // eyes (almonds)
+  var eyeL = quad([-0.60,-0.16],[-0.38,-0.265],[-0.16,-0.16],14)
+    .concat(quad([-0.16,-0.16],[-0.38,-0.075],[-0.60,-0.16],14).slice(1));
+  var eyeR = quad([ 0.16,-0.16],[ 0.38,-0.265],[ 0.60,-0.16],14)
+    .concat(quad([ 0.60,-0.16],[ 0.38,-0.075],[ 0.16,-0.16],14).slice(1));
+  lines.push({ pts: jit(eyeL, 0.007), closed:true });
+  lines.push({ pts: jit(eyeR, 0.007), closed:true });
+  // nose: bridge then base arc
+  var nose = [[-0.030,-0.12],[-0.016,0.02],[0.000,0.15],[-0.045,0.265]]
+    .concat(quad([-0.045,0.265],[0.005,0.345],[0.095,0.275],10).slice(1));
+  lines.push({ pts: jit(nose, 0.007), closed:false });
+  // mouth
+  var mouth = quad([-0.30,0.56],[0.00,0.485],[0.30,0.56],18)
+    .concat(quad([0.30,0.56],[0.00,0.685],[-0.30,0.56],18).slice(1));
+  lines.push({ pts: jit(mouth, 0.007), closed:true });
+  // inner jaw / chin contour
+  lines.push({ pts: jit(quad([-0.74,0.40],[0.00,1.06],[0.74,0.40],26), 0.009), closed:false });
+  return lines;
+}
+
+// ---------- the etude ----------
+// A seeded pulse-train. The "hand pattern" alternates sides; each hand event
+// is cross-wired to a muscle on the OPPOSITE side of the face (Manabe's
+// right-hand pulses hit the left eye, left-hand the right). The jaw sits on
+// the midline and answers either hand.
+function buildEtude(rng){
+  var events = [];
+  var t = 0.4 + rng()*0.4;
+  var hand = rng() < 0.5 ? 0 : 1; // 0 = left hand, 1 = right hand
+  var guard = 0;
+  while (t < PERIOD - 1.2 && guard++ < 200){
+    if (rng() < 0.72) hand = 1 - hand; // mostly alternate hands
+    var pool = hand === 0 ? RIGHT_REGIONS : LEFT_REGIONS;
+    var region;
+    if (rng() < 0.12) region = 8; // jaw, either hand
+    else region = pool[Math.floor(rng()*pool.length)];
+    events.push({ launch:t, region:region });
+    if (rng() < 0.15){ // occasional two-note chord, opposite side answers too
+      var pool2 = hand === 0 ? LEFT_REGIONS : RIGHT_REGIONS;
+      events.push({ launch:t, region: pool2[Math.floor(rng()*pool2.length)] });
+    }
+    var step = [0.55,0.8,0.8,1.1,1.1,1.6][Math.floor(rng()*6)];
+    t += step * (0.85 + rng()*0.3);
+  }
+  // keep the anchor window clean, then plant the two frame-one anchors:
+  events = events.filter(function(e){
+    return Math.abs(e.launch - 8.60) > 0.28 && Math.abs(e.launch - 8.825) > 0.28;
+  });
+  events.push({ launch: 8.60,  region: 8 }); // jaw: arrival 8.95, mid-contraction at PT0
+  events.push({ launch: 8.825, region: 0 }); // browL: spark mid-travel at PT0
+  events.sort(function(x,y){ return x.launch - y.launch; });
+  return events;
+}
+
+// ---------- generation state ----------
+var gen = null;
+function makeGen(seed, startT){
+  var rngFace = mulberry32(seed ^ 0x9e37);
+  var rngEtude = mulberry32(seed);
+  return {
+    seed: seed,
+    startT: startT, // piece-time at which pattern time is 0
+    face: buildFace(rngFace),
+    etude: buildEtude(rngEtude)
+  };
+}
+gen = makeGen(BASE_SEED, -PT0);
+
+var userEvents = []; // {launch: pattern-time, region}
+
+// ---------- contraction envelope ----------
+// fast attack (~60 ms), spring decay: the flesh answers after the spark.
+function envelope(dt){
+  if (dt < 0 || dt > 0.9) return 0;
+  if (dt < 0.06) return dt / 0.06;
+  return Math.exp(-(dt - 0.06) / 0.11);
+}
+
+// collect active contractions / sparks / twitch for pattern time pt
+function sampleState(pt){
+  var contractions = []; // per region strength
+  var i;
+  for (i=0;i<REGIONS.length;i++) contractions.push(0);
+  var sparks = [];
+  var twitch = 0;
+
+  function applyEvent(launch, region, repeating){
+    var rel = pt - launch;
+    if (rel < 0) return;
+    var dtLaunch;
+    if (repeating){
+      dtLaunch = rel - Math.floor(rel / PERIOD) * PERIOD;
+    } else {
+      if (rel > PERIOD) return;
+      dtLaunch = rel;
+    }
+    if (dtLaunch < 0.8) twitch += Math.exp(-dtLaunch / 0.16);
+    if (dtLaunch < TRAVEL){
+      sparks.push({ region: region, u: dtLaunch / TRAVEL });
+    } else {
+      var e = envelope(dtLaunch - TRAVEL);
+      if (e > contractions[region]) contractions[region] = e;
+    }
+  }
+  for (i=0;i<gen.etude.length;i++) applyEvent(gen.etude[i].launch, gen.etude[i].region, true);
+  for (i=0;i<userEvents.length;i++) applyEvent(userEvents[i].launch, userEvents[i].region, false);
+  if (twitch > 1) twitch = 1;
+  return { contractions: contractions, sparks: sparks, twitch: twitch };
+}
+
+// ---------- audio (lazy, gesture-gated) ----------
+var AC = null;
+function ensureAudio(){
+  if (AC) { if (AC.resume) AC.resume(); return; }
+  try {
+    var Ctx = (typeof window !== 'undefined') && (window.AudioContext || window.webkitAudioContext);
+    if (!Ctx) return;
+    AC = new Ctx();
+  } catch (e) { AC = null; }
+}
+function tone(freq, type, dur, gain, slideTo){
+  if (!AC) return;
+  try {
+    var t0 = AC.currentTime;
+    var o = AC.createOscillator(), g = AC.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(freq, t0);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t0 + dur);
+    g.gain.setValueAtTime(gain, t0);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    o.connect(g); g.connect(AC.destination);
+    o.start(t0); o.stop(t0 + dur + 0.05);
+  } catch (e) {}
+}
+function tickSound(){
+  tone(480, 'square', 0.32, 0.030, 1320); // rising tick while the spark travels
+}
+function voiceSound(regionIdx){
+  var r = REGIONS[regionIdx];
+  if (regionIdx === 8) tone(98, 'sine', 0.30, 0.50, 55); // jaw thump
+  else tone(r.freq, r.type, regionIdx < 2 ? 0.35 : 0.28, r.gain, 0);
+}
+
+var prevPtAudio = null;
+function stepAudio(pt){
+  if (!AC) { prevPtAudio = pt; return; }
+  if (prevPtAudio === null || pt < prevPtAudio) { prevPtAudio = pt; return; }
+  var i, k;
+  function check(launch, region, repeating){
+    var base = repeating ? Math.floor((prevPtAudio - launch) / PERIOD) : 0;
+    for (k = base; k <= base + 1; k++){
+      var occ = launch + (repeating ? k * PERIOD : 0);
+      if (occ > prevPtAudio && occ <= pt) tickSound();
+      var arr = occ + TRAVEL;
+      if (arr > prevPtAudio && arr <= pt) voiceSound(region);
+    }
+  }
+  for (i=0;i<gen.etude.length;i++) check(gen.etude[i].launch, gen.etude[i].region, true);
+  for (i=0;i<userEvents.length;i++) check(userEvents[i].launch, userEvents[i].region, false);
+  prevPtAudio = pt;
+}
+
+// ---------- canvas / sizing ----------
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var VW = 720, VH = 720, DPR = 1;
+
+function isPhone(){
+  var sw = 0, sh = 0;
+  if (typeof window !== 'undefined' && window.screen){
+    sw = window.screen.width || 0; sh = window.screen.height || 0;
+  }
+  var minDim = Math.min(sw, sh);
+  if (minDim > 0 && minDim < 700) return true;
+  return VH > VW * 1.15;
+}
+function resize(){
+  var w = VW, h = VH;
+  if (typeof window !== 'undefined'){
+    if (window.visualViewport && window.visualViewport.width){
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    } else if (window.innerWidth){
+      w = window.innerWidth; h = window.innerHeight;
+    }
+    DPR = window.devicePixelRatio || 1;
+  }
+  VW = w; VH = h;
+  canvas.width = Math.round(w * DPR);
+  canvas.height = Math.round(h * DPR);
+  canvas.style.width = w + 'px';
+  canvas.style.height = h + 'px';
+}
+if (typeof window !== 'undefined'){
+  if (window.visualViewport && window.visualViewport.addEventListener)
+    window.visualViewport.addEventListener('resize', resize);
+  if (window.addEventListener) window.addEventListener('resize', resize);
+}
+resize();
+
+// stage mapping: centred square of side S = min(VW, VH); stage units [-1,1]
+function stageGeom(){
+  var S = Math.min(VW, VH);
+  return { cx: VW/2, cy: VH/2, half: S/2, S: S };
+}
+function toPx(g, p){
+  return [g.cx + p[0]*g.half, g.cy + p[1]*g.half];
+}
+function toStage(clientX, clientY){
+  var g = stageGeom();
+  var rect = null;
+  if (canvas.getBoundingClientRect) rect = canvas.getBoundingClientRect();
+  var x = rect ? clientX - rect.left : clientX;
+  var y = rect ? clientY - rect.top : clientY;
+  return [(x - g.cx)/g.half, (y - g.cy)/g.half];
+}
+
+// ---------- drawing ----------
+function draw(tPiece){
+  canvas.style.width = VW + 'px';
+  canvas.style.height = VH + 'px';
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = GROUND;
+  ctx.fillRect(0, 0, VW, VH);
+
+  var pt = tPiece - gen.startT;
+  var st = sampleState(pt);
+  var g = stageGeom();
+  var px = function(p){ return toPx(g, p); };
+  var i, j;
+
+  var lw = Math.max(1, g.S * 0.0018);
+
+  // wire traces
+  ctx.strokeStyle = TRACE_LINE;
+  ctx.lineWidth = lw;
+  ctx.lineJoin = 'round';
+  for (i=0;i<TRACES.length;i++){
+    ctx.beginPath();
+    for (j=0;j<TRACES[i].length;j++){
+      var tp = px(TRACES[i][j]);
+      if (j === 0) ctx.moveTo(tp[0], tp[1]); else ctx.lineTo(tp[0], tp[1]);
+    }
+    ctx.stroke();
+  }
+
+  // region washes (faint warm discs)
+  for (i=0;i<REGIONS.length;i++){
+    var rp = px(REGIONS[i].c);
+    ctx.beginPath();
+    ctx.fillStyle = REGION_WASH;
+    ctx.globalAlpha = 0.5;
+    ctx.arc(rp[0], rp[1], REGIONS[i].r * 0.34 * g.half, 0, Math.PI*2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // face contours, scrunched by active contractions
+  ctx.strokeStyle = FACE_LINE;
+  ctx.lineWidth = Math.max(1, g.S * 0.0022);
+  for (i=0;i<gen.face.length;i++){
+    var line = gen.face[i];
+    ctx.beginPath();
+    for (j=0;j<line.pts.length;j++){
+      var p = line.pts[j];
+      var x = p[0], y = p[1];
+      for (var rI=0;rI<REGIONS.length;rI++){
+        var e = st.contractions[rI];
+        if (e <= 0.003) continue;
+        var rc = REGIONS[rI].c, rr = REGIONS[rI].r;
+        var dx = x - rc[0], dy = y - rc[1];
+        var d = Math.sqrt(dx*dx + dy*dy);
+        if (d < rr){
+          var f = 1 - d/rr;
+          f = f*f*(3 - 2*f);
+          var pull = 0.35 * e * f;
+          x += (rc[0] - x) * pull;
+          y += (rc[1] - y) * pull;
+        }
+      }
+      var pp = px([x, y]);
+      if (j === 0) ctx.moveTo(pp[0], pp[1]); else ctx.lineTo(pp[0], pp[1]);
+    }
+    if (line.closed) ctx.closePath();
+    ctx.stroke();
+  }
+
+  // contraction flashes (amber: the flesh answering)
+  for (i=0;i<REGIONS.length;i++){
+    var e2 = st.contractions[i];
+    if (e2 <= 0.003) continue;
+    var fp = px(REGIONS[i].c);
+    ctx.beginPath();
+    ctx.fillStyle = FLASH;
+    ctx.globalAlpha = 0.38 * e2;
+    ctx.arc(fp[0], fp[1], REGIONS[i].r * 0.30 * g.half, 0, Math.PI*2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // sparks travelling the traces
+  for (i=0;i<st.sparks.length;i++){
+    var sp = st.sparks[i];
+    for (var b=3;b>=0;b--){
+      var u = sp.u - b*0.055;
+      if (u < 0) continue;
+      var pos = px(tracePoint(sp.region, u));
+      ctx.beginPath();
+      ctx.fillStyle = SPARK;
+      ctx.globalAlpha = b === 0 ? 0.95 : 0.35 - b*0.09;
+      ctx.arc(pos[0], pos[1], Math.max(1.2, g.S * (b === 0 ? 0.0045 : 0.003)), 0, Math.PI*2);
+      ctx.fill();
+    }
+  }
+  ctx.globalAlpha = 1;
+
+  // hand sensor (bottom right): twitches on every launch
+  var tw = st.twitch;
+  var sPos = px([SENSOR_POS[0] - tw*0.010, SENSOR_POS[1] - tw*0.008]);
+  if (tw > 0.02){
+    ctx.beginPath();
+    ctx.strokeStyle = SENSOR;
+    ctx.globalAlpha = 0.65 * tw;
+    ctx.lineWidth = lw;
+    ctx.arc(sPos[0], sPos[1], g.S * 0.016 * (1 + 0.5*tw), 0, Math.PI*2);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+  ctx.beginPath();
+  ctx.fillStyle = SENSOR;
+  ctx.arc(sPos[0], sPos[1], Math.max(2, g.S * 0.0075) * (1 + 0.3*tw), 0, Math.PI*2);
+  ctx.fill();
+
+  // timeline strip along the bottom: ticks approach a playhead
+  var stripY = g.cy + 0.955 * g.half;
+  var x0 = g.cx - 0.94 * g.half, x1 = g.cx + 0.94 * g.half;
+  ctx.strokeStyle = TRACE_LINE;
+  ctx.lineWidth = lw;
+  ctx.beginPath();
+  ctx.moveTo(x0, stripY); ctx.lineTo(x1, stripY);
+  ctx.stroke();
+  var headX = g.cx - 0.88 * g.half;
+  ctx.strokeStyle = SPARK;
+  ctx.globalAlpha = 0.55;
+  ctx.beginPath();
+  ctx.moveTo(headX, stripY - g.S*0.018); ctx.lineTo(headX, stripY + g.S*0.018);
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+  var WIN = 8;
+  function tick(arr, region){
+    var dtA = arr - pt;
+    if (dtA < -0.4 || dtA > WIN) return;
+    var x = headX + (dtA / WIN) * (x1 - headX);
+    var hgt = g.S * (0.016 + (region % 4) * 0.004);
+    ctx.strokeStyle = dtA < TRAVEL ? SPARK : FACE_LINE;
+    ctx.globalAlpha = dtA < 0 ? Math.max(0, 1 + dtA/0.4) : 0.9;
+    ctx.beginPath();
+    ctx.moveTo(x, stripY - hgt); ctx.lineTo(x, stripY);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+  for (i=0;i<gen.etude.length;i++){
+    var ev = gen.etude[i];
+    var k = Math.ceil((pt - ev.launch - TRAVEL) / PERIOD);
+    tick(ev.launch + TRAVEL + k*PERIOD, ev.region);
+    tick(ev.launch + TRAVEL + (k-1)*PERIOD, ev.region);
+  }
+  for (i=0;i<userEvents.length;i++) tick(userEvents[i].launch + TRAVEL, userEvents[i].region);
+}
+
+// ---------- interaction ----------
+var pointers = null; // {path:[[x,y]...], downT, moved}
+var lastTap = -10, lastTapPos = null;
+
+function pieceNow(){
+  return lastT;
+}
+var lastT = 0;
+
+canvas.addEventListener('pointerdown', function(ev){
+  ensureAudio();
+  var s = toStage(ev.clientX, ev.clientY);
+  pointers = { path: [s], downT: pieceNow(), moved: false };
+});
+canvas.addEventListener('pointermove', function(ev){
+  if (!pointers) return;
+  var s = toStage(ev.clientX, ev.clientY);
+  var last = pointers.path[pointers.path.length-1];
+  var dx = s[0]-last[0], dy = s[1]-last[1];
+  if (Math.sqrt(dx*dx+dy*dy) > 0.012) pointers.path.push(s);
+  var first = pointers.path[0];
+  var ddx = s[0]-first[0], ddy = s[1]-first[1];
+  if (Math.sqrt(ddx*ddx+ddy*ddy) > 0.05) pointers.moved = true;
+});
+function endPointer(ev){
+  if (!pointers) return;
+  var rec = pointers; pointers = null;
+  var s = toStage(ev.clientX, ev.clientY);
+  var pt = pieceNow() - gen.startT;
+  if (rec.moved){
+    // drag: lay a pulse-train along the path; regions near the path fire
+    // in path order, ~120 ms apart
+    var hit = [];
+    for (var i=0;i<REGIONS.length;i++){
+      var rc = REGIONS[i].c, best = -1;
+      for (var j=0;j<rec.path.length;j++){
+        var dx = rec.path[j][0]-rc[0], dy = rec.path[j][1]-rc[1];
+        if (Math.sqrt(dx*dx+dy*dy) < REGIONS[i].r * 1.15){ best = j; break; }
+      }
+      if (best >= 0) hit.push({ region:i, order:best });
+    }
+    hit.sort(function(a,b){ return a.order - b.order; });
+    for (var h=0;h<hit.length;h++){
+      userEvents.push({ launch: pt + 0.05 + h*0.12, region: hit[h].region });
+    }
+    return;
+  }
+  // tap
+  var now = pieceNow();
+  if (lastTapPos && now - lastTap < 0.32){
+    var ddx = s[0]-lastTapPos[0], ddy = s[1]-lastTapPos[1];
+    if (Math.sqrt(ddx*ddx+ddy*ddy) < 0.12){
+      // double-tap: a new face
+      gen = makeGen((Math.random()*1e9)|0, now);
+      userEvents = [];
+      prevPtAudio = null;
+      lastTap = -10; lastTapPos = null;
+      return;
+    }
+  }
+  lastTap = now; lastTapPos = s;
+  // fire the tapped region
+  var bestR = -1, bestD = 1e9;
+  for (var i2=0;i2<REGIONS.length;i2++){
+    var dx2 = s[0]-REGIONS[i2].c[0], dy2 = s[1]-REGIONS[i2].c[1];
+    var d2 = Math.sqrt(dx2*dx2+dy2*dy2);
+    if (d2 < REGIONS[i2].r * 1.3 && d2 < bestD){ bestD = d2; bestR = i2; }
+  }
+  if (bestR >= 0) userEvents.push({ launch: pt + 0.02, region: bestR });
+}
+canvas.addEventListener('pointerup', endPointer);
+canvas.addEventListener('pointercancel', function(){ pointers = null; });
+
+// ---------- run ----------
+draw(0); // frame one: pattern time PT0 exactly, synchronous
+
+if (typeof requestAnimationFrame === 'function'){
+  var startStamp = null;
+  var frame = function(ts){
+    if (startStamp === null) startStamp = ts;
+    lastT = (ts - startStamp) / 1000;
+    stepAudio(lastT - gen.startT);
+    draw(lastT);
+    requestAnimationFrame(frame);
+  };
+  requestAnimationFrame(frame);
+}
+})();
+</script>
+</body>
+</html>
