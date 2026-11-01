@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Kicking the Clouds</title>
+<style>
+  html, body { margin: 0; padding: 0; overflow: hidden; background: #8A9299; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // Seeded PRNG (mulberry32), never Math.random.
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  var SKY = '#8A9299', SEA = '#31424F', HILL = '#4A5A43',
+      BONE = '#D6CDB8', RUST = '#8A4B2A', HILL_DARK = '#3A4636';
+
+  var W = 0, H = 0, isPhone = false;
+  function viewportSize() {
+    var w, h;
+    if (typeof window !== 'undefined' && window.visualViewport &&
+        typeof window.visualViewport.width === 'number') {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    } else {
+      w = window.innerWidth; h = window.innerHeight;
+    }
+    return { w: w, h: h };
+  }
+  function detectPhone(w, h) {
+    var minDim = 1e9;
+    if (typeof window !== 'undefined' && window.screen) {
+      minDim = Math.min(window.screen.width, window.screen.height);
+    }
+    if (minDim < 700) return true;
+    return h > w * 1.15;
+  }
+  function resize() {
+    var s = viewportSize();
+    W = s.w; H = s.h; isPhone = detectPhone(W, H);
+    canvas.width = W; canvas.height = H;
+    canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+  }
+
+  // ---- Seeded landscape data ----
+  var landRand = mulberry32(1370000);
+  var hills = [];   // ridge offsets along the horizon
+  var hills2 = [];
+  var clouds = [];
+  var i, r;
+  for (i = 0; i < 40; i++) {
+    hills.push(landRand() * 0.05 - 0.02);   // fraction of H, around horizon
+    hills2.push(landRand() * 0.02 - 0.002);
+  }
+  for (i = 0; i < 9; i++) {
+    clouds.push({ x: landRand(), y: 0.04 + landRand() * 0.22,
+                  w: 0.10 + landRand() * 0.16, a: 0.10 + landRand() * 0.10 });
+  }
+  var wavePhase = [];
+  for (i = 0; i < 6; i++) wavePhase.push(landRand() * Math.PI * 2);
+
+  // ---- Ribbons: three generations ----
+  // grandmother: wide + slow; mother: tighter; present: quickest.
+  function makeRibbon(seed, amp, wavelength, speed, bandY, alpha, width) {
+    var rnd = mulberry32(seed);
+    var harmonics = [];
+    for (i = 0; i < 3; i++) {
+      harmonics.push({ f: (0.8 + rnd() * 0.5) / wavelength,
+                       a: (0.55 + rnd() * 0.45), p: rnd() * Math.PI * 2 });
+    }
+    var marks = [];
+    // One mark every 90 px of ribbon-local coordinate; mark type cycles.
+    for (i = 0; i < 40; i++) {
+      marks.push({ x: i * 90 + rnd() * 30, k: Math.floor(rnd() * 5),
+                   s: 0.7 + rnd() * 0.6, rust: rnd() < 0.14 });
+    }
+    return { amp: amp, wavelength: wavelength, speed: speed, bandY: bandY,
+             alpha: alpha, width: width, harmonics: harmonics, marks: marks };
+  }
+  var ribbons = [
+    makeRibbon(1370000 + 0 * 7919, 26, 260, 6,  0.44, 0.85, 2.5),
+    makeRibbon(1370000 + 1 * 7919, 16, 160, 13, 0.54, 0.95, 2.0),
+    makeRibbon(1370000 + 2 * 7919, 9,  90,  24, 0.64, 1.00, 1.5)
+  ];
+  var MARK_SPAN = 40 * 90; // marks repeat every 3600 px of local coordinate
+
+  // ---- Drag state: closed-form over recorded samples ----
+  var dragSamples = []; // { dx, t } ; dx negative = drag left
+  var lastX = null, dragging = false;
+  var curT = 0;
+  function convergenceAt(t) {
+    var sum = 0, j, s;
+    for (j = 0; j < dragSamples.length; j++) {
+      s = dragSamples[j];
+      if (t - s.t <= 6) sum += (-s.dx) * Math.exp(-(t - s.t) / 3);
+    }
+    var c = 0.004 * sum;
+    if (c < 0) c = 0; if (c > 1) c = 1;
+    return c;
+  }
+
+  // ---- Gesture-gated audio: three detuned sine beds, drag only ----
+  var audioCtx = null, oscs = null, gains = null;
+  function ensureAudio() {
+    if (audioCtx) return;
+    var AC = null;
+    if (typeof AudioContext !== 'undefined') AC = AudioContext;
+    else if (typeof window !== 'undefined' && typeof window.webkitAudioContext !== 'undefined') AC = window.webkitAudioContext;
+    if (!AC) return;
+    try {
+      audioCtx = new AC();
+      oscs = []; gains = [];
+      var freqs = [220, 233, 247];
+      for (i = 0; i < 3; i++) {
+        var o = audioCtx.createOscillator();
+        o.type = 'sine'; o.frequency.value = freqs[i];
+        var g = audioCtx.createGain(); g.gain.value = 0;
+        o.connect(g); g.connect(audioCtx.destination); o.start();
+        oscs.push(o); gains.push(g);
+      }
+    } catch (e) { audioCtx = null; }
+  }
+  function updateAudio(c) {
+    if (!audioCtx || !oscs) return;
+    // Frequencies converge to 233 Hz as ribbons align.
+    var targets = [220 + 13 * c, 233, 247 - 14 * c];
+    for (i = 0; i < 3; i++) {
+      try { oscs[i].frequency.value = targets[i]; } catch (e) {}
+      try { gains[i].gain.value = 0.015; } catch (e) {}
+    }
+  }
+  function silenceAudio() {
+    if (!audioCtx || !gains) return;
+    for (i = 0; i < 3; i++) {
+      try { gains[i].gain.value = 0; } catch (e) {}
+    }
+  }
+
+  function onDown(e) {
+    dragging = true; lastX = e.clientX;
+    ensureAudio(); updateAudio(convergenceAt(curT));
+    if (e.preventDefault) e.preventDefault();
+  }
+  function onMove(e) {
+    if (!dragging || lastX === null) return;
+    var dx = e.clientX - lastX;
+    lastX = e.clientX;
+    dragSamples.push({ dx: dx, t: curT });
+    if (dragSamples.length > 400) dragSamples.splice(0, dragSamples.length - 400);
+    updateAudio(convergenceAt(curT));
+    if (e.preventDefault) e.preventDefault();
+  }
+  function onUp(e) {
+    dragging = false; lastX = null;
+    silenceAudio();
+  }
+  canvas.addEventListener('pointerdown', onDown);
+  canvas.addEventListener('pointermove', onMove);
+  canvas.addEventListener('pointerup', onUp);
+  canvas.addEventListener('pointercancel', onUp);
+
+  function waveAt(rb, x) {
+    var y = 0, j, h;
+    for (j = 0; j < rb.harmonics.length; j++) {
+      h = rb.harmonics[j];
+      y += h.a * Math.sin(2 * Math.PI * h.f * x + h.p);
+    }
+    return y * rb.amp / 1.6;
+  }
+
+  function draw(t) {
+    curT = t;
+    resize();
+    var horizonY = Math.round(H * 0.40);
+    var c = convergenceAt(t);
+
+    // Sky
+    ctx.fillStyle = SKY;
+    ctx.fillRect(0, 0, W, H);
+
+    // Clouds: flat-alpha rects drifting very slowly (1 px/s); horizon fixed.
+    var j;
+    for (j = 0; j < clouds.length; j++) {
+      var cl = clouds[j];
+      var cx = (((cl.x * W + t * 1) % (W + 200)) + W + 200) % (W + 200) - 100;
+      ctx.globalAlpha = cl.a;
+      ctx.fillStyle = '#B9C0C4';
+      ctx.fillRect(cx, cl.y * H, cl.w * W, H * 0.02);
+      ctx.fillRect(cx + cl.w * W * 0.2, cl.y * H - H * 0.012, cl.w * W * 0.5, H * 0.02);
+    }
+    ctx.globalAlpha = 1;
+
+    // Far hills (darker ridge) then near hills along the fixed horizon.
+    ctx.fillStyle = HILL_DARK;
+    ctx.beginPath();
+    ctx.moveTo(0, horizonY);
+    for (j = 0; j <= 40; j++) {
+      var hx = j / 40 * W;
+      ctx.lineTo(hx, horizonY - 6 + hills2[j % 40] * H);
+    }
+    ctx.lineTo(W, horizonY); ctx.closePath(); ctx.fill();
+
+    ctx.fillStyle = HILL;
+    ctx.beginPath();
+    ctx.moveTo(0, horizonY);
+    for (j = 0; j <= 40; j++) {
+      var hx2 = j / 40 * W;
+      ctx.lineTo(hx2, horizonY + hills[j % 40] * H);
+    }
+    ctx.lineTo(W, horizonY); ctx.closePath(); ctx.fill();
+
+    // Sea below the horizon; wave lines drift slowly in phase only.
+    ctx.fillStyle = SEA;
+    ctx.fillRect(0, horizonY, W, H - horizonY);
+    ctx.strokeStyle = 'rgba(138,146,153,0.35)';
+    ctx.lineWidth = 1;
+    for (j = 0; j < 6; j++) {
+      var wy = horizonY + (j + 1) * (H - horizonY) / 7;
+      ctx.beginPath();
+      for (var wx = 0; wx <= W; wx += 16) {
+        var wv = Math.sin(wx * 0.008 + wavePhase[j] + t * 0.05) * 3;
+        if (wx === 0) ctx.moveTo(wx, wy + wv); else ctx.lineTo(wx, wy + wv);
+      }
+      ctx.stroke();
+    }
+    // Fixed horizon line: the horizon never moves.
+    ctx.fillStyle = HILL_DARK;
+    ctx.fillRect(0, horizonY, W, 1);
+
+    // ---- Ribbons ----
+    var own = [], shared = 0;
+    for (j = 0; j < 3; j++) { own[j] = ribbons[j].speed * t; shared += own[j]; }
+    shared /= 3;
+    var eff = [];
+    for (j = 0; j < 3; j++) eff[j] = (1 - c) * own[j] + c * shared;
+
+    for (j = 0; j < 3; j++) {
+      var rb = ribbons[j];
+      var by = rb.bandY * H;
+      var off = eff[j];
+      // Alignment resonance: marks coincide when offsets agree mod 90.
+      // t > 2 excludes the trivial t = 0 state where all offsets are zero.
+      var aligned = false;
+      if (j > 0 && t > 2) {
+        var d01 = ((eff[0] - eff[j]) % 90 + 90) % 90;
+        if (d01 < 10 || d01 > 80) aligned = true;
+      }
+      ctx.globalAlpha = rb.alpha;
+      ctx.strokeStyle = aligned ? RUST : BONE;
+      ctx.lineWidth = rb.width;
+      ctx.beginPath();
+      for (var x = 0; x <= W; x += 4) {
+        var yy = by + waveAt(rb, x + off);
+        if (x === 0) ctx.moveTo(x, yy); else ctx.lineTo(x, yy);
+      }
+      ctx.stroke();
+      // Glyph marks along the ribbon: ticks, dots, loops, crosses, chevrons.
+      var m;
+      for (m = 0; m < rb.marks.length; m++) {
+        var mk = rb.marks[m];
+        var mx = (((mk.x - off) % MARK_SPAN) + MARK_SPAN) % MARK_SPAN;
+        // Only draw marks whose local position falls in view (span > W).
+        if (mx > W + 60) continue;
+        var my = by + waveAt(rb, mx + off);
+        ctx.fillStyle = mk.rust || aligned ? RUST : BONE;
+        ctx.strokeStyle = mk.rust || aligned ? RUST : BONE;
+        var ms = 4 * mk.s;
+        if (mk.k === 1) { // dot pair: filled, never stroked (no connecting spokes)
+          ctx.beginPath(); ctx.arc(mx, my, ms * 0.45, 0, Math.PI * 2); ctx.fill();
+          ctx.beginPath(); ctx.arc(mx + ms * 1.6, my, ms * 0.45, 0, Math.PI * 2); ctx.fill();
+          continue;
+        }
+        ctx.beginPath();
+        if (mk.k === 0) { // tick
+          ctx.moveTo(mx, my - ms); ctx.lineTo(mx, my + ms);
+        } else if (mk.k === 2) { // loop
+          ctx.moveTo(mx + ms, my); ctx.arc(mx, my, ms, 0, Math.PI * 2);
+        } else if (mk.k === 3) { // cross
+          ctx.moveTo(mx - ms, my); ctx.lineTo(mx + ms, my);
+          ctx.moveTo(mx, my - ms); ctx.lineTo(mx, my + ms);
+        } else { // chevron
+          ctx.moveTo(mx - ms, my + ms * 0.6); ctx.lineTo(mx, my - ms * 0.6); ctx.lineTo(mx + ms, my + ms * 0.6);
+        }
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function loop(ts) {
+    if (loop.start === null) loop.start = ts;
+    var t = (ts - loop.start) / 1000;
+    draw(t);
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+  }
+  loop.start = null;
+
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', resize);
+    }
+    if (window.addEventListener) window.addEventListener('resize', resize);
+  }
+  draw(0);
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
