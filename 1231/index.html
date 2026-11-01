@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Just One Peek (Aftermath)</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #141318; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- constants ----------
+  var T0 = 24;                 // fixed first-frame phase (seconds into the wave cycle)
+  var CYCLE = 90;              // density wave period
+  var MAXP = 46;               // phantom ranks 0..45
+  var ROOM = '#141318', WALL_A = '#17161d', WALL_B = '#100f13', FLOOR = '#0c0b0f';
+  var INK_PHANTOM = '#8A93A8', CORE = '#C62B5E', BONE = '#E8E2D4';
+  var FIG = '#0A0A0A', TINT = '#2E4A5A', WIN = '#1b1a21', WIN_IN = '#232230';
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ---------- seeded hash (seeded rnd() only; no unseeded randomness) ----------
+  function rnd(n) { var x = Math.sin(n * 127.1 + 311.7) * 43758.5453; return x - Math.floor(x); }
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function fract(v) { return v - Math.floor(v); }
+
+  // ---------- phantom static parameters (from rank i) ----------
+  var PH = [];
+  for (var i = 0; i < MAXP; i++) {
+    PH.push({
+      shape: i % 3,                                   // 0 rounded rect, 1 heart, 2 bell
+      size: 15 + 26 * rnd(i * 13 + 1),                // 15..41 px at scale 1
+      speed: 0.55 + 0.85 * rnd(i * 13 + 2),           // path cycles per 90 s
+      off: rnd(i * 13 + 3),                           // path phase offset
+      wobF1: 0.05 + 0.09 * rnd(i * 13 + 4),
+      wobP1: rnd(i * 13 + 5) * 6.2832,
+      wobF2: 0.03 + 0.07 * rnd(i * 13 + 6),
+      wobP2: rnd(i * 13 + 7) * 6.2832,
+      tiltP: rnd(i * 13 + 8) * 6.2832,
+      laneX: (rnd(i * 13 + 10) - 0.5) * 0.20,         // per-phantom current lane (fraction of W)
+      laneY: (rnd(i * 13 + 11) - 0.5) * 0.16,         // (fraction of H)
+      core: (i % 3 === 0),                            // one in three is "unread"
+      baseA: 0.5 + 0.35 * rnd(i * 13 + 9)
+    });
+  }
+
+  // ---------- density envelope ----------
+  function envCount(ph) {
+    if (ph < 35) return 6 + 40 * (ph / 35);           // build: 6 -> 46
+    if (ph < 55) return 46;                           // crest
+    return 46 - 44 * ((ph - 55) / 35);                // empty: 46 -> 2
+  }
+  function crestFactor(ph) {
+    if (ph < 33) return 0;
+    if (ph < 38) return (ph - 33) / 5;
+    if (ph < 52) return 1;
+    if (ph < 57) return 1 - (ph - 52) / 5;
+    return 0;
+  }
+  function emptyFactor(ph) {
+    if (ph < 55) return 0;
+    return Math.sin(Math.PI * (ph - 55) / 35);
+  }
+
+  // ---------- interaction state (recorded events only) ----------
+  var dissolved = {};        // key i + ':' + cycleIndex -> {td, x, y}
+  var stir = [];             // {t, x, y} drag samples, newest last, capped
+  var pointer = { down: false, stirGesture: false, lx: 0, ly: 0 };
+
+  // ---------- sizing (Visual Viewport API) ----------
+  var W = 0, H = 0, SCALE = 1, PHONE = false;
+  function measure() {
+    var vv = window.visualViewport;
+    W = (vv && vv.width) || window.innerWidth || 800;
+    H = (vv && vv.height) || window.innerHeight || 600;
+    canvas.width = W; canvas.height = H;
+    var sw = (window.screen && window.screen.width) || W;
+    var sh = (window.screen && window.screen.height) || H;
+    PHONE = (Math.min(sw, sh) < 700) || (H > W * 1.15);
+    SCALE = clamp(Math.min(W, H) / 760, 0.55, 1.25);
+    if (PHONE) SCALE = clamp(Math.min(W, H) / 620, 0.6, 1.1);
+  }
+
+  // ---------- phantom position: closed form in t ----------
+  function phantomPos(p, t, w, h) {
+    var u = fract(t * p.speed / CYCLE + p.off);
+    var x = w * (1.07 - 1.04 * u + p.laneX)
+          + (30 * Math.sin(t * p.wobF1 * 6.2832 + p.wobP1)
+           + 14 * Math.sin(t * p.wobF2 * 6.2832 + p.wobP2)) * SCALE;
+    var y = h * (-0.05 + 0.93 * Math.pow(u, 1.15) + p.laneY)
+          + (20 * Math.sin(t * p.wobF2 * 6.2832 + p.wobP2 + 1.7)
+           + 10 * Math.sin(t * p.wobF1 * 6.2832 + p.wobP1 + 0.6)) * SCALE;
+    var edge = clamp(Math.min(u * 7, (1 - u) * 7), 0, 1);
+    return { x: x, y: y, u: u, edge: edge };
+  }
+
+  // stir offset for a point at time t: sum over recent drag samples
+  function stirOffset(x, y, t) {
+    var ox = 0, oy = 0;
+    for (var k = stir.length - 1; k >= 0; k--) {
+      var s = stir[k], age = t - s.t;
+      if (age > 3) break;
+      var dx = x - s.x, dy = y - s.y;
+      var d2 = dx * dx + dy * dy, R = 120 * SCALE;
+      if (d2 < R * R && d2 > 1) {
+        var d = Math.sqrt(d2);
+        var f = (1 - d / R) * (1 - age / 3) * 34 * SCALE;
+        ox += (dx / d) * f; oy += (dy / d) * f;
+      }
+    }
+    return { x: ox, y: oy };
+  }
+
+  // ---------- shape paths (origin-centred, s = half-size) ----------
+  function traceShape(kind, s) {
+    ctx.beginPath();
+    if (kind === 0) {                       // rounded rectangle
+      var r = s * 0.38, w2 = s * 1.25, h2 = s * 0.92;
+      ctx.moveTo(-w2 + r, -h2);
+      ctx.lineTo(w2 - r, -h2); ctx.arc(w2 - r, -h2 + r, r, -Math.PI / 2, 0);
+      ctx.lineTo(w2, h2 - r);  ctx.arc(w2 - r, h2 - r, r, 0, Math.PI / 2);
+      ctx.lineTo(-w2 + r, h2); ctx.arc(-w2 + r, h2 - r, r, Math.PI / 2, Math.PI);
+      ctx.lineTo(-w2, -h2 + r); ctx.arc(-w2 + r, -h2 + r, r, Math.PI, Math.PI * 1.5);
+    } else if (kind === 1) {                // heart outline
+      ctx.moveTo(0, s * 0.95);
+      ctx.bezierCurveTo(-s * 1.5, s * 0.05, -s * 0.95, -s * 1.05, 0, -s * 0.42);
+      ctx.bezierCurveTo(s * 0.95, -s * 1.05, s * 1.5, s * 0.05, 0, s * 0.95);
+    } else {                                // bell curve
+      ctx.moveTo(-s * 1.35, s * 0.8);
+      ctx.bezierCurveTo(-s * 0.7, s * 0.78, -s * 0.52, -s * 0.85, 0, -s * 0.88);
+      ctx.bezierCurveTo(s * 0.52, -s * 0.85, s * 0.7, s * 0.78, s * 1.35, s * 0.8);
+      ctx.lineTo(-s * 1.35, s * 0.8);
+    }
+    if (kind !== 2) ctx.closePath();
+  }
+  function traceCore(kind, s) {
+    ctx.beginPath();
+    if (kind === 1) {
+      ctx.moveTo(0, s * 0.34);
+      ctx.bezierCurveTo(-s * 0.52, -s * 0.05, -s * 0.3, -s * 0.42, 0, -s * 0.16);
+      ctx.bezierCurveTo(s * 0.3, -s * 0.42, s * 0.52, -s * 0.05, 0, s * 0.34);
+    } else {
+      ctx.moveTo(s * 0.26, 0);
+      ctx.arc(0, 0, s * 0.26, 0, Math.PI * 2);
+    }
+    ctx.closePath();
+  }
+
+  // ---------- the room ----------
+  function drawRoom(t, ph) {
+    ctx.fillStyle = ROOM; ctx.fillRect(0, 0, W, H);
+    var cx = W * 0.62;                       // corner line
+    var fy = H * 0.78;                       // floor line
+    ctx.fillStyle = WALL_A; ctx.fillRect(0, 0, cx, fy);
+    ctx.fillStyle = WALL_B; ctx.fillRect(cx, 0, W - cx, fy);
+    ctx.fillStyle = FLOOR;  ctx.fillRect(0, fy, W, H - fy);
+    // skirting / baseboard
+    ctx.fillStyle = '#1e1c24'; ctx.fillRect(0, fy - 5 * SCALE, cx, 3 * SCALE);
+    ctx.fillStyle = '#181620'; ctx.fillRect(cx, fy - 5 * SCALE, W - cx, 3 * SCALE);
+    // corner shadow seam
+    ctx.fillStyle = 'rgba(0,0,0,0.35)'; ctx.fillRect(cx - 1.5, 0, 3, fy);
+    // floorboards suggestion: two faint seams running to the corner
+    ctx.strokeStyle = 'rgba(232,226,212,0.05)'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(W * 0.18, H); ctx.lineTo(cx, fy); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(W * 0.86, H); ctx.lineTo(cx, fy); ctx.stroke();
+    // window on the side wall: dark, no light
+    var wx = cx + (W - cx) * 0.30, wy = H * 0.14, ww = (W - cx) * 0.42, wh = H * 0.30;
+    ctx.fillStyle = WIN; ctx.fillRect(wx, wy, ww, wh);
+    ctx.fillStyle = WIN_IN; ctx.fillRect(wx + 4, wy + 4, ww - 8, wh - 8);
+    ctx.strokeStyle = 'rgba(232,226,212,0.07)';
+    ctx.beginPath(); ctx.moveTo(wx + ww / 2, wy + 4); ctx.lineTo(wx + ww / 2, wy + wh - 4); ctx.stroke();
+    // wave-clear tint wash
+    var ef = emptyFactor(ph);
+    if (ef > 0.01) {
+      ctx.fillStyle = TINT; ctx.globalAlpha = 0.16 * ef;
+      ctx.fillRect(0, 0, W, H);
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  // ---------- the figure (seated, lower-left corner) ----------
+  function drawFigure() {
+    var s = SCALE * (PHONE ? 1.05 : 1);
+    var fx = W * 0.155, fy = H * 0.78;       // sits on the floor line
+    ctx.fillStyle = FIG;
+    // back / torso: hunched dome
+    ctx.beginPath();
+    ctx.moveTo(fx - 34 * s, fy);
+    ctx.arc(fx - 6 * s, fy - 26 * s, 27 * s, Math.PI * 0.95, Math.PI * 1.95);
+    ctx.lineTo(fx + 20 * s, fy);
+    ctx.closePath(); ctx.fill();
+    // knees up: two bumps in front
+    ctx.beginPath(); ctx.moveTo(fx + 28 * s, fy); ctx.arc(fx + 20 * s, fy - 11 * s, 11.5 * s, -0.4, Math.PI + 0.4); ctx.closePath(); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(fx + 44 * s, fy); ctx.arc(fx + 37 * s, fy - 9 * s, 9.5 * s, -0.4, Math.PI + 0.4); ctx.closePath(); ctx.fill();
+    // legs along the floor
+    ctx.fillRect(fx + 12 * s, fy - 4.5 * s, 44 * s, 4.5 * s);
+    // head, bowed
+    ctx.beginPath(); ctx.moveTo(fx - 1 * s, fy - 56 * s); ctx.arc(fx - 8 * s, fy - 56 * s, 11 * s, 0, Math.PI * 2); ctx.closePath(); ctx.fill();
+    // rim light: bone edge on the lit side
+    ctx.strokeStyle = BONE; ctx.globalAlpha = 0.8; ctx.lineWidth = Math.max(1.2, 1.6 * s);
+    ctx.beginPath(); ctx.arc(fx - 8 * s, fy - 56 * s, 11 * s, -1.15, 0.75); ctx.stroke();
+    ctx.beginPath(); ctx.arc(fx - 6 * s, fy - 26 * s, 27 * s, Math.PI * 1.32, Math.PI * 1.86); ctx.stroke();
+    ctx.beginPath(); ctx.arc(fx + 20 * s, fy - 11 * s, 11.5 * s, -0.9, 0.7); ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- one frame ----------
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    var ph = ((t % CYCLE) + CYCLE) % CYCLE;
+    var cyc = Math.floor(t / CYCLE);
+    var env = envCount(ph);
+    var crest = crestFactor(ph);
+
+    drawRoom(t, ph);
+
+    // phantoms, back ranks first
+    for (var i = MAXP - 1; i >= 0; i--) {
+      var p = PH[i];
+      var key = i + ':' + cyc;
+      var dis = dissolved[key];
+      var pos = phantomPos(p, t, W, H);
+      var so = stirOffset(pos.x, pos.y, t);
+      var x = pos.x + so.x, y = pos.y + so.y;
+      var presence = clamp(env - i, 0, 1) * pos.edge;
+
+      if (dis) {
+        // fragments for 0.8 s after the dissolve, then absence
+        var age = t - dis.td;
+        if (age >= 0 && age < 0.8) {
+          ctx.strokeStyle = INK_PHANTOM; ctx.lineWidth = Math.max(1, 1.4 * SCALE);
+          ctx.globalAlpha = 0.7 * (1 - age / 0.8);
+          for (var f = 0; f < 5; f++) {
+            var ang = rnd(i * 31 + f * 7 + 1) * 6.2832;
+            var spd = (26 + 44 * rnd(i * 31 + f * 7 + 2)) * SCALE;
+            var fx2 = dis.x + Math.cos(ang) * spd * age;
+            var fy2 = dis.y + Math.sin(ang) * spd * age + 14 * SCALE * age * age;
+            var len = (7 - 5 * age) * SCALE;
+            ctx.beginPath();
+            ctx.moveTo(fx2, fy2);
+            ctx.lineTo(fx2 + Math.cos(ang) * len, fy2 + Math.sin(ang) * len);
+            ctx.stroke();
+          }
+          ctx.globalAlpha = 1;
+        }
+        continue;
+      }
+      if (presence <= 0.01) continue;
+
+      var half = p.size * SCALE;
+      var tilt = 0.28 * Math.sin(t * 0.05 + p.tiltP);
+      ctx.save();
+      ctx.translate(x, y); ctx.rotate(tilt);
+      // glow: larger, fainter outline copy (flat alpha, no blur)
+      ctx.globalAlpha = presence * p.baseA * 0.14;
+      ctx.strokeStyle = INK_PHANTOM; ctx.lineWidth = Math.max(1, 2.6 * SCALE);
+      traceShape(p.shape, half * 1.4); ctx.stroke();
+      // body outline
+      ctx.globalAlpha = presence * p.baseA;
+      ctx.lineWidth = Math.max(1, 1.6 * SCALE);
+      traceShape(p.shape, half); ctx.stroke();
+      // unread core
+      if (p.core) {
+        ctx.globalAlpha = presence * (0.55 + 0.45 * crest);
+        ctx.fillStyle = CORE;
+        traceCore(p.shape, half); ctx.fill();
+      }
+      ctx.restore();
+      ctx.globalAlpha = 1;
+    }
+
+    drawFigure();
+  }
+
+  // ---------- pointer ----------
+  function pieceTime() { return lastT; }
+  function toLocal(e) {
+    var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    return { x: (e.clientX || 0) - r.left, y: (e.clientY || 0) - r.top };
+  }
+  canvas.addEventListener('pointerdown', function (e) {
+    var pt = toLocal(e), t = pieceTime();
+    var cyc = Math.floor(t / CYCLE), ph = ((t % CYCLE) + CYCLE) % CYCLE, env = envCount(ph);
+    var best = -1, bestD = 1e9;
+    for (var i = 0; i < MAXP; i++) {
+      if (dissolved[i + ':' + cyc]) continue;
+      if (clamp(env - i, 0, 1) <= 0.05) continue;
+      var pos = phantomPos(PH[i], t, W, H);
+      var so = stirOffset(pos.x, pos.y, t);
+      var dx = pt.x - (pos.x + so.x), dy = pt.y - (pos.y + so.y);
+      var d = Math.sqrt(dx * dx + dy * dy);
+      var rr = PH[i].size * SCALE * 1.15 + 8;
+      if (d < rr && d < bestD) { bestD = d; best = i; }
+    }
+    pointer.down = true; pointer.lx = pt.x; pointer.ly = pt.y;
+    if (best >= 0) {
+      var bp = phantomPos(PH[best], t, W, H);
+      var bs = stirOffset(bp.x, bp.y, t);
+      dissolved[best + ':' + cyc] = { td: t, x: bp.x + bs.x, y: bp.y + bs.y };
+      pointer.stirGesture = false;
+    } else {
+      pointer.stirGesture = true;
+      stir.push({ t: t, x: pt.x, y: pt.y });
+    }
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (!pointer.down || !pointer.stirGesture) return;
+    var pt = toLocal(e);
+    stir.push({ t: pieceTime(), x: pt.x, y: pt.y });
+    if (stir.length > 48) stir.splice(0, stir.length - 48);
+    pointer.lx = pt.x; pointer.ly = pt.y;
+  });
+  function endPointer() { pointer.down = false; pointer.stirGesture = false; }
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', endPointer);
+  canvas.addEventListener('pointerleave', endPointer);
+
+  // ---------- run ----------
+  measure();
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { measure(); draw(lastT); });
+  }
+  window.addEventListener('resize', function () { measure(); draw(lastT); });
+
+  var lastT = T0;
+  draw(T0);                                    // synchronous fixed-phase first frame
+  var startStamp = null;
+  if (typeof requestAnimationFrame === 'function') {
+    var loop = function (stamp) {
+      if (startStamp === null) startStamp = stamp;
+      lastT = T0 + (stamp - startStamp) / 1000;
+      // prune old dissolves / stir samples
+      if (stir.length && lastT - stir[0].t > 4) stir = stir.filter(function (s) { return lastT - s.t <= 4; });
+      draw(lastT);
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
