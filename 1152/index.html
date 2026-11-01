@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Raw Import</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #000000; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // №1152 "Raw Import" — Antonio Roberts study block AR1
+  // (the 2009 Audacity databending tutorial: import an image as raw
+  // audio, run it through an echo/delay, export it, reopen as image).
+  // A procedural source — flat geometric tiles (circles, bars,
+  // triangles, squares) on black — is held as a 160x160 grid of colour
+  // indices, a stand-in sample buffer. On a seamless 10-second loop the
+  // buffer is "played through" a delay line: rows below the header tear
+  // horizontally, each torn row writing 3-4 fading ghost copies of
+  // itself to the right (the taps of the delay), colour channels split
+  // vertically inside tear bands, and deep-bent rows take flat bursts
+  // of impossible colour. The top 48 rows are the file header: they
+  // stay clean at all times so the before/after reads. Loop shape:
+  // 0s clean, 3s tears begin, 6s full databend, 8s partial recovery
+  // (never full), easing home to clean by 10s. Everything is computed
+  // in the grid data and drawn as flat rects: no offscreen canvas, no
+  // ImageData, no real encoding. Watch-only, silent.
+
+  // ---------- palette (flat only) ----------
+  var BG = '#000000';
+  var HEADER_BG = '#1A1A1A';
+  var PAL = ['#FF2E88', '#00F0FF', '#B6FF00', '#FFD500', '#FFFFFF'];
+  var BLACK = 0, PINK = 1, CYAN = 2, LIME = 3, YELLOW = 4, WHITE = 5;
+  // cell value = palette index + 1, so 0 in the grid means black
+
+  var COLS = 160, ROWS = 160;
+  var HEADER = 48;            // top 48 grid rows never bend
+  var BAND = 4;               // rows per tear band (bands tear together)
+  var LOOP = 10;              // seconds, seamless
+  var T0 = 6.2;               // fixed first-frame phase: full databend
+  var DELAY = 9;              // delay-line tap spacing, in cells (~40px)
+  var TAPS = [0.7, 0.45, 0.25, 0.15];  // ghost tap amplitudes
+
+  // ---------- seeded rng ----------
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function clamp(x, a, b) { return x < a ? a : x > b ? b : x; }
+  function smooth(x) { x = clamp(x, 0, 1); return x * x * (3 - 2 * x); }
+
+  // ---------- the source: flat geometric tiles on black ----------
+  // Shapes are placed once with a seeded rng; the grid is filled by
+  // testing each cell centre against the shape list (last shape wins).
+  var shapes = [];
+  (function buildShapes() {
+    var rng = mulberry32(115201);
+    for (var i = 0; i < 34; i++) {
+      var kind = rng();
+      var c = 1 + Math.floor(rng() * 5);
+      if (kind < 0.34) {                                   // circle
+        shapes.push({ k: 'c', x: 8 + rng() * 144, y: 8 + rng() * 144,
+                      r: 5 + rng() * 13, c: c });
+      } else if (kind < 0.62) {                            // bar
+        shapes.push({ k: 'b', x: rng() * 110, y: rng() * 152,
+                      w: 14 + rng() * 32, h: 3 + rng() * 5, c: c });
+      } else if (kind < 0.84) {                            // triangle
+        shapes.push({ k: 't', x: rng() * 138, y: rng() * 138,
+                      s: 9 + rng() * 13, o: Math.floor(rng() * 4), c: c });
+      } else {                                             // square
+        var sz = 6 + rng() * 11;
+        shapes.push({ k: 's', x: rng() * (152 - sz), y: rng() * (152 - sz),
+                      w: sz, h: sz, c: c });
+      }
+    }
+  })();
+
+  function shapeHit(sh, px, py) {
+    var dx, dy;
+    if (sh.k === 'c') {
+      dx = px - sh.x; dy = py - sh.y;
+      return dx * dx + dy * dy <= sh.r * sh.r;
+    }
+    if (sh.k === 'b' || sh.k === 's') {
+      return px >= sh.x && px < sh.x + sh.w && py >= sh.y && py < sh.y + sh.h;
+    }
+    // right triangle, 4 orientations, inside the s-by-s box
+    var u = (px - sh.x) / sh.s, v = (py - sh.y) / sh.s;
+    if (u < 0 || u >= 1 || v < 0 || v >= 1) return false;
+    if (sh.o === 0) return v <= 1 - u;
+    if (sh.o === 1) return v >= u;
+    if (sh.o === 2) return v <= u;
+    return v >= 1 - u;
+  }
+
+  var SRC = new Uint8Array(COLS * ROWS);
+  (function buildSource() {
+    for (var y = 0; y < ROWS; y++) {
+      for (var x = 0; x < COLS; x++) {
+        var px = x + 0.5, py = y + 0.5, v = BLACK;
+        for (var i = shapes.length - 1; i >= 0; i--) {
+          if (shapeHit(shapes[i], px, py)) { v = shapes[i].c; break; }
+        }
+        SRC[y * COLS + x] = v;
+      }
+    }
+  })();
+
+  // ---------- per-band bend parameters (seeded, fixed) ----------
+  var NBANDS = Math.ceil((ROWS - HEADER) / BAND);
+  var bands = [];
+  (function buildBands() {
+    for (var b = 0; b < NBANDS; b++) {
+      var rng = mulberry32(90210 + b * 977);
+      var bursts = [];
+      if (rng() < 0.55) {
+        var nb = 1 + Math.floor(rng() * 2);
+        for (var j = 0; j < nb; j++) {
+          bursts.push({ x: Math.floor(rng() * 120), len: 6 + Math.floor(rng() * 16),
+                        c: 1 + Math.floor(rng() * 5) });
+        }
+      }
+      bands.push({
+        th: 0.10 + rng() * 0.70,               // bend threshold for this band
+        off: Math.round((rng() * 2 - 0.7) * 15), // base tear offset, cells
+        bursts: bursts
+      });
+    }
+  })();
+
+  // ---------- loop envelope: how bent the whole file is ----------
+  // phase p in [0,1): clean to 0.3, full by 0.6, partial recovery to
+  // 0.35 at 0.8 (never full), easing home to clean by 1.0.
+  function bendAmount(p) {
+    if (p < 0.30) return 0;
+    if (p < 0.60) return smooth((p - 0.30) / 0.30);
+    if (p < 0.80) return 1 - 0.65 * smooth((p - 0.60) / 0.20);
+    return 0.35 * (1 - smooth((p - 0.80) / 0.20));
+  }
+  function bandStrength(b, B) {
+    var bd = bands[b];
+    return smooth((B - bd.th) / Math.max(0.05, 0.95 - bd.th));
+  }
+
+  // ---------- channel split, composed in the data ----------
+  // Inside a torn row the warm entries (pink/yellow — the "red"
+  // channel) are sampled from 2 cells up, the cool entry (cyan — the
+  // "blue" channel) from 2 cells down, lime (green) stays home, white
+  // is all channels at once. Split distance scales with band strength.
+  function isWarm(v) { return v === PINK || v === YELLOW; }
+  var rowBuf = new Uint8Array(COLS);
+  function composeRow(y, s) {
+    var base = y * COLS;
+    var dy = Math.round(2 * s);
+    if (dy <= 0) { rowBuf.set(SRC.subarray(base, base + COLS)); return rowBuf; }
+    var up = Math.max(0, y - dy) * COLS;
+    var dn = Math.min(ROWS - 1, y + dy) * COLS;
+    for (var x = 0; x < COLS; x++) {
+      var u = SRC[up + x], d = SRC[dn + x], b = SRC[base + x];
+      var v = BLACK;
+      if (u === WHITE || d === WHITE || b === WHITE) v = WHITE;
+      else if (d === CYAN) v = CYAN;
+      else if (isWarm(u)) v = u;
+      else if (b === LIME) v = LIME;
+      rowBuf[x] = v;
+    }
+    return rowBuf;
+  }
+
+  // ---------- phone detection ----------
+  var sw = (window.screen && window.screen.width) || 0;
+  var sh = (window.screen && window.screen.height) || 0;
+  var minScreen = Math.min(sw || 9999, sh || 9999);
+  var isPhone = minScreen < 700;
+
+  // ---------- view / canvas ----------
+  var canvas = document.getElementById('stage');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0;
+
+  function viewW() {
+    if (window.visualViewport && window.visualViewport.width) return window.visualViewport.width;
+    return window.innerWidth || 800;
+  }
+  function viewH() {
+    if (window.visualViewport && window.visualViewport.height) return window.innerHeight || 800;
+  }
+  function fit() {
+    W = viewW(); H = viewH();
+    canvas.width = W; canvas.height = H;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+  }
+
+  // ---------- draw ----------
+  // Rects are collected into flat groups keyed by colour (alpha 1) or
+  // colour+alpha (ghosts) so each group is one style set + one path.
+  function draw(t) {
+    fit();
+    var p = (((t % LOOP) + LOOP) % LOOP) / LOOP;
+    var B = bendAmount(p);
+
+    var side = isPhone ? W : Math.min(W, H);
+    var sx = (W - side) / 2, sy = (H - side) / 2;
+    var cw = side / COLS, chh = side / ROWS;
+
+    ctx.fillStyle = BG;
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = HEADER_BG;
+    ctx.fillRect(sx, sy, side, HEADER * chh);
+
+    var main = {};    // colourIdx -> [x,y,w,h, ...]
+    var ghost = {};   // colourIdx|alpha -> [x,y,w,h, ...]
+    var burstG = {};  // colourIdx -> [x,y,w,h, ...]
+    function push(map, key, x, y, w, h) {
+      var a = map[key];
+      if (!a) a = map[key] = [];
+      a.push(x, y, w, h);
+    }
+    function rowRuns(row, y, oxPx, s, collectGhosts) {
+      var py = sy + y * chh;
+      var x = 0;
+      while (x < COLS) {
+        var v = row[x];
+        if (v === BLACK) { x++; continue; }
+        var x0 = x;
+        while (x < COLS && row[x] === v) x++;
+        var len = x - x0;
+        var px = sx + (x0 * cw) + oxPx;
+        var pw = len * cw + 0.6;
+        push(main, v, px, py, pw, chh + 0.6);
+        if (collectGhosts) {
+          var taps = s > 0.75 ? 4 : 3;
+          for (var k = 0; k < taps; k++) {
+            var a = Math.round(TAPS[k] * s * 20) / 20;
+            if (a <= 0) continue;
+            push(ghost, v + '|' + a, px + (k + 1) * DELAY * cw, py, pw, chh + 0.6);
+          }
+        }
+      }
+    }
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(sx, sy, side, side);
+    ctx.clip();
+
+    for (var y2 = 0; y2 < ROWS; y2++) {
+      if (y2 < HEADER) {
+        rowRuns(SRC.subarray(y2 * COLS, y2 * COLS + COLS), y2, 0, 0, false);
+        continue;
+      }
+      var b = Math.floor((y2 - HEADER) / BAND);
+      var s = bandStrength(b, B);
+      if (s <= 0.001) {
+        rowRuns(SRC.subarray(y2 * COLS, y2 * COLS + COLS), y2, 0, 0, false);
+        continue;
+      }
+      var ox = Math.round(bands[b].off * s) * cw;
+      rowRuns(composeRow(y2, s), y2, ox, s, true);
+      // flat bursts of impossible colour in deep-bent rows
+      if (s > 0.6) {
+        var bw = (s - 0.6) / 0.4;
+        var bl = bands[b].bursts;
+        for (var j = 0; j < bl.length; j++) {
+          push(burstG, bl[j].c, sx + (bl[j].x * cw) + ox * 0.5,
+               sy + y2 * chh, bl[j].len * cw * bw, chh + 0.6);
+        }
+      }
+    }
+
+    var key, arr, i;
+    for (key in main) {
+      arr = main[key];
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = PAL[+key - 1];
+      ctx.beginPath();
+      for (i = 0; i < arr.length; i += 4) ctx.rect(arr[i], arr[i + 1], arr[i + 2], arr[i + 3]);
+      ctx.fill();
+    }
+    for (key in burstG) {
+      arr = burstG[key];
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = PAL[+key - 1];
+      ctx.beginPath();
+      for (i = 0; i < arr.length; i += 4) ctx.rect(arr[i], arr[i + 1], arr[i + 2], arr[i + 3]);
+      ctx.fill();
+    }
+    for (key in ghost) {
+      var parts = key.split('|');
+      arr = ghost[key];
+      ctx.globalAlpha = parseFloat(parts[1]);
+      ctx.fillStyle = PAL[+parts[0] - 1];
+      ctx.beginPath();
+      for (i = 0; i < arr.length; i += 4) ctx.rect(arr[i], arr[i + 1], arr[i + 2], arr[i + 3]);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    ctx.restore();
+  }
+
+  // ---------- run: synchronous fixed-phase first frame, then guarded rAF ----------
+  var lastT = T0;
+  if (window.addEventListener) {
+    window.addEventListener('resize', function () { draw(lastT); });
+  }
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { draw(lastT); });
+  }
+
+  draw(T0);
+
+  var startStamp = null;
+  function frame(stamp) {
+    if (startStamp === null) startStamp = stamp;
+    var t = T0 + (stamp - startStamp) / 1000;
+    lastT = t;
+    draw(t);
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+  }
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
