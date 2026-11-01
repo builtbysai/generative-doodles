@@ -1,0 +1,560 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>The Point Body</title>
+<style>
+  html, body { margin:0; padding:0; background:#020203; height:100%; overflow:hidden; }
+  canvas { display:block; touch-action:none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  var LOOP = 60;          // seconds, seamless
+  var PHASE0 = 21.5;      // fixed first-frame phase (a quiet passage, mid-gesture)
+  var TAU = Math.PI * 2;
+  // QA hook: ?phase=NN renders that loop phase as the first frame
+  if (typeof location !== 'undefined' && location.search) {
+    var pm = /[?&](?:phase|seed)=([0-9.]+)/.exec(location.search);
+    if (pm) PHASE0 = parseFloat(pm[1]);
+  }
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ---------- seeded rng ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function clamp(x, a, b) { return x < a ? a : (x > b ? b : x); }
+  function lerp(a, b, k) { return a + (b - a) * k; }
+  function smooth(x) { x = clamp(x, 0, 1); return x * x * (3 - 2 * x); }
+
+  // ---------- variants (seed -> numeric parameter set; blends are lerps) ----------
+  var NPH = 48;
+  function makeVariant(seed, bodyFrom) {
+    var rnd = mulberry32(seed);
+    var ph = new Float64Array(NPH);
+    for (var i = 0; i < NPH; i++) ph[i] = rnd() * TAU;
+    var body;
+    if (bodyFrom) {
+      body = new Float64Array(bodyFrom);
+    } else {
+      body = new Float64Array(8);
+      for (var j = 0; j < 8; j++) body[j] = 0.93 + rnd() * 0.15;
+    }
+    return { ph: ph, az0: rnd() * TAU, spd: 0.085 + rnd() * 0.05, body: body };
+  }
+  function lerpVariant(A, B, k) {
+    if (k <= 0) return A;
+    if (k >= 1) return B;
+    var ph = new Float64Array(NPH);
+    for (var i = 0; i < NPH; i++) ph[i] = lerp(A.ph[i], B.ph[i], k);
+    var body = new Float64Array(8);
+    for (var j = 0; j < 8; j++) body[j] = lerp(A.body[j], B.body[j], k);
+    return { ph: ph, az0: lerp(A.az0, B.az0, k), spd: lerp(A.spd, B.spd, k), body: body };
+  }
+
+  var V0 = makeVariant(11041001, null);
+  var events = []; // {t0, from, to}
+  var seedCounter = 1;
+
+  function paramsAt(t) {
+    var cur = V0;
+    for (var i = 0; i < events.length; i++) {
+      var ev = events[i];
+      if (t < ev.t0) break;
+      if (t >= ev.t0 + 1) cur = ev.to;
+      else cur = lerpVariant(ev.from, ev.to, smooth((t - ev.t0) / 1));
+    }
+    return cur;
+  }
+  function pushVariant(t, newBody) {
+    var from = paramsAt(t);
+    seedCounter++;
+    var to = makeVariant(11041001 + seedCounter * 7919, newBody ? null : from.body);
+    events.push({ t0: t, from: from, to: to });
+    if (events.length > 6) events.splice(0, events.length - 6);
+  }
+
+  // ---------- drag camera override ----------
+  var dragEvents = []; // {tRel, az, el}
+  var drag = null;     // {x0,y0, az0, el0, moved}
+  function offsetAt(t) {
+    if (drag) return { az: drag.az, el: drag.el };
+    var az = 0, el = 0;
+    for (var i = 0; i < dragEvents.length; i++) {
+      var ev = dragEvents[i];
+      if (t < ev.tRel) break;
+      var k = 1 - smooth((t - ev.tRel) / 1.4);
+      az = ev.az * k; el = ev.el * k;
+    }
+    return { az: az, el: el };
+  }
+
+  // ---------- loudness score (closed form, periodic in LOOP) ----------
+  function circDist(t, c) {
+    var d = Math.abs(t - c) % LOOP;
+    return d > LOOP / 2 ? LOOP - d : d;
+  }
+  function loud(t) {
+    var b1 = Math.exp(-Math.pow(circDist(t, 29.5) / 6.0, 2));
+    var b2 = Math.exp(-Math.pow(circDist(t, 52.0) / 4.5, 2));
+    var L = 0.16 + 0.80 * Math.max(b1, b2)
+      + 0.05 * Math.sin(TAU * t / LOOP + 1.0)
+      + 0.03 * Math.sin(TAU * 3 * t / LOOP);
+    return clamp(L, 0, 1);
+  }
+  // smooth sine loudness driving azimuth speed; analytic integral below
+  function azIntegral(t) {
+    // integral of Ls(u) du from 0..t, Ls = .5 + .42 sin(2*TAU*(u-22.5)/60) + .08 sin(5*TAU*u/60+1.7)
+    var a = -(60 / (4 * Math.PI)) * (Math.cos(TAU * 2 * (t - 22.5) / 60) - Math.cos(TAU * 2 * (-22.5) / 60));
+    var b = -(60 / (10 * Math.PI)) * (Math.cos(TAU * 5 * t / 60 + 1.7) - Math.cos(1.7));
+    return 0.5 * t + 0.42 * a + 0.08 * b;
+  }
+
+  // ---------- skeleton ----------
+  // joint ids
+  var PELVIS = 0, ABDOMEN = 1, CHEST = 2, NECK = 3,
+      SHL = 4, ELL = 5, WRL = 6, SHR = 7, ELR = 8, WRR = 9,
+      HIPL = 10, KNEEL = 11, ANKL = 12, TOEL = 13,
+      HIPR = 14, KNEER = 15, ANKR = 16, TOER = 17, HEADC = 18;
+  var NJ = 19;
+
+  function rotX(a) { var c = Math.cos(a), s = Math.sin(a); return [1, 0, 0, 0, c, -s, 0, s, c]; }
+  function rotY(a) { var c = Math.cos(a), s = Math.sin(a); return [c, 0, s, 0, 1, 0, -s, 0, c]; }
+  function rotZ(a) { var c = Math.cos(a), s = Math.sin(a); return [c, -s, 0, s, c, 0, 0, 0, 1]; }
+  function mulM(A, B) {
+    var R = new Array(9);
+    for (var r = 0; r < 3; r++) for (var c = 0; c < 3; c++)
+      R[r * 3 + c] = A[r * 3] * B[c] + A[r * 3 + 1] * B[3 + c] + A[r * 3 + 2] * B[6 + c];
+    return R;
+  }
+  function applyM(M, x, y, z, out) {
+    out[0] = M[0] * x + M[1] * y + M[2] * z;
+    out[1] = M[3] * x + M[4] * y + M[5] * z;
+    out[2] = M[6] * x + M[7] * y + M[8] * z;
+  }
+
+  var JP = []; // joint positions [x,y,z]
+  var JM = []; // joint rotation matrices
+  for (var ji = 0; ji < NJ; ji++) { JP.push([0, 0, 0]); JM.push([1, 0, 0, 0, 1, 0, 0, 0, 1]); }
+  var tmpV = [0, 0, 0];
+
+  function setJoint(id, parent, ox, oy, oz, rot) {
+    if (parent < 0) {
+      JP[id][0] = ox; JP[id][1] = oy; JP[id][2] = oz;
+      JM[id] = rot;
+    } else {
+      applyM(JM[parent], ox, oy, oz, tmpV);
+      JP[id][0] = JP[parent][0] + tmpV[0];
+      JP[id][1] = JP[parent][1] + tmpV[1];
+      JP[id][2] = JP[parent][2] + tmpV[2];
+      JM[id] = mulM(JM[parent], rot);
+    }
+  }
+
+  function computePose(t, P) {
+    function S(i, f) { return Math.sin(TAU * f * t / LOOP + P.ph[i % NPH]); }
+    var B = P.body;
+    var torso = B[0], uArm = 0.27 * B[1], fArm = 0.25 * B[2],
+        thigh = 0.42 * B[3], shin = 0.42 * B[4],
+        shW = B[6], hipW = B[7];
+    var bob = 0.035 * S(4, 2) + 0.015 * S(5, 3);
+    var hipH = thigh + shin + 0.06 + bob;
+    var rootX = 0.05 * S(6, 1), rootZ = 0.04 * S(7, 1);
+
+    var rootRot = mulM(rotY(0.55 * S(0, 1) + 0.25 * S(1, 2)),
+                    mulM(rotX(0.06 * S(2, 2)), rotZ(0.08 * S(3, 1))));
+    setJoint(PELVIS, -1, rootX, hipH, rootZ, rootRot);
+    setJoint(ABDOMEN, PELVIS, 0, 0.13 * torso, 0,
+      mulM(rotX(0.16 * S(8, 1) + 0.07 * S(9, 3)), rotZ(0.12 * S(10, 2))));
+    setJoint(CHEST, ABDOMEN, 0, 0.15 * torso, 0,
+      mulM(rotY(0.28 * S(11, 1) + 0.10 * S(12, 2)),
+        mulM(rotX(0.12 * S(13, 2) + 0.05 * S(14, 3)), rotZ(0.08 * S(20, 2)))));
+    setJoint(NECK, CHEST, 0, 0.15 * torso, 0,
+      mulM(rotX(0.14 * S(15, 2)), rotY(0.30 * S(16, 1))));
+    applyM(JM[NECK], 0, 0.055 + 0.082 * B[5], 0, tmpV);
+    JP[HEADC][0] = JP[NECK][0] + tmpV[0];
+    JP[HEADC][1] = JP[NECK][1] + tmpV[1];
+    JP[HEADC][2] = JP[NECK][2] + tmpV[2];
+    JM[HEADC] = JM[NECK];
+
+    // arms: local rot = Rz(abduction) * Rx(swing); elbow = Rx(bend, negative = forward)
+    setJoint(SHL, CHEST, -0.205 * shW, 0.115 * torso, 0,
+      mulM(rotZ(-(0.45 + 0.35 * S(19, 1))), rotX(0.85 * S(17, 2) + 0.30 * S(18, 3))));
+    setJoint(ELL, SHL, 0, -uArm, 0, rotX(-(0.55 + 0.40 * S(21, 2) + 0.15 * S(22, 3))));
+    setJoint(WRL, ELL, 0, -fArm, 0, rotX(0.20 * S(23, 3)));
+    setJoint(SHR, CHEST, 0.205 * shW, 0.115 * torso, 0,
+      mulM(rotZ(0.45 + 0.35 * S(28, 1)), rotX(0.85 * S(25, 2) + 0.30 * S(26, 3))));
+    setJoint(ELR, SHR, 0, -uArm, 0, rotX(-(0.55 + 0.40 * S(29, 2) + 0.15 * S(30, 3))));
+    setJoint(WRR, ELR, 0, -fArm, 0, rotX(0.20 * S(31, 3)));
+
+    // legs: hip = Rx(swing) * Rz(spread); knee = Rx(bend, positive = backward)
+    setJoint(HIPL, PELVIS, -0.105 * hipW, -0.04, 0,
+      mulM(rotX(0.50 * S(33, 2) + 0.20 * S(34, 1)), rotZ(0.10 * S(35, 1))));
+    setJoint(KNEEL, HIPL, 0, -thigh, 0, rotX(0.45 + 0.40 * S(36, 2) + 0.12 * S(37, 3)));
+    setJoint(ANKL, KNEEL, 0, -shin, 0, rotX(-(0.25 + 0.30 * S(38, 2))));
+    applyM(JM[ANKL], 0, -0.045, 0.105, tmpV);
+    JP[TOEL][0] = JP[ANKL][0] + tmpV[0]; JP[TOEL][1] = JP[ANKL][1] + tmpV[1]; JP[TOEL][2] = JP[ANKL][2] + tmpV[2];
+    setJoint(HIPR, PELVIS, 0.105 * hipW, -0.04, 0,
+      mulM(rotX(0.50 * S(41, 2) + 0.20 * S(42, 1)), rotZ(-0.10 * S(43, 1))));
+    setJoint(KNEER, HIPR, 0, -thigh, 0, rotX(0.45 + 0.40 * S(44, 2) + 0.12 * S(45, 3)));
+    setJoint(ANKR, KNEER, 0, -shin, 0, rotX(-(0.25 + 0.30 * S(46, 2))));
+    applyM(JM[ANKR], 0, -0.045, 0.105, tmpV);
+    JP[TOER][0] = JP[ANKR][0] + tmpV[0]; JP[TOER][1] = JP[ANKR][1] + tmpV[1]; JP[TOER][2] = JP[ANKR][2] + tmpV[2];
+
+    return B[5]; // head radius scale
+  }
+
+  // ---------- point cloud ----------
+  // segment table: [jointA, jointB, radius, flat, count]
+  var SEGDEF = [
+    [PELVIS, ABDOMEN, 0.135, 0.80, 1500],
+    [ABDOMEN, CHEST, 0.155, 0.80, 1900],
+    [CHEST, NECK, 0.125, 0.85, 900],
+    [CHEST, SHL, 0.050, 1, 150],
+    [CHEST, SHR, 0.050, 1, 150],
+    [SHL, ELL, 0.052, 1, 800],
+    [ELL, WRL, 0.042, 1, 600],
+    [SHR, ELR, 0.052, 1, 800],
+    [ELR, WRR, 0.042, 1, 600],
+    [PELVIS, HIPL, 0.070, 1, 200],
+    [HIPL, KNEEL, 0.072, 1, 1100],
+    [KNEEL, ANKL, 0.050, 1, 850],
+    [ANKL, TOEL, 0.035, 1, 150],
+    [PELVIS, HIPR, 0.070, 1, 200],
+    [HIPR, KNEER, 0.072, 1, 1100],
+    [KNEER, ANKR, 0.050, 1, 850],
+    [ANKR, TOER, 0.035, 1, 150]
+  ];
+  var NSEG = SEGDEF.length;
+  var HEADN = 1300, HANDN = 200; // per hand
+  var total = HEADN + HANDN * 2;
+  for (var si = 0; si < NSEG; si++) total += SEGDEF[si][4];
+
+  var pKind = new Int8Array(total);     // 0 seg, 1 head sphere, 2 hand sphere
+  var pSeg = new Int16Array(total);
+  var pS = new Float32Array(total);     // s along seg, or sphere dir x
+  var pTh = new Float32Array(total);    // theta, or sphere dir y
+  var pZ = new Float32Array(total);     // sphere dir z
+  var pRad = new Float32Array(total);
+  var pCos = new Float32Array(total);
+  var pSin = new Float32Array(total);
+  var pHash = new Float32Array(total);
+
+  (function buildPoints() {
+    var rnd = mulberry32(424243);
+    var idx = 0, i, j;
+    for (var s = 0; s < NSEG; s++) {
+      var n = SEGDEF[s][4];
+      for (i = 0; i < n; i++, idx++) {
+        pKind[idx] = 0; pSeg[idx] = s;
+        pS[idx] = rnd();
+        var th = rnd() * TAU;
+        pCos[idx] = Math.cos(th); pSin[idx] = Math.sin(th);
+        pRad[idx] = Math.pow(rnd(), 0.4);
+        pHash[idx] = rnd();
+      }
+    }
+    function sphere(kind, seg, n) {
+      for (i = 0; i < n; i++, idx++) {
+        pKind[idx] = kind; pSeg[idx] = seg;
+        // random unit direction
+        var u = rnd() * 2 - 1, a = rnd() * TAU, r = Math.sqrt(1 - u * u);
+        pS[idx] = r * Math.cos(a); pTh[idx] = u; pZ[idx] = r * Math.sin(a);
+        pRad[idx] = 0.55 + 0.45 * Math.pow(rnd(), 0.5);
+        pHash[idx] = rnd();
+      }
+    }
+    sphere(1, HEADC, HEADN);
+    sphere(2, WRL, HANDN);
+    sphere(2, WRR, HANDN);
+    total = idx;
+  })();
+
+  // ---------- sizing ----------
+  var cssW = 300, cssH = 300, dpr = 1, isPhone = false;
+  function resize() {
+    var vv = window.visualViewport;
+    var w = vv ? vv.width : window.innerWidth;
+    var h = vv ? vv.height : window.innerHeight;
+    cssW = w; cssH = h;
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+    canvas.style.width = w + 'px';
+    canvas.style.height = h + 'px';
+    var sw = window.screen ? Math.min(window.screen.width, window.screen.height) : 9999;
+    isPhone = sw < 700 || h > w * 1.15;
+  }
+  if (window.visualViewport && window.visualViewport.addEventListener)
+    window.visualViewport.addEventListener('resize', resize);
+  window.addEventListener('resize', resize);
+  resize();
+
+  // ---------- depth buckets ----------
+  var bucketCol = [];
+  for (var b = 0; b < 8; b++) {
+    var bt = b / 7;
+    bucketCol.push('rgba(' + Math.round(lerp(138, 255, bt)) + ',' +
+      Math.round(lerp(147, 255, bt)) + ',' + Math.round(lerp(160, 255, bt)) + ',' +
+      (0.45 + 0.55 * bt).toFixed(3) + ')');
+  }
+  var bucketSize = [1.15, 1.15, 1.3, 1.3, 1.5, 1.5, 1.8, 1.8];
+  var buckets = [];
+  for (var bb = 0; bb < 8; bb++) buckets.push([]);
+  var contactPts = [];
+  var tealNear = [], tealFar = [];
+
+  var lastL = 0;
+
+  // ---------- draw ----------
+  function draw(t) {
+    canvas.style.width = cssW + 'px';
+    canvas.style.height = cssH + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = '#020203';
+    ctx.fillRect(0, 0, cssW, cssH);
+
+    var P = paramsAt(t);
+    var headScale = computePose(t, P);
+    var L = loud(t);
+    lastL = L;
+
+    var off = offsetAt(t);
+    var az = P.az0 + P.spd * (0.25 * t + 0.75 * azIntegral(t)) + off.az;
+    var el = clamp(0.13 + 0.05 * Math.sin(TAU * t / LOOP + 2.0) + off.el, -0.35, 0.75);
+    var R = 3.0 + 2.3 * L;
+
+    var cf = Math.cos(el), sf = Math.sin(el);
+    // camera forward (from target toward camera), right, up
+    var fx = Math.sin(az) * cf, fy = sf, fz = Math.cos(az) * cf;
+    var rx = Math.cos(az), rz = -Math.sin(az);
+    // up = forward x right, right = (rx, 0, rz)
+    var ux = fy * rz, uy = fz * rx - fx * rz, uz = -fy * rx;
+    var tx = 0, ty = 0.92, tz = 0;
+    var camX = tx + fx * R, camY = ty + fy * R, camZ = tz + fz * R;
+
+    var minDim = Math.min(cssW, cssH);
+    var focal = 1.42 * minDim;
+    var cx = cssW / 2, cy = cssH / 2;
+
+    var stride = isPhone ? 2 : 1;
+    var emph = smooth((L - 0.70) / 0.18);
+
+    for (var b2 = 0; b2 < 8; b2++) buckets[b2].length = 0;
+    contactPts.length = 0; tealNear.length = 0; tealFar.length = 0;
+
+    // segment frames
+    var segA = [], segD = [], segU = [], segV = [], segR = [], segF = [];
+    for (var s2 = 0; s2 < NSEG; s2++) {
+      var A = JP[SEGDEF[s2][0]], Bp = JP[SEGDEF[s2][1]];
+      var dx = Bp[0] - A[0], dy = Bp[1] - A[1], dz = Bp[2] - A[2];
+      var len = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1;
+      dx /= len; dy /= len; dz /= len;
+      var hx = 0, hy = 1, hz = 0;
+      if (Math.abs(dy) > 0.9) { hx = 1; hy = 0; }
+      var ux2 = dy * hz - dz * hy, uy2 = dz * hx - dx * hz, uz2 = dx * hy - dy * hx;
+      var ul = Math.sqrt(ux2 * ux2 + uy2 * uy2 + uz2 * uz2) || 1;
+      ux2 /= ul; uy2 /= ul; uz2 /= ul;
+      segA.push(A); segD.push([dx, dy, dz]);
+      segU.push([ux2, uy2, uz2]);
+      segV.push([dy * uz2 - dz * uy2, dz * ux2 - dx * uz2, dx * uy2 - dy * ux2]);
+      segR.push(SEGDEF[s2][2]); segF.push(SEGDEF[s2][3]);
+    }
+    var headC = JP[HEADC], headR = 0.105 * headScale;
+    var handL = JP[WRL], handR = JP[WRR];
+
+    for (var i = 0; i < total; i += stride) {
+      var wx, wy, wz;
+      if (pKind[i] === 0) {
+        var sg = pSeg[i], A2 = segA[sg], D = segD[sg], U = segU[sg], V = segV[sg];
+        var sPos = pS[i];
+        // segment endpoints reconstructed from A and D*len: store base point + D*(s*len)
+        // (len recovered from joint distance)
+        var B2 = JP[SEGDEF[sg][1]];
+        var lx = B2[0] - A2[0], ly = B2[1] - A2[1], lz = B2[2] - A2[2];
+        var rr = segR[sg] * pRad[i];
+        var co = pCos[i] * rr, sn = pSin[i] * rr * segF[sg];
+        wx = A2[0] + lx * sPos + U[0] * co + V[0] * sn;
+        wy = A2[1] + ly * sPos + U[1] * co + V[1] * sn;
+        wz = A2[2] + lz * sPos + U[2] * co + V[2] * sn;
+      } else {
+        var C = pKind[i] === 1 ? headC : (pSeg[i] === WRL ? handL : handR);
+        var rad = (pKind[i] === 1 ? headR : 0.038) * pRad[i];
+        wx = C[0] + pS[i] * rad; wy = C[1] + pTh[i] * rad; wz = C[2] + pZ[i] * rad;
+      }
+
+      var relx = wx - camX, rely = wy - camY, relz = wz - camZ;
+      // view coords: zc = -dot(rel, forward) (camera looks along -forward)
+      var zc = -(relx * fx + rely * fy + relz * fz);
+      if (zc < 0.35) continue;
+      var xc = relx * rx + relz * rz;
+      var yc = relx * ux + rely * uy + relz * uz;
+      var sx = cx + focal * xc / zc;
+      var sy = cy - focal * yc / zc;
+      if (sx < -4 || sx > cssW + 4 || sy < -4 || sy > cssH + 4) continue;
+
+      if (wy < 0.07) {
+        // ground contact: faint bounce dot on the floor plane (y = 0.01)
+        var fry = 0.01 - camY;
+        var gz = Math.max(0.35, -(relx * fx + fry * fy + relz * fz));
+        var gxc = relx * rx + relz * rz;
+        var gyc = relx * ux + fry * uy + relz * uz;
+        contactPts.push(cx + focal * gxc / gz, cy - focal * gyc / gz);
+        if (wy < 0) continue; // below the floor: the bounce dot replaces the point
+      }
+
+      var dn = clamp((zc - (R - 1.35)) / 2.7, 0, 1);
+      var bk = (7 - Math.floor(dn * 7.999)) | 0;
+      buckets[bk].push(sx, sy);
+      if (emph > 0.02 && pHash[i] < 0.30) {
+        if (bk >= 4) tealNear.push(sx, sy); else tealFar.push(sx, sy);
+      }
+    }
+
+    ctx.fillStyle = 'rgba(190,200,214,0.13)';
+    for (var c2 = 0; c2 < contactPts.length; c2 += 2)
+      ctx.fillRect(contactPts[c2] - 0.8, contactPts[c2 + 1] - 0.8, 1.6, 1.6);
+
+    for (var b3 = 0; b3 < 8; b3++) {
+      var arr = buckets[b3];
+      if (!arr.length) continue;
+      ctx.fillStyle = bucketCol[b3];
+      var sz = bucketSize[b3], hs = sz / 2;
+      for (var q = 0; q < arr.length; q += 2) ctx.fillRect(arr[q] - hs, arr[q + 1] - hs, sz, sz);
+    }
+
+    if (emph > 0.02) {
+      ctx.fillStyle = 'rgba(77,216,200,' + (0.45 * emph).toFixed(3) + ')';
+      for (var tn = 0; tn < tealNear.length; tn += 2) ctx.fillRect(tealNear[tn] - 0.9, tealNear[tn + 1] - 0.9, 1.8, 1.8);
+      ctx.fillStyle = 'rgba(77,216,200,' + (0.24 * emph).toFixed(3) + ')';
+      for (var tf = 0; tf < tealFar.length; tf += 2) ctx.fillRect(tealFar[tf] - 0.65, tealFar[tf + 1] - 0.65, 1.3, 1.3);
+    }
+  }
+
+  // ---------- audio (lazy, gesture-gated, optional) ----------
+  var actx = null, masterGain = null, filtNode = null, audioOn = false;
+  function initAudio() {
+    if (audioOn) return;
+    try {
+      var AC = window.AudioContext || window.webkitAudioContext;
+      if (typeof AC !== 'function') return;
+      actx = new AC();
+      var len = 2 * actx.sampleRate;
+      var buf = actx.createBuffer(1, len, actx.sampleRate);
+      var d = buf.getChannelData(0);
+      var rnd = mulberry32(777);
+      for (var i = 0; i < len; i++) d[i] = rnd() * 2 - 1;
+      var noise = actx.createBufferSource();
+      noise.buffer = buf; noise.loop = true;
+      filtNode = actx.createBiquadFilter();
+      filtNode.type = 'lowpass'; filtNode.frequency.value = 320;
+      var ng = actx.createGain(); ng.gain.value = 0.5;
+      noise.connect(filtNode); filtNode.connect(ng);
+      var osc = actx.createOscillator();
+      osc.type = 'sine'; osc.frequency.value = 54;
+      var og = actx.createGain(); og.gain.value = 0.6;
+      osc.connect(og);
+      masterGain = actx.createGain(); masterGain.gain.value = 0;
+      ng.connect(masterGain); og.connect(masterGain);
+      masterGain.connect(actx.destination);
+      noise.start(); osc.start();
+      audioOn = true;
+    } catch (e) { /* piece is complete without audio */ }
+  }
+
+  // ---------- clock / loop ----------
+  function nowMs() {
+    if (typeof performance !== 'undefined' && performance.now) return performance.now();
+    return Date.now();
+  }
+  var tStart = nowMs();
+  function pieceTime() { return PHASE0 + (nowMs() - tStart) / 1000; }
+
+  draw(PHASE0); // deterministic synchronous first frame
+
+  if (typeof requestAnimationFrame === 'function') {
+    var rafLoop = function () {
+      var t = pieceTime();
+      draw(t);
+      if (audioOn && masterGain) {
+        try {
+          masterGain.gain.value = 0.03 + 0.15 * lastL;
+          if (filtNode) filtNode.frequency.value = 200 + 650 * lastL;
+        } catch (e) {}
+      }
+      requestAnimationFrame(rafLoop);
+    };
+    requestAnimationFrame(rafLoop);
+  }
+
+  // ---------- interaction ----------
+  var lastTapT = -10, lastTapX = 0, lastTapY = 0, pendingTap = null;
+  function evPos(e) {
+    var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  }
+  canvas.addEventListener('pointerdown', function (e) {
+    initAudio();
+    if (actx && actx.resume) { try { actx.resume(); } catch (err) {} }
+    var p = evPos(e);
+    var off = offsetAt(pieceTime());
+    drag = { x0: p.x, y0: p.y, az: off.az, el: off.el, azC: off.az, elC: off.el, moved: false, downT: pieceTime(), downX: p.x, downY: p.y };
+    if (canvas.setPointerCapture) { try { canvas.setPointerCapture(e.pointerId); } catch (err) {} }
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (!drag) return;
+    var p = evPos(e);
+    var dx = p.x - drag.x0, dy = p.y - drag.y0;
+    if (Math.abs(p.x - drag.downX) + Math.abs(p.y - drag.downY) > 8) drag.moved = true;
+    drag.az = drag.azC + dx * 0.006;
+    drag.el = clamp(drag.elC + dy * 0.004, -0.55, 0.62);
+  });
+  function endPointer(e) {
+    if (!drag) return;
+    var t = pieceTime();
+    var wasTap = !drag.moved && (t - drag.downT) < 0.30;
+    if (drag.moved || drag.az !== 0 || drag.el !== 0) {
+      dragEvents.push({ tRel: t, az: drag.az, el: drag.el });
+      if (dragEvents.length > 4) dragEvents.splice(0, dragEvents.length - 4);
+    }
+    var px = drag.downX, py = drag.downY;
+    drag = null;
+    if (wasTap) {
+      if (t - lastTapT < 0.35) {
+        // double tap: new dancer
+        if (pendingTap !== null && typeof clearTimeout === 'function') clearTimeout(pendingTap);
+        pendingTap = null;
+        pushVariant(t, true);
+        lastTapT = -10;
+      } else {
+        lastTapT = t; lastTapX = px; lastTapY = py;
+        if (typeof setTimeout === 'function') {
+          pendingTap = setTimeout(function () {
+            pendingTap = null;
+            pushVariant(pieceTime(), false);
+          }, 320);
+        } else {
+          pushVariant(t, false);
+        }
+      }
+    }
+  }
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', endPointer);
+})();
+</script>
+</body>
+</html>
