@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<!-- piece-9127-still-water-remembers -->
+<title>Still Water Remembers</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #0d1619; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; touch-action: none; cursor: crosshair; }
+</style>
+</head>
+<body>
+<canvas id="pond"></canvas>
+<script>
+'use strict';
+'use strict';
+/* №9127 "Still Water Remembers" — driver core. Pure functions, no DOM. */
+
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// ---- tuning constants (mirror of acceptance criteria) ----
+const RIPPLE_SPEED = 90;      // px/s
+const RIPPLE_LIFE = 4.0;      // s
+const RIPPLE_CAP = 40;
+const TRAIL_EVERY = 28;       // px of pointer travel per trail ripple
+const FISH_COUNT = 7;
+const CRUISE = 55;            // px/s cruise speed
+const CURIOUS_RANGE = 240;
+const CURIOUS_SPEED = 120;    // pointer speed below this = interesting
+const FLEE_RANGE = 260;
+const FLEE_SPEED = 500;       // pointer speed above this = threat
+const BURST = 3.2;            // startle speed multiplier
+const STARTLE_TIME = 0.9;     // s
+const RIPPLE_STARTLE_RANGE = 220;
+const RIPPLE_STARTLE_AGE = 0.3;
+const TURN_RATE = 2.8;        // rad/s max turn (cruise/curious)
+const STARTLE_TURN = 6.0;     // rad/s panic turn
+const APPROACH_STOP = 70;     // stop approaching closer than this
+
+function dist(ax, ay, bx, by) {
+  const dx = ax - bx, dy = ay - by;
+  return Math.hypot(dx, dy);
+}
+
+function createPond(W, H, seed) {
+  const rng = mulberry32(seed);
+  const pond = { W, H, t: 0, ripples: [], trailAcc: 0,
+    pointer: { x: W / 2, y: H / 2, speed: 0, lastActiveT: -10, trailX: W / 2, trailY: H / 2 },
+    fish: [], pads: [] };
+  const patterns = ['kohaku', 'tancho', 'utsuri', 'yamabuki', 'kohaku', 'utsuri', 'asagi'];
+  for (let i = 0; i < FISH_COUNT; i++) {
+    const a = rng() * Math.PI * 2;
+    pond.fish.push({
+      x: W * (0.15 + 0.7 * rng()), y: H * (0.15 + 0.7 * rng()),
+      vx: Math.cos(a) * CRUISE, vy: Math.sin(a) * CRUISE,
+      cruise: CRUISE * (0.9 + 0.2 * rng()),
+      size: 26 + rng() * 14,
+      pattern: patterns[i % patterns.length],
+      phase: rng() * Math.PI * 2,      // tail undulation
+      wanderPhase: rng() * Math.PI * 2,
+      startle: 0, sx: 0, sy: 0,        // startle timer + source point
+      wakeAcc: 0, seed: rng() * 1000
+    });
+  }
+  // lily pads (decoration layout, seeded)
+  for (let i = 0; i < 4; i++) {
+    pond.pads.push({
+      x: W * (0.12 + 0.76 * rng()), y: H * (0.12 + 0.76 * rng()),
+      r: 34 + rng() * 26, notch: rng() * Math.PI * 2
+    });
+  }
+  return pond;
+}
+
+function spawnRipple(pond, x, y, amp, kind) {
+  amp = Math.max(0.05, Math.min(1, amp));
+  pond.ripples.push({ x, y, t0: pond.t, amp, kind: kind || 'pointer' });
+  while (pond.ripples.length > RIPPLE_CAP) pond.ripples.shift(); // cull oldest
+  return pond.ripples[pond.ripples.length - 1];
+}
+
+function rippleAge(pond, r) { return pond.t - r.t0; }
+function ringRadius(pond, r) { return RIPPLE_SPEED * rippleAge(pond, r); }
+function ringAlpha(pond, r) {
+  const age = rippleAge(pond, r);
+  if (age < 0) return 0;
+  if (age >= RIPPLE_LIFE) return 0;
+  return r.amp * (1 - age / RIPPLE_LIFE);
+}
+function liveRipples(pond) {
+  return pond.ripples.filter(r => ringAlpha(pond, r) > 0);
+}
+
+// pointer events -------------------------------------------------
+function pointerActive(pond) { return (pond.t - pond.pointer.lastActiveT) < 0.6; }
+
+function pointerMove(pond, x, y, dt) {
+  const p = pond.pointer;
+  const d = dist(p.x, p.y, x, y);
+  const inst = dt > 0 ? d / dt : 0;
+  p.speed = p.speed * 0.6 + inst * 0.4;      // smoothed speed px/s
+  p.x = x; p.y = y; p.lastActiveT = pond.t;
+  // trail ripples every TRAIL_EVERY px, amplitude from speed
+  pond.trailAcc += d;
+  let guard = 0;
+  while (pond.trailAcc >= TRAIL_EVERY && guard++ < 8) {
+    pond.trailAcc -= TRAIL_EVERY;
+    const amp = Math.max(0.15, Math.min(0.9, p.speed / 450));
+    spawnRipple(pond, x, y, amp);
+  }
+}
+
+function pointerTap(pond, x, y) {
+  const p = pond.pointer;
+  p.x = x; p.y = y; p.speed = 0; p.lastActiveT = pond.t;
+  spawnRipple(pond, x, y, 1.0);   // stone drop
+}
+
+// fish -----------------------------------------------------------
+function newestRippleNear(pond, x, y, range, maxAge) {
+  for (let i = pond.ripples.length - 1; i >= 0; i--) {
+    const r = pond.ripples[i];
+    // wakes are the fish's own turbulence; only pointer ripples startle
+    if (r.kind !== 'pointer') continue;
+    if (rippleAge(pond, r) <= maxAge && dist(x, y, r.x, r.y) < range) return r;
+  }
+  return null;
+}
+
+function turnToward(f, dx, dy, speed, dt, rate) {
+  // steer velocity vector toward (dx,dy)*speed with max turn rate
+  const curA = Math.atan2(f.vy, f.vx);
+  const desA = Math.atan2(dy, dx);
+  let da = desA - curA;
+  while (da > Math.PI) da -= Math.PI * 2;
+  while (da < -Math.PI) da += Math.PI * 2;
+  const maxTurn = (rate || TURN_RATE) * dt;
+  const turn = Math.max(-maxTurn, Math.min(maxTurn, da));
+  const curS = Math.hypot(f.vx, f.vy) || 1;
+  const newS = curS + (speed - curS) * (1 - Math.exp(-4 * dt)); // analytic ease, dt-independent
+  const a = curA + turn;
+  f.vx = Math.cos(a) * newS; f.vy = Math.sin(a) * newS;
+}
+
+function updateFish(pond, f, dt) {
+  const p = pond.pointer;
+  const active = pointerActive(pond);
+  const d = dist(f.x, f.y, p.x, p.y);
+
+  if (f.startle > 0) {
+    f.startle -= dt;
+    const a = Math.atan2(f.y - f.sy, f.x - f.sx);
+    turnToward(f, Math.cos(a), Math.sin(a), f.cruise * BURST, dt, STARTLE_TURN);
+  } else {
+    const r = newestRippleNear(pond, f.x, f.y, RIPPLE_STARTLE_RANGE, RIPPLE_STARTLE_AGE);
+    if (r) {
+      f.startle = STARTLE_TIME; f.sx = r.x; f.sy = r.y;
+    } else if (active && p.speed > FLEE_SPEED && d < FLEE_RANGE) {
+      f.startle = STARTLE_TIME; f.sx = p.x; f.sy = p.y;
+    } else if (active && p.speed < CURIOUS_SPEED && d < CURIOUS_RANGE && d > APPROACH_STOP) {
+      turnToward(f, p.x - f.x, p.y - f.y, f.cruise * 1.15, dt); // curious approach
+    } else {
+      // wander: deterministic sinusoidal steering, no rng consumption
+      f.wanderPhase += dt * 0.9;
+      const a = Math.atan2(f.vy, f.vx) + Math.sin(f.wanderPhase + f.seed) * 1.1 * dt;
+      const s = Math.hypot(f.vx, f.vy) || f.cruise;
+      const ns = s + (f.cruise - s) * (1 - Math.exp(-2 * dt));
+      f.vx = Math.cos(a) * ns; f.vy = Math.sin(a) * ns;
+    }
+  }
+
+  // separation (light, O(n^2) with n=7 is trivial)
+  for (const o of pond.fish) {
+    if (o === f) continue;
+    const od = dist(f.x, f.y, o.x, o.y);
+    if (od < 52 && od > 0.01) {
+      const push = (52 - od) * 1.5 * dt;
+      f.vx += (f.x - o.x) / od * push;
+      f.vy += (f.y - o.y) / od * push;
+    }
+  }
+
+  // soft wall steering (gentle spring, velocity change per frame stays small)
+  const m = 70, wk = 6 * dt;
+  if (f.x < m) f.vx += (m - f.x) * wk;
+  if (f.x > pond.W - m) f.vx -= (f.x - (pond.W - m)) * wk;
+  if (f.y < m) f.vy += (m - f.y) * wk;
+  if (f.y > pond.H - m) f.vy -= (f.y - (pond.H - m)) * wk;
+
+  f.x += f.vx * dt; f.y += f.vy * dt;
+  f.phase += dt * (2 + Math.hypot(f.vx, f.vy) / f.cruise * 3);
+
+  // wake: fast fish leave small memory ripples
+  const spd = Math.hypot(f.vx, f.vy);
+  if (spd > f.cruise * 1.8) {
+    f.wakeAcc += dt;
+    if (f.wakeAcc > 0.45) { f.wakeAcc = 0; spawnRipple(pond, f.x, f.y, 0.25, 'wake'); }
+  } else f.wakeAcc = 0;
+}
+
+function stepPond(pond, dt) {
+  pond.t += dt;
+  // cull dead ripples
+  pond.ripples = pond.ripples.filter(r => ringAlpha(pond, r) > 0);
+  for (const f of pond.fish) updateFish(pond, f, dt);
+}
+
+function updatePond(pond, dt) {
+  // fixed-timestep substeps: identical trajectory at any frame rate
+  const sub = Math.max(1, Math.ceil(dt / (1 / 120)));
+  const h = dt / sub;
+  for (let i = 0; i < sub; i++) stepPond(pond, h);
+}
+
+if (typeof module !== 'undefined') {
+  module.exports = {
+    mulberry32, createPond, spawnRipple, ringRadius, ringAlpha, liveRipples,
+    pointerMove, pointerTap, pointerActive, updatePond, updateFish,
+    dist, RIPPLE_SPEED, RIPPLE_LIFE, RIPPLE_CAP, CRUISE, BURST, FISH_COUNT
+  };
+}
+
+
+/* ---------- render layer (decoration; driver lives in the core above) ---------- */
+const canvas = document.getElementById('pond');
+const ctx = canvas.getContext('2d');
+let W = 0, H = 0, pond = null, bg = null;
+
+const WATER = '#0d1619';
+const RIPPLE_RGB = '170,210,198';
+
+function buildBg() {
+  bg = document.createElement('canvas');
+  bg.width = Math.max(2, W); bg.height = Math.max(2, H);
+  const b = bg.getContext('2d');
+  b.fillStyle = WATER;
+  b.fillRect(0, 0, W, H);
+  // faint depth mottling, precomputed once
+  let s = 987654321;
+  const rnd = () => (s = (s * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+  for (let i = 0; i < 26; i++) {
+    const x = rnd() * W, y = rnd() * H, r = 90 + rnd() * 260;
+    const g = b.createRadialGradient(x, y, 0, x, y, r);
+    const light = rnd() > 0.5;
+    g.addColorStop(0, light ? 'rgba(42,70,66,0.15)' : 'rgba(0,0,0,0.12)');
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    b.fillStyle = g;
+    b.beginPath(); b.arc(x, y, r, 0, Math.PI * 2); b.fill();
+  }
+  // vignette
+  const v = b.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.35, W / 2, H / 2, Math.max(W, H) * 0.75);
+  v.addColorStop(0, 'rgba(0,0,0,0)');
+  v.addColorStop(1, 'rgba(0,0,0,0.42)');
+  b.fillStyle = v;
+  b.fillRect(0, 0, W, H);
+}
+
+function resize() {
+  const DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = Math.round(W * DPR); canvas.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  if (!pond) {
+    pond = createPond(W, H, 20261101);
+    // the pond remembers something from before you arrived: backdated,
+    // mid-fade, too old to startle anyone
+    const seeds = [[0.30, 0.30, -1.6], [0.68, 0.62, -2.4], [0.52, 0.24, -0.9]];
+    for (const [fx, fy, age] of seeds) {
+      const r = spawnRipple(pond, W * fx, H * fy, 0.55);
+      r.t0 = age;
+    }
+  } else {
+    pond.W = W; pond.H = H;
+    for (const f of pond.fish) {
+      f.x = Math.max(10, Math.min(W - 10, f.x));
+      f.y = Math.max(10, Math.min(H - 10, f.y));
+    }
+  }
+  buildBg();
+}
+window.addEventListener('resize', resize);
+
+function drawPads() {
+  for (const p of pond.pads) {
+    ctx.fillStyle = '#0d1c17';
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.r, p.notch + 0.35, p.notch + Math.PI * 2 - 0.35);
+    ctx.lineTo(p.x, p.y);
+    ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = 'rgba(150,190,175,0.16)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.r, p.notch + 0.35, p.notch + Math.PI * 2 - 0.35);
+    ctx.stroke();
+    ctx.fillStyle = 'rgba(150,190,175,0.10)';
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r * 0.12, 0, Math.PI * 2); ctx.fill();
+  }
+}
+
+function drawRipples() {
+  for (const r of pond.ripples) {
+    const al = ringAlpha(pond, r);
+    if (al <= 0.004) continue;
+    const rad = ringRadius(pond, r);
+    ctx.strokeStyle = 'rgba(' + RIPPLE_RGB + ',' + (al * 0.8).toFixed(3) + ')';
+    ctx.lineWidth = 0.6 + 2.6 * al;
+    ctx.beginPath(); ctx.arc(r.x, r.y, rad, 0, Math.PI * 2); ctx.stroke();
+    if (rad > 44) {
+      ctx.strokeStyle = 'rgba(' + RIPPLE_RGB + ',' + (al * 0.28).toFixed(3) + ')';
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.arc(r.x, r.y, rad * 0.8, 0, Math.PI * 2); ctx.stroke();
+    }
+  }
+}
+
+const BODY = {
+  kohaku: '#e6dfcd', tancho: '#e6dfcd', utsuri: '#ddd6c4',
+  yamabuki: '#d3a955', asagi: '#6e7f8c'
+};
+const TAIL = {
+  kohaku: '#d8d0ba', tancho: '#d8d0ba', utsuri: '#c6bfa9',
+  yamabuki: '#b98f3e', asagi: '#5a6a76'
+};
+
+function drawFish(f) {
+  const a = Math.atan2(f.vy, f.vx);
+  const s = f.size, L = s * 2.3;
+  ctx.save();
+  ctx.translate(f.x, f.y);
+  ctx.rotate(a);
+  // tail, wagging
+  const wag = Math.sin(f.phase) * s * 0.30;
+  ctx.fillStyle = TAIL[f.pattern];
+  ctx.beginPath();
+  ctx.moveTo(-L * 0.40, 0);
+  ctx.lineTo(-L * 0.74, -s * 0.44 + wag);
+  ctx.quadraticCurveTo(-L * 0.60, wag * 0.5, -L * 0.74, s * 0.44 + wag);
+  ctx.closePath(); ctx.fill();
+  // body
+  ctx.fillStyle = BODY[f.pattern];
+  ctx.beginPath();
+  ctx.ellipse(0, 0, L * 0.5, s * 0.40, 0, 0, Math.PI * 2);
+  ctx.fill();
+  // pattern markings
+  if (f.pattern === 'kohaku') {
+    ctx.fillStyle = '#b83a1c';
+    ctx.beginPath(); ctx.ellipse(L * 0.14, -s * 0.08, s * 0.30, s * 0.20, 0.4, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(-L * 0.16, s * 0.10, s * 0.22, s * 0.15, -0.5, 0, Math.PI * 2); ctx.fill();
+  } else if (f.pattern === 'tancho') {
+    ctx.fillStyle = '#b83a1c';
+    ctx.beginPath(); ctx.arc(L * 0.30, 0, s * 0.15, 0, Math.PI * 2); ctx.fill();
+  } else if (f.pattern === 'utsuri') {
+    ctx.fillStyle = '#181d22';
+    ctx.beginPath(); ctx.ellipse(-L * 0.10, -s * 0.10, s * 0.34, s * 0.24, 0.5, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(L * 0.22, s * 0.12, s * 0.20, s * 0.14, -0.4, 0, Math.PI * 2); ctx.fill();
+  } else if (f.pattern === 'asagi') {
+    ctx.fillStyle = 'rgba(230,223,205,0.45)';
+    ctx.beginPath(); ctx.ellipse(0, s * 0.14, L * 0.38, s * 0.20, 0, 0, Math.PI * 2); ctx.fill();
+  }
+  // eye
+  ctx.fillStyle = 'rgba(10,12,14,0.85)';
+  ctx.beginPath(); ctx.arc(L * 0.36, -s * 0.10, s * 0.055, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+}
+
+/* ---------- input: the pointer is a presence over the pond ---------- */
+let lastPT = 0;
+function evtPos(e) {
+  const r = canvas.getBoundingClientRect();
+  return [e.clientX - r.left, e.clientY - r.top];
+}
+canvas.addEventListener('pointerdown', (e) => {
+  const [x, y] = evtPos(e);
+  pointerTap(pond, x, y);           // a stone dropped
+  lastPT = performance.now();
+  try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+  e.preventDefault();
+});
+canvas.addEventListener('pointermove', (e) => {
+  const [x, y] = evtPos(e);
+  const now = performance.now();
+  const dt = Math.max(1, now - lastPT) / 1000;
+  lastPT = now;
+  pointerMove(pond, x, y, dt);      // stirring the surface
+});
+window.addEventListener('contextmenu', (e) => e.preventDefault());
+
+/* ---------- main loop ---------- */
+let last = performance.now();
+function frame(now) {
+  let dt = (now - last) / 1000;
+  last = now;
+  dt = Math.min(dt, 0.05);
+  updatePond(pond, dt);
+  ctx.drawImage(bg, 0, 0, W, H);
+  drawPads();
+  drawRipples();
+  for (const f of pond.fish) drawFish(f);
+  requestAnimationFrame(frame);
+}
+
+resize();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
