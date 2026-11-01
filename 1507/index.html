@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vita: Two Centuries, One Line</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #2a2a30; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  var CHARCOAL = '#2a2a30';
+  var CREAM = '#e8e0d0';
+  var TEAL = '#2e6f6a';
+  var GOLD = '#d9a441';
+  var GREY = '#b8bcc0';
+
+  // Cream and teal as rgb triples for per-segment blending.
+  var CREAM_RGB = [232, 224, 208];
+  var TEAL_RGB = [46, 111, 106];
+  var GOLD_RGB = [217, 164, 65];
+
+  var LOOP = 24;          // seconds: one full draw-and-redraw cycle
+  var DRAW_PHASE = 0.55;  // frame one shows the line drawn 55% across:
+                          // smooth cream at left, morph zone at centre,
+                          // stepped teal just begun at right.
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(1507000);
+  // Seeded curve constants, fixed for the whole piece life.
+  var P1 = rng() * Math.PI * 2;
+  var P2 = rng() * Math.PI * 2;
+  var P3 = rng() * Math.PI * 2;
+  var P4 = rng() * Math.PI * 2;
+
+  var W = 0, H = 0;
+  var drags = [];        // completed drags: {shift, tUp}
+  var activeDrag = null; // {x0, y0, dx}
+  var bootDone = false;
+
+  function viewport() {
+    var w, h;
+    if (typeof window !== 'undefined' && window.visualViewport) {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    } else if (typeof window !== 'undefined') {
+      w = window.innerWidth; h = window.innerHeight;
+    } else { w = 1280; h = 720; }
+    return { w: w, h: h };
+  }
+
+  function isPhone() {
+    if (typeof window !== 'undefined' && window.screen) {
+      var m = Math.min(window.screen.width, window.screen.height);
+      if (m < 700) { return true; }
+    }
+    return H > W * 1.15;
+  }
+
+  function resize() {
+    var v = viewport();
+    W = v.w; H = v.h;
+    canvas.width = W; canvas.height = H;
+    draw(0);
+  }
+
+  function r4(x) {
+    return Math.round(x * 10000) / 10000;
+  }
+
+  function clamp(x, lo, hi) {
+    if (x < lo) { return lo; }
+    if (x > hi) { return hi; }
+    return x;
+  }
+
+  function smoothstep(a, b, x) {
+    var t = clamp((x - a) / (b - a), 0, 1);
+    return t * t * (3 - 2 * t);
+  }
+
+  function lerp(a, b, t) {
+    return a + (b - a) * t;
+  }
+
+  function loopLocal(t) {
+    var lt = t % LOOP;
+    if (lt < 0) { lt += LOOP; }
+    return lt;
+  }
+
+  // Draw progress: 0..1 across the loop, phase-shifted so frame one
+  // already shows the line through the morph zone.
+  function drawProgressAt(t) {
+    var lt = loopLocal(t);
+    var p = (lt / LOOP + DRAW_PHASE) % 1;
+    return p;
+  }
+
+  // Morph shift from recorded drags: while dragging, the shift follows
+  // the pointer; after release it decays exponentially (tau 1.5 s), so
+  // the automatic morph resumes with no jump. Closed form over the
+  // recorded drag list and t, never frame-integrated state.
+  function shiftAt(t) {
+    var s = 0;
+    var i;
+    for (i = 0; i < drags.length; i++) {
+      s += drags[i].shift * Math.exp(-(t - drags[i].tUp) / 1.5);
+    }
+    if (activeDrag) { s += activeDrag.shift; }
+    return clamp(s, -0.35, 0.35);
+  }
+
+  // Morph weight at line position u (0 = left end, 1 = right end):
+  // a smooth bump peaking at the centre, shifted by dragging.
+  function morphWeightAt(u, t) {
+    var uu = clamp(u - shiftAt(t), 0, 1);
+    if (uu <= 0.5) { return smoothstep(0.22, 0.5, uu); }
+    return 1 - smoothstep(0.5, 0.78, uu);
+  }
+
+  function baseCurve(u) {
+    // Low-frequency vocal-style curve, shared by both characters so the
+    // morph never jumps: only its rendering changes.
+    return Math.sin(Math.PI * 2 * 1.0 * u + P1) * 0.05
+      + Math.sin(Math.PI * 2 * 2.0 * u + P2) * 0.025;
+  }
+
+  function smoothY(u, Hh) {
+    var c = 0.5 * Hh;
+    return c + (baseCurve(u)
+      + Math.sin(Math.PI * 2 * 5.0 * u + P3) * 0.008) * Hh;
+  }
+
+  function steppedY(u, Hh, lt) {
+    var c = 0.5 * Hh;
+    var step = 0.018 * Hh;
+    var v = baseCurve(u) * Hh;
+    var idx = Math.round(v / step);
+    // Tremble: 3 full cycles per loop, so it is exactly periodic, plus a
+    // seeded per-step phase so steps shimmer independently.
+    var trem = Math.sin(Math.PI * 2 * 3 * lt / LOOP + idx * 1.7 + P4) * 0.0035 * Hh;
+    return c + idx * step + trem;
+  }
+
+  function lineY(u, t) {
+    var lt = loopLocal(t);
+    var w = morphWeightAt(u, t);
+    return lerp(smoothY(u, H), steppedY(u, H, lt), w);
+  }
+
+  function mixColor(w) {
+    var r = Math.round(lerp(CREAM_RGB[0], TEAL_RGB[0], w));
+    var g = Math.round(lerp(CREAM_RGB[1], TEAL_RGB[1], w));
+    var b = Math.round(lerp(CREAM_RGB[2], TEAL_RGB[2], w));
+    return 'rgb(' + r + ',' + g + ',' + b + ')';
+  }
+
+  function draw(t) {
+    if (!W || !H) {
+      var v = viewport();
+      W = v.w; H = v.h;
+      canvas.width = W; canvas.height = H;
+    }
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.fillStyle = CHARCOAL;
+    ctx.fillRect(0, 0, W, H);
+
+    var x0 = W * 0.08, x1 = W * 0.92;
+    var p = drawProgressAt(t);
+    var headX = x0 + p * (x1 - x0);
+    var lw = Math.max(2, Math.min(W, H) * 0.004);
+    var dx = Math.max(2, W / 500);
+    ctx.lineCap = 'round';
+
+    var x;
+    for (x = x0; x < headX; x += dx) {
+      var xa = x, xb = Math.min(x + dx, headX);
+      var ua = (xa - x0) / (x1 - x0);
+      var ub = (xb - x0) / (x1 - x0);
+      var um = (ua + ub) / 2;
+      var w = morphWeightAt(um, t);
+      var ya = lineY(ua, t), yb = lineY(ub, t);
+      // Faint gold under-stroke across the morph zone only: a wash,
+      // never a vertical seam mark.
+      if (w > 0.08 && w < 0.92) {
+        ctx.beginPath();
+        ctx.moveTo(xa, ya);
+        ctx.lineTo(xb, yb);
+        ctx.strokeStyle = 'rgba(' + GOLD_RGB[0] + ',' + GOLD_RGB[1] + ',' + GOLD_RGB[2] + ',' + r4(0.15) + ')';
+        ctx.lineWidth = lw + 2;
+        ctx.stroke();
+      }
+      ctx.beginPath();
+      ctx.moveTo(xa, ya);
+      ctx.lineTo(xb, yb);
+      ctx.strokeStyle = mixColor(w);
+      ctx.lineWidth = lw;
+      ctx.stroke();
+    }
+
+    // Grey endpoint dots: the line's start (always drawn) and the draw
+    // head (the pen). Filled rects, never batched arcs.
+    var dot = Math.max(3, Math.min(W, H) * 0.008);
+    ctx.fillStyle = GREY;
+    ctx.fillRect(x0 - dot / 2, lineY(0, t) - dot / 2, dot, dot);
+    if (p > 0.01 && p < 0.999) {
+      var hu = (headX - x0) / (x1 - x0);
+      ctx.fillRect(headX - dot / 2, lineY(hu, t) - dot / 2, dot, dot);
+    }
+  }
+
+  function onDown(e) {
+    var x = (e.clientX !== undefined) ? e.clientX : e.x;
+    var y = (e.clientY !== undefined) ? e.clientY : e.y;
+    // Drags start on the line's middle band; anything else is ignored.
+    if (Math.abs(y - H * 0.5) < H * 0.25) {
+      activeDrag = { x0: x, y0: y, dx: 0, shift: 0 };
+    }
+  }
+  function onMove(e) {
+    if (!activeDrag) { return; }
+    var x = (e.clientX !== undefined) ? e.clientX : e.x;
+    activeDrag.dx = x - activeDrag.x0;
+    activeDrag.shift = clamp(activeDrag.dx / W * 0.6, -0.35, 0.35);
+  }
+  function onUp(e) {
+    if (!activeDrag) { return; }
+    // The release time must come from the probe clock when driven, so
+    // onUp accepts an explicit time through the probe API wrapper; in a
+    // real browser the rAF clock is the only clock and the decay starts
+    // from the last drawn time, recorded by draw().
+    drags.push({ shift: activeDrag.shift, tUp: lastDrawT });
+    activeDrag = null;
+  }
+
+  var lastDrawT = 0;
+  var origDraw = draw;
+  draw = function (t) {
+    lastDrawT = t;
+    origDraw(t);
+  };
+
+  canvas.addEventListener('pointerdown', onDown);
+  canvas.addEventListener('pointermove', onMove);
+  canvas.addEventListener('pointerup', onUp);
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('resize', resize);
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', resize);
+    }
+  }
+
+  // Probe API: drive the piece at forced times without touching the clock.
+  if (typeof window !== 'undefined') {
+    window.__piece = {
+      drawAt: function (t) { draw(t); },
+      drawProgressAt: drawProgressAt,
+      morphWeightAt: morphWeightAt,
+      shiftAt: shiftAt,
+      lineY: lineY,
+      pointerDown: onDown,
+      pointerMove: onMove,
+      pointerUp: onUp
+    };
+  }
+
+  // Fixed-phase first frame.
+  draw(0);
+  bootDone = true;
+
+  var startTime = null;
+  function loop(ts) {
+    if (startTime === null) { startTime = ts; }
+    var t = (ts - startTime) / 1000;
+    draw(t);
+    if (typeof requestAnimationFrame !== 'undefined') {
+      requestAnimationFrame(loop);
+    }
+  }
+  if (typeof requestAnimationFrame !== 'undefined') {
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
