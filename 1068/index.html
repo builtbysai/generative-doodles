@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Figure Eight</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #060607; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ---------- palette (strict) ----------
+  var VOID = '#060607';
+  var RAIL = '#2A2E35';
+  var FLASH = '#FFFFFF';
+  // segment states: 0 red, 1 amber, 2 blue, 3 green, 4 dim (rail-dark bead)
+  var STATE_HEX = ['#FF5A5A', '#FFD75E', '#7FD4FF', '#9DFF6E', '#2A2E35'];
+  var STATE_RGB = [[255, 90, 90], [255, 215, 94], [127, 212, 255], [157, 255, 110], [42, 46, 53]];
+
+  // ---------- model constants ----------
+  var T0 = 19;              // fixed frame-one phase (seconds)
+  var LOOP = 55;            // seamless loop (s)
+  var TRAV = 11;            // one full circuit per ball (s); 55 = 5 x 11
+  var SEG_N = 7;            // checkpoints and segments
+  var BALLS = 16;
+  var FLASH_T = 0.45;       // checkpoint flash decay window (s)
+  var TABLE_N = 4096;       // arc-length table resolution
+
+  // ---------- seeded rng ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- the rail curve ----------
+  // Lissajous 1:2 figure eight with a slow radial modulation, so the lobes
+  // swell and pinch like a spiral tightening. q(u) in normalized units:
+  // |qx| <= 1.17, |qy| <= 0.585, single crossing at the origin.
+  function curveQ(u) {
+    var m = 1 + 0.12 * Math.sin(3 * u + 0.7) + 0.05 * Math.sin(5 * u);
+    return { x: Math.sin(u) * m, y: 0.5 * Math.sin(2 * u) * m };
+  }
+
+  // ---------- sizing (Visual Viewport API) ----------
+  var W = 720, H = 720;
+  function resize() {
+    var vv = (typeof window !== 'undefined' && window.visualViewport) ? window.visualViewport : null;
+    W = vv ? vv.width : (window.innerWidth || 720);
+    H = vv ? vv.height : (window.innerHeight || 720);
+    canvas.width = W;
+    canvas.height = H;
+    buildArc();
+  }
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', resize);
+  }
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('resize', resize);
+  }
+
+  function isPhone() {
+    var sm = 9999;
+    if (typeof window !== 'undefined' && window.screen) {
+      sm = Math.min(window.screen.width || 9999, window.screen.height || 9999);
+    }
+    return sm < 700 || H > W * 1.15;
+  }
+
+  // ---------- arc-length table in device px (rebuilt on resize) ----------
+  var arcPts = [];      // {x, y, tx, ty, nx, ny} at equal parameter steps
+  var arcCum = [];      // cumulative length at each sample
+  var arcL = 1;         // total circuit length (px)
+  function buildArc() {
+    arcPts = []; arcCum = [];
+    var sx = (W / 2) * 0.97 / 1.17;
+    var sy = (H / 2) * 0.95 / 0.585;
+    var cx = W / 2, cy = H / 2;
+    var i, q, px, py;
+    for (i = 0; i < TABLE_N; i++) {
+      q = curveQ((i / TABLE_N) * Math.PI * 2);
+      arcPts.push({ x: cx + q.x * sx, y: cy + q.y * sy });
+    }
+    var total = 0;
+    for (i = 0; i < TABLE_N; i++) {
+      var a = arcPts[i], b = arcPts[(i + 1) % TABLE_N];
+      arcCum.push(total);
+      total += Math.hypot(b.x - a.x, b.y - a.y);
+    }
+    arcL = total;
+    for (i = 0; i < TABLE_N; i++) {
+      var p0 = arcPts[(i + TABLE_N - 1) % TABLE_N], p1 = arcPts[(i + 1) % TABLE_N];
+      var dx = p1.x - p0.x, dy = p1.y - p0.y;
+      var len = Math.hypot(dx, dy) || 1;
+      arcPts[i].tx = dx / len; arcPts[i].ty = dy / len;
+      arcPts[i].nx = -dy / len; arcPts[i].ny = dx / len;
+    }
+  }
+  // position and frame at arc length s (px, wraps)
+  function posAt(s) {
+    s = ((s % arcL) + arcL) % arcL;
+    var lo = 0, hi = TABLE_N - 1;
+    while (lo < hi) {
+      var mid = (lo + hi + 1) >> 1;
+      if (arcCum[mid] <= s) lo = mid; else hi = mid - 1;
+    }
+    var i = lo;
+    var j = (i + 1) % TABLE_N;
+    var segEnd = (j === 0) ? arcL : arcCum[j];
+    var span = segEnd - arcCum[i];
+    var f = span > 0 ? (s - arcCum[i]) / span : 0;
+    var a = arcPts[i], b = arcPts[j];
+    return {
+      x: a.x + (b.x - a.x) * f,
+      y: a.y + (b.y - a.y) * f,
+      tx: a.tx + (b.tx - a.tx) * f,
+      ty: a.ty + (b.ty - a.ty) * f,
+      nx: a.nx + (b.nx - a.nx) * f,
+      ny: a.ny + (b.ny - a.ny) * f
+    };
+  }
+
+  // ---------- fleet per seed (ball phases, directions, base segment states) ----------
+  var BASE_SEED = 1068045;   // probed: at t = 19 two checkpoints sit mid-flash (ages 0.013 s, 0.100 s)
+  var fleetCache = {};
+  function buildFleet(seed) {
+    if (fleetCache[seed]) return fleetCache[seed];
+    var rnd = mulberry32(seed);
+    var phases = [], dirs = [], i;
+    for (i = 0; i < BALLS; i++) {
+      phases.push((i + 0.15 + rnd() * 0.7) / BALLS);   // stratified around the circuit
+      dirs.push(rnd() < 0.42 ? -1 : 1);
+    }
+    var pool = [0, 1, 2, 3, 0, 2, 4];                  // all four hues + one dim
+    for (i = pool.length - 1; i > 0; i--) {
+      var k = Math.floor(rnd() * (i + 1));
+      var tmp = pool[i]; pool[i] = pool[k]; pool[k] = tmp;
+    }
+    var fleet = { seed: seed, phases: phases, dirs: dirs, baseStates: pool };
+    fleetCache[seed] = fleet;
+    return fleet;
+  }
+
+  // ---------- interaction events (empty before any input) ----------
+  var reseeds = [];      // {t, seed}
+  var overrides = [];    // {t, seg, state, seed}
+  var seedCounter = 0;
+
+  function fleetFor(t) {
+    var s = BASE_SEED;
+    for (var i = 0; i < reseeds.length; i++) if (reseeds[i].t <= t) s = reseeds[i].seed;
+    return buildFleet(s);
+  }
+  function segStateAt(fleet, seg, t) {
+    var st = fleet.baseStates[seg];
+    for (var i = 0; i < overrides.length; i++) {
+      var o = overrides[i];
+      if (o.seed === fleet.seed && o.seg === seg && o.t <= t) st = o.state;
+    }
+    return st;
+  }
+  function nextState(st) { return (st + 1) % STATE_HEX.length; }
+
+  function modL(a) { return ((a % arcL) + arcL) % arcL; }
+
+  // ball kinematics: unwrapped arc A(t) = phase + dir * v * t, v = arcL / TRAV
+  function ballArc(fleet, i, t) {
+    return fleet.phases[i] * arcL + fleet.dirs[i] * (arcL / TRAV) * t;
+  }
+  // the state a ball carries: the state of its current segment at entry time
+  function ballState(fleet, i, t) {
+    var v = arcL / TRAV;
+    var segL = arcL / SEG_N;
+    var A = ballArc(fleet, i, t);
+    var m = Math.floor(A / segL);
+    var seg = ((m % SEG_N) + SEG_N) % SEG_N;
+    var tE;
+    if (fleet.dirs[i] > 0) tE = (m * segL - fleet.phases[i] * arcL) / v;
+    else tE = (fleet.phases[i] * arcL - (m + 1) * segL) / v;
+    if (tE < 0) tE = 0;
+    if (tE > t) tE = t;
+    return segStateAt(fleet, seg, tE);
+  }
+  // age of the most recent pass of checkpoint k by any ball, at time t
+  function flashAge(fleet, k, t) {
+    var v = arcL / TRAV;
+    var sk = k * (arcL / SEG_N);
+    var best = Infinity;
+    for (var i = 0; i < BALLS; i++) {
+      var A = ballArc(fleet, i, t);
+      var rel = fleet.dirs[i] > 0 ? modL(A - sk) : modL(sk - A);
+      var age = rel / v;
+      if (age < best) best = age;
+    }
+    return best;
+  }
+
+  function rgba(rgb, a) {
+    return 'rgba(' + rgb[0] + ',' + rgb[1] + ',' + rgb[2] + ',' + a + ')';
+  }
+
+  // ---------- draw: pure function of piece time t ----------
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    var bs = Math.min(W, H) / 720;                 // ball scale
+    var fleet = fleetFor(t);
+    var i, k, p;
+
+    ctx.fillStyle = VOID;
+    ctx.fillRect(0, 0, W, H);
+
+    // --- ties (sleepers): short cross ticks along the arc ---
+    var gap = (isPhone() ? 3.6 : 3.1) * Math.max(bs, 0.55);
+    var tieStep = 30 * Math.max(bs, 0.55);
+    ctx.strokeStyle = RAIL;
+    ctx.globalAlpha = 0.5;
+    ctx.lineWidth = Math.max(1, 1.2 * bs);
+    ctx.beginPath();
+    for (var s = 0; s < arcL; s += tieStep) {
+      p = posAt(s);
+      ctx.moveTo(p.x - p.nx * (gap + 2.4 * bs), p.y - p.ny * (gap + 2.4 * bs));
+      ctx.lineTo(p.x + p.nx * (gap + 2.4 * bs), p.y + p.ny * (gap + 2.4 * bs));
+    }
+    ctx.stroke();
+
+    // --- the two rails ---
+    ctx.globalAlpha = 0.95;
+    ctx.lineWidth = Math.max(1.1, 1.6 * bs);
+    for (var side = -1; side <= 1; side += 2) {
+      ctx.beginPath();
+      for (i = 0; i <= TABLE_N; i += 4) {
+        p = arcPts[i % TABLE_N];
+        var ox = p.x + p.nx * gap * side, oy = p.y + p.ny * gap * side;
+        if (i === 0) ctx.moveTo(ox, oy); else ctx.lineTo(ox, oy);
+      }
+      ctx.closePath();
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+
+    // --- checkpoints: base diamonds, then earned flashes ---
+    var dia = Math.max(4.5, 7 * bs);
+    for (k = 0; k < SEG_N; k++) {
+      p = posAt(k * (arcL / SEG_N));
+      ctx.beginPath();
+      ctx.moveTo(p.x + p.tx * dia, p.y + p.ty * dia);
+      ctx.lineTo(p.x + p.nx * dia * 0.62, p.y + p.ny * dia * 0.62);
+      ctx.lineTo(p.x - p.tx * dia, p.y - p.ty * dia);
+      ctx.lineTo(p.x - p.nx * dia * 0.62, p.y - p.ny * dia * 0.62);
+      ctx.closePath();
+      ctx.strokeStyle = RAIL;
+      ctx.globalAlpha = 0.9;
+      ctx.lineWidth = Math.max(1, 1.3 * bs);
+      ctx.stroke();
+      var age = flashAge(fleet, k, t);
+      if (age < FLASH_T) {
+        var fa = 0.8 * Math.pow(1 - age / FLASH_T, 2);
+        ctx.fillStyle = FLASH;
+        ctx.globalAlpha = fa;
+        ctx.fill();
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    // --- balls: layered discs in their segment state color ---
+    for (i = 0; i < BALLS; i++) {
+      var st = ballState(fleet, i, t);
+      var rgb = STATE_RGB[st];
+      p = posAt(ballArc(fleet, i, t));
+      if (st === 4) {
+        // dim segment: a dark bead on the rail, no glow
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 6.4 * bs, 0, Math.PI * 2);
+        ctx.fillStyle = RAIL;
+        ctx.globalAlpha = 0.28;
+        ctx.fill();
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 3.6 * bs, 0, Math.PI * 2);
+        ctx.globalAlpha = 0.9;
+        ctx.fill();
+      } else {
+        var layers = [[11.5, 0.10], [7.2, 0.20], [4.4, 0.55], [2.7, 0.92]];
+        for (var L = 0; L < layers.length; L++) {
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, layers[L][0] * bs, 0, Math.PI * 2);
+          ctx.fillStyle = rgba(rgb, 1);
+          ctx.globalAlpha = layers[L][1];
+          ctx.fill();
+        }
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- audio (lazy, gesture-gated, typeof-guarded) ----------
+  var actx = null;
+  function ensureAudio() {
+    if (actx) return;
+    try {
+      var AC = (typeof AudioContext !== 'undefined') ? AudioContext :
+               ((typeof webkitAudioContext !== 'undefined') ? webkitAudioContext : null);
+      if (AC) actx = new AC();
+    } catch (e) { actx = null; }
+  }
+  function tone(freq, dur, vol, type) {
+    if (!actx) return;
+    try {
+      var o = actx.createOscillator();
+      var g = actx.createGain();
+      var now = actx.currentTime;
+      o.type = type || 'sine';
+      o.frequency.value = freq;
+      g.gain.setValueAtTime(vol, now);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+      o.connect(g); g.connect(actx.destination);
+      o.start(now); o.stop(now + dur + 0.02);
+    } catch (e) { /* silent */ }
+  }
+  function tick() { tone(1750, 0.035, 0.045, 'triangle'); }
+  function confirmTone() { tone(660, 0.07, 0.05, 'sine'); setTimeout(function () { tone(880, 0.09, 0.05, 'sine'); }, 55); }
+
+  // ---------- interaction ----------
+  var startStamp = null;
+  function pieceNow(nowMs) {
+    if (startStamp === null) startStamp = nowMs;
+    return T0 + (nowMs - startStamp) / 1000;
+  }
+  function eventNow() {
+    return (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+  }
+  function nearestArc(px, py) {
+    var best = 0, bd = Infinity;
+    for (var i = 0; i < TABLE_N; i += 2) {
+      var dx = arcPts[i].x - px, dy = arcPts[i].y - py;
+      var d = dx * dx + dy * dy;
+      if (d < bd) { bd = d; best = i; }
+    }
+    return { s: arcCum[best], dist: Math.sqrt(bd) };
+  }
+
+  var drag = null;        // {downT, downX, downY, moved, lastSeg}
+  var lastDownClock = -1e9;
+
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', function (e) {
+      ensureAudio();
+      var now = eventNow();
+      var t = pieceNow(now);
+      // double-tap: new rail
+      if (now - lastDownClock < 320) {
+        seedCounter++;
+        reseeds.push({ t: t, seed: BASE_SEED + seedCounter * 7919 });
+        lastDownClock = -1e9;
+        drag = null;
+        return;
+      }
+      lastDownClock = now;
+      var near = nearestArc(e.clientX, e.clientY);
+      var seg = Math.floor(modL(near.s) / (arcL / SEG_N)) % SEG_N;
+      drag = { downT: t, downX: e.clientX, downY: e.clientY, moved: false, lastSeg: seg };
+    });
+    canvas.addEventListener('pointermove', function (e) {
+      if (!drag) return;
+      var dx = e.clientX - drag.downX, dy = e.clientY - drag.downY;
+      if (dx * dx + dy * dy > 36) drag.moved = true;
+      if (!drag.moved) return;
+      var t = pieceNow(eventNow());
+      var near = nearestArc(e.clientX, e.clientY);
+      var seg = Math.floor(modL(near.s) / (arcL / SEG_N)) % SEG_N;
+      if (seg !== drag.lastSeg) {
+        // the visitor terminal: crossing into a segment steps its state
+        drag.lastSeg = seg;
+        var fleet = fleetFor(t);
+        var cur = segStateAt(fleet, seg, t);
+        overrides.push({ t: t, seg: seg, state: nextState(cur), seed: fleet.seed });
+        confirmTone();
+      }
+    });
+    function endPointer(e) {
+      if (!drag) return;
+      var t = pieceNow(eventNow());
+      var dur = t - drag.downT;
+      var wasDrag = drag.moved;
+      drag = null;
+      if (wasDrag || dur > 0.35) return;
+      // tap: near a checkpoint, flip the state of the segment after it
+      var bs = Math.min(W, H) / 720;
+      for (var k = 0; k < SEG_N; k++) {
+        var p = posAt(k * (arcL / SEG_N));
+        var ddx = p.x - e.clientX, ddy = p.y - e.clientY;
+        if (ddx * ddx + ddy * ddy < Math.pow(46 * Math.max(bs, 0.6), 2)) {
+          var seg = (k + 1) % SEG_N;
+          var fleet = fleetFor(t);
+          var cur = segStateAt(fleet, seg, t);
+          overrides.push({ t: t, seg: seg, state: nextState(cur), seed: fleet.seed });
+          confirmTone();
+          return;
+        }
+      }
+    }
+    canvas.addEventListener('pointerup', endPointer);
+    canvas.addEventListener('pointercancel', function () { drag = null; });
+  }
+
+  // ---------- frame one + loop ----------
+  resize();
+  draw(T0);
+  if (typeof requestAnimationFrame === 'function') {
+    var prevT = T0;
+    var raf = function (nowMs) {
+      var t = pieceNow(nowMs);
+      // checkpoint ticks: a pass is an age reset between frames
+      if (actx) {
+        var fleet = fleetFor(t);
+        var ticked = false;
+        for (var k = 0; k < SEG_N && !ticked; k++) {
+          if (flashAge(fleet, k, t) < flashAge(fleet, k, prevT)) { tick(); ticked = true; }
+        }
+      }
+      prevT = t;
+      draw(t);
+      requestAnimationFrame(raf);
+    };
+    requestAnimationFrame(raf);
+  }
+})();
+</script>
+</body>
+</html>

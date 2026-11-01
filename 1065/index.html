@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Slit Scanner</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #050505; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded rng ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- palette (strict) ----------
+  var VOID = '#050505';
+  var BAR = '#E8EAEE';
+  var HUB = '#2A2E35';
+  var FLASH = '#FFFFFF';
+  var LOCK = '#FFD75E';
+
+  // ---------- sim constants ----------
+  var STEP = 1 / 120;          // fixed sim step, seconds
+  var PREROLL = 1800;          // 15.0 s at 120 Hz: frame one, inside the big rotor's lock
+  var CYCLE = 45;              // strobe sweep loop, seconds
+  var SAMPLE_KEEP = 2.2;       // seconds of strobe samples drawn per rotor
+  var LOCK_MAX = 0.045;        // apparent pattern drift (rev/s) below which a rotor reads as standing
+  var FLASH_SPAN = 0.09;       // seconds over which the global flash decays
+  var FLASH_MAX = 0.15;        // flash discipline: alpha ceiling, a lift, never a whiteout
+  var BASE_SEED = 1065226;
+  var TAU = Math.PI * 2;
+
+  // Strobe frequency keyframes over the 45 s cycle: [time, Hz].
+  // Flat segments are dwells; ramps are the sweep. Each dwell is tuned so one
+  // rotor's bar pattern stands still in it (see process.md for the lock math):
+  // F = 3.75 locks the big rotor, F = 5.25 locks small A, F = 4.25 locks small B.
+  var KEYS = [
+    [0, 5.00], [10, 5.00],
+    [13, 3.75], [19, 3.75],
+    [24, 5.25], [30, 5.25],
+    [35, 4.25], [41, 4.25],
+    [45, 5.00]
+  ];
+
+  function cyc(t) { return ((t % CYCLE) + CYCLE) % CYCLE; }
+
+  function sweepFreq(t) {
+    var u = cyc(t), i;
+    for (i = 0; i < KEYS.length - 1; i++) {
+      var a = KEYS[i], b = KEYS[i + 1];
+      if (u >= a[0] && u <= b[0]) {
+        if (b[0] === a[0]) return b[1];
+        var f = (u - a[0]) / (b[0] - a[0]);
+        return a[1] + (b[1] - a[1]) * f;
+      }
+    }
+    return KEYS[KEYS.length - 1][1];
+  }
+
+  // Apparent pattern drift for a rotor of f rev/s sampled at F Hz. The 5 bars
+  // map onto themselves every 1/5 turn, so the pattern stands when 5f/F is
+  // near an integer; the residue is the pattern's true crawl rate.
+  function apparent(f, F) {
+    var r = 5 * f / F;
+    var d = Math.abs(r - Math.round(r));
+    return d * F / 5;
+  }
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 720, H = 720, DPR = 1;
+
+  function isPhone() {
+    var sw = 0, sh = 0;
+    if (typeof window !== 'undefined' && window.screen) {
+      sw = window.screen.width || 0; sh = window.screen.height || 0;
+    }
+    var mn = Math.min(sw, sh);
+    if (mn > 0 && mn < 700) return true;
+    return H > W * 1.15; // aspect fallback only
+  }
+
+  function fit() {
+    var vv = (typeof window !== 'undefined') ? window.visualViewport : null;
+    if (vv && vv.width) { W = vv.width; H = vv.height; }
+    else if (typeof window !== 'undefined' && window.innerWidth) { W = window.innerWidth; H = window.innerHeight; }
+    DPR = (typeof window !== 'undefined' && window.devicePixelRatio) ? Math.min(window.devicePixelRatio, 2) : 1;
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+  }
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', function () { fit(); draw(); });
+    }
+    if (window.addEventListener) {
+      window.addEventListener('resize', function () { fit(); draw(); });
+    }
+  }
+
+  // World: a 1000 x 1000 square, contain-fit and centered, so the whole
+  // triangle fits at any size, phones included.
+  function worldTransform() {
+    var side = Math.min(W, H);
+    return { side: side, ox: (W - side) / 2, oy: (H - side) / 2 };
+  }
+
+  // ---------- rotors ----------
+  // Assemblies in a triangle, sizes descending: one big, two smaller.
+  // Speeds in revolutions per second.
+  var ASSEMBLIES = [
+    { x: 0.300, y: 0.350, len: 235, hub: 17.0 },
+    { x: 0.720, y: 0.280, len: 150, hub: 12.5 },
+    { x: 0.545, y: 0.730, len: 118, hub: 10.5 }
+  ];
+  var AUTHORED_SPEEDS = [1.50, 1.05, 0.85];
+  var rotors = [];   // {asm, revs, angle, dragOff, locked, samples: [{a, t, lock}]}
+  var simTime = 0;
+  var strobePhase = 0;
+  var lastStrobeT = -10;
+  var snapBias = 0;  // Hz added to the sweep after a tap; decays back over ~6 s
+  var reseedCount = 0;
+
+  function buildRotors(seed) {
+    var rng = mulberry32(seed);
+    rotors = [];
+    for (var i = 0; i < 3; i++) {
+      var f = AUTHORED_SPEEDS[i];
+      if (reseedCount > 0) {
+        f = 0.6 + rng() * 1.3;
+        // keep the three speeds distinguishable so their locks stay separate
+        for (var j = 0; j < i; j++) {
+          if (Math.abs(f - rotors[j].revs) < 0.12) f += 0.17;
+        }
+      }
+      rotors.push({
+        asm: ASSEMBLIES[i],
+        revs: f,
+        angle: rng() * TAU,
+        dragOff: 0,
+        locked: false,
+        samples: []
+      });
+    }
+  }
+
+  function strobeFreqNow() { return sweepFreq(simTime) + snapBias; }
+
+  // ---------- audio (lazy, gesture-born, typeof-guarded) ----------
+  var AC = (typeof AudioContext !== 'undefined') ? AudioContext
+         : (typeof window !== 'undefined' && window.webkitAudioContext) ? window.webkitAudioContext
+         : null;
+  var actx = null, masterGain = null, humOsc = [], humGain = [];
+  function ensureAudio() {
+    if (!AC || actx) return;
+    try {
+      actx = new AC();
+      masterGain = actx.createGain();
+      masterGain.gain.value = 0.6;
+      masterGain.connect(actx.destination);
+      for (var i = 0; i < 3; i++) {
+        var o = actx.createOscillator();
+        o.type = 'triangle';
+        o.frequency.value = 36 + rotors[i].revs * 48;
+        var g = actx.createGain();
+        g.gain.value = 0.012;
+        o.connect(g); g.connect(masterGain);
+        o.start();
+        humOsc.push(o); humGain.push(g);
+      }
+    } catch (e) { actx = null; }
+  }
+  function audioTick() {
+    if (!actx) return;
+    try {
+      var t = actx.currentTime;
+      var o = actx.createOscillator();
+      o.type = 'square';
+      o.frequency.value = 1600;
+      var g = actx.createGain();
+      g.gain.setValueAtTime(0.035, t);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.03);
+      o.connect(g); g.connect(masterGain);
+      o.start(t); o.stop(t + 0.04);
+    } catch (e) {}
+  }
+  function audioLock(i) {
+    if (!actx) return;
+    try {
+      var t = actx.currentTime;
+      var o = actx.createOscillator();
+      o.type = 'sine';
+      o.frequency.value = 520 + i * 90;
+      var g = actx.createGain();
+      g.gain.setValueAtTime(0.05, t);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.5);
+      o.connect(g); g.connect(masterGain);
+      o.start(t); o.stop(t + 0.55);
+    } catch (e) {}
+  }
+  function updateAudioHums() {
+    if (!actx) return;
+    try {
+      for (var i = 0; i < 3 && i < humOsc.length; i++) {
+        var f = 36 + Math.max(0.05, rotors[i].revs + rotors[i].dragOff) * 48;
+        humOsc[i].frequency.setTargetAtTime(f, actx.currentTime, 0.05);
+      }
+    } catch (e) {}
+  }
+
+  // ---------- pointer state (drag = motor, tap = snap, double-tap = reseed) ----------
+  var ptr = { down: false, x: 0, y: 0, startX: 0, startY: 0, rotor: -1, dragging: false };
+  var lastTapAt = -10;
+
+  function pointerPos(e) {
+    var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    return { x: (e.clientX || 0) - r.left, y: (e.clientY || 0) - r.top };
+  }
+  function nearestRotor(px, py) {
+    var tr = worldTransform();
+    var best = -1, bd = Infinity;
+    for (var i = 0; i < rotors.length; i++) {
+      var cx = tr.ox + rotors[i].asm.x * tr.side;
+      var cy = tr.oy + rotors[i].asm.y * tr.side;
+      var d = (px - cx) * (px - cx) + (py - cy) * (py - cy);
+      if (d < bd) { bd = d; best = i; }
+    }
+    return best;
+  }
+
+  function onDown(e) {
+    ensureAudio();
+    if (actx && actx.resume) { try { actx.resume(); } catch (err) {} }
+    var p = pointerPos(e);
+    ptr.down = true; ptr.dragging = false;
+    ptr.x = ptr.startX = p.x; ptr.y = ptr.startY = p.y;
+    ptr.rotor = nearestRotor(p.x, p.y);
+  }
+  function onMove(e) {
+    if (!ptr.down) return;
+    var p = pointerPos(e);
+    ptr.x = p.x; ptr.y = p.y;
+    if (Math.abs(p.x - ptr.startX) > 6 || Math.abs(p.y - ptr.startY) > 6) ptr.dragging = true;
+  }
+  function onUp(e) {
+    if (!ptr.down) return;
+    ptr.down = false;
+    if (ptr.dragging) { ptr.dragging = false; ptr.rotor = -1; return; }
+    // a tap: snap the strobe to the nearest lock frequency; a second tap
+    // inside 0.35 s is a double-tap and reseeds instead.
+    if (simTime - lastTapAt < 0.35) {
+      lastTapAt = -10;
+      reseedCount++;
+      resetSim(BASE_SEED + reseedCount * 7919);
+      draw();
+      return;
+    }
+    lastTapAt = simTime;
+    var F = strobeFreqNow();
+    var best = null, bd = Infinity, i, m, cand;
+    for (i = 0; i < rotors.length; i++) {
+      for (m = 1; m <= 4; m++) {
+        cand = 5 * rotors[i].revs / m;
+        if (cand < 3.3 || cand > 5.7) continue;
+        if (Math.abs(cand - F) < bd) { bd = Math.abs(cand - F); best = cand; }
+      }
+    }
+    if (best !== null) snapBias += (best - F);
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', function () { ptr.down = false; ptr.dragging = false; ptr.rotor = -1; });
+  }
+
+  // ---------- fixed-step simulation ----------
+  function stepSim(live) {
+    simTime += STEP;
+    snapBias *= Math.exp(-STEP / 6); // the snap relaxes; the sweep resumes
+    var F = strobeFreqNow();
+    var i, r;
+    // drag: the held rotor's velocity offset follows the horizontal drag,
+    // and eases back to zero once released
+    for (i = 0; i < rotors.length; i++) {
+      r = rotors[i];
+      if (ptr.down && ptr.dragging && ptr.rotor === i) {
+        var target = (ptr.x - ptr.startX) * 0.004;
+        if (target > 1.6) target = 1.6;
+        if (target < -1.6) target = -1.6;
+        r.dragOff += (target - r.dragOff) * Math.min(1, STEP * 10);
+      } else if (r.dragOff !== 0) {
+        r.dragOff *= Math.exp(-STEP * 1.6);
+        if (Math.abs(r.dragOff) < 0.001) r.dragOff = 0;
+      }
+      r.angle += (r.revs + r.dragOff) * TAU * STEP; // velocity is the instrument: no easing on the rotor itself
+      var was = r.locked;
+      r.locked = apparent(r.revs + r.dragOff, F) < LOCK_MAX;
+      if (live && r.locked && !was) audioLock(i);
+    }
+    strobePhase += F * STEP;
+    if (strobePhase >= 1) {
+      strobePhase -= Math.floor(strobePhase);
+      lastStrobeT = simTime;
+      for (i = 0; i < rotors.length; i++) {
+        rotors[i].samples.push({ a: rotors[i].angle, t: simTime, lock: rotors[i].locked });
+      }
+      if (live) audioTick();
+    }
+    for (i = 0; i < rotors.length; i++) {
+      var s = rotors[i].samples;
+      while (s.length && simTime - s[0].t > SAMPLE_KEEP) s.shift();
+    }
+  }
+
+  function resetSim(seed) {
+    buildRotors(seed);
+    simTime = 0;
+    strobePhase = 0;
+    lastStrobeT = -10;
+    snapBias = 0;
+    for (var s = 0; s < PREROLL; s++) stepSim(false);
+  }
+
+  // ---------- drawing ----------
+  function drawBars(cx, cy, len, angle, color, alpha, width) {
+    ctx.strokeStyle = color;
+    ctx.globalAlpha = alpha;
+    ctx.lineWidth = width;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    for (var k = 0; k < 5; k++) {
+      var a = angle + (k * TAU) / 5;
+      ctx.moveTo(cx, cy);
+      ctx.lineTo(cx + Math.cos(a) * len, cy + Math.sin(a) * len);
+    }
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  function draw() {
+    if (!rotors.length) return;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = VOID;
+    ctx.fillRect(0, 0, W, H);
+
+    // the global flash: a faint full-frame lift at strobe instants only
+    var flashAge = simTime - lastStrobeT;
+    if (flashAge >= 0 && flashAge < FLASH_SPAN) {
+      ctx.fillStyle = FLASH;
+      ctx.globalAlpha = FLASH_MAX * (1 - flashAge / FLASH_SPAN);
+      ctx.fillRect(0, 0, W, H);
+      ctx.globalAlpha = 1;
+    }
+
+    var tr = worldTransform();
+    var u = tr.side / 1000; // world unit to px
+    var i, j, r, cx, cy, len, wdt;
+
+    // faint true-motion ghosts: where the bars physically are, dim
+    for (i = 0; i < rotors.length; i++) {
+      r = rotors[i];
+      cx = tr.ox + r.asm.x * tr.side;
+      cy = tr.oy + r.asm.y * tr.side;
+      len = r.asm.len * u;
+      wdt = Math.max(1.4, len * 0.02);
+      var om = (r.revs + r.dragOff) * TAU;
+      drawBars(cx, cy, len, r.angle - om * 0.10, BAR, 0.020, wdt);
+      drawBars(cx, cy, len, r.angle - om * 0.05, BAR, 0.032, wdt);
+      drawBars(cx, cy, len, r.angle, BAR, 0.055, wdt);
+    }
+
+    // strobe samples: the apparent pattern. Newest brightest, decaying.
+    // Samples taken while their rotor was locked burn amber; the rest are
+    // the cool paper of the bars. No blur, no trails: samples are instants.
+    for (i = 0; i < rotors.length; i++) {
+      r = rotors[i];
+      cx = tr.ox + r.asm.x * tr.side;
+      cy = tr.oy + r.asm.y * tr.side;
+      len = r.asm.len * u;
+      wdt = Math.max(1.4, len * 0.02);
+      var s = r.samples;
+      for (j = 0; j < s.length; j++) {
+        var ageS = simTime - s[j].t;
+        var al = 0.92 * Math.exp(-ageS / 0.7);
+        if (al < 0.02) continue;
+        drawBars(cx, cy, len, s[j].a, s[j].lock ? LOCK : BAR, al, wdt);
+      }
+    }
+
+    // hubs last: the machines' centers, always visible
+    for (i = 0; i < rotors.length; i++) {
+      r = rotors[i];
+      cx = tr.ox + r.asm.x * tr.side;
+      cy = tr.oy + r.asm.y * tr.side;
+      ctx.fillStyle = HUB;
+      ctx.globalAlpha = 1;
+      ctx.beginPath(); ctx.arc(cx, cy, Math.max(3, r.asm.hub * u), 0, TAU); ctx.fill();
+      ctx.fillStyle = BAR;
+      ctx.globalAlpha = 0.55;
+      ctx.beginPath(); ctx.arc(cx, cy, Math.max(1.2, r.asm.hub * u * 0.28), 0, TAU); ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  // ---------- boot: pre-roll, frame one, live loop ----------
+  fit();
+  resetSim(BASE_SEED);
+  draw();
+
+  if (typeof requestAnimationFrame !== 'undefined') {
+    var lastMs = null;
+    var loop = function (ms) {
+      if (lastMs === null) lastMs = ms;
+      var elapsed = (ms - lastMs) / 1000;
+      lastMs = ms;
+      if (elapsed > 0.25) elapsed = 0.25;
+      var steps = Math.floor(elapsed / STEP);
+      if (steps > 30) steps = 30;
+      for (var i = 0; i < steps; i++) stepSim(true);
+      updateAudioHums();
+      draw();
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,513 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Doors of Light</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #030304; overflow: hidden; height: 100%; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ---------- palette (strict, white light only) ----------
+  var VOID = '#030304';
+  var FRAME = '#F4F6F8';
+  var GLOW = '#DCE8FF';
+  var DISC = '#FFFFFF';
+  var WIRE = '#1A1C20';
+  var MIST = '#0C0E12';
+
+  // ---------- constants ----------
+  var T0 = 18;                    // fixed frame-one phase (seconds)
+  var TAU = Math.PI * 2;
+  var BASE_SEED = 1064225;        // piece 1064, prompt PP225
+  var BREATHE_PERIODS = [12, 15, 20, 30];   // all divide the 60 s loop
+  var SWING_PERIODS = [20, 30, 60];
+  var MIST_PERIODS = [20, 30, 60];
+
+  // ---------- seeded rng ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+  // ---------- room model (all geometry in world units, 1 = min(viewW, viewH)) ----------
+  // Each frame is a rectangle hung from a pivot point on its top edge; the pivot
+  // is fixed in the room and the frame rotates about it (pendulum swing, drag
+  // tilt). A lens disc hangs above the pivot of some frames, on the same axis.
+  function buildRoom(seed) {
+    var rnd = mulberry32(seed);
+    var frames = [];
+    var n = 7;
+    var rot = (rnd() * 2 - 1) * 0.03;
+    var i, fr;
+    for (i = 0; i < n; i++) {
+      var t01 = i / (n - 1);
+      var frac = 0.70 * Math.pow(0.15 / 0.70, t01);   // 0.70 down to 0.15
+      var ar = 1.22 + rnd() * 0.18;                   // width / height
+      var hw = frac / 2;
+      var hh = frac / ar / 2;
+      if (i > 0) {
+        var delta = 0;
+        var guard = 0;
+        do { delta = (rnd() * 2 - 1) * 0.085; guard++; }
+        while (Math.abs(delta) < 0.021 && guard < 12); // every step visibly off
+        rot = clamp(rot + delta, -0.19, 0.19);
+      }
+      var px = (rnd() * 2 - 1) * 0.38 * hw;           // pivot along the top edge
+      var ox = (rnd() * 2 - 1) * 0.015;
+      var oy = (rnd() * 2 - 1) * 0.015;
+      var cR = Math.cos(rot), sR = Math.sin(rot);
+      fr = {
+        hw: hw, hh: hh, rot: rot, px: px,
+        ox: ox, oy: oy,
+        // world position of the pivot: C + Rot(rot) * P, P = (px, -hh)
+        wpx: ox + (cR * px - sR * (-hh)),
+        wpy: oy + (sR * px + cR * (-hh)),
+        hang: 0.05 + rnd() * 0.07,
+        hasLens: false,
+        bPeriod: BREATHE_PERIODS[Math.floor(rnd() * BREATHE_PERIODS.length)],
+        bPhase: rnd() * TAU,
+        swingPeriod: SWING_PERIODS[Math.floor(rnd() * SWING_PERIODS.length)],
+        swingPhase: rnd() * TAU,
+        swingAmp: 0.010 + rnd() * 0.012,
+        tilt: 0, tiltTarget: 0
+      };
+      frames.push(fr);
+    }
+    // three lens discs, on outer / middle / inner frames
+    var owners = [0, 2, 4];
+    for (i = 0; i < owners.length; i++) {
+      var j = owners[i] + Math.floor(rnd() * 2);
+      if (j >= n) j = n - 1;
+      frames[j].hasLens = true;
+    }
+    // mist blobs: seeded soft shapes drifting on loop-divisor periods
+    var blobs = [];
+    var nb = 16;
+    for (i = 0; i < nb; i++) {
+      blobs.push({
+        bx: (rnd() * 2 - 1) * 0.46,
+        by: (rnd() * 2 - 1) * 0.46,
+        r: 0.10 + rnd() * 0.20,
+        amp: 0.012 + rnd() * 0.026,
+        period: MIST_PERIODS[Math.floor(rnd() * MIST_PERIODS.length)],
+        phase: rnd() * TAU,
+        front: rnd() < 0.3
+      });
+    }
+    return { frames: frames, blobs: blobs };
+  }
+
+  // ---------- state ----------
+  var seed = BASE_SEED;
+  var room = buildRoom(seed);
+  var flashes = [];               // {frame: index, t0: piece time}
+  var drag = null;                // {frame, startX, base}
+  var downInfo = null;            // {x, y, realMs}
+  var pendingTap = null;          // {frame, due: piece time}
+  var lastTapReal = 0;
+  var lastDrawT = T0;
+
+  // ---------- clock: frame one is always the fixed phase T0 ----------
+  function perfNow() {
+    return (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+  }
+  var startReal = perfNow();
+  function pieceNow() { return T0 + (perfNow() - startReal) / 1000; }
+
+  // ---------- viewport ----------
+  var viewW = 720, viewH = 720, dpr = 1;
+  function resize() {
+    var w = 0, h = 0;
+    if (typeof window !== 'undefined') {
+      if (window.visualViewport && window.visualViewport.width) {
+        w = window.visualViewport.width; h = window.visualViewport.height;
+      } else if (window.innerWidth) { w = window.innerWidth; h = window.innerHeight; }
+    }
+    if (!w || !h) { w = 720; h = 720; }
+    viewW = w; viewH = h;
+    dpr = Math.min(2, (typeof window !== 'undefined' && window.devicePixelRatio) || 1);
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+  }
+  function isPhone() {
+    var sw = 0, sh = 0;
+    if (typeof window !== 'undefined' && window.screen) {
+      sw = window.screen.width || 0; sh = window.screen.height || 0;
+    }
+    var mn = Math.min(sw, sh);
+    if (mn && mn < 700) return true;
+    return viewH > viewW * 1.15;
+  }
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', function () { resize(); draw(pieceNow()); });
+    }
+    if (window.addEventListener) {
+      window.addEventListener('resize', function () { resize(); draw(pieceNow()); });
+    }
+  }
+
+  // ---------- per-frame kinematics (closed form in t) ----------
+  function theta(fr, t) {
+    return fr.rot + fr.swingAmp * Math.sin(TAU * t / fr.swingPeriod + fr.swingPhase) + fr.tilt;
+  }
+  function breathe(fr, t) {
+    return 1 + 0.02 * Math.sin(TAU * t / fr.bPeriod + fr.bPhase);
+  }
+
+  // ---------- audio: lazy, gesture-only, guarded ----------
+  var AC = null, master = null, humNodes = [], audioOn = false;
+  function audioCtor() {
+    if (typeof window !== 'undefined' && (window.AudioContext || window.webkitAudioContext)) {
+      return window.AudioContext || window.webkitAudioContext;
+    }
+    if (typeof AudioContext !== 'undefined') return AudioContext;
+    return null;
+  }
+  function stopHums() {
+    for (var i = 0; i < humNodes.length; i++) {
+      try { humNodes[i].osc.stop(); } catch (e) {}
+      try { humNodes[i].osc.disconnect(); } catch (e) {}
+      try { humNodes[i].gain.disconnect(); } catch (e) {}
+    }
+    humNodes = [];
+  }
+  function buildHums() {
+    if (!audioOn || !AC || !master) return;
+    stopHums();
+    for (var i = 0; i < room.frames.length; i++) {
+      var fr = room.frames[i];
+      var frac = fr.hw * 2;
+      var osc = AC.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.value = 46 + (0.70 - frac) * 130;   // deeper frame, lower hum
+      var g = AC.createGain();
+      g.gain.value = 0.010 + frac * 0.022;
+      osc.connect(g); g.connect(master);
+      osc.start();
+      humNodes.push({ osc: osc, gain: g });
+    }
+  }
+  function ensureAudio() {
+    if (audioOn) return;
+    var Ctor = audioCtor();
+    if (!Ctor) return;
+    try {
+      AC = new Ctor();
+      if (AC.resume) AC.resume();
+      master = AC.createGain();
+      master.gain.value = 0;
+      master.connect(AC.destination);
+      master.gain.linearRampToValueAtTime(0.05, AC.currentTime + 1.6);
+      // room tone: looped, low-passed noise
+      var len = Math.floor(AC.sampleRate * 2);
+      var buf = AC.createBuffer(1, len, AC.sampleRate);
+      var d = buf.getChannelData(0);
+      var lp = 0, k;
+      for (k = 0; k < len; k++) {
+        var wht = Math.random() * 2 - 1;
+        lp += 0.02 * (wht - lp);
+        d[k] = lp * 0.7;
+      }
+      var src = AC.createBufferSource();
+      src.buffer = buf; src.loop = true;
+      var filt = AC.createBiquadFilter();
+      filt.type = 'lowpass'; filt.frequency.value = 300;
+      var ng = AC.createGain(); ng.gain.value = 0.5;
+      src.connect(filt); filt.connect(ng); ng.connect(master);
+      src.start();
+      audioOn = true;
+      buildHums();
+    } catch (e) {
+      AC = null; master = null; audioOn = false;
+    }
+  }
+  function chime() {
+    if (!audioOn || !AC || !master) return;
+    try {
+      var t = AC.currentTime;
+      var freqs = [1567.98, 2093.00];
+      for (var i = 0; i < freqs.length; i++) {
+        var o = AC.createOscillator();
+        o.type = 'sine'; o.frequency.value = freqs[i];
+        var g = AC.createGain();
+        g.gain.setValueAtTime(0.0001, t);
+        g.gain.exponentialRampToValueAtTime(0.045 / (i + 1), t + 0.015);
+        g.gain.exponentialRampToValueAtTime(0.0001, t + 1.4);
+        o.connect(g); g.connect(master);
+        o.start(t); o.stop(t + 1.5);
+      }
+    } catch (e) {}
+  }
+
+  // ---------- interaction ----------
+  function frameScore(fr, t, wx, wy, cx0, cy0, U) {
+    var th = theta(fr, t);
+    var dx = (wx - (cx0 + fr.wpx * U)) / U;
+    var dy = (wy - (cy0 + fr.wpy * U)) / U;
+    var c = Math.cos(-th), s = Math.sin(-th);
+    var lx = fr.px + (dx * c - dy * s);
+    var ly = -fr.hh + (dx * s + dy * c);
+    return Math.max(Math.abs(lx) / fr.hw, Math.abs(ly) / fr.hh);
+  }
+  function nearestFrame(t, wx, wy) {
+    var U = Math.min(viewW, viewH);
+    var cx0 = viewW / 2, cy0 = viewH / 2;
+    var best = -1, bestScore = Infinity;
+    for (var i = 0; i < room.frames.length; i++) {
+      var sc = frameScore(room.frames[i], t, wx, wy, cx0, cy0, U);
+      if (sc < bestScore) { bestScore = sc; best = i; }
+    }
+    return { index: best, score: bestScore };
+  }
+  function fireFlash(idx, t) {
+    flashes.push({ frame: idx, t0: t });
+    chime();
+  }
+  function reseed() {
+    seed = (seed + 0x9E3779B9) >>> 0;
+    room = buildRoom(seed);
+    flashes = [];
+    drag = null;
+    pendingTap = null;
+    if (audioOn) buildHums();
+  }
+  function evtPos(e) {
+    var x = 0, y = 0;
+    if (e.clientX !== undefined) { x = e.clientX; y = e.clientY; }
+    else if (e.touches && e.touches.length) { x = e.touches[0].clientX; y = e.touches[0].clientY; }
+    else if (e.changedTouches && e.changedTouches.length) { x = e.changedTouches[0].clientX; y = e.changedTouches[0].clientY; }
+    var r = null;
+    if (canvas.getBoundingClientRect) r = canvas.getBoundingClientRect();
+    if (r) { x -= r.left; y -= r.top; }
+    return { x: x, y: y };
+  }
+  function onDown(e) {
+    ensureAudio();
+    if (e.preventDefault) e.preventDefault();
+    var p = evtPos(e);
+    var now = perfNow();
+    var t = pieceNow();
+    if (lastTapReal && now - lastTapReal < 320) {
+      pendingTap = null;
+      lastTapReal = 0;
+      reseed();
+      downInfo = null;
+      return;
+    }
+    downInfo = { x: p.x, y: p.y, realMs: now };
+    var near = nearestFrame(t, p.x, p.y);
+    if (near.score < 1.5) {
+      drag = { frame: near.index, startX: p.x, base: room.frames[near.index].tilt };
+      room.frames[near.index].tiltTarget = room.frames[near.index].tilt;
+    }
+  }
+  function onMove(e) {
+    if (!drag) return;
+    var p = evtPos(e);
+    var fr = room.frames[drag.frame];
+    fr.tiltTarget = clamp(drag.base + (p.x - drag.startX) * 0.0016, -0.30, 0.30);
+  }
+  function onUp(e) {
+    var now = perfNow();
+    var wasDrag = drag;
+    if (drag) {
+      room.frames[drag.frame].tiltTarget = 0;
+      drag = null;
+    }
+    if (downInfo && now - downInfo.realMs < 260) {
+      var p = evtPos(e);
+      var moved = Math.abs(p.x - downInfo.x) + Math.abs(p.y - downInfo.y);
+      if (moved < 9) {
+        var near = nearestFrame(pieceNow(), p.x, p.y);
+        pendingTap = { frame: near.index, due: pieceNow() + 0.30 };
+        lastTapReal = now;
+      }
+    }
+    downInfo = null;
+    void wasDrag;
+  }
+  if (typeof window !== 'undefined' && window.PointerEvent) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+  } else {
+    canvas.addEventListener('mousedown', onDown);
+    canvas.addEventListener('mousemove', onMove);
+    canvas.addEventListener('mouseup', onUp);
+    canvas.addEventListener('touchstart', onDown);
+    canvas.addEventListener('touchmove', onMove);
+    canvas.addEventListener('touchend', onUp);
+  }
+
+  // ---------- drawing ----------
+  function strokeFramePath(fr, t, cx0, cy0, U) {
+    var th = theta(fr, t);
+    var b = breathe(fr, t);
+    var hw = fr.hw * b, hh = fr.hh * b;
+    var c = Math.cos(th), s = Math.sin(th);
+    var wpx = cx0 + fr.wpx * U, wpy = cy0 + fr.wpy * U;
+    var local = [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]];
+    ctx.beginPath();
+    for (var i = 0; i < 4; i++) {
+      var dx = local[i][0] - fr.px;
+      var dy = local[i][1] + fr.hh;
+      var wx = wpx + (dx * c - dy * s) * U;
+      var wy = wpy + (dx * s + dy * c) * U;
+      if (i === 0) ctx.moveTo(wx, wy); else ctx.lineTo(wx, wy);
+    }
+    ctx.closePath();
+  }
+  function flashEnv(idx, t) {
+    var env = 0;
+    for (var i = 0; i < flashes.length; i++) {
+      if (flashes[i].frame !== idx) continue;
+      var age = t - flashes[i].t0;
+      if (age < 0 || age > 1.2) continue;
+      var atk = age < 0.05 ? age / 0.05 : 1;
+      var e = atk * Math.exp(-3.0 * age);
+      if (e > env) env = e;
+    }
+    return env;
+  }
+  function drawMistBlob(bl, t, cx0, cy0, U, frontPass) {
+    var bx = cx0 + (bl.bx + Math.sin(TAU * t / bl.period + bl.phase) * bl.amp) * U;
+    var by = cy0 + (bl.by + Math.cos(TAU * t / (bl.period * 1.0) + bl.phase * 1.7) * bl.amp * 0.6) * U;
+    var r = bl.r * U;
+    for (var L = 5; L >= 1; L--) {
+      ctx.globalAlpha = 0.085 * (frontPass ? 0.7 : 1);
+      ctx.fillStyle = MIST;
+      ctx.beginPath();
+      ctx.ellipse(bx, by, r * (0.5 + 0.12 * L), r * (0.5 + 0.12 * L) * 0.55, 0.3, 0, TAU);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+  function draw(t) {
+    var dt = clamp(t - lastDrawT, 0, 0.05);
+    lastDrawT = t;
+    // tilt easing: fast while dragged, slow pendulum settle on release
+    var i, fr;
+    for (i = 0; i < room.frames.length; i++) {
+      fr = room.frames[i];
+      var rate = (drag && drag.frame === i) ? 16 : 2.6;
+      fr.tilt += (fr.tiltTarget - fr.tilt) * (1 - Math.exp(-dt * rate));
+    }
+    // prune old flashes
+    flashes = flashes.filter(function (f) { return t - f.t0 < 1.3; });
+
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    canvas.style.width = viewW + 'px';
+    canvas.style.height = viewH + 'px';
+    ctx.fillStyle = VOID;
+    ctx.fillRect(0, 0, viewW, viewH);
+
+    var U = Math.min(viewW, viewH);
+    var cx0 = viewW / 2, cy0 = viewH / 2;
+    var phone = isPhone();
+    var baseW = Math.max(1.1, U * 0.0022);
+
+    var bi;
+    for (bi = 0; bi < room.blobs.length; bi++) {
+      if (!room.blobs[bi].front) drawMistBlob(room.blobs[bi], t, cx0, cy0, U, false);
+    }
+
+    // frames, outer to inner
+    for (i = 0; i < room.frames.length; i++) {
+      fr = room.frames[i];
+      var env = flashEnv(i, t);
+      // glow pass beneath: same path, wider, dimmer
+      strokeFramePath(fr, t, cx0, cy0, U);
+      ctx.strokeStyle = GLOW;
+      ctx.globalAlpha = 0.5;
+      ctx.lineWidth = baseW + 3.2;
+      ctx.stroke();
+      // core pass
+      strokeFramePath(fr, t, cx0, cy0, U);
+      ctx.strokeStyle = FRAME;
+      ctx.globalAlpha = 1;
+      ctx.lineWidth = baseW;
+      ctx.stroke();
+      if (env > 0.01) {
+        strokeFramePath(fr, t, cx0, cy0, U);
+        ctx.strokeStyle = GLOW;
+        ctx.globalAlpha = 0.55 * env;
+        ctx.lineWidth = baseW + 3.2 + 7 * env;
+        ctx.stroke();
+        strokeFramePath(fr, t, cx0, cy0, U);
+        ctx.strokeStyle = DISC;
+        ctx.globalAlpha = Math.min(1, 0.35 + env);
+        ctx.lineWidth = baseW + 1.6 * env;
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+      }
+    }
+
+    // lens discs on their wires, drawn after the frames (the sources)
+    for (i = 0; i < room.frames.length; i++) {
+      fr = room.frames[i];
+      if (!fr.hasLens) continue;
+      var th = theta(fr, t);
+      var wpx = cx0 + fr.wpx * U, wpy = cy0 + fr.wpy * U;
+      var lx = wpx + fr.hang * Math.sin(th) * U;
+      var ly = wpy - fr.hang * Math.cos(th) * U;
+      ctx.strokeStyle = WIRE;
+      ctx.globalAlpha = 1;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(lx, 0);
+      ctx.lineTo(lx, ly);
+      ctx.stroke();
+      var dr = U * (phone ? 0.011 : 0.0095);
+      ctx.fillStyle = DISC;
+      ctx.globalAlpha = 0.16;
+      ctx.beginPath(); ctx.arc(lx, ly, dr * 2.6, 0, TAU); ctx.fill();
+      ctx.globalAlpha = 0.32;
+      ctx.beginPath(); ctx.arc(lx, ly, dr * 1.6, 0, TAU); ctx.fill();
+      ctx.globalAlpha = 1;
+      ctx.beginPath(); ctx.arc(lx, ly, dr, 0, TAU); ctx.fill();
+    }
+
+    for (bi = 0; bi < room.blobs.length; bi++) {
+      if (room.blobs[bi].front) drawMistBlob(room.blobs[bi], t, cx0, cy0, U, true);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- run ----------
+  resize();
+  draw(T0);
+  function tick() {
+    var t = pieceNow();
+    if (pendingTap && t >= pendingTap.due) {
+      fireFlash(pendingTap.frame, t);
+      pendingTap = null;
+    }
+    draw(t);
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(tick);
+    }
+  }
+  if (typeof requestAnimationFrame === 'function') {
+    requestAnimationFrame(tick);
+  }
+})();
+</script>
+</body>
+</html>

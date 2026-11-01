@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Orb Fleet</title>
+<style>
+  html, body { margin:0; padding:0; background:#0A0B0D; height:100%; overflow:hidden; }
+  canvas { display:block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+
+/* ================= palette (strict) ================= */
+var STAGE   = '#0A0B0D';
+var CHASSIS = '#16181C';
+var WIRE    = '#C33A2B';
+var ORB     = '#BFE3FF';
+var PATHC   = '#2A2E35';
+
+/* ================= timing ================= */
+var LOOP = 60;      /* choreography loop, seconds */
+var T0   = 22;      /* frame one: fixed phase, inside the diamond hold */
+var curT = T0;      /* piece time, seconds; rAF anchored as T0 + elapsed */
+var schedOffset = 0;/* piece time of last reseed; local t = (curT - schedOffset) mod LOOP */
+
+/* ================= seeded rng ================= */
+function mulberry32(a){
+  return function(){
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    var t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+/* ================= formations (unit offsets, span about +/-1) ================= */
+var F_RING = [], F_DIAMOND = [], F_STACK = [];
+(function(){
+  var i, a;
+  for (i = 0; i < 10; i++){
+    a = -Math.PI/2 + i * (Math.PI*2/10);
+    F_RING.push([Math.cos(a)*0.88, Math.sin(a)*0.88]);
+  }
+  F_DIAMOND = [
+    [0,-1], [-0.48,-0.52], [0.48,-0.52],
+    [-0.95,0], [-0.32,0], [0.32,0], [0.95,0],
+    [-0.48,0.52], [0.48,0.52], [0,1]
+  ];
+  for (i = 0; i < 10; i++){
+    F_STACK.push([(i % 2 ? 0.16 : -0.16), -1 + i*(2/9)]);
+  }
+})();
+/* phase order over the loop: ring 0-15, diamond 15-30, scatter 30-45, stack 45-60.
+   Each phase holds 11 s, then morphs over 4 s into the next. t=22 sits in the diamond hold. */
+var PHASES = null; /* built per seed because scatter is seeded */
+
+/* ================= choreography state ================= */
+var N = 10;
+var drones = [];    /* {depth, wire:[[ang,len]...], bobN, bobP, bobA} */
+var centerPhase = [0, 0];
+
+function generate(seed){
+  var rnd = mulberry32(seed);
+  var scatter = [], i, r, a;
+  for (i = 0; i < N; i++){
+    r = 0.25 + rnd()*0.70; a = rnd()*Math.PI*2;
+    scatter.push([Math.cos(a)*r, Math.sin(a)*r]);
+  }
+  PHASES = [F_RING, F_DIAMOND, scatter, F_STACK];
+  drones = [];
+  for (i = 0; i < N; i++){
+    var wires = [], k, nw = 2 + Math.floor(rnd()*2);
+    for (k = 0; k < nw; k++){
+      wires.push([rnd()*Math.PI*2, 0.45 + rnd()*0.45]);
+    }
+    drones.push({
+      depth: 0.62 + rnd()*0.63,
+      wire: wires,
+      bobN: 1 + Math.floor(rnd()*3),
+      bobP: rnd()*Math.PI*2,
+      bobA: 0.006 + rnd()*0.005
+    });
+  }
+  centerPhase = [rnd()*Math.PI*2, rnd()*Math.PI*2];
+}
+var seed = 10660227;
+generate(seed);
+
+/* ================= closed-form position ================= */
+function smootherstep(u){ return u*u*u*(u*(u*6-15)+10); }
+
+function formationOffset(i, lt){
+  var ph = Math.floor(lt/15) % 4;
+  var inPh = lt - Math.floor(lt/15)*15;
+  var cur = PHASES[ph][i], nxt = PHASES[(ph+1)%4][i];
+  if (inPh <= 11) return cur;
+  var u = smootherstep((inPh-11)/4);
+  return [cur[0] + (nxt[0]-cur[0])*u, cur[1] + (nxt[1]-cur[1])*u];
+}
+
+function dronePos(i, lt){
+  var off = formationOffset(i, lt);
+  var th = 0.18 * Math.sin(Math.PI*2 * lt / LOOP);
+  var co = Math.cos(th), si = Math.sin(th);
+  var rx = off[0]*co - off[1]*si, ry = off[0]*si + off[1]*co;
+  var cx = 0.5 + 0.15*Math.sin(Math.PI*2*lt/LOOP + centerPhase[0]);
+  var cy = 0.5 + 0.12*Math.sin(Math.PI*4*lt/LOOP + centerPhase[1]);
+  var d = drones[i];
+  var bx = d.bobA * Math.sin(Math.PI*2 * d.bobN * lt / LOOP + d.bobP);
+  var by = d.bobA * Math.cos(Math.PI*2 * d.bobN * lt / LOOP + d.bobP*1.7);
+  return [cx + rx*0.27 + bx, cy + ry*0.27 + by];
+}
+
+function droneSpeed(i, lt){
+  var e = 0.05;
+  var a = dronePos(i, lt+e), b = dronePos(i, lt-e);
+  var dx = a[0]-b[0], dy = a[1]-b[1];
+  return Math.sqrt(dx*dx + dy*dy) / (2*e);
+}
+
+/* ================= recorded interaction events ================= */
+var swerves = [];  /* {t, i, vx, vy} impulse events; offset is a closed-form bump sum */
+var flashes = [];  /* {t, i} orb flash events */
+var lastImpulseT = -10;
+
+function swerveOffset(i, t){
+  var ox = 0, oy = 0, k;
+  for (k = 0; k < swerves.length; k++){
+    var ev = swerves[k];
+    if (ev.i !== i) continue;
+    var s = t - ev.t;
+    if (s <= 0 || s >= 4) continue;
+    var bump = (s/0.9) * Math.exp(1 - s/0.9);   /* rises, then decays to zero: the return */
+    ox += ev.vx * bump; oy += ev.vy * bump;
+  }
+  var m = Math.sqrt(ox*ox + oy*oy);
+  if (m > 0.22){ ox *= 0.22/m; oy *= 0.22/m; }
+  return [ox, oy];
+}
+
+function flashBoost(i, t){
+  var b = 0, k;
+  for (k = 0; k < flashes.length; k++){
+    if (flashes[k].i !== i) continue;
+    var s = t - flashes[k].t;
+    if (s >= 0 && s < 1.1) b = Math.max(b, Math.exp(-s*3.2));
+  }
+  return b;
+}
+
+/* ================= canvas / viewport ================= */
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var VW = 800, VH = 600, isPhone = false;
+
+function viewSize(){
+  var w, h;
+  if (typeof window !== 'undefined' && window.visualViewport){
+    w = window.visualViewport.width; h = window.visualViewport.height;
+  } else if (typeof window !== 'undefined' && window.innerWidth){
+    w = window.innerWidth; h = window.innerHeight;
+  } else { w = 800; h = 600; }
+  return [w, h];
+}
+
+function resize(){
+  var s = viewSize();
+  VW = s[0]; VH = s[1];
+  canvas.width = Math.round(VW);
+  canvas.height = Math.round(VH);
+  var sw = 0, sh = 0;
+  if (typeof window !== 'undefined' && window.screen){
+    sw = window.screen.width || 0; sh = window.screen.height || 0;
+  }
+  isPhone = (Math.min(sw, sh) > 0 && Math.min(sw, sh) < 700) || (VH > VW*1.15);
+  draw(curT);
+}
+if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.addEventListener){
+  window.visualViewport.addEventListener('resize', resize);
+}
+if (typeof window !== 'undefined' && window.addEventListener){
+  window.addEventListener('resize', resize);
+}
+
+/* ================= drawing ================= */
+function localT(t){
+  var lt = (t - schedOffset) % LOOP;
+  if (lt < 0) lt += LOOP;
+  return lt;
+}
+
+function draw(t){
+  var w = canvas.width, h = canvas.height;
+  canvas.style.width = w + 'px';
+  canvas.style.height = h + 'px';
+  var unit = Math.min(w, h);
+  var ox = w/2, oy = h/2;
+  var lt = localT(t);
+  var i, j;
+
+  ctx.fillStyle = STAGE;
+  ctx.fillRect(0, 0, w, h);
+
+  /* recorded paths, faint, behind everything */
+  ctx.strokeStyle = PATHC;
+  ctx.globalAlpha = 0.4;
+  ctx.lineWidth = 1;
+  for (i = 0; i < N; i++){
+    ctx.beginPath();
+    for (j = 0; j <= 200; j++){
+      var p = dronePos(i, j/200*LOOP);
+      var px = ox + (p[0]-0.5)*unit, py = oy + (p[1]-0.5)*unit;
+      if (j === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.closePath();
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+
+  /* drones, far (small) first */
+  var order = [];
+  for (i = 0; i < N; i++) order.push(i);
+  order.sort(function(a, b){ return drones[a].depth - drones[b].depth; });
+
+  for (var oi = 0; oi < N; oi++){
+    i = order[oi];
+    var d = drones[i];
+    var pos = dronePos(i, lt);
+    var so = swerveOffset(i, t);
+    var X = ox + (pos[0] + so[0] - 0.5)*unit;
+    var Y = oy + (pos[1] + so[1] - 0.5)*unit;
+    var a = 0.020 * d.depth * unit;          /* arm half-length */
+    var lw = Math.max(1, 0.0035 * unit * d.depth);
+
+    /* X arms */
+    ctx.strokeStyle = CHASSIS;
+    ctx.lineWidth = lw;
+    ctx.beginPath();
+    ctx.moveTo(X-a, Y-a); ctx.lineTo(X+a, Y+a);
+    ctx.moveTo(X-a, Y+a); ctx.lineTo(X+a, Y-a);
+    ctx.stroke();
+    /* rotor discs at arm ends */
+    ctx.fillStyle = CHASSIS;
+    var rr = 0.0045 * unit * d.depth, sx, sy;
+    var corners = [[-1,-1],[1,-1],[-1,1],[1,1]];
+    for (j = 0; j < 4; j++){
+      sx = X + corners[j][0]*a; sy = Y + corners[j][1]*a;
+      ctx.beginPath(); ctx.arc(sx, sy, rr, 0, Math.PI*2); ctx.fill();
+    }
+    /* center board */
+    var bs = 0.011 * unit * d.depth;
+    ctx.fillRect(X-bs/2, Y-bs/2, bs, bs);
+    ctx.strokeStyle = WIRE;
+    ctx.globalAlpha = 0.55;
+    ctx.lineWidth = 1;
+    ctx.strokeRect(X-bs/2, Y-bs/2, bs, bs);
+    ctx.globalAlpha = 1;
+    /* red wiring marks */
+    ctx.strokeStyle = WIRE;
+    ctx.lineWidth = Math.max(1, lw*0.55);
+    ctx.beginPath();
+    for (j = 0; j < d.wire.length; j++){
+      var wa = d.wire[j][0], wl = d.wire[j][1]*a;
+      ctx.moveTo(X, Y);
+      ctx.lineTo(X + Math.cos(wa)*wl, Y + Math.sin(wa)*wl);
+    }
+    ctx.stroke();
+
+    /* orb on top, halo of layered alpha (no gradients) */
+    var boost = flashBoost(i, t);
+    var oX = X, oY = Y - a*0.95;
+    var R = 0.0062 * unit * d.depth * (1 + 0.5*boost);
+    ctx.fillStyle = ORB;
+    ctx.globalAlpha = 0.06 * (1 + 1.6*boost);
+    ctx.beginPath(); ctx.arc(oX, oY, R*2.8, 0, Math.PI*2); ctx.fill();
+    ctx.globalAlpha = 0.12 * (1 + 1.6*boost);
+    ctx.beginPath(); ctx.arc(oX, oY, R*2.0, 0, Math.PI*2); ctx.fill();
+    ctx.globalAlpha = 0.30 * (1 + 1.2*boost);
+    ctx.beginPath(); ctx.arc(oX, oY, R*1.45, 0, Math.PI*2); ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.beginPath(); ctx.arc(oX, oY, R, 0, Math.PI*2); ctx.fill();
+  }
+}
+
+/* ================= audio (lazy, gesture-only, guarded) ================= */
+var AC = null, motorOsc = [], motorGain = [];
+function initAudio(){
+  if (AC) { if (AC.resume) AC.resume(); return; }
+  var Ctor = null;
+  if (typeof AudioContext !== 'undefined') Ctor = AudioContext;
+  else if (typeof window !== 'undefined' && typeof window.webkitAudioContext !== 'undefined') Ctor = window.webkitAudioContext;
+  if (!Ctor) return;
+  try {
+    AC = new Ctor();
+    var master = AC.createGain();
+    master.gain.value = 0.6;
+    master.connect(AC.destination);
+    for (var i = 0; i < N; i++){
+      var o = AC.createOscillator();
+      o.type = 'sawtooth';
+      o.frequency.value = 50;
+      var f = AC.createBiquadFilter();
+      f.type = 'lowpass'; f.frequency.value = 420;
+      var g = AC.createGain();
+      g.gain.value = 0;
+      o.connect(f); f.connect(g); g.connect(master);
+      o.start();
+      motorOsc.push(o); motorGain.push(g);
+    }
+  } catch (e) { AC = null; motorOsc = []; motorGain = []; }
+}
+function ping(){
+  if (!AC) return;
+  try {
+    var o = AC.createOscillator(), g = AC.createGain();
+    o.type = 'sine'; o.frequency.value = 740;
+    g.gain.setValueAtTime(0.09, AC.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, AC.currentTime + 0.3);
+    o.connect(g); g.connect(AC.destination);
+    o.start(); o.stop(AC.currentTime + 0.32);
+  } catch (e) {}
+}
+function updateAudio(lt){
+  if (!AC) return;
+  for (var i = 0; i < N; i++){
+    var sp = droneSpeed(i, lt);
+    motorOsc[i].frequency.setTargetAtTime(42 + sp*260, AC.currentTime, 0.06);
+    motorGain[i].gain.setTargetAtTime(0.008 + Math.min(sp, 0.3)*0.03, AC.currentTime, 0.06);
+  }
+}
+
+/* ================= interaction ================= */
+function toWorld(cx, cy){
+  var unit = Math.min(VW, VH);
+  return [(cx - VW/2)/unit + 0.5, (cy - VH/2)/unit + 0.5];
+}
+var pDown = false, downT = 0, downXY = [0, 0], lastDownStamp = -10, moved = 0;
+
+function onDown(e){
+  initAudio();
+  pDown = true; moved = 0;
+  downT = curT; downXY = [e.clientX, e.clientY];
+  if (curT - lastDownStamp < 0.35){
+    /* double-tap: new choreography */
+    seed = (seed * 1664525 + 1013904223) >>> 0;
+    generate(seed);
+    schedOffset = curT;
+    swerves = []; flashes = [];
+    lastDownStamp = -10;
+    draw(curT);
+    return;
+  }
+  lastDownStamp = curT;
+}
+function onMove(e){
+  if (!pDown) return;
+  var dx = e.clientX - downXY[0], dy = e.clientY - downXY[1];
+  moved = Math.max(moved, Math.sqrt(dx*dx + dy*dy));
+  if (curT - lastImpulseT < 0.05) return;
+  lastImpulseT = curT;
+  var wp = toWorld(e.clientX, e.clientY);
+  var lt = localT(curT);
+  for (var i = 0; i < N; i++){
+    var pos = dronePos(i, lt);
+    var vx = pos[0] - wp[0], vy = pos[1] - wp[1];
+    var dist = Math.sqrt(vx*vx + vy*vy);
+    if (dist < 0.16 && dist > 0.0001){
+      var mag = 0.10 * (1 - dist/0.16);
+      swerves.push({ t: curT, i: i, vx: vx/dist*mag, vy: vy/dist*mag });
+    }
+  }
+  if (swerves.length > 500) swerves.splice(0, swerves.length - 500);
+}
+function onUp(e){
+  if (!pDown) return;
+  pDown = false;
+  if (curT - downT < 0.3 && moved < 6){
+    /* tap: flash the nearest orb */
+    var wp = toWorld(e.clientX, e.clientY);
+    var lt = localT(curT), best = -1, bd = 0.09;
+    for (var i = 0; i < N; i++){
+      var pos = dronePos(i, lt);
+      var so = swerveOffset(i, curT);
+      var dx = pos[0]+so[0]-wp[0], dy = pos[1]+so[1]-wp[1];
+      var dist = Math.sqrt(dx*dx + dy*dy);
+      if (dist < bd){ bd = dist; best = i; }
+    }
+    if (best >= 0){
+      flashes.push({ t: curT, i: best });
+      ping();
+    }
+  }
+}
+if (typeof window !== 'undefined' && window.addEventListener){
+  window.addEventListener('pointerdown', onDown);
+  window.addEventListener('pointermove', onMove);
+  window.addEventListener('pointerup', onUp);
+}
+
+/* ================= main loop ================= */
+resize();
+draw(T0);
+var firstTs = -1;
+function tick(ts){
+  if (firstTs < 0) firstTs = ts;
+  curT = T0 + (ts - firstTs)/1000;
+  /* prune dead events */
+  while (swerves.length && curT - swerves[0].t > 4.5) swerves.shift();
+  while (flashes.length && curT - flashes[0].t > 1.5) flashes.shift();
+  draw(curT);
+  updateAudio(localT(curT));
+  if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(tick);
+}
+if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(tick);
+</script>
+</body>
+</html>

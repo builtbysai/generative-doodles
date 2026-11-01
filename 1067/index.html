@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cold Camera</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0B0C0E; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ---------- palette (strict) ----------
+  var REAL_BG = [11, 12, 14];      // #0B0C0E
+  var VIRT_BG = [5, 7, 12];        // #05070C
+  var FIG = '#1C1E24';
+  var LIGHT = '#E8EAEE';
+  var WIRE = [127, 212, 255];      // #7FD4FF
+  var WIRE_A = 0.6;                // wireframe alpha at full virtual
+
+  // ---------- model constants ----------
+  var T0 = 20;                     // fixed frame-one phase (seconds)
+  var LOOP = 50;                   // camera loop (seconds)
+  var TAU = Math.PI * 2;
+  var PHASE0 = -TAU * (T0 / LOOP); // makes pathMorph(T0) = 0.5 exactly
+  var ZOOM_MAX = 1.18;             // used in the in-frame guarantee
+  var CAM_MAX = 0.52;              // camera drift bound, same guarantee
+
+  // ---------- seeded rng ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function V(d) { return 2.3 - 1.25 * d; }   // visible half-span at depth d
+
+  // ---------- figure shapes, local coords (x right, y up, height 1) ----------
+  function octagon(cx, cy, r) {
+    var pts = [];
+    for (var i = 0; i < 8; i++) {
+      var a = (i / 8) * TAU + TAU / 16;
+      pts.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r]);
+    }
+    return pts;
+  }
+  var BODY = [[-0.15, 0], [-0.11, 0.42], [-0.16, 0.74], [-0.09, 0.84],
+              [0.09, 0.84], [0.16, 0.74], [0.11, 0.42], [0.15, 0],
+              [0.05, 0], [0.028, 0.36], [-0.028, 0.36], [-0.05, 0]];
+  function sheared(pts, k) {
+    return pts.map(function (p) { return [p[0] + k * p[1], p[1]]; });
+  }
+  var SHAPES = {
+    stand: { polys: [BODY, octagon(0, 0.93, 0.07)], wires: [[[0, 0.84], [0, 0.40]]] },
+    lean:  { polys: [sheared(BODY, 0.16), octagon(0.148, 0.93, 0.07)], wires: [[[0.134, 0.84], [0.064, 0.40]]] },
+    block: { polys: [[[-0.21, 0], [0.21, 0], [0.21, 0.70], [-0.21, 0.70]],
+                     [[-0.13, 0.70], [0.13, 0.70], [0.13, 0.90], [-0.13, 0.90]]],
+             wires: [[[-0.21, 0], [0.21, 0.70]]] },
+    arch:  { polys: [[[-0.24, 0], [-0.16, 0], [-0.16, 0.78], [-0.24, 0.78]],
+                     [[0.16, 0], [0.24, 0], [0.24, 0.78], [0.16, 0.78]],
+                     [[-0.24, 0.78], [0.24, 0.78], [0.24, 0.90], [-0.24, 0.90]]],
+             wires: [] }
+  };
+  var TYPES = ['stand', 'lean', 'block', 'arch'];
+
+  // ---------- scene per seed ----------
+  var sceneCache = {};
+  function scene(seed) {
+    if (sceneCache[seed]) return sceneCache[seed];
+    var rnd = mulberry32(seed);
+    var figs = [];
+    var order = TYPES.slice();
+    for (var i = order.length - 1; i > 0; i--) {
+      var j = Math.floor(rnd() * (i + 1));
+      var tmp = order[i]; order[i] = order[j]; order[j] = tmp;
+    }
+    var n = 9;
+    for (var k = 0; k < n; k++) {
+      var d = 0.14 + 0.84 * (k / (n - 1)) + (rnd() - 0.5) * 0.07;
+      d = Math.max(0.10, Math.min(0.98, d));
+      var xLim = Math.max(0.12, 0.9 * V(d) / ZOOM_MAX - CAM_MAX);
+      var type = order[k % order.length];
+      var xr = rnd() * 2 - 1;
+      var xs = (xr < 0 ? -1 : 1) * (0.25 + 0.75 * Math.abs(xr)) * xLim;
+      figs.push({
+        type: type,
+        d: d,
+        x: xs,
+        swayAmp: (type === 'stand' || type === 'lean') ? 0.018 + rnd() * 0.016 : 0,
+        swayPer: 7 + rnd() * 6,
+        swayPh: rnd() * TAU
+      });
+    }
+    figs.sort(function (a, b) { return a.d - b.d; });   // far to near
+    var sc = {
+      figs: figs,
+      cam: {
+        a1: 0.22 + rnd() * 0.18, p1: rnd() * TAU,
+        a2: 0.05 + rnd() * 0.07, p2: rnd() * TAU,
+        zp: rnd() * TAU, fp: rnd() * TAU
+      }
+    };
+    sceneCache[seed] = sc;
+    return sc;
+  }
+
+  // ---------- interaction events (empty before any input) ----------
+  var BASE_SEED = 1067001;
+  var reseeds = [];    // {t, seed}
+  var flips = [];      // [t, ...] tap times, each toggles the lead
+  var drags = [];      // {t0, m0, moves:[{t,m}], t1:null|number, mEnd}
+  var seedCounter = 0;
+
+  function seedFor(t) {
+    var s = BASE_SEED;
+    for (var i = 0; i < reseeds.length; i++) if (reseeds[i].t <= t) s = reseeds[i].seed;
+    return s;
+  }
+
+  // ---------- camera: one recorded path, closed form ----------
+  function cameraAt(t) {
+    var c = scene(seedFor(t)).cam;
+    var w = TAU * t / LOOP;
+    return {
+      x: c.a1 * Math.sin(w + c.p1) + c.a2 * Math.sin(2 * w + c.p2),
+      zoom: 1 + 0.14 * Math.sin(w + c.zp) + 0.04 * Math.sin(2 * w + c.zp * 1.7),
+      focus: 0
+    };
+  }
+  function focusAt(t, cam) {
+    var c = scene(seedFor(t)).cam;
+    return 0.55 * cam.x + 0.45 * Math.sin(TAU * t / 37 + c.fp);
+  }
+
+  // ---------- morph: continuous, driven by the path, flipped by taps ----------
+  function smooth(u) { return u * u * (3 - 2 * u); }
+  function leadOffset(t) {
+    // phase offset easing between 0 and PI as flips accumulate
+    var from = 0, to = 0, segStart = -1e9;
+    for (var i = 0; i < flips.length; i++) {
+      var f = flips[i];
+      if (f > t) break;
+      var cur = from + (to - from) * smooth(Math.min(1, (f - segStart) / 1.5));
+      from = cur;
+      to = (i % 2 === 0) ? Math.PI : 0;
+      segStart = f;
+    }
+    return from + (to - from) * smooth(Math.min(1, (t - segStart) / 1.5));
+  }
+  function pathMorph(t) {
+    return 0.5 + 0.5 * Math.sin(TAU * t / LOOP + PHASE0 + leadOffset(t));
+  }
+  function morphAt(t) {
+    var base = pathMorph(t);
+    var result = base;
+    for (var i = 0; i < drags.length; i++) {
+      var dr = drags[i];
+      if (t < dr.t0) continue;
+      if (dr.t1 === null || t <= dr.t1) {
+        var mv = dr.m0;
+        for (var j = 0; j < dr.moves.length; j++) if (dr.moves[j].t <= t) mv = dr.moves[j].m;
+        result = mv;
+      } else {
+        var u = Math.min(1, (t - dr.t1) / 2.5);
+        result = dr.mEnd + (base - dr.mEnd) * smooth(u);
+      }
+    }
+    return result;
+  }
+
+  // ---------- sizing (Visual Viewport API) ----------
+  var W = 720, H = 720;
+  function resize() {
+    var vv = (typeof window !== 'undefined' && window.visualViewport) ? window.visualViewport : null;
+    W = vv ? vv.width : (window.innerWidth || 720);
+    H = vv ? vv.height : (window.innerHeight || 720);
+    canvas.width = W;
+    canvas.height = H;
+  }
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', resize);
+  }
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('resize', resize);
+  }
+  resize();
+
+  function isPhone() {
+    var sm = 9999;
+    if (typeof window !== 'undefined' && window.screen) {
+      sm = Math.min(window.screen.width || 9999, window.screen.height || 9999);
+    }
+    return sm < 700 || H > W * 1.15;
+  }
+
+  function mix(a, b, f) {
+    return 'rgb(' + Math.round(a[0] + (b[0] - a[0]) * f) + ',' +
+                    Math.round(a[1] + (b[1] - a[1]) * f) + ',' +
+                    Math.round(a[2] + (b[2] - a[2]) * f) + ')';
+  }
+  function wire(a) {
+    return 'rgba(' + WIRE[0] + ',' + WIRE[1] + ',' + WIRE[2] + ',' + a.toFixed(3) + ')';
+  }
+
+  // ---------- draw: pure function of piece time t ----------
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    var unit = Math.min(W, H);
+    var cx = W / 2;
+    var sceneH = Math.min(H, unit * 1.5);       // scene band, centered on tall frames
+    var topOff = (H - sceneH) / 2;
+    var horizonY = topOff + sceneH * 0.60;
+    var groundSpan = sceneH * 0.40 * 0.94;
+    var sc = scene(seedFor(t));
+    var cam = cameraAt(t);
+    cam.focus = focusAt(t, cam);
+    var m = morphAt(t);
+    var lw = Math.max(1.2, 1.6 * (unit / 720));
+    if (isPhone()) lw = Math.max(lw, 1.5);
+
+    function projX(x, d) { return cx + ((x - cam.x) * cam.zoom / V(d)) * (W / 2) * 0.96; }
+    function feetY(d) { return horizonY + Math.pow(d, 1.6) * groundSpan; }
+
+    // background: the two spaces pre-blended, one continuous field
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = mix(REAL_BG, VIRT_BG, m);
+    ctx.fillRect(0, 0, W, H);
+
+    // real floor: a dark ground that dissolves as the virtual takes over
+    ctx.fillStyle = FIG;
+    ctx.globalAlpha = 0.30 * (1 - m);
+    ctx.fillRect(0, horizonY, W, groundSpan);
+    ctx.globalAlpha = 1;
+
+    // virtual ground grid: perspective lines from the same camera
+    if (m > 0.01) {
+      ctx.strokeStyle = wire(WIRE_A * 0.55 * m);
+      ctx.lineWidth = 1;
+      var gx, dd, s;
+      ctx.beginPath();   // longitudinal lines
+      for (gx = -2.4; gx <= 2.41; gx += 0.4) {
+        for (s = 0; s <= 12; s++) {
+          dd = 0.03 + (1 - 0.03) * (s / 12);
+          var px = projX(gx, dd), py = feetY(dd);
+          if (s === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+        }
+      }
+      ctx.stroke();
+      ctx.beginPath();   // transverse lines
+      var depths = [0.06, 0.14, 0.24, 0.36, 0.50, 0.66, 0.84, 1.0];
+      for (var ti = 0; ti < depths.length; ti++) {
+        dd = depths[ti];
+        ctx.moveTo(projX(-2.4, dd), feetY(dd));
+        ctx.lineTo(projX(2.4, dd), feetY(dd));
+      }
+      ctx.stroke();
+      ctx.strokeStyle = wire(WIRE_A * 0.7 * m);   // horizon
+      ctx.beginPath();
+      ctx.moveTo(0, horizonY);
+      ctx.lineTo(W, horizonY);
+      ctx.stroke();
+    }
+
+    // camera-light pool on the ground (real layer), centered on the focus
+    var poolD = 0.55;
+    var poolX = projX(cam.focus, poolD);
+    var poolY = feetY(poolD) + unit * 0.02;
+    if (m < 0.99) {
+      var layers = [[1.0, 0.06], [0.72, 0.065], [0.45, 0.08]];
+      for (var L = 0; L < layers.length; L++) {
+        ctx.save();
+        ctx.translate(poolX, poolY);
+        ctx.scale(1, 0.30);
+        ctx.beginPath();
+        ctx.arc(0, 0, unit * 0.30 * layers[L][0], 0, TAU);
+        ctx.fillStyle = LIGHT;
+        ctx.globalAlpha = layers[L][1] * (1 - m);
+        ctx.fill();
+        ctx.restore();
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    // figures: one set, two renders, cross-dissolved per element
+    for (var fi = 0; fi < sc.figs.length; fi++) {
+      var fg = sc.figs[fi];
+      var shape = SHAPES[fg.type];
+      var sx = projX(fg.x, fg.d);
+      var fy = feetY(fg.d);
+      var h = unit * 0.58 * cam.zoom / V(fg.d);
+      var sway = fg.swayAmp ? fg.swayAmp * Math.sin(TAU * t / fg.swayPer + fg.swayPh) : 0;
+      var cs = Math.cos(sway), sn = Math.sin(sway);
+      var dist = Math.abs(sx - poolX) / (unit * 0.62);
+      var light = Math.max(0, 1 - dist);
+      light = light * light;
+
+      function toScreen(p) {
+        var lx = p[0] * h, ly = -p[1] * h;
+        return [sx + lx * cs - ly * sn, fy + lx * sn + ly * cs];
+      }
+      function tracePoly(poly) {
+        ctx.beginPath();
+        for (var q = 0; q < poly.length; q++) {
+          var pt = toScreen(poly[q]);
+          if (q === 0) ctx.moveTo(pt[0], pt[1]); else ctx.lineTo(pt[0], pt[1]);
+        }
+        ctx.closePath();
+      }
+
+      if (m < 0.99) {   // real render: filled dark shapes
+        ctx.fillStyle = FIG;
+        ctx.globalAlpha = 1 - m;
+        for (var a = 0; a < shape.polys.length; a++) { tracePoly(shape.polys[a]); ctx.fill(); }
+        if (light > 0.01) {   // the camera-light catches shapes near the focus
+          ctx.fillStyle = LIGHT;
+          ctx.globalAlpha = (1 - m) * 0.34 * light;
+          for (var b = 0; b < shape.polys.length; b++) { tracePoly(shape.polys[b]); ctx.fill(); }
+        }
+        ctx.globalAlpha = 1;
+      }
+      if (m > 0.01) {   // virtual render: wireframe of the same shapes
+        ctx.strokeStyle = wire(WIRE_A * m);
+        ctx.lineWidth = lw;
+        for (var c = 0; c < shape.polys.length; c++) { tracePoly(shape.polys[c]); ctx.stroke(); }
+        for (var e = 0; e < shape.wires.length; e++) {
+          ctx.beginPath();
+          for (var g = 0; g < shape.wires[e].length; g++) {
+            var wp = toScreen(shape.wires[e][g]);
+            if (g === 0) ctx.moveTo(wp[0], wp[1]); else ctx.lineTo(wp[0], wp[1]);
+          }
+          ctx.stroke();
+        }
+        ctx.fillStyle = wire(WIRE_A * m);   // joint nodes
+        for (var n2 = 0; n2 < shape.polys.length; n2++) {
+          for (var v = 0; v < shape.polys[n2].length; v++) {
+            var np = toScreen(shape.polys[n2][v]);
+            ctx.beginPath();
+            ctx.arc(np[0], np[1], Math.max(1.3, lw * 1.1), 0, TAU);
+            ctx.fill();
+          }
+        }
+      }
+    }
+    ctx.globalAlpha = 1;
+    return m;
+  }
+
+  // ---------- audio: lazy, gesture-gated, crossfaded by the morph ----------
+  var actx = null, gReal = null, gShimmer = null;
+  function ensureAudio() {
+    if (actx) { if (actx.resume) actx.resume(); return; }
+    var AC = (typeof AudioContext !== 'undefined') ? AudioContext :
+             ((typeof window !== 'undefined' && window.webkitAudioContext) ? window.webkitAudioContext : null);
+    if (!AC) return;
+    try {
+      actx = new AC();
+      var len = actx.sampleRate * 2;
+      var buf = actx.createBuffer(1, len, actx.sampleRate);
+      var data = buf.getChannelData(0);
+      for (var i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
+      var src = actx.createBufferSource();
+      src.buffer = buf; src.loop = true;
+      var lp = actx.createBiquadFilter();
+      lp.type = 'lowpass'; lp.frequency.value = 220;
+      gReal = actx.createGain(); gReal.gain.value = 0;
+      src.connect(lp); lp.connect(gReal); gReal.connect(actx.destination);
+      src.start();
+      gShimmer = actx.createGain(); gShimmer.gain.value = 0;
+      var o1 = actx.createOscillator(); o1.type = 'sine'; o1.frequency.value = 1567;
+      var o2 = actx.createOscillator(); o2.type = 'sine'; o2.frequency.value = 2093;
+      o1.connect(gShimmer); o2.connect(gShimmer); gShimmer.connect(actx.destination);
+      o1.start(); o2.start();
+    } catch (err) { actx = null; }
+  }
+  function updateAudio(m, t) {
+    if (!actx || !gReal || !gShimmer) return;
+    try {
+      gReal.gain.value = 0.045 * (1 - m);
+      gShimmer.gain.value = 0.014 * m * (0.8 + 0.2 * Math.sin(t * 0.7));
+    } catch (err) { /* audio is decoration; the visual never depends on it */ }
+  }
+
+  // ---------- interaction ----------
+  var startStamp = null;
+  function pieceNow(nowMs) {
+    if (startStamp === null) startStamp = nowMs;
+    return T0 + (nowMs - startStamp) / 1000;
+  }
+  function nowMs() {
+    return (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+  }
+
+  var lastDownMs = -1e9, suppressTap = false;
+  var downInfo = null;   // {t, x, dragging, drag}
+
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', function (e) {
+      ensureAudio();
+      var ms = nowMs();
+      var t = pieceNow(ms);
+      if (ms - lastDownMs < 320) {   // double-tap: new camera path
+        seedCounter++;
+        reseeds.push({ t: t, seed: BASE_SEED + seedCounter * 7919 });
+        suppressTap = true;
+        lastDownMs = -1e9;
+        downInfo = null;
+        return;
+      }
+      lastDownMs = ms;
+      suppressTap = false;
+      var dr = { t0: t, m0: morphAt(t), moves: [], t1: null, mEnd: 0 };
+      downInfo = { t: t, x: e.clientX || 0, dragging: false, drag: dr };
+    });
+    canvas.addEventListener('pointermove', function (e) {
+      if (!downInfo) return;
+      var x = e.clientX || 0;
+      if (!downInfo.dragging && Math.abs(x - downInfo.x) > 6) {
+        downInfo.dragging = true;
+        drags.push(downInfo.drag);
+      }
+      if (downInfo.dragging) {
+        var t = pieceNow(nowMs());
+        var mm = Math.max(0, Math.min(1, x / (W || 1)));
+        downInfo.drag.moves.push({ t: t, m: mm });
+      }
+    });
+    function endPointer(e) {
+      if (!downInfo) return;
+      var ms = nowMs();
+      var t = pieceNow(ms);
+      if (downInfo.dragging) {
+        var dr = downInfo.drag;
+        dr.t1 = t;
+        dr.mEnd = dr.moves.length ? dr.moves[dr.moves.length - 1].m : dr.m0;
+      } else if (!suppressTap && ms - lastDownMs < 400) {
+        flips.push(t);   // tap: switch which space leads
+      }
+      downInfo = null;
+    }
+    canvas.addEventListener('pointerup', endPointer);
+    canvas.addEventListener('pointercancel', endPointer);
+  }
+
+  // ---------- frame one + loop ----------
+  draw(T0);
+  if (typeof requestAnimationFrame === 'function') {
+    var raf = function (now) {
+      var t = pieceNow(now);
+      var mNow = draw(t);
+      updateAudio(mNow, t);
+      requestAnimationFrame(raf);
+    };
+    requestAnimationFrame(raf);
+  }
+})();
+</script>
+</body>
+</html>
