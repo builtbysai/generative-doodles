@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Samaras</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#07090D; overflow:hidden; }
+  canvas { display:block; touch-action:none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  /* ------- Samaras (Jussi Ängeslevä, Guangzhou Terminal 3) -------
+     Dozens of samara flying-seeds hang from invisible lines in a high
+     dark space, each slowly autorotating on its own axis like a
+     helicopter seed (period 6-10 s), drifting down its own lane and
+     being winched smoothly back up in an endless cycle. Pale Lingnan
+     wood wings with brass spines; the drive side is dark bronze with
+     an occasional gear glint at the hubs along the top beam. Warm top
+     light catches each wing as it turns broadside; the lower third is
+     deep shadow, where seeds dim, "land", and rise again.
+     Drag stirs the air (spin + drift impulses, damped springs);
+     double-tap reseeds wing shapes and lanes. Silent by design.
+     Physics exception per house rule: fixed-timestep simulation in
+     the rAF loop from a seeded deterministic state; frame one is the
+     seeded state after a fixed 90 s pre-roll. No gradients, no
+     offscreen canvas — every shape is drawn directly, each ellipse
+     on its own path (node-canvas batches subpaths badly). */
+
+  var TPI = Math.PI * 2;
+  var DT = 1 / 120;              // fixed simulation timestep
+  var PREROLL = 90;              // seconds of sim run before frame one
+  var WINCH_T = 4;               // seconds to winch a seed back up
+
+  // Palette — nothing else.
+  var SPACE = '#07090D';         // the high dark space
+  var WOOD = '#C8A87A';          // pale Lingnan wood wings
+  var BRASS = '#8A6A3A';         // brass spine / shaded wing
+  var BRONZE = '#3A2C1A';        // drive mechanism, pods, lines
+  var GLINT = '#E8C876';         // bright gear glint
+  var LIGHT = '#FFE3B3';         // warm top light
+  var SHADOW = '#1A1208';        // deep shadow floor
+
+  /* ---------------- seeded rng ---------------- */
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function seedFromQuery() {
+    try {
+      var s = (typeof location !== 'undefined' && location.search) || '';
+      var m = /[?&]seed=(\d+)/.exec(s);
+      if (m) return parseInt(m[1], 10) >>> 0;
+    } catch (e) { /* no location: fall through */ }
+    return 1134;
+  }
+
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function lerp(a, b, f) { return a + (b - a) * f; }
+  function easeInOut(f) {
+    f = clamp(f, 0, 1);
+    return f < 0.5 ? 4 * f * f * f : 1 - Math.pow(-2 * f + 2, 3) / 2;
+  }
+  function hexRGB(h) {
+    return [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
+  }
+  function mixc(h1, h2, f) {
+    var a = hexRGB(h1), b = hexRGB(h2);
+    return 'rgb(' + Math.round(lerp(a[0], b[0], f)) + ',' +
+                    Math.round(lerp(a[1], b[1], f)) + ',' +
+                    Math.round(lerp(a[2], b[2], f)) + ')';
+  }
+
+  /* ---------------- canvas / sizing ---------------- */
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0, DPR = 1, PHONE = false;
+
+  function detectPhone() {
+    try {
+      var s = window.screen;
+      if (s) {
+        var m = Math.min(s.width, s.height);
+        if (m > 0) return m < 700;
+      }
+    } catch (e) { /* fall through to aspect */ }
+    return H > W * 1.15;
+  }
+
+  function fit() {
+    var vv = (typeof window !== 'undefined' && window.visualViewport) ? window.visualViewport : null;
+    W = vv ? vv.width : window.innerWidth;
+    H = vv ? vv.height : window.innerHeight;
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    PHONE = detectPhone();
+  }
+
+  /* ---------------- scene generation ----------------
+     Every irregularity derives from one seed: lane assignment (a
+     shuffled stratification, so seeds rarely overlap), depth, wing
+     length/curve/width, descent and rotation periods, cycle phase,
+     vertical range, sway, hub offset, glint phase. */
+  var seeds = [];
+  var curSeed = 1134;
+
+  function genScene(seed) {
+    var rng = mulberry32(seed * 7919 + 29);
+    var N = PHONE ? 24 : 30;
+    var slots = [], i;
+    for (i = 0; i < N; i++) slots.push(i);
+    for (i = N - 1; i > 0; i--) {           // Fisher-Yates with the seeded rng
+      var j = Math.floor(rng() * (i + 1));
+      var tmp = slots[i]; slots[i] = slots[j]; slots[j] = tmp;
+    }
+    seeds = [];
+    for (i = 0; i < N; i++) {
+      var dn = rng();                       // depth 0 (far) .. 1 (near)
+      seeds.push({
+        laneX: clamp((slots[i] + 0.5) / N + (rng() - 0.5) * (0.8 / N), 0.02, 0.98),
+        dn: dn,
+        depthS: 0.55 + dn * 0.55,
+        lenF: (0.062 + dn * 0.06) * (0.9 + rng() * 0.2),   // wing length, fraction of min(W,H)
+        wingW: 0.24 + rng() * 0.10,                        // blade half-thickness at broadside
+        curve: 0.6 + rng() * 0.8,                          // blade sweep bow
+        descentT: 44 + rng() * 30,                         // slow descent, seconds
+        phase: rng(),                                      // offset within its own cycle
+        yTop: 0.05 + rng() * 0.10,                         // hang height, fraction of H
+        yBot: 0.88 + rng() * 0.08,                         // landing depth, fraction of H
+        period: 6 + rng() * 4,                             // autorotation period 6-10 s
+        dir: rng() < 0.5 ? -1 : 1,
+        rot: rng() * TPI,
+        swayF: 0.25 + rng() * 0.35,
+        swayP: rng() * TPI,
+        swayA: 0.4 + rng() * 0.7,
+        hubOff: rng() * 0.012,
+        glintP: rng() * TPI,
+        /* dynamic stir state, integrated by the fixed-step sim */
+        dox: 0, doy: 0, dvx: 0, dvy: 0,   // drift offset (fraction of min(W,H)) + velocity
+        sbv: 0,                            // spin-boost velocity, rad/s
+        _x: 0, _y: 0
+      });
+    }
+    seeds.sort(function (a, b) { return a.depthS - b.depthS; });  // far first
+  }
+
+  /* ---------------- simulation ----------------
+     Vertical cycle position is a closed-form function of simTime
+     (slow descent, then an eased 4 s winch back to the top; spin
+     eases off while winched). Rotation angle and the stir state
+     (drift spring, spin boost) are integrated at fixed DT. */
+  var simTime = 0;
+
+  function cycState(s) {
+    var cyc = s.descentT + WINCH_T;
+    var lt = (simTime + s.phase * cyc) % cyc;
+    if (lt < s.descentT) {
+      return { yN: lerp(s.yTop, s.yBot, lt / s.descentT), spin: 1 };
+    }
+    var wf = (lt - s.descentT) / WINCH_T;
+    return { yN: lerp(s.yBot, s.yTop, easeInOut(wf)), spin: 0.35 };
+  }
+
+  function step(dt) {
+    simTime += dt;
+    for (var i = 0; i < seeds.length; i++) {
+      var s = seeds[i];
+      var st = cycState(s);
+      s.rot += s.dir * TPI / s.period * st.spin * dt + s.sbv * dt;
+      s.sbv *= Math.exp(-dt * 1.1);
+      s.dvx += (-3.2 * s.dox - 2.4 * s.dvx) * dt;
+      s.dvy += (-3.2 * s.doy - 2.4 * s.dvy) * dt;
+      s.dox += s.dvx * dt;
+      s.doy += s.dvy * dt;
+      if (s.dox > 0.13 || s.dox < -0.13) { s.dox = clamp(s.dox, -0.13, 0.13); s.dvx = 0; }
+      if (s.doy > 0.13 || s.doy < -0.13) { s.doy = clamp(s.doy, -0.13, 0.13); s.dvy = 0; }
+    }
+  }
+
+  function preroll() {
+    simTime = 0;
+    var steps = Math.round(PREROLL / DT);
+    for (var i = 0; i < steps; i++) step(DT);
+  }
+
+  /* ---------------- drawing ---------------- */
+  function drawSeed(s, minWH) {
+    var st = cycState(s);
+    var x = s.laneX * W + Math.sin(simTime * s.swayF + s.swayP) * s.swayA * minWH * 0.008 + s.dox * minWH;
+    var y = st.yN * H + s.doy * minWH;
+    s._x = x; s._y = y;
+    var L = minWH * s.lenF;
+    var rot = s.rot;
+    var face = Math.abs(Math.sin(rot));            // 1 = blade broadside to viewer/light
+    var lightY = 1 - 0.38 * (y / H);               // higher seeds catch more light
+    var catchF = face * face * 0.7 * lightY;       // warm catch strength
+    var podRy = L * 0.115, podRx = L * 0.075;
+    var hubY = (0.010 + s.hubOff) * H;
+
+    /* winch line + drive hub, with an occasional gear glint */
+    ctx.globalAlpha = 0.5;
+    ctx.strokeStyle = BRONZE;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(x, hubY);
+    ctx.lineTo(x, y - podRy * 0.8);
+    ctx.stroke();
+    ctx.globalAlpha = 0.9;
+    ctx.fillStyle = BRONZE;
+    ctx.beginPath();
+    ctx.arc(x, hubY, Math.max(1.6, 2.6 * s.depthS), 0, TPI);
+    ctx.fill();
+    var g = Math.pow(Math.max(0, Math.sin(rot * 2 + s.glintP)), 10);
+    if (g > 0.25) {
+      ctx.globalAlpha = g * 0.85;
+      ctx.fillStyle = GLINT;
+      ctx.beginPath();
+      ctx.arc(x, hubY, 1.3, 0, TPI);
+      ctx.fill();
+    }
+
+    /* the wing: a curved blade from the pod root to a spinning tip.
+       Horizontal extent follows cos(rot); apparent thickness follows
+       |sin(rot)| — edge-on it is a sliver, broadside it opens pale. */
+    var rx0 = x, ry0 = y - podRy * 0.5;
+    var tx = rx0 + Math.cos(rot) * L;
+    var ty = ry0 - (0.30 + 0.24 * Math.sin(rot)) * L;
+    var vx = tx - rx0, vy = ty - ry0;
+    var vl = Math.hypot(vx, vy) || 1;
+    var ux = vx / vl, uy = vy / vl;                // along the blade
+    var px = -uy, py = ux;                         // across the blade
+    var ht = L * s.wingW * (0.30 + 0.70 * face);   // apparent half-thickness
+    var bow = L * 0.10 * s.curve;                  // sweep bow along the blade
+    var mx = rx0 + vx * 0.52 + ux * bow, my = ry0 + vy * 0.52 + uy * bow;
+
+    ctx.globalAlpha = 0.55 + 0.45 * s.dn;
+    ctx.fillStyle = mixc(mixc(BRASS, WOOD, 0.38 + 0.62 * face), LIGHT, catchF);
+    ctx.beginPath();
+    ctx.moveTo(rx0, ry0);
+    ctx.quadraticCurveTo(mx + px * ht, my + py * ht, tx, ty);
+    ctx.quadraticCurveTo(mx - px * ht, my - py * ht, rx0, ry0);
+    ctx.fill();
+
+    /* brass spine along the blade's curve */
+    ctx.globalAlpha = 0.8;
+    ctx.strokeStyle = mixc(BRASS, GLINT, catchF);
+    ctx.lineWidth = Math.max(1, L * 0.016);
+    ctx.beginPath();
+    ctx.moveTo(rx0, ry0);
+    ctx.quadraticCurveTo(mx, my, tx, ty);
+    ctx.stroke();
+
+    /* seed pod at the pivot, below the wing root */
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = mixc(BRONZE, BRASS, 0.35 + 0.35 * face);
+    ctx.beginPath();
+    ctx.ellipse(x, y, podRx, podRy, 0, 0, TPI);
+    ctx.fill();
+    if (face > 0.75) {
+      ctx.globalAlpha = (face - 0.75) * 2 * 0.5;
+      ctx.fillStyle = LIGHT;
+      ctx.beginPath();
+      ctx.arc(x - podRx * 0.3, y - podRy * 0.35, 1.2, 0, TPI);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function draw() {
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    var minWH = Math.min(W, H);
+    var i, k;
+
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = SPACE;
+    ctx.fillRect(0, 0, W, H);
+
+    /* warm top light, in soft flat strips (no gradients) */
+    for (k = 0; k < 6; k++) {
+      ctx.globalAlpha = 0.02 * (1 - k / 6);
+      ctx.fillStyle = LIGHT;
+      ctx.fillRect(0, k * 0.05 * H, W, 0.05 * H + 1);
+    }
+
+    /* deep shadow floor, in overlapping bands so it has no hard edge */
+    for (k = 0; k < 16; k++) {
+      var bf = k / 15;
+      ctx.globalAlpha = 0.55 * bf * bf;
+      ctx.fillStyle = SHADOW;
+      ctx.fillRect(0, (0.58 + 0.42 * bf) * H, W, 0.045 * H + 1);
+    }
+
+    /* drive beam along the top */
+    ctx.globalAlpha = 0.85;
+    ctx.fillStyle = BRONZE;
+    ctx.fillRect(0, 0, W, Math.max(2, 0.004 * H));
+    ctx.globalAlpha = 1;
+
+    for (i = 0; i < seeds.length; i++) drawSeed(seeds[i], minWH);
+
+    /* shadow settles over the lower third: layered strips dim the
+       seeds as they descend, land, and start the winch back up */
+    for (k = 0; k < 9; k++) {
+      ctx.globalAlpha = 0.035 + 0.03 * k;
+      ctx.fillStyle = SHADOW;
+      ctx.fillRect(0, (0.62 + 0.042 * k) * H, W, 0.05 * H + 1);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  /* ---------------- interaction ----------------
+     Drag stirs the air: seeds near the pointer gain spin and a radial
+     drift, answered by damped springs in the sim. Double-tap reseeds
+     wing shapes and lanes. Nothing ever reloads. */
+  var drag = null;
+  var lastTap = { t: -1e9, x: 0, y: 0 };
+
+  function stir(x, y, dx, dy, tap) {
+    var minWH = Math.min(W, H);
+    var R = 0.22 * minWH + 60;
+    var speed = Math.hypot(dx, dy);
+    for (var i = 0; i < seeds.length; i++) {
+      var s = seeds[i];
+      var ox = s._x - x, oy = s._y - y;
+      var d = Math.hypot(ox, oy);
+      if (d >= R) continue;
+      var fall = 1 - d / R;
+      fall *= fall;
+      var rx = d > 1 ? ox / d : 0, ry = d > 1 ? oy / d : -1;
+      s.dvx += rx * fall * (tap ? 0.05 : 0.02 + speed * 0.0006);
+      s.dvy += ry * fall * (tap ? 0.05 : 0.02 + speed * 0.0006);
+      var cross = d > 1 ? (rx * dy - ry * dx) : rx;
+      s.sbv += clamp(cross, -1, 1) * fall * (tap ? 1.5 : speed * 0.05);
+      s.sbv = clamp(s.sbv, -6, 6);
+    }
+  }
+
+  function reseed() {
+    curSeed = (curSeed * 1664525 + 1013904223) >>> 0;
+    genScene(curSeed);
+    preroll();
+    draw();
+  }
+
+  canvas.addEventListener('pointerdown', function (e) {
+    var now = Date.now();
+    var x = e.clientX, y = e.clientY;
+    if (now - lastTap.t < 350 && Math.hypot(x - lastTap.x, y - lastTap.y) < 48) {
+      lastTap.t = -1e9;
+      drag = null;
+      reseed();
+      return;
+    }
+    lastTap = { t: now, x: x, y: y };
+    stir(x, y, 0, 0, true);
+    drag = { x: x, y: y };
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (!drag) return;
+    var dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+    stir(e.clientX, e.clientY, dx, dy, false);
+    drag = { x: e.clientX, y: e.clientY };
+  });
+  function endDrag() { drag = null; }
+  canvas.addEventListener('pointerup', endDrag);
+  canvas.addEventListener('pointercancel', endDrag);
+
+  /* ---------------- boot + loop ---------------- */
+  fit();
+  curSeed = seedFromQuery();
+  genScene(curSeed);
+  preroll();
+  draw();
+
+  function onResize() {
+    var wasPhone = PHONE;
+    fit();
+    if (PHONE !== wasPhone) { genScene(curSeed); preroll(); }
+    draw();
+  }
+  if (typeof window !== 'undefined') {
+    window.addEventListener('resize', onResize);
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', onResize);
+    }
+  }
+
+  var last = 0, acc = 0;
+  function frame(ts) {
+    if (!last) last = ts;
+    var el = (ts - last) / 1000;
+    last = ts;
+    acc += Math.min(el, 0.1);
+    while (acc >= DT) { step(DT); acc -= DT; }
+    draw();
+    requestAnimationFrame(frame);
+  }
+  if (typeof requestAnimationFrame === 'function') {
+    requestAnimationFrame(frame);
+  }
+})();
+</script>
+</body>
+</html>

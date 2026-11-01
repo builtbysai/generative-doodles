@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Drawing Robot</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0B0D10; overflow: hidden; height: 100%; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded RNG ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function lerp(a, b, t) { return a + (b - a) * t; }
+  function smootherstep(t) { t = clamp(t, 0, 1); return t * t * t * (t * (t * 6 - 15) + 10); }
+  function mixHex(c1, c2, t) {
+    var r = Math.round(lerp(c1[0], c2[0], t));
+    var g = Math.round(lerp(c1[1], c2[1], t));
+    var b = Math.round(lerp(c1[2], c2[2], t));
+    return 'rgb(' + r + ',' + g + ',' + b + ')';
+  }
+
+  // ---------- constants ----------
+  var BASE_SEED = 11352207;
+  var T0 = 144.4;              // fixed first-frame phase (piece seconds): mid-draw of cycle 9, a hero vessel
+  var CYCLE = 15;              // one artifact every ~15 s
+  var T_TRAVEL = 2.2;          // travel to the next spot
+  var T_SCAN = 5.2;            // scan pulse runs 2.2..5.2 (~3 s)
+  var T_DRAW_END = 13.8;       // drawing runs 5.2..13.8, then a short rest
+  var K_START = -6;            // the wall already holds history when the piece opens
+  var K_KEEP = 400;            // render at most the newest 400 artifacts
+  var HOME = { x: 0.10, y: 0.88 };
+
+  var WALL = '#0B0D10';
+  var CHALK = [232, 228, 218]; // #E8E4DA
+  var GHOST = [46, 51, 57];    // #2E3339
+  var CARRIAGE = '#1E2228';
+  var AMBER = '#D8A24A';
+  var SCAN = '154,223,255';    // #9ADFFF as r,g,b
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  var W = 0, H = 0, U = 1;
+  var PHONE = false;
+  var pieceTime = T0;
+
+  // ---------- interaction state (recorded events only) ----------
+  var findsByCycle = {};       // cycle index -> {nx, ny, seed}
+  var findCycles = [];         // assigned cycle indices, ascending
+  var wipes = [];              // piece times of double-tap wall wipes
+
+  function isPhone(w, h) {
+    var sw = 0, sh = 0;
+    if (typeof window !== 'undefined' && window.screen) {
+      sw = window.screen.width || 0;
+      sh = window.screen.height || 0;
+    }
+    var minScreen = Math.min(sw, sh);
+    if (minScreen > 0) return minScreen < 700;
+    return h > w * 1.15;
+  }
+
+  function fit() {
+    var w, h;
+    if (typeof window !== 'undefined' && window.visualViewport) {
+      w = window.visualViewport.width;
+      h = window.visualViewport.height;
+    } else {
+      w = window.innerWidth;
+      h = window.innerHeight;
+    }
+    W = Math.max(50, Math.floor(w));
+    H = Math.max(50, Math.floor(h));
+    canvas.width = W;
+    canvas.height = H;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    U = Math.min(W, H) / 800;
+    if (U < 0.35) U = 0.35;
+    PHONE = isPhone(W, H);
+  }
+
+  // ---------- artifact generators (local coords, roughly [-1,1]) ----------
+
+  function catmull(p0, p1, p2, p3, t) {
+    var t2 = t * t, t3 = t2 * t;
+    return 0.5 * ((2 * p1) + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 + (-p0 + 3 * p1 - 3 * p2 + p3) * t3);
+  }
+
+  // Vessel profile: symmetric outline from a seeded half-width profile.
+  function vesselLines(rng, hero) {
+    var ctrl = [0.30, 0.42, 0.52, 0.55, 0.44, 0.26, 0.24, 0.34, 0.36];
+    var ct = [0.00, 0.05, 0.20, 0.42, 0.62, 0.78, 0.87, 0.94, 1.00];
+    for (var i = 1; i < ctrl.length - 1; i++) ctrl[i] += (rng() - 0.5) * 0.09;
+    function halfW(t) {
+      var j = 0;
+      while (j < ct.length - 2 && t > ct[j + 1]) j++;
+      var span = ct[j + 1] - ct[j];
+      var lt = span > 0 ? (t - ct[j]) / span : 0;
+      var p0 = ctrl[Math.max(0, j - 1)], p1 = ctrl[j], p2 = ctrl[j + 1], p3 = ctrl[Math.min(ctrl.length - 1, j + 2)];
+      return catmull(p0, p1, p2, p3, lt);
+    }
+    var N = 30, outline = [], k, t, w;
+    for (k = 0; k <= N; k++) { t = k / N; w = halfW(t); outline.push([-w, 0.78 - 1.56 * t]); }        // left side, bottom -> top
+    outline.push([-halfW(1) * 0.55, -0.84]); outline.push([0, -0.86]); outline.push([halfW(1) * 0.55, -0.84]); // rim
+    for (k = N; k >= 0; k--) { t = k / N; w = halfW(t); outline.push([w, 0.78 - 1.56 * t]); }          // right side, top -> bottom
+    outline.push([halfW(0) * 0.5, 0.84]); outline.push([0, 0.86]); outline.push([-halfW(0) * 0.5, 0.84]); // base
+    var lines = [outline];
+    if (hero) {
+      var inner = [];
+      for (k = 0; k < outline.length; k++) inner.push([outline[k][0] * 0.80, outline[k][1] * 0.86 - 0.02]);
+      lines.push(inner);
+      var band = [], bt = 0.45 + (rng() - 0.5) * 0.08, bw = halfW(bt);
+      for (k = 0; k <= 10; k++) {
+        var bx = -bw + (2 * bw) * (k / 10);
+        band.push([bx, 0.78 - 1.56 * bt + Math.sin((k / 10) * Math.PI) * 0.05]);
+      }
+      lines.push(band);
+    }
+    return lines;
+  }
+
+  // Rune set: 3-5 angular stroke clusters, abstract marks (never letters).
+  function runeLines(rng) {
+    var n = 3 + Math.floor(rng() * 3);
+    var lines = [];
+    var totalW = 1.15, step = totalW / n;
+    for (var i = 0; i < n; i++) {
+      var cx = -totalW / 2 + step * (i + 0.5) + (rng() - 0.5) * 0.06;
+      var hh = 0.55 + rng() * 0.25;
+      var lean = (rng() - 0.5) * 0.16;
+      lines.push([[cx - lean, -hh], [cx + lean, hh]]);
+      var nb = 1 + Math.floor(rng() * 2);
+      for (var b = 0; b < nb; b++) {
+        var fy = -hh + (0.35 + 0.45 * b + rng() * 0.15) * hh;
+        var fx = cx + lean * ((fy + hh) / (2 * hh) - 0.5) * 2 * 0.5;
+        var dir = rng() < 0.5 ? -1 : 1;
+        var bl = 0.22 + rng() * 0.14;
+        lines.push([[fx, fy], [fx + dir * bl, fy + bl * (0.8 + rng() * 0.4)]]);
+      }
+      if (rng() < 0.4) { // occasional cross-stroke
+        lines.push([[cx - 0.16, -hh * 0.2], [cx + 0.16 + lean, hh * 0.25]]);
+      }
+    }
+    return lines;
+  }
+
+  // Spiral ornament: archimedean, sometimes double-armed.
+  function spiralLines(rng) {
+    var turns = 2.5 + rng() * 1.1;
+    var a0 = rng() * Math.PI * 2;
+    var dir = rng() < 0.5 ? 1 : -1;
+    function arm(off) {
+      var pts = [], N = 110;
+      for (var k = 0; k <= N; k++) {
+        var f = k / N, th = a0 + off + dir * f * turns * Math.PI * 2;
+        var r = 0.07 + 0.78 * f;
+        pts.push([Math.cos(th) * r, Math.sin(th) * r * 0.94]);
+      }
+      return pts;
+    }
+    var lines = [arm(0)];
+    if (rng() < 0.45) lines.push(arm(Math.PI));
+    return lines;
+  }
+
+  // ---------- artifact definitions (pure functions of cycle / find) ----------
+
+  function buildDef(seed, typePick, cx, cy, size, hero) {
+    var rng = mulberry32(seed);
+    var type;
+    if (hero) type = 'vessel';
+    else if (typePick < 0.45) type = 'vessel';
+    else if (typePick < 0.70) type = 'runes';
+    else type = 'spiral';
+    var lines = type === 'vessel' ? vesselLines(rng, hero) : (type === 'runes' ? runeLines(rng) : spiralLines(rng));
+    // cumulative arc-length table across all polylines, in local units
+    var run = 0, table = [];
+    for (var i = 0; i < lines.length; i++) {
+      var per = [0];
+      for (var j = 1; j < lines[i].length; j++) {
+        var ddx = lines[i][j][0] - lines[i][j - 1][0], ddy = lines[i][j][1] - lines[i][j - 1][1];
+        run += Math.sqrt(ddx * ddx + ddy * ddy);
+        per.push(run);
+      }
+      table.push(per);
+    }
+    return { lines: lines, table: table, total: run, cx: cx, cy: cy, size: size, type: type };
+  }
+
+  var defCache = {};
+  function scheduledDef(k) {
+    if (defCache['k' + k]) return defCache['k' + k];
+    var rng = mulberry32(BASE_SEED + k * 7919);
+    var hero = (k % 5 === 4);
+    var cx = 0.16 + rng() * 0.68;
+    var cy = 0.20 + rng() * 0.60;
+    var size = hero ? 0.21 + rng() * 0.04 : 0.095 + rng() * 0.06;
+    var typePick = rng();
+    var def = buildDef(BASE_SEED + k * 104729 + 13, typePick, cx, cy, size, hero);
+    def.birth = k * CYCLE + T_SCAN;
+    defCache['k' + k] = def;
+    return def;
+  }
+  function findDef(k) {
+    if (defCache['f' + k]) return defCache['f' + k];
+    var f = findsByCycle[k];
+    var rng = mulberry32(f.seed);
+    var def = buildDef(f.seed + 31, rng(), f.nx, f.ny, 0.12, false);
+    def.birth = k * CYCLE + T_SCAN;
+    defCache['f' + k] = def;
+    return def;
+  }
+  function defForCycle(k) {
+    return findsByCycle[k] ? findDef(k) : scheduledDef(k);
+  }
+
+  // point on a def's path at arc-length s (local units); returns local [x,y]
+  function pointAt(def, s) {
+    s = clamp(s, 0, def.total);
+    for (var i = 0; i < def.lines.length; i++) {
+      var per = def.table[i], pts = def.lines[i];
+      var start = per[0], end = per[per.length - 1];
+      if (s <= end || i === def.lines.length - 1) {
+        for (var j = 1; j < per.length; j++) {
+          if (s <= per[j] || j === per.length - 1) {
+            var seg = per[j] - per[j - 1];
+            var f = seg > 0 ? (s - per[j - 1]) / seg : 0;
+            return [lerp(pts[j - 1][0], pts[j][0], f), lerp(pts[j - 1][1], pts[j][1], f)];
+          }
+        }
+      }
+    }
+    var last = def.lines[def.lines.length - 1];
+    return last[last.length - 1];
+  }
+
+  function toPx(def, p) {
+    var sp = def.size * Math.min(W, H);
+    return { x: def.cx * W + p[0] * sp, y: def.cy * H + p[1] * sp };
+  }
+  function defStartPx(def) { return toPx(def, def.lines[0][0]); }
+  function defEndPx(def) {
+    var l = def.lines[def.lines.length - 1];
+    return toPx(def, l[l.length - 1]);
+  }
+
+  // ---------- drawing helpers ----------
+
+  function strokePrefix(def, s, color, alpha) {
+    if (s <= 0 || alpha <= 0) return;
+    ctx.strokeStyle = color;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    for (var pass = 0; pass < 2; pass++) {
+      ctx.globalAlpha = alpha * (pass === 0 ? 0.30 : 0.92);
+      ctx.lineWidth = Math.max(1, (pass === 0 ? 3.0 : 1.5) * U);
+      var budget = s;
+      ctx.beginPath();
+      var pen = false;
+      for (var i = 0; i < def.lines.length; i++) {
+        var per = def.table[i], pts = def.lines[i];
+        var lineLen = per[per.length - 1] - per[0];
+        if (budget <= 0) break;
+        var take = Math.min(budget, lineLen);
+        var lp = toPx(def, pts[0]);
+        if (!pen) { ctx.moveTo(lp.x, lp.y); pen = true; } else { ctx.moveTo(lp.x, lp.y); }
+        var acc = 0;
+        for (var j = 1; j < pts.length; j++) {
+          var segLen = per[j] - per[j - 1];
+          if (acc + segLen <= take) {
+            lp = toPx(def, pts[j]);
+            ctx.lineTo(lp.x, lp.y);
+            acc += segLen;
+          } else {
+            var f = segLen > 0 ? (take - acc) / segLen : 0;
+            var q = [lerp(pts[j - 1][0], pts[j][0], f), lerp(pts[j - 1][1], pts[j][1], f)];
+            lp = toPx(def, q);
+            ctx.lineTo(lp.x, lp.y);
+            acc = take;
+            break;
+          }
+        }
+        budget -= take;
+      }
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function circlePath(x, y, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+  }
+
+  // robot: two top rails, a carriage riding them, a drop rod to the pen tip
+  function drawRobot(tip, pt, phase) {
+    var railY1 = 9 * U + 4, railY2 = railY1 + 11 * U;
+    ctx.fillStyle = CARRIAGE;
+    ctx.globalAlpha = 0.75;
+    ctx.fillRect(0, railY1, W, Math.max(1.5, 2.6 * U));
+    ctx.fillRect(0, railY2, W, Math.max(1.5, 2.6 * U));
+    ctx.globalAlpha = 1;
+    // drop rod
+    var cw = 36 * U, ch = 17 * U;
+    var cxp = clamp(tip.x, cw / 2 + 2, W - cw / 2 - 2);
+    ctx.fillStyle = CARRIAGE;
+    ctx.globalAlpha = 0.85;
+    ctx.fillRect(cxp - Math.max(1, 1.6 * U), railY2 + 3 * U, Math.max(2, 3.2 * U), Math.max(0, tip.y - railY2 - 3 * U));
+    ctx.globalAlpha = 1;
+    // carriage body
+    ctx.fillStyle = CARRIAGE;
+    ctx.fillRect(cxp - cw / 2, railY1 - 4 * U, cw, ch);
+    // wheels on the rails
+    ctx.fillStyle = '#0B0D10';
+    circlePath(cxp - cw * 0.30, railY1 + 1.3 * U, Math.max(1.6, 2.6 * U)); ctx.fill();
+    circlePath(cxp + cw * 0.30, railY1 + 1.3 * U, Math.max(1.6, 2.6 * U)); ctx.fill();
+    circlePath(cxp - cw * 0.30, railY2 + 1.3 * U, Math.max(1.6, 2.6 * U)); ctx.fill();
+    circlePath(cxp + cw * 0.30, railY2 + 1.3 * U, Math.max(1.6, 2.6 * U)); ctx.fill();
+    // pen holder + tip
+    ctx.fillStyle = CARRIAGE;
+    ctx.beginPath();
+    ctx.moveTo(tip.x - 4.5 * U, tip.y - 9 * U);
+    ctx.lineTo(tip.x + 4.5 * U, tip.y - 9 * U);
+    ctx.lineTo(tip.x, tip.y);
+    ctx.closePath();
+    ctx.fill();
+    // amber status light (pulses gently while scanning)
+    var pulse = phase === 'scan' ? 0.65 + 0.35 * Math.sin(pt * 6.0) : 1;
+    ctx.globalAlpha = pulse;
+    ctx.fillStyle = AMBER;
+    circlePath(cxp + cw * 0.28, railY1 + 4.5 * U, Math.max(1.8, 3.0 * U));
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  function drawScan(def, pt, p) {
+    var c = { x: def.cx * W, y: def.cy * H };
+    var maxR = def.size * Math.min(W, H) * 1.25 + 12 * U;
+    var span = T_SCAN - T_TRAVEL;
+    for (var i = 0; i < 2; i++) {
+      var f = ((p - T_TRAVEL) / span + i * 0.5) % 1;
+      if (f < 0) f += 1;
+      var r = 4 + f * maxR;
+      ctx.strokeStyle = 'rgba(' + SCAN + ',' + (0.34 * (1 - f)).toFixed(3) + ')';
+      ctx.lineWidth = Math.max(1, 1.3 * U);
+      circlePath(c.x, c.y, r);
+      ctx.stroke();
+    }
+    ctx.fillStyle = 'rgba(' + SCAN + ',0.7)';
+    circlePath(c.x, c.y, Math.max(1.4, 2.2 * U));
+    ctx.fill();
+  }
+
+  // ---------- main draw ----------
+
+  function wipeFactor(birth, pt) {
+    var m = 1;
+    for (var i = 0; i < wipes.length; i++) {
+      if (wipes[i] > birth) {
+        var f = clamp(1 - (pt - wipes[i]) / 1.6, 0, 1);
+        if (f < m) m = f;
+      }
+    }
+    return m;
+  }
+
+  function fadeColor(ageCycles) {
+    var g = clamp((ageCycles - 1) / 3.5, 0, 1);
+    return mixHex(CHALK, GHOST, g);
+  }
+
+  function draw(pt) {
+    ctx.fillStyle = WALL;
+    ctx.fillRect(0, 0, W, H);
+
+    var kNow = Math.floor(pt / CYCLE);
+    var p = pt - kNow * CYCLE;
+
+    // history: every completed artifact, oldest to newest
+    var kMin = Math.max(K_START, kNow - K_KEEP);
+    for (var k = kMin; k < kNow; k++) {
+      var def = defForCycle(k);
+      var wf = wipeFactor(def.birth, pt);
+      if (wf <= 0) continue;
+      var ageC = (pt - def.birth) / CYCLE;
+      strokePrefix(def, def.total, fadeColor(ageC), 0.95 * wf);
+    }
+
+    // current artifact + robot
+    var cur = defForCycle(kNow);
+    var tip, phase;
+    if (p < T_TRAVEL) {
+      phase = 'travel';
+      var prevEnd = HOME;
+      if (kNow - 1 >= K_START) prevEnd = defEndPx(defForCycle(kNow - 1));
+      else prevEnd = { x: HOME.x * W, y: HOME.y * H };
+      var start = defStartPx(cur);
+      var e = smootherstep(p / T_TRAVEL);
+      tip = { x: lerp(prevEnd.x, start.x, e), y: lerp(prevEnd.y, start.y, e) };
+    } else if (p < T_SCAN) {
+      phase = 'scan';
+      tip = defStartPx(cur);
+      drawScan(cur, pt, p);
+    } else if (p < T_DRAW_END) {
+      phase = 'draw';
+      var s = cur.total * ((p - T_SCAN) / (T_DRAW_END - T_SCAN));
+      var wfCur = wipeFactor(cur.birth, pt);
+      strokePrefix(cur, s, fadeColor(0), 0.95 * wfCur);
+      tip = toPx(cur, pointAt(cur, s));
+    } else {
+      phase = 'rest';
+      var wfDone = wipeFactor(cur.birth, pt);
+      strokePrefix(cur, cur.total, fadeColor((pt - cur.birth) / CYCLE), 0.95 * wfDone);
+      tip = defEndPx(cur);
+    }
+    drawRobot(tip, pt, phase);
+  }
+
+  // ---------- events ----------
+  function pointerPos(e) {
+    var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    return { x: (e.clientX || 0) - r.left, y: (e.clientY || 0) - r.top };
+  }
+  var dragging = false, dragMoved = 0, lastX = 0, lastY = 0;
+  var lastTapT = -10, lastTapX = 0, lastTapY = 0;
+
+  canvas.addEventListener('pointerdown', function (e) {
+    var p = pointerPos(e);
+    dragging = true; dragMoved = 0; lastX = p.x; lastY = p.y;
+    if (canvas.setPointerCapture && e.pointerId !== undefined) {
+      try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+    }
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (!dragging) return;
+    var p = pointerPos(e);
+    dragMoved += Math.abs(p.x - lastX) + Math.abs(p.y - lastY);
+    lastX = p.x; lastY = p.y;
+  });
+  function endPointer(e) {
+    if (!dragging) return;
+    dragging = false;
+    var p = pointerPos(e);
+    if (dragMoved > 24) {
+      // drag feeds the robot a find at this spot: it preempts the schedule
+      // after the current artifact finishes.
+      var pt = pieceTime;
+      var cand = Math.floor(pt / CYCLE) + 1;
+      while (findsByCycle[cand]) cand++;
+      var nx = clamp(p.x / Math.max(1, W), 0.06, 0.94);
+      var ny = clamp(p.y / Math.max(1, H), 0.10, 0.92);
+      var seed = (Math.round(nx * 977) * 131 + Math.round(ny * 977) * 17 + cand * 7919 + BASE_SEED) | 0;
+      findsByCycle[cand] = { nx: nx, ny: ny, seed: seed };
+      findCycles.push(cand);
+      lastTapT = -10;
+    } else {
+      var dt = pieceTime - lastTapT;
+      var dx = p.x - lastTapX, dy = p.y - lastTapY;
+      if (dt > 0 && dt < 0.35 && dx * dx + dy * dy < 1600) {
+        wipes.push(pieceTime);   // double-tap: ghosts fade to black, a fresh wall
+        lastTapT = -10;
+      } else {
+        lastTapT = pieceTime; lastTapX = p.x; lastTapY = p.y;
+      }
+    }
+    draw(pieceTime);
+  }
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', endPointer);
+
+  // ---------- run ----------
+  fit();
+  draw(T0);
+  pieceTime = T0;
+
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener('resize', function () { fit(); draw(pieceTime); });
+    }
+    window.addEventListener('resize', function () { fit(); draw(pieceTime); });
+  }
+
+  var startStamp = null;
+  function frame(now) {
+    if (startStamp === null) startStamp = now;
+    pieceTime = T0 + (now - startStamp) / 1000;
+    draw(pieceTime);
+    if (typeof requestAnimationFrame !== 'undefined') {
+      requestAnimationFrame(frame);
+    }
+  }
+  if (typeof requestAnimationFrame !== 'undefined') {
+    requestAnimationFrame(frame);
+  }
+})();
+</script>
+</body>
+</html>
