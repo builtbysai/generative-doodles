@@ -1,0 +1,571 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Siphon</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0A0B0E; overflow: hidden; height: 100%; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+// No.972 "Siphon" (study #119 kyle-mcdonald, PP133 "Wifi Whisperer").
+// Fixed-timestep 120 Hz simulation, seeded. Frame one is the synchronous
+// draw after exactly 3600 pre-roll steps. No wall clock feeds drawn state.
+
+var GROUND = '#0A0B0E';
+var BODY   = '#C9CFDB';
+var HEAD   = '#F5F2EA';
+var BEACON = '#4FD6FF';
+var RED    = '#FF3B3B';
+var AMBER  = '#FFC44F';
+
+var STEP = 1 / 120;
+var WORLD = 720;              // reference square; drawn scaled to fit
+var SEED = 972101;
+
+// ---------- seeded RNG ----------
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// ---------- canvas ----------
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var viewW = 720, viewH = 720;
+
+function isPhone() {
+  var sw = 9999, sh = 9999;
+  if (typeof window !== 'undefined' && window.screen) {
+    sw = window.screen.width || 9999;
+    sh = window.screen.height || 9999;
+  }
+  if (Math.min(sw, sh) < 700) return true;
+  return viewH > viewW * 1.15;
+}
+
+function resize() {
+  var vv = (typeof window !== 'undefined' && window.visualViewport) ? window.visualViewport : null;
+  viewW = vv ? vv.width : (window.innerWidth || 720);
+  viewH = vv ? vv.height : (window.innerHeight || 720);
+  var dpr = Math.min((typeof window !== 'undefined' && window.devicePixelRatio) || 1, 2);
+  canvas.width = Math.round(viewW * dpr);
+  canvas.height = Math.round(viewH * dpr);
+  canvas.style.width = viewW + 'px';
+  canvas.style.height = viewH + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+if (typeof window !== 'undefined') {
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', resize);
+  }
+  window.addEventListener('resize', resize);
+}
+resize();
+
+// ---------- world state ----------
+var sim = null;
+
+function buildVenue(gen) {
+  var rng = mulberry32(SEED + gen * 7919);
+  var figures = [];
+  var cell = WORLD / 4;
+  // 12 figures scattered in a jittered 4x3 lattice, generous space between.
+  var slots = [];
+  for (var gy = 0; gy < 3; gy++) for (var gx = 0; gx < 4; gx++) slots.push([gx, gy]);
+  // seeded shuffle of slots
+  for (var i = slots.length - 1; i > 0; i--) {
+    var j = Math.floor(rng() * (i + 1));
+    var tmp = slots[i]; slots[i] = slots[j]; slots[j] = tmp;
+  }
+  for (var k = 0; k < 12; k++) {
+    var hx = (slots[k][0] + 0.5) * cell + (rng() - 0.5) * cell * 0.42;
+    var hy = (slots[k][1] + 0.5) * (WORLD / 3) + (rng() - 0.5) * (WORLD / 3) * 0.42;
+    figures.push({
+      hx: hx, hy: hy,
+      wobA: 3 + rng() * 5, wobB: 3 + rng() * 5,
+      wobFA: 0.05 + rng() * 0.08, wobFB: 0.04 + rng() * 0.07,
+      phA: rng() * Math.PI * 2, phB: rng() * Math.PI * 2,
+      period: 4 + rng() * 3.5,               // beacon every 4-7.5 s
+      nextBeacon: 1 + rng() * 6,             // staggered first beacons
+      beaconStart: -1, beaconDur: 3,
+      coolUntil: 0
+    });
+  }
+  var waypoints = [];
+  for (var w = 0; w < 24; w++) {
+    waypoints.push([60 + rng() * (WORLD - 120), 60 + rng() * (WORLD - 120)]);
+  }
+  return {
+    gen: gen,
+    venueStart: gen * 240,
+    rng: rng,
+    figures: figures,
+    wx: WORLD * 0.5, wy: WORLD * 0.42, wvx: 0, wvy: 0,
+    wSpeed: 30,
+    wpIndex: 0,
+    waypoints: waypoints,
+    trace: [],            // {x, y, t}
+    spirals: [],          // {t0, fx, fy, fig}
+    glyphs: [],           // {x, y, vx, vy, t0, life, kind, size, seed}
+    priorityFig: -1,
+    overrideUntil: -1, overrideX: 0, overrideY: 0,
+    lastCaptureT: -10
+  };
+}
+
+sim = buildVenue(0);
+var simT = 0;             // seconds of sim time, advanced only in fixed steps
+var stepCount = 0;
+var events = [];          // {step, type, x, y, fig} consumed in step order
+
+function figPos(f, t) {
+  return [
+    f.hx + Math.sin(t * f.wobFA * Math.PI * 2 + f.phA) * f.wobA,
+    f.hy + Math.cos(t * f.wobFB * Math.PI * 2 + f.phB) * f.wobB
+  ];
+}
+
+function spawnLeak(fig, fx, fy, t) {
+  var rng = sim.rng;
+  for (var i = 0; i < 60; i++) {
+    sim.glyphs.push({
+      x: fx + (rng() - 0.5) * 10,
+      y: fy - 6,
+      vx: (rng() - 0.5) * 7,
+      vy: -(15 + rng() * 16),
+      t0: t + i * 0.033,                    // emitted over ~2 s
+      life: 4.5 + rng() * 1.5,
+      kind: Math.floor(rng() * 3),          // 0 dot, 1 tick, 2 arc
+      size: 1.6 + rng() * 2.2,
+      seed: rng() * Math.PI * 2
+    });
+  }
+  if (sim.glyphs.length > 900) sim.glyphs.splice(0, sim.glyphs.length - 900);
+}
+
+function stepSim() {
+  var t = simT;
+  // venue reseed every 240 s
+  var gen = Math.floor(t / 240);
+  if (gen !== sim.gen) {
+    var keepOverride = sim.overrideUntil, ox = sim.overrideX, oy = sim.overrideY;
+    sim = buildVenue(gen);
+    sim.overrideUntil = keepOverride; sim.overrideX = ox; sim.overrideY = oy;
+  }
+
+  // consume events scheduled for this step
+  for (var e = events.length - 1; e >= 0; e--) {
+    if (events[e].step <= stepCount) {
+      var ev = events[e];
+      events.splice(e, 1);
+      if (ev.type === 'forceBeacon') {
+        var f = sim.figures[ev.fig];
+        if (f) {
+          f.beaconStart = t; f.nextBeacon = t + f.period;
+          sim.priorityFig = ev.fig;
+        }
+      } else if (ev.type === 'override') {
+        sim.overrideUntil = ev.until; sim.overrideX = ev.x; sim.overrideY = ev.y;
+      } else if (ev.type === 'newVenue') {
+        sim = buildVenue(sim.gen + 1);
+        sim.venueStart = t; // local venue clock restarts; gen check uses floor(t/240), guard:
+        sim.gen = Math.floor(t / 240);
+        simT = Math.floor(t / 240) * 240 + 0.0001; t = simT;
+      }
+    }
+  }
+
+  // figures: beacon scheduling
+  for (var i = 0; i < sim.figures.length; i++) {
+    var fg = sim.figures[i];
+    if (fg.beaconStart < 0 && t >= fg.nextBeacon) {
+      fg.beaconStart = t;
+      onBeaconSound();
+    }
+    if (fg.beaconStart >= 0 && t - fg.beaconStart > fg.beaconDur) {
+      fg.beaconStart = -1;
+      fg.nextBeacon = t + fg.period * (0.7 + sim.rng() * 0.6);
+      if (sim.priorityFig === i) sim.priorityFig = -1;
+    }
+  }
+
+  // whisperer steering
+  var tx = null, ty = null;
+  if (t < sim.overrideUntil) {
+    tx = sim.overrideX; ty = sim.overrideY;
+  } else if (sim.priorityFig >= 0 && sim.figures[sim.priorityFig].beaconStart >= 0) {
+    var pp = figPos(sim.figures[sim.priorityFig], t);
+    tx = pp[0]; ty = pp[1];
+  } else {
+    var bestD = 1e18, bi = -1;
+    for (var b = 0; b < sim.figures.length; b++) {
+      if (sim.figures[b].beaconStart >= 0) {
+        var bp = figPos(sim.figures[b], t);
+        var bd = (bp[0] - sim.wx) * (bp[0] - sim.wx) + (bp[1] - sim.wy) * (bp[1] - sim.wy);
+        if (bd < bestD) { bestD = bd; bi = b; }
+      }
+    }
+    if (bi >= 0) {
+      var tp = figPos(sim.figures[bi], t);
+      tx = tp[0]; ty = tp[1];
+    } else {
+      var wp = sim.waypoints[sim.wpIndex % sim.waypoints.length];
+      var wd = (wp[0] - sim.wx) * (wp[0] - sim.wx) + (wp[1] - sim.wy) * (wp[1] - sim.wy);
+      if (wd < 24 * 24) sim.wpIndex++;
+      tx = wp[0]; ty = wp[1];
+    }
+  }
+  if (tx !== null) {
+    var dx = tx - sim.wx, dy = ty - sim.wy;
+    var dl = Math.sqrt(dx * dx + dy * dy) || 1;
+    var sp = sim.wSpeed;
+    if (dl < 40) sp = sim.wSpeed * (0.35 + 0.65 * dl / 40);
+    var dvx = (dx / dl) * sp, dvy = (dy / dl) * sp;
+    var blend = 1 - Math.exp(-STEP * 3.2);
+    sim.wvx += (dvx - sim.wvx) * blend;
+    sim.wvy += (dvy - sim.wvy) * blend;
+    sim.wx += sim.wvx * STEP;
+    sim.wy += sim.wvy * STEP;
+    sim.wx = Math.max(24, Math.min(WORLD - 24, sim.wx));
+    sim.wy = Math.max(24, Math.min(WORLD - 24, sim.wy));
+  }
+  // trace recording (every 0.2 s)
+  if (stepCount % 24 === 0) {
+    sim.trace.push({ x: sim.wx, y: sim.wy, t: t });
+    while (sim.trace.length && t - sim.trace[0].t > 55) sim.trace.shift();
+  }
+
+  // captures
+  for (var c = 0; c < sim.figures.length; c++) {
+    var cf = sim.figures[c];
+    if (cf.beaconStart >= 0 && t >= cf.coolUntil) {
+      var cp = figPos(cf, t);
+      var cdx = cp[0] - sim.wx, cdy = cp[1] - sim.wy;
+      if (cdx * cdx + cdy * cdy < 30 * 30) {
+        cf.beaconStart = -1;
+        cf.coolUntil = t + cf.period;
+        cf.nextBeacon = t + cf.period * (0.8 + sim.rng() * 0.5);
+        if (sim.priorityFig === c) sim.priorityFig = -1;
+        sim.spirals.push({ t0: t, fx: cp[0], fy: cp[1] });
+        spawnLeak(c, cp[0], cp[1], t);
+        sim.lastCaptureT = t;
+        onSiphonSound();
+      }
+    }
+  }
+  // prune spirals / glyphs
+  sim.spirals = sim.spirals.filter(function (s) { return t - s.t0 < 1.5; });
+  sim.glyphs = sim.glyphs.filter(function (g) { return t - g.t0 < g.life; });
+
+  simT += STEP;
+  stepCount++;
+}
+
+// ---------- audio (lazy, guarded; silent in QA) ----------
+var AC = null, masterGain = null;
+function ensureAudio() {
+  if (AC || typeof window === 'undefined') return;
+  var Ctor = window.AudioContext || window.webkitAudioContext;
+  if (!Ctor) return;
+  try {
+    AC = new Ctor();
+    masterGain = AC.createGain();
+    masterGain.gain.value = 0.5;
+    masterGain.connect(AC.destination);
+    // near-silence room bed: soft breath-like filtered noise, very low
+    var len = AC.sampleRate * 2;
+    var buf = AC.createBuffer(1, len, AC.sampleRate);
+    var d = buf.getChannelData(0);
+    for (var i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * 0.25;
+    var src = AC.createBufferSource();
+    src.buffer = buf; src.loop = true;
+    var filt = AC.createBiquadFilter();
+    filt.type = 'lowpass'; filt.frequency.value = 320;
+    var bedGain = AC.createGain(); bedGain.gain.value = 0.015;
+    var lfo = AC.createOscillator(); lfo.frequency.value = 0.11;
+    var lfoGain = AC.createGain(); lfoGain.gain.value = 0.007;
+    lfo.connect(lfoGain); lfoGain.connect(bedGain.gain);
+    src.connect(filt); filt.connect(bedGain); bedGain.connect(masterGain);
+    src.start(); lfo.start();
+  } catch (err) { AC = null; }
+}
+function tone(freqA, freqB, dur, gainVal, type) {
+  if (!AC || !masterGain) return;
+  try {
+    var o = AC.createOscillator(), g = AC.createGain();
+    o.type = type || 'sine';
+    var now = AC.currentTime;
+    o.frequency.setValueAtTime(freqA, now);
+    o.frequency.exponentialRampToValueAtTime(Math.max(30, freqB), now + dur);
+    g.gain.setValueAtTime(gainVal, now);
+    g.gain.exponentialRampToValueAtTime(0.0004, now + dur);
+    o.connect(g); g.connect(masterGain);
+    o.start(now); o.stop(now + dur + 0.05);
+  } catch (err) { /* audio is garnish */ }
+}
+var lastPingAt = 0;
+function onBeaconSound() {
+  if (!AC) return;
+  var nowMs = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+  if (nowMs - lastPingAt < 350) return;
+  lastPingAt = nowMs;
+  tone(3400, 3300, 0.12, 0.012, 'sine');           // almost-inaudible ping
+}
+function onSiphonSound() {
+  if (!AC) return;
+  tone(300, 1500, 1.1, 0.03, 'sawtooth');          // rising whine
+  for (var i = 0; i < 7; i++) {                    // whispered clicks
+    (function (k) {
+      setTimeout(function () { tone(1800 + Math.random() * 1400, 1200, 0.03, 0.008, 'square'); }, 200 + k * 160);
+    })(i);
+  }
+}
+
+// ---------- interaction ----------
+// View transform: world square fitted into the viewport, centered.
+function viewTransform() {
+  var s = Math.min(viewW, viewH) / WORLD;
+  return { s: s, ox: (viewW - WORLD * s) / 2, oy: (viewH - WORLD * s) / 2 };
+}
+function toWorld(px, py) {
+  var v = viewTransform();
+  return [(px - v.ox) / v.s, (py - v.oy) / v.s];
+}
+function nearestFigure(wx, wy) {
+  var bd = 1e18, bi = -1;
+  for (var i = 0; i < sim.figures.length; i++) {
+    var p = figPos(sim.figures[i], simT);
+    var d = (p[0] - wx) * (p[0] - wx) + (p[1] - wy) * (p[1] - wy);
+    if (d < bd) { bd = d; bi = i; }
+  }
+  return (bd < 70 * 70) ? bi : -1;
+}
+var pDown = null, lastTap = null;
+function onDown(e) {
+  ensureAudio();
+  if (AC && AC.state === 'suspended') { try { AC.resume(); } catch (err) {} }
+  var r = canvas.getBoundingClientRect();
+  var px = (e.clientX || 0) - r.left, py = (e.clientY || 0) - r.top;
+  var w = toWorld(px, py);
+  pDown = { x: w[0], y: w[1], step: stepCount, moved: false };
+  events.push({ step: stepCount, type: 'override', x: w[0], y: w[1], until: simT + 10 });
+}
+function onMove(e) {
+  if (!pDown) return;
+  var r = canvas.getBoundingClientRect();
+  var px = (e.clientX || 0) - r.left, py = (e.clientY || 0) - r.top;
+  var w = toWorld(px, py);
+  var ddx = w[0] - pDown.x, ddy = w[1] - pDown.y;
+  if (ddx * ddx + ddy * ddy > 8 * 8) pDown.moved = true;
+  events.push({ step: stepCount, type: 'override', x: w[0], y: w[1], until: simT + 10 });
+}
+function onUp(e) {
+  if (!pDown) return;
+  var wasDrag = pDown.moved;
+  var wx = pDown.x, wy = pDown.y;
+  pDown = null;
+  if (wasDrag) return; // drag = steer the whisperer; override already fed by move events
+  // tap
+  var nowStep = stepCount;
+  if (lastTap && nowStep - lastTap.step < 42) {  // double-tap within ~0.35 s
+    events.push({ step: nowStep, type: 'newVenue' });
+    lastTap = null;
+    return;
+  }
+  lastTap = { step: nowStep };
+  var fi = nearestFigure(wx, wy);
+  if (fi >= 0) events.push({ step: nowStep, type: 'forceBeacon', fig: fi });
+}
+if (typeof window !== 'undefined') {
+  canvas.addEventListener('pointerdown', onDown);
+  canvas.addEventListener('pointermove', onMove);
+  canvas.addEventListener('pointerup', onUp);
+  canvas.addEventListener('pointercancel', function () { pDown = null; });
+}
+
+// ---------- drawing ----------
+function rr(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function draw() {
+  canvas.style.width = viewW + 'px';
+  canvas.style.height = viewH + 'px';
+  var t = simT;
+  var v = viewTransform();
+  ctx.fillStyle = GROUND;
+  ctx.fillRect(0, 0, viewW, viewH);
+  ctx.save();
+  ctx.translate(v.ox, v.oy);
+  ctx.scale(v.s, v.s);
+
+  // venue dim-in (brief, right after a reseed)
+  var venueAge = t - Math.floor(t / 240) * 240;
+
+  // whisperer route trace: the only continuous line
+  if (sim.trace.length > 1) {
+    ctx.strokeStyle = RED;
+    ctx.lineWidth = 1.4;
+    ctx.lineCap = 'round';
+    for (var i = 1; i < sim.trace.length; i++) {
+      var a = 0.16 * (1 - (t - sim.trace[i].t) / 55);
+      if (a <= 0.004) continue;
+      ctx.globalAlpha = a;
+      ctx.beginPath();
+      ctx.moveTo(sim.trace[i - 1].x, sim.trace[i - 1].y);
+      ctx.lineTo(sim.trace[i].x, sim.trace[i].y);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // beacon rings
+  for (var b = 0; b < sim.figures.length; b++) {
+    var bf = sim.figures[b];
+    if (bf.beaconStart < 0) continue;
+    var bp2 = figPos(bf, t);
+    var prog = (t - bf.beaconStart) / bf.beaconDur;
+    if (prog < 0 || prog > 1) continue;
+    ctx.globalAlpha = 0.15 * (1 - prog * 0.65);
+    ctx.strokeStyle = BEACON;
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    ctx.arc(bp2[0], bp2[1], 6 + prog * 52, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.globalAlpha = 0.15 * (1 - prog) * 0.7;
+    ctx.beginPath();
+    ctx.arc(bp2[0], bp2[1], 6 + prog * 34, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  // figures: head dot over rounded body rect (seated, serene)
+  for (var f = 0; f < sim.figures.length; f++) {
+    var fp = figPos(sim.figures[f], t);
+    ctx.fillStyle = BODY;
+    rr(fp[0] - 9, fp[1] - 1, 18, 14, 6);
+    ctx.fill();
+    ctx.fillStyle = HEAD;
+    ctx.beginPath();
+    ctx.arc(fp[0], fp[1] - 6, 4.6, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // leaked glyphs (amber data rising and fading)
+  for (var g = 0; g < sim.glyphs.length; g++) {
+    var gl = sim.glyphs[g];
+    var age = t - gl.t0;
+    if (age < 0) continue;
+    var gx = gl.x + gl.vx * age + Math.sin(age * 1.7 + gl.seed) * 3;
+    var gy = gl.y + gl.vy * age;
+    var fade = age < 0.5 ? age / 0.5 : 1 - Math.max(0, (age - gl.life * 0.55) / (gl.life * 0.45));
+    ctx.globalAlpha = Math.max(0, Math.min(1, fade)) * 0.85;
+    ctx.strokeStyle = AMBER;
+    ctx.fillStyle = AMBER;
+    ctx.lineWidth = 1.3;
+    if (gl.kind === 0) {
+      ctx.beginPath();
+      ctx.arc(gx, gy, gl.size * 0.55, 0, Math.PI * 2);
+      ctx.fill();
+    } else if (gl.kind === 1) {
+      ctx.beginPath();
+      ctx.moveTo(gx - gl.size, gy + gl.size * 0.4);
+      ctx.lineTo(gx + gl.size * 0.4, gy - gl.size);
+      ctx.stroke();
+    } else {
+      ctx.beginPath();
+      ctx.arc(gx, gy, gl.size, gl.seed, gl.seed + Math.PI * 1.25);
+      ctx.stroke();
+    }
+  }
+  ctx.globalAlpha = 1;
+
+  // siphon spirals: captured rings contracting into the whisperer
+  for (var s2 = 0; s2 < sim.spirals.length; s2++) {
+    var sp2 = sim.spirals[s2];
+    var p = (t - sp2.t0) / 1.5;
+    if (p < 0 || p > 1) continue;
+    var cx = sp2.fx + (sim.wx - sp2.fx) * p;
+    var cy = sp2.fy + (sim.wy - sp2.fy) * p;
+    var R = 42 * (1 - p) + 5;
+    ctx.globalAlpha = 0.7 * (1 - p * 0.35);
+    ctx.strokeStyle = RED;
+    ctx.lineWidth = 1.8;
+    ctx.beginPath();
+    var turns = 2.6;
+    for (var q = 0; q <= 60; q++) {
+      var u = q / 60;
+      var ang = sp2.t0 * 2 + u * turns * Math.PI * 2 + p * 4;
+      var rad = R * (1 - u * 0.82);
+      var X = cx + Math.cos(ang) * rad, Y = cy + Math.sin(ang) * rad;
+      if (q === 0) ctx.moveTo(X, Y); else ctx.lineTo(X, Y);
+    }
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  // the whisperer: hollow red circle with one ear-arc
+  var headAng = Math.atan2(sim.wvy, sim.wvx);
+  if (Math.abs(sim.wvx) + Math.abs(sim.wvy) < 0.01) headAng = -Math.PI / 2;
+  ctx.strokeStyle = RED;
+  ctx.lineWidth = 2;
+  ctx.globalAlpha = 0.95;
+  ctx.beginPath();
+  ctx.arc(sim.wx, sim.wy, 15, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.lineWidth = 1.7;
+  ctx.beginPath();
+  ctx.arc(sim.wx, sim.wy, 8, headAng - 0.9, headAng + 0.9);
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+
+  ctx.restore();
+
+  // venue-change dim veil (first 0.9 s of a venue)
+  if (venueAge < 0.9) {
+    ctx.fillStyle = GROUND;
+    ctx.globalAlpha = 0.55 * (1 - venueAge / 0.9);
+    ctx.fillRect(0, 0, viewW, viewH);
+    ctx.globalAlpha = 1;
+  }
+}
+
+// ---------- run ----------
+// Pre-roll: exactly 3600 fixed steps so frame one is mid-venue.
+for (var pr = 0; pr < 3600; pr++) stepSim();
+draw();
+
+var lastMs = null;
+function frame(nowMs) {
+  if (lastMs === null) lastMs = nowMs;
+  var dt = (nowMs - lastMs) / 1000;
+  lastMs = nowMs;
+  if (dt > 0.25) dt = 0.25;
+  var n = Math.floor(dt / STEP);
+  if (n > 30) n = 30;
+  for (var i = 0; i < n; i++) stepSim();
+  draw();
+  window.requestAnimationFrame(frame);
+}
+if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
+  window.requestAnimationFrame(frame);
+}
+</script>
+</body>
+</html>

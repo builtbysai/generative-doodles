@@ -1,0 +1,707 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Follow Everyone</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #101116; overflow: hidden; height: 100%; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+/* Follow Everyone - No.970 (study #119 kyle-mcdonald, PP131 "Exhausting a Crowd")
+   A plaza from above. Forty anonymous walkers cross in seeded streams while
+   glyph-tags - bubbles of invented strokes, never words - attach above them,
+   drift with them, then detach and slide down into an archive ticker along
+   the bottom: the poem of the plaza, written by everyone. A bus periodically
+   disgorges eight more walkers. Fixed-step sim (120 Hz), seeded, so frame
+   one (after exactly 3600 pre-roll steps) is deterministic. */
+
+// ---------- seeded RNG (mulberry32) ----------
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// ---------- palette ----------
+var GROUND = '#101116', PAVING = '#1E2129', WALKER = '#C9CFDB', BUSC = '#FFC44F';
+var BUBBLE_FILL = '#0B0C10', GLYPH = '#F5F2EA';
+var CYAN = [79, 214, 255];
+var ARCH_A = [58, 64, 80], ARCH_B = [30, 33, 41];   // archive fade #3A4050 -> #1E2129
+function rgba(c, a) { return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a + ')'; }
+function lerpC(a, b, t) {
+  return [Math.round(a[0] + (b[0] - a[0]) * t),
+          Math.round(a[1] + (b[1] - a[1]) * t),
+          Math.round(a[2] + (b[2] - a[2]) * t)];
+}
+function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+function smooth(t) { return t * t * (3 - 2 * t); }
+
+// ---------- constants ----------
+var DT = 1 / 120;                  // fixed sim step
+var MASTER_SEED = 970131;
+var DAY_LEN = 300;                 // a new day every ~5 minutes
+var TAG_TARGET = 20;               // live tags hover in the 15-25 band
+var ARCH_SLOT = 0.060;             // archive slot pitch, stage-width fraction
+var ARCH_MINI = 0.050;             // archive mini bubble width, stage fraction
+
+// ---------- sim state ----------
+var masterRng = mulberry32(MASTER_SEED);
+var dayRng = mulberry32(1);
+var simTime = 0, dayTime = 0, generation = 0;
+var agents = [];                   // walkers
+var tags = [];                     // live + detaching tags
+var archive = [];                  // {seed, glyphs, born, xf} ticker items
+var bus = null;
+var attachTimer = 0;
+var nextAgentId = 1;
+var pendingSounds = [];            // sound cues raised by the sim, drained live
+var lastTickSecond = -1;
+var eventQueue = [];
+
+// ---------- glyphs: invented strokes, never words ----------
+function makeGlyphs(seed) {
+  var r = mulberry32(seed);
+  var n = 1 + Math.floor(r() * 3);            // 1-3 glyphs per tag
+  var gs = [];
+  for (var i = 0; i < n; i++) {
+    gs.push({
+      type: Math.floor(r() * 10),
+      dx: (i - (n - 1) / 2) * 0.30,           // slot offset, bubble-width fraction
+      sc: 0.8 + r() * 0.4,
+      rot: (r() - 0.5) * 0.7,
+      ph: r() * 6.283
+    });
+  }
+  return gs;
+}
+
+// ---------- agents ----------
+function edgePoint(r) {
+  var e = Math.floor(r() * 4), t = r();
+  if (e === 0) return { x: t, y: -0.02 };
+  if (e === 1) return { x: 1.02, y: t };
+  if (e === 2) return { x: t, y: 1.02 };
+  return { x: -0.02, y: t };
+}
+function exitTarget(r, fromEdgePt) {
+  var p = edgePoint(r);
+  var guard = 0;
+  while (Math.abs(p.x - fromEdgePt.x) < 0.3 && Math.abs(p.y - fromEdgePt.y) < 0.3 && guard++ < 8) p = edgePoint(r);
+  return p;
+}
+function newCommuter(temp) {
+  var entry = edgePoint(dayRng);
+  return {
+    id: nextAgentId++, kind: 'com', temp: !!temp, alive: true,
+    x: entry.x, y: entry.y,
+    tx: 0, ty: 0, speed: 0.040 + dayRng() * 0.022,
+    phase: dayRng() * 6.283, tag: null
+  };
+}
+function newLoiterer() {
+  var ax = 0.12 + dayRng() * 0.76, ay = 0.12 + dayRng() * 0.76;
+  return {
+    id: nextAgentId++, kind: 'loi', temp: false, alive: true,
+    x: ax, y: ay, ax: ax, ay: ay,
+    la: 0.5 + dayRng() * 0.7, lb: 0.4 + dayRng() * 0.7,
+    lp1: dayRng() * 6.283, lp2: dayRng() * 6.283,
+    lr1: 0.03 + dayRng() * 0.05, lr2: 0.03 + dayRng() * 0.05,
+    speed: 0.030 + dayRng() * 0.015, tag: null
+  };
+}
+function spawnDay() {
+  agents = []; tags = []; archive = [];
+  var i, a;
+  for (i = 0; i < 28; i++) {
+    a = newCommuter(false);
+    // scatter commuters through the plaza so frame one is already busy
+    a.x = dayRng(); a.y = dayRng();
+    var t = exitTarget(dayRng, a); a.tx = t.x; a.ty = t.y;
+    agents.push(a);
+  }
+  for (i = 0; i < 12; i++) agents.push(newLoiterer());
+  bus = { state: 'away', t: 0, nextAt: 24, spawned: 0, x: -0.15 };
+  attachTimer = 0.3;
+  // a first handful of tags so the plaza opens mid-conversation
+  var tagged = 0;
+  for (i = 0; i < agents.length && tagged < 11; i++) {
+    if (dayRng() < 0.45) { attachTag(agents[i], true); tagged++; }
+  }
+}
+
+// ---------- tags ----------
+function attachTag(agent, opening) {
+  var seed = Math.floor(dayRng() * 2147483646) + 1;
+  var tag = {
+    seed: seed, glyphs: makeGlyphs(seed), agent: agent,
+    state: 'in', t: 0, life: 9 + dayRng() * 11,
+    bob: dayRng() * 6.283, sx: 0, sy: 0
+  };
+  if (opening) { tag.state = 'live'; tag.t = 0.5 + dayRng() * 4; }
+  agent.tag = tag;
+  tags.push(tag);
+  pendingSounds.push({ type: 'pop' });
+  return tag;
+}
+function startDetach(tag) {
+  // bubble center in stage fractions, captured from the agent it rode
+  tag.sx = tag.agent.x;
+  tag.sy = tag.agent.y * 0.9 - 0.048;
+  tag.state = 'out'; tag.t = 0;
+  if (tag.agent) tag.agent.tag = null;
+  tag.agent = null;
+}
+function finishDetach(tag) {
+  archive.push({ seed: tag.seed, glyphs: tag.glyphs, born: simTime, xf: 1 - ARCH_MINI / 2 });
+  var cap = Math.floor(1 / ARCH_SLOT);
+  while (archive.length > cap) archive.shift();
+}
+
+// ---------- bus ----------
+function stepBus() {
+  bus.t += DT;
+  if (bus.state === 'away') {
+    if (dayTime >= bus.nextAt) { bus.state = 'arrive'; bus.t = 0; pendingSounds.push({ type: 'bus' }); }
+  } else if (bus.state === 'arrive') {
+    var p = clamp(bus.t / 2.5, 0, 1);
+    bus.x = -0.15 + (0.004 + 0.15) * smooth(p);
+    if (p >= 1) { bus.state = 'dwell'; bus.t = 0; bus.spawned = 0; }
+  } else if (bus.state === 'dwell') {
+    if (bus.spawned < 8 && bus.t >= bus.spawned * 0.5) {
+      var a = {
+        id: nextAgentId++, kind: 'ride', temp: true, alive: true,
+        x: 0.145, y: 0.50 + (dayRng() - 0.5) * 0.03,
+        tx: 0.25 + dayRng() * 0.6, ty: 0.15 + dayRng() * 0.7,
+        speed: 0.045 + dayRng() * 0.02, phase: dayRng() * 6.283, tag: null
+      };
+      agents.push(a);
+      bus.spawned++;
+      pendingSounds.push({ type: 'pop' });
+    }
+    if (bus.t >= 4.5) { bus.state = 'depart'; bus.t = 0; }
+  } else if (bus.state === 'depart') {
+    var q = clamp(bus.t / 2.5, 0, 1);
+    bus.x = 0.004 - 0.154 * smooth(q);
+    if (q >= 1) { bus.state = 'away'; bus.t = 0; bus.nextAt = dayTime + 68 + dayRng() * 8; }
+  }
+}
+
+// ---------- sim step ----------
+function stepSim() {
+  simTime += DT; dayTime += DT;
+
+  // archive ticker typewriter clack, every ~4 s
+  var sec = Math.floor(simTime / 4);
+  if (sec !== lastTickSecond) { lastTickSecond = sec; pendingSounds.push({ type: 'tick' }); }
+
+  // agents
+  var i, a;
+  for (i = 0; i < agents.length; i++) {
+    a = agents[i];
+    if (!a.alive) continue;
+    if (a.kind === 'loi') {
+      var gx = a.ax + Math.sin(simTime * a.la + a.lp1) * a.lr1;
+      var gy = a.ay + Math.cos(simTime * a.lb + a.lp2) * a.lr2;
+      var dx = gx - a.x, dy = gy - a.y, d = Math.sqrt(dx * dx + dy * dy);
+      if (d > 0.001) {
+        var sp = a.speed * Math.min(1, d / 0.02);
+        a.x += dx / d * sp * DT; a.y += dy / d * sp * DT;
+      }
+    } else {
+      var mx = a.tx - a.x, my = a.ty - a.y, md = Math.sqrt(mx * mx + my * my);
+      if (md < 0.006) {
+        if (a.kind === 'ride') {
+          a.kind = 'com';
+          var t1 = exitTarget(dayRng, a); a.tx = t1.x; a.ty = t1.y;
+        } else if (a.temp) {
+          a.alive = false;
+          if (a.tag) startDetach(a.tag);
+        } else {
+          var en = edgePoint(dayRng);
+          a.x = en.x; a.y = en.y;
+          var t2 = exitTarget(dayRng, en); a.tx = t2.x; a.ty = t2.y;
+        }
+      } else {
+        var ux = mx / md, uy = my / md;
+        // gentle seeded wobble across the line of walk
+        var wob = Math.sin(simTime * 0.9 + a.phase) * 0.010;
+        a.x += (ux + -uy * wob) * a.speed * DT;
+        a.y += (uy + ux * wob) * a.speed * DT;
+      }
+    }
+  }
+  // sweep the departed
+  for (i = agents.length - 1; i >= 0; i--) if (!agents[i].alive) agents.splice(i, 1);
+
+  stepBus();
+
+  // tag attach manager
+  attachTimer -= DT;
+  if (attachTimer <= 0) {
+    attachTimer = 0.8;
+    var live = 0, j;
+    for (j = 0; j < tags.length; j++) if (tags[j].state !== 'out') live++;
+    if (live < TAG_TARGET) {
+      var free = [];
+      for (j = 0; j < agents.length; j++) if (!agents[j].tag) free.push(agents[j]);
+      if (free.length) attachTag(free[Math.floor(dayRng() * free.length)], false);
+    }
+  }
+  // tag lifecycle
+  for (i = tags.length - 1; i >= 0; i--) {
+    var tg = tags[i];
+    tg.t += DT;
+    if (tg.state === 'in' && tg.t >= 0.5) tg.state = 'live';
+    else if (tg.state === 'live' && tg.t >= tg.life) startDetach(tg);
+    else if (tg.state === 'out' && tg.t >= 1.6) { finishDetach(tg); tags.splice(i, 1); }
+  }
+  // archive slots ease leftward as newer bubbles arrive
+  for (i = 0; i < archive.length; i++) {
+    var slotC = 1 - (archive.length - 1 - i) * ARCH_SLOT - ARCH_MINI / 2;
+    var mv = slotC - archive[i].xf;
+    var maxStep = 0.25 * DT;
+    archive[i].xf += clamp(mv, -maxStep, maxStep);
+  }
+
+  if (dayTime >= DAY_LEN) newDay();
+}
+
+function newDay() {
+  generation++;
+  dayRng = mulberry32(Math.floor(masterRng() * 2147483646) + 1);
+  dayTime = 0;
+  spawnDay();
+}
+
+// ---------- pointer events (queued, consumed by sim timestamp) ----------
+function applyEvent(ev) {
+  if (ev.type === 'annotate') {
+    var best = null, bd = 0.055;
+    for (var i = 0; i < agents.length; i++) {
+      var a = agents[i];
+      var dx = a.x - ev.x, dy = a.y - ev.y, d = Math.sqrt(dx * dx + dy * dy);
+      if (d < bd && !a.tag) { bd = d; best = a; }
+    }
+    if (!best) { // nearest tagged agent still gets a fresh tag swapped in
+      for (var j = 0; j < agents.length; j++) {
+        var b = agents[j];
+        var ex = b.x - ev.x, ey = b.y - ev.y, ed = Math.sqrt(ex * ex + ey * ey);
+        if (ed < 0.055) { best = b; break; }
+      }
+      if (best && best.tag) { // retire the old tag to the archive early
+        var old = best.tag; old.state = 'live'; old.t = Math.max(old.t, old.life);
+        startDetach(old);
+      }
+    }
+    if (best) attachTag(best, false);
+  } else if (ev.type === 'newday') {
+    newDay();
+  }
+}
+function drainEvents() {
+  eventQueue.sort(function (p, q) { return p.at - q.at; });
+  while (eventQueue.length && eventQueue[0].at <= simTime) applyEvent(eventQueue.shift());
+}
+
+// ---------- canvas / layout ----------
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var W = 0, H = 0, DPR = 1, stage = 0, ox = 0, oy = 0, isPhone = false;
+var plazaH = 0, tickTop = 0, tickMid = 0;
+
+function resize() {
+  var vv = (typeof window !== 'undefined' && window.visualViewport) ? window.visualViewport : null;
+  W = vv ? vv.width : window.innerWidth;
+  H = vv ? vv.height : window.innerHeight;
+  DPR = Math.min(2, (typeof window !== 'undefined' && window.devicePixelRatio) || 1);
+  canvas.width = Math.round(W * DPR); canvas.height = Math.round(H * DPR);
+  var sw = (typeof window !== 'undefined' && window.screen) ? window.screen : null;
+  isPhone = !!((sw && Math.min(sw.width, sw.height) < 700) || H > W * 1.15);
+  stage = Math.min(W, H);
+  ox = (W - stage) / 2; oy = (H - stage) / 2;
+  plazaH = stage * 0.9;
+  tickTop = oy + plazaH;
+  tickMid = tickTop + stage * 0.05;
+}
+if (typeof window !== 'undefined') {
+  window.addEventListener('resize', function () { resize(); draw(); });
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { resize(); draw(); });
+  }
+}
+
+function rr(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y); ctx.arcTo(x + w, y, x + w, y + r, r);
+  ctx.lineTo(x + w, y + h - r); ctx.arcTo(x + w, y + h, x + w - r, y + h, r);
+  ctx.lineTo(x + r, y + h); ctx.arcTo(x, y + h, x, y + h - r, r);
+  ctx.lineTo(x, y + r); ctx.arcTo(x, y, x + r, y, r);
+  ctx.closePath();
+}
+
+// one invented glyph, centered at (cx, cy), half-size s
+function drawGlyph(g, cx, cy, s) {
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(g.rot);
+  ctx.scale(g.sc, g.sc);
+  ctx.beginPath();
+  var t = g.type;
+  if (t === 0) { ctx.moveTo(-s, 0); ctx.lineTo(s, 0); }
+  else if (t === 1) { ctx.moveTo(0, -s); ctx.lineTo(0, s); }
+  else if (t === 2) { ctx.moveTo(-s, s * 0.7); ctx.lineTo(s, -s * 0.7); }
+  else if (t === 3) { ctx.arc(0, s * 0.2, s * 0.85, Math.PI, 0); }
+  else if (t === 4) { /* dots handled below */ }
+  else if (t === 5) {
+    ctx.moveTo(-s, s * 0.5); ctx.lineTo(-s * 0.35, -s * 0.5);
+    ctx.lineTo(s * 0.35, s * 0.5); ctx.lineTo(s, -s * 0.5);
+  } else if (t === 6) { ctx.arc(0, 0, s * 0.7, 0, 6.2832); }
+  else if (t === 7) {
+    ctx.moveTo(-s * 0.7, -s * 0.7); ctx.lineTo(s * 0.7, s * 0.7);
+    ctx.moveTo(s * 0.7, -s * 0.7); ctx.lineTo(-s * 0.7, s * 0.7);
+  } else if (t === 8) {
+    ctx.moveTo(-s, 0);
+    ctx.quadraticCurveTo(-s * 0.5, -s, 0, 0);
+    ctx.quadraticCurveTo(s * 0.5, s, s, 0);
+  } else {
+    ctx.moveTo(-s * 0.6, s * 0.8); ctx.lineTo(-s * 0.6, -s * 0.4);
+    ctx.arc(0, -s * 0.4, s * 0.6, Math.PI, 0);
+  }
+  if (t === 4) {
+    ctx.fillStyle = GLYPH;
+    var offs = [[-0.55, 0.3], [0, -0.45], [0.55, 0.3]];
+    for (var i = 0; i < 3; i++) {
+      ctx.beginPath();
+      ctx.arc(offs[i][0] * s, offs[i][1] * s, s * 0.22, 0, 6.2832);
+      ctx.fill();
+    }
+  } else {
+    ctx.strokeStyle = GLYPH;
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawBubble(cx, cy, w, h, glyphs, alpha, scale, outline) {
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.translate(cx, cy);
+  ctx.scale(scale, scale);
+  rr(-w / 2, -h / 2, w, h, h * 0.28);
+  ctx.fillStyle = BUBBLE_FILL;
+  ctx.fill();
+  ctx.strokeStyle = outline;
+  ctx.lineWidth = Math.max(1, stage / 720 * 1.4);
+  ctx.stroke();
+  // little tail pointing down at the walker
+  ctx.beginPath();
+  ctx.moveTo(-w * 0.07, h / 2 - 1);
+  ctx.lineTo(0, h / 2 + h * 0.22);
+  ctx.lineTo(w * 0.07, h / 2 - 1);
+  ctx.closePath();
+  ctx.fillStyle = BUBBLE_FILL;
+  ctx.fill();
+  ctx.strokeStyle = outline;
+  ctx.stroke();
+  ctx.lineWidth = Math.max(1, stage / 720 * 1.5);
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  var gs = Math.min(w, h) * 0.21;
+  for (var i = 0; i < glyphs.length; i++) {
+    drawGlyph(glyphs[i], glyphs[i].dx * w, 0, gs);
+  }
+  ctx.restore();
+}
+
+// ---------- draw ----------
+var followAgent = null, followPt = null;
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+  var u = stage / 720;
+  ctx.fillStyle = GROUND;
+  ctx.fillRect(0, 0, W, H);
+
+  // paving: large abstract tiles
+  ctx.strokeStyle = PAVING;
+  ctx.lineWidth = Math.max(1, 1.6 * u);
+  ctx.beginPath();
+  var k;
+  for (k = 0; k <= 6; k++) {
+    var gx = ox + stage * k / 6;
+    ctx.moveTo(gx, oy); ctx.lineTo(gx, oy + plazaH);
+  }
+  for (k = 0; k <= 5; k++) {
+    var gy = oy + plazaH * k / 5;
+    ctx.moveTo(ox, gy); ctx.lineTo(ox + stage, gy);
+  }
+  ctx.stroke();
+  // ticker separator
+  ctx.beginPath();
+  ctx.moveTo(ox, tickTop); ctx.lineTo(ox + stage, tickTop);
+  ctx.stroke();
+
+  // archive ticker: the poem so far, fading as it scrolls
+  for (var i = 0; i < archive.length; i++) {
+    var it = archive[i];
+    var age = clamp((simTime - it.born) / 75, 0, 1);
+    var oc = lerpC(ARCH_A, ARCH_B, age);
+    var cxp = ox + it.xf * stage;
+    var mw = ARCH_MINI * stage, mh = stage * 0.055;
+    ctx.save();
+    ctx.globalAlpha = 0.95 - age * 0.45;
+    rr(cxp - mw / 2, tickMid - mh / 2, mw, mh, mh * 0.28);
+    ctx.fillStyle = BUBBLE_FILL;
+    ctx.fill();
+    ctx.strokeStyle = rgba(oc, 0.9);
+    ctx.lineWidth = Math.max(1, 1.1 * u);
+    ctx.stroke();
+    ctx.globalAlpha = (0.95 - age * 0.45) * (0.85 - age * 0.5);
+    ctx.lineWidth = Math.max(1, 1.2 * u);
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    for (var gi = 0; gi < it.glyphs.length; gi++) {
+      drawGlyph(it.glyphs[gi], cxp + it.glyphs[gi].dx * mw, tickMid, Math.min(mw, mh) * 0.20);
+    }
+    ctx.restore();
+  }
+
+  // bus at the left-edge stop
+  if (bus && bus.state !== 'away') {
+    var bw = 0.135 * stage, bh = 0.070 * plazaH;
+    var bx = ox + bus.x * stage, by = oy + 0.52 * plazaH - bh / 2;
+    rr(bx, by, bw, bh, 6 * u);
+    ctx.fillStyle = BUSC;
+    ctx.fill();
+    ctx.fillStyle = 'rgba(16,17,22,0.55)';
+    for (var wi = 0; wi < 4; wi++) {
+      ctx.fillRect(bx + bw * (0.08 + wi * 0.22), by + bh * 0.16, bw * 0.15, bh * 0.30);
+    }
+    ctx.fillStyle = '#101116';
+    ctx.beginPath();
+    ctx.arc(bx + bw * 0.22, by + bh, 4.4 * u, 0, 6.2832);
+    ctx.arc(bx + bw * 0.78, by + bh, 4.4 * u, 0, 6.2832);
+    ctx.fill();
+  }
+
+  // walkers
+  for (var ai = 0; ai < agents.length; ai++) {
+    var a = agents[ai];
+    ctx.globalAlpha = a.kind === 'loi' ? 0.72 : 0.95;
+    ctx.fillStyle = WALKER;
+    ctx.beginPath();
+    ctx.arc(ox + a.x * stage, oy + a.y * plazaH, 3.6 * u, 0, 6.2832);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // tags ride above their walkers; detached tags slide to the ticker
+  var bwub = 54 * u, hub = 34 * u;
+  for (var ti = 0; ti < tags.length; ti++) {
+    var tg = tags[ti];
+    var alpha = 1, scale = 1, cx2, cy2;
+    if (tg.state === 'out') {
+      var p2 = smooth(clamp(tg.t / 1.6, 0, 1));
+      cx2 = ox + (tg.sx + (1 - ARCH_MINI / 2 - tg.sx) * p2) * stage;
+      cy2 = oy + (tg.sy + (0.95 - tg.sy) * p2) * stage;
+      scale = 1 - p2 * 0.42;
+      alpha = tg.t > 1.15 ? 1 - (tg.t - 1.15) / 0.45 : 1;
+    } else {
+      var bob = Math.sin(simTime * 1.3 + tg.bob) * 2 * u;
+      cx2 = ox + tg.agent.x * stage;
+      cy2 = oy + tg.agent.y * plazaH - 17 * u - hub / 2 + bob;
+      if (tg.state === 'in') {
+        var ip = clamp(tg.t / 0.5, 0, 1);
+        scale = 0.6 + 0.4 * smooth(ip);
+        alpha = ip;
+      }
+    }
+    drawBubble(cx2, cy2, bwub, hub, tg.glyphs, alpha, scale, rgba(CYAN, 0.8));
+  }
+
+  // the follow line: click and follow, made literal
+  if (followAgent && followAgent.alive && followPt) {
+    ctx.strokeStyle = rgba(CYAN, 0.6);
+    ctx.lineWidth = Math.max(1, 1.5 * u);
+    ctx.beginPath();
+    ctx.moveTo(followPt.x, followPt.y);
+    ctx.lineTo(ox + followAgent.x * stage, oy + followAgent.y * plazaH);
+    ctx.stroke();
+    ctx.fillStyle = rgba(CYAN, 0.9);
+    ctx.beginPath();
+    ctx.arc(ox + followAgent.x * stage, oy + followAgent.y * plazaH, 6.5 * u, 0, 6.2832);
+    ctx.strokeStyle = rgba(CYAN, 0.9);
+    ctx.stroke();
+  }
+}
+
+// ---------- audio (lazy, guarded; silent in the QA renderer) ----------
+var AC = null, masterGain = null, audioRng = mulberry32(4242);
+function ensureAudio() {
+  if (AC) { if (AC.resume) AC.resume(); return; }
+  var Ctor = (typeof window !== 'undefined') && (window.AudioContext || window.webkitAudioContext);
+  if (!Ctor) return;
+  try {
+    AC = new Ctor();
+    masterGain = AC.createGain();
+    masterGain.gain.value = 0.5;
+    masterGain.connect(AC.destination);
+    // street bed: looped filtered noise, low city wash
+    var len = AC.sampleRate * 2;
+    var buf = AC.createBuffer(1, len, AC.sampleRate);
+    var ch = buf.getChannelData(0);
+    var last = 0;
+    for (var i = 0; i < len; i++) {
+      var white = audioRng() * 2 - 1;
+      last = last * 0.96 + white * 0.04;
+      ch[i] = last * 2.4;
+    }
+    var src = AC.createBufferSource();
+    src.buffer = buf; src.loop = true;
+    var lp = AC.createBiquadFilter();
+    lp.type = 'lowpass'; lp.frequency.value = 420;
+    var bedGain = AC.createGain();
+    bedGain.gain.value = 0.05;
+    src.connect(lp); lp.connect(bedGain); bedGain.connect(masterGain);
+    src.start();
+  } catch (e) { AC = null; }
+}
+function blip(freq, dur, vol, when) {
+  if (!AC) return;
+  try {
+    var t0 = AC.currentTime + (when || 0);
+    var o = AC.createOscillator(), g = AC.createGain();
+    o.type = 'sine';
+    o.frequency.setValueAtTime(freq, t0);
+    o.frequency.exponentialRampToValueAtTime(freq * 1.35, t0 + dur);
+    g.gain.setValueAtTime(0, t0);
+    g.gain.linearRampToValueAtTime(vol, t0 + 0.012);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    o.connect(g); g.connect(masterGain);
+    o.start(t0); o.stop(t0 + dur + 0.05);
+  } catch (e) {}
+}
+function clack() {
+  if (!AC) return;
+  try {
+    var t0 = AC.currentTime;
+    var o = AC.createOscillator(), g = AC.createGain();
+    o.type = 'square';
+    o.frequency.value = 1900 + audioRng() * 500;
+    g.gain.setValueAtTime(0.018, t0);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.045);
+    o.connect(g); g.connect(masterGain);
+    o.start(t0); o.stop(t0 + 0.06);
+  } catch (e) {}
+}
+function rumble() {
+  if (!AC) return;
+  try {
+    var t0 = AC.currentTime;
+    var o = AC.createOscillator(), g = AC.createGain();
+    o.type = 'triangle';
+    o.frequency.setValueAtTime(52, t0);
+    o.frequency.linearRampToValueAtTime(38, t0 + 1.6);
+    g.gain.setValueAtTime(0, t0);
+    g.gain.linearRampToValueAtTime(0.10, t0 + 0.3);
+    g.gain.linearRampToValueAtTime(0.0, t0 + 1.8);
+    o.connect(g); g.connect(masterGain);
+    o.start(t0); o.stop(t0 + 1.9);
+  } catch (e) {}
+}
+function drainSounds() {
+  if (!AC) { pendingSounds.length = 0; return; }
+  for (var i = 0; i < pendingSounds.length; i++) {
+    var s = pendingSounds[i];
+    if (s.type === 'pop') blip(520 + audioRng() * 260, 0.09, 0.05);
+    else if (s.type === 'tick') clack();
+    else if (s.type === 'bus') rumble();
+  }
+  pendingSounds.length = 0;
+}
+
+// ---------- pointer interaction ----------
+var pDown = null, lastTapStamp = null;
+function nearestAgentPx(cx, cy) {
+  var best = null, bd = 36 * (stage / 720) + 10;
+  for (var i = 0; i < agents.length; i++) {
+    var a = agents[i];
+    var dx = ox + a.x * stage - cx, dy = oy + a.y * plazaH - cy;
+    var d = Math.sqrt(dx * dx + dy * dy);
+    if (d < bd) { bd = d; best = a; }
+  }
+  return best;
+}
+if (canvas && canvas.addEventListener) {
+  canvas.addEventListener('pointerdown', function (e) {
+    ensureAudio();
+    pDown = { x: e.clientX, y: e.clientY, t: e.timeStamp, moved: false, agent: nearestAgentPx(e.clientX, e.clientY) };
+    followPt = { x: e.clientX, y: e.clientY };
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (!pDown) return;
+    followPt = { x: e.clientX, y: e.clientY };
+    var dx = e.clientX - pDown.x, dy = e.clientY - pDown.y;
+    if (Math.sqrt(dx * dx + dy * dy) > 8) {
+      pDown.moved = true;
+      if (pDown.agent) followAgent = pDown.agent;
+    }
+  });
+  canvas.addEventListener('pointerup', function (e) {
+    if (!pDown) return;
+    if (pDown.moved) {
+      // it was a follow drag; the line simply lets go
+    } else if (e.timeStamp - pDown.t < 400) {
+      if (lastTapStamp !== null && e.timeStamp - lastTapStamp < 350) {
+        eventQueue.push({ at: simTime, type: 'newday' });
+        lastTapStamp = null;
+      } else {
+        var a = nearestAgentPx(e.clientX, e.clientY);
+        if (a) {
+          eventQueue.push({
+            at: simTime, type: 'annotate',
+            x: (e.clientX - ox) / stage, y: (e.clientY - oy) / plazaH
+          });
+        }
+        lastTapStamp = e.timeStamp;
+      }
+    }
+    followAgent = null; followPt = null;
+    pDown = null;
+  });
+}
+
+// ---------- boot: pre-roll exactly 3600 steps, draw frame one ----------
+resize();
+newDay();
+for (var k = 0; k < 3600; k++) stepSim();
+pendingSounds.length = 0;
+draw();
+
+// ---------- live loop (guarded; absent in the QA renderer) ----------
+if (typeof requestAnimationFrame === 'function') {
+  var lastTs = null, acc = 0;
+  var frame = function (ts) {
+    if (lastTs === null) lastTs = ts;
+    var dt = Math.min(0.25, (ts - lastTs) / 1000); lastTs = ts;
+    acc += dt;
+    var n = 0;
+    while (acc >= DT && n < 40) { drainEvents(); stepSim(); acc -= DT; n++; }
+    if (n === 40) acc = 0;
+    drainSounds();
+    draw();
+    requestAnimationFrame(frame);
+  };
+  requestAnimationFrame(frame);
+}
+</script>
+</body>
+</html>
