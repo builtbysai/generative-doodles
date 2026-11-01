@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Translation Chain</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #1C1A16; overflow: hidden; height: 100%; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---- invented glyph alphabet: 40 glyphs, each 2-4 abstract primitives ----
+  // Primitives are strokes, arcs, dots and ticks in unit coords. Nothing here
+  // is a letter in any alphabet; the alphabet is invented once per glyph id
+  // and reused identically every frame.
+  function glyphPrimitives(g) {
+    var rng = mulberry32(((g + 1) * 0x9E3779B9) >>> 0);
+    var n = 2 + Math.floor(rng() * 3);
+    var prims = [];
+    for (var i = 0; i < n; i++) {
+      var k = Math.floor(rng() * 4);
+      if (k === 0) {
+        prims.push({ k: 'line',
+          x1: 0.15 + rng() * 0.7, y1: 0.15 + rng() * 0.7,
+          x2: 0.15 + rng() * 0.7, y2: 0.15 + rng() * 0.7 });
+      } else if (k === 1) {
+        var a0 = rng() * Math.PI * 2;
+        prims.push({ k: 'arc', cx: 0.25 + rng() * 0.5, cy: 0.25 + rng() * 0.5,
+          r: 0.12 + rng() * 0.18, a0: a0, a1: a0 + 0.6 + rng() * 2.2 });
+      } else if (k === 2) {
+        prims.push({ k: 'dot', cx: 0.2 + rng() * 0.6, cy: 0.2 + rng() * 0.6,
+          r: 0.05 + rng() * 0.07 });
+      } else {
+        var tx = 0.2 + rng() * 0.6, ty = 0.2 + rng() * 0.6, s = 0.08 + rng() * 0.1;
+        prims.push({ k: 'tri', x1: tx, y1: ty - s, x2: tx - s, y2: ty + s, x3: tx + s, y3: ty + s });
+      }
+    }
+    return prims;
+  }
+  var GLYPHS = [];
+  for (var gi = 0; gi < 40; gi++) GLYPHS.push(glyphPrimitives(gi));
+
+  // Sample points along a glyph's primitives, in unit coords, for dithering.
+  function glyphSamples(g) {
+    var pts = [];
+    var prims = GLYPHS[g];
+    for (var i = 0; i < prims.length; i++) {
+      var p = prims[i];
+      if (p.k === 'line') {
+        for (var s = 0; s <= 12; s++) {
+          pts.push([p.x1 + (p.x2 - p.x1) * s / 12, p.y1 + (p.y2 - p.y1) * s / 12]);
+        }
+      } else if (p.k === 'arc') {
+        for (var a = 0; a <= 10; a++) {
+          var ang = p.a0 + (p.a1 - p.a0) * a / 10;
+          pts.push([p.cx + Math.cos(ang) * p.r, p.cy + Math.sin(ang) * p.r]);
+        }
+      } else if (p.k === 'dot') {
+        pts.push([p.cx, p.cy]); pts.push([p.cx, p.cy]);
+      } else {
+        pts.push([p.x1, p.y1]); pts.push([p.x2, p.y2]); pts.push([p.x3, p.y3]);
+      }
+    }
+    return pts;
+  }
+  var SAMPLES = [];
+  for (var si = 0; si < 40; si++) SAMPLES.push(glyphSamples(si));
+
+  // The glyph-string for string-index n: 14 invented glyphs, seeded.
+  function stringFor(n) {
+    var rng = mulberry32(((1346000 + n * 7919) >>> 0));
+    var s = [];
+    for (var i = 0; i < 14; i++) s.push(Math.floor(rng() * 40));
+    return s;
+  }
+  var STRING_CACHE = {};
+  function getString(n) {
+    if (!STRING_CACHE[n]) STRING_CACHE[n] = stringFor(n);
+    return STRING_CACHE[n];
+  }
+
+  // ---- conveyor: one band-height per 6 s step, 1 s ease, then settle ----
+  // S(t) is the scroll in band units. Bands are stream items: item m sits in
+  // string floor(m/5), medium mod(m,5). At t = 0, S = 0 and items 0..4 show
+  // string 0 in media photograph, workshop, sculpture, pad, thread.
+  function easeInOut(u) {
+    return u < 0.5 ? 4 * u * u * u : 1 - Math.pow(-2 * u + 2, 3) / 2;
+  }
+  function scrollAt(t) {
+    var step = Math.floor(t / 6);
+    var p = t - step * 6;
+    return step + (p < 1 ? easeInOut(p) : 1);
+  }
+
+  // ---- tap-to-freeze state (closed-form over recorded tap events) ----
+  var frozen = {}; // item m -> { y: frozenY, releasedAt: -1 | t, fromY }
+  var downPos = null;
+
+  function itemAtY(y, S, bandH) {
+    return Math.floor(y / bandH - S);
+  }
+
+  function drawGlyphStrokes(g, x, y, w, h, stroke, lw, alpha) {
+    var prims = GLYPHS[g];
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.strokeStyle = stroke;
+    ctx.fillStyle = stroke;
+    ctx.lineWidth = lw;
+    ctx.lineCap = 'round';
+    for (var i = 0; i < prims.length; i++) {
+      var p = prims[i];
+      ctx.beginPath();
+      if (p.k === 'line') {
+        ctx.moveTo(x + p.x1 * w, y + p.y1 * h);
+        ctx.lineTo(x + p.x2 * w, y + p.y2 * h);
+        ctx.stroke();
+      } else if (p.k === 'arc') {
+        ctx.moveTo(x + (p.cx + Math.cos(p.a0) * p.r) * w, y + (p.cy + Math.sin(p.a0) * p.r) * h);
+        ctx.arc(x + p.cx * w, y + p.cy * h, p.r * Math.min(w, h), p.a0, p.a1);
+        ctx.stroke();
+      } else if (p.k === 'dot') {
+        ctx.fillRect(x + (p.cx - p.r) * w, y + (p.cy - p.r) * h, p.r * 2 * w, p.r * 2 * h);
+      } else {
+        ctx.moveTo(x + p.x1 * w, y + p.y1 * h);
+        ctx.lineTo(x + p.x2 * w, y + p.y2 * h);
+        ctx.lineTo(x + p.x3 * w, y + p.y3 * h);
+        ctx.closePath();
+        ctx.stroke();
+      }
+    }
+    ctx.restore();
+  }
+
+  // Bayer 4x4 thresholds for the photograph dither.
+  var BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
+  function drawDither(g, gi, x, y, w, h, t, alphaScale) {
+    var pts = SAMPLES[g];
+    var dot = Math.max(2, w * 0.055);
+    for (var i = 0; i < pts.length; i++) {
+      var b = BAYER[(i + gi * 3) % 16] / 16;
+      var shade = Math.floor(58 + b * 125);
+      var shimmer = 0.82 + 0.18 * Math.sin(t * 1.7 + gi * 0.7 + i * 0.13);
+      ctx.save();
+      ctx.globalAlpha = alphaScale * shimmer;
+      ctx.fillStyle = 'rgb(' + shade + ',' + (shade - 6) + ',' + (shade - 16) + ')';
+      ctx.fillRect(x + pts[i][0] * w - dot / 2, y + pts[i][1] * h - dot / 2, dot, dot);
+      ctx.restore();
+    }
+  }
+
+  function bandCells(W, bandH) {
+    var cellW = W / 14;
+    var pad = bandH * 0.12;
+    return { cellW: cellW, cw: cellW * 0.8, ch: bandH - pad * 2, pad: pad };
+  }
+
+  function drawBand(m, med, n, y, W, bandH, t) {
+    var str = getString(n);
+    var cells = bandCells(W, bandH);
+    var cellW = cells.cellW, cw = cells.cw, ch = cells.ch, pad = cells.pad;
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, y, W, bandH);
+    ctx.clip();
+
+    if (med === 0) {
+      // (1) PHOTOGRAPH: glyphs as a grayscale dithered block.
+      ctx.fillStyle = '#232019';
+      ctx.fillRect(0, y, W, bandH);
+      for (var i = 0; i < 14; i++) {
+        var cx = i * cellW + (cellW - cw) / 2;
+        drawDither(str[i], i, cx, y + pad, cw, ch, t, 1);
+      }
+    } else if (med === 1) {
+      // (2) WORKSHOP: faint dither block under scattered annotation marks.
+      ctx.fillStyle = '#1C1A16';
+      ctx.fillRect(0, y, W, bandH);
+      for (var i2 = 0; i2 < 14; i2++) {
+        var cx2 = i2 * cellW + (cellW - cw) / 2;
+        drawDither(str[i2], i2, cx2, y + pad, cw, ch, t, 0.22);
+      }
+      var rng = mulberry32(((1346000 + n * 7919 + 555) >>> 0));
+      for (var j = 0; j < 14; j++) {
+        var gx = j * cellW + cellW / 2;
+        var gy = y + bandH / 2;
+        var r = cellW * (0.28 + rng() * 0.22);
+        var a0 = rng() * Math.PI * 2;
+        var a1 = a0 + 0.8 + rng() * 2.4;
+        ctx.save();
+        ctx.globalAlpha = 0.75 + 0.25 * Math.sin(t * 1.3 + j);
+        ctx.strokeStyle = '#C86A3A';
+        ctx.lineWidth = Math.max(1.5, cellW * 0.025);
+        ctx.beginPath();
+        ctx.moveTo(gx + Math.cos(a0) * r, gy + Math.sin(a0) * r);
+        ctx.arc(gx, gy, r, a0, a1);
+        ctx.stroke();
+        ctx.fillStyle = '#C86A3A';
+        ctx.fillRect(gx - 2, gy - 2, 4, 4);
+        ctx.restore();
+      }
+    } else if (med === 2) {
+      // (3) SCULPTURE: marks extruded as isometric blocks, sized by complexity.
+      ctx.fillStyle = '#1C1A16';
+      ctx.fillRect(0, y, W, bandH);
+      for (var k = 0; k < 14; k++) {
+        var g = str[k];
+        var cx3 = k * cellW + cellW / 2;
+        var bw = cellW * 0.55;
+        var bh = bandH * (0.16 + GLYPHS[g].length * 0.07);
+        var dep = cellW * 0.16;
+        var baseY = y + bandH * 0.82;
+        var topY = baseY - bh;
+        ctx.fillStyle = '#5C4E38';
+        ctx.beginPath();
+        ctx.moveTo(cx3 - bw / 2, topY);
+        ctx.lineTo(cx3 - bw / 2 + dep, topY - dep * 0.55);
+        ctx.lineTo(cx3 - bw / 2 + dep, baseY - dep * 0.55);
+        ctx.lineTo(cx3 - bw / 2, baseY);
+        ctx.closePath();
+        ctx.fill();
+        ctx.save();
+        ctx.globalAlpha = 0.6;
+        ctx.fillStyle = '#8A7A5C';
+        ctx.beginPath();
+        ctx.moveTo(cx3 + bw / 2, topY);
+        ctx.lineTo(cx3 + bw / 2 + dep, topY - dep * 0.55);
+        ctx.lineTo(cx3 + bw / 2 + dep, baseY - dep * 0.55);
+        ctx.lineTo(cx3 + bw / 2, baseY);
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
+        ctx.fillStyle = '#8A7A5C';
+        ctx.beginPath();
+        ctx.moveTo(cx3 - bw / 2, topY);
+        ctx.lineTo(cx3 - bw / 2 + dep, topY - dep * 0.55);
+        ctx.lineTo(cx3 + bw / 2 + dep, topY - dep * 0.55);
+        ctx.lineTo(cx3 + bw / 2, topY);
+        ctx.closePath();
+        ctx.fill();
+        ctx.fillStyle = '#5C4E38';
+        ctx.fillRect(cx3 - bw / 2, topY, bw, bh);
+      }
+    } else if (med === 3) {
+      // (4) LEGAL PAD: graphite sketch lines on yellow.
+      ctx.fillStyle = '#E8C96A';
+      ctx.fillRect(0, y, W, bandH);
+      ctx.strokeStyle = '#3A3A3E';
+      ctx.globalAlpha = 0.15;
+      ctx.lineWidth = 1;
+      for (var rl = 1; rl < 8; rl++) {
+        var ry = y + bandH * rl / 8;
+        ctx.beginPath();
+        ctx.moveTo(0, ry);
+        ctx.lineTo(W, ry);
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+      var jrng = mulberry32(((n * 7919 + 91) >>> 0));
+      for (var s = 0; s < 14; s++) {
+        var cx4 = s * cellW + (cellW - cw) / 2;
+        // Fixed per-glyph jitter: sketch strokes trace the skeleton twice.
+        var jx = (jrng() - 0.5) * cw * 0.06;
+        var jy = (jrng() - 0.5) * ch * 0.06;
+        drawGlyphStrokes(str[s], cx4 + jx, y + pad + jy, cw, ch, '#3A3A3E', Math.max(1.5, cellW * 0.02), 0.9);
+        drawGlyphStrokes(str[s], cx4 + 1, y + pad + 1, cw, ch, '#3A3A3E', Math.max(1, cellW * 0.012), 0.35);
+      }
+    } else {
+      // (5) THREAD: one continuous stitched curve in crimson through centroids.
+      ctx.fillStyle = '#1C1A16';
+      ctx.fillRect(0, y, W, bandH);
+      var pts = [];
+      for (var q = 0; q < 14; q++) {
+        pts.push([q * cellW + cellW / 2, y + bandH / 2 + Math.sin(q / 13 * Math.PI) * bandH * 0.12]);
+      }
+      ctx.save();
+      ctx.strokeStyle = '#A02C2C';
+      ctx.lineWidth = Math.max(2, cellW * 0.03);
+      ctx.setLineDash([9, 7]);
+      ctx.lineDashOffset = -((t * 14) % 16);
+      ctx.beginPath();
+      ctx.moveTo(pts[0][0], pts[0][1]);
+      for (var r2 = 1; r2 < pts.length; r2++) {
+        var mx = (pts[r2 - 1][0] + pts[r2][0]) / 2;
+        var my = (pts[r2 - 1][1] + pts[r2][1]) / 2;
+        ctx.quadraticCurveTo(pts[r2 - 1][0], pts[r2 - 1][1], mx, my);
+      }
+      ctx.lineTo(pts[13][0], pts[13][1]);
+      ctx.stroke();
+      ctx.restore();
+      ctx.fillStyle = '#A02C2C';
+      for (var d = 0; d < 14; d++) {
+        ctx.fillRect(pts[d][0] - 2, pts[d][1] - 2, 4, 4);
+      }
+    }
+
+    ctx.restore();
+  }
+
+  var W = 0, H = 0, pieceTime = 0;
+
+  function size() {
+    var vw = (window.visualViewport && window.visualViewport.width) || window.innerWidth;
+    var vh = (window.visualViewport && window.visualViewport.height) || window.innerHeight;
+    W = vw; H = vh;
+    canvas.width = vw;
+    canvas.height = vh;
+    canvas.style.width = vw + 'px';
+    canvas.style.height = vh + 'px';
+  }
+
+  function draw(t) {
+    pieceTime = t;
+    size();
+    var bandH = H / 5;
+    var S = scrollAt(t);
+    ctx.fillStyle = '#1C1A16';
+    ctx.fillRect(0, 0, W, H);
+
+    // Stream items whose bands overlap the viewport.
+    var mMin = Math.floor(-S) - 1;
+    var mMax = Math.ceil(5 - S) + 1;
+    var frozenDrawn = [];
+    for (var m = mMin; m <= mMax; m++) {
+      if (frozen[m]) continue;
+      var y = (m + S) * bandH;
+      var med = ((m % 5) + 5) % 5;
+      var n = Math.floor(m / 5);
+      drawBand(m, med, n, y, W, bandH, t);
+    }
+    // Frozen bands stay put (drawn last, on top) while the conveyor runs on.
+    for (var key in frozen) {
+      if (!frozen.hasOwnProperty(key)) continue;
+      var fm = parseInt(key, 10);
+      var f = frozen[fm];
+      var fy;
+      if (f.releasedAt >= 0) {
+        var u = Math.min(1, (t - f.releasedAt) / 1);
+        var streamY = (fm + S) * bandH;
+        fy = f.fromY + (streamY - f.fromY) * easeInOut(u);
+        if (u >= 1) frozenDrawn.push(fm);
+      } else {
+        fy = f.y;
+      }
+      var fmed = ((fm % 5) + 5) % 5;
+      var fn = Math.floor(fm / 5);
+      drawBand(fm, fmed, fn, fy, W, bandH, t);
+      ctx.save();
+      ctx.strokeStyle = '#B9B4A8';
+      ctx.globalAlpha = 0.5;
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(0.75, fy + 0.75, W - 1.5, bandH - 1.5);
+      ctx.restore();
+    }
+    for (var di = 0; di < frozenDrawn.length; di++) delete frozen[frozenDrawn[di]];
+
+    // Hairline separators between band slots.
+    ctx.save();
+    ctx.strokeStyle = 'rgba(0,0,0,0.25)';
+    ctx.lineWidth = 1;
+    for (var b = 1; b < 5; b++) {
+      ctx.beginPath();
+      ctx.moveTo(0, b * bandH + 0.5);
+      ctx.lineTo(W, b * bandH + 0.5);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  canvas.addEventListener('pointerdown', function (e) {
+    downPos = { x: e.clientX, y: e.clientY };
+  });
+  canvas.addEventListener('pointerup', function (e) {
+    if (!downPos) return;
+    var dx = e.clientX - downPos.x;
+    var dy = e.clientY - downPos.y;
+    var t = pieceTime;
+    var bandH = H / 5;
+    var S = scrollAt(t);
+    downPos = null;
+    if (Math.sqrt(dx * dx + dy * dy) >= 12) return; // drag does nothing
+    var m = itemAtY(e.clientY, S, bandH);
+    if (frozen[m] && frozen[m].releasedAt < 0) {
+      frozen[m].releasedAt = t;
+      frozen[m].fromY = frozen[m].y;
+    } else if (!frozen[m]) {
+      frozen[m] = { y: (m + S) * bandH, releasedAt: -1, fromY: 0 };
+    }
+  });
+
+  function onResize() { draw(pieceTime); }
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', onResize);
+  }
+  if (window.addEventListener) window.addEventListener('resize', onResize);
+
+  // Frame one: synchronous developed frame at exactly t = 0 (boot flag).
+  draw(0);
+  if (typeof requestAnimationFrame === 'function') {
+    var start = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+    var nowFn = (typeof performance !== 'undefined' && performance.now)
+      ? function () { return performance.now(); } : Date.now;
+    function loop() {
+      var t = (nowFn() - start) / 1000;
+      draw(t);
+      requestAnimationFrame(loop);
+    }
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
