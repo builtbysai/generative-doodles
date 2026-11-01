@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Saliva Exchange</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0A0B0E; height: 100%; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded RNG ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- palette ----------
+  var GROUND = [10, 11, 14];        // #0A0B0E
+  var COUNTER = [30, 34, 43];       // #1E222B
+  var COUNTER_EDGE = [58, 65, 80];  // lighter top edge of the slab (derived shade)
+  var COUNTER_RAIL = [40, 46, 58];  // faint rail line on the slab face (derived shade)
+  var BASE = [201, 207, 219];       // #C9CFDB patrons
+  var MINT = [125, 249, 198];       // #7DF9C6 attendant
+  var CYAN = [79, 214, 255];        // #4FD6FF
+  var MAGENTA = [255, 79, 216];     // #FF4FD8
+
+  function mix(a, b, f) {
+    return [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f];
+  }
+  function css(c, alpha) {
+    return 'rgba(' + Math.round(c[0]) + ',' + Math.round(c[1]) + ',' + Math.round(c[2]) + ',' + (alpha === undefined ? 1 : alpha) + ')';
+  }
+  function smooth(a, b, x) {
+    var t = (x - a) / (b - a);
+    if (t < 0) t = 0; if (t > 1) t = 1;
+    return t * t * (3 - 2 * t);
+  }
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('stage');
+  var ctx = canvas.getContext('2d');
+  var cw = 0, ch = 0, dpr = 1, phone = false;
+
+  function detectPhone() {
+    var s = window.screen;
+    if (s && s.width && s.height) return Math.min(s.width, s.height) < 700;
+    return ch > cw * 1.15;
+  }
+  function resize() {
+    var vv = window.visualViewport;
+    var w = vv ? vv.width : window.innerWidth;
+    var h = vv ? vv.height : window.innerHeight;
+    dpr = window.devicePixelRatio || 1;
+    cw = w; ch = h;
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+    phone = detectPhone();
+  }
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', resize);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // ---------- layout (normalized coordinates) ----------
+  var STATION_X = 0.68;
+  var ROW_Y = 0.775;          // patron row, in front of the counter
+  var ATT_Y = 0.645;          // attendant behind the counter
+  var COUNTER_TOP = 0.70;
+  var COUNTER_BOT = 0.865;
+  var PAIR_AX = 0.626, PAIR_BX = 0.734;
+  function slotX(i) { return 0.572 - i * (phone ? 0.052 : 0.0575); }
+  function strandRise() { return phone ? 0.36 : 0.40; }
+
+  // ---------- simulation ----------
+  var DT = 1 / 120;
+  var BASE_SEED = 966127;
+  var simT = 0;
+  var patrons = [];
+  var queue = [];             // patron refs, front first
+  var pair = null;            // {a, b}
+  var exState = 'idle';       // idle -> stepup -> strands -> settle -> idle
+  var exT = 0;
+  var idleDur = 1.0;          // first exchange starts early so the bar is already working
+  var shiftCount = 0;
+  var fade = null;            // {t} while a new shift fades tints out
+  var sample = null;          // {p, t} strand-inspector coil
+  var pendingTap = null;      // {t, patron}
+  var dragP = null;           // patron being dragged
+  var dragOrigIndex = -1;
+  var soundQueue = [];
+
+  function patronColor(p) {
+    var f = fade ? (fade.t / 2) : 0;
+    var cy = p.cyan * (1 - f), mg = p.magenta * (1 - f);
+    var c = BASE;
+    c = mix(c, CYAN, cy * 0.55);
+    c = mix(c, MAGENTA, mg * 0.55);
+    return c;
+  }
+
+  function makePatron(x, tinted, rng) {
+    var p = {
+      x: x, tx: x, cyan: 0, magenta: 0,
+      state: 'queue', speed: 0.13,
+      wob: rng() * Math.PI * 2
+    };
+    if (tinted) {
+      var amt = 0.25 + rng() * 0.65;
+      if (rng() < 0.5) p.cyan = amt; else p.magenta = amt;
+      if (rng() < 0.5) p.magenta += rng() * 0.2; else p.cyan += rng() * 0.2;
+      if (p.cyan > 1) p.cyan = 1;
+      if (p.magenta > 1) p.magenta = 1;
+    }
+    return p;
+  }
+
+  function buildShift(seed, tinted) {
+    var rng = mulberry32(seed);
+    patrons = []; queue = []; pair = null;
+    exState = 'idle'; exT = 0; idleDur = 1.0;
+    sample = null;
+    for (var i = 0; i < 11; i++) {
+      var p = makePatron(slotX(i), tinted, rng);
+      patrons.push(p); queue.push(p);
+    }
+  }
+
+  function startExchange() {
+    if (queue.length < 2) { exState = 'idle'; exT = 0; idleDur = 0.8; return; }
+    var a = queue.shift(), b = queue.shift();
+    a.state = 'pair'; b.state = 'pair';
+    a.speed = 0.34; b.speed = 0.34;
+    pair = { a: a, b: b };
+    exState = 'stepup'; exT = 0;
+  }
+
+  function finishExchange() {
+    // absorb: A's strand arrived as magenta, B's arrived as cyan
+    var a = pair.a, b = pair.b;
+    a.magenta = Math.min(1, a.magenta + 0.55); a.cyan *= 0.75;
+    b.cyan = Math.min(1, b.cyan + 0.55); b.magenta *= 0.75;
+    a.state = 'exit'; b.state = 'exit';
+    a.speed = 0.17; b.speed = 0.17;
+    pair = null;
+    soundQueue.push('absorb');
+  }
+
+  function step() {
+    simT += DT;
+
+    // exchange state machine
+    exT += DT;
+    if (exState === 'idle' && exT >= idleDur) {
+      startExchange();
+    } else if (exState === 'stepup' && exT >= 1.4) {
+      exState = 'strands'; exT = 0;
+      soundQueue.push('strand');
+    } else if (exState === 'strands' && exT >= 4.5) {
+      exState = 'settle'; exT = 0;
+      finishExchange();
+    } else if (exState === 'settle' && exT >= 0.9) {
+      exState = 'idle'; exT = 0; idleDur = 3.0;
+    }
+
+    // queue slot targets
+    for (var i = 0; i < queue.length; i++) {
+      if (queue[i] !== dragP) queue[i].tx = slotX(i);
+    }
+    if (pair) {
+      pair.a.tx = PAIR_AX; pair.b.tx = PAIR_BX;
+    }
+
+    // move patrons, retire exits, spawn replacements
+    for (var j = patrons.length - 1; j >= 0; j--) {
+      var p = patrons[j];
+      if (p === dragP) continue;
+      var dx = p.tx - p.x;
+      var maxStep = p.speed * DT;
+      if (Math.abs(dx) <= maxStep) p.x = p.tx; else p.x += (dx > 0 ? maxStep : -maxStep);
+      if (p.state === 'exit') p.tx = 1.08;
+      if (p.state === 'exit' && p.x > 1.05) {
+        patrons.splice(j, 1);
+        var rng = mulberry32(BASE_SEED + shiftCount * 7919 + Math.round(simT * 120) + patrons.length * 131);
+        var np = makePatron(-0.04, false, rng);
+        np.state = 'queue';
+        patrons.push(np); queue.push(np);
+      }
+    }
+
+    // pending tap resolves into a sample (or expires)
+    if (pendingTap && simT - pendingTap.t >= 0.35) {
+      if (pendingTap.patron && patrons.indexOf(pendingTap.patron) >= 0) {
+        sample = { p: pendingTap.patron, t: 0 };
+      }
+      pendingTap = null;
+    }
+
+    if (sample) {
+      sample.t += DT;
+      if (sample.t >= 8) sample = null;
+    }
+
+    if (fade) {
+      fade.t += DT;
+      if (fade.t >= 2) {
+        fade = null;
+        shiftCount++;
+        buildShift(BASE_SEED + shiftCount * 104729, false);
+      }
+    }
+  }
+
+  // ---------- strands ----------
+  // Strand from A to B (and B to A): dotted double-helix rails rising over the
+  // station, weaving around each other, color swapping at the midpoint.
+  function strandPoint(ax, bx, s, dir) {
+    var x = ax + (bx - ax) * s;
+    var y = ROW_Y - Math.sin(s * Math.PI) * strandRise();
+    var weave = Math.sin(s * Math.PI * 3 + (dir > 0 ? 0 : Math.PI)) * 0.026 * Math.sin(s * Math.PI);
+    return [x + weave, y];
+  }
+
+  function drawStrand(ax, bx, fromCol, toCol, prog, alpha) {
+    var steps = Math.floor(prog / 0.018);
+    for (var k = 0; k <= steps; k++) {
+      var s = k * 0.018;
+      var ctr = strandPoint(ax, bx, s, ax < bx ? 1 : -1);
+      var tw = s * Math.PI * 4;
+      var ox = Math.cos(tw) * 0.0055, oy = Math.sin(tw) * 0.0038;
+      var f = smooth(0.3, 0.7, s);
+      var col = css(mix(fromCol, toCol, f), alpha);
+      ctx.fillStyle = col;
+      // two helix rails
+      ctx.beginPath(); ctx.arc((ctr[0] + ox) * cw, (ctr[1] + oy) * ch, 2.1, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc((ctr[0] - ox) * cw, (ctr[1] - oy) * ch, 2.1, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+
+  // ---------- draw ----------
+  function draw() {
+    canvas.style.width = cw + 'px';
+    canvas.style.height = ch + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    // ground
+    ctx.fillStyle = css(GROUND);
+    ctx.fillRect(0, 0, cw, ch);
+
+    var minDim = Math.min(cw, ch);
+    var pr = Math.max(6, minDim * 0.0125);   // patron radius
+
+    // attendant (behind the counter)
+    var attBob = Math.sin(simT * 1.1) * 0.0022;
+    ctx.fillStyle = css(MINT);
+    ctx.beginPath(); ctx.arc(STATION_X * cw, (ATT_Y + attBob) * ch, pr * 1.4, 0, Math.PI * 2); ctx.fill();
+
+    // counter slab
+    ctx.fillStyle = css(COUNTER);
+    ctx.fillRect(0, COUNTER_TOP * ch, cw, (COUNTER_BOT - COUNTER_TOP) * ch);
+    ctx.fillStyle = css(COUNTER_EDGE);
+    ctx.fillRect(0, COUNTER_TOP * ch, cw, Math.max(1.5, ch * 0.0022));
+    ctx.fillStyle = css(COUNTER_RAIL);
+    ctx.fillRect(0, (COUNTER_BOT - 0.018) * ch, cw, Math.max(1, ch * 0.0016));
+
+    // exchange strands (under the pair's dots, over everything else)
+    if ((exState === 'strands' || exState === 'settle') && pair) {
+      var prog = exState === 'strands' ? (exT / 4.5) : 1;
+      var alpha = exState === 'settle' ? (1 - exT / 0.9) : 1;
+      drawStrand(pair.a.x, pair.b.x, CYAN, MAGENTA, prog, alpha);
+      drawStrand(pair.b.x, pair.a.x, MAGENTA, CYAN, prog, alpha);
+    } else if (exState === 'settle' && lastPair) {
+      var a2 = 1 - exT / 0.9;
+      drawStrand(lastPair.ax, lastPair.bx, CYAN, MAGENTA, 1, a2);
+      drawStrand(lastPair.bx, lastPair.ax, MAGENTA, CYAN, 1, a2);
+    }
+
+    // patrons
+    for (var i = 0; i < patrons.length; i++) {
+      var p = patrons[i];
+      var bob = Math.sin(simT * 1.3 + p.wob) * 0.0022;
+      ctx.fillStyle = css(patronColor(p));
+      ctx.beginPath(); ctx.arc(p.x * cw, (ROW_Y + bob) * ch, pr, 0, Math.PI * 2); ctx.fill();
+    }
+
+    // sample coil: the tapped patron's accumulated strand, held above the bar
+    if (sample) {
+      var sp = sample.p;
+      var env = Math.min(1, sample.t / 0.5, (8 - sample.t) / 1);
+      if (env > 0) {
+        var cxp = sp.x, cyp = ROW_Y - 0.175;
+        var col = patronColor(sp);
+        ctx.fillStyle = css(col, 0.9 * env);
+        for (var k = 0; k < 28; k++) {
+          var a = k * 0.6 + simT * 3;
+          var dx = Math.cos(a) * 0.012, dy = (k / 27 - 0.5) * 0.085 + Math.sin(a) * 0.004;
+          ctx.beginPath(); ctx.arc((cxp + dx) * cw, (cyp + dy) * ch, 1.9, 0, Math.PI * 2); ctx.fill();
+          ctx.beginPath(); ctx.arc((cxp - dx) * cw, (cyp - dy) * ch, 1.9, 0, Math.PI * 2); ctx.fill();
+        }
+      }
+    }
+  }
+
+  // strand endpoints remembered through the settle fade (pair ref is released at absorb)
+  var lastPair = null;
+  var _finish = finishExchange;
+  finishExchange = function () {
+    lastPair = { ax: pair.a.x, bx: pair.b.x };
+    _finish();
+  };
+
+  // ---------- audio (lazy, guarded, first gesture only) ----------
+  var AC = null, bedOn = false, nextClink = 0;
+  function ensureAudio() {
+    if (AC) { if (AC.resume) AC.resume(); return; }
+    try {
+      var Ctor = window.AudioContext || window.webkitAudioContext;
+      if (!Ctor) return;
+      AC = new Ctor();
+      // bar bed: low filtered noise murmur
+      var len = 2 * AC.sampleRate;
+      var buf = AC.createBuffer(1, len, AC.sampleRate);
+      var d = buf.getChannelData(0);
+      var lr = mulberry32(4242);
+      for (var i = 0; i < len; i++) d[i] = lr() * 2 - 1;
+      var src = AC.createBufferSource();
+      src.buffer = buf; src.loop = true;
+      var flt = AC.createBiquadFilter(); flt.type = 'lowpass'; flt.frequency.value = 320;
+      var g = AC.createGain(); g.gain.value = 0.016;
+      src.connect(flt); flt.connect(g); g.connect(AC.destination);
+      src.start();
+      bedOn = true;
+      nextClink = AC.currentTime + 5;
+    } catch (e) { AC = null; }
+  }
+  function tone(f0, f1, dur, peak, type) {
+    if (!AC) return;
+    try {
+      var t = AC.currentTime;
+      var o = AC.createOscillator(), g = AC.createGain();
+      o.type = type || 'sine';
+      o.frequency.setValueAtTime(f0, t);
+      o.frequency.exponentialRampToValueAtTime(Math.max(30, f1), t + dur);
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(peak, t + 0.08);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      o.connect(g); g.connect(AC.destination);
+      o.start(t); o.stop(t + dur + 0.05);
+    } catch (e) { /* sound is decoration only */ }
+  }
+  function drainAudio() {
+    if (!AC) { soundQueue.length = 0; return; }
+    while (soundQueue.length) {
+      var ev = soundQueue.shift();
+      if (ev === 'strand') { tone(520, 780, 3.4, 0.045); tone(780, 520, 3.4, 0.045); }
+      else if (ev === 'absorb') { tone(95, 48, 0.28, 0.12); }
+    }
+    if (bedOn && AC.currentTime >= nextClink) {
+      tone(2300 + Math.random() * 600, 2100, 0.06, 0.015); // glass clink (sound only, never visual)
+      nextClink = AC.currentTime + 5 + Math.random() * 6;
+    }
+  }
+
+  // ---------- interaction ----------
+  function normPos(e) {
+    var x = (e.clientX || 0) / (cw || 1);
+    var y = (e.clientY || 0) / (ch || 1);
+    return [x, y];
+  }
+  function hitPatron(x, y) {
+    var best = null, bd = 0.035;
+    for (var i = 0; i < patrons.length; i++) {
+      var p = patrons[i];
+      var dx = p.x - x, dy = ROW_Y - y;
+      var d = Math.sqrt(dx * dx + dy * dy);
+      if (d < bd) { bd = d; best = p; }
+    }
+    return best;
+  }
+  var downPos = null, downT = 0;
+
+  canvas.addEventListener('pointerdown', function (e) {
+    ensureAudio();
+    var pos = normPos(e);
+    downPos = pos; downT = simT;
+    var p = hitPatron(pos[0], pos[1]);
+    if (p && p.state === 'queue') {
+      dragP = p;
+      dragOrigIndex = queue.indexOf(p);
+    }
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (!dragP) return;
+    var pos = normPos(e);
+    dragP.x = pos[0];
+    dragP.tx = pos[0];
+  });
+  canvas.addEventListener('pointerup', function (e) {
+    var pos = normPos(e);
+    var moved0 = downPos ? Math.sqrt(Math.pow(pos[0] - downPos[0], 2) + Math.pow(pos[1] - downPos[1], 2)) : 1;
+    if (dragP && moved0 <= 0.02) {
+      dragP = null; // a press without travel is a tap, not a drag
+    }
+    if (dragP) {
+      var p = dragP; dragP = null;
+      var nearStation = Math.abs(pos[0] - STATION_X) < 0.11 && pos[1] > 0.52 && pos[1] < 0.92;
+      var qi = queue.indexOf(p);
+      if (qi >= 0) queue.splice(qi, 1);
+      if (nearStation) {
+        queue.unshift(p);           // skip the line: next exchange partner
+      } else {
+        var idx = Math.min(dragOrigIndex, queue.length);
+        queue.splice(idx, 0, p);    // back to its place in line
+      }
+      p.tx = slotX(queue.indexOf(p));
+      downPos = null;
+      return;
+    }
+    // plain tap: resolve single vs double in step() timing
+    var moved = downPos ? Math.sqrt(Math.pow(pos[0] - downPos[0], 2) + Math.pow(pos[1] - downPos[1], 2)) : 1;
+    downPos = null;
+    if (moved > 0.02) return;
+    if (pendingTap && simT - pendingTap.t < 0.35) {
+      pendingTap = null;
+      if (!fade) fade = { t: 0 };  // double-tap: a new shift
+    } else {
+      pendingTap = { t: simT, patron: hitPatron(pos[0], pos[1]) };
+    }
+  });
+
+  // ---------- run ----------
+  buildShift(BASE_SEED, true);
+  for (var s = 0; s < 3000; s++) step();   // pre-roll: 25 s of the shift already lived
+  draw();                                   // frame one: synchronous, deterministic
+
+  var lastTs = null, acc = 0;
+  function frame(ts) {
+    if (typeof ts !== 'number') ts = 0;
+    if (lastTs === null) lastTs = ts;
+    var el = (ts - lastTs) / 1000;
+    lastTs = ts;
+    if (el > 0.25) el = 0.25;
+    if (el < 0) el = 0;
+    acc += el;
+    var n = 0;
+    while (acc >= DT && n < 40) { step(); acc -= DT; n++; }
+    drainAudio();
+    draw();
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+  }
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

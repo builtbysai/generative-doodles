@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Seeing Voices</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #07080C; overflow: hidden; height: 100%; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+/* Seeing Voices - No.967 (study #118 lauren-lee-mccarthy, PP128)
+   A voice-ring steers an avatar through a seeded maze toward its center.
+   The voice speaks only in rings. Fixed-step sim (120 Hz), seeded, so
+   frame one (after exactly 3600 pre-roll steps) is deterministic. */
+
+// ---------- seeded RNG (mulberry32) ----------
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// ---------- palette ----------
+var GROUND = '#07080C', WALL = '#23262E', AVATAR = '#F5F2EA';
+var VIOLET = [184, 122, 255], RED = [255, 59, 59], PATH = [79, 214, 255];
+function rgba(c, a) { return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a + ')'; }
+function lerpC(a, b, t) {
+  return [Math.round(a[0] + (b[0] - a[0]) * t),
+          Math.round(a[1] + (b[1] - a[1]) * t),
+          Math.round(a[2] + (b[2] - a[2]) * t)];
+}
+
+// ---------- constants ----------
+var GW = 21, GH = 21;              // maze cells
+var CENTER = { x: 10, y: 10 };     // the goal cell
+var DT = 1 / 120;                  // fixed sim step
+var SPEED = 1.0;                   // cells per second (about 34 px/s at gallery scale)
+var PULSE_T = 3.0;                 // voice pulse period, seconds
+var TRAIL_FADE = 600;              // remembered path fades over 10 min
+var MASTER_SEED = 967128;
+
+// ---------- sim state ----------
+var rng = mulberry32(MASTER_SEED);
+var simTime = 0, stepCount = 0;
+var maze = null;                   // {n,e,s,w} wall flags per cell index
+var distCenter = null;             // BFS distance to CENTER over maze
+var avatar = null;
+var trail = [];                    // {x,y,t} remembered path samples
+var suggestion = null;             // {x,y,until} tap-whisper target cell
+var split = null;                  // {start,end,forced} active disagreement
+var nextSplitAt = 0;               // seeded schedule for the next split
+var flare = 0;                     // seconds remaining of the center flare
+var pendingSounds = [];            // sound cues raised by the sim, drained by rAF
+var generation = 0;
+
+function idx(x, y) { return y * GW + x; }
+function inB(x, y) { return x >= 0 && y >= 0 && x < GW && y < GH; }
+
+function genMaze() {
+  // recursive backtracker (iterative), perfect maze: exactly one route anywhere
+  var n = [], e = [], s = [], w = [], vis = [];
+  for (var i = 0; i < GW * GH; i++) { n.push(1); e.push(1); s.push(1); w.push(1); vis.push(0); }
+  var stack = [[0, 0]]; vis[0] = 1;
+  var DIRS = [[0, -1], [1, 0], [0, 1], [-1, 0]];
+  while (stack.length) {
+    var cur = stack[stack.length - 1], cx = cur[0], cy = cur[1], opts = [];
+    for (var d = 0; d < 4; d++) {
+      var nx = cx + DIRS[d][0], ny = cy + DIRS[d][1];
+      if (inB(nx, ny) && !vis[idx(nx, ny)]) opts.push(d);
+    }
+    if (!opts.length) { stack.pop(); continue; }
+    var dir = opts[Math.floor(rng() * opts.length)];
+    var mx = cx + DIRS[dir][0], my = cy + DIRS[dir][1];
+    if (dir === 0) { n[idx(cx, cy)] = 0; s[idx(mx, my)] = 0; }
+    if (dir === 1) { e[idx(cx, cy)] = 0; w[idx(mx, my)] = 0; }
+    if (dir === 2) { s[idx(cx, cy)] = 0; n[idx(mx, my)] = 0; }
+    if (dir === 3) { w[idx(cx, cy)] = 0; e[idx(mx, my)] = 0; }
+    vis[idx(mx, my)] = 1; stack.push([mx, my]);
+  }
+  return { n: n, e: e, s: s, w: w };
+}
+
+function bfsDist(goal) {
+  var dist = new Array(GW * GH).fill(-1);
+  var q = [[goal.x, goal.y]]; dist[idx(goal.x, goal.y)] = 0;
+  while (q.length) {
+    var c = q.shift(), cx = c[0], cy = c[1], d0 = dist[idx(cx, cy)], m = maze;
+    var nb = [];
+    if (!m.n[idx(cx, cy)]) nb.push([cx, cy - 1]);
+    if (!m.e[idx(cx, cy)]) nb.push([cx + 1, cy]);
+    if (!m.s[idx(cx, cy)]) nb.push([cx, cy + 1]);
+    if (!m.w[idx(cx, cy)]) nb.push([cx - 1, cy]);
+    for (var i = 0; i < nb.length; i++) {
+      var j = idx(nb[i][0], nb[i][1]);
+      if (dist[j] < 0) { dist[j] = d0 + 1; q.push(nb[i]); }
+    }
+  }
+  return dist;
+}
+
+function neighbors(cell) {
+  var m = maze, x = cell.x, y = cell.y, out = [];
+  if (!m.n[idx(x, y)]) out.push({ x: x, y: y - 1 });
+  if (!m.e[idx(x, y)]) out.push({ x: x + 1, y: y });
+  if (!m.s[idx(x, y)]) out.push({ x: x, y: y + 1 });
+  if (!m.w[idx(x, y)]) out.push({ x: x - 1, y: y });
+  return out;
+}
+
+// Junction choices use BFS distance to the goal (the center, or a cached
+// BFS field for a tap-whispered suggestion cell).
+var suggDist = null;
+function goalDist(cell) {
+  if (suggestion && suggDist) return suggDist[idx(cell.x, cell.y)];
+  return distCenter[idx(cell.x, cell.y)];
+}
+
+function chooseNext(cell, prev) {
+  var opts = neighbors(cell);
+  var fwd = [];
+  for (var i = 0; i < opts.length; i++) {
+    if (!prev || opts[i].x !== prev.x || opts[i].y !== prev.y) fwd.push(opts[i]);
+  }
+  if (!fwd.length) fwd = opts;             // dead end: backtrack is allowed
+  if (!fwd.length) return cell;
+  if (split) {                              // disagreement: unguided choice
+    return fwd[Math.floor(rng() * fwd.length)];
+  }
+  if (rng() < 0.20) {                       // seeded wander noise
+    return fwd[Math.floor(rng() * fwd.length)];
+  }
+  var best = fwd[0], bd = goalDist(fwd[0]);
+  for (var j = 1; j < fwd.length; j++) {
+    var d = goalDist(fwd[j]);
+    if (d < bd) { bd = d; best = fwd[j]; }
+  }
+  return best;
+}
+
+function newMind() {
+  generation++;
+  maze = genMaze();
+  distCenter = bfsDist(CENTER);
+  trail = [];
+  suggestion = null; suggDist = null;
+  split = null;
+  var corners = [{ x: 0, y: 0 }, { x: GW - 1, y: 0 }, { x: 0, y: GH - 1 }, { x: GW - 1, y: GH - 1 }];
+  var start = corners[Math.floor(rng() * 4)];
+  avatar = {
+    cell: { x: start.x, y: start.y },
+    prev: null,
+    x: start.x + 0.5, y: start.y + 0.5,
+    tx: start.x + 0.5, ty: start.y + 0.5,
+    hx: 1, hy: 0
+  };
+  avatar.target = chooseNext(avatar.cell, null);
+  avatar.tx = avatar.target.x + 0.5; avatar.ty = avatar.target.y + 0.5;
+  nextSplitAt = simTime + 40 + rng() * 30;
+  flare = 0;
+}
+
+function detNoise(k) { // deterministic hash noise in [-1,1], no RNG stream use
+  var v = Math.sin(k * 127.1 + 311.7) * 43758.5453;
+  return (v - Math.floor(v)) * 2 - 1;
+}
+
+function stepSim() {
+  stepCount++; simTime += DT;
+
+  // pulse bookkeeping: the voice speaks every 3 s
+  if (stepCount % Math.round(PULSE_T / DT) === 0) {
+    var dc = distCenter[idx(avatar.cell.x, avatar.cell.y)];
+    pendingSounds.push({ type: split ? 'split' : 'pulse', prox: 1 - dc / (GW * GH) });
+  }
+
+  // split scheduling (seeded disagreements)
+  if (!split && simTime >= nextSplitAt) {
+    split = { start: simTime, end: simTime + 6, forced: false };
+    pendingSounds.push({ type: 'splitStart' });
+  }
+  if (split && simTime >= split.end) {
+    split = null;
+    nextSplitAt = simTime + 40 + rng() * 30;
+    pendingSounds.push({ type: 'converge' });
+  }
+  if (suggestion && simTime > suggestion.until) { suggestion = null; suggDist = null; }
+  if (flare > 0) { flare -= DT; if (flare <= 0) { flare = 0; newMind(); } return; }
+
+  // avatar motion, cell center to cell center
+  var sp = SPEED * (split ? 0.45 : 1);
+  var dx = avatar.tx - avatar.x, dy = avatar.ty - avatar.y;
+  var d = Math.sqrt(dx * dx + dy * dy), step = sp * DT;
+  if (d <= step) {
+    avatar.x = avatar.tx; avatar.y = avatar.ty;
+    var arrived = { x: avatar.target.x, y: avatar.target.y };
+    avatar.prev = avatar.cell; avatar.cell = arrived;
+    if (suggestion && arrived.x === suggestion.x && arrived.y === suggestion.y) {
+      suggestion = null; suggDist = null;
+    }
+    if (arrived.x === CENTER.x && arrived.y === CENTER.y && !suggestion) {
+      flare = 1.2; pendingSounds.push({ type: 'arrive' });
+      avatar.target = arrived; avatar.tx = avatar.x; avatar.ty = avatar.y;
+    } else {
+      avatar.target = chooseNext(arrived, avatar.prev);
+      avatar.tx = avatar.target.x + 0.5; avatar.ty = avatar.target.y + 0.5;
+      var ndx = avatar.tx - avatar.x, ndy = avatar.ty - avatar.y, nl = Math.sqrt(ndx * ndx + ndy * ndy);
+      if (nl > 0) { avatar.hx = ndx / nl; avatar.hy = ndy / nl; }
+    }
+  } else {
+    avatar.x += dx / d * step; avatar.y += dy / d * step;
+    avatar.hx = dx / d; avatar.hy = dy / d;
+  }
+
+  // remembered path, sampled every 3 steps
+  if (stepCount % 3 === 0) {
+    trail.push({ x: avatar.x, y: avatar.y, t: simTime });
+    while (trail.length && simTime - trail[0].t > TRAIL_FADE) trail.shift();
+  }
+}
+
+// ---------- events (consumed by timestamp, in sim order) ----------
+var eventQueue = []; // {at, type, x, y} in sim seconds
+function applyEvent(ev) {
+  if (ev.type === 'tap') {
+    suggestion = { x: ev.x, y: ev.y, until: simTime + 25 };
+    suggDist = bfsDist(suggestion);
+    pendingSounds.push({ type: 'pulse', prox: 0.5 });
+  } else if (ev.type === 'doubt') {
+    split = { start: simTime, end: simTime + 10, forced: true };
+    pendingSounds.push({ type: 'splitStart' });
+  } else if (ev.type === 'newmind') {
+    newMind();
+  }
+}
+function drainEvents() {
+  eventQueue.sort(function (a, b) { return a.at - b.at; });
+  while (eventQueue.length && eventQueue[0].at <= simTime) applyEvent(eventQueue.shift());
+}
+
+// ---------- canvas / layout ----------
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var W = 0, H = 0, DPR = 1, stage = 0, ox = 0, oy = 0, cellPx = 0, isPhone = false;
+
+function resize() {
+  var vv = (typeof window !== 'undefined' && window.visualViewport) ? window.visualViewport : null;
+  W = vv ? vv.width : window.innerWidth;
+  H = vv ? vv.height : window.innerHeight;
+  DPR = Math.min(2, (typeof window !== 'undefined' && window.devicePixelRatio) || 1);
+  canvas.width = Math.round(W * DPR); canvas.height = Math.round(H * DPR);
+  var sw = (typeof window !== 'undefined' && window.screen) ? window.screen : null;
+  isPhone = !!((sw && Math.min(sw.width, sw.height) < 700) || H > W * 1.15);
+  stage = Math.min(W, H);
+  ox = (W - stage) / 2; oy = (H - stage) / 2;
+  cellPx = stage / GW;
+}
+if (typeof window !== 'undefined') {
+  window.addEventListener('resize', function () { resize(); draw(); });
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { resize(); draw(); });
+  }
+}
+
+// ---------- draw ----------
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+  ctx.fillStyle = GROUND; ctx.fillRect(0, 0, W, H);
+
+  var i, x, y;
+  // maze walls, one batched stroke
+  ctx.strokeStyle = WALL; ctx.lineWidth = Math.max(1.4, cellPx * 0.07);
+  ctx.beginPath();
+  for (y = 0; y < GH; y++) for (x = 0; x < GW; x++) {
+    var j = idx(x, y), px = ox + x * cellPx, py = oy + y * cellPx;
+    if (maze.n[j]) { ctx.moveTo(px, py); ctx.lineTo(px + cellPx, py); }
+    if (maze.w[j]) { ctx.moveTo(px, py); ctx.lineTo(px, py + cellPx); }
+    if (y === GH - 1 && maze.s[j]) { ctx.moveTo(px, py + cellPx); ctx.lineTo(px + cellPx, py + cellPx); }
+    if (x === GW - 1 && maze.e[j]) { ctx.moveTo(px + cellPx, py); ctx.lineTo(px + cellPx, py + cellPx); }
+  }
+  ctx.stroke();
+
+  // remembered path, banded alphas by age
+  var LEVELS = 10;
+  for (var L = 0; L < LEVELS; L++) {
+    var a0 = L / LEVELS, a1 = (L + 1) / LEVELS;
+    ctx.strokeStyle = rgba(PATH, 0.5 * (1 - (a0 + a1) / 2));
+    ctx.lineWidth = Math.max(1, cellPx * 0.045);
+    ctx.beginPath();
+    var pen = false;
+    for (i = 1; i < trail.length; i++) {
+      var age = (simTime - trail[i].t) / TRAIL_FADE;
+      if (age >= a0 && age < a1) {
+        var p0 = trail[i - 1], p1 = trail[i];
+        if (!pen) { ctx.moveTo(ox + p0.x * cellPx, oy + p0.y * cellPx); pen = true; }
+        ctx.lineTo(ox + p1.x * cellPx, oy + p1.y * cellPx);
+      } else pen = false;
+    }
+    ctx.stroke();
+  }
+
+  // avatar position (split adds a visible hesitation jitter)
+  var ax = avatar.x, ay = avatar.y;
+  var splitAmt = 0;
+  if (split) {
+    var sIn = Math.min(1, (simTime - split.start) / 0.5);
+    var sOut = Math.min(1, (split.end - simTime) / 0.5);
+    splitAmt = Math.max(0, Math.min(sIn, sOut));
+    ax += detNoise(stepCount * 2) * 0.055 * splitAmt;
+    ay += detNoise(stepCount * 2 + 5000) * 0.055 * splitAmt;
+  }
+  var apx = ox + ax * cellPx, apy = oy + ay * cellPx;
+
+  // voice rings, floating just ahead of the avatar
+  var lead = 0.42;
+  var rcx = apx + avatar.hx * lead * cellPx, rcy = apy + avatar.hy * lead * cellPx;
+  var phase = (simTime % PULSE_T) / PULSE_T;
+  var swell = Math.sin(phase * Math.PI * 2);
+  var ringAlpha = 0.65 + 0.25 * swell;
+  var radMul = 1 + 0.10 * swell;
+  if (flare > 0) { var fp = 1 - flare / 1.2; radMul = 1 + 1.3 * fp; ringAlpha *= (1 - fp); }
+  var ringCol = lerpC(VIOLET, RED, splitAmt);
+  var perpX = -avatar.hy, perpY = avatar.hx;
+  var offs = splitAmt > 0.01 ? [-1, 1] : [0];
+  ctx.lineWidth = Math.max(1.2, cellPx * 0.05);
+  for (var o = 0; o < offs.length; o++) {
+    var cxp = rcx + perpX * offs[o] * 0.30 * splitAmt * cellPx;
+    var cyp = rcy + perpY * offs[o] * 0.30 * splitAmt * cellPx;
+    for (var r = 0; r < 3; r++) {
+      ctx.strokeStyle = rgba(ringCol, ringAlpha * (1 - r * 0.18));
+      ctx.beginPath();
+      ctx.arc(cxp, cyp, (0.34 + r * 0.26) * radMul * cellPx, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+  }
+
+  // avatar
+  ctx.fillStyle = AVATAR;
+  ctx.beginPath(); ctx.arc(apx, apy, Math.max(2, cellPx * 0.13), 0, Math.PI * 2); ctx.fill();
+}
+
+// ---------- audio (lazy, first gesture only) ----------
+var AC = null, humGain = null;
+function ensureAudio() {
+  if (AC) return;
+  try {
+    var Ctor = (typeof window !== 'undefined') && (window.AudioContext || window.webkitAudioContext);
+    if (!Ctor) return;
+    AC = new Ctor();
+    humGain = AC.createGain(); humGain.gain.value = 0.0;
+    var lp = AC.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 220;
+    var hum = AC.createOscillator(); hum.type = 'sine'; hum.frequency.value = 48;
+    hum.connect(lp); lp.connect(humGain); humGain.connect(AC.destination);
+    hum.start();
+    humGain.gain.linearRampToValueAtTime(0.035, AC.currentTime + 2.5);
+  } catch (e) { AC = null; }
+}
+function ping(freq, gain, dur, delay) {
+  if (!AC) return;
+  try {
+    var t0 = AC.currentTime + (delay || 0);
+    var o = AC.createOscillator(), g = AC.createGain();
+    o.type = 'sine'; o.frequency.value = freq;
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(gain, t0 + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    o.connect(g); g.connect(AC.destination);
+    o.start(t0); o.stop(t0 + dur + 0.05);
+  } catch (e) {}
+}
+function drainSounds() {
+  if (!AC) { pendingSounds.length = 0; return; }
+  for (var i = 0; i < pendingSounds.length; i++) {
+    var s = pendingSounds[i];
+    if (s.type === 'pulse') ping(480 + 320 * (s.prox || 0), 0.10, 0.7);
+    else if (s.type === 'split' || s.type === 'splitStart') { ping(392 * 0.98, 0.08, 0.9); ping(392 * 1.02, 0.08, 0.9, 0.12); }
+    else if (s.type === 'converge') ping(392, 0.10, 1.1);
+    else if (s.type === 'arrive') { ping(660, 0.10, 1.2); ping(880, 0.07, 1.4, 0.15); }
+  }
+  pendingSounds.length = 0;
+}
+
+// ---------- pointer interaction ----------
+var pDown = null, lastTap = null;
+function toCell(cx, cy) {
+  var gx = Math.floor((cx - ox) / cellPx), gy = Math.floor((cy - oy) / cellPx);
+  gx = Math.max(0, Math.min(GW - 1, gx)); gy = Math.max(0, Math.min(GH - 1, gy));
+  return { x: gx, y: gy };
+}
+if (canvas && canvas.addEventListener) {
+  canvas.addEventListener('pointerdown', function (e) {
+    ensureAudio();
+    pDown = { x: e.clientX, y: e.clientY, t: e.timeStamp, moved: false };
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (!pDown) return;
+    var dx = e.clientX - pDown.x, dy = e.clientY - pDown.y;
+    if (Math.sqrt(dx * dx + dy * dy) > 8) pDown.moved = true;
+  });
+  canvas.addEventListener('pointerup', function (e) {
+    if (!pDown) return;
+    var at = simTime;
+    if (pDown.moved) {
+      eventQueue.push({ at: at, type: 'doubt' });
+    } else if (e.timeStamp - pDown.t < 400) {
+      if (lastTap && e.timeStamp - lastTap < 350) {
+        eventQueue.push({ at: at, type: 'newmind' });
+        lastTap = null;
+      } else {
+        var cell = toCell(e.clientX, e.clientY);
+        eventQueue.push({ at: at, type: 'tap', x: cell.x, y: cell.y });
+        lastTap = e.timeStamp;
+      }
+    }
+    pDown = null;
+  });
+}
+
+// ---------- boot: pre-roll exactly 3600 steps, draw frame one ----------
+resize();
+newMind();
+for (var k = 0; k < 3600; k++) stepSim();
+pendingSounds.length = 0;
+draw();
+
+// ---------- live loop (guarded; absent in the QA renderer) ----------
+if (typeof requestAnimationFrame === 'function') {
+  var lastTs = null, acc = 0;
+  var frame = function (ts) {
+    if (lastTs === null) lastTs = ts;
+    var dt = Math.min(0.25, (ts - lastTs) / 1000); lastTs = ts;
+    acc += dt;
+    var n = 0;
+    while (acc >= DT && n < 40) { drainEvents(); stepSim(); acc -= DT; n++; }
+    if (n === 40) acc = 0;
+    drainSounds();
+    draw();
+    requestAnimationFrame(frame);
+  };
+  requestAnimationFrame(frame);
+}
+</script>
+</body>
+</html>

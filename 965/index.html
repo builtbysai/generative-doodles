@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Social Turkers</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0C0D12; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="doodle"></canvas>
+<script>
+'use strict';
+/* No.965 "Social Turkers" - study #118 lauren-lee-mccarthy, PP126.
+   Thirty mini-arenas in a 6x5 grid. In each, a white dater-dot orbits a
+   magenta date-dot while tiny cyan vote ticks along the arena edges steer
+   the orbit: every 2 s the ticks re-vote (seeded worker temperaments bias
+   them inward, outward, or erratic) and the orbit's target radius shifts.
+   Each arena resolves on its own staggered timer: a tight orbit leaves a
+   mint ring in the ledger, a loose one a red cross, and a new pair starts.
+   When all thirty arenas hold glyphs, the season ends and reseeds.
+   Fixed-timestep sim (120 Hz), 3600 pre-roll steps, deterministic per seed. */
+
+var COLS = 6, ROWS = 5, COUNT = COLS * ROWS;
+var DT = 1 / 120;            // fixed timestep
+var PREROLL = 3600;          // 30 s of gig work before frame one
+var REFRESH = 240;           // ticks re-vote every 2 s
+var PAUSE_STEPS = 144;       // 1.2 s between resolution and the next pair
+var TAP_WINDOW = 42;         // steps a tap waits to see if it is a double tap
+var RING_MAX = 26.4;         // mean orbit radius under this reads as a good date
+var R_NORM = 44;             // radius the tightness is normalized against
+var BASE_SEED = 965126;
+
+/* ---------------- seeded rng ---------------- */
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    var t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+/* ---------------- canvas / viewport ---------------- */
+var canvas = document.getElementById('doodle');
+var ctx = canvas.getContext('2d');
+var viewW = 800, viewH = 800, DPR = 1;
+
+function isPhone() {
+  var sw = 0, sh = 0;
+  if (typeof window !== 'undefined' && window.screen && window.screen.width) {
+    sw = window.screen.width; sh = window.screen.height;
+    return Math.min(sw, sh) < 700;
+  }
+  return viewH > viewW * 1.15; // aspect fallback only
+}
+function fit() {
+  var w = 0, h = 0;
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.width) {
+    w = window.visualViewport.width; h = window.visualViewport.height;
+  } else if (typeof window !== 'undefined' && window.innerWidth) {
+    w = window.innerWidth; h = window.innerHeight;
+  }
+  if (!w || !h) { w = 800; h = 800; }
+  viewW = w; viewH = h;
+  DPR = 1;
+  if (typeof window !== 'undefined' && window.devicePixelRatio) {
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+  }
+  canvas.width = Math.round(viewW * DPR);
+  canvas.height = Math.round(viewH * DPR);
+}
+fit();
+var PHONE = isPhone();
+
+/* ---------------- layout ---------------- */
+function layout() {
+  var m = PHONE ? 6 : 10;
+  var cell = Math.min((viewW - m * 2) / COLS, (viewH - m * 2) / ROWS);
+  var gw = cell * COLS, gh = cell * ROWS;
+  return { cell: cell, gx: (viewW - gw) / 2, gy: (viewH - gh) / 2, gw: gw, gh: gh };
+}
+
+/* ---------------- state ---------------- */
+var stepCount = 0;
+var season = 0;
+var seasonFade = 0;          // steps of glyph fade-out before a reseed
+var arenas = [];
+var events = [];             // recorded interaction events {step, kind, ...}
+var pendingTap = null;       // {step, idx} waiting out the double-tap window
+
+function makeTicks(rng) {
+  var n = 6 + Math.floor(rng() * 5); // 6-10 ticks per arena
+  var ticks = [];
+  for (var i = 0; i < n; i++) {
+    ticks.push({
+      side: Math.floor(rng() * 4),          // 0 top, 1 right, 2 bottom, 3 left
+      frac: 0.08 + rng() * 0.84,
+      vote: rng() < 0.5 ? -1 : 1,           // -1 inward (tighten), +1 outward
+      flash: rng() * 0.5
+    });
+  }
+  return ticks;
+}
+
+function spawnPair(a, first) {
+  // date-dot starts near the center, dater-dot on a fresh orbit around it
+  a.dateX = 50 + (a.rng() - 0.5) * 14;
+  a.dateY = 50 + (a.rng() - 0.5) * 14;
+  a.dateVX = 0; a.dateVY = 0;
+  var ang = a.rng() * Math.PI * 2;
+  var r0 = 20 + a.rng() * 10;
+  a.daterX = a.dateX + Math.cos(ang) * r0;
+  a.daterY = a.dateY + Math.sin(ang) * r0;
+  a.daterVX = -Math.sin(ang) * 30 * a.dirSign;
+  a.daterVY = Math.cos(ang) * 30 * a.dirSign;
+  a.sumR = 0; a.nR = 0;
+  a.state = 'orbit'; a.stateStep = 0;
+  if (first) {
+    // staggered well into the season so frame one is mid-ledger, not a wipe
+    a.roundLeft = Math.round((18 + a.rng() * 45) * 120);
+  } else {
+    a.roundLeft = Math.round((15 + a.rng() * 10) * 120);
+  }
+  a.rigged = a.rigNext; a.rigNext = false;
+  a.rGoal = a.rigged ? 13 : 26;
+  refreshVotes(a, true);
+}
+
+function buildSeason(seed) {
+  var rng = mulberry32(seed);
+  arenas = [];
+  for (var i = 0; i < COUNT; i++) {
+    var a = {
+      col: i % COLS, row: Math.floor(i / COLS),
+      rng: mulberry32(seed * 31 + i * 1013 + 7),
+      temp: (rng() - 0.5) * 1.1,            // worker temperament: inward vs outward bias
+      erratic: rng() * 0.45,                // chance a tick ignores the temperament
+      dirSign: rng() < 0.5 ? -1 : 1,        // orbit direction
+      wanderPhase: rng() * Math.PI * 2,
+      wanderRate: (0.0015 + rng() * 0.002) * (rng() < 0.5 ? -1 : 1),
+      dateSpeed: 5 + rng() * 3.5,
+      ticks: null, refreshAt: 0,
+      dateX: 50, dateY: 50, dateVX: 0, dateVY: 0,
+      daterX: 50, daterY: 50, daterVX: 0, daterVY: 0,
+      rTarget: 26, rGoal: 26,
+      state: 'orbit', stateStep: 0, roundLeft: 0,
+      sumR: 0, nR: 0,
+      glyph: null, glyphStep: -100000, resolvedSeason: false,
+      rigNext: false, rigged: false
+    };
+    a.ticks = makeTicks(a.rng);
+    a.refreshAt = Math.floor(a.rng() * REFRESH);
+    spawnPair(a, true);
+    arenas.push(a);
+  }
+}
+
+/* ---------------- the vote ---------------- */
+function refreshVotes(a, silent) {
+  var inwardP = 0.5 + a.temp;
+  if (a.rigged) inwardP = 0.96;
+  var net = 0;
+  for (var i = 0; i < a.ticks.length; i++) {
+    var t = a.ticks[i];
+    var inward;
+    if (a.rng() < a.erratic) inward = a.rng() < 0.5;
+    else inward = a.rng() < inwardP;
+    t.vote = inward ? -1 : 1;
+    t.flash = 1;
+    net += t.vote;
+  }
+  var p = net / a.ticks.length;             // -1 all inward .. +1 all outward
+  a.rGoal = a.rigged ? 13 + p * 3 : 26 + p * 15;
+  if (a.rGoal < 11) a.rGoal = 11;
+  if (a.rGoal > 43) a.rGoal = 43;
+  if (!silent) {
+    // the visible kink: the fresh votes shove the dater radially, once
+    var dx = a.daterX - a.dateX, dy = a.daterY - a.dateY;
+    var r = Math.sqrt(dx * dx + dy * dy) || 1;
+    var kick = -p * 7;                      // inward majority pulls in, outward pushes out
+    a.daterVX += (dx / r) * kick;
+    a.daterVY += (dy / r) * kick;
+  }
+}
+
+/* ---------------- audio (lazy, guarded) ---------------- */
+var AC = null, lastBedStep = -10000, lastResolveStep = -10000;
+function ensureAudio() {
+  if (AC) { if (AC.resume) AC.resume(); return; }
+  var Ctor = null;
+  if (typeof AudioContext !== 'undefined') Ctor = AudioContext;
+  else if (typeof webkitAudioContext !== 'undefined') Ctor = webkitAudioContext;
+  if (!Ctor) return;
+  try { AC = new Ctor(); } catch (e) { AC = null; }
+}
+function tone(freq, freqEnd, dur, gain, type) {
+  if (!AC) return;
+  try {
+    var o = AC.createOscillator(), g = AC.createGain();
+    o.type = type || 'sine';
+    var now = AC.currentTime;
+    o.frequency.setValueAtTime(freq, now);
+    if (freqEnd) o.frequency.exponentialRampToValueAtTime(freqEnd, now + dur);
+    g.gain.setValueAtTime(0.0001, now);
+    g.gain.exponentialRampToValueAtTime(gain, now + 0.006);
+    g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+    o.connect(g); g.connect(AC.destination);
+    o.start(now); o.stop(now + dur + 0.02);
+  } catch (e) { /* audio is decoration only */ }
+}
+function playBedTick() { tone(1500 + Math.random() * 900, 0, 0.03, 0.010, 'square'); }
+function playResolve(ring) {
+  if (stepCount - lastResolveStep < 30) return; // throttle: at most ~4 per second
+  lastResolveStep = stepCount;
+  if (ring) { tone(1568, 0, 0.35, 0.030, 'sine'); tone(2093, 0, 0.28, 0.016, 'sine'); }
+  else tone(130, 70, 0.22, 0.05, 'sine');     // a dull thud for a bad date
+}
+
+/* ---------------- resolution and seasons ---------------- */
+function resolveArena(a) {
+  var meanR = a.nR > 0 ? a.sumR / a.nR : R_NORM;
+  var ring = (meanR / R_NORM) * R_NORM < RING_MAX;
+  a.glyph = ring ? 'ring' : 'cross';
+  a.glyphStep = stepCount;
+  a.resolvedSeason = true;
+  playResolve(ring);
+  a.state = 'pause'; a.stateStep = 0;
+  var all = true;
+  for (var i = 0; i < COUNT; i++) if (!arenas[i].resolvedSeason) { all = false; break; }
+  if (all && seasonFade === 0) seasonFade = 120; // the season closes, glyphs fade
+}
+
+function doRig(idx) {
+  var a = arenas[idx];
+  a.rigNext = true;
+  for (var i = 0; i < a.ticks.length; i++) a.ticks[i].flash = 1; // the flood is visible at once
+}
+function doSwap(i, j) {
+  if (i === j || i < 0 || j < 0) return;
+  var A = arenas[i], B = arenas[j];
+  var tx = A.dateX, ty = A.dateY, tvx = A.dateVX, tvy = A.dateVY;
+  A.dateX = B.dateX; A.dateY = B.dateY; A.dateVX = B.dateVX; A.dateVY = B.dateVY;
+  B.dateX = tx; B.dateY = ty; B.dateVX = tvx; B.dateVY = tvy;
+  // pairs restart around their new dates; round timers keep running (recorded choice)
+  restartOrbit(A); restartOrbit(B);
+}
+function restartOrbit(a) {
+  if (a.state !== 'orbit') return;
+  var ang = a.rng() * Math.PI * 2;
+  var r0 = Math.max(12, Math.min(40, a.rTarget));
+  a.daterX = a.dateX + Math.cos(ang) * r0;
+  a.daterY = a.dateY + Math.sin(ang) * r0;
+  a.daterVX = -Math.sin(ang) * 30 * a.dirSign;
+  a.daterVY = Math.cos(ang) * 30 * a.dirSign;
+  a.sumR = 0; a.nR = 0;
+}
+function doSeason() {
+  season++;
+  seasonFade = 0;
+  buildSeason(BASE_SEED + season * 7919);
+}
+function consumeEvents() {
+  for (var i = events.length - 1; i >= 0; i--) {
+    if (events[i].step <= stepCount) {
+      var ev = events[i];
+      events.splice(i, 1);
+      if (ev.kind === 'rig') doRig(ev.idx);
+      else if (ev.kind === 'swap') doSwap(ev.a, ev.b);
+      else if (ev.kind === 'season') doSeason();
+    }
+  }
+  if (pendingTap && stepCount >= pendingTap.step + TAP_WINDOW) {
+    doRig(pendingTap.idx);
+    pendingTap = null;
+  }
+}
+
+/* ---------------- the sim ---------------- */
+function stepArena(a) {
+  var i;
+  for (i = 0; i < a.ticks.length; i++) {
+    a.ticks[i].flash *= Math.exp(-DT * 2.6);
+    if (a.ticks[i].flash < 0.02) a.ticks[i].flash = 0.02;
+  }
+  if (stepCount >= a.refreshAt) {
+    refreshVotes(a, false);
+    a.refreshAt += REFRESH;
+  }
+  a.rTarget += (a.rGoal - a.rTarget) * Math.min(1, 2.2 * DT);
+
+  if (a.state === 'pause') {
+    a.stateStep++;
+    if (a.stateStep >= PAUSE_STEPS) spawnPair(a, false);
+    return;
+  }
+
+  // date-dot: a slow seeded wander, softly contained near the center
+  var wa = a.wanderPhase + stepCount * a.wanderRate;
+  var dvx = Math.cos(wa) * a.dateSpeed, dvy = Math.sin(wa) * a.dateSpeed;
+  var dcx = a.dateX - 50, dcy = a.dateY - 50;
+  var dc = Math.sqrt(dcx * dcx + dcy * dcy);
+  if (dc > 16) { dvx -= (dcx / dc) * (dc - 16) * 1.4; dvy -= (dcy / dc) * (dc - 16) * 1.4; }
+  a.dateVX += (dvx - a.dateVX) * Math.min(1, 1.8 * DT);
+  a.dateVY += (dvy - a.dateVY) * Math.min(1, 1.8 * DT);
+  a.dateX += a.dateVX * DT;
+  a.dateY += a.dateVY * DT;
+
+  // dater-dot: velocity steered toward the orbit the votes currently demand
+  var dx = a.daterX - a.dateX, dy = a.daterY - a.dateY;
+  var r = Math.sqrt(dx * dx + dy * dy);
+  if (r < 0.001) { dx = 1; dy = 0; r = 1; }
+  var ux = dx / r, uy = dy / r;
+  var tx = -uy * a.dirSign, ty = ux * a.dirSign;
+  var vt = 30 + r * 0.12;                              // orbital pace
+  var vr = (a.rTarget - r) * 2.4;                      // radial correction toward the voted radius
+  if (vr > 20) vr = 20; else if (vr < -20) vr = -20;
+  var tvx = tx * vt + ux * vr, tvy = ty * vt + uy * vr;
+  var blend = Math.min(1, 5.5 * DT);
+  a.daterVX += (tvx - a.daterVX) * blend;
+  a.daterVY += (tvy - a.daterVY) * blend;
+  a.daterX += a.daterVX * DT;
+  a.daterY += a.daterVY * DT;
+  // keep the dater inside its own arena
+  if (a.daterX < 5) { a.daterX = 5; a.daterVX = Math.abs(a.daterVX); }
+  if (a.daterX > 95) { a.daterX = 95; a.daterVX = -Math.abs(a.daterVX); }
+  if (a.daterY < 5) { a.daterY = 5; a.daterVY = Math.abs(a.daterVY); }
+  if (a.daterY > 95) { a.daterY = 95; a.daterVY = -Math.abs(a.daterVY); }
+
+  var dx2 = a.daterX - a.dateX, dy2 = a.daterY - a.dateY;
+  a.sumR += Math.sqrt(dx2 * dx2 + dy2 * dy2);
+  a.nR++;
+  a.roundLeft--;
+  if (a.roundLeft <= 0) resolveArena(a);
+}
+
+function step() {
+  consumeEvents();
+  for (var i = 0; i < COUNT; i++) stepArena(arenas[i]);
+  if (seasonFade > 0) {
+    seasonFade--;
+    if (seasonFade === 0) doSeason();
+  }
+  stepCount++;
+}
+
+/* ---------------- draw ---------------- */
+var TICK_NORMALS = [[0, 1], [-1, 0], [0, -1], [1, 0]]; // inward normal per side
+function tickPoint(t) {
+  if (t.side === 0) return [t.frac * 100, 0];
+  if (t.side === 1) return [100, t.frac * 100];
+  if (t.side === 2) return [t.frac * 100, 100];
+  return [0, t.frac * 100];
+}
+function draw() {
+  canvas.style.width = viewW + 'px';
+  canvas.style.height = viewH + 'px';
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = '#0C0D12';
+  ctx.fillRect(0, 0, viewW, viewH);
+  var L = layout();
+  var cell = L.cell;
+  var fade = seasonFade > 0 ? seasonFade / 120 : 1;
+  var i, a, lx, ly;
+
+  function SX(aa, x) { return L.gx + (aa.col + x / 100) * cell; }
+  function SY(aa, y) { return L.gy + (aa.row + y / 100) * cell; }
+
+  // arena hairlines
+  ctx.strokeStyle = '#262A35';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (i = 0; i < COUNT; i++) {
+    a = arenas[i];
+    ctx.rect(L.gx + a.col * cell, L.gy + a.row * cell, cell, cell);
+  }
+  ctx.stroke();
+
+  // the ledger: resolved glyphs, centered in their arenas
+  var gr = cell * 0.24;
+  for (i = 0; i < COUNT; i++) {
+    a = arenas[i];
+    if (!a.glyph) continue;
+    var age = stepCount - a.glyphStep;
+    var ga = Math.min(1, age / 60) * 0.9 * fade;
+    if (ga <= 0) continue;
+    var cx = SX(a, 50), cy = SY(a, 50);
+    ctx.lineWidth = Math.max(2, cell * 0.022);
+    ctx.lineCap = 'round';
+    if (a.glyph === 'ring') {
+      ctx.strokeStyle = 'rgba(125,255,184,' + ga.toFixed(3) + ')';
+      ctx.beginPath();
+      ctx.arc(cx, cy, gr, 0, Math.PI * 2);
+      ctx.stroke();
+    } else {
+      ctx.strokeStyle = 'rgba(255,59,59,' + ga.toFixed(3) + ')';
+      ctx.beginPath();
+      ctx.moveTo(cx - gr * 0.8, cy - gr * 0.8);
+      ctx.lineTo(cx + gr * 0.8, cy + gr * 0.8);
+      ctx.moveTo(cx + gr * 0.8, cy - gr * 0.8);
+      ctx.lineTo(cx - gr * 0.8, cy + gr * 0.8);
+      ctx.stroke();
+    }
+  }
+
+  // vote ticks along the arena edges: the gig workers, made visible
+  ctx.strokeStyle = '#4FD6FF';
+  ctx.lineCap = 'round';
+  for (i = 0; i < COUNT; i++) {
+    a = arenas[i];
+    ctx.lineWidth = Math.max(1.2, cell * 0.016);
+    for (var j = 0; j < a.ticks.length; j++) {
+      var t = a.ticks[j];
+      var p = tickPoint(t);
+      var n = TICK_NORMALS[t.side];
+      var dir = t.vote < 0 ? 1 : -1;        // inward vote points in, outward points out
+      var len = cell * 0.075;
+      var floor = a.rigged ? 0.5 : 0;
+      var al = 0.16 + 0.84 * Math.max(t.flash, floor);
+      ctx.strokeStyle = 'rgba(79,214,255,' + al.toFixed(3) + ')';
+      ctx.beginPath();
+      ctx.moveTo(SX(a, p[0] - n[0] * dir * 2.5), SY(a, p[1] - n[1] * dir * 2.5));
+      ctx.lineTo(SX(a, p[0] + n[0] * dir * 7.5), SY(a, p[1] + n[1] * dir * 7.5));
+      ctx.stroke();
+    }
+  }
+
+  // the pairs: magenta date-dot, white dater-dot
+  for (i = 0; i < COUNT; i++) {
+    a = arenas[i];
+    if (a.state !== 'orbit') continue;
+    ctx.fillStyle = '#FF4FD8';
+    ctx.beginPath();
+    ctx.arc(SX(a, a.dateX), SY(a, a.dateY), Math.max(2, cell * 0.026), 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#F5F2EA';
+    ctx.beginPath();
+    ctx.arc(SX(a, a.daterX), SY(a, a.daterY), Math.max(2.4, cell * 0.032), 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+/* ---------------- interaction ---------------- */
+function toView(e) {
+  var rx = 0, ry = 0;
+  if (canvas.getBoundingClientRect) {
+    var r = canvas.getBoundingClientRect();
+    rx = r.left; ry = r.top;
+  }
+  return { x: e.clientX - rx, y: e.clientY - ry };
+}
+function arenaAt(p) {
+  var L = layout();
+  var c = Math.floor((p.x - L.gx) / L.cell);
+  var r = Math.floor((p.y - L.gy) / L.cell);
+  if (c < 0 || c >= COLS || r < 0 || r >= ROWS) return -1;
+  return r * COLS + c;
+}
+var pDown = null, dragStart = -1, dragging = false;
+
+function onDown(e) {
+  ensureAudio();
+  var p = toView(e);
+  pDown = p; dragging = false;
+  dragStart = arenaAt(p);
+}
+function onMove(e) {
+  if (!pDown) return;
+  var p = toView(e);
+  var dx = p.x - pDown.x, dy = p.y - pDown.y;
+  if (dx * dx + dy * dy > 100) dragging = true;
+}
+function onUp(e) {
+  if (!pDown) return;
+  var p = toView(e);
+  if (dragging) {
+    var end = arenaAt(p);
+    if (dragStart >= 0 && end >= 0 && end !== dragStart) {
+      events.push({ step: stepCount, kind: 'swap', a: dragStart, b: end });
+    }
+  } else {
+    var idx = arenaAt(p);
+    if (idx >= 0) {
+      if (pendingTap && stepCount - pendingTap.step < TAP_WINDOW) {
+        pendingTap = null; // second tap: a new season, not a rigged vote
+        events.push({ step: stepCount, kind: 'season' });
+      } else {
+        pendingTap = { step: stepCount, idx: idx };
+      }
+    }
+  }
+  pDown = null; dragStart = -1; dragging = false;
+}
+if (canvas.addEventListener) {
+  canvas.addEventListener('pointerdown', onDown);
+  canvas.addEventListener('pointermove', onMove);
+  canvas.addEventListener('pointerup', onUp);
+  canvas.addEventListener('pointercancel', function () { pDown = null; dragStart = -1; dragging = false; });
+}
+function onResize() { fit(); draw(); }
+if (typeof window !== 'undefined' && window.addEventListener) {
+  window.addEventListener('resize', onResize);
+}
+if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.addEventListener) {
+  window.visualViewport.addEventListener('resize', onResize);
+}
+
+/* ---------------- run: pre-roll, frame one, live loop ---------------- */
+buildSeason(BASE_SEED);
+for (var s = 0; s < PREROLL; s++) step();
+draw();
+
+if (typeof requestAnimationFrame === 'function') {
+  var lastTs = -1, acc = 0;
+  var frame = function (ts) {
+    if (lastTs < 0) lastTs = ts;
+    var el = (ts - lastTs) / 1000;
+    lastTs = ts;
+    if (el > 0.1) el = 0.1; // cap: never spiral after a stall
+    acc += el;
+    var n = Math.floor(acc / DT);
+    if (n > 30) n = 30;
+    acc -= n * DT;
+    for (var i = 0; i < n; i++) step();
+    if (AC && stepCount - lastBedStep > 11) { // the gig-work bed: a soft tick patter
+      lastBedStep = stepCount;
+      if (Math.random() < 0.75) playBedTick();
+    }
+    draw();
+    requestAnimationFrame(frame);
+  };
+  requestAnimationFrame(frame);
+}
+</script>
+</body>
+</html>
