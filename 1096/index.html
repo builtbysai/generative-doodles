@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Immaterial Terrain</title>
+<style>
+  html, body {
+    margin: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #05070A;
+  }
+  canvas {
+    display: block;
+    touch-action: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="piece"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // Frame one is a fixed phase: t = 18.5s. The terrain is mid-evolution
+  // and the second scan sweep (of three in the loop) stands at u ~ 0.39,
+  // brightening and re-drawing the contours it crosses.
+  var T0 = 18.5;
+  var LOOP = 45;          // seconds, seamless
+  var SWEEP_EVERY = 15;   // one scan sweep per 15s, three per loop
+  var SWEEP_DUR = 8;      // the band crosses in 8s, then rests off-form
+  var WORLD = 1000;
+  var NL = 16;            // iso levels
+  var L0 = 0.045, LSTEP = 0.056;
+
+  var canvas = document.getElementById('piece');
+  var ctx = canvas.getContext('2d');
+  var currentT = T0;
+  var view = { w: 0, h: 0, dpr: 1, scale: 1, ox: 0, oy: 0, phone: false };
+
+  var COL = {
+    ground: '#05070A',
+    edge: [159, 216, 255],   // #9FD8FF contour edges
+    core: [223, 242, 255],   // #DFF2FF contour cores
+    white: [255, 255, 255],  // scan band
+    grid: '#2A4A66'
+  };
+
+  function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+  function clamp01(v) { return clamp(v, 0, 1); }
+  function lerp(a, b, u) { return a + (b - a) * u; }
+  function smoother(u) { u = clamp01(u); return u * u * u * (u * (u * 6 - 15) + 10); }
+  function smoothstep(a, b, v) { return smoother((v - a) / (b - a)); }
+  function mixc(c1, c2, u) {
+    return 'rgb(' + Math.round(lerp(c1[0], c2[0], u)) + ',' +
+                    Math.round(lerp(c1[1], c2[1], u)) + ',' +
+                    Math.round(lerp(c1[2], c2[2], u)) + ')';
+  }
+
+  // ---- seeded value noise -------------------------------------------------
+  function hash2(ix, iy, seed) {
+    var n = Math.imul(ix, 374761393) ^ Math.imul(iy, 668265263) ^ Math.imul(seed, 974634);
+    n = Math.imul(n ^ (n >>> 13), 1274126177);
+    n ^= n >>> 16;
+    return (n >>> 0) / 4294967296;
+  }
+  function vnoise(x, y, seed) {
+    var xi = Math.floor(x), yi = Math.floor(y);
+    var xf = x - xi, yf = y - yi;
+    var u = smoother(xf), v = smoother(yf);
+    var a = hash2(xi, yi, seed), b = hash2(xi + 1, yi, seed);
+    var c = hash2(xi, yi + 1, seed), d = hash2(xi + 1, yi + 1, seed);
+    return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+  }
+  function fbm(x, y, oct, seed) {
+    var sum = 0, amp = 0.5, tot = 0, fx = x, fy = y;
+    for (var i = 0; i < oct; i++) {
+      sum += amp * vnoise(fx, fy, seed + i * 131);
+      tot += amp;
+      amp *= 0.5;
+      var nx = (fx * 2.03) + 19.7, ny = (fy * 2.03) + 7.9;
+      fx = nx; fy = ny;
+    }
+    return sum / tot;
+  }
+
+  // ---- heightfield ---------------------------------------------------------
+  // All drift is sinusoidal with integer cycles per 45s loop, so the seam
+  // closes exactly and the field is a closed-form function of t (no state).
+  function heightAt(u, v, ph) {
+    var ox = 0.45 * Math.sin(ph), oy = 0.38 * Math.cos(ph);
+    var ox2 = 0.22 * Math.sin(2 * ph + 1.7), oy2 = 0.19 * Math.cos(2 * ph + 0.6);
+    var px = u * 3.1 + ox + 4.0, py = v * 2.3 + oy + 9.0;
+    var wx = fbm(px * 0.8 + 13.7 + ox2, py * 0.8 + 7.3 + oy2, 2, 517) - 0.5;
+    var wy = fbm(px * 0.8 + 3.1 - ox2, py * 0.8 + 17.9 - oy2, 2, 913) - 0.5;
+    var qx = px + 0.85 * wx, qy = py + 0.85 * wy;
+    var n = fbm(qx, qy, 4, 271);
+    var rr = 1 - Math.abs(2 * fbm(qx * 1.6 + 31.7 - ox2, qy * 1.6 + 11.3 + ox, 2, 733) - 1);
+    var h = 0.72 * n + 0.38 * rr * rr;
+    h *= 0.9 + 0.14 * Math.sin(2 * ph + 0.9);        // breathing amplitude
+    h = Math.pow(clamp01((h - 0.16) / 0.85), 1.25);  // lift plains, sharpen peaks
+    var env = 1 - 0.93 * smoothstep(0.5, 0.99, u);   // mass weighted left
+    env *= 0.8 + 0.3 * (1 - u) * (1 - v * 0.5);
+    return clamp01(h * env + 0.015);
+  }
+
+  // ---- projection (oblique, world units) -----------------------------------
+  function projX(u) { return 46 + u * 908; }
+  function projY(v, h) { return 238 + v * 478 - h * 372 * (0.38 + 0.62 * v); }
+
+  // ---- scan band -------------------------------------------------------------
+  // Returns band centre u, or -10 when the band rests off-form.
+  function bandAt(t) {
+    var s = t % SWEEP_EVERY;
+    if (s >= SWEEP_DUR) return -10;
+    return -0.06 + 1.18 * smoother(s / SWEEP_DUR);
+  }
+
+  function resize() {
+    var vw = window.innerWidth;
+    var vh = window.innerHeight;
+    if (window.visualViewport) {
+      vw = window.visualViewport.width;
+      vh = window.visualViewport.height;
+    }
+    var dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.max(1, Math.round(vw * dpr));
+    canvas.height = Math.max(1, Math.round(vh * dpr));
+    var screenMin = 0;
+    if (window.screen) screenMin = Math.min(window.screen.width || 0, window.screen.height || 0);
+    var phone = screenMin > 0 ? screenMin < 700 : vh > vw * 1.15;
+    var scale = Math.min(vw / WORLD, vh / WORLD);
+    view = {
+      w: vw, h: vh, dpr: dpr, scale: scale,
+      ox: (vw - WORLD * scale) / 2, oy: (vh - WORLD * scale) / 2,
+      phone: phone
+    };
+  }
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', function () { resize(); draw(currentT); });
+  }
+  window.addEventListener('resize', function () { resize(); draw(currentT); });
+  resize();
+
+  // ---- trailing scan-grids ----------------------------------------------------
+  function drawGrids() {
+    ctx.strokeStyle = COL.grid;
+    ctx.globalAlpha = 0.25;
+    ctx.lineWidth = 1.1;
+    ctx.beginPath();
+    var i, u, v;
+    for (i = 0; i <= 15; i++) {           // u lines, trailing past both edges
+      u = -0.07 + i * (1.23 / 15);
+      ctx.moveTo(projX(u), projY(-0.35, 0));
+      ctx.lineTo(projX(u), projY(1.3, 0));
+    }
+    for (i = 0; i <= 20; i++) {           // v lines, trailing back and front
+      v = -0.35 + i * (1.65 / 20);
+      ctx.moveTo(projX(-0.07), projY(v, 0));
+      ctx.lineTo(projX(1.16), projY(v, 0));
+    }
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  // ---- contours -----------------------------------------------------------------
+  function strokeBucket(segs, style, alpha, width) {
+    if (!segs.length) return;
+    ctx.strokeStyle = style;
+    ctx.globalAlpha = alpha;
+    ctx.lineWidth = width;
+    ctx.beginPath();
+    for (var i = 0; i < segs.length; i += 4) {
+      ctx.moveTo(segs[i], segs[i + 1]);
+      ctx.lineTo(segs[i + 2], segs[i + 3]);
+    }
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  function drawContours(t, ph) {
+    var N = view.phone ? 76 : 96;
+    var W = N + 1;
+    var H = new Float32Array(W * W);
+    var PX = new Float32Array(W * W);
+    var PY = new Float32Array(W * W);
+    var i, j, idx;
+    for (j = 0; j <= N; j++) {
+      var v = j / N;
+      for (i = 0; i <= N; i++) {
+        var u = i / N;
+        idx = j * W + i;
+        var h = heightAt(u, v, ph);
+        H[idx] = h;
+        PX[idx] = projX(u);
+        PY[idx] = projY(v, h);
+      }
+    }
+
+    var band = bandAt(t);
+    var main = [], hot = [], fine = [];
+    for (var k = 0; k < NL; k++) { main.push([]); hot.push([]); }
+    for (k = 0; k < NL - 1; k++) fine.push([]);
+
+    // marching-squares-lite: per cell, per level inside the corner range,
+    // collect edge crossings in cyclic order and pair them into segments.
+    for (j = 0; j < N; j++) {
+      for (i = 0; i < N; i++) {
+        var i00 = j * W + i, i10 = i00 + 1, i01 = i00 + W, i11 = i01 + 1;
+        var h00 = H[i00], h10 = H[i10], h01 = H[i01], h11 = H[i11];
+        var mn = Math.min(h00, h10, h01, h11), mx = Math.max(h00, h10, h01, h11);
+        if (mx - mn < 1e-5) continue;
+        var uc = (i + 0.5) / N;
+        var d = band > -5 ? Math.abs(uc - band) : 99;
+        var boost = Math.exp(-(d * d) / (2 * 0.09 * 0.09));
+        var isHot = boost >= 0.45;
+        var wantFine = boost >= 0.18;
+        var k0 = Math.max(0, Math.floor((mn - L0) / LSTEP));
+        var k1 = Math.min(NL - 1, Math.ceil((mx - L0) / LSTEP));
+        for (k = k0; k <= k1; k++) {
+          var L = L0 + k * LSTEP;
+          if (L <= mn || L >= mx) continue;
+          emit(H, PX, PY, i00, i10, i01, i11, L, isHot ? hot[k] : main[k]);
+          if (wantFine && k < NL - 1) {
+            var LF = L + LSTEP * 0.5;
+            if (LF > mn && LF < mx) emit(H, PX, PY, i00, i10, i01, i11, LF, fine[k]);
+          }
+        }
+      }
+    }
+
+    for (k = 0; k < NL; k++) {
+      var Lk = L0 + k * LSTEP;
+      var aN = 0.14 + 0.62 * Math.pow(Lk, 1.15);
+      var col = mixc(COL.edge, COL.core, Math.pow(Lk, 0.8));
+      strokeBucket(main[k], col, Math.min(0.85, aN), 1.35);
+      strokeBucket(hot[k], mixc(COL.edge, COL.white, 0.55), Math.min(1, aN * 1.5 + 0.25), 1.5);
+      if (k < NL - 1) {
+        var LF2 = Lk + LSTEP * 0.5;
+        strokeBucket(fine[k], mixc(COL.edge, COL.core, Math.pow(LF2, 0.8)),
+          Math.min(0.8, (0.14 + 0.62 * Math.pow(LF2, 1.15)) * 0.6), 1.0);
+      }
+    }
+    return band;
+  }
+
+  // Edge order around the cell: bottom, right, top, left (cyclic).
+  function emit(H, PX, PY, i00, i10, i01, i11, L, out) {
+    var hs = [H[i00], H[i10], H[i11], H[i01]];           // corners: BL BR TR TL
+    var xs = [PX[i00], PX[i10], PX[i11], PX[i01]];
+    var ys = [PY[i00], PY[i10], PY[i11], PY[i01]];
+    var cx = [], cy = [];
+    for (var e = 0; e < 4; e++) {
+      var a = e, b = (e + 1) % 4;
+      var ha = hs[a], hb = hs[b];
+      if ((ha < L && hb >= L) || (hb < L && ha >= L)) {
+        var f = (L - ha) / (hb - ha);
+        cx.push(lerp(xs[a], xs[b], f));
+        cy.push(lerp(ys[a], ys[b], f));
+      }
+    }
+    if (cx.length === 2) {
+      out.push(cx[0], cy[0], cx[1], cy[1]);
+    } else if (cx.length === 4) {
+      var c = (hs[0] + hs[1] + hs[2] + hs[3]) * 0.25;
+      if (c > L) { out.push(cx[0], cy[0], cx[1], cy[1], cx[2], cy[2], cx[3], cy[3]); }
+      else { out.push(cx[1], cy[1], cx[2], cy[2], cx[3], cy[3], cx[0], cy[0]); }
+    }
+  }
+
+  function drawBand(band) {
+    if (band < -0.06 || band > 1.12) return;
+    var bx = projX(band);
+    ctx.strokeStyle = '#FFFFFF';
+    ctx.lineCap = 'round';
+    ctx.globalAlpha = 0.30; ctx.lineWidth = 1.6;
+    ctx.beginPath(); ctx.moveTo(bx, 92); ctx.lineTo(bx, 884); ctx.stroke();
+    ctx.globalAlpha = 0.16; ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.moveTo(bx + 26, 92); ctx.lineTo(bx + 26, 884); ctx.stroke();
+    ctx.globalAlpha = 0.18; ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.moveTo(bx - 17, 92); ctx.lineTo(bx - 17, 884); ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  function draw(t) {
+    currentT = t;
+    canvas.style.width = view.w + 'px';
+    canvas.style.height = view.h + 'px';
+    ctx.setTransform(view.dpr || 1, 0, 0, view.dpr || 1, 0, 0);
+    ctx.fillStyle = COL.ground;
+    ctx.fillRect(0, 0, view.w, view.h);
+    ctx.translate(view.ox, view.oy);
+    ctx.scale(view.scale, view.scale);
+
+    var tt = ((t % LOOP) + LOOP) % LOOP;
+    var ph = 2 * Math.PI * tt / LOOP;
+    drawGrids();
+    var band = drawContours(tt, ph);
+    drawBand(band);
+  }
+
+  var startMs = null;
+  function frame(ms) {
+    if (typeof ms !== 'number' || !isFinite(ms)) ms = 0;
+    if (startMs === null) startMs = ms;
+    draw(T0 + (ms - startMs) / 1000);
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+  }
+
+  frame(0);
+})();
+</script>
+</body>
+</html>
