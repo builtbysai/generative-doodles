@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Codec Tutorial</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #000000; overflow: hidden; height: 100%; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- Codec Tutorial — Nick Briz study NB1 ----------
+  // After Briz's Glitch Codec Tutorial (2010): a media player tweaked so
+  // videos become infested with the patterns of the codec algorithms that
+  // play them. Here a serene procedural dusk — ten flat sky bands, an
+  // orange sun, dark dunes — is periodically destroyed by codec breakage.
+  // The scene is sampled from a pure function into a grid of display cells
+  // (no offscreen canvas, no ImageData, no real encoding); the destruction
+  // happens in the data: each 16px-equivalent macroblock band renders its
+  // rows shifted right by a seeded per-band drift, the vacated strip fills
+  // with stretched edge smears and flat artifact blocks, bright shapes get
+  // a chroma-trail ghost, and the macroblock grid flickers on. At 18s a
+  // KEYFRAME snaps the scene back clean and it holds to the loop point.
+  // 24s loop, watch-only: 0-6s clean (I-FRAME), 6-18s P-FRAME DRIFT,
+  // 18s KEYFRAME, 18-24s clean hold. A caption strip names the phase.
+
+  var T0 = 13;                 // fixed phase for the deterministic first frame (mid-drift)
+  var LOOP = 24;               // seconds
+  var DRIFT_START = 6, KEY_T = 18, KEY_WINDOW = 0.4;   // keyframe flash window
+  var PAGE_BG = '#000000';
+  var CAP_BG = '#000000';
+  var SUN = '#FF9E4F';
+  var ARTIFACTS = ['#00FFC2', '#FF2B6E', '#FFE14D'];
+  var CAP_TEXT = '#D8D8D8';
+  var CAP_KEY = '#FFE14D';
+
+  // sky: 10 discrete flat bands, top #0B1026 -> horizon #2A1A3E
+  var SKY = ['#0B1026', '#0E1230', '#11143A', '#141743', '#171A4B',
+             '#1A1C48', '#1E1D45', '#221D42', '#261C40', '#2A1A3E'];
+  var HORIZON = 0.62;          // scene fraction where ground begins
+  var GROUND_FAR = '#0D0A18';  // far dune tone
+  var GROUND_NEAR = '#060510'; // near dune tone
+  var SUN_CX = 0.63, SUN_CY = 0.44, SUN_R = 0.135;   // sun, scene fractions
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ---------- seeded rng ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- scene function ----------
+  // Pure: returns a flat color for a point in scene space (u, v in 0..1).
+  // Sky bands by v; sun disc by distance; two dune silhouettes over the
+  // ground; a one-cell horizon line where sky meets far ground.
+  function duneFar(u) { return HORIZON + 0.045 * Math.sin(u * 5.1 + 0.7) + 0.02 * Math.sin(u * 11.3); }
+  function duneNear(u) { return 0.80 + 0.05 * Math.sin(u * 3.7 + 2.4) + 0.018 * Math.sin(u * 9.1 + 1.0); }
+  var SCENE_W = 1, SCENE_H = 1;   // pixel dims of the current frame, set in draw()
+  function hash2(x, y) {
+    var h = (x * 374761393 + y * 668265263) | 0;
+    h = Math.imul(h ^ (h >>> 13), 1274126177);
+    return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+  }
+  function sceneColor(u, v) {
+    // sun distance measured in pixels so the disc reads round at any aspect
+    var du = (u - SUN_CX) * SCENE_W, dv = (v - SUN_CY) * SCENE_H;
+    var rPx = SUN_R * SCENE_H;
+    if (du * du + dv * dv <= rPx * rPx) return SUN;
+    if (v >= duneNear(u)) return GROUND_NEAR;
+    // two flat mesa silhouettes standing on the far ground
+    if (v >= 0.575 && v < duneFar(u) + 0.03 && u > 0.07 && u < 0.21) return '#08060F';
+    if (v >= 0.595 && v < duneFar(u) + 0.03 && u > 0.83 && u < 0.94) return '#08060F';
+    if (v >= duneFar(u)) return GROUND_FAR;
+    // sparse dim stars in the upper sky — texture for the drift to tear
+    if (v < 0.34) {
+      var scx = Math.floor(u * 240), scy = Math.floor(v * 160);
+      if (hash2(scx, scy) < 0.012) return '#46538A';
+    }
+    var band = Math.floor(v / HORIZON * SKY.length);
+    if (band < 0) band = 0; if (band > SKY.length - 1) band = SKY.length - 1;
+    return SKY[band];
+  }
+  function isBright(c) { return c === SUN; }
+
+  // ---------- codec model (per macroblock band, seeded once) ----------
+  var seed = 1160001;
+  var BANDS = [];              // per scene band: drift rate, artifact slots
+  (function buildBands() {
+    var rng = mulberry32(seed);
+    for (var b = 0; b < 64; b++) {
+      var slots = [];
+      var n = 2 + Math.floor(rng() * 2);            // 2-3 artifact blocks per band
+      for (var k = 0; k < n; k++) {
+        slots.push({
+          at: 0.2 + rng() * 0.8,                    // drift level at which this block appears
+          pos: rng(),                               // position along the smear reach, 0..1
+          len: 0.3 + rng() * 0.5,                   // length, fraction of the strip
+          col: Math.floor(rng() * 3)
+        });
+      }
+      BANDS.push({
+        rate: 0.35 + rng() * 0.9,                   // per-band drift rate: bands tear unevenly
+        art: slots
+      });
+    }
+  })();
+
+  // global drift envelope D(t): 0 to 6s; stepped ramp 6-18s; snap at 18s; 0 to 24s
+  function driftAt(t) {
+    if (t < DRIFT_START || t >= KEY_T) return 0;
+    var p = (t - DRIFT_START) / (KEY_T - DRIFT_START);   // 0..1 across the drift phase
+    var stepped = Math.floor(p * 24) / 24;               // P-frames accumulate in steps
+    return stepped * stepped * (3 - 2 * stepped);        // smoothstep over the steps
+  }
+  function phaseAt(t) {
+    if (t >= KEY_T && t < KEY_T + KEY_WINDOW) return 'KEYFRAME';
+    if (t >= DRIFT_START && t < KEY_T) return 'P-FRAME DRIFT';
+    return 'I-FRAME';
+  }
+
+  // ---------- viewport / sizing ----------
+  var W = 0, H = 0, DPR = 1;
+  function viewSize() {
+    var vv = (typeof window !== 'undefined' && window.visualViewport) ? window.visualViewport : null;
+    var w = vv ? vv.width : (window.innerWidth || 800);
+    var h = vv ? vv.height : (window.innerHeight || 600);
+    return { w: w, h: h };
+  }
+  function isPhone() {
+    var scr = (typeof window !== 'undefined' && window.screen) ? window.screen : null;
+    if (scr && scr.width && scr.height) {
+      if (Math.min(scr.width, scr.height) < 700) return true;
+    }
+    return H > W * 1.15;
+  }
+  function fit() {
+    var s = viewSize();
+    W = s.w; H = s.h;
+    DPR = Math.min((window.devicePixelRatio || 1), 2);
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+  }
+  fit();
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', fit);
+  }
+  window.addEventListener('resize', fit);
+
+  // ---------- time ----------
+  function nowSec() {
+    return (typeof performance !== 'undefined' && performance.now) ? performance.now() / 1000 : Date.now() / 1000;
+  }
+  var startStamp = nowSec();
+  function pieceT() { return T0 + (nowSec() - startStamp); }
+
+  // ---------- drawing ----------
+  function draw(T) {
+    // pin CSS size every draw (house rule for high-DPR phones)
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+    ctx.fillStyle = PAGE_BG;
+    ctx.fillRect(0, 0, W, H);
+
+    var t = ((T % LOOP) + LOOP) % LOOP;
+    var D = driftAt(t);
+    var phase = phaseAt(t);
+
+    // caption strip height
+    var capH = isPhone() ? 30 : 34;
+    var sceneH = H - capH;
+
+    // scene grid: cells ~4px; macroblock band = 16px-equivalent = 4 cells
+    SCENE_W = W; SCENE_H = sceneH;
+    var cell = Math.max(2, Math.round(Math.min(W, sceneH) / 180));
+    var cols = Math.ceil(W / cell);
+    var rows = Math.ceil(sceneH / cell);
+    var CB = 4;                                   // cells per macroblock band
+    var bandRows = Math.ceil(rows / CB);
+    var maxShift = Math.round(cols * 0.20);       // worst band slides 20% of the width
+
+    var ghostOff = Math.max(2, Math.round(D * 10 / cell));   // chroma trail offset, in cells
+    var ghosts = [];                              // {x, y} bright cells that trail off a shape's edge
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, 0, W, sceneH);
+    ctx.clip();
+
+    for (var b = 0; b < bandRows; b++) {
+      var bd = BANDS[b % BANDS.length];
+      var shift = Math.round(D * bd.rate * maxShift);
+      var r0 = b * CB, r1 = Math.min(rows, r0 + CB);
+      for (var y = r0; y < r1; y++) {
+        var v = (y + 0.5) / rows;
+        // main pass: run-length over the shifted sampling
+        var x = 0;
+        while (x < cols) {
+          var sx = x - shift; if (sx < 0) sx = 0;         // vacated strip clamps to the edge run
+          var c = sceneColor((sx + 0.5) / cols, v);
+          var x0 = x; x++;
+          while (x < cols) {
+            var sx2 = x - shift; if (sx2 < 0) sx2 = 0;
+            if (sceneColor((sx2 + 0.5) / cols, v) !== c) break;
+            x++;
+          }
+          ctx.fillStyle = c;
+          ctx.fillRect(x0 * cell, y * cell, (x - x0) * cell + 0.5, cell + 0.5);
+        }
+        // chroma trail: only where a bright shape's edge ends — the ghost
+        // lands on non-bright ground just right of the shape, never on it
+        if (D > 0.05) {
+          for (var gx = 0; gx < cols; gx++) {
+            var gsx = gx - shift; if (gsx < 0) gsx = 0;
+            if (!isBright(sceneColor((gsx + 0.5) / cols, v))) continue;
+            var dsx = gx + ghostOff - shift; if (dsx < 0) dsx = 0;
+            if (!isBright(sceneColor((dsx + 0.5) / cols, v))) ghosts.push({ x: gx + ghostOff, y: y });
+          }
+        }
+        // artifact smear blocks: seeded along the smeared reach of the band
+        if (shift >= 3) {
+          for (var k = 0; k < bd.art.length; k++) {
+            var a = bd.art[k];
+            if (D < a.at) continue;
+            var stripPx = shift * cell;
+            var reach = stripPx + D * bd.rate * W * 0.38;
+            var ax = Math.floor(a.pos * Math.max(1, reach - 4));
+            var aw = Math.max(4, Math.floor(a.len * stripPx));
+            ctx.fillStyle = ARTIFACTS[a.col];
+            ctx.fillRect(ax, y * cell, aw, cell + 0.5);
+          }
+        }
+      }
+    }
+
+    // chroma-trail ghosts over the main pass: one artifact color, low alpha
+    if (ghosts.length) {
+      ctx.globalAlpha = 0.25;
+      ctx.fillStyle = '#FF2B6E';
+      for (var gi = 0; gi < ghosts.length; gi++) {
+        var g = ghosts[gi];
+        ctx.fillRect(g.x * cell, g.y * cell, cell + 0.5, cell + 0.5);
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    // macroblock grid overlay: only while drift is active, flickering alpha
+    if (D > 0.02) {
+      var step = Math.floor(t * 7);
+      var flick = 0.15 + 0.2 * ((step * 2654435761 >>> 8) % 100) / 100;   // 0.15..0.35, stepped
+      ctx.strokeStyle = 'rgba(255,255,255,' + flick.toFixed(3) + ')';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      var mb = CB * cell;
+      for (var mx = mb; mx < W; mx += mb) { ctx.moveTo(mx + 0.5, 0); ctx.lineTo(mx + 0.5, sceneH); }
+      for (var my = mb; my < sceneH; my += mb) { ctx.moveTo(0, my + 0.5); ctx.lineTo(W, my + 0.5); }
+      ctx.stroke();
+    }
+
+    ctx.restore();
+
+    // caption strip: the tutorial's phase label (specced text)
+    ctx.fillStyle = CAP_BG;
+    ctx.fillRect(0, sceneH, W, capH);
+    var fs = isPhone() ? 13 : 15;
+    ctx.font = fs + 'px monospace';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = (phase === 'KEYFRAME') ? CAP_KEY : CAP_TEXT;
+    ctx.fillText(phase, 12, sceneH + capH / 2 + 1);
+  }
+
+  // ---------- run: synchronous fixed-phase first frame, then guarded rAF ----------
+  draw(T0);
+  if (typeof requestAnimationFrame === 'function') {
+    var loop = function () {
+      draw(pieceT());
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
