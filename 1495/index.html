@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Curiosity and Benevolence</title>
+<style>
+  html, body { margin: 0; padding: 0; overflow: hidden; background: #e8e0d0; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // Palette (NR8 only, no other color).
+  var FIELD = '#e8e0d0';
+  var BLUE = '#4a5a7a';
+  var BRICK = '#a8674a';
+  var WOOD = '#8a6a48';
+  var GOLD = '#d9a441';
+  var SKIN = '#f2ead8';
+
+  // Seeded PRNG (mulberry32), never Math.random. No randomness is needed
+  // for the composition, but the seed is kept for parity with the study.
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(1495000);
+  void rng;
+
+  // Loop timeline (loop-local seconds): approach 0-16, sit 16-28,
+  // return 28-44, hold 44-48. Every value derives from loop-local time.
+  var LOOP = 48;
+  var APPROACH_END = 16;
+  var SIT_END = 28;
+  var RETURN_END = 44;
+
+  // Per-figure drag segments, recorded in loop-local time:
+  // {start, end (null while active), rate}. Rate is clamped so a figure
+  // can never run: max 2x the automatic pace, min 0.25x.
+  var segs = { left: [], right: [] };
+  var active = { left: null, right: null };
+
+  var lastT = 0;
+  var lastLt = 0;
+  var W = 0, H = 0;
+
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+  function lerp(a, b, t) { return a + (b - a) * t; }
+  function ease(t) { return t * t * (3 - 2 * t); }
+
+  // Integral of a figure's walk rate over [a, b] (loop-local), from its
+  // recorded segments; rate is 1 outside segments.
+  function intRate(fig, a, b) {
+    if (b <= a) return 0;
+    var total = 0, prev = a, i, s, segEnd;
+    var list = segs[fig];
+    for (i = 0; i < list.length; i++) {
+      s = list[i];
+      if (s.start >= b) break;
+      if (s.end !== null && s.end <= a) continue;
+      if (s.start > prev) { total += (Math.min(s.start, b) - prev); prev = Math.min(s.start, b); }
+      if (prev >= b) break;
+      segEnd = (s.end === null) ? b : Math.min(b, s.end);
+      if (segEnd > prev) { total += s.rate * (segEnd - prev); prev = segEnd; }
+      if (prev >= b) break;
+    }
+    if (prev < b) total += (b - prev);
+    return total;
+  }
+
+  // Approach distance (capped at 16) and return distance (capped at 16).
+  function approachDist(fig, lt) {
+    return Math.min(APPROACH_END, intRate(fig, 0, Math.min(lt, SIT_END)));
+  }
+  function returnDist(fig, lt) {
+    if (lt <= SIT_END) return 0;
+    return Math.min(RETURN_END - SIT_END, intRate(fig, SIT_END, Math.min(lt, RETURN_END)));
+  }
+
+  // Loop-local time at which a figure's approach distance first reaches 16.
+  function arrivalTime(fig) {
+    var lo = 0, hi = SIT_END, mid, k;
+    if (approachDist(fig, SIT_END) < APPROACH_END) return Infinity;
+    for (k = 0; k < 40; k++) {
+      mid = (lo + hi) / 2;
+      if (approachDist(fig, mid) >= APPROACH_END) hi = mid; else lo = mid;
+    }
+    return hi;
+  }
+
+  function size() {
+    var vw = (typeof window !== 'undefined' && window.visualViewport)
+      ? window.visualViewport.width : window.innerWidth;
+    var vh = (typeof window !== 'undefined' && window.visualViewport)
+      ? window.visualViewport.height : window.innerHeight;
+    W = vw; H = vh;
+    canvas.width = W; canvas.height = H;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+  }
+
+  // Geometry, all from min(W, H) so nothing clips on phones.
+  function geom() {
+    var s = Math.min(W, H) * 0.085;
+    var tableW = Math.min(W * 0.30, s * 5.2);
+    var tableH = s * 0.55;
+    var cy = H * 0.55;
+    return {
+      s: s,
+      tableX: 0.5 * W, tableY: cy,
+      tableW: tableW, tableH: tableH,
+      discR: Math.max(3, s * 0.28),
+      leftEdge: 0.06 * W, rightEdge: 0.94 * W,
+      leftSeat: 0.5 * W - tableW / 2 - s * 1.15,
+      rightSeat: 0.5 * W + tableW / 2 + s * 1.15,
+      baseY: cy
+    };
+  }
+
+  // Figure state at loop-local time lt: x, seated?, walking?, walk phase.
+  function figureState(fig, lt, g) {
+    var a = approachDist(fig, lt);
+    var ap = a / APPROACH_END;
+    var edge = (fig === 'left') ? g.leftEdge : g.rightEdge;
+    var seat = (fig === 'left') ? g.leftSeat : g.rightSeat;
+    var x, seated, walking, p;
+    if (lt < SIT_END) {
+      x = lerp(edge, seat, ease(ap));
+      seated = (a >= APPROACH_END);
+      walking = !seated;
+      p = ap;
+    } else if (lt < RETURN_END) {
+      var r = returnDist(fig, lt) / (RETURN_END - SIT_END);
+      var startX = lerp(edge, seat, ease(a / APPROACH_END));
+      x = lerp(startX, edge, ease(r));
+      seated = false;
+      walking = (r < 1);
+      p = r;
+    } else {
+      // Hold: ease from the return position to the edge, so the loop
+      // closes exactly at lt = 48 whatever drags did.
+      var r2 = returnDist(fig, RETURN_END) / (RETURN_END - SIT_END);
+      var startX2 = lerp(edge, seat, ease(a / APPROACH_END));
+      var pos44 = lerp(startX2, edge, ease(r2));
+      var h = (lt - RETURN_END) / (LOOP - RETURN_END);
+      x = lerp(pos44, edge, h);
+      seated = false;
+      walking = false;
+      p = 0;
+    }
+    return { x: x, seated: seated, walking: walking, p: p, arrived: a >= APPROACH_END };
+  }
+
+  function drawFigure(cx, cy, s, clothes, facing, seated, bob) {
+    // Abstract figure: torso rect, head disc, dot eyes, legs or seated pose.
+    ctx.fillStyle = clothes;
+    if (seated) {
+      ctx.fillRect(cx - 0.30 * s, cy - 1.05 * s, 0.60 * s, 1.05 * s);
+      ctx.fillRect(cx + (facing > 0 ? 0.30 * s : -0.95 * s), cy - 0.10 * s, 0.65 * s, 0.22 * s);
+      ctx.fillRect(cx + (facing > 0 ? 0.75 * s : -0.95 * s), cy + 0.12 * s, 0.20 * s, 0.75 * s);
+    } else {
+      var by = cy + bob;
+      ctx.fillRect(cx - 0.30 * s, by - 1.05 * s, 0.60 * s, 1.05 * s);
+      ctx.fillRect(cx - 0.26 * s, by, 0.20 * s, 0.85 * s);
+      ctx.fillRect(cx + 0.06 * s, by, 0.20 * s, 0.85 * s);
+      cy = by;
+    }
+    ctx.beginPath();
+    ctx.moveTo(cx, cy - 1.05 * s - 0.30 * s);
+    ctx.arc(cx, cy - 1.05 * s - 0.30 * s, 0.32 * s, 0, Math.PI * 2);
+    ctx.fillStyle = SKIN;
+    ctx.fill();
+    ctx.fillStyle = FIELD;
+    ctx.fillRect(cx + facing * 0.10 * s, cy - 1.05 * s - 0.34 * s, 0.07 * s, 0.07 * s);
+  }
+
+  function draw(t) {
+    lastT = t;
+    var lt = ((t % LOOP) + LOOP) % LOOP;
+    // A wrap to a new loop iteration clears drag history: drags belong to
+    // the iteration in which they were made.
+    if (lt < lastLt - 0.001) {
+      segs = { left: [], right: [] };
+      active = { left: null, right: null };
+    }
+    lastLt = lt;
+    size();
+    var g = geom();
+
+    ctx.fillStyle = FIELD;
+    ctx.fillRect(0, 0, W, H);
+
+    var L = figureState('left', lt, g);
+    var R = figureState('right', lt, g);
+
+    // Glow: layered flat-alpha discs, never a canvas gradient, gated on
+    // both figures seated; fades in over 1 s after the later arrival.
+    var bothSeated = L.arrived && R.arrived && lt < SIT_END;
+    var glowA = 0;
+    if (bothSeated) {
+      var tBoth = Math.max(arrivalTime('left'), arrivalTime('right'));
+      glowA = clamp((lt - tBoth) / 1, 0, 1);
+    }
+    if (glowA > 0) {
+      var ga = function (a) { return Math.round(a * 10000) / 10000; };
+      var cx = g.tableX, cy = g.tableY - g.discR;
+      ctx.fillStyle = 'rgba(217,164,65,' + ga(0.06 * glowA) + ')';
+      ctx.beginPath(); ctx.moveTo(cx, cy);
+      ctx.arc(cx, cy, g.discR * 3.0, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = 'rgba(217,164,65,' + ga(0.12 * glowA) + ')';
+      ctx.beginPath(); ctx.moveTo(cx, cy);
+      ctx.arc(cx, cy, g.discR * 2.1, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = 'rgba(217,164,65,' + ga(0.25 * glowA) + ')';
+      ctx.beginPath(); ctx.moveTo(cx, cy);
+      ctx.arc(cx, cy, g.discR * 1.4, 0, Math.PI * 2); ctx.fill();
+    }
+
+    // Table: wood top and legs, centered; gold disc on top.
+    ctx.fillStyle = WOOD;
+    ctx.fillRect(g.tableX - g.tableW / 2, g.tableY, g.tableW, g.tableH * 0.28);
+    ctx.fillRect(g.tableX - g.tableW / 2 + g.s * 0.15, g.tableY + g.tableH * 0.28, g.s * 0.18, g.tableH * 0.9);
+    ctx.fillRect(g.tableX + g.tableW / 2 - g.s * 0.33, g.tableY + g.tableH * 0.28, g.s * 0.18, g.tableH * 0.9);
+    var discY = g.tableY - g.discR;
+    ctx.fillStyle = GOLD;
+    ctx.beginPath(); ctx.moveTo(g.tableX, discY);
+    ctx.arc(g.tableX, discY, g.discR, 0, Math.PI * 2); ctx.fill();
+
+    // Figures, walking with a bob tied to walk progress (zero at both
+    // ends, so no jump at phase boundaries).
+    function bobOf(st) {
+      if (!st.walking) return 0;
+      return Math.sin(st.p * Math.PI * 2 * 8) * g.s * 0.05;
+    }
+    drawFigure(L.x, g.baseY, g.s, BLUE, 1, L.seated, bobOf(L));
+    drawFigure(R.x, g.baseY, g.s, BRICK, -1, R.seated, bobOf(R));
+  }
+
+  function pickFigure(x, y) {
+    var g = geom();
+    var lt = lastLt;
+    var L = figureState('left', lt, g);
+    var R = figureState('right', lt, g);
+    var tol = g.s * 1.6;
+    var dl = Math.abs(x - L.x) + Math.abs(y - g.baseY) * 0.5;
+    var dr = Math.abs(x - R.x) + Math.abs(y - g.baseY) * 0.5;
+    if (dl < tol && dl <= dr) return 'left';
+    if (dr < tol) return 'right';
+    return null;
+  }
+
+  function onDown(e) {
+    var x = (e.clientX !== undefined) ? e.clientX : e.touches[0].clientX;
+    var y = (e.clientY !== undefined) ? e.clientY : e.touches[0].clientY;
+    var fig = pickFigure(x, y);
+    if (!fig) return;
+    active[fig] = { start: lastLt, x0: x, rate: 1, end: null };
+    segs[fig].push(active[fig]);
+  }
+  function onMove(e) {
+    var x = (e.clientX !== undefined) ? e.clientX : e.touches[0].clientX;
+    var fig = active.left ? 'left' : (active.right ? 'right' : null);
+    if (!fig) return;
+    var dx = x - active[fig].x0;
+    var r = clamp(1 + dx / 300, 0.25, 2);
+    active[fig].end = lastLt;
+    active[fig] = { start: lastLt, x0: x, rate: r, end: null };
+    segs[fig].push(active[fig]);
+  }
+  function onUp() {
+    var fig = active.left ? 'left' : (active.right ? 'right' : null);
+    if (!fig) return;
+    active[fig].end = lastLt;
+    active[fig] = null;
+  }
+
+  canvas.addEventListener('pointerdown', onDown);
+  canvas.addEventListener('pointermove', onMove);
+  canvas.addEventListener('pointerup', onUp);
+  canvas.addEventListener('pointercancel', onUp);
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', function () { draw(lastT); });
+    }
+    window.addEventListener('resize', function () { draw(lastT); });
+  }
+
+  // Frame one at a constant phase; clock starts only with the rAF loop.
+  draw(0);
+  if (typeof window !== 'undefined' && typeof window.__piece === 'undefined') {
+    window.__piece = {
+      draw: draw,
+      down: function (x, y) { onDown({ clientX: x, clientY: y }); },
+      move: function (x, y) { onMove({ clientX: x, clientY: y }); },
+      up: function () { onUp(); },
+      setTime: function (t) { lastT = t; lastLt = ((t % LOOP) + LOOP) % LOOP; },
+      state: function () {
+        var g = geom();
+        var lt = lastLt;
+        var L = figureState('left', lt, g);
+        var R = figureState('right', lt, g);
+        var both = L.arrived && R.arrived && lt < SIT_END;
+        var glow = 0;
+        if (both) glow = clamp((lt - Math.max(arrivalTime('left'), arrivalTime('right'))) / 1, 0, 1);
+        return { lt: lt, leftX: L.x, rightX: R.x, leftSeated: L.seated, rightSeated: R.seated, glow: glow, W: W, H: H };
+      }
+    };
+  }
+  var start = null;
+  function loop(ts) {
+    if (start === null) start = ts;
+    var t = (ts - start) / 1000;
+    draw(t);
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+  }
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
