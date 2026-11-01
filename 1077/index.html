@@ -1,0 +1,462 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Worn by the Tracker</title>
+<style>
+  html, body {
+    margin: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #050507;
+  }
+  canvas {
+    display: block;
+    touch-action: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="piece"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  var T0 = 20;
+  var LOOP = 60;
+  var WORLD = 1000;
+  var LAG = 0.012; // the Vicon truth: the suit reports 12 ms behind, always
+  var canvas = document.getElementById('piece');
+  var ctx = canvas.getContext('2d');
+  var currentT = T0;
+  var view = { w: 0, h: 0, scale: 1, ox: 0, oy: 0, phone: false };
+  var generation = 0;
+  var drag = null;
+  var lastTap = null;
+  var freeze = null;
+  var audio = null;
+  var lastBeat = -1;
+
+  var COLORS = {
+    void: '#050507',
+    marker: '#FFFFFF',
+    joint: '#2AFFD5',
+    id: '#8A8A88',
+    reticle: '#FF3B30'
+  };
+
+  function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+  function hash(n) {
+    var x = Math.sin(n * 127.1 + 311.7) * 43758.5453;
+    return x - Math.floor(x);
+  }
+
+  function smooth(u) { return u * u * (3 - 2 * u); }
+
+  // k cycles per 60 s loop: every frequency is an integer count, so the
+  // phrase loops seamlessly at any generation.
+  function W(k) { return Math.PI * 2 * k / LOOP; }
+
+  function resize() {
+    var vw = window.innerWidth;
+    var vh = window.innerHeight;
+    if (window.visualViewport) {
+      vw = window.visualViewport.width;
+      vh = window.visualViewport.height;
+    }
+    var dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.max(1, Math.round(vw * dpr));
+    canvas.height = Math.max(1, Math.round(vh * dpr));
+    var screenMin = 0;
+    if (window.screen) screenMin = Math.min(window.screen.width || 0, window.screen.height || 0);
+    var phone = screenMin > 0 ? screenMin < 700 : vh > vw * 1.15;
+    var scale = Math.min(vw / WORLD, vh / WORLD);
+    view = {
+      w: vw,
+      h: vh,
+      dpr: dpr,
+      scale: scale,
+      ox: (vw - WORLD * scale) / 2,
+      oy: (vh - WORLD * scale) / 2,
+      phone: phone
+    };
+  }
+
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { resize(); draw(currentT); });
+  }
+  window.addEventListener('resize', function () { resize(); draw(currentT); });
+  resize();
+
+  // ---- the drag offset: the core follows the visitor's finger ------------
+  var OFF_EASE = 0.16;
+  var offFrom = { x: 0, y: 0 };
+  var offTo = { x: 0, y: 0 };
+  var offT0 = -100;
+
+  function offsetAt(t) {
+    var u = clamp((t - offT0) / OFF_EASE, 0, 1);
+    var s = smooth(u);
+    return {
+      x: offFrom.x + (offTo.x - offFrom.x) * s,
+      y: offFrom.y + (offTo.y - offFrom.y) * s
+    };
+  }
+
+  function coreBase(t) {
+    return {
+      x: 500 + 22 * Math.sin(W(2) * t + 0.7) + 8 * Math.sin(W(5) * t),
+      y: 505 + 9 * Math.sin(W(4) * t + 1.1)
+    };
+  }
+
+  function coreAt(t) {
+    var b = coreBase(t);
+    var o = offsetAt(t);
+    return { x: b.x + o.x, y: b.y + o.y };
+  }
+
+  // ---- the rig ------------------------------------------------------------
+  // Twelve markers, plug-in-gait style. Index order is fixed; IDs are the
+  // prompt-specced debug text drawn beside each marker.
+  var IDS = [
+    'HEAD', 'CHEST',
+    'L_SHOULDER', 'R_SHOULDER',
+    'L_HAND', 'R_HAND',
+    'L_HIP', 'R_HIP',
+    'L_KNEE', 'R_KNEE',
+    'L_FOOT', 'R_FOOT'
+  ];
+  // Label side per marker: -1 = label to the left, +1 = to the right,
+  // 0 = above (head, chest). Fixed by identity, as a debug view would.
+  var SIDE = [0, 0, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1];
+  var BONES = [
+    [0, 1],           // head - chest
+    [1, 2], [1, 3],   // chest - shoulders
+    [2, 3],           // shoulder line
+    [2, 4], [3, 5],   // arms
+    [1, 6], [1, 7],   // chest - hips
+    [6, 7],           // hip line
+    [6, 8], [8, 10],  // left leg
+    [7, 9], [9, 11]   // right leg
+  ];
+  var CHEST = 1;
+
+  function phraseParams() {
+    var g = generation * 977;
+    return {
+      armPhase: hash(g + 11) * Math.PI * 2,
+      stepPhase: hash(g + 23) * Math.PI * 2,
+      leanPhase: hash(g + 37) * Math.PI * 2,
+      armAmp: 0.78 + hash(g + 41) * 0.2,
+      stepAmp: 0.48 + hash(g + 43) * 0.14
+    };
+  }
+
+  // Marker positions at capture time t, around the given core. Pure
+  // closed-form: sine-layered FK, nothing integrated.
+  function rigAt(t, core, P) {
+    var lean = 0.10 * Math.sin(W(2) * t + P.leanPhase) + 0.05 * Math.sin(W(3) * t + 1.0);
+    var ux = Math.sin(lean), uy = -Math.cos(lean);   // body up vector
+    var px = Math.cos(lean), py = Math.sin(lean);    // body side vector
+
+    var chest = {
+      x: core.x + ux * 118 + px * 6 * Math.sin(W(3) * t + 1.0),
+      y: core.y + uy * 118 + py * 6 * Math.sin(W(3) * t + 1.0)
+    };
+    var head = {
+      x: chest.x + ux * 78 + px * 4 * Math.sin(W(2) * t + 2.2 + P.leanPhase),
+      y: chest.y + uy * 78 + py * 4 * Math.sin(W(2) * t + 2.2 + P.leanPhase)
+    };
+    var lSho = { x: chest.x - px * 64 - ux * 4, y: chest.y - py * 64 - uy * 4 };
+    var rSho = { x: chest.x + px * 64 - ux * 4, y: chest.y + py * 64 - uy * 4 };
+    var lHip = { x: core.x - px * 36, y: core.y - py * 36 + 6 };
+    var rHip = { x: core.x + px * 36, y: core.y + py * 36 + 6 };
+
+    // Arms: single segments swinging in the frontal plane, angle from
+    // straight-down; pi raises the hand above the shoulder.
+    var ARM = 168;
+    var aL = 1.15 + P.armAmp * Math.sin(W(3) * t + P.armPhase) + 0.35 * Math.sin(W(7) * t);
+    var aR = 1.15 + P.armAmp * Math.sin(W(3) * t + P.armPhase + 2.6) + 0.35 * Math.sin(W(7) * t + 1.9);
+    var lHand = { x: lSho.x - ARM * Math.sin(aL), y: lSho.y + ARM * Math.cos(aL) };
+    var rHand = { x: rSho.x + ARM * Math.sin(aR), y: rSho.y + ARM * Math.cos(aR) };
+
+    // Legs: thigh + shin, lateral swing with a knee-bend hump per cycle.
+    var THIGH = 148, SHIN = 148;
+    function leg(hip, ph) {
+      var s = P.stepAmp * Math.sin(W(4) * t + ph);
+      var bend = 0.5 + 0.5 * Math.sin(W(4) * t + ph + 2.2);
+      var kb = 0.12 + 0.9 * bend * bend;
+      var knee = {
+        x: hip.x + THIGH * Math.sin(s),
+        y: hip.y + THIGH * Math.cos(s)
+      };
+      var foot = {
+        x: knee.x + SHIN * Math.sin(s - kb),
+        y: knee.y + SHIN * Math.cos(s - kb)
+      };
+      return { knee: knee, foot: foot };
+    }
+    var legL = leg(lHip, P.stepPhase);
+    var legR = leg(rHip, P.stepPhase + Math.PI);
+
+    var pts = [head, chest, lSho, rSho, lHand, rHand, lHip, rHip,
+               legL.knee, legR.knee, legL.foot, legR.foot];
+    // Human-scaled about the core, then per-marker capture shimmer:
+    // sub-unit, seeded, integer-cycle.
+    for (var i = 0; i < pts.length; i++) {
+      pts[i] = {
+        x: core.x + (pts[i].x - core.x) * 1.18 + 0.5 * Math.sin(W(37) * t + hash(i * 19 + 3) * Math.PI * 2),
+        y: core.y + (pts[i].y - core.y) * 1.18 + 0.5 * Math.cos(W(41) * t + hash(i * 23 + 5) * Math.PI * 2)
+      };
+    }
+    return pts;
+  }
+
+  function circle(x, y, r) {
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  function draw(t) {
+    currentT = t;
+    canvas.style.width = view.w + 'px';
+    canvas.style.height = view.h + 'px';
+    ctx.setTransform(view.dpr || 1, 0, 0, view.dpr || 1, 0, 0);
+    ctx.fillStyle = COLORS.void;
+    ctx.fillRect(0, 0, view.w, view.h);
+    ctx.translate(view.ox, view.oy);
+    ctx.scale(view.scale, view.scale);
+
+    var frozen = freeze && t >= freeze.t0 && t <= freeze.t0 + 5;
+    var te = frozen ? freeze.tSnap : t;
+    var tc = te - LAG; // capture time: everything drawn is 12 ms old
+    var P = phraseParams();
+    var core = coreAt(tc);
+    var pts = rigAt(tc, core, P);
+
+    // Trails: the recorded history of each marker, evaluated analytically
+    // from the same closed form and drawn as fading segments.
+    var TRAIL_N = 48, TRAIL_DT = 1 / 24;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = COLORS.marker;
+    ctx.lineWidth = 1.6;
+    var hist = [pts];
+    var k, i;
+    for (k = 1; k <= TRAIL_N; k++) {
+      var tk = tc - k * TRAIL_DT;
+      hist.push(rigAt(tk, coreAt(tk), P));
+    }
+    for (i = 0; i < 12; i++) {
+      for (k = TRAIL_N; k >= 1; k--) {
+        var f = 1 - k / (TRAIL_N + 1);
+        ctx.globalAlpha = 0.38 * f * f;
+        ctx.beginPath();
+        ctx.moveTo(hist[k][i].x, hist[k][i].y);
+        ctx.lineTo(hist[k - 1][i].x, hist[k - 1][i].y);
+        ctx.stroke();
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    // Joint lines: the skeleton, drawn.
+    ctx.strokeStyle = COLORS.joint;
+    ctx.globalAlpha = 0.5;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (i = 0; i < BONES.length; i++) {
+      var a = pts[BONES[i][0]], b = pts[BONES[i][1]];
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x, b.y);
+    }
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    // The reticle: the camera, watching the torso.
+    var torso = pts[CHEST];
+    var ang = W(5) * tc;
+    ctx.strokeStyle = COLORS.reticle;
+    ctx.globalAlpha = 0.85;
+    ctx.lineWidth = 2;
+    for (k = 0; k < 4; k++) {
+      var a0 = ang + k * Math.PI / 2;
+      ctx.beginPath();
+      ctx.arc(torso.x, torso.y, 30, a0 + 0.18, a0 + Math.PI / 2 - 0.18);
+      ctx.stroke();
+      var am = a0 + Math.PI / 4;
+      ctx.beginPath();
+      ctx.moveTo(torso.x + Math.cos(am) * 24, torso.y + Math.sin(am) * 24);
+      ctx.lineTo(torso.x + Math.cos(am) * 36, torso.y + Math.sin(am) * 36);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+
+    // Markers: retroreflective points — layered flat-alpha glow, solid core.
+    for (i = 0; i < 12; i++) {
+      ctx.fillStyle = COLORS.marker;
+      ctx.globalAlpha = 0.16;
+      circle(pts[i].x, pts[i].y, 11);
+      ctx.globalAlpha = 0.32;
+      circle(pts[i].x, pts[i].y, 7.5);
+      ctx.globalAlpha = 1;
+      circle(pts[i].x, pts[i].y, 4.6);
+    }
+
+    // IDs: tiny mono debug tags. Bright while a freeze holds the frame.
+    ctx.fillStyle = COLORS.id;
+    ctx.globalAlpha = frozen ? 1 : 0.55;
+    ctx.font = '14px ui-monospace, SFMono-Regular, Menlo, monospace';
+    for (i = 0; i < 12; i++) {
+      if (SIDE[i] === 0) {
+        ctx.textAlign = 'center';
+        ctx.fillText(IDS[i], pts[i].x, pts[i].y - 16);
+      } else if (SIDE[i] < 0) {
+        ctx.textAlign = 'right';
+        ctx.fillText(IDS[i], pts[i].x - 13, pts[i].y + 4);
+      } else {
+        ctx.textAlign = 'left';
+        ctx.fillText(IDS[i], pts[i].x + 13, pts[i].y + 4);
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    updateAudio(te);
+  }
+
+  // ---- audio: lazy, gesture-gated, typeof-guarded -------------------------
+  function ensureAudio() {
+    if (audio) {
+      if (audio.ctx.state === 'suspended' && audio.ctx.resume) audio.ctx.resume();
+      return;
+    }
+    var AC = null;
+    if (typeof AudioContext !== 'undefined') AC = AudioContext;
+    else if (typeof webkitAudioContext !== 'undefined') AC = webkitAudioContext;
+    if (!AC) return;
+    try {
+      var actx = new AC();
+      var master = actx.createGain();
+      master.gain.value = 0.045;
+      master.connect(actx.destination);
+      // the faint carrier hum: the system, listening
+      var hum = actx.createOscillator();
+      var humGain = actx.createGain();
+      hum.type = 'sine';
+      hum.frequency.value = 50;
+      humGain.gain.value = 0.5;
+      hum.connect(humGain); humGain.connect(master);
+      hum.start();
+      audio = { ctx: actx, master: master, hum: hum };
+    } catch (e) {
+      audio = null;
+    }
+  }
+
+  function tick(when, freq) {
+    try {
+      var osc = audio.ctx.createOscillator();
+      var g = audio.ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = freq;
+      g.gain.setValueAtTime(0.0001, when);
+      g.gain.exponentialRampToValueAtTime(0.22, when + 0.004);
+      g.gain.exponentialRampToValueAtTime(0.0001, when + 0.055);
+      osc.connect(g); g.connect(audio.master);
+      osc.start(when);
+      osc.stop(when + 0.07);
+    } catch (e) {}
+  }
+
+  function updateAudio(t) {
+    if (!audio) return;
+    // A soft tick on each beat of the phrase, pitched by which foot the
+    // step cycle has down: marker contact, made audible.
+    var beat = Math.floor(t / 0.9375);
+    if (beat !== lastBeat) {
+      lastBeat = beat;
+      var P = phraseParams();
+      var leftDown = Math.sin(W(4) * t + P.stepPhase) < 0;
+      tick(audio.ctx.currentTime + 0.01, leftDown ? 1560 : 1320);
+    }
+  }
+
+  // ---- interaction ----------------------------------------------------------
+  function pointerWorld(ev) {
+    var rect = canvas.getBoundingClientRect();
+    var cx = (ev.clientX - rect.left - view.ox) / view.scale;
+    var cy = (ev.clientY - rect.top - view.oy) / view.scale;
+    return { x: cx, y: cy };
+  }
+
+  function onDown(ev) {
+    ensureAudio();
+    var p = pointerWorld(ev);
+    drag = { startX: p.x, startY: p.y, startT: currentT, moved: false };
+    if (canvas.setPointerCapture && ev.pointerId !== undefined) {
+      try { canvas.setPointerCapture(ev.pointerId); } catch (e) {}
+    }
+  }
+
+  function onMove(ev) {
+    if (!drag) return;
+    var p = pointerWorld(ev);
+    if (Math.hypot(p.x - drag.startX, p.y - drag.startY) > 7) drag.moved = true;
+    if (drag.moved) {
+      freeze = null; // being the body breaks any held frame
+      var base = coreBase(currentT);
+      offFrom = offsetAt(currentT);
+      offTo = {
+        x: clamp(p.x - base.x, -280, 280),
+        y: clamp(p.y - base.y, -210, 210)
+      };
+      offT0 = currentT;
+    }
+    draw(currentT);
+  }
+
+  function onUp(ev) {
+    if (!drag) return;
+    var p = pointerWorld(ev);
+    var ended = drag;
+    drag = null;
+    var quick = currentT - ended.startT < 0.45;
+    if (quick && !ended.moved) {
+      if (lastTap && currentT - lastTap.t < 0.42 && Math.hypot(p.x - lastTap.x, p.y - lastTap.y) < 40) {
+        // double-tap: a new phrase — reseeded, and the body returns home
+        generation++;
+        freeze = null;
+        lastTap = null;
+        offFrom = offsetAt(currentT);
+        offTo = { x: 0, y: 0 };
+        offT0 = currentT;
+        draw(currentT);
+        return;
+      }
+      lastTap = { t: currentT, x: p.x, y: p.y };
+      // tap: freeze frame — hold this exact marker set for 5 seconds
+      freeze = { t0: currentT, tSnap: currentT };
+    }
+    draw(currentT);
+  }
+
+  canvas.addEventListener('pointerdown', onDown);
+  canvas.addEventListener('pointermove', onMove);
+  canvas.addEventListener('pointerup', onUp);
+  canvas.addEventListener('pointercancel', function () { drag = null; });
+
+  function frame(ms) {
+    var t = T0 + (typeof ms === 'number' && isFinite(ms) ? ms / 1000 : 0);
+    draw(t);
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+  }
+
+  frame(0);
+})();
+</script>
+</body>
+</html>

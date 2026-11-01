@@ -1,0 +1,789 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>REC / PLAY</title>
+<style>
+  html, body {
+    margin: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #060709;
+  }
+  canvas {
+    display: block;
+    touch-action: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="piece"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  var canvas = document.getElementById('piece');
+  var ctx = canvas.getContext('2d');
+
+  var VOID = '#060709';
+  var ORB = '#CFE8FF';
+  var BAR = '#23262C';
+  var BODY = '#101114';
+  var DOT = '#FFFFFF';
+  var CONE = '#9FD8FF';
+  var REC = '#FF3B30';
+  var TYPE = '#8A8A88';
+  var TAKE_COLORS = ['#4FF2E0', '#FFD75E', '#B98AFF'];
+
+  var HOLD_END = 0.7;       // pause at the end of a take before rewind
+  var HOLD_START = 0.7;     // pause at the start before the next loop
+  var PROFILE_A = 0.25;     // accel / decel fraction of flight and rewind
+  var PHASE0 = 3.2;         // fixed first-frame phase inside take 1 playback
+
+  var W = 0;
+  var H = 0;
+  var DPR = 1;
+  var isPhone = false;
+
+  var setSeed = 10790241;
+  var orbs = [];
+  var bars = [];
+
+  // takes[slot] = built take or null; slot = the take the readout names
+  var takes = [null, null, null];
+  var slot = 0;
+  var playback = { start: -PHASE0 };
+  var lastPhaseKind = null;
+
+  var startStamp = 0;
+  if (typeof performance !== 'undefined' && performance && typeof performance.now === 'function') {
+    startStamp = performance.now();
+  }
+
+  var drag = { active: false, recording: false, points: [], startX: 0, startY: 0, startElapsed: 0, pointer: null };
+  var pendingTap = null;
+  var audio = null;
+
+  function clamp(v, a, b) {
+    return v < a ? a : (v > b ? b : v);
+  }
+
+  function mod(v, n) {
+    return ((v % n) + n) % n;
+  }
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0;
+      a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---- velocity profile: accelerate, hold, decelerate (never linear) ----
+  var VP = 1 / (1 - PROFILE_A);
+
+  function smoother(x) {
+    x = clamp(x, 0, 1);
+    return x * x * x * (x * (x * 6 - 15) + 10);
+  }
+
+  function smootherInt(x) {
+    x = clamp(x, 0, 1);
+    return x * x * x * x * (2.5 - 3 * x + x * x);
+  }
+
+  function profile(q) {
+    var a = PROFILE_A;
+    if (q < a) return VP * a * smootherInt(q / a);
+    if (q > 1 - a) return 1 - VP * a * smootherInt((1 - q) / a);
+    return VP * (q - 0.5 * a);
+  }
+
+  function profileRate(q) {
+    var a = PROFILE_A;
+    if (q < a) return VP * smoother(q / a);
+    if (q > 1 - a) return VP * smoother((1 - q) / a);
+    return VP;
+  }
+
+  // ---- the test range: a sparse set of orbs and bars, center-weighted ----
+  function makeSet() {
+    var rand = mulberry32(setSeed);
+    var i;
+    orbs = [];
+    bars = [];
+    for (i = 0; i < 6; i++) {
+      orbs.push({
+        x: 0.20 + rand() * 0.60,
+        y: 0.24 + rand() * 0.52,
+        r: 0.010 + rand() * 0.016
+      });
+    }
+    for (i = 0; i < 5; i++) {
+      var vertical = rand() < 0.35;
+      bars.push({
+        x: 0.18 + rand() * 0.58,
+        y: 0.26 + rand() * 0.50,
+        len: 0.09 + rand() * 0.16,
+        th: 0.006 + rand() * 0.005,
+        vertical: vertical
+      });
+    }
+  }
+
+  // ---- a take: open Catmull-Rom path, arc-length sampled ----
+  function buildTake(ctrl) {
+    var n = ctrl.length;
+    var ext = [ctrl[0]].concat(ctrl, [ctrl[n - 1]]);
+    var pts = [];
+    var i;
+    var j;
+    var SEG = Math.max(10, Math.round(760 / (n - 1)));
+    for (i = 0; i < n - 1; i++) {
+      var p0 = ext[i];
+      var p1 = ext[i + 1];
+      var p2 = ext[i + 2];
+      var p3 = ext[i + 3];
+      for (j = 0; j < SEG; j++) {
+        var t = j / SEG;
+        var t2 = t * t;
+        var t3 = t2 * t;
+        pts.push({
+          x: 0.5 * ((2 * p1.x) + (-p0.x + p2.x) * t + (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * t2 + (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * t3),
+          y: 0.5 * ((2 * p1.y) + (-p0.y + p2.y) * t + (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * t2 + (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * t3)
+        });
+      }
+    }
+    pts.push({ x: ctrl[n - 1].x, y: ctrl[n - 1].y });
+    var cum = [0];
+    var total = 0;
+    for (i = 1; i < pts.length; i++) {
+      var a = pts[i - 1];
+      var b = pts[i];
+      total += Math.sqrt((b.x - a.x) * (b.x - a.x) + (b.y - a.y) * (b.y - a.y));
+      cum.push(total);
+    }
+    var flyDur = clamp(total / 0.17, 4, 11);
+    return {
+      pts: pts,
+      cum: cum,
+      total: total,
+      flyDur: flyDur,
+      rewindDur: clamp(flyDur * 0.35, 1.0, 2.2)
+    };
+  }
+
+  function seededTake() {
+    return buildTake([
+      { x: 0.14, y: 0.72 },
+      { x: 0.28, y: 0.50 },
+      { x: 0.40, y: 0.60 },
+      { x: 0.50, y: 0.36 },
+      { x: 0.63, y: 0.28 },
+      { x: 0.76, y: 0.44 },
+      { x: 0.85, y: 0.66 }
+    ]);
+  }
+
+  function takePos(tk, dist) {
+    var cum = tk.cum;
+    var pts = tk.pts;
+    var n = pts.length;
+    var d = clamp(dist, 0, tk.total);
+    var lo = 0;
+    var hi = n - 1;
+    while (lo < hi) {
+      var mid = (lo + hi) >> 1;
+      if (cum[mid + 1] < d) lo = mid + 1;
+      else hi = mid;
+    }
+    var i = Math.min(lo, n - 2);
+    var segLen = cum[i + 1] - cum[i];
+    var f = segLen > 0 ? (d - cum[i]) / segLen : 0;
+    var a = pts[i];
+    var b = pts[i + 1];
+    var dx = b.x - a.x;
+    var dy = b.y - a.y;
+    var mag = Math.sqrt(dx * dx + dy * dy) || 1;
+    return {
+      x: a.x + dx * f,
+      y: a.y + dy * f,
+      hx: dx / mag,
+      hy: dy / mag,
+      idx: i,
+      frac: f
+    };
+  }
+
+  // ---- playback timeline: fly, hold, rewind, hold, loop ----
+  // The playback head is a pure function of elapsed time.
+  function phaseAt(e) {
+    var tk = takes[slot];
+    if (!tk) return { kind: 'rest', u: 0, media: 0, speed: 0 };
+    var D = tk.flyDur;
+    var R = tk.rewindDur;
+    var C = D + HOLD_END + R + HOLD_START;
+    var c = mod(e - playback.start, C);
+    if (c < D) {
+      var q = c / D;
+      var u = profile(q);
+      return { kind: 'fly', u: u, media: u * D, speed: (tk.total / D) * profileRate(q) };
+    }
+    if (c < D + HOLD_END) return { kind: 'holdEnd', u: 1, media: D, speed: 0 };
+    if (c < D + HOLD_END + R) {
+      var qr = (c - D - HOLD_END) / R;
+      var ur = 1 - profile(qr);
+      return { kind: 'rewind', u: ur, media: ur * D, speed: (tk.total / R) * profileRate(qr) };
+    }
+    return { kind: 'holdStart', u: 0, media: 0, speed: 0 };
+  }
+
+  function elapsedNow() {
+    if (typeof performance !== 'undefined' && performance && typeof performance.now === 'function') {
+      return Math.max(0, (performance.now() - startStamp) / 1000);
+    }
+    return 0;
+  }
+
+  function resize() {
+    var vv = window.visualViewport;
+    var w = (vv && vv.width) ? vv.width : window.innerWidth;
+    var h = (vv && vv.height) ? vv.height : window.innerHeight;
+    var sw = (window.screen && window.screen.width) ? window.screen.width : w;
+    var sh = (window.screen && window.screen.height) ? window.screen.height : h;
+    W = Math.max(1, Math.round(w));
+    H = Math.max(1, Math.round(h));
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    isPhone = Math.min(sw, sh) < 700 || (Math.min(sw, sh) >= 700 && H > W * 1.15);
+  }
+
+  function geomNow() {
+    var unit = Math.min(W, H);
+    return { unit: unit, ox: (W - unit) / 2, oy: (H - unit) / 2 };
+  }
+
+  function toScreen(nx, ny, geom) {
+    return { x: geom.ox + nx * geom.unit, y: geom.oy + ny * geom.unit };
+  }
+
+  // ---- audio: lazy, gesture-gated, silent before the first touch ----
+  function initAudio() {
+    var AC;
+    if (audio) {
+      if (audio.ctx && typeof audio.ctx.resume === 'function') audio.ctx.resume();
+      return;
+    }
+    AC = window.AudioContext || window.webkitAudioContext;
+    if (typeof AC !== 'function') return;
+    try {
+      var ac = new AC();
+      var master = ac.createGain();
+      master.gain.value = 0.8;
+      master.connect(ac.destination);
+      var osc = ac.createOscillator();
+      osc.type = 'sawtooth';
+      osc.frequency.value = 48;
+      var filter = ac.createBiquadFilter();
+      filter.type = 'lowpass';
+      filter.frequency.value = 260;
+      var gain = ac.createGain();
+      gain.gain.value = 0;
+      osc.connect(filter);
+      filter.connect(gain);
+      gain.connect(master);
+      osc.start();
+      audio = { ctx: ac, master: master, osc: osc, gain: gain };
+    } catch (err) {
+      audio = null;
+    }
+  }
+
+  function blip(freq, dur, peak, type) {
+    if (!audio || !audio.ctx) return;
+    try {
+      var ac = audio.ctx;
+      var o = ac.createOscillator();
+      var g = ac.createGain();
+      var t0 = ac.currentTime;
+      o.type = type;
+      o.frequency.value = freq;
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.exponentialRampToValueAtTime(peak, t0 + 0.010);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      o.connect(g);
+      g.connect(audio.master);
+      o.start(t0);
+      o.stop(t0 + dur + 0.05);
+    } catch (err) {}
+  }
+
+  function updateAudio(speedNorm, active) {
+    if (!audio || !audio.ctx) return;
+    try {
+      audio.osc.frequency.value = 44 + speedNorm * 42;
+      audio.gain.gain.value = active ? 0.012 + speedNorm * 0.008 : 0.003;
+    } catch (err) {
+      audio = null;
+    }
+  }
+
+  // ---- drawing ----
+  function drawSet(geom) {
+    var i;
+    var p;
+    ctx.fillStyle = BAR;
+    ctx.globalAlpha = 1;
+    for (i = 0; i < bars.length; i++) {
+      var b = bars[i];
+      p = toScreen(b.x, b.y, geom);
+      if (b.vertical) {
+        ctx.fillRect(p.x - b.th * geom.unit / 2, p.y, b.th * geom.unit, b.len * geom.unit);
+      } else {
+        ctx.fillRect(p.x, p.y - b.th * geom.unit / 2, b.len * geom.unit, b.th * geom.unit);
+      }
+    }
+    for (i = 0; i < orbs.length; i++) {
+      var o = orbs[i];
+      p = toScreen(o.x, o.y, geom);
+      var r = o.r * geom.unit;
+      ctx.fillStyle = ORB;
+      ctx.globalAlpha = 0.07;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, r * 3.4, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 0.16;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, r * 1.9, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 0.85;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function strokePath(geom, pts, color, alpha, width) {
+    if (pts.length < 2) return;
+    var i;
+    var p;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = color;
+    ctx.globalAlpha = alpha;
+    ctx.lineWidth = width;
+    ctx.beginPath();
+    for (i = 0; i < pts.length; i++) {
+      p = toScreen(pts[i].x, pts[i].y, geom);
+      if (i === 0) ctx.moveTo(p.x, p.y);
+      else ctx.lineTo(p.x, p.y);
+    }
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  function drawTraces(geom, flownIdx, flownFrac) {
+    var i;
+    var count = 0;
+    for (i = 0; i < 3; i++) if (takes[i]) count++;
+    for (i = 0; i < 3; i++) {
+      var tk = takes[i];
+      if (!tk || i === slot) continue;
+      // older takes sit fainter in the stack; the tests are kept, not erased
+      var order = 0;
+      var j;
+      for (j = 0; j < i; j++) if (takes[j]) order++;
+      var alpha = count > 1 ? 0.16 + 0.20 * (order / (count - 1)) : 0.3;
+      strokePath(geom, tk.pts, TAKE_COLORS[i], alpha, Math.max(1.2, geom.unit * 0.0030));
+    }
+    var cur = takes[slot];
+    if (cur) {
+      var color = TAKE_COLORS[slot];
+      strokePath(geom, cur.pts, color, 0.14, Math.max(2.5, geom.unit * 0.010));
+      strokePath(geom, cur.pts, color, 0.38, Math.max(1.3, geom.unit * 0.0032));
+      // the part already flown in this loop burns at full strength
+      var head = cur.pts.slice(0, flownIdx + 1);
+      if (flownFrac > 0 && flownIdx + 1 < cur.pts.length) {
+        var a = cur.pts[flownIdx];
+        var b = cur.pts[flownIdx + 1];
+        head.push({ x: a.x + (b.x - a.x) * flownFrac, y: a.y + (b.y - a.y) * flownFrac });
+      }
+      if (head.length > 1) {
+        strokePath(geom, head, color, 0.20, Math.max(2.5, geom.unit * 0.010));
+        strokePath(geom, head, color, 0.95, Math.max(1.3, geom.unit * 0.0032));
+      }
+    }
+  }
+
+  function drawRecording(geom) {
+    if (!drag.recording || drag.points.length < 2) return;
+    var color = TAKE_COLORS[slot];
+    strokePath(geom, drag.points, color, 0.16, Math.max(2.5, geom.unit * 0.010));
+    strokePath(geom, drag.points, color, 0.95, Math.max(1.3, geom.unit * 0.0032));
+  }
+
+  function drawDrone(geom, st) {
+    var c = toScreen(st.x, st.y, geom);
+    var s = geom.unit * (isPhone ? 0.062 : 0.052);
+    var ang = Math.atan2(st.hy, st.hx);
+    var i;
+    ctx.save();
+    ctx.translate(c.x, c.y);
+    ctx.globalAlpha = st.alpha;
+
+    // view cone: layered flat alpha, no gradients
+    ctx.fillStyle = CONE;
+    ctx.globalAlpha = st.alpha * 0.10;
+    ctx.beginPath();
+    ctx.moveTo(s * 0.2, 0);
+    ctx.arc(0, 0, geom.unit * 0.30, ang - 0.34, ang + 0.34);
+    ctx.closePath();
+    ctx.fill();
+    ctx.globalAlpha = st.alpha * 0.25;
+    ctx.beginPath();
+    ctx.moveTo(s * 0.2, 0);
+    ctx.arc(0, 0, geom.unit * 0.28, ang - 0.26, ang + 0.26);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.rotate(ang);
+    // rotor blur discs
+    ctx.fillStyle = CONE;
+    for (i = 0; i < 4; i++) {
+      var sx = (i % 2 === 0 ? -1 : 1) * s * 0.62;
+      var sy = (i < 2 ? -1 : 1) * s * 0.62;
+      ctx.globalAlpha = st.alpha * 0.10;
+      ctx.beginPath();
+      ctx.arc(sx, sy, s * 0.36, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    // arms
+    ctx.strokeStyle = BODY;
+    ctx.globalAlpha = st.alpha;
+    ctx.lineWidth = s * 0.17;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(-s * 0.62, -s * 0.62);
+    ctx.lineTo(s * 0.62, s * 0.62);
+    ctx.moveTo(-s * 0.62, s * 0.62);
+    ctx.lineTo(s * 0.62, -s * 0.62);
+    ctx.stroke();
+    // rotor hubs
+    ctx.fillStyle = BODY;
+    for (i = 0; i < 4; i++) {
+      var rx = (i % 2 === 0 ? -1 : 1) * s * 0.62;
+      var ry = (i < 2 ? -1 : 1) * s * 0.62;
+      ctx.beginPath();
+      ctx.arc(rx, ry, s * 0.27, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    // center body
+    ctx.beginPath();
+    ctx.moveTo(s * 0.52, 0);
+    ctx.lineTo(0, s * 0.42);
+    ctx.lineTo(-s * 0.52, 0);
+    ctx.lineTo(0, -s * 0.42);
+    ctx.closePath();
+    ctx.fill();
+    ctx.strokeStyle = CONE;
+    ctx.globalAlpha = st.alpha * 0.40;
+    ctx.lineWidth = Math.max(1, geom.unit * 0.0016);
+    ctx.stroke();
+    ctx.globalAlpha = st.alpha;
+    // camera dot
+    ctx.fillStyle = DOT;
+    ctx.beginPath();
+    ctx.arc(s * 0.17, 0, s * 0.115, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
+  function pad2(v) {
+    return (v < 10 ? '0' : '') + v;
+  }
+
+  function timecode(sec) {
+    sec = Math.max(0, sec);
+    var m = Math.floor(sec / 60);
+    var s = Math.floor(sec - m * 60);
+    var f = Math.floor((sec - Math.floor(sec)) * 24);
+    return pad2(m) + ':' + pad2(s) + ':' + pad2(f);
+  }
+
+  function drawReadout(geom, mode, mediaSec) {
+    var fs = Math.max(10, Math.round(geom.unit * 0.017));
+    var pad = Math.round(geom.unit * 0.024) + 4;
+    var x = pad;
+    var y = pad + fs;
+    ctx.font = fs + 'px monospace';
+    ctx.textBaseline = 'alphabetic';
+    var word = mode === 'REC' ? 'REC' : 'PLAY';
+    ctx.fillStyle = mode === 'REC' ? REC : TAKE_COLORS[0];
+    ctx.globalAlpha = 1;
+    ctx.fillText(word, x, y);
+    var wWord = ctx.measureText(word).width;
+    var label = '  TAKE ' + (slot + 1) + '  ' + timecode(mediaSec);
+    ctx.fillStyle = TYPE;
+    ctx.fillText(label, x + wWord, y);
+    // take pips: filled in the take color when recorded, hollow when empty
+    var pip = Math.max(5, Math.round(fs * 0.55));
+    var py = y + Math.round(fs * 0.55);
+    var i;
+    for (i = 0; i < 3; i++) {
+      var px = x + i * (pip + 6);
+      if (takes[i]) {
+        ctx.fillStyle = TAKE_COLORS[i];
+        ctx.globalAlpha = i === slot ? 1 : 0.55;
+        ctx.fillRect(px, py, pip, pip);
+      } else {
+        ctx.strokeStyle = TYPE;
+        ctx.globalAlpha = 0.7;
+        ctx.lineWidth = 1;
+        ctx.strokeRect(px + 0.5, py + 0.5, pip - 1, pip - 1);
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawAt(elapsed) {
+    var geom = geomNow();
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+    ctx.fillStyle = VOID;
+    ctx.fillRect(0, 0, W, H);
+
+    drawSet(geom);
+
+    var mode;
+    var media = 0;
+    var droneState;
+    var speedNorm = 0;
+
+    if (drag.recording) {
+      mode = 'REC';
+      media = elapsed - drag.startElapsed;
+      drawTraces(geom, -1, 0);
+      drawRecording(geom);
+      var pts = drag.points;
+      var head = pts.length ? pts[pts.length - 1] : { x: 0.5, y: 0.85 };
+      var prev = pts.length > 1 ? pts[pts.length - 2] : head;
+      var dx = head.x - prev.x;
+      var dy = head.y - prev.y;
+      var mag = Math.sqrt(dx * dx + dy * dy);
+      droneState = {
+        x: head.x,
+        y: head.y,
+        hx: mag > 0.0001 ? dx / mag : 0,
+        hy: mag > 0.0001 ? dy / mag : -1,
+        alpha: 1
+      };
+      drawDrone(geom, droneState);
+      updateAudio(0.25, true);
+    } else {
+      mode = 'PLAY';
+      var ph = phaseAt(elapsed);
+      media = ph.media;
+      var tk = takes[slot];
+      if (tk) {
+        var pos = takePos(tk, ph.u * tk.total);
+        drawTraces(geom, pos.idx, pos.frac);
+        droneState = {
+          x: pos.x,
+          y: pos.y,
+          hx: ph.kind === 'rewind' ? -pos.hx : pos.hx,
+          hy: ph.kind === 'rewind' ? -pos.hy : pos.hy,
+          alpha: 1
+        };
+        var peak = (tk.total / tk.flyDur) * VP;
+        speedNorm = peak > 0 ? ph.speed / peak : 0;
+      } else {
+        drawTraces(geom, -1, 0);
+        droneState = { x: 0.5, y: 0.85, hx: 0, hy: -1, alpha: 0.85 };
+      }
+      drawDrone(geom, droneState);
+      updateAudio(speedNorm, ph.kind === 'fly' || ph.kind === 'rewind');
+
+      // loop sounds: confirm at each flight start, soft blip at the end of the take
+      if (lastPhaseKind !== null && ph.kind !== lastPhaseKind) {
+        if (ph.kind === 'fly') blip(740, 0.14, 0.045, 'sine');
+        if (ph.kind === 'holdEnd') blip(520, 0.10, 0.04, 'sine');
+      }
+      lastPhaseKind = ph.kind;
+    }
+
+    drawReadout(geom, mode, media);
+  }
+
+  // ---- interaction ----
+  function eventPoint(e) {
+    var rect = { left: 0, top: 0 };
+    if (typeof canvas.getBoundingClientRect === 'function') rect = canvas.getBoundingClientRect();
+    return {
+      x: (e.clientX || 0) - rect.left,
+      y: (e.clientY || 0) - rect.top
+    };
+  }
+
+  function toNorm(px, py) {
+    var unit = Math.min(W, H);
+    return {
+      x: (px - (W - unit) / 2) / unit,
+      y: (py - (H - unit) / 2) / unit
+    };
+  }
+
+  function pathLength(points) {
+    var total = 0;
+    var i;
+    for (i = 1; i < points.length; i++) {
+      var dx = points[i].x - points[i - 1].x;
+      var dy = points[i].y - points[i - 1].y;
+      total += Math.sqrt(dx * dx + dy * dy);
+    }
+    return total;
+  }
+
+  function registerTap() {
+    var elapsed = elapsedNow();
+    if (pendingTap && elapsed - pendingTap.elapsed < 0.36) {
+      // double-tap: clear all takes, back to a fresh empty take 1
+      if (pendingTap.timer) clearTimeout(pendingTap.timer);
+      pendingTap = null;
+      takes = [null, null, null];
+      slot = 0;
+      lastPhaseKind = null;
+      blip(300, 0.12, 0.05, 'triangle');
+      return;
+    }
+    pendingTap = { elapsed: elapsed, timer: null };
+    if (typeof setTimeout === 'function') {
+      pendingTap.timer = setTimeout(function () {
+        pendingTap = null;
+        // single tap: next take (three is the grammar; at take 3 it stays)
+        if (slot < 2) {
+          slot++;
+          playback.start = elapsedNow();
+          lastPhaseKind = null;
+          blip(980, 0.06, 0.04, 'triangle');
+        }
+      }, 335);
+    } else {
+      pendingTap = null;
+      if (slot < 2) {
+        slot++;
+        playback.start = elapsedNow();
+        lastPhaseKind = null;
+      }
+    }
+  }
+
+  function onPointerDown(e) {
+    var p = eventPoint(e);
+    initAudio();
+    drag.active = true;
+    drag.recording = false;
+    drag.points = [];
+    drag.startX = p.x;
+    drag.startY = p.y;
+    drag.startElapsed = elapsedNow();
+    if (canvas.setPointerCapture && e.pointerId !== undefined) {
+      try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+    }
+    if (e.preventDefault) e.preventDefault();
+  }
+
+  function onPointerMove(e) {
+    if (!drag.active) return;
+    var p = eventPoint(e);
+    if (!drag.recording) {
+      if (Math.abs(p.x - drag.startX) > 9 || Math.abs(p.y - drag.startY) > 9) {
+        drag.recording = true;
+        drag.startElapsed = elapsedNow();
+        drag.points.push(toNorm(drag.startX, drag.startY));
+        blip(1800, 0.035, 0.05, 'square');
+      } else {
+        return;
+      }
+    }
+    var np = toNorm(p.x, p.y);
+    np.x = clamp(np.x, -0.05, 1.05);
+    np.y = clamp(np.y, -0.05, 1.05);
+    var last = drag.points[drag.points.length - 1];
+    if (!last || Math.abs(np.x - last.x) > 0.008 || Math.abs(np.y - last.y) > 0.008) {
+      drag.points.push(np);
+    }
+    if (e.preventDefault) e.preventDefault();
+  }
+
+  function onPointerUp(e) {
+    if (!drag.active) return;
+    var wasRecording = drag.recording;
+    var points = drag.points;
+    drag.active = false;
+    drag.recording = false;
+    drag.points = [];
+    if (wasRecording) {
+      if (points.length >= 4 && pathLength(points) >= 0.12) {
+        takes[slot] = buildTake(points);
+        playback.start = elapsedNow();
+        lastPhaseKind = null;
+        blip(740, 0.14, 0.05, 'sine');
+      }
+    } else if (elapsedNow() - drag.startElapsed < 0.35) {
+      registerTap();
+    }
+    if (e.preventDefault) e.preventDefault();
+  }
+
+  function onPointerCancel() {
+    drag.active = false;
+    drag.recording = false;
+    drag.points = [];
+  }
+
+  if (window.visualViewport && typeof window.visualViewport.addEventListener === 'function') {
+    window.visualViewport.addEventListener('resize', resize);
+  }
+  if (typeof window.addEventListener === 'function') {
+    window.addEventListener('resize', resize);
+  }
+  if (typeof canvas.addEventListener === 'function') {
+    canvas.addEventListener('pointerdown', onPointerDown);
+    canvas.addEventListener('pointermove', onPointerMove);
+    canvas.addEventListener('pointerup', onPointerUp);
+    canvas.addEventListener('pointercancel', onPointerCancel);
+  }
+
+  makeSet();
+  takes[0] = seededTake();
+  resize();
+  if (typeof performance !== 'undefined' && performance && typeof performance.now === 'function') {
+    startStamp = performance.now();
+  }
+  drawAt(0);
+
+  var raf = null;
+  if (typeof window.requestAnimationFrame === 'function') raf = window.requestAnimationFrame;
+  else if (typeof requestAnimationFrame === 'function') raf = requestAnimationFrame;
+
+  function loop() {
+    drawAt(elapsedNow());
+    if (raf) raf(loop);
+  }
+  if (raf) raf(loop);
+})();
+</script>
+</body>
+</html>

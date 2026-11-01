@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Six Hundred Kilos</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#07080A; overflow:hidden; }
+  canvas { display:block; touch-action:none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function(){
+"use strict";
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+
+/* ---------- palette (prompt-fixed) ---------- */
+var HALL = '#07080A', RAIL = '#3A3E45', WALL = '#101218',
+    CG_A = '#9FC4E8', CG_B = '#F2E9D8', ROLLER = '#555B63',
+    SHADOW = '#000000', AMBER = '#D8A24A';
+
+/* ---------- scale ----------
+   Simulation runs in wall-width units: 1 unit = the wall = 7600 mm.
+   Wall px width = 0.84 * stage. So pxPerMm = (0.84*S)/7600 and the
+   spec cap 500 mm/s = 500/7600 units/s = 0.065789 units/s, hard-clamped
+   after every integration step, in every mode. No force can exceed it
+   because velocity itself is clamped, not just acceleration. */
+var WALL_MM = 7600;
+var CAP   = 500 / WALL_MM;        /* 0.065789 units/s  == 500 mm/s exactly */
+var A_AUTO = 95  / WALL_MM;       /* accel cap, autonomous program  (mm/s^2 -> units) */
+var A_DRAG = 130 / WALL_MM;       /* accel cap, visitor push */
+var X_LIM = 0.165;                /* rail travel limit, units (1254 mm) */
+var DT = 1/120;                   /* fixed timestep */
+
+/* ---------- seeded rng ---------- */
+function mulberry32(a){ return function(){ a|=0; a = a + 0x6D2B79F5 | 0; var t = Math.imul(a ^ a>>>15, 1|a); t = t + Math.imul(t ^ t>>>7, 61|t) ^ t; return ((t ^ t>>>14)>>>0)/4294967296; }; }
+
+/* ---------- state ---------- */
+var SEED = 1078, gen = 0;
+var targets = [], blobs = [];
+var x = 0, v = 0, simT = 0;
+var mode = 'auto';                /* auto | drag | glide */
+var dragTarget = 0, grabDX = 0, glideAge = 0;
+var flashUntil = -1;              /* sim-time until speed readout shows */
+var clackFlag = false;
+
+function buildProgram(){
+  var r = mulberry32(SEED + gen*7919);
+  targets = [];
+  for (var i=0;i<5;i++) targets.push((r()*2-1) * 0.125);
+  blobs = [];
+  for (var j=0;j<8;j++){
+    blobs.push({
+      u: 0.10 + r()*0.80, w: 0.14 + r()*0.52,
+      ru: 0.10 + r()*0.16, rv: 0.16 + r()*0.26,
+      col: r() < 0.58 ? CG_A : CG_B,
+      a: 0.05 + r()*0.075,
+      ph: r()*Math.PI*2, sp: 0.05 + r()*0.075, dr: 0.006 + r()*0.012
+    });
+  }
+}
+buildProgram();
+x = targets[0];
+
+function programTarget(t){
+  var seg = Math.floor((t % 60) / 12);
+  var nxt = targets[(seg+1) % 5];
+  return nxt; /* chase the upcoming waypoint: heavy spring never quite arrives, always hauling */
+}
+
+function clamp(vv, lo, hi){ return vv < lo ? lo : (vv > hi ? hi : vv); }
+
+function step(dt){
+  simT += dt;
+  var a = 0;
+  if (mode === 'drag'){
+    a = clamp(3.1*(dragTarget - x) - 0.85*v, -A_DRAG, A_DRAG);
+  } else if (mode === 'glide'){
+    glideAge += dt;
+    a = -0.115*v - Math.sign(v)*0.0016;      /* long heavy glide: viscous + a whisper of Coulomb drag */
+    if (Math.abs(v) < 0.0022 && glideAge > 2.6) mode = 'auto';
+  } else {
+    a = clamp(1.55*(programTarget(simT) - x) - 0.46*v, -A_AUTO, A_AUTO);
+  }
+  v += a*dt;
+  v = clamp(v, -CAP, CAP);                    /* THE SPEC: velocity can never exceed 500 mm/s */
+  x += v*dt;
+  if (x >  X_LIM){ x =  X_LIM; if (Math.abs(v) > 0.012) clackFlag = true; v = 0; }
+  if (x < -X_LIM){ x = -X_LIM; if (Math.abs(v) > 0.012) clackFlag = true; v = 0; }
+}
+
+/* fixed pre-roll: 12 simulated seconds, synchronously, so frame one is reproducible */
+for (var p=0; p<Math.round(12/DT); p++) step(DT);
+clackFlag = false;
+
+/* ---------- audio (lazy, gesture-only, guarded) ---------- */
+var AC = null, rumbleOsc = null, rumbleGain = null, whirOsc = null, whirGain = null;
+function ensureAudio(){
+  if (AC) return;
+  try {
+    var Ctor = (typeof window !== 'undefined') && (window.AudioContext || window.webkitAudioContext);
+    if (!Ctor) return;
+    AC = new Ctor();
+    rumbleOsc = AC.createOscillator(); rumbleOsc.type = 'sine'; rumbleOsc.frequency.value = 44;
+    var lp = AC.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 160;
+    rumbleGain = AC.createGain(); rumbleGain.gain.value = 0;
+    rumbleOsc.connect(lp); lp.connect(rumbleGain); rumbleGain.connect(AC.destination); rumbleOsc.start();
+    whirOsc = AC.createOscillator(); whirOsc.type = 'triangle'; whirOsc.frequency.value = 190;
+    whirGain = AC.createGain(); whirGain.gain.value = 0;
+    whirOsc.connect(whirGain); whirGain.connect(AC.destination); whirOsc.start();
+  } catch(e){ AC = null; }
+}
+function clack(){
+  if (!AC) return;
+  try {
+    var o = AC.createOscillator(), g = AC.createGain(), t = AC.currentTime;
+    o.type = 'square'; o.frequency.setValueAtTime(150, t); o.frequency.exponentialRampToValueAtTime(55, t+0.09);
+    g.gain.setValueAtTime(0.12, t); g.gain.exponentialRampToValueAtTime(0.001, t+0.1);
+    o.connect(g); g.connect(AC.destination); o.start(t); o.stop(t+0.11);
+  } catch(e){}
+}
+function audioTick(){
+  if (!AC) return;
+  try {
+    var s = Math.abs(v)/CAP;
+    rumbleOsc.frequency.value = 40 + s*30;
+    rumbleGain.gain.value = 0.015 + s*0.05;
+    whirGain.gain.value = (mode === 'drag') ? 0.012 + s*0.02 : 0;
+  } catch(e){}
+}
+
+/* ---------- layout ---------- */
+var W = 0, H = 0, S = 0, OX = 0, OY = 0;
+function resize(){
+  var vv = (typeof window !== 'undefined' && window.visualViewport) ? window.visualViewport : null;
+  W = vv ? vv.width  : (window.innerWidth  || 720);
+  H = vv ? vv.height : (window.innerHeight || 720);
+  canvas.width = Math.round(W); canvas.height = Math.round(H);
+  S = Math.min(W, H); OX = (W - S)/2; OY = (H - S)/2;
+}
+if (typeof window !== 'undefined'){
+  window.addEventListener('resize', resize);
+  if (window.visualViewport) window.visualViewport.addEventListener('resize', resize);
+}
+resize();
+function isPhone(){
+  try {
+    var mn = Math.min(window.screen.width, window.screen.height);
+    if (mn < 700) return true;
+  } catch(e){}
+  return H > W*1.15;
+}
+
+/* ---------- draw ---------- */
+function draw(){
+  ctx.fillStyle = HALL; ctx.fillRect(0,0,W,H);
+  var wallW = 0.84*S, wallH = 0.62*S;
+  var cx = OX + S/2 + x*wallW;               /* wall centre px */
+  var wallX = cx - wallW/2, wallY = OY + 0.235*S;
+  var railY = OY + 0.15*S;
+  var pxMm = wallW / WALL_MM;
+
+  /* ceiling supports */
+  ctx.strokeStyle = RAIL; ctx.globalAlpha = 0.4; ctx.lineWidth = Math.max(1, S*0.002);
+  for (var sx = 0; sx <= 8; sx++){
+    var px = OX + sx*(S/8);
+    ctx.beginPath(); ctx.moveTo(px, OY); ctx.lineTo(px, railY); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+
+  /* shadow-field beneath the wall: skewed by speed, the weight made visible */
+  var sk = clamp(v/CAP, -1, 1) * 0.045*S;
+  var shH = 0.13*S, shW = wallW*0.97;
+  ctx.fillStyle = SHADOW; ctx.globalAlpha = 0.6;
+  ctx.beginPath();
+  ctx.moveTo(cx - shW/2 + sk*0.3, wallY + wallH);
+  ctx.lineTo(cx + shW/2 + sk*0.3, wallY + wallH);
+  ctx.lineTo(cx + shW/2 + sk,      wallY + wallH + shH);
+  ctx.lineTo(cx - shW/2 + sk,      wallY + wallH + shH);
+  ctx.closePath(); ctx.fill();
+  ctx.globalAlpha = 1;
+
+  /* wall body */
+  ctx.fillStyle = WALL; ctx.fillRect(wallX, wallY, wallW, wallH);
+
+  /* CG light-forms, clipped to the wall: layered flat-alpha ellipses, stored data */
+  ctx.save();
+  ctx.beginPath(); ctx.rect(wallX, wallY, wallW, wallH); ctx.clip();
+  for (var bi=0; bi<blobs.length; bi++){
+    var b = blobs[bi];
+    var bu = b.u + Math.sin(simT*b.sp + b.ph)*b.dr;
+    var bx = wallX + bu*wallW, by = wallY + b.w*wallH;
+    var layers = [1.65, 1.18, 0.78], alphas = [0.22, 0.34, 0.5];
+    ctx.fillStyle = b.col;
+    for (var li=0; li<3; li++){
+      ctx.globalAlpha = b.a * alphas[li];
+      ctx.beginPath();
+      ctx.ellipse(bx, by, b.ru*wallW*layers[li], b.rv*wallH*layers[li], 0, 0, Math.PI*2);
+      ctx.fill();
+    }
+  }
+  ctx.globalAlpha = 1;
+  /* panel seams */
+  ctx.strokeStyle = '#FFFFFF'; ctx.globalAlpha = 0.05; ctx.lineWidth = 1;
+  for (var si=1; si<4; si++){
+    var seamX = wallX + si*(wallW/4);
+    ctx.beginPath(); ctx.moveTo(seamX, wallY); ctx.lineTo(seamX, wallY+wallH); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  ctx.restore();
+  ctx.strokeStyle = RAIL; ctx.lineWidth = Math.max(1, S*0.0025);
+  ctx.strokeRect(wallX, wallY, wallW, wallH);
+
+  /* hangers + rollers (ride with the wall) */
+  ctx.fillStyle = ROLLER;
+  var rollW = 0.038*S, rollH = 0.02*S;
+  for (var ri=0; ri<4; ri++){
+    var rx = wallX + (ri+0.5)*(wallW/4);
+    ctx.fillRect(rx - rollW/2, railY - rollH/2, rollW, rollH);
+    ctx.strokeStyle = RAIL; ctx.lineWidth = Math.max(1, S*0.003);
+    ctx.beginPath(); ctx.moveTo(rx, railY + rollH/2); ctx.lineTo(rx, wallY); ctx.stroke();
+  }
+
+  /* the rail itself: the grammar — full width, above everything it constrains */
+  ctx.strokeStyle = RAIL; ctx.lineWidth = Math.max(1.5, S*0.004);
+  ctx.beginPath(); ctx.moveTo(OX, railY); ctx.lineTo(OX+S, railY); ctx.stroke();
+  ctx.lineWidth = Math.max(1, S*0.0018);
+  ctx.beginPath(); ctx.moveTo(OX, railY + 0.012*S); ctx.lineTo(OX+S, railY + 0.012*S); ctx.stroke();
+  /* end stops */
+  ctx.fillStyle = ROLLER;
+  ctx.fillRect(OX + S/2 - X_LIM*wallW - wallW/2 - 0.008*S, railY - 0.014*S, 0.008*S, 0.028*S);
+  ctx.fillRect(OX + S/2 + X_LIM*wallW + wallW/2,             railY - 0.014*S, 0.008*S, 0.028*S);
+
+  /* specced type */
+  var fs = Math.max(10, Math.round(S*0.016));
+  ctx.font = fs + 'px monospace';
+  ctx.fillStyle = AMBER; ctx.globalAlpha = 0.7;
+  var label = 'MAX 500mm/s';
+  ctx.fillText(label, OX + S - ctx.measureText(label).width - S*0.015, railY - S*0.012);
+  if (simT < flashUntil){
+    var fade = clamp((flashUntil - simT)/0.6, 0, 1);
+    ctx.globalAlpha = 0.9 * Math.min(1, fade + 0.25);
+    var spd = Math.round(Math.abs(v) * WALL_MM);
+    var txt = 'v = ' + spd + ' mm/s';
+    ctx.fillText(txt, OX + S*0.015, railY - S*0.012);
+  }
+  ctx.globalAlpha = 1;
+
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+}
+
+/* ---------- interaction ---------- */
+var downAt = 0, downX = 0, moved = 0, lastTapT = -10, downTime = 0;
+function stageU(clientX){
+  var r = canvas.getBoundingClientRect();
+  return ((clientX - r.left) - OX - S/2) / (0.84*S);
+}
+canvas.addEventListener('pointerdown', function(e){
+  ensureAudio();
+  if (AC && AC.resume) AC.resume();
+  downAt = performance.now(); downTime = simT;
+  downX = e.clientX; moved = 0;
+  grabDX = stageU(e.clientX) - x;
+  mode = 'drag'; dragTarget = x;
+  if (canvas.setPointerCapture) { try { canvas.setPointerCapture(e.pointerId); } catch(err){} }
+});
+canvas.addEventListener('pointermove', function(e){
+  if (mode !== 'drag') return;
+  moved = Math.max(moved, Math.abs(e.clientX - downX));
+  dragTarget = clamp(stageU(e.clientX) - grabDX, -X_LIM, X_LIM);
+});
+function endPointer(e){
+  if (mode !== 'drag') return;
+  var quick = (performance.now() - downAt) < 300;
+  if (moved < 6 && quick){
+    /* tap */
+    if (simT - lastTapT < 0.35){
+      gen++; buildProgram(); lastTapT = -10;   /* double-tap: new program */
+    } else {
+      flashUntil = simT + 2.2;                  /* tap: flash the live speed */
+      lastTapT = simT;
+    }
+    mode = 'auto';
+  } else {
+    mode = 'glide'; glideAge = 0;               /* release: the long heavy glide */
+  }
+}
+canvas.addEventListener('pointerup', endPointer);
+canvas.addEventListener('pointercancel', endPointer);
+
+/* ---------- main loop: fixed-timestep sim, one draw per frame ---------- */
+draw();
+var lastMs = -1, acc = 0;
+function frame(ms){
+  if (lastMs < 0) lastMs = ms;
+  var ft = Math.min(0.1, (ms - lastMs)/1000); lastMs = ms;
+  acc += ft;
+  while (acc >= DT){ step(DT); acc -= DT; }
+  if (clackFlag){ clackFlag = false; clack(); }
+  audioTick();
+  draw();
+  window.requestAnimationFrame(frame);
+}
+if (typeof window !== 'undefined' && window.requestAnimationFrame) window.requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
