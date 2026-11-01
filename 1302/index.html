@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Le Chiffonnier</title>
+<style>
+  html, body { margin: 0; padding: 0; overflow: hidden; background: #E8E2D4; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0, isPhone = false;
+
+  // Seeded PRNG (mulberry32). No Math.random anywhere in this piece.
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  // Deterministic value in [0,1) for auto-sort event i and a salt.
+  function eventRand(i, salt) {
+    return mulberry32(1302000 + i * 7919 + salt * 131)();
+  }
+
+  // Palette
+  var ROOM = '#E8E2D4', FLOOR = '#DCD3BE', FLOORLINE = '#C9BFAE',
+      COTTON = '#D9D2C2', STEEL = '#4A4C52', STEELDARK = '#33353B',
+      INDIGO = '#3B4E6B', MADDER = '#8C4632', UNDYED = '#CFC4AC',
+      BLACK = '#2A2A2E', STITCH = '#8A7F68';
+
+  var BINS = [
+    { color: INDIGO, label: 0 },
+    { color: MADDER, label: 1 },
+    { color: UNDYED, label: 2 },
+    { color: BLACK,  label: 3 }
+  ];
+  var CATS = [INDIGO, MADDER, UNDYED, BLACK];
+
+  // Loose draggable scraps. Each starts resting on its home bin's pile.
+  var SCRAPS = [];
+  (function initScraps() {
+    var r = mulberry32(1302);
+    var homes = [0, 1, 2, 3, 0, 2, 1, 3];
+    for (var i = 0; i < 8; i++) {
+      var verts = [];
+      var nv = 5 + Math.floor(r() * 3);
+      for (var k = 0; k < nv; k++) {
+        var a = (k / nv) * Math.PI * 2;
+        var rad = 0.7 + r() * 0.5;
+        verts.push([Math.cos(a) * rad, Math.sin(a) * rad]);
+      }
+      SCRAPS.push({
+        id: i, home: homes[i], color: CATS[homes[i]],
+        verts: verts, size: 11 + r() * 7, rot: r() * Math.PI * 2
+      });
+    }
+  })();
+
+  // Recorded user events (closed-form state, never frame-integrated).
+  // drags: {scrap, x0, y0, x1, y1, t0, t1} pointer path while held.
+  // drops: {scrap, fromBin, toBin, sx, sy, tx, ty, t0, dur} arc after release.
+  var drags = [];      // completed drags (pointer held then released)
+  var activeDrag = null; // {scrap, px, py} while held
+  var drops = [];      // completed releases (arc + settle)
+  var pointer = { x: -1e9, y: -1e9, inside: false };
+
+  var floorY = 0, binGeo = []; // per-bin {cx, w, h, top, scale}
+  var curT = 0;
+
+  function size() {
+    var vv = (typeof window !== 'undefined' && window.visualViewport) ? window.visualViewport : null;
+    W = vv ? vv.width : window.innerWidth;
+    H = vv ? vv.height : window.innerHeight;
+    canvas.width = W; canvas.height = H;
+    var minDim = 1e9;
+    if (typeof window !== 'undefined' && window.screen) {
+      minDim = Math.min(window.screen.width, window.screen.height);
+    }
+    isPhone = minDim < 700 || H > W * 1.15;
+  }
+
+  function build() {
+    floorY = H * 0.86;
+    binGeo = [];
+    var xs = [0.15, 0.385, 0.62, 0.855];
+    var scales = [1.0, 0.96, 0.92, 0.88];
+    for (var i = 0; i < 4; i++) {
+      var w = Math.min(W * 0.19, 230) * scales[i];
+      var h = H * 0.34 * scales[i];
+      binGeo.push({ cx: W * xs[i], w: w, h: h, top: floorY - h, scale: scales[i] });
+    }
+  }
+
+  // --- Event model -------------------------------------------------------
+  // Auto-sort: one event every 16 s starting at t = 10 s. Event i lifts a
+  // seeded loose scrap from its current bin and arcs it to another bin.
+  // Events are skipped if the picked scrap is user-held at event start.
+  function autoEvent(i) {
+    var start = 10 + i * 16;
+    var pick = Math.floor(eventRand(i, 1) * SCRAPS.length);
+    var toBin = Math.floor(eventRand(i, 2) * 4);
+    return { i: i, start: start, scrap: pick, toBin: toBin, dur: 2.2 };
+  }
+  function userHeldAt(scrap, t) {
+    if (activeDrag && activeDrag.scrap === scrap && activeDrag.t0 <= t) return true;
+    for (var d = 0; d < drags.length; d++) {
+      if (drags[d].scrap === scrap && drags[d].t0 <= t && t <= drags[d].t1) return true;
+    }
+    return false;
+  }
+  // Resolve every scrap's status at time t. Returns array of
+  // {scrap, mode, bin, x, y, rot, scale} where mode is 'rest','drag','arc'.
+  function resolve(t) {
+    var status = [];
+    for (var s = 0; s < SCRAPS.length; s++) {
+      status.push({ scrap: s, mode: 'rest', bin: SCRAPS[s].home, x: 0, y: 0 });
+    }
+    // Apply user drops in time order (completed arcs only).
+    for (var d = 0; d < drops.length; d++) {
+      var dr = drops[d];
+      if (t >= dr.t0 + dr.dur) status[dr.scrap].bin = dr.toBin;
+    }
+    // Apply completed auto events in time order.
+    var maxI = Math.floor((t - 10) / 16);
+    for (var i = 0; i <= maxI && i < 400; i++) {
+      var ev = autoEvent(i);
+      if (t < ev.start) break;
+      if (userHeldAt(ev.scrap, ev.start)) continue;
+      var st = status[ev.scrap];
+      if (st.mode === 'arc') continue;
+      if (t >= ev.start + ev.dur) {
+        st.bin = ev.toBin;
+      } else {
+        st.mode = 'arc';
+        st.auto = ev;
+      }
+    }
+    // Active user drag overrides everything for that scrap.
+    if (activeDrag) {
+      var as = status[activeDrag.scrap];
+      as.mode = 'drag';
+      as.x = activeDrag.px; as.y = activeDrag.py - 12;
+    }
+    // Active user drop/return arc overrides.
+    for (var d2 = 0; d2 < drops.length; d2++) {
+      var dr2 = drops[d2];
+      if (t >= dr2.t0 && t < dr2.t0 + dr2.dur) {
+        var st2 = status[dr2.scrap];
+        st2.mode = 'arc';
+        st2.drop = dr2;
+      }
+    }
+    // Resting positions: seeded spot on the current bin's pile.
+    for (var s2 = 0; s2 < SCRAPS.length; s2++) {
+      var st3 = status[s2];
+      if (st3.mode !== 'rest') continue;
+      var g = binGeo[st3.bin];
+      var r = mulberry32(1302000 + s2 * 37 + st3.bin * 7);
+      var px = g.cx + (r() - 0.5) * g.w * 0.62;
+      var py = g.top - 6 - r() * g.h * 0.10;
+      st3.x = px; st3.y = py;
+    }
+    return status;
+  }
+  function pileCount(status, bin) {
+    var n = 0;
+    for (var s = 0; s < status.length; s++) {
+      if (status[s].mode === 'rest' && status[s].bin === bin) n++;
+    }
+    return n;
+  }
+  function arcPos(x0, y0, x1, y1, p) {
+    // Quadratic arc: lift above the straight line, ease in-out.
+    var e = p < 0.5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2;
+    var mx = (x0 + x1) / 2, my = Math.min(y0, y1) - 90;
+    var x = (1 - e) * (1 - e) * x0 + 2 * (1 - e) * e * mx + e * e * x1;
+    var y = (1 - e) * (1 - e) * y0 + 2 * (1 - e) * e * my + e * e * y1;
+    return [x, y];
+  }
+
+  // --- Drawing -----------------------------------------------------------
+  function drawScrap(sc, x, y, rot, scale) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(rot);
+    ctx.scale(scale, scale);
+    ctx.beginPath();
+    for (var k = 0; k < sc.verts.length; k++) {
+      var vx = sc.verts[k][0] * sc.size, vy = sc.verts[k][1] * sc.size;
+      if (k === 0) ctx.moveTo(vx, vy); else ctx.lineTo(vx, vy);
+    }
+    ctx.closePath();
+    ctx.fillStyle = sc.color;
+    ctx.fill();
+    ctx.strokeStyle = STEELDARK;
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.restore();
+  }
+  function drawBin(i, t, status) {
+    var g = binGeo[i];
+    var rest = pileCount(status, i);
+    var breathe = Math.sin(t * (Math.PI * 2 / 9) + i * 1.3) * 0.5 + 0.5;
+    var bulge = (4 + rest * 1.5 + breathe * 3) * g.scale;
+    var hover = pointer.inside &&
+      pointer.x > g.cx - g.w / 2 && pointer.x < g.cx + g.w / 2 &&
+      pointer.y > g.top - 20 && pointer.y < floorY + 10;
+    var top = g.top, bot = floorY, hw = g.w / 2;
+
+    // Cotton membrane: translucent, sides bowed by the bulge.
+    ctx.beginPath();
+    ctx.moveTo(g.cx - hw, top);
+    ctx.quadraticCurveTo(g.cx - hw - bulge, (top + bot) / 2, g.cx - hw, bot);
+    ctx.lineTo(g.cx + hw, bot);
+    ctx.quadraticCurveTo(g.cx + hw + bulge, (top + bot) / 2, g.cx + hw, top);
+    ctx.closePath();
+    ctx.fillStyle = COTTON;
+    ctx.globalAlpha = 0.55;
+    ctx.fill();
+    ctx.globalAlpha = 1;
+
+    // Pile: seeded cluster of small scraps in the bin's category color,
+    // peeking above the rim, plus the resting loose scraps drawn later.
+    var r = mulberry32(9100 + i * 77);
+    var base = 11;
+    ctx.fillStyle = BINS[i].color;
+    for (var k = 0; k < base; k++) {
+      var px = g.cx + (r() - 0.5) * g.w * 0.7;
+      var py = top - 4 - r() * 14 * g.scale;
+      var s = (5 + r() * 6) * g.scale;
+      ctx.save();
+      ctx.translate(px, py);
+      ctx.rotate(r() * Math.PI * 2);
+      ctx.beginPath();
+      ctx.moveTo(-s, 0);
+      ctx.lineTo(-s * 0.3, -s * 0.7);
+      ctx.lineTo(s * 0.6, -s * 0.4);
+      ctx.lineTo(s, s * 0.4);
+      ctx.lineTo(-s * 0.4, s * 0.6);
+      ctx.closePath();
+      ctx.globalAlpha = 0.9;
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      ctx.restore();
+    }
+
+    // Steel armature: thin line cage.
+    ctx.strokeStyle = STEEL;
+    ctx.lineWidth = Math.max(1, 1.5 * g.scale);
+    ctx.beginPath();
+    ctx.moveTo(g.cx - hw, top); ctx.lineTo(g.cx - hw, bot);
+    ctx.moveTo(g.cx + hw, top); ctx.lineTo(g.cx + hw, bot);
+    ctx.moveTo(g.cx - hw / 3, top); ctx.lineTo(g.cx - hw / 3, bot);
+    ctx.moveTo(g.cx + hw / 3, top); ctx.lineTo(g.cx + hw / 3, bot);
+    ctx.moveTo(g.cx - hw, top); ctx.lineTo(g.cx + hw, top);
+    ctx.moveTo(g.cx - hw, (top + bot) / 2); ctx.lineTo(g.cx + hw, (top + bot) / 2);
+    ctx.moveTo(g.cx - hw, bot); ctx.lineTo(g.cx + hw, bot);
+    ctx.stroke();
+
+    // Stitch lines on the cotton: dashed, shimmering faintly on hover.
+    ctx.strokeStyle = STITCH;
+    ctx.lineWidth = 1;
+    ctx.setLineDash([5, 5]);
+    ctx.lineDashOffset = hover ? -t * 12 : 0;
+    ctx.globalAlpha = hover ? 0.95 : 0.45;
+    ctx.beginPath();
+    ctx.moveTo(g.cx - hw + 3, top + 6); ctx.lineTo(g.cx - hw + 3, bot - 4);
+    ctx.moveTo(g.cx + hw - 3, top + 6); ctx.lineTo(g.cx + hw - 3, bot - 4);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.globalAlpha = 1;
+  }
+
+  function draw(t) {
+    curT = t;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = ROOM;
+    ctx.fillRect(0, 0, W, H);
+    // Floor band and line.
+    ctx.fillStyle = FLOOR;
+    ctx.fillRect(0, floorY, W, H - floorY);
+    ctx.strokeStyle = FLOORLINE;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, floorY); ctx.lineTo(W, floorY);
+    ctx.stroke();
+
+    var status = resolve(t);
+    for (var i = 0; i < 4; i++) drawBin(i, t, status);
+
+    // Scraps: resting ones first, then in-flight ones on top.
+    for (var s = 0; s < status.length; s++) {
+      var st = status[s];
+      if (st.mode !== 'rest') continue;
+      drawScrap(SCRAPS[s], st.x, st.y, SCRAPS[s].rot, 1);
+    }
+    for (var s2 = 0; s2 < status.length; s2++) {
+      var st2 = status[s2];
+      if (st2.mode === 'drag') {
+        drawScrap(SCRAPS[s2], st2.x, st2.y, SCRAPS[s2].rot, 1.18);
+      } else if (st2.mode === 'arc' && st2.drop) {
+        var dr = st2.drop;
+        var p = (t - dr.t0) / dr.dur;
+        var pos = arcPos(dr.sx, dr.sy, dr.tx, dr.ty, p);
+        drawScrap(SCRAPS[s2], pos[0], pos[1], SCRAPS[s2].rot, 1.15);
+      } else if (st2.mode === 'arc' && st2.auto) {
+        var ev = st2.auto;
+        var g0 = binGeo[status[s2].bin];
+        var g1 = binGeo[ev.toBin];
+        var p2 = (t - ev.start) / ev.dur;
+        var pos2 = arcPos(g0.cx, g0.top - 10, g1.cx, g1.top - 10, p2);
+        drawScrap(SCRAPS[s2], pos2[0], pos2[1], SCRAPS[s2].rot, 1.15);
+      }
+    }
+  }
+
+  // --- Pointer -----------------------------------------------------------
+  function canvasPos(e) {
+    var rect = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    var x = (e.clientX !== undefined ? e.clientX : (e.touches ? e.touches[0].clientX : 0)) - rect.left;
+    var y = (e.clientY !== undefined ? e.clientY : (e.touches ? e.touches[0].clientY : 0)) - rect.top;
+    return [x, y];
+  }
+  function hitScrap(x, y) {
+    var status = resolve(curT);
+    var best = -1, bd = 1e9;
+    for (var s = 0; s < status.length; s++) {
+      if (status[s].mode !== 'rest') continue;
+      var dx = status[s].x - x, dy = status[s].y - y;
+      var d = Math.sqrt(dx * dx + dy * dy);
+      if (d < 34 && d < bd) { bd = d; best = s; }
+    }
+    return best;
+  }
+  function binAt(x, y) {
+    for (var i = 0; i < 4; i++) {
+      var g = binGeo[i];
+      if (x > g.cx - g.w / 2 - 10 && x < g.cx + g.w / 2 + 10 && y > g.top - 30 && y < floorY + 20) return i;
+    }
+    return -1;
+  }
+  function onDown(e) {
+    var p = canvasPos(e);
+    var s = hitScrap(p[0], p[1]);
+    if (s >= 0) {
+      activeDrag = { scrap: s, px: p[0], py: p[1], t0: curT };
+      if (e.preventDefault) e.preventDefault();
+    }
+  }
+  function onMove(e) {
+    var p = canvasPos(e);
+    pointer.x = p[0]; pointer.y = p[1]; pointer.inside = true;
+    if (activeDrag) {
+      activeDrag.px = p[0]; activeDrag.py = p[1];
+      if (e.preventDefault) e.preventDefault();
+    }
+  }
+  function onUp(e) {
+    if (!activeDrag) return;
+    var p = canvasPos(e);
+    var s = activeDrag.scrap;
+    var status = resolve(curT);
+    var fromBin = status[s].bin;
+    var toBin = binAt(p[0], p[1]);
+    drags.push({ scrap: s, t0: activeDrag.t0, t1: curT });
+    var rest = status[s];
+    if (toBin >= 0) {
+      drops.push({ scrap: s, fromBin: fromBin, toBin: toBin,
+        sx: p[0], sy: p[1] - 12,
+        tx: binGeo[toBin].cx, ty: binGeo[toBin].top - 8,
+        t0: curT, dur: 0.7 });
+    } else {
+      drops.push({ scrap: s, fromBin: fromBin, toBin: fromBin,
+        sx: p[0], sy: p[1] - 12,
+        tx: rest.x, ty: rest.y,
+        t0: curT, dur: 0.5 });
+    }
+    activeDrag = null;
+  }
+  function onLeave() { pointer.inside = false; }
+
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointerleave', onLeave);
+    canvas.addEventListener('touchstart', onDown, { passive: false });
+    canvas.addEventListener('touchmove', onMove, { passive: false });
+    canvas.addEventListener('touchend', onUp);
+  }
+
+  function onResize() { size(); build(); draw(curT); }
+  if (typeof window !== 'undefined') {
+    if (window.addEventListener) {
+      window.addEventListener('resize', onResize);
+      if (window.visualViewport) window.visualViewport.addEventListener('resize', onResize);
+    }
+  }
+
+  // Boot: frame one is exactly t = 0. The clock starts with the rAF loop.
+  size();
+  build();
+  draw(0);
+  var t0 = null;
+  function loop(ts) {
+    if (t0 === null) t0 = ts;
+    draw((ts - t0) / 1000);
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+  }
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
