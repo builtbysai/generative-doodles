@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<!-- piece-9119-curtain-drift -->
+<title>Curtain Drift</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #000; }
+  #c { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; touch-action: none; cursor: crosshair; }
+  #hint {
+    position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%);
+    color: rgba(255,255,255,0.42); font: 12px/1.4 system-ui, -apple-system, sans-serif;
+    letter-spacing: 0.08em; pointer-events: none; user-select: none;
+    transition: opacity 1.2s ease; white-space: nowrap;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hint">drag to stir &middot; tap for a new sky</div>
+<script>
+// Curtain Drift (piece 9119) — pure driver core. No DOM, no canvas.
+// Runnable in node for the harness; inlined into index.html for the piece.
+'use strict';
+
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function createField(seed) {
+  const rnd = mulberry32(seed);
+  const N = 30;
+  const rays = [];
+  for (let i = 0; i < N; i++) {
+    rays.push({
+      x: rnd(),                       // base lateral position 0..1
+      w: 0.008 + rnd() * 0.022,       // column width fraction
+      phase: rnd() * Math.PI * 2,     // per-ray phase offset
+      edge: 0.72 + rnd() * 0.22,      // curtain bottom edge (sky fraction)
+      speed: 0.7 + rnd() * 0.6,       // individual drift speed factor
+      swayAmp: 0.008 + rnd() * 0.028, // lateral sway amplitude
+      hueMix: rnd(),                  // 0 = green, 1 = violet
+      bright: 0.45 + rnd() * 0.55,    // base brightness
+    });
+  }
+  const stars = [];
+  for (let i = 0; i < 130; i++) {
+    stars.push({ x: rnd(), y: rnd() * 0.55, r: 0.3 + rnd() * 1.1, tw: rnd() * Math.PI * 2 });
+  }
+  const ridge = [];
+  for (let i = 0; i <= 40; i++) {
+    ridge.push(0.5 + 0.5 * Math.sin(i * 1.7 + rnd() * 6.28) * (0.4 + 0.6 * rnd()));
+  }
+  return {
+    seed, rays, stars, ridge, N,
+    horizon: 0.62,                    // fraction of height: sky above, water below
+    waveT1: 48 + rnd() * 22,          // lateral sweep period, seconds
+    waveT2: 9 + rnd() * 6,            // breathing period, seconds
+    phase1: rnd() * Math.PI * 2,
+    phase2: rnd() * Math.PI * 2,
+    gust: null,                       // { x, t0, strength }
+  };
+}
+
+// Per-ray brightness envelope at time t: breathing * lateral traveling wave (+ gust).
+// The lateral wave is a function of POSITION: neighboring rays sit in the same
+// phase, so bright bands genuinely sweep sideways through the columns.
+function rayEnvelope(ray, field, t) {
+  const lat = 0.5 + 0.5 * Math.sin(
+    2 * Math.PI * (ray.x - t / field.waveT1) + field.phase1 + ray.phase * 0.25);
+  const br = 0.5 + 0.5 * Math.sin(
+    2 * Math.PI * t / field.waveT2 + field.phase2 + ray.phase * 0.7);
+  let e = ray.bright * (0.22 + 0.78 * lat) * (0.25 + 0.75 * br);
+  if (field.gust) {
+    const age = t - field.gust.t0;
+    if (age >= 0 && age < 8) {
+      const d = Math.abs(ray.x - field.gust.x);
+      e += field.gust.strength * Math.exp(-(d * d) / 0.012) * Math.exp(-age / 3.2);
+    }
+  }
+  return Math.min(e, 1.6);
+}
+
+// Lateral sway offset of a ray at time t (renderer uses this; gust bends rays).
+function raySway(ray, field, t) {
+  let s = ray.swayAmp * Math.sin(2 * Math.PI * t / (field.waveT2 * 1.6) + ray.phase);
+  if (field.gust) {
+    const age = t - field.gust.t0;
+    if (age >= 0 && age < 8) {
+      const d = ray.x - field.gust.x;
+      s += 0.09 * field.gust.strength * Math.exp(-(d * d) / 0.016) * Math.exp(-age / 3.0) * Math.sign(d || 1);
+    }
+  }
+  return s;
+}
+
+// Vertical curtain profile within the sky: y in 0..1 (0 = top, 1 = horizon).
+function rayVertical(ray, y, t) {
+  if (y <= 0 || y >= 1) return 0;
+  const edge = ray.edge + 0.03 * Math.sin(t * 0.4 + ray.phase * 2);
+  const topIn = Math.min(1, y / 0.10);                 // fade in from top
+  const bottomOut = Math.max(0, 1 - y / Math.max(edge, 0.05)); // fade to ragged edge
+  // bright low band just above the edge (aurora lower border)
+  const band = Math.exp(-Math.pow((y - edge * 0.92) / 0.16, 2));
+  return topIn * bottomOut * (0.35 + 0.65 * band);
+}
+
+// Diffuse glow between the rays: the curtains sit in a breathing wash.
+function diffuseGlow(field, x, y, t) {
+  if (y <= 0 || y >= 1) return 0;
+  const br = 0.5 + 0.5 * Math.sin(2 * Math.PI * t / field.waveT2 + field.phase2 + 2.1);
+  const lat = 0.5 + 0.5 * Math.sin(2 * Math.PI * (x - t / field.waveT1) + field.phase1 + 1.3);
+  const vert = Math.max(0, 1 - y / 0.9) * Math.min(1, y / 0.08);
+  return 0.19 * (0.05 + 0.95 * br) * (0.35 + 0.65 * lat) * vert;
+}
+
+// Sky brightness at (x, y in sky fraction 0..1), t seconds.
+function skyBrightness(field, x, y, t) {
+  let b = diffuseGlow(field, x, y, t);
+  for (let i = 0; i < field.N; i++) {
+    const ray = field.rays[i];
+    const cx = ray.x + raySway(ray, field, t);
+    const dx = (x - cx) / ray.w;
+    b += rayEnvelope(ray, field, t) * rayVertical(ray, y, t) * Math.exp(-dx * dx);
+  }
+  return b;
+}
+
+// Column brightness: mean sky brightness over the column (for reflections).
+function columnSky(field, x, t, samples) {
+  samples = samples || 8;
+  let s = 0;
+  for (let k = 0; k < samples; k++) s += skyBrightness(field, x, (k + 0.5) / samples, t);
+  return s / samples;
+}
+
+// Water brightness at (x, yw 0..1 below horizon): mirrored columns, decayed, shimmered.
+function waterBrightness(field, x, yw, t) {
+  const col = columnSky(field, x, t);
+  const decay = Math.exp(-yw * 3.2);
+  const shimmer = 0.72 + 0.28 * Math.sin(2 * Math.PI * (x * 9 + t * 0.7) + 3 * Math.sin(x * 40));
+  return col * decay * 0.38 * shimmer;
+}
+
+function injectGust(field, x, t, strength) {
+  field.gust = { x: x, t0: t, strength: strength == null ? 1.2 : strength };
+}
+
+function reseed(field, newSeed) {
+  const f = createField(newSeed);
+  field.seed = f.seed; field.rays = f.rays; field.stars = f.stars;
+  field.ridge = f.ridge; field.waveT1 = f.waveT1; field.waveT2 = f.waveT2;
+  field.phase1 = f.phase1; field.phase2 = f.phase2; field.gust = null;
+}
+
+if (typeof module !== 'undefined') {
+  module.exports = {
+    createField, rayEnvelope, raySway, rayVertical,
+    skyBrightness, columnSky, waterBrightness, injectGust, reseed,
+  };
+}
+
+</script>
+<script>
+'use strict';
+(function () {
+  var cv = document.getElementById('c');
+  var ctx = cv.getContext('2d');
+  var hint = document.getElementById('hint');
+
+  var seedParam = new URLSearchParams(location.search).get('seed');
+  var seed = seedParam ? (parseInt(seedParam, 10) >>> 0) : ((Date.now() ^ (Math.random() * 1e9)) >>> 0);
+  var field = createField(seed);
+
+  var W = 0, H = 0, horizonY = 0, DPR = 1;
+  var t0 = performance.now();
+  var t = 0;
+
+  // low-res diffuse buffer
+  var DW = 220, DH = 140;
+  var dc = document.createElement('canvas'); dc.width = DW; dc.height = DH;
+  var dctx = dc.getContext('2d');
+  var dimg = dctx.createImageData(DW, DH);
+
+  var starCv = document.createElement('canvas');
+  var sctx = starCv.getContext('2d');
+
+  function resize() {
+    DPR = Math.min(2, window.devicePixelRatio || 1);
+    W = Math.floor(window.innerWidth); H = Math.floor(window.innerHeight);
+    cv.width = Math.floor(W * DPR); cv.height = Math.floor(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    horizonY = Math.floor(H * field.horizon);
+    starCv.width = W; starCv.height = horizonY;
+    drawStarsStatic();
+  }
+
+  function drawStarsStatic() {
+    sctx.clearRect(0, 0, W, horizonY);
+    for (var i = 0; i < field.stars.length; i++) {
+      var s = field.stars[i];
+      sctx.fillStyle = 'rgba(220,232,255,' + (0.25 + 0.35 * (s.r / 1.4)).toFixed(3) + ')';
+      sctx.beginPath();
+      sctx.arc(s.x * W, s.y * horizonY, s.r, 0, 6.2832);
+      sctx.fill();
+    }
+  }
+
+  function lerp(a, b, k) { return a + (b - a) * k; }
+  // palette: low green -> mid teal -> top violet, shifted by hueMix
+  function rayColors(hueMix) {
+    var top = [lerp(53, 139, hueMix) | 0, lerp(224, 92, hueMix) | 0, lerp(255, 255, hueMix) | 0];
+    var low = [70, 255, 160];
+    return { top: top, low: low };
+  }
+  function rgba(c, a) { return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a.toFixed(3) + ')'; }
+
+  function drawDiffuse() {
+    var d = dimg.data, p = 0;
+    for (var j = 0; j < DH; j++) {
+      var y = j / DH;
+      for (var i = 0; i < DW; i++) {
+        var x = i / DW;
+        var g = diffuseGlow(field, x, y, t);
+        // tint: teal-green wash, peak channel ~150
+        var rr = 360 * g, gg = 800 * g, bb = 640 * g;
+        d[p++] = rr > 255 ? 255 : rr;
+        d[p++] = gg > 255 ? 255 : gg;
+        d[p++] = bb > 255 ? 255 : bb;
+        d[p++] = 255;
+      }
+    }
+    dctx.putImageData(dimg, 0, 0);
+  }
+
+  function drawFrame() {
+    t = (performance.now() - t0) / 1000;
+
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+    // sky + water base
+    ctx.fillStyle = '#04060c';
+    ctx.fillRect(0, 0, W, horizonY + 1);
+    ctx.fillStyle = '#020304';
+    ctx.fillRect(0, horizonY, W, H - horizonY);
+
+    // stars
+    ctx.globalAlpha = 0.85;
+    ctx.drawImage(starCv, 0, 0);
+
+    // diffuse wash
+    drawDiffuse();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = 1;
+    ctx.drawImage(dc, 0, 0, W, horizonY);
+
+    // rays: soft halo + striated core, never a flat slab
+    for (var i = 0; i < field.N; i++) {
+      var ray = field.rays[i];
+      var E = rayEnvelope(ray, field, t);
+      if (E > 1.05) E = 1.05; // render cap: keeps additive cores from clipping
+      if (E < 0.02) continue;
+      var cx = (ray.x + raySway(ray, field, t)) * W;
+      var edge = (ray.edge + 0.03 * Math.sin(t * 0.4 + ray.phase * 2)) * horizonY;
+      var topY = horizonY * 0.015;
+      var cols = rayColors(ray.hueMix);
+      // halo
+      var wHalo = Math.max(3, ray.w * W * 5);
+      var gH = ctx.createLinearGradient(0, topY, 0, edge);
+      gH.addColorStop(0.00, rgba(cols.top, 0));
+      gH.addColorStop(0.70, rgba(cols.low, 0.10 * E));
+      gH.addColorStop(0.94, rgba(cols.low, 0.18 * E));
+      gH.addColorStop(1.00, rgba(cols.low, 0));
+      ctx.fillStyle = gH;
+      ctx.fillRect(cx - wHalo, topY, wHalo * 2, edge - topY);
+      // striated core: 3 soft sub-columns break the slab look
+      var coreW = Math.max(1.5, ray.w * W * 1.1);
+      for (var s = -1; s <= 1; s++) {
+        var am = s === 0 ? 1 : 0.45;
+        var ox = cx + s * coreW * 0.9;
+        var gC = ctx.createLinearGradient(0, topY, 0, edge);
+        gC.addColorStop(0.00, rgba(cols.top, 0));
+        gC.addColorStop(0.50, rgba(cols.top, 0.10 * E * am));
+        gC.addColorStop(0.82, rgba(cols.low, 0.34 * E * am));
+        gC.addColorStop(0.94, rgba(cols.low, 0.62 * E * am));
+        gC.addColorStop(1.00, rgba(cols.low, 0));
+        ctx.fillStyle = gC;
+        ctx.fillRect(ox - coreW * 0.55, topY, coreW * 1.1, edge - topY);
+      }
+      // afterglow seats the curtain into the horizon
+      var gA = ctx.createLinearGradient(0, horizonY - 14, 0, horizonY + 8);
+      gA.addColorStop(0, rgba(cols.low, 0));
+      gA.addColorStop(0.65, rgba(cols.low, 0.12 * E));
+      gA.addColorStop(1, rgba(cols.low, 0));
+      ctx.fillStyle = gA;
+      ctx.fillRect(cx - wHalo, horizonY - 14, wHalo * 2, 22);
+    }
+
+    // water: flipped diffuse reflection + per-ray streaks
+    ctx.globalAlpha = 0.34;
+    ctx.save();
+    ctx.translate(0, horizonY * 1.6);
+    ctx.scale(1, -0.6);
+    ctx.drawImage(dc, 0, 0, W, horizonY);
+    ctx.restore();
+    ctx.globalAlpha = 1;
+    for (var k = 0; k < field.N; k++) {
+      var r2 = field.rays[k];
+      var E2 = rayEnvelope(r2, field, t);
+      if (E2 > 1.05) E2 = 1.05;
+      if (E2 < 0.03) continue;
+      var shimmer = Math.sin(t * 0.7 + r2.phase * 3) * 5;
+      var cx2 = (r2.x + raySway(r2, field, t)) * W + shimmer;
+      var rh = (H - horizonY) * (0.35 + 0.4 * r2.edge);
+      var passes = [
+        { w: Math.max(4, r2.w * W * 6), a: 0.09 },
+        { w: Math.max(1.5, r2.w * W * 1.6), a: 0.20 }
+      ];
+      for (var q = 0; q < 2; q++) {
+        var g2 = ctx.createLinearGradient(0, horizonY, 0, horizonY + rh);
+        g2.addColorStop(0, 'rgba(70,255,170,' + (passes[q].a * E2).toFixed(3) + ')');
+        g2.addColorStop(1, 'rgba(70,255,170,0)');
+        ctx.fillStyle = g2;
+        ctx.fillRect(cx2 - passes[q].w, horizonY, passes[q].w * 2, rh);
+      }
+    }
+
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+
+    // fjord ridges
+    drawRidge(0, 0.30);
+    drawRidge(0.70, 1.0);
+
+    // hairline horizon
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx.fillRect(0, horizonY - 1, W, 2);
+  }
+
+  function drawRidge(x0f, x1f) {
+    var x0 = x0f * W, x1 = x1f * W;
+    ctx.beginPath();
+    ctx.moveTo(x0, horizonY + 2);
+    var n = field.ridge.length;
+    for (var i = 0; i <= 40; i++) {
+      var f = i / 40;
+      var h = field.ridge[(i * 7 + (x0f > 0.5 ? 13 : 0)) % n] * horizonY * 0.13;
+      ctx.lineTo(x0 + f * (x1 - x0), horizonY - h);
+    }
+    ctx.lineTo(x1, horizonY + 2);
+    ctx.closePath();
+    ctx.fillStyle = '#020409';
+    ctx.fill();
+  }
+
+  // interaction: drag stirs (gust), tap reseeds
+  var pdown = null, dragged = false;
+  cv.addEventListener('pointerdown', function (e) {
+    pdown = { x: e.clientX, y: e.clientY };
+    dragged = false;
+    cv.setPointerCapture(e.pointerId);
+  });
+  cv.addEventListener('pointermove', function (e) {
+    if (!pdown) return;
+    var dx = e.clientX - pdown.x, dy = e.clientY - pdown.y;
+    if (Math.abs(dx) + Math.abs(dy) > 8) dragged = true;
+    if (dragged) {
+      injectGust(field, Math.max(0, Math.min(1, e.clientX / W)), t, 1.3);
+      hint.style.opacity = '0';
+    }
+  });
+  function endPointer(e) {
+    if (!pdown) return;
+    if (!dragged) {
+      // tap: fresh sky
+      reseed(field, (seed ^ (Math.random() * 1e9)) >>> 0);
+      seed = field.seed;
+      drawStarsStatic();
+    }
+    pdown = null;
+  }
+  cv.addEventListener('pointerup', endPointer);
+  cv.addEventListener('pointercancel', function () { pdown = null; });
+
+  window.addEventListener('resize', resize);
+  resize();
+
+  function loop() { drawFrame(); requestAnimationFrame(loop); }
+  loop();
+})();
+</script>
+</body>
+</html>
