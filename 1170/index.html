@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Satromizer</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0A0A0C; overflow: hidden; height: 100%; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- Satromizer — Jon Satrom study JS3 ----------
+  // After the Satromizer plugin (2001, Satrom + Ben Syverson / PoxParty):
+  // "don't learn the tool, build a wrong tool." A fake plugin panel is
+  // docked over a calm procedural dusk landscape, and its five sliders
+  // genuinely corrupt the picture — every control works on the image.
+  // The landscape is a pure function sampled into a grid of palette
+  // indices (no offscreen canvas, no ImageData); the corruptions are
+  // source-coordinate warps applied to that grid in the data:
+  //   SMEAR   — each 8px row band samples from further left (content
+  //             drags right, the vacated edge stretches into a smear)
+  //   TEAR    — vertical slices sample from displaced rows (rips)
+  //   CHANNEL — the R and B components are read from index samples
+  //             offset left/right of the G sample (channel split)
+  //   STUTTER — the landscape's own clock advances in quantized holds
+  //   DECAY   — each column samples from higher up, more toward the
+  //             bottom, so the image melts downward in drips
+  // BYPASS flips between clean and corrupted instantly; double-tap a
+  // slider to snap it back to zero. Silent by design.
+
+  var T0 = 7.3;                // fixed phase for the deterministic first frame
+
+  // ---------- palette ----------
+  var SKY = ['#0B1026', '#0E1230', '#11143A', '#141743', '#171A4B',
+             '#1A1C48', '#1E1D45', '#221D42', '#261C40', '#2A1A3E'];
+  var SUN_HEX = '#FF9E4F';
+  var STAR_HEX = '#93A5D8';
+  var CLOUD_HEX = '#43315E';
+  var BIRD_HEX = '#05070F';
+  var HILL_FAR_HEX = '#2C2044';
+  var HILL_MID_HEX = '#1D2B2E';
+  var GROUND_HEX = '#100D1E';
+
+  var PAL_HEX = SKY.concat([SUN_HEX, STAR_HEX, CLOUD_HEX, BIRD_HEX,
+                            HILL_FAR_HEX, HILL_MID_HEX, GROUND_HEX]);
+  var I_SUN = 10, I_STAR = 11, I_CLOUD = 12, I_BIRD = 13,
+      I_HFAR = 14, I_HMID = 15, I_GROUND = 16;
+  function hexRgb(h) {
+    return [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
+  }
+  var PAL = PAL_HEX.map(hexRgb);
+  var rgbCache = {};
+  function rgbStr(r, g, b) {
+    var k = (r << 16) | (g << 8) | b;
+    var s = rgbCache[k];
+    if (!s) { s = 'rgb(' + r + ',' + g + ',' + b + ')'; rgbCache[k] = s; }
+    return s;
+  }
+
+  // panel palette
+  var PANEL_BG = '#141416', PANEL_EDGE = '#26262B', PANEL_TEXT = '#E8E8E8',
+      PANEL_DIM = '#8A8A92', PANEL_FAINT = '#5A5A62', TRACK = '#333333',
+      AMBER = '#FFE14D';
+
+  // ---------- sliders ----------
+  var SLIDERS = [
+    { name: 'SMEAR',   accent: '#00FFC2', v: 0.45 },
+    { name: 'TEAR',    accent: '#FF2B6E', v: 0.30 },
+    { name: 'CHANNEL', accent: '#FFE14D', v: 0.50 },
+    { name: 'STUTTER', accent: '#3D5AFE', v: 0.25 },
+    { name: 'DECAY',   accent: '#FF9100', v: 0.35 }
+  ];
+  var bypass = false;
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ---------- seeded rng ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function hash2(x, y) {
+    var h = (x * 374761393 + y * 668265263) | 0;
+    h = Math.imul(h ^ (h >>> 13), 1274126177);
+    return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+  }
+
+  // ---------- seeded corruption tables (built once) ----------
+  var rng = mulberry32(117003);
+  var BAND_SEED = [];                       // per 8px row band, 0.15..1
+  for (var bi = 0; bi < 256; bi++) BAND_SEED.push(0.15 + 0.85 * rng());
+  var SLICES = [];                          // {u0, u1, off} vertical slices
+  (function () {
+    var u = 0;
+    while (u < 1) {
+      var w = 0.05 + 0.09 * rng();
+      SLICES.push({ u0: u, u1: Math.min(1, u + w), off: rng() * 2 - 1 });
+      u += w;
+    }
+  })();
+  var DRIP_PTS = [];                        // value-noise control points over u
+  for (var di = 0; di <= 24; di++) DRIP_PTS.push(0.10 + 0.90 * rng());
+  function dripAt(u) {
+    var f = u * 24, i = Math.floor(f), fr = f - i;
+    var s = fr * fr * (3 - 2 * fr);
+    var a = DRIP_PTS[Math.min(24, i)], b = DRIP_PTS[Math.min(24, i + 1)];
+    return a + (b - a) * s;
+  }
+  function sliceOffAt(u) {
+    for (var i = 0; i < SLICES.length; i++) {
+      if (u < SLICES[i].u1) return SLICES[i].off;
+    }
+    return SLICES[SLICES.length - 1].off;
+  }
+
+  // ---------- scene function ----------
+  // Pure: returns a palette index for landscape fraction (u, v) at
+  // effective time te. Distances measured in landscape pixels so the
+  // sun and clouds stay round at any aspect.
+  var LAND_W = 1, LAND_H = 1;               // px dims, set in draw()
+  var SUN_U = 0.40, SUN_V = 0.44, SUN_RF = 0.145;
+  var CLOUDS = [
+    { u0: 0.12, v: 0.17, sp: 0.006, s: 1.00 },
+    { u0: 0.58, v: 0.26, sp: 0.004, s: 0.75 },
+    { u0: 0.86, v: 0.12, sp: 0.008, s: 0.55 }
+  ];
+  var BIRDS = [
+    { u0: 0.30, v: 0.22, sp: 0.011, ph: 0.0 },
+    { u0: 0.66, v: 0.30, sp: 0.009, ph: 2.1 }
+  ];
+  var BIRD_MASK = [[1, 0, 0, 0, 1], [0, 1, 0, 1, 0], [0, 0, 1, 0, 0]];
+  function hillFar(u) { return 0.615 + 0.045 * Math.sin(u * 4.3 + 1.2) + 0.018 * Math.sin(u * 9.7); }
+  function hillMid(u) { return 0.735 + 0.042 * Math.sin(u * 3.1 + 4.0) + 0.018 * Math.sin(u * 7.9 + 0.5); }
+  function groundLine(u) { return 0.855 + 0.026 * Math.sin(u * 2.3 + 2.0); }
+  function wrapDx(px, cx) { var d = Math.abs(px - cx); return Math.min(d, LAND_W - d); }
+
+  function sceneIdx(u, v, te, cellCx, cellCy) {
+    var px = u * LAND_W, py = v * LAND_H;
+    var idx = Math.min(9, Math.floor(v * 10));            // sky band
+    if (v < 0.52 && hash2(cellCx, cellCy) > 0.9986) idx = I_STAR;
+    // clouds (flat unions of circles, drifting with te, wrap-aware)
+    for (var ci = 0; ci < CLOUDS.length; ci++) {
+      var c = CLOUDS[ci];
+      var cx = (((c.u0 + te * c.sp) % 1) + 1) % 1 * LAND_W;
+      var cy = c.v * LAND_H, R = 0.052 * LAND_H * c.s;
+      var dxs = [-0.9 * R, 0, 0.9 * R], rs = [0.72 * R, R, 0.78 * R];
+      for (var k = 0; k < 3; k++) {
+        var ddx = wrapDx(px, cx + dxs[k]), ddy = py - cy;
+        if (ddx * ddx + ddy * ddy <= rs[k] * rs[k]) { idx = I_CLOUD; break; }
+      }
+    }
+    // sun disc
+    var sdx = px - SUN_U * LAND_W, sdy = py - SUN_V * LAND_H;
+    var sr = SUN_RF * Math.min(LAND_H, LAND_W * 2.2);   // keep the disc inside narrow phone landscapes
+    if (sdx * sdx + sdy * sdy <= sr * sr) idx = I_SUN;
+    // birds (3x5 cell glyphs riding on te)
+    for (var fi = 0; fi < BIRDS.length; fi++) {
+      var b = BIRDS[fi];
+      var bu = (((b.u0 + te * b.sp) % 1) + 1) % 1;
+      var bv = b.v + 0.012 * Math.sin(te * 1.7 + b.ph);
+      var gx = cellCx - Math.floor(bu * GRID_COLS) + 2;
+      var gy = cellCy - Math.floor(bv * GRID_ROWS) + 1;
+      if (gx >= 0 && gx < 5 && gy >= 0 && gy < 3 && BIRD_MASK[gy][gx]) idx = I_BIRD;
+    }
+    // hills in front
+    if (v > groundLine(u)) idx = I_GROUND;
+    else if (v > hillMid(u)) idx = I_HMID;
+    else if (v > hillFar(u)) idx = I_HFAR;
+    return idx;
+  }
+
+  // ---------- viewport / sizing ----------
+  var W = 0, H = 0, DPR = 1;
+  function viewSize() {
+    var vv = (typeof window !== 'undefined' && window.visualViewport) ? window.visualViewport : null;
+    var w = vv ? vv.width : (window.innerWidth || 800);
+    var h = vv ? vv.height : (window.innerHeight || 600);
+    return { w: w, h: h };
+  }
+  function isPhone() {
+    var scr = (typeof window !== 'undefined' && window.screen) ? window.screen : null;
+    if (scr && scr.width && scr.height) {
+      if (Math.min(scr.width, scr.height) < 700) return true;
+    }
+    return H > W * 1.15;
+  }
+  function fit() {
+    var s = viewSize();
+    W = s.w; H = s.h;
+    DPR = Math.min((window.devicePixelRatio || 1), 2);
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+  }
+  fit();
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', fit);
+  }
+  window.addEventListener('resize', fit);
+
+  // ---------- time ----------
+  function nowSec() {
+    return (typeof performance !== 'undefined' && performance.now) ? performance.now() / 1000 : Date.now() / 1000;
+  }
+  var startStamp = nowSec();
+  var curT = T0;
+  function pieceT() { return T0 + (nowSec() - startStamp); }
+
+  // ---------- grid state ----------
+  var GRID_COLS = 0, GRID_ROWS = 0;
+  var grid = new Uint8Array(0);
+  var tearCol = new Int16Array(0), smearRow = new Int16Array(0);
+  var LAYOUT = null;
+
+  function effTime(t) {
+    if (bypass) return t;
+    var step = 0.12 + SLIDERS[3].v * 0.5;                 // STUTTER
+    return Math.floor(t / step) * step;
+  }
+  function clampI(x, n) { return x < 0 ? 0 : (x > n - 1 ? n - 1 : x); }
+
+  // ---------- drawing ----------
+  function draw(T) {
+    curT = T;
+    canvas.style.width = W + 'px';                        // pin CSS size every draw
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+    var phone = isPhone();
+    var panelW = phone ? Math.round(Math.min(210, Math.max(168, W * 0.46))) : 260;
+    var landW = W - panelW;
+    LAND_W = landW; LAND_H = H;
+
+    ctx.fillStyle = '#0A0A0C';
+    ctx.fillRect(0, 0, W, H);
+
+    // ----- landscape grid -----
+    var cell = Math.max(4, Math.round(Math.min(landW, H) / 160));
+    var cols = Math.ceil(landW / cell), rows = Math.ceil(H / cell);
+    GRID_COLS = cols; GRID_ROWS = rows;
+    if (grid.length !== cols * rows) {
+      grid = new Uint8Array(cols * rows);
+      tearCol = new Int16Array(cols);
+      smearRow = new Int16Array(rows);
+    }
+    var te = effTime(T);
+    for (var gy = 0; gy < rows; gy++) {
+      var vv = (gy + 0.5) / rows;
+      for (var gx = 0; gx < cols; gx++) {
+        grid[gy * cols + gx] = sceneIdx((gx + 0.5) / cols, vv, te, gx, gy);
+      }
+    }
+
+    // ----- corruption amounts -----
+    var smearA = bypass ? 0 : SLIDERS[0].v;
+    var tearA = bypass ? 0 : SLIDERS[1].v;
+    var chanA = bypass ? 0 : SLIDERS[2].v;
+    var decayA = bypass ? 0 : SLIDERS[4].v;
+    var maxSmear = Math.round(cols * 0.16);
+    var maxTear = Math.round(rows * 0.09);
+    var maxMelt = Math.round(rows * 0.26);
+    var chOff = Math.round(chanA * 3);
+    var bandCells = Math.max(1, Math.round(8 / cell));
+    for (var x0 = 0; x0 < cols; x0++) {
+      tearCol[x0] = Math.round(tearA * sliceOffAt((x0 + 0.5) / cols) * maxTear);
+    }
+    for (var y0 = 0; y0 < rows; y0++) {
+      var band = Math.floor(y0 / bandCells) % 256;
+      smearRow[y0] = Math.round(smearA * BAND_SEED[band] * maxSmear);
+    }
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, 0, landW, H);
+    ctx.clip();
+    for (var y = 0; y < rows; y++) {
+      var meltBase = decayA * (y / Math.max(1, rows - 1)) * maxMelt;
+      var sx0 = smearRow[y];
+      var runKey = -1, runX = 0, runRgb = null;
+      for (var x = 0; x <= cols; x++) {
+        var key = -1, rgb = null;
+        if (x < cols) {
+          var melt = Math.round(dripAt((x + 0.5) / cols) * meltBase);
+          var sy = clampI(y - tearCol[x] - melt, rows);
+          var base = sy * cols;
+          var sx = clampI(x - sx0, cols);
+          var im = grid[base + sx];
+          var r, g, b;
+          if (chOff > 0) {
+            r = PAL[grid[base + clampI(x - sx0 - chOff, cols)]][0];
+            g = PAL[im][1];
+            b = PAL[grid[base + clampI(x - sx0 + chOff, cols)]][2];
+          } else { var p = PAL[im]; r = p[0]; g = p[1]; b = p[2]; }
+          key = (r << 16) | (g << 8) | b;
+          if (key !== runKey) { rgb = [r, g, b]; }
+        }
+        if (key !== runKey) {
+          if (runKey >= 0) {
+            ctx.fillStyle = rgbStr(runRgb[0], runRgb[1], runRgb[2]);
+            ctx.fillRect(runX * cell, y * cell, (x - runX) * cell + 1, cell + 1);
+          }
+          runKey = key; runX = x; runRgb = rgb;
+        }
+      }
+    }
+    ctx.restore();
+
+    // ----- plugin panel -----
+    var pad = phone ? 12 : 16;
+    var px = landW;
+    ctx.fillStyle = PANEL_BG;
+    ctx.fillRect(px, 0, panelW, H);
+    ctx.fillStyle = PANEL_EDGE;
+    ctx.fillRect(px, 0, 1, H);
+
+    var small = panelW < 220;
+    ctx.textBaseline = 'top';
+    // header
+    ctx.fillStyle = PANEL_TEXT;
+    ctx.font = 'bold ' + (small ? 13 : 15) + 'px monospace';
+    ctx.fillText('SATROMIZER', px + pad, 14);
+    ctx.font = (small ? 8 : 9) + 'px monospace';
+    ctx.fillStyle = PANEL_FAINT;
+    ctx.fillText('WRONG TOOL · EST. 2001', px + pad, 14 + (small ? 17 : 19));
+    ctx.font = (small ? 8.5 : 9.5) + 'px monospace';
+    ctx.fillStyle = bypass ? AMBER : PANEL_FAINT;
+    ctx.fillText(bypass ? 'BYPASSED — CLEAN SIGNAL' : 'LIVE — SIGNAL CORRUPTED', px + pad, 46);
+
+    // bypass switch
+    var swW = 36, swH = 18, swX = px + panelW - pad - swW, swY = 14;
+    ctx.fillStyle = TRACK;
+    ctx.fillRect(swX, swY, swW, swH);
+    ctx.fillStyle = bypass ? AMBER : PANEL_TEXT;
+    var knobX = bypass ? swX + swW - 16 : swX + 2;
+    ctx.fillRect(knobX, swY + 2, 14, swH - 4);
+    ctx.font = (small ? 8 : 9) + 'px monospace';
+    ctx.fillStyle = PANEL_DIM;
+    ctx.fillText('BYPASS', swX - (small ? 36 : 42), swY + 5);
+
+    // sliders
+    var sTop = 78;
+    var footH = 96;
+    var blockH = Math.max(50, Math.min(120, (H - sTop - footH) / SLIDERS.length));
+    var trackW = panelW - pad * 2;
+    var sliderRects = [];
+    for (var i = 0; i < SLIDERS.length; i++) {
+      var s = SLIDERS[i];
+      var by = sTop + i * blockH;
+      ctx.font = 'bold ' + (small ? 10 : 11) + 'px monospace';
+      ctx.fillStyle = s.accent;
+      ctx.fillText(s.name, px + pad, by);
+      ctx.font = (small ? 10 : 11) + 'px monospace';
+      ctx.fillStyle = PANEL_TEXT;
+      var pct = Math.round(s.v * 100) + '%';
+      ctx.fillText(pct, px + panelW - pad - ctx.measureText(pct).width, by);
+      var ty = by + 20;
+      ctx.fillStyle = TRACK;
+      ctx.fillRect(px + pad, ty, trackW, 6);
+      ctx.fillStyle = s.accent;
+      ctx.fillRect(px + pad, ty, Math.round(trackW * s.v), 6);
+      ctx.fillStyle = PANEL_TEXT;
+      ctx.fillRect(px + pad + Math.round(trackW * s.v) - 5, ty - 5, 10, 16);
+      sliderRects.push({ x: px, y: by - 4, w: panelW, h: Math.min(64, blockH - 6), trackX: px + pad, trackW: trackW });
+    }
+
+    // footer: render queue
+    var fy = H - footH;
+    ctx.fillStyle = PANEL_EDGE;
+    ctx.fillRect(px + pad, fy, trackW, 1);
+    ctx.font = (small ? 8.5 : 9.5) + 'px monospace';
+    ctx.fillStyle = PANEL_DIM;
+    ctx.fillText('RENDER QUEUE:', px + pad, fy + 10);
+    var eff = bypass ? 0 : (SLIDERS[0].v + SLIDERS[1].v + SLIDERS[2].v + SLIDERS[3].v + SLIDERS[4].v) / 5;
+    ctx.font = 'bold ' + (small ? 13 : 15) + 'px monospace';
+    ctx.fillStyle = PANEL_TEXT;
+    ctx.fillText(Math.round(eff * 100) + '% CORRUPTED', px + pad, fy + 24);
+    ctx.fillStyle = TRACK;
+    ctx.fillRect(px + pad, fy + 50, trackW, 5);
+    ctx.fillStyle = '#FF9100';
+    ctx.fillRect(px + pad, fy + 50, Math.round(trackW * eff), 5);
+    ctx.font = (small ? 8 : 8.5) + 'px monospace';
+    ctx.fillStyle = PANEL_FAINT;
+    ctx.fillText(small ? 'drag · double-tap = reset' : 'drag sliders · double-tap resets one', px + pad, fy + 64);
+
+    LAYOUT = { panelX: px, panelW: panelW, sliders: sliderRects, bypassRect: { x: swX - 46, y: swY - 4, w: swW + 46, h: swH + 8 } };
+  }
+
+  // ---------- interaction ----------
+  var dragSlider = -1;
+  var lastTap = { i: -1, t: -10 };
+  function evtPos(e) {
+    var r = canvas.getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  }
+  function inRect(p, r) { return p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h; }
+  function setSlider(i, x) {
+    var r = LAYOUT.sliders[i];
+    var v = (x - r.trackX) / r.trackW;
+    SLIDERS[i].v = v < 0 ? 0 : (v > 1 ? 1 : v);
+  }
+  canvas.addEventListener('pointerdown', function (e) {
+    if (!LAYOUT) return;
+    var p = evtPos(e);
+    if (inRect(p, LAYOUT.bypassRect)) { bypass = !bypass; draw(curT); return; }
+    for (var i = 0; i < LAYOUT.sliders.length; i++) {
+      if (inRect(p, LAYOUT.sliders[i])) {
+        var now = nowSec();
+        if (lastTap.i === i && now - lastTap.t < 0.35) {
+          SLIDERS[i].v = 0;                              // double-tap snaps to zero
+          lastTap = { i: -1, t: -10 };
+          draw(curT);
+          return;
+        }
+        lastTap = { i: i, t: now };
+        dragSlider = i;
+        setSlider(i, p.x);
+        draw(curT);
+        return;
+      }
+    }
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (dragSlider < 0 || !LAYOUT) return;
+    setSlider(dragSlider, evtPos(e).x);
+    draw(curT);
+  });
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('pointerup', function () { dragSlider = -1; });
+  }
+
+  // ---------- run ----------
+  draw(T0);
+  if (typeof requestAnimationFrame === 'function') {
+    var loop = function () {
+      draw(pieceT());
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>

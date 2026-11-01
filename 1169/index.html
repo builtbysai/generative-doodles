@@ -1,0 +1,562 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>I Love Resets</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0D0D0F; overflow: hidden; height: 100%; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- I Love Resets — Jon Satrom study JS2 ----------
+  // After Satrom's I ♥ PRESETS: "do everything wrong the right way."
+  // A trio console (VOX / VID / DRUM) runs a seeded procedural jam.
+  // Every knob and slider is wired to the actual sequencer parameters —
+  // nothing is chrome. Drag any control past its sane range (to 400%,
+  // into negative) and the jam mutates live. Every 8 bars the console
+  // does it wrong on its own: all parameters slam to seeded extremes in
+  // four hard steps, hold for two bars of beautiful wrongness, then the
+  // big RESET slams everything back to presets with a clunk.
+  // Sound starts only inside a visitor gesture (house rule): before the
+  // first tap the whole performance runs silently — same clock, same
+  // parameters, waveform and step grid drawn from the audio's own data.
+
+  var BG = '#0D0D0F';
+  var PANEL = '#1A1A1E';
+  var PANEL_EDGE = '#2C2C33';
+  var INK = '#E8E8E8';
+  var DIM = '#8A8A94';
+  var KNOB = '#E8E8E8';
+  var ACC = { VOX: '#FF2B6E', VID: '#00FFC2', DRUM: '#FFE14D' };
+  var TRACK = '#00FFC2';
+  var RESET_RED = '#FF3B30';
+
+  // ---------- seeded rng ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function hash2(a, b) {
+    var h = (Math.imul(a | 0, 374761393) + Math.imul(b | 0, 668265263)) | 0;
+    h = Math.imul(h ^ (h >>> 13), 1274126177);
+    return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+  }
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+  // ---------- sequencer clock ----------
+  var BPM = 132;
+  var STEP = 60 / BPM / 4;            // 16th notes: ~0.11364 s
+  var BAR = STEP * 16;                // ~1.8182 s
+  var CYCLE_BARS = 10;                // 8-bar count + slam + 2 bars of wrongness
+  var T0 = 4.6;                       // fixed first-frame phase: bar 2, step 8
+
+  // ---------- parameters ----------
+  // Display percent runs -100..400; frac 0..1 maps linearly onto it.
+  // presetPct is the sane value; extremes are seeded per cycle.
+  function pctToFrac(p) { return (p + 100) / 500; }
+  function fracToPct(f) { return -100 + 500 * f; }
+  var PARAMS = [
+    { ch: 'VOX',  key: 'cutoff',  label: 'CUTOFF',  kind: 'knob',   presetPct: 100 },
+    { ch: 'VOX',  key: 'detune',  label: 'DETUNE',  kind: 'knob',   presetPct: 0 },
+    { ch: 'VOX',  key: 'fold',    label: 'FOLD',    kind: 'slider', presetPct: 40 },
+    { ch: 'VID',  key: 'shards',  label: 'SHARDS',  kind: 'knob',   presetPct: 60 },
+    { ch: 'VID',  key: 'glitch',  label: 'GLITCH',  kind: 'knob',   presetPct: 35 },
+    { ch: 'VID',  key: 'spin',    label: 'SPIN',    kind: 'slider', presetPct: 50 },
+    { ch: 'DRUM', key: 'density', label: 'DENSITY', kind: 'knob',   presetPct: 70 },
+    { ch: 'DRUM', key: 'bright',  label: 'BRIGHT',  kind: 'knob',   presetPct: 55 },
+    { ch: 'DRUM', key: 'swing',   label: 'SWING',   kind: 'slider', presetPct: 10 }
+  ];
+  var P = {};
+  PARAMS.forEach(function (p) {
+    p.userFrac = pctToFrac(p.presetPct);
+    P[p.key] = p;
+  });
+  var EXTREME_SET = [400, 385, -100, -65, 330, 255, -90, 400, 300, -100, 210, -40];
+  function extremeFrac(param, cycleIdx) {
+    var r = hash2(cycleIdx * 31 + 7, param.key.length * 131 + param.key.charCodeAt(0) * 17 + param.key.charCodeAt(param.key.length - 1));
+    var pct = EXTREME_SET[Math.floor(r * EXTREME_SET.length) % EXTREME_SET.length];
+    return pctToFrac(pct);
+  }
+
+  // ---------- transport state (re-anchored by RESET) ----------
+  var anchorT = 0;          // visual-clock time of the anchor
+  var anchorBar = 0;        // cycle-bar position at the anchor
+  var flashUntil = -1;      // RESET button flash deadline (visual clock)
+
+  function cyclePos(t) {
+    var bars = anchorBar + (t - anchorT) / BAR;
+    var cyc = Math.floor(bars / CYCLE_BARS);
+    var cb = bars - cyc * CYCLE_BARS;
+    return { cycle: cyc, bar: cb, inCycle: cb * BAR };
+  }
+  // envelope mix toward extremes: 0 sane, 1 fully wrong (stepped slam)
+  function envMix(t) {
+    var cp = cyclePos(t);
+    if (cp.bar < 7.875) return { mix: 0, cp: cp };
+    if (cp.bar < 8) {
+      var f = (cp.bar - 7.875) / 0.125;
+      return { mix: (Math.floor(f * 4) + 1) / 4, cp: cp };
+    }
+    return { mix: 1, cp: cp };
+  }
+  function effFrac(param, t) {
+    var e = envMix(t);
+    if (e.mix <= 0) return param.userFrac;
+    var ex = extremeFrac(param, e.cp.cycle);
+    return param.userFrac + (ex - param.userFrac) * e.mix;
+  }
+  function effPct(param, t) { return fracToPct(effFrac(param, t)); }
+  function isClunk(t) {
+    var cp = cyclePos(t);
+    return cp.inCycle < 0.15 && (t - anchorT) > BAR; // just wrapped / reset
+  }
+
+  // ---------- seeded patterns ----------
+  var bassRng = mulberry32(1169001);
+  var BASS = [];              // 32 steps (2 bars): midi note or -1
+  var bassScale = [0, 0, 7, 12, 10, 7, 3, 0, 5, 7, 12, 0, -5, 0, 7, 3];
+  for (var bi = 0; bi < 32; bi++) {
+    var br = bassRng();
+    BASS.push(br < 0.18 ? -1 : 45 + bassScale[Math.floor(bassRng() * bassScale.length)]);
+  }
+  function bassAt(stepIdx) {
+    for (var k = 0; k < 32; k++) {
+      var n = BASS[(((stepIdx - k) % 32) + 32) % 32];
+      if (n > 0) return n;
+    }
+    return 45;
+  }
+  var drumThresh = [];        // [lane][step] seeded thresholds
+  for (var ln = 0; ln < 4; ln++) {
+    drumThresh.push([]);
+    for (var st = 0; st < 16; st++) drumThresh[ln].push(hash2(400 + ln, st * 7 + 1));
+  }
+  var LANE_W = [1.0, 0.75, 0.9, 0.6];
+
+  function stepFloat(t) { return t / STEP; }
+  function drumActive(lane, stepInBar, t) {
+    var dens = clamp(effPct(P.density, t), -100, 400) / 100;   // 0.7 at preset
+    var thr = drumThresh[lane][stepInBar];
+    return thr < dens * LANE_W[lane] * 0.85;
+  }
+
+  // ---------- audio (lazy, gesture-only, typeof-guarded) ----------
+  var AC = null, master = null, voxFilter = null, voxShaper = null, noiseBuf = null;
+  var audioOn = false, schedTimer = null, nextStep = 0, nextStepCtxTime = 0;
+  function makeFoldCurve(k) {
+    var n = 256, curve = new Float32Array(n), i, x;
+    for (i = 0; i < n; i++) { x = (i / (n - 1)) * 2 - 1; curve[i] = Math.tanh(x * (1 + k * 3)); }
+    return curve;
+  }
+  function startAudio(nowT) {
+    if (audioOn) return;
+    var Ctor = (typeof window !== 'undefined' && (window.AudioContext || window.webkitAudioContext)) || null;
+    if (!Ctor) return;                       // visuals continue silently
+    try {
+      AC = new Ctor();
+      master = AC.createGain(); master.gain.value = 0.15; master.connect(AC.destination);
+      voxFilter = AC.createBiquadFilter(); voxFilter.type = 'lowpass'; voxFilter.Q.value = 4;
+      voxShaper = AC.createWaveShaper(); voxShaper.curve = makeFoldCurve(0.4);
+      voxFilter.connect(voxShaper); voxShaper.connect(master);
+      var len = AC.sampleRate * 0.5, buf = AC.createBuffer(1, len, AC.sampleRate), d = buf.getChannelData(0);
+      var nr = mulberry32(777);
+      for (var i = 0; i < len; i++) d[i] = nr() * 2 - 1;
+      noiseBuf = buf;
+      audioOn = true;
+      var sf = stepFloat(nowT);
+      nextStep = Math.ceil(sf);
+      nextStepCtxTime = AC.currentTime + 0.06 + (nextStep - sf) * STEP;
+      schedTimer = setInterval(schedule, 25);
+    } catch (e) { AC = null; audioOn = false; }
+  }
+  function schedule() {
+    if (!AC) return;
+    while (nextStepCtxTime < AC.currentTime + 0.09) {
+      var sw = clamp(effPct(P.swing, lastT), -100, 400) / 100;   // 0.1 at preset
+      var when = nextStepCtxTime + ((nextStep % 2 === 1) ? sw * STEP * 0.4 : 0);
+      scheduleStep(nextStep, when);
+      nextStepCtxTime += STEP;
+      nextStep++;
+    }
+  }
+  function scheduleStep(stepIdx, when) {
+    var t = lastT + (when - AC.currentTime);
+    var barStep = ((stepIdx % 16) + 16) % 16;
+    // VOX: square bass through the shared filter + shaper
+    var note = BASS[((stepIdx % 32) + 32) % 32];
+    if (note > 0) {
+      var cut = clamp(effPct(P.cutoff, t), -100, 400);
+      voxFilter.frequency.setValueAtTime(clamp(90 * Math.pow(2, (cut + 100) / 500 * 5.2), 40, 4000), when);
+      var fold = clamp(effPct(P.fold, t), 0, 400) / 100;
+      voxShaper.curve = makeFoldCurve(fold);
+      var osc = AC.createOscillator(); osc.type = 'square';
+      var det = clamp(effPct(P.detune, t), -100, 400) * 3;
+      osc.frequency.value = 440 * Math.pow(2, (note - 69) / 12);
+      osc.detune.value = clamp(det, -600, 600);
+      var g = AC.createGain();
+      g.gain.setValueAtTime(0.5, when);
+      g.gain.exponentialRampToValueAtTime(0.001, when + STEP * 0.95);
+      osc.connect(g); g.connect(voxFilter);
+      osc.start(when); osc.stop(when + STEP);
+    }
+    // DRUM: noise bursts through a bandpass
+    for (var lane = 0; lane < 4; lane++) {
+      if (!drumActive(lane, barStep, t)) continue;
+      if (lane === 0 && barStep % 4 !== 0 && hash2(stepIdx, 9) > 0.4) continue;
+      var src = AC.createBufferSource(); src.buffer = noiseBuf;
+      var bp = AC.createBiquadFilter(); bp.type = 'bandpass';
+      var brt = clamp(effPct(P.bright, t), -100, 400);
+      bp.frequency.value = clamp(300 * Math.pow(2, (brt + 100) / 500 * 4.5) * (0.6 + lane * 0.5), 100, 8000);
+      bp.Q.value = 1.1;
+      var dg = AC.createGain();
+      dg.gain.setValueAtTime(lane === 0 ? 0.9 : 0.4, when);
+      dg.gain.exponentialRampToValueAtTime(0.001, when + 0.07);
+      src.connect(bp); bp.connect(dg); dg.connect(master);
+      src.start(when, hash2(stepIdx, lane) * 0.3, 0.09); src.stop(when + 0.09);
+    }
+  }
+
+  // ---------- phone detection ----------
+  var sw = (window.screen && window.screen.width) || 0;
+  var sh = (window.screen && window.screen.height) || 0;
+  var minScreen = Math.min(sw || 9999, sh || 9999);
+  var isPhone = minScreen < 700;
+
+  // ---------- view / canvas ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0;
+  function viewW() {
+    if (window.visualViewport && window.visualViewport.width) return window.visualViewport.width;
+    return window.innerWidth || 800;
+  }
+  function viewH() {
+    if (window.visualViewport && window.visualViewport.height) return window.visualViewport.height;
+    return window.innerHeight || 800;
+  }
+  function fit() {
+    W = viewW(); H = viewH();
+    canvas.width = W; canvas.height = H;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+  }
+
+  // ---------- layout ----------
+  var hit = [];   // rebuilt each draw: {x,y,w,h,kind,param?}
+  function layout() {
+    var resetH = Math.max(56, H * 0.09);
+    var headH = Math.max(30, H * 0.05);
+    var areaY = headH + 6, areaH = H - areaY - resetH - 10;
+    var areaX = 10, areaW = W - 20;
+    var panels = [];
+    var gap = 10;
+    var stacked = isPhone || W < 700;
+    if (!stacked) {
+      var pw = (areaW - gap * 2) / 3;
+      for (var i = 0; i < 3; i++) panels.push({ x: areaX + i * (pw + gap), y: areaY, w: pw, h: areaH });
+    } else {
+      var ph = (areaH - gap * 2) / 3;
+      for (var j = 0; j < 3; j++) panels.push({ x: areaX, y: areaY + j * (ph + gap), w: areaW, h: ph });
+    }
+    return { panels: panels, headH: headH, reset: { x: areaX, y: H - resetH - 4, w: areaW, h: resetH } };
+  }
+
+  // ---------- drawing helpers ----------
+  function rr(x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+  function text(str, x, y, font, color, align) {
+    ctx.font = font; ctx.fillStyle = color; ctx.textAlign = align || 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(str, x, y);
+  }
+
+  function drawKnob(cx, cy, r, param, t) {
+    var pct = effPct(param, t);
+    var f = clamp((pct + 100) / 500, 0, 1);
+    var ang = -Math.PI * 0.75 + f * Math.PI * 1.5;
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.fillStyle = KNOB; ctx.fill();
+    ctx.lineWidth = 2; ctx.strokeStyle = '#000'; ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(cx + Math.cos(ang) * r * 0.82, cy + Math.sin(ang) * r * 0.82);
+    ctx.lineWidth = Math.max(3, r * 0.22); ctx.strokeStyle = ACC[param.ch]; ctx.stroke();
+    ctx.beginPath(); ctx.arc(cx, cy, r * 0.16, 0, Math.PI * 2);
+    ctx.fillStyle = '#111'; ctx.fill();
+    text(param.label, cx, cy + r + 11, '600 10px system-ui, sans-serif', DIM, 'center');
+    text(Math.round(pct) + '%', cx, cy + r + 24, '700 12px ui-monospace, monospace', INK, 'center');
+  }
+  function drawSlider(x, y, w, param, t) {
+    var pct = effPct(param, t);
+    var f = clamp((pct + 100) / 500, 0, 1);
+    ctx.fillStyle = '#0A0A0C'; ctx.fillRect(x, y - 4, w, 8);
+    ctx.fillStyle = TRACK; ctx.fillRect(x, y - 4, w * f, 8);
+    var hx = x + w * f;
+    ctx.fillStyle = KNOB; ctx.fillRect(hx - 5, y - 11, 10, 22);
+    ctx.strokeStyle = '#000'; ctx.lineWidth = 1; ctx.strokeRect(hx - 5, y - 11, 10, 22);
+    text(param.label, x, y - 18, '600 10px system-ui, sans-serif', DIM, 'left');
+    text(Math.round(pct) + '%', x + w, y - 18, '700 12px ui-monospace, monospace', INK, 'right');
+  }
+
+  // VOX waveform strip: current bass note, folded + rounded by the params
+  function drawWave(x, y, w, h, t) {
+    ctx.fillStyle = '#0A0A0C'; ctx.fillRect(x, y, w, h);
+    ctx.strokeStyle = PANEL_EDGE; ctx.lineWidth = 1; ctx.strokeRect(x, y, w, h);
+    var stepI = Math.floor(stepFloat(t));
+    var note = bassAt(stepI);
+    var freq = 440 * Math.pow(2, (note - 69) / 12);
+    var cut = clamp(effPct(P.cutoff, t), -100, 400);
+    var smooth = clamp(1.1 - (cut + 100) / 500, 0.05, 1);       // low cutoff = round
+    var fold = clamp(effPct(P.fold, t), 0, 400) / 100;
+    var det = clamp(effPct(P.detune, t), -100, 400);
+    ctx.beginPath();
+    var N = 90, prevY = 0;
+    for (var i = 0; i <= N; i++) {
+      var ph = (i / N) * Math.PI * 2 * 2 + t * freq * 0.11;
+      var s = Math.sin(ph) >= 0 ? 1 : -1;
+      var v = Math.tanh(s * (1 + fold * 2.2));
+      var yy = y + h / 2 - v * h * 0.38;
+      yy = i === 0 ? yy : prevY + (yy - prevY) * (1 - smooth * 0.55);
+      prevY = yy;
+      var xx = x + (i / N) * w;
+      if (i === 0) ctx.moveTo(xx, yy); else ctx.lineTo(xx, yy);
+    }
+    ctx.lineWidth = 2.5; ctx.strokeStyle = ACC.VOX; ctx.stroke();
+    if (Math.abs(det) > 4) {  // detuned ghost
+      ctx.beginPath();
+      prevY = 0;
+      for (var j = 0; j <= N; j++) {
+        var ph2 = (j / N) * Math.PI * 2 * 2 + t * freq * 0.11 * (1 + det / 2400);
+        var s2 = Math.sin(ph2) >= 0 ? 1 : -1;
+        var v2 = Math.tanh(s2 * (1 + fold * 2.2));
+        var yy2 = y + h / 2 - v2 * h * 0.38;
+        yy2 = j === 0 ? yy2 : prevY + (yy2 - prevY) * (1 - smooth * 0.55);
+        prevY = yy2;
+        var xx2 = x + (j / N) * w;
+        if (j === 0) ctx.moveTo(xx2, yy2); else ctx.lineTo(xx2, yy2);
+      }
+      ctx.globalAlpha = 0.35; ctx.lineWidth = 1.5; ctx.strokeStyle = INK; ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  // VID shard viewport
+  function drawShards(x, y, w, h, t) {
+    ctx.fillStyle = '#0A0A0C'; ctx.fillRect(x, y, w, h);
+    ctx.strokeStyle = PANEL_EDGE; ctx.lineWidth = 1; ctx.strokeRect(x, y, w, h);
+    ctx.save();
+    ctx.beginPath(); ctx.rect(x, y, w, h); ctx.clip();
+    var count = Math.round(clamp(effPct(P.shards, t), -100, 400) / 100 * 13 + 3);
+    count = clamp(count, 2, 52);
+    var glitch = clamp(effPct(P.glitch, t), -100, 400) / 100;
+    var spin = clamp(effPct(P.spin, t), -100, 400) / 100;
+    var stepI = Math.floor(stepFloat(t));
+    var cx = x + w / 2, cy = y + h / 2;
+    var R = Math.min(w, h) * 0.42;
+    for (var i = 0; i < count; i++) {
+      var seed = hash2(i, 31);
+      var ang = seed * Math.PI * 2 + t * spin * (0.4 + seed * 0.8) * (seed > 0.5 ? 1 : -1);
+      var rad = R * (0.25 + 0.75 * hash2(i, 47));
+      var gx = 0, gy = 0;
+      if (hash2(stepI, i) < glitch * 0.16) { gx = (hash2(i, stepI) - 0.5) * 26; gy = (hash2(stepI, i + 9) - 0.5) * 18; }
+      var px = cx + Math.cos(ang) * rad + gx, py = cy + Math.sin(ang) * rad * 0.8 + gy;
+      var sz = 5 + hash2(i, 71) * Math.min(w, h) * 0.11;
+      var rot = ang + stepI * 0.0 + t * spin * 1.3 + seed * 6;
+      ctx.save(); ctx.translate(px, py); ctx.rotate(rot);
+      ctx.beginPath();
+      if (i % 3 === 0) { ctx.moveTo(-sz, sz * 0.7); ctx.lineTo(sz, sz * 0.4); ctx.lineTo(0, -sz); }
+      else if (i % 3 === 1) { ctx.rect(-sz * 0.7, -sz * 0.7, sz * 1.4, sz * 1.4); }
+      else { ctx.moveTo(-sz, -sz * 0.6); ctx.lineTo(sz * 0.6, -sz); ctx.lineTo(sz, sz * 0.8); ctx.lineTo(-sz * 0.4, sz); }
+      ctx.closePath();
+      ctx.fillStyle = i % 4 === 0 ? INK : ACC.VID;
+      ctx.globalAlpha = 0.85;
+      ctx.fill();
+      ctx.restore();
+    }
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
+  // DRUM step grid: 4 lanes x 16 steps
+  function drawGrid(x, y, w, h, t) {
+    ctx.fillStyle = '#0A0A0C'; ctx.fillRect(x, y, w, h);
+    ctx.strokeStyle = PANEL_EDGE; ctx.lineWidth = 1; ctx.strokeRect(x, y, w, h);
+    var stepI = Math.floor(stepFloat(t));
+    var cur = ((stepI % 16) + 16) % 16;
+    var sw = clamp(effPct(P.swing, t), -100, 400) / 100;
+    var cw = w / 16, chh = h / 4;
+    for (var lane = 0; lane < 4; lane++) {
+      for (var s = 0; s < 16; s++) {
+        var on = drumActive(lane, s, t);
+        var shift = (s % 2 === 1) ? sw * cw * 0.18 : 0;
+        var cx = x + s * cw + 2 + shift, cy = y + lane * chh + 2;
+        ctx.fillStyle = on ? ACC.DRUM : '#232329';
+        if (s === cur) { ctx.fillStyle = on ? '#FFFFFF' : '#3D3D47'; }
+        ctx.fillRect(cx, cy, cw - 4, chh - 4);
+      }
+    }
+  }
+
+  // ---------- draw ----------
+  var lastT = T0;
+  function draw(t) {
+    lastT = t;
+    fit();
+    hit = [];
+    ctx.fillStyle = BG; ctx.fillRect(0, 0, W, H);
+    var L = layout();
+    var clunk = isClunk(t);
+    var shX = 0, shY = 0;
+    if (clunk) { shX = (hash2(Math.floor(t * 60), 1) - 0.5) * 4; shY = (hash2(Math.floor(t * 60), 2) - 0.5) * 4; }
+    ctx.save();
+    ctx.translate(shX, shY);
+
+    // header / start line
+    text(W < 560 ? 'I ♥ PRESETS' : 'I ♥ PRESETS — A TRIO CONSOLE', 12, L.headH / 2, '700 13px ui-monospace, monospace', DIM, 'left');
+    text(audioOn ? 'SOUND ON — EVERY KNOB IS LIVE' : 'TAP TO START THE JAM',
+      W - 12, L.headH / 2, '700 13px ui-monospace, monospace', audioOn ? ACC.VID : ACC.DRUM, 'right');
+
+    var chans = [
+      { name: 'VOX', display: 'wave', params: [P.cutoff, P.detune, P.fold] },
+      { name: 'VID', display: 'shards', params: [P.shards, P.glitch, P.spin] },
+      { name: 'DRUM', display: 'grid', params: [P.density, P.bright, P.swing] }
+    ];
+    chans.forEach(function (ch, idx) {
+      var p = L.panels[idx];
+      rr(p.x, p.y, p.w, p.h, 10);
+      ctx.fillStyle = PANEL; ctx.fill();
+      ctx.lineWidth = 1; ctx.strokeStyle = PANEL_EDGE; ctx.stroke();
+      text(ch.name, p.x + 14, p.y + 20, '800 19px system-ui, sans-serif', ACC[ch.name], 'left');
+      var compact = p.h < 300;
+      var dispH = compact ? clamp(p.h * 0.3, 44, 84) : clamp(p.h * 0.4, 64, 250);
+      var dx = p.x + 12, dy = p.y + 34, dw = p.w - 24;
+      if (ch.display === 'wave') drawWave(dx, dy, dw, dispH, t);
+      else if (ch.display === 'shards') drawShards(dx, dy, dw, dispH, t);
+      else drawGrid(dx, dy, dw, dispH, t);
+      // controls: two knobs + one slider (always all three — every control works)
+      var cyBase = dy + dispH + (compact ? 10 : 14);
+      var knobR = compact ? clamp(Math.min(p.w * 0.11, 20), 13, 20)
+                          : clamp(Math.min(p.w * 0.14, (p.h - dispH - 120) / 2), 16, 42);
+      var k1x = p.x + p.w * 0.28, k2x = p.x + p.w * 0.72;
+      var knobY = cyBase + knobR;
+      drawKnob(k1x, knobY, knobR, ch.params[0], t);
+      drawKnob(k2x, knobY, knobR, ch.params[1], t);
+      hit.push({ x: k1x - knobR - 6, y: knobY - knobR - 6, w: knobR * 2 + 12, h: knobR * 2 + 40, kind: 'knob', param: ch.params[0] });
+      hit.push({ x: k2x - knobR - 6, y: knobY - knobR - 6, w: knobR * 2 + 12, h: knobR * 2 + 40, kind: 'knob', param: ch.params[1] });
+      var slY = knobY + knobR + (compact ? 44 : 52);
+      if (slY < p.y + p.h - 10) {
+        drawSlider(p.x + 16, slY, p.w - 32, ch.params[2], t);
+        hit.push({ x: p.x + 10, y: slY - 26, w: p.w - 20, h: 44, kind: 'slider', param: ch.params[2] });
+      }
+    });
+
+    // RESET bar
+    var rb = L.reset;
+    var flashing = clunk || t < flashUntil;
+    rr(rb.x, rb.y, rb.w, rb.h, 10);
+    ctx.fillStyle = flashing ? '#FF6B64' : RESET_RED; ctx.fill();
+    text('RESET', rb.x + rb.w / 2, rb.y + rb.h / 2, '800 ' + Math.round(rb.h * 0.42) + 'px system-ui, sans-serif', '#FFFFFF', 'center');
+    hit.push({ x: rb.x, y: rb.y, w: rb.w, h: rb.h, kind: 'reset' });
+    ctx.restore();
+  }
+
+  // ---------- interaction ----------
+  var drag = null;
+  function ptrPos(e) {
+    var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    var cx = (e.clientX !== undefined ? e.clientX : (e.touches && e.touches[0] ? e.touches[0].clientX : 0)) - r.left;
+    var cy = (e.clientY !== undefined ? e.clientY : (e.touches && e.touches[0] ? e.touches[0].clientY : 0)) - r.top;
+    return { x: cx, y: cy };
+  }
+  function hitAt(x, y) {
+    for (var i = hit.length - 1; i >= 0; i--) {
+      var hb = hit[i];
+      if (x >= hb.x && x <= hb.x + hb.w && y >= hb.y && y <= hb.y + hb.h) return hb;
+    }
+    return null;
+  }
+  function doReset() {
+    PARAMS.forEach(function (p) { p.userFrac = pctToFrac(p.presetPct); });
+    anchorT = lastT; anchorBar = 0;
+    flashUntil = lastT + 0.3;
+    draw(lastT);
+  }
+  function onDown(e) {
+    startAudio(lastT);
+    if (AC && AC.resume) AC.resume();
+    var pos = ptrPos(e);
+    var hb = hitAt(pos.x, pos.y);
+    if (hb && hb.kind === 'reset') { doReset(); return; }
+    if (hb && hb.param) {
+      drag = { param: hb.param, kind: hb.kind, startX: pos.x, startY: pos.y, startFrac: hb.param.userFrac, box: hb };
+      if (hb.kind === 'slider') moveSlider(pos);
+    }
+    if (e.preventDefault) e.preventDefault();
+  }
+  function moveSlider(pos) {
+    if (!drag || drag.kind !== 'slider') return;
+    var b = drag.box;
+    var f = clamp((pos.x - (b.x + 6)) / (b.w - 12), 0, 1);
+    drag.param.userFrac = f;
+  }
+  function onMove(e) {
+    if (!drag) return;
+    var pos = ptrPos(e);
+    if (drag.kind === 'knob') {
+      var dy = drag.startY - pos.y;
+      drag.param.userFrac = clamp(drag.startFrac + dy / 140, 0, 1);
+    } else if (drag.kind === 'slider') {
+      moveSlider(pos);
+    }
+    if (e.preventDefault) e.preventDefault();
+  }
+  function onUp() { drag = null; }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+    canvas.addEventListener('touchstart', onDown, { passive: false });
+    canvas.addEventListener('touchmove', onMove, { passive: false });
+    canvas.addEventListener('touchend', onUp);
+  }
+  if (window.addEventListener) {
+    window.addEventListener('resize', function () { draw(lastT); });
+  }
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { draw(lastT); });
+  }
+
+  draw(T0);
+
+  var startStamp = null;
+  function frame(stamp) {
+    if (startStamp === null) startStamp = stamp;
+    var t = T0 + (stamp - startStamp) / 1000;
+    lastT = t;
+    draw(t);
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+  }
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
