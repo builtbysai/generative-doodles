@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Every One</title>
+<style>html,body{margin:0;padding:0;background:#121110;overflow:hidden;height:100%}canvas{display:block;touch-action:none}</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function(){
+'use strict';
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;var t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+
+var GROUND = '#121110';
+var WHITE = '#f2f0ea';
+var GRAY = '#8a867d';
+var BLACK = '#2b2a28';
+
+var PITCH = 14;
+var DRIFT_PERIOD = 40;   /* slow drift wave, seconds */
+var SETTLE_TAU = 2.5;    /* drag-stir decay, seconds */
+var STIR_RADIUS = 70;
+var STIR_MAX = 40;
+
+var W = 0, H = 0;
+var currentT = 0;
+var t0 = null;
+var beads = []; /* {x, y, rx, ry, jit, occ} — rest position + per-bead irregularity */
+
+function isPhone(){
+  if (typeof window !== 'undefined' && window.screen){
+    var m = Math.min(window.screen.width, window.screen.height);
+    if (m < 700){ return true; }
+  }
+  return H > W * 1.15;
+}
+function size(){
+  var vw = (typeof window !== 'undefined' && window.visualViewport) ? window.visualViewport.width : window.innerWidth;
+  var vh = (typeof window !== 'undefined' && window.visualViewport) ? window.visualViewport.height : window.innerHeight;
+  W = vw; H = vh;
+  canvas.width = W; canvas.height = H;
+  canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+  buildBeads();
+}
+if (typeof window !== 'undefined' && window.addEventListener){
+  if (window.visualViewport && window.visualViewport.addEventListener){ window.visualViewport.addEventListener('resize', function(){ size(); draw(currentT); }); }
+  window.addEventListener('resize', function(){ size(); draw(currentT); });
+}
+
+function smooth(a, b, x){
+  if (x <= a){ return 0; }
+  if (x >= b){ return 1; }
+  var u = (x - a) / (b - a);
+  return u * u * (3 - 2 * u);
+}
+/* Soft elliptical mask: 1 inside, 0 outside, feathered band 0.85–1.15 radii. */
+function ellipseMask(px, py, cx, cy, rx, ry){
+  var dx = (px - cx) / rx, dy = (py - cy) / ry;
+  var r = Math.sqrt(dx * dx + dy * dy);
+  return 1 - smooth(0.85, 1.15, r);
+}
+
+/*
+  Portrait brightness field, in pixels, built from analytic blobs only.
+  No photo, no real face, no likeness: a dark hair mass, a lighter face
+  oval, and a broad shoulder wedge — abstract, generic, and deliberately
+  low-contrast so the portrait ghosts rather than resolves.
+*/
+function portraitValue(px, py, cxFrac){
+  var S = Math.min(W, H);
+  var cx = cxFrac * W;
+  var hair = ellipseMask(px, py, cx, 0.36 * H, 0.21 * S, 0.25 * S);
+  var face = ellipseMask(px, py, cx, 0.42 * H, 0.14 * S, 0.18 * S);
+  var shoulders = ellipseMask(px, py, cx, 0.92 * H, 0.42 * S, 0.24 * S);
+  var v = 0.40;
+  v -= 0.32 * hair;
+  v += 0.55 * face;
+  v += 0.18 * shoulders;
+  v += 0.03 * (0.5 - py / H);
+  if (v < 0){ v = 0; }
+  if (v > 1){ v = 1; }
+  return v;
+}
+
+function buildBeads(){
+  var rng = mulberry32(1352000);
+  beads = [];
+  var cols = Math.ceil(W / PITCH), rows = Math.ceil(H / PITCH);
+  var r, c;
+  for (r = 0; r < rows; r++){
+    for (c = 0; c < cols; c++){
+      var x = (c + 0.5) * PITCH + (rng() * 4 - 2);
+      var y = (r + 0.5) * PITCH + (rng() * 4 - 2);
+      beads.push({
+        x: x, y: y,
+        rx: 5.5 + rng() * 2.5,
+        ry: 5.5 + rng() * 2.5,
+        jit: (rng() * 2 - 1) * 0.07,
+        occ: (rng() < 0.08) ? (rng() < 0.5 ? -1 : 1) : 0
+      });
+    }
+  }
+}
+
+/* Drift-wave contrast: 0.55–1.0 over the 40 s cycle, so the portrait
+   breathes between ghost and legibility. Frame one (t=0) sits at 0.775. */
+function contrastAt(t){
+  return 0.55 + 0.45 * (0.5 + 0.5 * Math.sin(2 * Math.PI * t / DRIFT_PERIOD));
+}
+function driftCx(t){
+  return 0.5 + 0.01 * Math.sin(2 * Math.PI * t / DRIFT_PERIOD + 1.3);
+}
+
+/* Recorded drag samples only. Stir is a closed-form function of the
+   sample list and piece time — never frame-integrated state. */
+var drags = []; /* {mx, my, dx, dy, t} */
+var downPos = null;
+var lastPos = null;
+
+function stirOffset(bx, by, t){
+  var ox = 0, oy = 0, i, s, age, dx, dy, d, fall, decay, sp, mag;
+  for (i = 0; i < drags.length; i++){
+    s = drags[i];
+    age = t - s.t;
+    if (age < 0 || age > 8){ continue; }
+    dx = bx - s.mx; dy = by - s.my;
+    d = Math.sqrt(dx * dx + dy * dy);
+    fall = Math.exp(-(d * d) / (2 * STIR_RADIUS * STIR_RADIUS));
+    decay = Math.exp(-age / SETTLE_TAU);
+    sp = Math.min(1, Math.sqrt(s.dx * s.dx + s.dy * s.dy) / 30);
+    mag = 26 * sp * fall * decay;
+    if (d > 1){ ox += dx / d * mag; oy += dy / d * mag; }
+    else { ox += s.dx * 0.5 * mag; oy += s.dy * 0.5 * mag; }
+  }
+  var m = Math.sqrt(ox * ox + oy * oy);
+  if (m > STIR_MAX){ ox *= STIR_MAX / m; oy *= STIR_MAX / m; }
+  return {x: ox, y: oy};
+}
+
+function onDown(e){
+  if (e.preventDefault){ e.preventDefault(); }
+  downPos = {x: e.clientX, y: e.clientY};
+  lastPos = {x: e.clientX, y: e.clientY};
+}
+function onMove(e){
+  if (!downPos){ return; }
+  if (e.preventDefault){ e.preventDefault(); }
+  var dx = e.clientX - lastPos.x, dy = e.clientY - lastPos.y;
+  drags.push({mx: (e.clientX + lastPos.x) / 2, my: (e.clientY + lastPos.y) / 2, dx: dx, dy: dy, t: currentT});
+  if (drags.length > 400){ drags.splice(0, drags.length - 400); }
+  lastPos = {x: e.clientX, y: e.clientY};
+}
+function onUp(e){
+  if (e.preventDefault){ e.preventDefault(); }
+  downPos = null; lastPos = null;
+}
+canvas.addEventListener('pointerdown', onDown);
+canvas.addEventListener('pointermove', onMove);
+canvas.addEventListener('pointerup', onUp);
+canvas.addEventListener('pointercancel', onUp);
+
+function draw(t){
+  currentT = t;
+  ctx.fillStyle = GROUND;
+  ctx.fillRect(0, 0, W, H);
+  var c = contrastAt(t);
+  var cx = driftCx(t);
+  var i, b, pv, v, col, off, wx;
+  for (i = 0; i < beads.length; i++){
+    b = beads[i];
+    pv = portraitValue(b.x, b.y, cx);
+    v = 0.5 + (pv - 0.5) * c + b.jit + (b.occ !== 0 ? b.occ * 0.10 : 0);
+    if (v < 0){ v = 0; }
+    if (v > 1){ v = 1; }
+    if (v >= 0.64){ col = WHITE; }
+    else if (v >= 0.36){ col = GRAY; }
+    else { col = BLACK; }
+    off = stirOffset(b.x, b.y, t);
+    /* Traveling wave ripple, ±1.2 px, phase-locked to piece time. */
+    wx = 1.2 * Math.sin(2 * Math.PI * (b.x / W * 1.5 + t / DRIFT_PERIOD));
+    ctx.fillStyle = col;
+    ctx.beginPath();
+    ctx.moveTo(b.x + wx + off.x + b.rx, b.y + off.y);
+    ctx.ellipse(b.x + wx + off.x, b.y + off.y, b.rx, b.ry, 0, 0, 2 * Math.PI);
+    ctx.fill();
+  }
+}
+
+size();
+draw(0);
+function loop(ts){
+  if (t0 === null){ t0 = ts; }
+  draw((ts - t0) / 1000);
+  if (typeof requestAnimationFrame === 'function'){ requestAnimationFrame(loop); }
+}
+if (typeof requestAnimationFrame === 'function'){ requestAnimationFrame(loop); }
+})();
+</script>
+</body>
+</html>
