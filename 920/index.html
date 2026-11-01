@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nenana</title>
+<style>
+  html, body { margin:0; padding:0; background:#060A10; height:100%; overflow:hidden; }
+  canvas { display:block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function(){
+'use strict';
+var cv = document.getElementById('c');
+var ctx = cv.getContext('2d');
+
+/* ---------- palette (strict) ---------- */
+var GROUND = '#060A10';
+var COLD = [59, 110, 165];   /* #3B6EA5 late breakup */
+var HOT  = [232, 163, 61];   /* #E8A33D early breakup */
+var CURSOR = '#F2F0EB';
+var SLATE = '#8FA3B8';       /* legend text */
+var GOLD = [255, 215, 94];   /* #FFD75E the 2019 band */
+
+function rgba(c, a){ return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a + ')'; }
+function lerpC(a, b, t){
+  return [Math.round(a[0] + (b[0]-a[0])*t), Math.round(a[1] + (b[1]-a[1])*t), Math.round(a[2] + (b[2]-a[2])*t)];
+}
+
+/* ---------- seeded RNG (mulberry32) ---------- */
+function mulberry32(a){ return function(){ a|=0; a = a+0x6D2B79F5|0; var t = Math.imul(a^a>>>15, 1|a); t = t + Math.imul(t^t>>>7, 61|t) ^ t; return ((t^t>>>14)>>>0)/4294967296; }; }
+var rng = mulberry32(92081);
+function gauss(){ var u=0, v=0; while(!u) u=rng(); while(!v) v=rng(); return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v); }
+
+/* ---------- synthesized dataset: 109 breakup days, 1917-2026 ----------
+   Mean slides from day 128 (1917) to day 114 (2026); seeded gaussian
+   noise sd 6.5; values rounded and clamped to [106, 138]. 2019 (index
+   102) is then forced to exactly day 104, below the clamp floor, so it
+   is the unique minimum by construction: the earliest on record.
+   Band colour t = (138 - day) / 34 over the data range: day 138 is pure
+   cold blue, the earliest days run to pure amber. */
+var N = 109, YEAR0 = 1917, IDX2019 = 102;
+var days = [];
+(function buildData(){
+  for(var i=0; i<N; i++){
+    var mean = 128 - 14*(i/(N-1));
+    var d = Math.round(mean + gauss()*6.5);
+    if(d < 106) d = 106;
+    if(d > 138) d = 138;
+    days.push(d);
+  }
+  days[IDX2019] = 104;
+})();
+/* the ten earliest breakups, for the anomaly view */
+var earliest = [];
+(function(){
+  var idx = [];
+  for(var i=0; i<N; i++) idx.push(i);
+  idx.sort(function(a, b){ return (days[a] - days[b]) || (a - b); });
+  earliest = idx.slice(0, 10);
+})();
+function isEarliest(i){ return earliest.indexOf(i) >= 0; }
+function bandColor(i){
+  if(i === IDX2019) return GOLD;
+  var t = (138 - days[i])/34;
+  if(t < 0) t = 0; if(t > 1) t = 1;
+  return lerpC(COLD, HOT, t);
+}
+
+/* ---------- calendar labels from day-of-year (non-leap) ---------- */
+var MON = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+var MLEN = [31,28,31,30,31,30,31,31,30,31,30,31];
+function dateLabel(i){
+  var d = days[i], m = 0;
+  while(d > MLEN[m]){ d -= MLEN[m]; m++; }
+  return d + ' ' + MON[m] + ' ' + (YEAR0 + i);
+}
+
+/* ---------- playback state: closed-form over recorded events ----------
+   posU is an unwrapped year position (float); frame one is posU = 30
+   (index 30, the late 1940s). In 'play', posU = anchorPosU + (t-anchorT),
+   one year per second, display index = floor(posU) mod 109.
+   A drag records frozenPosU at press and dragIdx under the finger; the
+   displayed pos during the drag is the representative of dragIdx nearest
+   frozenPosU, fraction preserved. Release re-anchors 'play' there.
+   Strikes and anomaly windows are recorded events read by draw. */
+var PHASE0 = 30;
+var anchorT = 0, anchorPosU = PHASE0;
+var dragging = false, frozenPosU = PHASE0, dragRepU = PHASE0;
+var strikes = [];       /* {idx, t} */
+var anomalyT = -100;    /* double-tap time; view holds 10 s */
+var ANOMALY_HOLD = 10, FLASH_SEC = 2.5;
+function posUAt(t){
+  if(dragging) return dragRepU;
+  return anchorPosU + (t - anchorT);
+}
+function repFor(idx, nearU){
+  var base = Math.floor(nearU), frac = nearU - base;
+  var rel = ((base - idx) % N + N) % N;
+  var c1 = base - rel, c2 = c1 + N;
+  var u = (Math.abs(c2 - nearU) < Math.abs(c1 - nearU)) ? c2 : c1;
+  return u + frac;
+}
+
+/* ---------- clock ---------- */
+var T0 = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+function nowT(){ return (typeof performance !== 'undefined' && performance.now) ? (performance.now()-T0)/1000 : 0; }
+
+/* ---------- audio (lazy, gesture-gated, typeof-guarded) ----------
+   Each year is a chord: triangle oscillators at f, 1.25f, 1.5f with
+   f = 220 + (140 - day) * 4 Hz, so earlier melts sound higher.
+   Everything runs through a master gain carrying the sunspot shimmer:
+   a 0.09 Hz LFO between 0.75 and 1.0, set from the same t draw uses. */
+var AC = null, master = null;
+function initAudio(){
+  if(AC){ try{ if(AC.resume) AC.resume(); }catch(e){} return; }
+  try{
+    var Ctor = (typeof window !== 'undefined') ? (window.AudioContext || window.webkitAudioContext) : null;
+    if(!Ctor) return;
+    AC = new Ctor();
+    master = AC.createGain();
+    master.gain.value = 0.9;
+    master.connect(AC.destination);
+  }catch(e){ AC = null; master = null; }
+}
+function sndChord(i){
+  if(!AC || !master) return;
+  try{
+    var f = 220 + (140 - days[i])*4;
+    var t = AC.currentTime;
+    var mults = [1, 1.25, 1.5], gains = [0.16, 0.10, 0.08];
+    for(var k=0; k<3; k++){
+      var o = AC.createOscillator(), g = AC.createGain();
+      o.type = 'triangle'; o.frequency.value = f*mults[k];
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(gains[k], t + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 1.4);
+      o.connect(g); g.connect(master);
+      o.start(t); o.stop(t + 1.5);
+    }
+  }catch(e){}
+}
+var audPrevIdx = null;
+function audioTick(t){
+  if(!AC || !master) return;
+  try{ master.gain.value = 0.875 + 0.125*Math.sin(2*Math.PI*0.09*t); }catch(e){}
+  if(dragging) return;
+  var idx = ((Math.floor(posUAt(t)) % N) + N) % N;
+  if(audPrevIdx !== null && idx !== audPrevIdx) sndChord(idx);
+  audPrevIdx = idx;
+}
+
+/* ---------- layout ---------- */
+function viewSize(){
+  var w = 0, h = 0;
+  try{ if(window.visualViewport){ w = window.visualViewport.width; h = window.visualViewport.height; } }catch(e){}
+  if(!w || !h){ w = window.innerWidth || 720; h = window.innerHeight || 720; }
+  return [w, h];
+}
+function layout(W, H, phone){
+  var top = H*0.07, bot = H*0.93;
+  return {
+    top: top, bot: bot,
+    staffX: phone ? W*0.37 : W*0.31,
+    bandW: phone ? W*0.30 : W*0.28,
+    cursorEnd: W*0.96,
+    legendX: W*0.035
+  };
+}
+function yOfDay(day, L){ return L.top + (day - 60)/80*(L.bot - L.top); }
+
+/* ---------- draw ---------- */
+function drawBand(i, L, alpha, core){
+  var y = yOfDay(days[i], L);
+  var c = bandColor(i);
+  /* glow: layered alpha rects, no shadowBlur */
+  ctx.fillStyle = rgba(c, alpha*0.10);
+  ctx.fillRect(L.staffX - 2, y - 4.5, L.bandW + 4, 9);
+  ctx.fillStyle = rgba(c, alpha*0.28);
+  ctx.fillRect(L.staffX - 1, y - 2.5, L.bandW + 2, 5);
+  ctx.fillStyle = rgba(c, alpha);
+  ctx.fillRect(L.staffX, y - core/2, L.bandW, core);
+}
+function draw(t){
+  var s = viewSize(), W = s[0], H = s[1];
+  if(cv.width !== W) cv.width = W;
+  if(cv.height !== H) cv.height = H;
+  cv.style.width = W + 'px';
+  cv.style.height = H + 'px';
+  var scrMin = 0;
+  try{ scrMin = Math.min(window.screen.width, window.screen.height); }catch(e){}
+  var phone = (scrMin > 0 && scrMin < 700) || (H > W*1.15);
+  var L = layout(W, H, phone);
+
+  ctx.fillStyle = GROUND;
+  ctx.fillRect(0, 0, W, H);
+
+  var inAnomaly = (t - anomalyT) < ANOMALY_HOLD && (t - anomalyT) >= 0;
+  var posU = posUAt(t);
+  var curIdx = ((Math.floor(posU) % N) + N) % N;
+  var relCur = ((curIdx - PHASE0) % N + N) % N;
+  function relOf(i){ return ((i - PHASE0) % N + N) % N; }
+
+  if(inAnomaly){
+    /* only the ten earliest, burning; pulse is a pure function of t */
+    var pulse = 0.88 + 0.12*Math.sin(2*Math.PI*t/2.4);
+    for(var a=0; a<earliest.length; a++){
+      var ei = earliest[a];
+      drawBand(ei, L, (ei === IDX2019 ? 1 : 0.92)*pulse, ei === IDX2019 ? 3.4 : 2.8);
+    }
+  } else {
+    /* unplayed (faintest), then played (dim-lit), then current (full) */
+    var i;
+    for(i=0; i<N; i++){
+      if(i === curIdx || relOf(i) < relCur) continue;
+      drawBand(i, L, 0.13, 1.6);
+    }
+    for(i=0; i<N; i++){
+      if(i === curIdx || relOf(i) >= relCur) continue;
+      drawBand(i, L, 0.38, 2);
+    }
+    drawBand(curIdx, L, 1, 3);
+    /* cursor line at the current band's height, extending right */
+    var cy = yOfDay(days[curIdx], L);
+    ctx.globalAlpha = 0.9;
+    ctx.fillStyle = CURSOR;
+    ctx.fillRect(L.staffX + L.bandW + 6, cy - 0.5, L.cursorEnd - (L.staffX + L.bandW + 6), 1);
+    ctx.globalAlpha = 1;
+    /* strike flashes: brightening plus the date label, 2.5 s envelope */
+    ctx.font = (phone ? 10 : 12) + 'px Menlo, Consolas, monospace';
+    ctx.textBaseline = 'middle';
+    for(var k=strikes.length-1; k>=0; k--){
+      var st = strikes[k], age = t - st.t;
+      if(age < 0 || age > FLASH_SEC) continue;
+      var env = 1 - age/FLASH_SEC;
+      drawBand(st.idx, L, 0.35 + 0.65*env, 3);
+      var ly = yOfDay(days[st.idx], L);
+      ctx.globalAlpha = Math.min(1, env*1.6);
+      ctx.fillStyle = st.idx === IDX2019 ? '#FFD75E' : SLATE;
+      ctx.fillText(dateLabel(st.idx), L.staffX + L.bandW + 14, ly);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  /* legend: fixed left-margin column, always present */
+  ctx.font = (phone ? 8 : 11) + 'px Menlo, Consolas, monospace';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = SLATE;
+  var lx = L.legendX, ly0 = L.top + (phone ? 8 : 12), lh = phone ? 13 : 17;
+  ctx.fillText('HIGHER = EARLIER MELT', lx, ly0);
+  ctx.fillText('BLUE LATE \u00B7 AMBER EARLY', lx, ly0 + lh);
+  ctx.fillText('ONE BAND = ONE YEAR', lx, ly0 + 2*lh);
+}
+
+/* ---------- interaction ---------- */
+function nearestIdxAtY(y){
+  var s = viewSize(), W = s[0], H = s[1];
+  var scrMin = 0;
+  try{ scrMin = Math.min(window.screen.width, window.screen.height); }catch(e){}
+  var phone = (scrMin > 0 && scrMin < 700) || (H > W*1.15);
+  var L = layout(W, H, phone);
+  var day = 60 + (y - L.top)/(L.bot - L.top)*80;
+  var best = 0, bd = 1e9;
+  for(var i=0; i<N; i++){
+    var d = Math.abs(days[i] - day);
+    if(d < bd){ bd = d; best = i; }
+  }
+  return best;
+}
+var pDown = null, lastTapT = -10;
+function onDown(e){
+  initAudio();
+  var t = nowT();
+  var x = (typeof e.clientX === 'number') ? e.clientX : 0;
+  var y = (typeof e.clientY === 'number') ? e.clientY : 0;
+  pDown = { t: t, x: x, y: y, drag: false };
+  frozenPosU = posUAt(t);
+}
+function onMove(e){
+  if(!pDown) return;
+  var x = (typeof e.clientX === 'number') ? e.clientX : 0;
+  var y = (typeof e.clientY === 'number') ? e.clientY : 0;
+  var dist = Math.sqrt((x-pDown.x)*(x-pDown.x) + (y-pDown.y)*(y-pDown.y));
+  if(!pDown.drag && dist > 7){
+    pDown.drag = true;
+    dragging = true;
+    dragRepU = frozenPosU;
+  }
+  if(pDown.drag){
+    dragRepU = repFor(nearestIdxAtY(y), frozenPosU);
+  }
+}
+function onUp(e){
+  if(!pDown) return;
+  var t = nowT();
+  if(pDown.drag){
+    anchorPosU = dragRepU; anchorT = t;
+    dragging = false;
+    audPrevIdx = null;
+  } else if(t - pDown.t < 0.5){
+    var y = (typeof e.clientY === 'number') ? e.clientY : pDown.y;
+    if(t - lastTapT < 0.35){
+      anomalyT = t;
+      lastTapT = -10;
+    } else {
+      var idx = nearestIdxAtY(y);
+      strikes.push({ idx: idx, t: t });
+      if(strikes.length > 4) strikes.shift();
+      sndChord(idx);
+      lastTapT = t;
+    }
+  }
+  pDown = null;
+}
+if(cv.addEventListener){
+  cv.addEventListener('pointerdown', onDown);
+  cv.addEventListener('pointermove', onMove);
+  cv.addEventListener('pointerup', onUp);
+  cv.addEventListener('pointerleave', onUp);
+}
+
+/* ---------- run ---------- */
+draw(0);
+function onResize(){ draw(nowT()); }
+try{ if(window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', onResize); }catch(e){}
+try{ if(window.addEventListener) window.addEventListener('resize', onResize); }catch(e){}
+if(typeof requestAnimationFrame !== 'undefined'){
+  var step = function(){
+    var t = nowT();
+    draw(t);
+    audioTick(t);
+    requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+})();
+</script>
+</body>
+</html>

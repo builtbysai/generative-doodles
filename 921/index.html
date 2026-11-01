@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>On Standby</title>
+<style>
+  html, body { margin:0; padding:0; background:#050607; height:100%; overflow:hidden; }
+  canvas { display:block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function(){
+'use strict';
+var cv = document.getElementById('c');
+var ctx = cv.getContext('2d');
+
+/* ---------- palette (strict) ---------- */
+var GROUND = '#050607';
+var BASE   = '#1A2226';  /* lane baselines */
+var MINT   = '#7FD4C1';  /* pulses: the standby-light color */
+var SPIKE  = '#E8E4D8';  /* warm white: transient spike peaks only */
+var CAPT   = '#5A6B73';  /* captions */
+
+/* ---------- seeded RNG (mulberry32) ---------- */
+function mulberry32(a){ return function(){ a|=0; a = a+0x6D2B79F5|0; var t = Math.imul(a^a>>>15, 1|a); t = t + Math.imul(t^t>>>7, 61|t) ^ t; return ((t^t>>>14)>>>0)/4294967296; }; }
+var rng = mulberry32(92182);
+
+/* ---------- time ----------
+   The night is a 600 s loop standing in for 10 hours (1 loop-second = 1 real
+   minute). PHASE0 starts the loop at loop-time 300, the middle of the night,
+   so frame one is mid-night: the fridge is halfway through an on-cycle at
+   mid-lane, the charger's one spike is long past, a speaker blip is live. */
+var LOOP = 600, PHASE0 = 300;
+function loopT(t){ var lt = (t + PHASE0) % LOOP; if(lt < 0) lt += LOOP; return lt; }
+
+/* ---------- device profiles ----------
+   Each lane is a list of draw events {s, d, w, spike, wrap} in loop seconds:
+   s = start, d = duration, w = watts, spike = a fast transient peak (drawn
+   warm white), wrap = a continuous all-night trickle at w watts.
+   A pulse's brightness comes from w, its length along the lane from d: the
+   lane is the night itself, left edge = lights-out, right edge = morning.
+   A bright head travels the event's segment while it runs; after it ends the
+   segment afterglows and decays (tau 20 s). All periodic, all closed-form. */
+function ev(s, d, w, spike){ return { s:s, d:d, w:w, spike:!!spike, wrap:false }; }
+function wrapEv(w){ return { s:0, d:LOOP, w:w, spike:false, wrap:true }; }
+
+var LANES = [];
+(function buildProfiles(){
+  /* 0 fridge: 90 W, 30 on / 30 off, phase 45 so [285,315] holds loop-time 300 */
+  var fridge = [];
+  for(var k=0; k<10; k++) fridge.push(ev(45 + 60*k, 30, 90, false));
+  LANES.push({ name:'fridge', hum:50, events:fridge });
+
+  /* 1 router: a constant 6 W trickle, all night */
+  LANES.push({ name:'router', hum:55, events:[wrapEv(6)] });
+
+  /* 2 phone charger: one spike to 15 W early, then sleeps */
+  LANES.push({ name:'phone charger', hum:52, events:[ev(35, 15, 15, true)] });
+
+  /* 3 tv: standby 1.5 W with a soft flicker: seeded short draws, 1.1-2.2 W */
+  var tv = [], cur = 2 + rng()*6;
+  while(cur < LOOP - 16){
+    var dd = 4 + rng()*10;
+    tv.push(ev(cur, dd, 1.1 + rng()*1.1, false));
+    cur += dd + 3 + rng()*15;
+  }
+  LANES.push({ name:'tv', hum:58, events:tv });
+
+  /* 4 games console: 8 W standby all night, three update bursts (spikes) */
+  LANES.push({ name:'games console', hum:51, events:[
+    wrapEv(8), ev(120, 30, 34, true), ev(310, 25, 28, true), ev(470, 35, 38, true)
+  ]});
+
+  /* 5 laptop: 3 W sleep all night, four brief wake spikes at 12 W */
+  LANES.push({ name:'laptop', hum:57, events:[
+    wrapEv(3), ev(80, 6, 12, true), ev(205, 6, 12, true), ev(388, 6, 12, true), ev(512, 7, 12, true)
+  ]});
+
+  /* 6 smart speaker: 4 W steady all night, tiny query blips at 9 W */
+  var spk = [wrapEv(4)];
+  spk.push(ev(297, 3, 9, false)); /* live at frame one */
+  for(var i=0; i<5; i++) spk.push(ev(40 + i*95 + rng()*40, 2 + rng()*2, 9, false));
+  LANES.push({ name:'smart speaker', hum:60, events:spk });
+})();
+
+/* ---------- event evaluation (closed-form, periodic) ---------- */
+var TAU = 20; /* afterglow decay, seconds */
+function alphaFor(w){ return 0.10 + 0.90*Math.pow(w/90, 0.65); }
+/* returns {a: segment alpha 0..1, head: 0..1 progress or -1, spike: bool} */
+function evalEvent(e, lt){
+  if(e.wrap) return { a: alphaFor(e.w), head: lt/LOOP, spike:false };
+  var tau = lt - e.s; tau = ((tau % LOOP) + LOOP) % LOOP;
+  if(tau < e.d) return { a: alphaFor(e.w), head: tau/e.d, spike:e.spike };
+  var sinceEnd = tau - e.d;
+  if(sinceEnd < 130) return { a: alphaFor(e.w)*Math.exp(-sinceEnd/TAU), head: 1, spike:e.spike };
+  return null;
+}
+function drawAt(lane, lt){ /* current watts, for the hums */
+  var w = 0;
+  for(var i=0; i<lane.events.length; i++){
+    var e = lane.events[i];
+    if(e.wrap){ w += e.w; continue; }
+    var tau = lt - e.s; tau = ((tau % LOOP) + LOOP) % LOOP;
+    if(tau < e.d) w += e.w;
+  }
+  return w;
+}
+
+/* ---------- recorded interaction events ----------
+   drags: {t0, t1 (null while held), lane, cancelled}
+   taps:  {t0, lane} visitor pulses
+   Everything the piece shows is a closed-form function of t and these lists. */
+var drags = [], taps = [];
+function ampAt(laneIdx, t){
+  for(var i=drags.length-1; i>=0; i--){
+    var dr = drags[i];
+    if(dr.cancelled || t < dr.t0) continue;
+    var target = (dr.lane === laneIdx) ? 2.6 : 0.45;
+    var ramp = Math.min(1, (t - dr.t0)/0.8);
+    var m = 1 + (target - 1)*ramp;
+    if(dr.t1 !== null && t > dr.t1){
+      var mEnd = 1 + (target - 1)*Math.min(1, (dr.t1 - dr.t0)/0.8);
+      m = 1 + (mEnd - 1)*Math.exp(-(t - dr.t1)/2.5);
+    }
+    return m;
+  }
+  return 1;
+}
+
+/* ---------- audio: the room, only after a first gesture ---------- */
+var AC = null, humOsc = [], humGain = [], master = null;
+function audioInit(){
+  if(AC) { if(AC.resume) AC.resume(); return; }
+  var Ctor = null;
+  try{ if(typeof AudioContext !== 'undefined') Ctor = AudioContext; }catch(e){}
+  try{ if(!Ctor && typeof webkitAudioContext !== 'undefined') Ctor = webkitAudioContext; }catch(e){}
+  if(!Ctor) return;
+  try{
+    AC = new Ctor();
+    master = AC.createBiquadFilter();
+    master.type = 'lowpass'; master.frequency.value = 420; master.Q.value = 0.4;
+    var mg = AC.createGain(); mg.gain.value = 0.9;
+    master.connect(mg); mg.connect(AC.destination);
+    for(var i=0; i<LANES.length; i++){
+      var o = AC.createOscillator(); o.type = 'sine'; o.frequency.value = LANES[i].hum;
+      var g = AC.createGain(); g.gain.value = 0;
+      o.connect(g); g.connect(master); o.start();
+      humOsc.push(o); humGain.push(g);
+    }
+  }catch(e){ AC = null; humOsc = []; humGain = []; }
+}
+function tapClick(laneIdx){
+  if(!AC) return;
+  try{
+    var t0 = AC.currentTime;
+    var dur = 0.07, buf = AC.createBuffer(1, Math.ceil(AC.sampleRate*dur), AC.sampleRate);
+    var ch = buf.getChannelData(0);
+    for(var i=0; i<ch.length; i++) ch[i] = (rng()*2 - 1)*(1 - i/ch.length);
+    var src = AC.createBufferSource(); src.buffer = buf;
+    var bp = AC.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 1800; bp.Q.value = 1.2;
+    var g = AC.createGain(); g.gain.value = 0.12;
+    src.connect(bp); bp.connect(g); g.connect(master); src.start(t0);
+  }catch(e){}
+}
+function audioTick(t){
+  if(!AC || !humGain.length) return;
+  var lt = loopT(t), now = AC.currentTime;
+  for(var i=0; i<LANES.length; i++){
+    var w = drawAt(LANES[i], lt);
+    var swell = 0;
+    for(var j=0; j<taps.length; j++){
+      if(taps[j].lane === i){
+        var age = t - taps[j].t0;
+        if(age >= 0 && age < 3) swell += 14*Math.exp(-age/0.9);
+      }
+    }
+    var target = Math.min(0.055, (w + swell)/90*0.055)*ampAt(i, t);
+    try{ humGain[i].gain.setTargetAtTime(target, now, 0.25); }catch(e){}
+  }
+}
+
+/* ---------- layout ---------- */
+function viewSize(){
+  var w = 0, h = 0;
+  try{ if(window.visualViewport){ w = window.visualViewport.width; h = window.visualViewport.height; } }catch(e){}
+  if(!w || !h){ w = window.innerWidth || 720; h = window.innerHeight || 720; }
+  return [w, h];
+}
+function layout(W, H, phone){
+  var capW = phone ? 76 : Math.max(92, W*0.13);
+  var x0 = capW + (phone ? 6 : 12);
+  var x1 = W - (phone ? 8 : W*0.03);
+  var top = H*0.16, bot = H*0.84, band = (bot - top)/LANES.length;
+  var ys = [];
+  for(var i=0; i<LANES.length; i++) ys.push(top + (i + 0.5)*band);
+  return { x0:x0, x1:x1, ys:ys, band:band };
+}
+function laneAtY(lay, y){
+  var best = 0, bd = 1e9;
+  for(var i=0; i<lay.ys.length; i++){ var d = Math.abs(y - lay.ys[i]); if(d < bd){ bd = d; best = i; } }
+  return best;
+}
+
+/* ---------- draw ---------- */
+var lastLay = null, lastPhone = false;
+function draw(t){
+  var s = viewSize(), W = s[0], H = s[1];
+  if(cv.width !== W) cv.width = W;
+  if(cv.height !== H) cv.height = H;
+  cv.style.width = W + 'px';
+  cv.style.height = H + 'px';
+  var scrMin = 0;
+  try{ scrMin = Math.min(window.screen.width, window.screen.height); }catch(e){}
+  var phone = (scrMin > 0 && scrMin < 700) || (H > W*1.15);
+  var lay = layout(W, H, phone);
+  lastLay = lay; lastPhone = phone;
+  var lt = loopT(t);
+  var laneW = lay.x1 - lay.x0;
+  var minDim = Math.min(W, H);
+  var glowW = Math.max(6, Math.min(16, minDim*0.02));
+  var coreW = Math.max(2, glowW*0.26);
+
+  ctx.fillStyle = GROUND;
+  ctx.fillRect(0, 0, W, H);
+
+  /* captions */
+  ctx.fillStyle = CAPT;
+  ctx.font = (phone ? 8.5 : 11) + 'px monospace';
+  ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+  for(var i=0; i<LANES.length; i++) ctx.fillText(LANES[i].name, lay.x0 - (phone ? 6 : 12), lay.ys[i]);
+
+  /* baselines */
+  ctx.fillStyle = BASE;
+  for(var j=0; j<LANES.length; j++) ctx.fillRect(lay.x0, lay.ys[j] - 0.5, laneW, 1);
+
+  /* pulses: layered strokes, wide faint glow + narrow bright core */
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.lineCap = 'round';
+  for(var li=0; li<LANES.length; li++){
+    var lane = LANES[li], y = lay.ys[li], amp = ampAt(li, t);
+    for(var ei=0; ei<lane.events.length; ei++){
+      var e = lane.events[ei], r = evalEvent(e, lt);
+      if(!r || r.a <= 0.003) continue;
+      var segX0 = lay.x0 + (e.s/LOOP)*laneW;
+      var segLen = (e.d/LOOP)*laneW;
+      var drawn = (r.head < 0) ? segLen : segLen*r.head;
+      if(drawn <= 0.5 && !e.wrap) continue;
+      var col = r.spike ? SPIKE : MINT;
+      /* wrapped segment (an on-cycle straddling the loop seam) splits in two */
+      var parts = [];
+      if(segX0 + drawn <= lay.x1 + 0.5) parts.push([segX0, drawn]);
+      else { parts.push([segX0, lay.x1 - segX0]); parts.push([lay.x0, (segX0 + drawn) - lay.x1]); }
+      for(var p=0; p<parts.length; p++){
+        var px = parts[p][0], pw = parts[p][1];
+        if(pw <= 0.3) continue;
+        ctx.strokeStyle = col;
+        ctx.globalAlpha = r.a*0.16*amp;
+        ctx.lineWidth = glowW;
+        ctx.beginPath(); ctx.moveTo(px, y); ctx.lineTo(px + pw, y); ctx.stroke();
+        ctx.globalAlpha = Math.min(1, r.a*0.85*amp);
+        ctx.lineWidth = coreW;
+        ctx.beginPath(); ctx.moveTo(px, y); ctx.lineTo(px + pw, y); ctx.stroke();
+      }
+      /* the traveling head */
+      if(!e.wrap && r.head >= 0 && r.head < 1){
+        var hx = segX0 + drawn; if(hx > lay.x1) hx = lay.x0 + (hx - lay.x1);
+        ctx.fillStyle = col;
+        ctx.globalAlpha = Math.min(1, r.a*amp);
+        ctx.beginPath(); ctx.arc(hx, y, coreW*0.95, 0, Math.PI*2); ctx.fill();
+      }
+    }
+    /* visitor pulses from taps: small, slow, 24 s to cross the lane */
+    for(var vi=0; vi<taps.length; vi++){
+      if(taps[vi].lane !== li) continue;
+      var age = t - taps[vi].t0;
+      if(age < 0 || age > 26) continue;
+      var frac = age/24;
+      var cx = lay.x0 + frac*laneW;
+      var half = laneW*0.03;
+      var env = Math.sin(Math.PI*Math.min(1, frac))* (age > 24 ? Math.exp(-(age - 24)/0.8) : 1);
+      if(env <= 0.01) continue;
+      ctx.strokeStyle = MINT;
+      ctx.globalAlpha = 0.16*env*amp;
+      ctx.lineWidth = glowW;
+      ctx.beginPath(); ctx.moveTo(Math.max(lay.x0, cx - half), y); ctx.lineTo(Math.min(lay.x1, cx + half), y); ctx.stroke();
+      ctx.globalAlpha = 0.8*env*amp;
+      ctx.lineWidth = coreW;
+      ctx.beginPath(); ctx.moveTo(Math.max(lay.x0, cx - half), y); ctx.lineTo(Math.min(lay.x1, cx + half), y); ctx.stroke();
+    }
+  }
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+
+  /* the compression, stated small at the bottom */
+  ctx.fillStyle = CAPT;
+  ctx.font = (phone ? 9 : 11) + 'px monospace';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText('10 minutes = 10 hours', W/2, H*0.93);
+}
+
+/* ---------- pointer: drag listens closer, tap leaves a trickle ---------- */
+var T0 = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+function nowT(){ return (typeof performance !== 'undefined' && performance.now) ? (performance.now() - T0)/1000 : 0; }
+var pDown = null;
+function onDown(e){
+  audioInit();
+  var t = nowT();
+  var x = (typeof e.clientX === 'number') ? e.clientX : 0;
+  var y = (typeof e.clientY === 'number') ? e.clientY : 0;
+  var lane = lastLay ? laneAtY(lastLay, y) : 0;
+  var dr = { t0:t, t1:null, lane:lane, cancelled:false };
+  drags.push(dr);
+  pDown = { t:t, x:x, y:y, drag:dr, moved:false };
+}
+function onMove(e){
+  if(!pDown || !lastLay) return;
+  var y = (typeof e.clientY === 'number') ? e.clientY : pDown.y;
+  var x = (typeof e.clientX === 'number') ? e.clientX : pDown.x;
+  if(Math.abs(x - pDown.x) + Math.abs(y - pDown.y) > 8) pDown.moved = true;
+  pDown.drag.lane = laneAtY(lastLay, y);
+}
+function onUp(e){
+  if(!pDown) return;
+  var t = nowT();
+  pDown.drag.t1 = t;
+  if(!pDown.moved && t - pDown.t < 0.35){
+    /* a tap: the drag blip never happened; instead a trickle pulse starts */
+    pDown.drag.cancelled = true;
+    taps.push({ t0:t, lane:pDown.drag.lane });
+    tapClick(pDown.drag.lane);
+  }
+  pDown = null;
+}
+if(cv.addEventListener){
+  cv.addEventListener('pointerdown', onDown);
+  cv.addEventListener('pointermove', onMove);
+  cv.addEventListener('pointerup', onUp);
+  cv.addEventListener('pointerleave', onUp);
+}
+
+/* ---------- run ---------- */
+draw(0);
+function onResize(){ draw(nowT()); }
+try{ if(window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', onResize); }catch(e){}
+try{ if(window.addEventListener) window.addEventListener('resize', onResize); }catch(e){}
+if(typeof requestAnimationFrame !== 'undefined'){
+  var step = function(){
+    var t = nowT();
+    draw(t);
+    audioTick(t);
+    requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+})();
+</script>
+</body>
+</html>
