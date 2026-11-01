@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Sound Is the Light</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #060709; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- constants ----------
+  var CHAMBER = '#060709';       // page ground / void outside the room band
+  var BAND = '#0B0D10';          // the room band, one step above the void
+  var PLATFORM = '#1A1D24';
+  var PLATFORM_RIM = '#3A3D46';
+  var SPHERE = '#C9CFDB';
+  var SPEC = '#FFFFFF';
+  var BEAM = '#D8FFE8';
+  var FLARE = '#FFFFFF';
+  var DUST_DARK = '#3A3D46';
+  var DUST_LIGHT = '#8A8D84';
+  var RIPPLE = '#7DF9C6';
+
+  var SIM_DT = 1 / 120;          // fixed step, seconds
+  var PREROLL = 3600;            // 30 s of sim before frame one
+  var COMP_LEN = 180;            // one composition (beam path) lasts ~3 min
+  var DEFAULT_SEED = 974135;
+
+  // ---------- helpers ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+  function smooth(u) { return u * u * (3 - 2 * u); }
+
+  var seedParam = 0;
+  try {
+    var m = /[?&]seed=(\d+)/.exec(location.search || '');
+    if (m) seedParam = parseInt(m[1], 10);
+  } catch (e) { /* no location in some contexts */ }
+  var BASE_SEED = seedParam || DEFAULT_SEED;
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  var W = 720, H = 720, DPR = 1;
+
+  function isPhone() {
+    try {
+      var sw = window.screen ? window.screen.width : W;
+      var sh = window.screen ? window.screen.height : H;
+      if (Math.min(sw, sh) < 700) return true;
+    } catch (e) { /* fall through */ }
+    return H > W * 1.15;
+  }
+
+  function resize() {
+    var vv = window.visualViewport;
+    var w = vv ? vv.width : (window.innerWidth || 720);
+    var h = vv ? vv.height : (window.innerHeight || 720);
+    DPR = Math.min(2, window.devicePixelRatio || 1);
+    W = w; H = h;
+    canvas.width = Math.round(w * DPR);
+    canvas.height = Math.round(h * DPR);
+    canvas.style.width = w + 'px';
+    canvas.style.height = h + 'px';
+    layout();
+  }
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { resize(); draw(); });
+  }
+  if (window.addEventListener) {
+    window.addEventListener('resize', function () { resize(); draw(); });
+  }
+
+  // ---------- layout (unit space -> px) ----------
+  var U = 720, CX = 360, CY = 400, PRX = 240, PRY = 76;
+
+  function layout() {
+    U = Math.min(W, H);
+    CX = W / 2;
+    CY = H * 0.56;
+    var wide = isPhone() ? 0.37 : 0.335;
+    PRX = wide * U;
+    PRY = 0.105 * U;
+  }
+
+  // ---------- composition (seeded pile + beam path) ----------
+  var compIndex = 0;
+  var spheres = [];   // {ex, ey, rU, rays, raySeed, pitch, level, prev, lastRipple}
+  var dust = [];      // {orb, ang0, omg, sz, light}
+  var beamSide = 1;
+
+  function buildComposition(idx) {
+    var seed = (BASE_SEED ^ Math.imul(idx + 1, 0x85EBCA6B)) >>> 0;
+    var rng = mulberry32(seed);
+    var phone = isPhone();
+    var nS = phone ? 22 : 26;
+    var raw = [];
+    var guard = 0;
+    while (raw.length < nS && guard++ < 4000) {
+      var ex = (rng() * 2 - 1) * 0.86;
+      var ey = (rng() * 2 - 1) * 0.82;
+      if (ex * ex + ey * ey > 0.78) continue;
+      raw.push({ ex: ex, ey: ey, rU: 0.0085 + rng() * 0.011, rays: 5 + Math.floor(rng() * 4), raySeed: rng() * 6.2832 });
+    }
+    // pitch by position rank: left-to-right rank lifted by height in the pile
+    var scored = raw.map(function (s, i) { return { i: i, key: (s.ex + 1) * 0.5 + (0.5 - s.ey * 0.5) * 0.6 }; });
+    scored.sort(function (a, b) { return a.key - b.key; });
+    var pitchOf = [];
+    scored.forEach(function (e, rank) {
+      var f = raw.length > 1 ? rank / (raw.length - 1) : 0.5;
+      pitchOf[e.i] = Math.round(200 * Math.pow(6, f) * 100) / 100; // 200..1200 Hz
+    });
+    raw.forEach(function (s, i) {
+      s.pitch = pitchOf[i];
+      s.level = 0; s.prev = 0; s.lastRipple = -10;
+    });
+    raw.sort(function (a, b) { return a.ey - b.ey; }); // back (top) first
+    spheres = raw;
+
+    var nD = phone ? 60 : 90;
+    dust = [];
+    for (var j = 0; j < nD; j++) {
+      dust.push({
+        orb: 1.16 + rng() * 0.42,
+        ang0: rng() * 6.2832,
+        omg: (0.05 + rng() * 0.11) * (rng() < 0.5 ? 1 : -1),
+        sz: 1.6 + rng() * 1.6,
+        light: j % 2 === 0
+      });
+    }
+    beamSide = rng() < 0.5 ? -1 : 1;
+  }
+
+  // Beam LFO parameter set for one composition cycle, from its own seed stream.
+  function beamParams(cycle) {
+    var seed = (BASE_SEED ^ Math.imul(compIndex + 1, 0x85EBCA6B) ^ Math.imul(cycle + 3, 0x27D4EB2F)) >>> 0;
+    var rng = mulberry32(seed);
+    return {
+      p1: rng() * 6.2832, p2: rng() * 6.2832, p3: rng() * 6.2832, p4: rng() * 6.2832,
+      f1: 34 + rng() * 26,            // main sweep period, s
+      tilt: (0.22 + rng() * 0.2) * beamSide,
+      swayAmp: 0.5 + rng() * 0.5
+    };
+  }
+
+  function beamAuto(tc) {
+    var cycle = Math.floor(tc / COMP_LEN);
+    var lt = tc - cycle * COMP_LEN;
+    var a = beamParams(cycle);
+    function evalP(P, t) {
+      var sw = 0.72 * Math.sin(6.2832 * t / P.f1 + P.p1) + 0.28 * Math.sin(6.2832 * t / 13.7 + P.p2);
+      var th = P.tilt + 0.15 * Math.sin(6.2832 * t / 31 + P.p3);
+      var sy = Math.sin(6.2832 * t / 23 + P.p4) * P.swayAmp;
+      return { sw: sw, th: th, sy: sy };
+    }
+    var cur = evalP(a, tc);
+    // crossfade into the next cycle's path over the last 4 s (no jump cut)
+    if (lt > COMP_LEN - 4) {
+      var nxt = evalP(beamParams(cycle + 1), tc);
+      var w = smooth((lt - (COMP_LEN - 4)) / 4);
+      cur = {
+        sw: cur.sw + (nxt.sw - cur.sw) * w,
+        th: cur.th + (nxt.th - cur.th) * w,
+        sy: cur.sy + (nxt.sy - cur.sy) * w
+      };
+    }
+    return cur;
+  }
+
+  // ---------- interaction state ----------
+  var cue = null;   // {x, y (unit), t0}  unit = px offsets scaled by U around centre
+  var pin = null;   // {x, y (unit), th}
+
+  function toUnit(px, py) { return { x: (px - CX) / U, y: (py - CY) / U }; }
+
+  // Beam state at composition time tc, honouring cue and pin.
+  function beamState(tc) {
+    var b = beamAuto(tc);
+    var c = { x: b.sw * 0.30, y: b.sy * 0.045, th: b.th };
+    if (cue) {
+      var age = tc - cue.t0;
+      if (age > 7) { cue = null; }
+      else {
+        var w = age < 0.9 ? smooth(age / 0.9) : (age > 5.5 ? 1 - smooth((age - 5.5) / 1.5) : 1);
+        c.x += (cue.x - c.x) * w;
+        c.y += (cue.y - c.y) * w;
+        c.th += (0 - c.th) * w * 0.6;
+      }
+    }
+    if (pin) {
+      c.x = pin.x; c.y = pin.y; c.th = pin.th;
+    }
+    return c;
+  }
+
+  // Beam geometry in px for time tc.
+  function beamGeom(tc) {
+    var st = beamState(tc);
+    var cxp = CX + st.x * U, cyp = CY + st.y * U;
+    var dx = Math.sin(st.th), dy = Math.cos(st.th);
+    var nx = Math.cos(st.th), ny = -Math.sin(st.th);
+    return { cx: cxp, cy: cyp, dx: dx, dy: dy, nx: nx, ny: ny, bw: (isPhone() ? 0.085 : 0.075) * U };
+  }
+
+  function beamIntensity(g, px, py) {
+    var d = Math.abs((px - g.cx) * g.nx + (py - g.cy) * g.ny);
+    var u = clamp(1 - d / g.bw, 0, 1);
+    return Math.pow(smooth(u), 1.2);
+  }
+
+  function spherePx(s) {
+    var dome = (1 - Math.min(1, s.ex * s.ex + s.ey * s.ey)) * 0.016 * U;
+    return { x: CX + s.ex * PRX * 0.88, y: CY + s.ey * PRY * 0.9 - dome, r: s.rU * U };
+  }
+
+  // ---------- simulation ----------
+  var tComp = 0;
+  var ripples = [];   // {t0, x, y} in unit coords around centre
+
+  function spawnRipple(s, p) {
+    ripples.push({ t0: tComp, x: (p.x - CX) / U, y: (p.y - CY) / U });
+    if (ripples.length > 240) ripples.splice(0, ripples.length - 240);
+    s.lastRipple = tComp;
+  }
+
+  function step(dt) {
+    tComp += dt;
+    var g = beamGeom(tComp);
+    for (var i = 0; i < spheres.length; i++) {
+      var s = spheres[i];
+      var p = spherePx(s);
+      var I = beamIntensity(g, p.x, p.y);
+      s.prev = s.level;
+      if (I > s.level) s.level = Math.min(I, s.level + dt * 4);
+      else s.level = Math.max(I, s.level * Math.exp(-dt / 0.45));
+      if (s.prev < 0.5 && s.level >= 0.5) spawnRipple(s, p);
+      else if (s.level > 0.78 && tComp - s.lastRipple > 1.15) spawnRipple(s, p);
+    }
+  }
+
+  // ---------- audio (lazy, gesture-only) ----------
+  var AC = null, master = null, voices = [];
+  function initAudio() {
+    if (AC) return;
+    try {
+      var Ctor = window.AudioContext || window.webkitAudioContext;
+      if (typeof Ctor !== 'function') return;
+      AC = new Ctor();
+      master = AC.createGain(); master.gain.value = 0.5; master.connect(AC.destination);
+      // deep sub-drone bed
+      var dg = AC.createGain(); dg.gain.value = 0.05; dg.connect(master);
+      var o1 = AC.createOscillator(); o1.type = 'sine'; o1.frequency.value = 55; o1.connect(dg); o1.start();
+      var o2 = AC.createOscillator(); o2.type = 'sine'; o2.frequency.value = 82.5;
+      var dg2 = AC.createGain(); dg2.gain.value = 0.4; o2.connect(dg2); dg2.connect(dg); o2.start();
+      voices = spheres.map(function (s) { return makeVoice(s.pitch); });
+    } catch (e) { AC = null; }
+  }
+  function makeVoice(pitch) {
+    var o = AC.createOscillator(); o.type = 'sine'; o.frequency.value = pitch;
+    var gn = AC.createGain(); gn.gain.value = 0;
+    o.connect(gn); gn.connect(master); o.start();
+    return { o: o, gn: gn };
+  }
+  function dropVoices() {
+    for (var i = 0; i < voices.length; i++) {
+      try { voices[i].gn.gain.value = 0; voices[i].o.stop(); voices[i].gn.disconnect(); } catch (e) {}
+    }
+    voices = [];
+  }
+  function audioFrame() {
+    if (!AC || !voices.length) return;
+    try {
+      var t = AC.currentTime;
+      for (var i = 0; i < spheres.length && i < voices.length; i++) {
+        voices[i].gn.gain.setTargetAtTime(spheres[i].level * 0.13, t, 0.06);
+      }
+    } catch (e) { /* audio is decoration; never break the picture */ }
+  }
+
+  // ---------- drawing ----------
+  function drawRoom() {
+    ctx.fillStyle = CHAMBER;
+    ctx.fillRect(0, 0, W, H);
+    // curved panoramic band: top edge dips at centre, bottom edge bulges
+    ctx.beginPath();
+    ctx.moveTo(-12, H * 0.135);
+    ctx.quadraticCurveTo(W / 2, H * 0.30, W + 12, H * 0.135);
+    ctx.lineTo(W + 12, H * 0.80);
+    ctx.quadraticCurveTo(W / 2, H * 0.99, -12, H * 0.80);
+    ctx.closePath();
+    ctx.fillStyle = BAND;
+    ctx.fill();
+  }
+
+  function drawBeam(g, alphaScale, hwScale) {
+    var L = U * 0.85;
+    var hw = g.bw * hwScale;
+    var x1 = g.cx - g.dx * L, y1 = g.cy - g.dy * L;
+    var x2 = g.cx + g.dx * L, y2 = g.cy + g.dy * L;
+    ctx.beginPath();
+    ctx.moveTo(x1 + g.nx * hw, y1 + g.ny * hw);
+    ctx.lineTo(x2 + g.nx * hw, y2 + g.ny * hw);
+    ctx.lineTo(x2 - g.nx * hw, y2 - g.ny * hw);
+    ctx.lineTo(x1 - g.nx * hw, y1 - g.ny * hw);
+    ctx.closePath();
+    ctx.fillStyle = BEAM;
+    ctx.globalAlpha = alphaScale;
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  function drawDust(g) {
+    for (var i = 0; i < dust.length; i++) {
+      var d = dust[i];
+      var a = d.ang0 + d.omg * tComp;
+      var rx = PRX * d.orb, ry = PRY * (d.orb + 0.35);
+      var x = CX + Math.cos(a) * rx;
+      var y = CY - 0.02 * U + Math.sin(a) * ry;
+      var I = beamIntensity(g, x, y);
+      var sz = d.sz * (U / 720);
+      ctx.fillStyle = d.light ? DUST_LIGHT : DUST_DARK;
+      ctx.globalAlpha = 0.55 + 0.2 * Math.sin(a * 2 + i);
+      ctx.fillRect(x - sz / 2, y - sz / 4, sz, sz / 2);
+      if (I > 0.25) { // shimmer where the light passes
+        ctx.fillStyle = BEAM;
+        ctx.globalAlpha = (I - 0.25) * 0.9;
+        ctx.fillRect(x - sz / 2, y - sz / 4, sz, sz / 2);
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function draw() {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    var g = beamGeom(tComp);
+    drawRoom();
+
+    // platform
+    ctx.beginPath();
+    ctx.ellipse(CX, CY, PRX, PRY, 0, 0, 6.2832);
+    ctx.fillStyle = PLATFORM;
+    ctx.fill();
+    ctx.globalAlpha = 0.35;
+    ctx.strokeStyle = PLATFORM_RIM;
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    // beam under the pile (layered flat alphas, no gradients)
+    drawBeam(g, 0.10, 1.0);
+    drawBeam(g, 0.13, 0.66);
+    drawBeam(g, 0.16, 0.36);
+
+    drawDust(g);
+
+    // ripples (tone made visible)
+    for (var ri = ripples.length - 1; ri >= 0; ri--) {
+      var rp = ripples[ri];
+      var age = tComp - rp.t0;
+      if (age > 2.2) { ripples.splice(ri, 1); continue; }
+      var rr = (6 + age * 46) * (U / 720);
+      ctx.beginPath();
+      ctx.arc(CX + rp.x * U, CY + rp.y * U, rr, 0, 6.2832);
+      ctx.strokeStyle = RIPPLE;
+      ctx.globalAlpha = 0.4 * (1 - age / 2.2);
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+
+    // spheres
+    for (var i = 0; i < spheres.length; i++) {
+      var s = spheres[i];
+      var p = spherePx(s);
+      if (s.level > 0.03) { // specular bloom under a flaring sphere
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.r * (1 + 0.9 * s.level), 0, 6.2832);
+        ctx.fillStyle = FLARE;
+        ctx.globalAlpha = 0.26 * s.level;
+        ctx.fill();
+        ctx.globalAlpha = 1;
+      }
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.r, 0, 6.2832);
+      ctx.fillStyle = SPHERE;
+      ctx.globalAlpha = 0.92;
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      // specular dot, upper left
+      ctx.beginPath();
+      ctx.arc(p.x - p.r * 0.35, p.y - p.r * 0.35, Math.max(0.8, p.r * 0.32), 0, 6.2832);
+      ctx.fillStyle = SPEC;
+      ctx.fill();
+      if (s.level > 0.03) { // star-burst, caused by the beam and nothing else
+        ctx.strokeStyle = FLARE;
+        ctx.globalAlpha = 0.75 * s.level;
+        ctx.lineWidth = 1.5;
+        var rl = p.r * (1.2 + 2.2 * s.level);
+        ctx.beginPath();
+        for (var k = 0; k < s.rays; k++) {
+          var an = s.raySeed + k * 6.2832 / s.rays;
+          ctx.moveTo(p.x + Math.cos(an) * p.r * 0.7, p.y + Math.sin(an) * p.r * 0.7);
+          ctx.lineTo(p.x + Math.cos(an) * rl, p.y + Math.sin(an) * rl);
+        }
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+      }
+    }
+
+    // one soft wash pass over the pile so lit spheres sit inside the light
+    drawBeam(g, 0.06, 1.0);
+  }
+
+  // ---------- pointer interaction ----------
+  var downAt = 0, downX = 0, downY = 0, dragging = false, lastTapAt = -10, pendingTap = null;
+
+  function pieceNow() { return tComp; }
+
+  function onDown(x, y) {
+    initAudio();
+    if (AC && AC.resume) { try { AC.resume(); } catch (e) {} }
+    downAt = pieceNow(); downX = x; downY = y; dragging = false;
+  }
+  function onMove(x, y) {
+    if (downAt === 0) return;
+    if (Math.abs(x - downX) + Math.abs(y - downY) > 10) dragging = true;
+    if (dragging) {
+      var b = beamAuto(tComp);
+      pin = (function () { var u = toUnit(x, y); return { x: u.x, y: u.y, th: b.th }; })();
+    }
+  }
+  function onUp(x, y) {
+    if (pin) { pin = null; downAt = 0; return; }
+    if (downAt === 0) return;
+    downAt = 0;
+    var now = pieceNow();
+    if (now - lastTapAt < 0.35 && pendingTap) {
+      // double-tap: a new composition
+      pendingTap = null; lastTapAt = -10;
+      compIndex++;
+      buildComposition(compIndex);
+      ripples = [];
+      cue = null;
+      if (AC) { dropVoices(); initAudioRefresh(); }
+      return;
+    }
+    lastTapAt = now;
+    var u = toUnit(x, y);
+    pendingTap = { x: u.x, y: u.y, fireAt: now + 0.35 };
+  }
+  function initAudioRefresh() {
+    // rebuild voices for the new pile
+    try {
+      if (!AC) return;
+      voices = spheres.map(function (s) { return makeVoice(s.pitch); });
+    } catch (e) { /* ignore */ }
+  }
+
+  function firePending() {
+    if (pendingTap && pieceNow() >= pendingTap.fireAt) {
+      cue = { x: pendingTap.x, y: pendingTap.y, t0: pieceNow() };
+      pendingTap = null;
+    }
+  }
+
+  function evPos(e) {
+    var r = { x: 0, y: 0 };
+    if (e) {
+      if (typeof e.clientX === 'number') { r.x = e.clientX; r.y = e.clientY; }
+      else if (e.touches && e.touches[0]) { r.x = e.touches[0].clientX; r.y = e.touches[0].clientY; }
+      else if (e.changedTouches && e.changedTouches[0]) { r.x = e.changedTouches[0].clientX; r.y = e.changedTouches[0].clientY; }
+    }
+    return r;
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', function (e) { var p = evPos(e); onDown(p.x, p.y); });
+    canvas.addEventListener('pointermove', function (e) { var p = evPos(e); onMove(p.x, p.y); });
+    canvas.addEventListener('pointerup', function (e) { var p = evPos(e); onUp(p.x, p.y); });
+    canvas.addEventListener('touchstart', function (e) { var p = evPos(e); onDown(p.x, p.y); }, { passive: true });
+    canvas.addEventListener('touchmove', function (e) { var p = evPos(e); onMove(p.x, p.y); }, { passive: true });
+    canvas.addEventListener('touchend', function (e) { var p = evPos(e); onUp(p.x, p.y); });
+  }
+
+  // ---------- init: build, pre-roll exactly 3600 steps, draw frame one ----------
+  buildComposition(0);
+  resize();
+  for (var k = 0; k < PREROLL; k++) step(SIM_DT);
+  draw();
+
+  // ---------- live loop ----------
+  function nowMs() {
+    return (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+  }
+  var lastMs = nowMs(), acc = 0;
+  function frame() {
+    var ms = nowMs();
+    var dt = (ms - lastMs) / 1000;
+    lastMs = ms;
+    if (dt > 0.25) dt = 0.25;
+    if (dt > 0) {
+      acc += dt;
+      var n = 0;
+      while (acc >= SIM_DT && n < 60) { step(SIM_DT); acc -= SIM_DT; n++; }
+      if (n === 60) acc = 0;
+    }
+    firePending();
+    draw();
+    audioFrame();
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+  }
+  if (typeof requestAnimationFrame === 'function') {
+    requestAnimationFrame(frame);
+  }
+})();
+</script>
+</body>
+</html>

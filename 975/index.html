@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Emergency Level</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #07080C; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+/* No.975 "Emergency Level" - PP136, kyle-mcdonald study.
+   A radar scope watches abstract jets fly seeded historical routes.
+   Deviation from baseline is the only signal; a 1-5 gauge reports it.
+   Fixed-timestep 120 Hz sim, seeded; frame one = draw after exactly
+   3600 pre-roll steps. No text anywhere; the gauge is the message. */
+
+// ---------- seeded RNG ----------
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// ---------- constants ----------
+var SCOPE = '#07080C', RING = '#1E2129', SWEEP = '#4FD6FF',
+    CITY = '#F5F2EA', BASE = '#3A3D46', AMBER = '#FFC44F', RED = '#FF3B3B';
+var DT = 1 / 120;
+var DEV_THRESH = 0.04;      // scope units (scope radius = 1)
+var GAUGE_TAU = 9;          // seconds, exponential decay of deviation mass
+var GAUGE_GAIN = 2.0;       // tuned: frame-one level ~3.0 at seed 975136
+var BASE_SEED = 975136;
+
+// ---------- world ----------
+var world = null;
+function buildWorld(seed) {
+  var rnd = mulberry32(seed);
+  // five cities inside the scope, kept apart
+  var cities = [];
+  var guard = 0;
+  while (cities.length < 5 && guard++ < 4000) {
+    var ang = rnd() * Math.PI * 2;
+    var rad = 0.25 + rnd() * 0.55;
+    var p = { x: Math.cos(ang) * rad, y: Math.sin(ang) * rad };
+    var ok = true;
+    for (var i = 0; i < cities.length; i++) {
+      var dx = cities[i].x - p.x, dy = cities[i].y - p.y;
+      if (dx * dx + dy * dy < 0.45 * 0.45) { ok = false; break; }
+    }
+    if (ok) cities.push(p);
+  }
+  // eight ordered routes between distant cities
+  var pairs = [];
+  for (var a = 0; a < 5; a++) for (var b = 0; b < 5; b++) {
+    if (a === b) continue;
+    var ddx = cities[a].x - cities[b].x, ddy = cities[a].y - cities[b].y;
+    if (ddx * ddx + ddy * ddy > 0.55 * 0.55) pairs.push([a, b]);
+  }
+  // seeded shuffle, take 8
+  for (var s = pairs.length - 1; s > 0; s--) {
+    var j = Math.floor(rnd() * (s + 1)), tmp = pairs[s]; pairs[s] = pairs[j]; pairs[j] = tmp;
+  }
+  var routes = [];
+  for (var r = 0; r < Math.min(8, pairs.length); r++) {
+    var A = cities[pairs[r][0]], B = cities[pairs[r][1]];
+    var mx = (A.x + B.x) / 2, my = (A.y + B.y) / 2;
+    var ex = B.x - A.x, ey = B.y - A.y, el = Math.hypot(ex, ey) || 1;
+    var off = (0.06 + rnd() * 0.18) * (rnd() < 0.5 ? -1 : 1);
+    routes.push({
+      a: pairs[r][0], b: pairs[r][1],
+      ax: A.x, ay: A.y, bx: B.x, by: B.y,
+      cx: mx + (-ey / el) * off, cy: my + (ex / el) * off,
+      overrideCtrl: null, overrideUntil: -1
+    });
+  }
+  // jets
+  var jets = [];
+  var nJets = 7;
+  for (var k = 0; k < nJets; k++) {
+    var jr = mulberry32(seed * 7 + 1013 + k * 131);
+    var route = routes[k % routes.length];
+    var dur = 34 + jr() * 30;               // one-way seconds
+    var phase = jr() * dur * 2;
+    // deviation episodes over a long horizon
+    var eps = [], cur = 4 + jr() * 18;
+    while (cur < 1500) {
+      var edur = 6 + jr() * 8;
+      eps.push({ start: cur, dur: edur, amp: 0.05 + jr() * 0.055, sign: jr() < 0.5 ? -1 : 1 });
+      cur += edur + 9 + jr() * 24;
+    }
+    jets.push({
+      route: route, dur: dur, phase: phase,
+      eps: eps, dev: 0, wasOver: false,
+      flaggedUntil: -1, pos: { x: 0, y: 0 }, heading: 0, trail: []
+    });
+  }
+  return { cities: cities, routes: routes, jets: jets, seed: seed };
+}
+
+function routeCtrl(rt, t) {
+  if (rt.overrideCtrl && t < rt.overrideUntil) return rt.overrideCtrl;
+  return { x: rt.cx, y: rt.cy };
+}
+function arcPoint(rt, u, t) {
+  var c = routeCtrl(rt, t);
+  var v = 1 - u;
+  return {
+    x: v * v * rt.ax + 2 * v * u * c.x + u * u * rt.bx,
+    y: v * v * rt.ay + 2 * v * u * c.y + u * u * rt.by
+  };
+}
+function arcTangent(rt, u, t) {
+  var c = routeCtrl(rt, t);
+  return {
+    x: 2 * (1 - u) * (c.x - rt.ax) + 2 * u * (rt.bx - c.x),
+    y: 2 * (1 - u) * (c.y - rt.ay) + 2 * u * (rt.by - c.y)
+  };
+}
+function jetDeviation(jet, t) {
+  for (var i = 0; i < jet.eps.length; i++) {
+    var e = jet.eps[i];
+    if (t < e.start) break;
+    if (t <= e.start + e.dur) {
+      var p = (t - e.start) / e.dur;
+      // smooth in/out: sin^2 envelope
+      var env = Math.sin(Math.PI * p); env = env * env;
+      return e.amp * env * e.sign;
+    }
+  }
+  return 0;
+}
+
+// ---------- sim state ----------
+var simT = 0, mass = 0, level = 1, ticks = [], alertUntil = -1, aboveSince = -1;
+var lastZone = 1, watchSeed = BASE_SEED;
+var events = []; // {t, kind, ...} consumed in step order
+
+function resetWatch(seed) {
+  world = buildWorld(seed);
+  mass = 0; level = 1; ticks = []; alertUntil = -1; aboveSince = -1; lastZone = 1;
+}
+
+function step() {
+  var t = simT;
+  // consume events stamped at or before this step
+  for (var ei = events.length - 1; ei >= 0; ei--) {
+    if (events[ei].t <= t) { applyEvent(events[ei]); events.splice(ei, 1); }
+  }
+  var sumExcess = 0;
+  for (var i = 0; i < world.jets.length; i++) {
+    var jet = world.jets[i];
+    // closed-form position along arc (ping-pong)
+    var cyc = (t + jet.phase) % (jet.dur * 2);
+    var u = cyc < jet.dur ? cyc / jet.dur : 2 - cyc / jet.dur;
+    var dirSign = cyc < jet.dur ? 1 : -1;
+    var base = arcPoint(jet.route, u, t);
+    var tan = arcTangent(jet.route, u, t);
+    var tl = Math.hypot(tan.x, tan.y) || 1;
+    var dev = jetDeviation(jet, t);
+    jet.dev = dev;
+    var px = -tan.y / tl, py = tan.x / tl;
+    jet.pos.x = base.x + px * dev;
+    jet.pos.y = base.y + py * dev;
+    jet.heading = Math.atan2(tan.y * dirSign, tan.x * dirSign);
+    // trail: sample every 2 steps, keep 150 samples (~2.5 s)
+    if ((stepCount % 2) === 0) {
+      jet.trail.push({ x: jet.pos.x, y: jet.pos.y });
+      if (jet.trail.length > 150) jet.trail.shift();
+    }
+    var ade = Math.abs(dev);
+    var suppressed = jet.route.overrideCtrl && t < jet.route.overrideUntil;
+    if (ade > DEV_THRESH) {
+      if (!suppressed) {
+        sumExcess += ade - DEV_THRESH;
+        if (!jet.wasOver) { ticks.push({ t: t, mag: ade }); }
+      }
+      jet.wasOver = true;
+    } else jet.wasOver = false;
+  }
+  if (ticks.length > 40) ticks.splice(0, ticks.length - 40);
+  mass += sumExcess * GAUGE_GAIN * DT;
+  mass *= Math.exp(-DT / GAUGE_TAU);
+  level = 1 + 4 * Math.min(1, mass);
+  // level-5 alert: sustained near-max
+  if (level >= 4.85) {
+    if (aboveSince < 0) aboveSince = t;
+    if (t - aboveSince > 1.2 && t > alertUntil) { alertUntil = t + 4; audioKlaxon(); }
+  } else aboveSince = -1;
+  var zone = Math.max(1, Math.min(5, Math.ceil(level - 0.0001)));
+  if (zone > lastZone) audioRise();
+  lastZone = zone;
+  // sweep pings over cities
+  var sa = sweepAngle(t);
+  for (var ci = 0; ci < world.cities.length; ci++) {
+    var ca = Math.atan2(world.cities[ci].y, world.cities[ci].x);
+    var prev = sweepAngle(t - DT);
+    if (crossedAngle(prev, sa, ca)) audioPing();
+  }
+  simT += DT; stepCount++;
+}
+var stepCount = 0;
+function sweepAngle(t) { return (t * Math.PI * 2 / 12) % (Math.PI * 2); }
+function crossedAngle(prev, now, target) {
+  // angles in atan2 space vs sweep in [0,2pi): normalise
+  var tg = target < 0 ? target + Math.PI * 2 : target;
+  if (now < prev) return tg >= prev || tg < now; // wrapped
+  return tg >= prev && tg < now;
+}
+
+function applyEvent(ev) {
+  if (ev.kind === 'flag') {
+    var jet = world.jets[ev.jet];
+    if (jet) { jet.flaggedUntil = simT + 30; mass += 0.12; audioBlip(0.09); }
+  } else if (ev.kind === 'baseline') {
+    var rt = world.routes[ev.route];
+    if (rt) { rt.overrideCtrl = { x: ev.cx, y: ev.cy }; rt.overrideUntil = simT + 60; }
+  } else if (ev.kind === 'newwatch') {
+    watchSeed = watchSeed * 1664525 + 1013904223;
+    var keepT = simT;
+    resetWatch(watchSeed >>> 0);
+    simT = keepT;
+  }
+}
+
+// ---------- audio (lazy, guarded) ----------
+var AC = null, bedGain = null;
+function audioInit() {
+  if (AC) return;
+  try {
+    if (typeof AudioContext === 'undefined' && typeof webkitAudioContext === 'undefined') return;
+    var Ctx = AudioContext || webkitAudioContext;
+    AC = new Ctx();
+    bedGain = AC.createGain(); bedGain.gain.value = 0.05;
+    var osc = AC.createOscillator(); osc.type = 'sine'; osc.frequency.value = 52;
+    var og = AC.createGain(); og.gain.value = 0.5;
+    osc.connect(og); og.connect(bedGain); bedGain.connect(AC.destination);
+    osc.start();
+  } catch (e) { AC = null; }
+}
+function blip(freq, dur, gain, type) {
+  if (!AC) return;
+  try {
+    var o = AC.createOscillator(), g = AC.createGain();
+    o.type = type || 'sine'; o.frequency.value = freq;
+    g.gain.setValueAtTime(gain, AC.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, AC.currentTime + dur);
+    o.connect(g); g.connect(AC.destination);
+    o.start(); o.stop(AC.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+function audioPing() { blip(920, 0.18, 0.05); }
+function audioBlip(dev) { blip(280 + dev * 4200, 0.12, 0.09, 'triangle'); }
+function audioRise() {
+  if (!AC) return;
+  try {
+    var o = AC.createOscillator(), g = AC.createGain();
+    o.type = 'sine';
+    o.frequency.setValueAtTime(220, AC.currentTime);
+    o.frequency.exponentialRampToValueAtTime(620, AC.currentTime + 0.35);
+    g.gain.setValueAtTime(0.06, AC.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, AC.currentTime + 0.4);
+    o.connect(g); g.connect(AC.destination); o.start(); o.stop(AC.currentTime + 0.45);
+  } catch (e) {}
+}
+function audioKlaxon() {
+  if (!AC) return;
+  for (var i = 0; i < 3; i++) {
+    try {
+      var o = AC.createOscillator(), g = AC.createGain(), f = AC.createBiquadFilter();
+      f.type = 'lowpass'; f.frequency.value = 500;
+      o.type = 'sawtooth'; o.frequency.value = 138;
+      var t0 = AC.currentTime + i * 0.45;
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.exponentialRampToValueAtTime(0.12, t0 + 0.05);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.32);
+      o.connect(f); f.connect(g); g.connect(AC.destination);
+      o.start(t0); o.stop(t0 + 0.4);
+    } catch (e) {}
+  }
+}
+// tick sounds hook: watch ticks array growth in draw loop is impure;
+// instead blip from step via flag on jet crossing:
+var _lastTickCount = 0;
+
+// ---------- layout / canvas ----------
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var VW = 0, VH = 0, isPhone = false;
+var L = null; // layout {cx, cy, R, gaugeX, gaugeW, top, bot, ledgerX}
+function computeLayout() {
+  var w = VW, h = VH;
+  var gaugeW = Math.max(46, Math.min(84, w * 0.075));
+  var ledgerW = 26;
+  var availW = w - gaugeW - ledgerW;
+  var R = Math.min(availW, h) * 0.465;
+  var cx = availW / 2, cy = h / 2;
+  L = {
+    cx: cx, cy: cy, R: R,
+    gaugeX: w - gaugeW + 12, gaugeW: gaugeW - 24,
+    ledgerX: w - gaugeW - ledgerW + 8,
+    top: cy - R * 0.98, bot: cy + R * 0.98
+  };
+}
+function resize() {
+  var vv = (typeof window !== 'undefined' && window.visualViewport) ? window.visualViewport : null;
+  VW = vv ? vv.width : window.innerWidth;
+  VH = vv ? vv.height : window.innerHeight;
+  canvas.width = VW; canvas.height = VH;
+  canvas.style.width = VW + 'px'; canvas.style.height = VH + 'px';
+  var sw = 0, sh = 0;
+  try { sw = window.screen.width; sh = window.screen.height; } catch (e) {}
+  var minDim = Math.min(sw || VW, sh || VH);
+  isPhone = minDim < 700 || (VH > VW * 1.15 && minDim < 900);
+  computeLayout();
+}
+if (typeof window !== 'undefined') {
+  if (window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', resize);
+  window.addEventListener('resize', resize);
+}
+function X(x) { return L.cx + x * L.R; }
+function Y(y) { return L.cy + y * L.R; }
+
+// ---------- draw ----------
+function draw() {
+  canvas.style.width = VW + 'px'; canvas.style.height = VH + 'px';
+  ctx.fillStyle = SCOPE; ctx.fillRect(0, 0, VW, VH);
+  var t = simT;
+  // sweep wedge (layered flat-alpha sectors behind the line)
+  var sa = sweepAngle(t);
+  for (var i = 15; i >= 0; i--) {
+    var a0 = sa - (i + 1) * 0.045, a1 = sa - i * 0.045;
+    ctx.beginPath();
+    ctx.moveTo(L.cx, L.cy);
+    ctx.arc(L.cx, L.cy, L.R, a0, a1);
+    ctx.closePath();
+    ctx.fillStyle = SWEEP; ctx.globalAlpha = 0.055 * (1 - i / 16);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  // rings
+  ctx.strokeStyle = RING; ctx.lineWidth = 1;
+  for (var r = 1; r <= 5; r++) {
+    ctx.beginPath(); ctx.arc(L.cx, L.cy, L.R * r / 5, 0, Math.PI * 2); ctx.stroke();
+  }
+  // outer rim (+ red pulse at level 5 alert)
+  var alert = t < alertUntil;
+  ctx.beginPath(); ctx.arc(L.cx, L.cy, L.R, 0, Math.PI * 2);
+  if (alert) {
+    ctx.strokeStyle = RED; ctx.globalAlpha = 0.45 + 0.3 * Math.sin(t * 6);
+    ctx.lineWidth = 2.5;
+  } else { ctx.strokeStyle = RING; ctx.globalAlpha = 1; ctx.lineWidth = 1.5; }
+  ctx.stroke(); ctx.globalAlpha = 1;
+  // sweep line
+  ctx.beginPath();
+  ctx.moveTo(L.cx, L.cy);
+  ctx.lineTo(L.cx + Math.cos(sa) * L.R, L.cy + Math.sin(sa) * L.R);
+  ctx.strokeStyle = SWEEP; ctx.globalAlpha = 0.25; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.globalAlpha = 1;
+  // baselines
+  ctx.strokeStyle = BASE; ctx.lineWidth = 1;
+  for (var bi = 0; bi < world.routes.length; bi++) {
+    var rt = world.routes[bi], c = routeCtrl(rt, t);
+    ctx.globalAlpha = (rt.overrideCtrl && t < rt.overrideUntil) ? 0.75 : 0.4;
+    ctx.beginPath();
+    ctx.moveTo(X(rt.ax), Y(rt.ay));
+    ctx.quadraticCurveTo(X(c.x), Y(c.y), X(rt.bx), Y(rt.by));
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  // jets: trails then triangles
+  for (var ji = 0; ji < world.jets.length; ji++) {
+    var jet2 = world.jets[ji];
+    var hot = Math.abs(jet2.dev) > DEV_THRESH || t < jet2.flaggedUntil;
+    var col = hot ? RED : AMBER;
+    if (alert && !hot) col = AMBER;
+    ctx.strokeStyle = col; ctx.lineWidth = alert ? 2 : 1.5;
+    var n = jet2.trail.length;
+    for (var s2 = 1; s2 < n; s2++) {
+      ctx.globalAlpha = 0.75 * (s2 / n);
+      ctx.beginPath();
+      ctx.moveTo(X(jet2.trail[s2 - 1].x), Y(jet2.trail[s2 - 1].y));
+      ctx.lineTo(X(jet2.trail[s2].x), Y(jet2.trail[s2].y));
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+    // triangle
+    var jx = X(jet2.pos.x), jy = Y(jet2.pos.y), ha = jet2.heading;
+    var sz = Math.max(5, L.R * 0.016);
+    ctx.beginPath();
+    ctx.moveTo(jx + Math.cos(ha) * sz, jy + Math.sin(ha) * sz);
+    ctx.lineTo(jx + Math.cos(ha + 2.5) * sz * 0.75, jy + Math.sin(ha + 2.5) * sz * 0.75);
+    ctx.lineTo(jx + Math.cos(ha - 2.5) * sz * 0.75, jy + Math.sin(ha - 2.5) * sz * 0.75);
+    ctx.closePath();
+    ctx.fillStyle = AMBER; ctx.fill();
+  }
+  // cities
+  for (var ci2 = 0; ci2 < world.cities.length; ci2++) {
+    var cp = world.cities[ci2];
+    ctx.beginPath(); ctx.arc(X(cp.x), Y(cp.y), Math.max(2.5, L.R * 0.007), 0, Math.PI * 2);
+    ctx.fillStyle = CITY; ctx.fill();
+    ctx.beginPath(); ctx.arc(X(cp.x), Y(cp.y), Math.max(5, L.R * 0.016), 0, Math.PI * 2);
+    ctx.strokeStyle = CITY; ctx.globalAlpha = 0.25; ctx.lineWidth = 1; ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+  // gauge
+  var gx = L.gaugeX, gw = L.gaugeW, gt = L.top, gb = L.bot, gh = gb - gt;
+  var zoneH = gh / 5;
+  // track
+  ctx.fillStyle = RING; ctx.fillRect(gx, gt, gw, gh);
+  // top zone wash (over the track)
+  ctx.fillStyle = RED; ctx.globalAlpha = 0.22;
+  ctx.fillRect(gx, gt, gw, zoneH);
+  ctx.globalAlpha = 1;
+  // fill up to needle
+  var ny = gb - (level - 1) / 4 * gh;
+  ctx.fillStyle = AMBER; ctx.globalAlpha = 0.26;
+  ctx.fillRect(gx, ny, gw, gb - ny);
+  ctx.globalAlpha = 1;
+  // zone ticks
+  ctx.strokeStyle = CITY; ctx.lineWidth = 1.5;
+  for (var z = 0; z <= 5; z++) {
+    var zy = gb - z * zoneH;
+    ctx.globalAlpha = z === 5 ? 0.9 : 0.55;
+    ctx.beginPath(); ctx.moveTo(gx - 7, zy); ctx.lineTo(gx + gw + (z === 0 || z === 5 ? 7 : 3), zy); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  // needle
+  ctx.fillStyle = AMBER;
+  ctx.fillRect(gx - 5, ny - 1.5, gw + 10, 3);
+  ctx.beginPath();
+  ctx.moveTo(gx - 12, ny); ctx.lineTo(gx - 5, ny - 4); ctx.lineTo(gx - 5, ny + 4);
+  ctx.closePath(); ctx.fill();
+  // ledger ticks (newest at top, fading over ~60 s)
+  var shown = 0;
+  for (var ti = ticks.length - 1; ti >= 0 && shown < 22; ti--) {
+    var age = t - ticks[ti].t;
+    if (age > 60) continue;
+    var ly = gt + shown * ((gh - 8) / 22) + 4;
+    ctx.strokeStyle = RED; ctx.globalAlpha = 0.85 * (1 - age / 60);
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(L.ledgerX, ly); ctx.lineTo(L.ledgerX + 12, ly); ctx.stroke();
+    shown++;
+  }
+  ctx.globalAlpha = 1;
+}
+
+// ---------- interaction ----------
+var pDown = null, lastTap = null;
+function toScope(cx, cy) { return { x: (cx - L.cx) / L.R, y: (cy - L.cy) / L.R }; }
+function onDown(e) {
+  audioInit();
+  var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+  var x = (e.clientX || 0) - r.left, y = (e.clientY || 0) - r.top;
+  pDown = { x: x, y: y, t: performance.now(), path: [{ x: x, y: y }] };
+}
+function onMove(e) {
+  if (!pDown) return;
+  var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+  pDown.path.push({ x: (e.clientX || 0) - r.left, y: (e.clientY || 0) - r.top });
+}
+function onUp(e) {
+  if (!pDown) return;
+  var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+  var x = (e.clientX || 0) - r.left, y = (e.clientY || 0) - r.top;
+  pDown.path.push({ x: x, y: y });
+  var nowMs = performance.now();
+  var moved = 0;
+  for (var i = 1; i < pDown.path.length; i++) {
+    moved += Math.hypot(pDown.path[i].x - pDown.path[i - 1].x, pDown.path[i].y - pDown.path[i - 1].y);
+  }
+  if (moved < 14) {
+    // tap: double-tap?
+    if (lastTap && nowMs - lastTap < 350) {
+      events.push({ t: simT, kind: 'newwatch' });
+      lastTap = null;
+    } else {
+      lastTap = nowMs;
+      // hit-test jets (screen px)
+      var best = -1, bestD = 26;
+      for (var ji = 0; ji < world.jets.length; ji++) {
+        var d = Math.hypot(X(world.jets[ji].pos.x) - x, Y(world.jets[ji].pos.y) - y);
+        if (d < bestD) { bestD = d; best = ji; }
+      }
+      if (best >= 0) events.push({ t: simT, kind: 'flag', jet: best });
+    }
+  } else {
+    // drag: find nearest route by mean distance of path samples to arc
+    var bestRoute = -1, bestScore = 1e9, bestMid = null;
+    for (var ri = 0; ri < world.routes.length; ri++) {
+      var rt = world.routes[ri], score = 0;
+      for (var pi = 0; pi < pDown.path.length; pi += 3) {
+        var sp = toScope(pDown.path[pi].x, pDown.path[pi].y);
+        var md = 1e9;
+        for (var uu = 0; uu <= 1.0001; uu += 0.05) {
+          var ap = arcPoint(rt, uu, simT);
+          var dd = Math.hypot(ap.x - sp.x, ap.y - sp.y);
+          if (dd < md) md = dd;
+        }
+        score += md;
+      }
+      if (score < bestScore) { bestScore = score; bestRoute = ri; }
+    }
+    if (bestRoute >= 0) {
+      var rt2 = world.routes[bestRoute];
+      var midP = toScope(pDown.path[Math.floor(pDown.path.length / 2)].x, pDown.path[Math.floor(pDown.path.length / 2)].y);
+      // quadratic control point so curve passes near midP at u=0.5: C = 2*M - 0.5*(A+B)
+      var ccx = 2 * midP.x - 0.5 * (rt2.ax + rt2.bx);
+      var ccy = 2 * midP.y - 0.5 * (rt2.ay + rt2.by);
+      events.push({ t: simT, kind: 'baseline', route: bestRoute, cx: ccx, cy: ccy });
+    }
+  }
+  pDown = null;
+}
+if (canvas.addEventListener) {
+  canvas.addEventListener('pointerdown', onDown);
+  canvas.addEventListener('pointermove', onMove);
+  canvas.addEventListener('pointerup', onUp);
+}
+
+// ---------- boot: pre-roll exactly 3600 steps, draw frame one ----------
+resize();
+resetWatch(BASE_SEED);
+for (var pr = 0; pr < 3600; pr++) step();
+// deviation blips for ticks logged during play (checked after each frame)
+_lastTickCount = ticks.length;
+draw();
+
+// ---------- live loop ----------
+var lastMs = -1, acc = 0;
+function frame(ms) {
+  if (lastMs < 0) lastMs = ms;
+  var elapsed = Math.min(0.25, (ms - lastMs) / 1000);
+  lastMs = ms;
+  acc += elapsed;
+  var guard2 = 0;
+  while (acc >= DT && guard2++ < 60) { step(); acc -= DT; }
+  if (ticks.length > _lastTickCount) {
+    var nt = ticks[ticks.length - 1];
+    audioBlip(Math.abs(nt.mag));
+    _lastTickCount = ticks.length;
+  }
+  draw();
+  if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(frame);
+}
+if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(frame);
+</script>
+</body>
+</html>
