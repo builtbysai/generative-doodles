@@ -1,0 +1,627 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<!-- piece-9128-council-of-petals -->
+<title>Council of Petals</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%; overflow: hidden;
+    background: #0a0d13;
+    touch-action: none; -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #view { position: fixed; inset: 0; display: block; cursor: pointer; }
+  #cap {
+    position: fixed; left: 22px; bottom: 20px; z-index: 2;
+    pointer-events: none;
+    font-family: Georgia, 'Times New Roman', serif;
+    color: #ece4d0;
+    opacity: 0.85; transition: opacity 2.5s ease;
+  }
+  #cap.dim { opacity: 0.32; }
+  #cap h1 {
+    margin: 0 0 4px 0; font-size: 19px; font-weight: normal;
+    letter-spacing: 0.06em;
+  }
+  #cap p { margin: 0; font-size: 12px; letter-spacing: 0.04em; opacity: 0.7; }
+</style>
+</head>
+<body>
+<canvas id="view"></canvas>
+<div id="cap"><h1>Council of Petals</h1><p>tap for a new bloom</p></div>
+<script>
+'use strict';
+/* Council of Petals — driver core. Pure functions, no DOM.
+ * Shipped verbatim inside index.html (inlined by build.js). */
+
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+const TAU = Math.PI * 2;
+const WEDGES = 12;
+const WEDGE = TAU / WEDGES;
+
+const P = {
+  rings: 7,
+  ringSpanSeconds: 60,   // ring k seeds at t = k * ringSpanSeconds / rings
+  ticksPerSec: 12,
+  maxWalkers: 1200,
+  maxSteps: 600,
+  bandCount: 20,
+  sectorCount: 12,
+  cellCapacity: 8,
+  dr: 0.005,
+  seedR0: 0.02,
+};
+
+function ringRadius(k) {
+  if (k <= 0) return 0;
+  return Math.pow(k / P.rings, 1.12);
+}
+
+// Ring personality: ring k answers the previous rings' densities RELATIVE to
+// their running median — restraint when the last ring was crowded for this
+// council, boldness when it was sparse. Self-calibrating; no fragile constants.
+function ringBias(k, prevDensity, history) {
+  // returns { n, bold, forkMul, sapMul }
+  let n = 26, bold = 1.0, forkMul = 1.0, sapMul = 1.0;
+  if (k === 0) { n = 44; sapMul = 0.8; } // dense flowery heart
+  else {
+    const sorted = history.slice().sort((a, b) => a - b);
+    const median = sorted[Math.floor(sorted.length / 2)];
+    if (prevDensity > median * 1.25 + 0.01) { n = 16; bold = 0.7; forkMul = 0.6; }
+    else if (prevDensity < median * 0.75) { n = 34; bold = 1.35; forkMul = 1.5; }
+  }
+  if (k >= 3) forkMul *= 1.2;
+  if (k >= 5) forkMul *= 1.3; // outer rings lace outward
+  return { n, bold, forkMul, sapMul };
+}
+
+function createSystem(seed) {
+  // Temperament: each council has its own character, drawn from the seed —
+  // lacy or clean, wild or straight, long or short of trail. This is what
+  // makes two seeds grow visibly different individuals of the same species.
+  const trng = mulberry32((seed ^ 0x9e3779b9) >>> 0);
+  const temper = {
+    fork: 0.5 + 1.1 * trng(),
+    veer: 0.5 + 1.1 * trng(),
+    sap: 0.8 + 0.4 * trng(),
+  };
+  const sys = {
+    seed: seed >>> 0,
+    temper: temper,
+    rng: mulberry32(seed),
+    time: 0,
+    acc: 0,
+    walkers: [],
+    segments: [],   // wedge-space: {r1,t1,r2,t2,w,role,ring}
+    blooms: [],     // wedge-space: {r,theta,s,role,ring}
+    grid: new Float64Array(P.bandCount * P.sectorCount),
+    nextRing: 0,
+    pending: [],    // trickle seeds: {at, k, bias, n}
+    ringStats: [],  // per ring {seeded, density}
+    decisions: { advance: 0, veer: 0, fork: 0, bloom: 0, fade: 0 },
+    frontier: 0,
+    done: false,
+    totalSteps: 0,
+    maxAgeEver: 0,
+    lastSeedT: 0,
+  };
+  seedRing(sys, 0);
+  // seed head: a small crown of gold blooms at the hub, there from the start
+  for (let i = 0; i < 6; i++) {
+    sys.blooms.push({ r: 0.028, theta: (i / 6 - 0.5) * WEDGE * 0.8, s: 0.02, role: 'gold', ring: 0 });
+  }
+  return sys;
+}
+
+function bandOf(r) {
+  return Math.min(P.bandCount - 1, Math.max(0, Math.floor(r * P.bandCount)));
+}
+function sectorOf(theta) {
+  const x = (theta / WEDGE + 0.5) * P.sectorCount;
+  return Math.min(P.sectorCount - 1, Math.max(0, Math.floor(x)));
+}
+function gridAdd(sys, r, theta, delta) {
+  sys.grid[bandOf(r) * P.sectorCount + sectorOf(theta)] += delta;
+}
+// Crowding normalized by hub geometry: near the center, ribbon overlap is
+// geometrically forced (circumference ~ r), so the same raw count means less.
+function normCrowd(count, r) {
+  const hub = Math.max(1, 0.06 / Math.max(r, 0.02));
+  return Math.min(1, (count / P.cellCapacity) / hub);
+}
+function cellCrowd(sys, r, theta) {
+  return normCrowd(sys.grid[bandOf(r) * P.sectorCount + sectorOf(theta)], r);
+}
+
+// Mean crowding over the radial span of ring k (measured in wedge space).
+function ringDensity(sys, k) {
+  const lo = k === 0 ? 0 : ringRadius(k);
+  const hi = ringRadius(k + 1);
+  const b0 = bandOf(lo), b1 = Math.max(b0, bandOf(Math.min(0.999, hi)));
+  let sum = 0, n = 0;
+  for (let b = b0; b <= b1; b++) {
+    const rMid = (b + 0.5) / P.bandCount;
+    for (let s = 0; s < P.sectorCount; s++) {
+      sum += normCrowd(sys.grid[b * P.sectorCount + s], rMid);
+      n++;
+    }
+  }
+  return n ? sum / n : 0;
+}
+
+function spawnWalkers(sys, k, bias, r0, n) {
+  const rng = sys.rng;
+  for (let i = 0; i < n; i++) {
+    const theta = (rng() - 0.5) * WEDGE * 0.92;
+    const w = {
+      r: r0 * (0.75 + 0.8 * rng()),
+      theta: theta,
+      heading: (rng() - 0.5) * 0.55,
+      sap: (140 + 120 * rng()) * bias.sapMul * sys.temper.sap,
+      width: (0.0016 + 0.0034 * rng()) * bias.bold,
+      age: 0,
+      ring: k,
+      alive: true,
+      role: rng() < 0.14 ? 'gold' : 'petal',
+      forkMul: bias.forkMul,
+      // The council fates a few walkers at birth: if they live to a good age,
+      // their death becomes a flower instead of a fading trail.
+      fated: rng() < 0.08,
+    };
+    sys.walkers.push(w);
+    gridAdd(sys, w.r, w.theta, 1);
+  }
+}
+
+// A ring unfurls: 60% of its walkers at once, the rest trickling in over ~3s,
+// so birth crowding never massacres the newborns.
+function seedRing(sys, k) {
+  const prevDensity = k === 0 ? 0 : sys.ringStats[k - 1].peakDensity;
+  if (k > 0) sys.ringStats[k - 1].density = prevDensity;
+  const history = sys.ringStats.map(s => s.peakDensity);
+  const bias = ringBias(k, prevDensity, history);
+  const r0 = k === 0 ? P.seedR0 : ringRadius(k);
+  const n0 = Math.ceil(bias.n * 0.6);
+  spawnWalkers(sys, k, bias, r0, n0);
+  if (bias.n - n0 > 0) {
+    sys.pending.push({ at: sys.time + 1.4, k: k, bias: bias, n: bias.n - n0 });
+  }
+  sys.ringStats[k] = { seeded: bias.n, density: 0, peakDensity: 0, prevDensity: prevDensity };
+  sys.nextRing = k + 1;
+  sys.lastSeedT = sys.time;
+}
+
+function decide(w, sys) {
+  const rng = sys.rng;
+  const crowd = cellCrowd(sys, w.r, w.theta);
+  const crowdD = w.age < 6 ? 0 : crowd; // sprouts don't die of crowding
+  const lowSap = w.sap < 20;
+  if (rng() < 0.003 + 0.02 * crowdD + (lowSap ? 0.25 : 0)) return { type: 'fade' };
+  if (w.age > 8 && w.sap > 45 && sys.walkers.length < P.maxWalkers &&
+      rng() < 0.05 * (1 - 0.65 * crowd) * w.forkMul * sys.temper.fork) return { type: 'fork' };
+  if (rng() < (0.15 + 0.30 * crowd) * sys.temper.veer) {
+    // veer away from the denser side: a genuine local decision
+    const cL = cellCrowd(sys, w.r, w.theta - 0.05);
+    const cR = cellCrowd(sys, w.r, w.theta + 0.05);
+    const dir = cL === cR ? (rng() < 0.5 ? -1 : 1) : (cL < cR ? -1 : 1);
+    return { type: 'veer', dir: dir, mag: 0.35 + 0.65 * rng() };
+  }
+  return { type: 'advance' };
+}
+
+function moveWalker(sys, w) {
+  const r1 = w.r, t1 = w.theta;
+  const dr = P.dr;
+  w.r += dr * Math.cos(w.heading);
+  w.theta += (dr * Math.sin(w.heading)) / Math.max(0.03, w.r);
+  const half = WEDGE / 2;
+  if (w.theta > half) { w.theta = half - (w.theta - half); w.heading = -w.heading; }
+  else if (w.theta < -half) { w.theta = -half - (w.theta + half); w.heading = -w.heading; }
+  if (w.r < 0.015) { w.r = 0.015; w.heading = -w.heading; }
+  // The heart knows its bounds: ring-0 walkers fade when they reach r=0.40,
+  // leaving a dense knot of trails at the center.
+  if (w.ring === 0 && w.r > 0.40) {
+    w.r = 0.40;
+    sys.segments.push({ r1: r1, t1: t1, r2: w.r, t2: w.theta, w: w.width, role: w.role, ring: w.ring });
+    w.alive = false;
+    sys.decisions.fade++;
+    return;
+  }
+  if (w.r > 1.02) {
+    w.r = 1.02;
+    sys.segments.push({ r1: r1, t1: t1, r2: w.r, t2: w.theta, w: w.width, role: w.role, ring: w.ring });
+    w.alive = false;
+    sys.decisions.fade++;
+    return;
+  }
+  sys.segments.push({ r1: r1, t1: t1, r2: w.r, t2: w.theta, w: w.width, role: w.role, ring: w.ring });
+}
+
+function stepWalker(sys, w) {
+  const d = decide(w, sys);
+  sys.decisions[d.type]++;
+  gridAdd(sys, w.r, w.theta, -1);
+  if (d.type === 'fade') {
+    w.alive = false;
+  } else if (d.type === 'fork') {
+    // Branching does not kill the stem: the parent pays a flat cost and keeps
+    // going; the child gets its own fixed vitality — a side branchlet.
+    w.sap -= 18;
+    const child = {
+      r: w.r, theta: w.theta,
+      heading: w.heading + (sys.rng() < 0.5 ? -0.55 : 0.55),
+      sap: 40 + 30 * sys.rng(),
+      width: w.width * 0.7,
+      age: 0, ring: w.ring, alive: true, role: w.role,
+      forkMul: w.forkMul,
+    };
+    sys.walkers.push(child);
+    gridAdd(sys, child.r, child.theta, 1);
+    moveWalker(sys, w);
+  } else if (d.type === 'veer') {
+    w.sap -= 1.6;
+    w.heading += d.dir * d.mag * 0.35;
+    moveWalker(sys, w);
+  } else {
+    w.sap -= 1.0;
+    moveWalker(sys, w);
+  }
+  w.age++;
+  if (w.age > sys.maxAgeEver) sys.maxAgeEver = w.age;
+  if (w.alive && (w.age >= P.maxSteps || w.sap <= 0)) {
+    w.alive = false;
+    sys.decisions.fade++;
+  }
+  // A fated walker that lives to a good age crowns into a flower where it
+  // falls: its recorded fade becomes a bloom.
+  if (!w.alive && w.fated && !w.crowned && w.age > 25) {
+    w.crowned = true;
+    sys.decisions.fade--;
+    sys.decisions.bloom++;
+    sys.blooms.push({ r: w.r, theta: w.theta, s: w.width * 6, role: w.role, ring: w.ring, crown: true });
+  }
+  w.width *= 0.996;
+  if (w.alive) gridAdd(sys, w.r, w.theta, 1);
+  sys.totalSteps++;
+}
+
+function tick(sys) {
+  const alive = sys.walkers;
+  for (let i = 0; i < alive.length; i++) {
+    if (alive[i].alive) stepWalker(sys, alive[i]);
+  }
+  sys.walkers = alive.filter(w => w.alive);
+  // per-ring peak density: what the NEXT ring answers to
+  for (let k = 0; k < sys.nextRing; k++) {
+    const d = ringDensity(sys, k);
+    if (d > sys.ringStats[k].peakDensity) sys.ringStats[k].peakDensity = d;
+  }
+  let f = sys.frontier; // cumulative max: the fossil record never shrinks
+  for (let i = 0; i < sys.walkers.length; i++) {
+    if (sys.walkers[i].r > f) f = sys.walkers[i].r;
+  }
+  sys.frontier = f;
+}
+
+function stepSystem(sys, dt) {
+  if (sys.done) return;
+  sys.time += dt;
+  // Rings overlap like shingles: ring k+1 unfurls 2s before ring k is spent,
+  // so growth never stutters between waves.
+  const ringInterval = P.ringSpanSeconds / P.rings;
+  while (sys.nextRing < P.rings &&
+         sys.time >= sys.nextRing * ringInterval - (sys.nextRing > 0 ? 2 : 0)) {
+    seedRing(sys, sys.nextRing);
+  }
+  while (sys.pending.length && sys.pending[0].at <= sys.time) {
+    const p = sys.pending.shift();
+    spawnWalkers(sys, p.k, p.bias, p.k === 0 ? P.seedR0 : ringRadius(p.k), p.n);
+  }
+  sys.acc += dt;
+  const TICK = 1 / P.ticksPerSec;
+  let n = 0;
+  while (sys.acc >= TICK && n < 16) {
+    sys.acc -= TICK;
+    tick(sys);
+    n++;
+    if (sys.done) break;
+  }
+  if (n === 16) sys.acc = 0;
+  // Demand seeding: the council convenes the next ring when the current one
+  // thins, so the drawing never stalls between waves.
+  if (!sys.done && sys.nextRing < P.rings &&
+      sys.walkers.length < 6 && sys.time - sys.lastSeedT > 3) {
+    seedRing(sys, sys.nextRing);
+  }
+  // The council adjourns when every ring has spoken and every walker is spent.
+  if (sys.nextRing >= P.rings && sys.walkers.length === 0 && sys.pending.length === 0) {
+    sys.done = true;
+  }
+}
+
+// ---- mirror expansion (render transform; also used by harness) ----
+function expandPolar(r, theta, wedgeIdx, reflect) {
+  const t = reflect ? -theta : theta;
+  return [r, t + wedgeIdx * WEDGE];
+}
+
+function eachMirror(fn) {
+  for (let i = 0; i < WEDGES; i++) {
+    fn(i, false);
+    fn(i, true);
+  }
+}
+
+// Project wedge-space polar to screen coords.
+function project(r, theta, cx, cy, scale) {
+  return [cx + r * Math.cos(theta) * scale, cy + r * Math.sin(theta) * scale];
+}
+
+if (typeof module !== 'undefined') {
+  module.exports = {
+    mulberry32, createSystem, stepSystem, tick, decide, seedRing, ringDensity,
+    ringBias, ringRadius, expandPolar, eachMirror, project,
+    TAU, WEDGES, WEDGE, P,
+  };
+}
+
+</script>
+<script>
+(function () {
+  'use strict';
+
+  var GROUND = '#0a0d13';
+  var ART = 2048, AC = ART / 2;
+  var S = AC * 0.94; // sim units -> art px (R=1 fills 94% of half the plate)
+
+  var view = document.getElementById('view');
+  var vctx = view.getContext('2d');
+  var capEl = document.getElementById('cap');
+
+  var art = document.createElement('canvas');
+  art.width = ART; art.height = ART;
+  var actx = art.getContext('2d');
+
+  var vw = 0, vh = 0, dpr = 1;
+
+  function paintGround() {
+    actx.setTransform(1, 0, 0, 1, 0, 0);
+    actx.globalAlpha = 1;
+    actx.fillStyle = GROUND;
+    actx.fillRect(0, 0, ART, ART);
+    // film grain, baked under the drawing
+    var nz = 512;
+    var nc = document.createElement('canvas');
+    nc.width = nz; nc.height = nz;
+    var nx = nc.getContext('2d');
+    var id = nx.createImageData(nz, nz);
+    for (var i = 0; i < id.data.length; i += 4) {
+      var v = (Math.random() * 255) | 0;
+      id.data[i] = v; id.data[i + 1] = v; id.data[i + 2] = v;
+      id.data[i + 3] = 9;
+    }
+    nx.putImageData(id, 0, 0);
+    actx.drawImage(nc, 0, 0, ART, ART);
+  }
+
+  function resize() {
+    dpr = Math.min(2, window.devicePixelRatio || 1);
+    vw = window.innerWidth; vh = window.innerHeight;
+    view.width = Math.round(vw * dpr);
+    view.height = Math.round(vh * dpr);
+    view.style.width = vw + 'px';
+    view.style.height = vh + 'px';
+  }
+  window.addEventListener('resize', resize);
+
+  var STROKE = {
+    petal: 'rgba(236,228,208,0.78)',
+    gold: 'rgba(201,162,39,0.85)'
+  };
+  var BLOOM_PETAL = {
+    petal: 'rgba(184,67,44,0.88)',
+    gold: 'rgba(168,132,42,0.9)'
+  };
+  var BLOOM_CORE = {
+    petal: 'rgba(217,164,65,0.95)',
+    gold: 'rgba(236,228,208,0.95)'
+  };
+
+  function drawSegments(from, to) {
+    var segs = sys.segments;
+    for (var j = from; j < to; j++) {
+      var s = segs[j];
+      actx.beginPath();
+      for (var i = 0; i < WEDGES; i++) {
+        for (var m = 0; m < 2; m++) {
+          var p1 = expandPolar(s.r1, s.t1, i, m === 1);
+          var p2 = expandPolar(s.r2, s.t2, i, m === 1);
+          actx.moveTo(AC + p1[0] * Math.cos(p1[1]) * S, AC + p1[0] * Math.sin(p1[1]) * S);
+          actx.lineTo(AC + p2[0] * Math.cos(p2[1]) * S, AC + p2[0] * Math.sin(p2[1]) * S);
+        }
+      }
+      actx.strokeStyle = STROKE[s.role];
+      actx.lineWidth = Math.max(0.75, 2 * s.w * S);
+      actx.lineCap = 'round';
+      actx.stroke();
+    }
+  }
+
+  // Flowers are drawn as stroked rings with a dot core: rings overlap into
+  // lace, never into solid fill, no matter how the council clusters them.
+  function drawBloom(b) {
+    var pr, cr, x, y, i, m, p;
+    // rings: one path for all 24 mirrors, one stroke
+    actx.beginPath();
+    for (i = 0; i < WEDGES; i++) {
+      for (m = 0; m < 2; m++) {
+        p = expandPolar(b.r, b.theta, i, m === 1);
+        x = AC + p[0] * Math.cos(p[1]) * S;
+        y = AC + p[0] * Math.sin(p[1]) * S;
+        pr = b.s * S;
+        actx.moveTo(x + pr, y);
+        actx.arc(x, y, pr, 0, TAU);
+      }
+    }
+    actx.strokeStyle = BLOOM_PETAL[b.role];
+    actx.lineWidth = Math.max(1, pr * 0.28);
+    actx.stroke();
+    // cores: one path, one fill
+    actx.beginPath();
+    for (i = 0; i < WEDGES; i++) {
+      for (m = 0; m < 2; m++) {
+        p = expandPolar(b.r, b.theta, i, m === 1);
+        x = AC + p[0] * Math.cos(p[1]) * S;
+        y = AC + p[0] * Math.sin(p[1]) * S;
+        cr = b.s * S * 0.30;
+        actx.moveTo(x + cr, y);
+        actx.arc(x, y, cr, 0, TAU);
+      }
+    }
+    actx.fillStyle = BLOOM_CORE[b.role];
+    actx.fill();
+  }
+
+  // fit the square plate into the viewport (contain), centered
+  function plate() {
+    var s = Math.min(vw, vh) / ART;
+    var d = ART * s;
+    return { s: s, ox: (vw - d) / 2, oy: (vh - d) / 2 };
+  }
+
+  function blit(alpha) {
+    var pl = plate();
+    vctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    vctx.globalAlpha = 1;
+    vctx.fillStyle = GROUND;
+    vctx.fillRect(0, 0, vw, vh);
+    vctx.globalAlpha = alpha;
+    vctx.drawImage(art, pl.ox, pl.oy, ART * pl.s, ART * pl.s);
+    vctx.globalAlpha = 1;
+  }
+
+  var shimmer = [];
+  function pickShimmer() {
+    shimmer = [];
+    var pl = plate();
+    var bl = sys.blooms;
+    for (var n = 0; n < 48; n++) {
+      var b = bl[(Math.random() * bl.length) | 0];
+      var i = (Math.random() * WEDGES) | 0;
+      var p = expandPolar(b.r, b.theta, i, Math.random() < 0.5);
+      var ax = AC + p[0] * Math.cos(p[1]) * S;
+      var ay = AC + p[0] * Math.sin(p[1]) * S;
+      shimmer.push({
+        x: pl.ox + ax * pl.s,
+        y: pl.oy + ay * pl.s,
+        ph: Math.random() * TAU
+      });
+    }
+  }
+
+  function drawShimmer(t) {
+    vctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    for (var n = 0; n < shimmer.length; n++) {
+      var p = shimmer[n];
+      var a = 0.10 + 0.30 * (0.5 + 0.5 * Math.sin(t * 2.2 + p.ph));
+      vctx.beginPath();
+      vctx.arc(p.x, p.y, 2.2, 0, TAU);
+      vctx.fillStyle = 'rgba(217,164,65,' + a.toFixed(3) + ')';
+      vctx.fill();
+    }
+  }
+
+  function seedParam() {
+    var q = new URLSearchParams(window.location.search).get('seed');
+    var n = q === null ? NaN : parseInt(q, 10);
+    if (!isNaN(n)) return n >>> 0;
+    return (Math.random() * 4294967296) >>> 0;
+  }
+
+  var sys = null;
+  var lastDrawnSeg = 0, lastDrawnBloom = 0;
+  var state = 'growing'; // growing | complete | fading
+  var fadeT = 0;
+
+  function reseed(newSeed) {
+    sys = createSystem(newSeed);
+    paintGround();
+    lastDrawnSeg = 0;
+    lastDrawnBloom = 0;
+    shimmer = [];
+    state = 'growing';
+    capEl.classList.add('dim');
+  }
+
+  view.addEventListener('pointerdown', function () {
+    if (state === 'fading') return;
+    state = 'fading';
+    fadeT = 0;
+  });
+
+  var lastT = 0;
+  function frame(now) {
+    requestAnimationFrame(frame);
+    if (!lastT) lastT = now;
+    var dt = Math.min(0.1, (now - lastT) / 1000);
+    lastT = now;
+    if (state === 'growing') {
+      stepSystem(sys, dt);
+      drawSegments(lastDrawnSeg, sys.segments.length);
+      lastDrawnSeg = sys.segments.length;
+      for (var j = lastDrawnBloom; j < sys.blooms.length; j++) drawBloom(sys.blooms[j]);
+      lastDrawnBloom = sys.blooms.length;
+      blit(1);
+      if (sys.done) {
+        state = 'complete';
+        pickShimmer();
+      }
+    } else if (state === 'complete') {
+      blit(1);
+      drawShimmer(now / 1000);
+    } else if (state === 'fading') {
+      fadeT += dt;
+      blit(Math.max(0, 1 - fadeT / 0.7));
+      if (fadeT >= 0.7) reseed((Math.random() * 4294967296) >>> 0);
+    }
+  }
+
+  // review / fast-forward API (used by headless checks; harmless in production)
+  window.__council = {
+    get sys() { return sys; },
+    get state() { return state; },
+    ffTo: function (t) {
+      var guard = 0;
+      while (!sys.done && sys.time < t && guard++ < 20000) stepSystem(sys, 0.5);
+      drawSegments(lastDrawnSeg, sys.segments.length);
+      lastDrawnSeg = sys.segments.length;
+      for (var j = lastDrawnBloom; j < sys.blooms.length; j++) drawBloom(sys.blooms[j]);
+      lastDrawnBloom = sys.blooms.length;
+      if (sys.done && state === 'growing') {
+        state = 'complete';
+        pickShimmer();
+      }
+      blit(1);
+    }
+  };
+
+  resize();
+  paintGround();
+  reseed(seedParam());
+  setTimeout(function () { capEl.classList.add('dim'); }, 9000);
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
