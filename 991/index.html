@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Palm-Sized Dancers</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #07080C; overflow: hidden; height: 100%; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* No.991 "Palm-Sized Dancers" -- five microdrones fly a tight ballet at
+   center stage while the motion-capture system around them (corner
+   cameras, scan lines, lock rings, the 2.4 GHz band, the camera-view
+   ghost panel) dwarfs them. Everything drawn is a closed-form function
+   of piece time plus recorded visitor events; frame one is the
+   synchronous draw at the fixed offset T0 = 17 s and never touches the
+   wall clock. */
+
+// ---------- seeded rng / hash ----------
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function hash2(a, b) { // deterministic per-index hash -> [0,1)
+  var h = Math.imul((a ^ 0x9E3779B9) | 0, 2654435761) ^ Math.imul(b + 1, 40503);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+
+// ---------- palette ----------
+var STAGE = "#07080C", AMBER = "#FFC44F", SYS = "#3A3D46";
+var MINT = "#7DF9C6", BAND = "#14161C", WAVE = "#4FD6FF";
+var GHOST = "#0E1118", WHITE = "#FFFFFF";
+
+// ---------- constants ----------
+var BASE_SEED = 991152;
+var T0 = 17;               // frame-one piece time (s): mid-HOLD, see process.md
+var CYCLE = 17;            // phrase cycle length (s)
+var O_BREAK = 8, O_SOLO = 10.5, O_REFORM = 14.5; // offsets inside a cycle
+var N_DRONE = 5;
+
+var canvas = document.getElementById("c");
+var ctx = canvas.getContext("2d");
+var W = 0, H = 0, PHONE = false;
+
+// ---------- visitor events (recorded, consumed as data) ----------
+var seedBase = BASE_SEED;
+var taps = [];             // piece times of executed command-burst taps
+var shadow = null;         // {x, y, until} active occlusion zone, stage px
+var dragging = false;
+
+// ---------- sizing: Visual Viewport API ----------
+function fit() {
+  var vv = window.visualViewport;
+  var w = vv && vv.width ? vv.width : window.innerWidth;
+  var h = vv && vv.height ? vv.height : window.innerHeight;
+  W = Math.max(50, Math.round(w)); H = Math.max(50, Math.round(h));
+  if (canvas.width !== W) canvas.width = W;
+  if (canvas.height !== H) canvas.height = H;
+  var sw = window.screen ? window.screen.width : W;
+  var sh = window.screen ? window.screen.height : H;
+  PHONE = Math.min(sw, sh) < 700 || H > W * 1.15;
+}
+if (window.visualViewport && window.visualViewport.addEventListener) {
+  window.visualViewport.addEventListener("resize", fit);
+}
+window.addEventListener("resize", fit);
+
+// ---------- choreography: closed-form phrase timeline ----------
+// One cycle: HOLD formation [0,8) -> move to solo spots [8,10.5) ->
+// solo hold [10.5,14.5) -> move to next formation [14.5,17).
+var FORMATIONS = [
+  // circle / pentagon
+  null, // filled below
+  // diamond + center
+  [[0, -1], [1, 0], [0, 1], [-1, 0], [0, 0]],
+  // line
+  [[-1.1, 0], [-0.55, 0], [0, 0], [0.55, 0], [1.1, 0]],
+  // V
+  [[-1, -0.6], [-0.5, -0.1], [0, 0.5], [0.5, -0.1], [1, -0.6]],
+  // cross
+  [[0, 0], [0.85, 0], [-0.85, 0], [0, 0.85], [0, -0.85]]
+];
+FORMATIONS[0] = (function () {
+  var pts = [];
+  for (var i = 0; i < N_DRONE; i++) {
+    var a = -Math.PI / 2 + i * (Math.PI * 2 / N_DRONE);
+    pts.push([Math.cos(a), Math.sin(a)]);
+  }
+  return pts;
+})();
+
+function ease(u) { return u < 0.5 ? 4 * u * u * u : 1 - Math.pow(-2 * u + 2, 3) / 2; }
+
+function formationFor(cyc) {
+  var idx = Math.floor(hash2(seedBase, cyc * 3 + 11) * FORMATIONS.length) % FORMATIONS.length;
+  var rot = (hash2(seedBase, cyc * 3 + 12) - 0.5) * 0.7;
+  var base = FORMATIONS[idx], out = [], i, x, y;
+  for (i = 0; i < N_DRONE; i++) {
+    x = base[i][0]; y = base[i][1];
+    out.push([x * Math.cos(rot) - y * Math.sin(rot), x * Math.sin(rot) + y * Math.cos(rot)]);
+  }
+  return out;
+}
+function soloFor(cyc) {
+  var out = [], i, ang, rad;
+  for (i = 0; i < N_DRONE; i++) {
+    ang = hash2(seedBase, cyc * 31 + i * 7 + 21) * Math.PI * 2;
+    rad = 0.7 + hash2(seedBase, cyc * 31 + i * 7 + 22) * 1.15;
+    out.push([Math.cos(ang) * rad, Math.sin(ang) * rad * 0.8]);
+  }
+  return out;
+}
+
+// Effective piece time: taps shift the phase so the REFORM move starts
+// at the tap moment. Shifts accumulate over the recorded tap list.
+function effTime(t) {
+  var S = 0, k, p, sh;
+  for (k = 0; k < taps.length; k++) {
+    if (taps[k] > t) break;
+    p = (taps[k] + S) % CYCLE;
+    sh = (O_REFORM - p + CYCLE) % CYCLE;
+    S += sh;
+  }
+  return t + S;
+}
+
+// Drone position in unit space at effective time E.
+function unitPos(E, i) {
+  var cyc = Math.floor(E / CYCLE), o = E - cyc * CYCLE;
+  var F = formationFor(cyc), S = soloFor(cyc), a, b, u;
+  if (o < O_BREAK) { a = F[i]; b = F[i]; u = 0; }
+  else if (o < O_SOLO) { a = F[i]; b = S[i]; u = ease((o - O_BREAK) / (O_SOLO - O_BREAK)); }
+  else if (o < O_REFORM) { a = S[i]; b = S[i]; u = 0; }
+  else {
+    var F2 = formationFor(cyc + 1);
+    a = S[i]; b = F2[i]; u = ease((o - O_REFORM) / (CYCLE - O_REFORM));
+  }
+  var x = a[0] + (b[0] - a[0]) * u;
+  var y = a[1] + (b[1] - a[1]) * u;
+  // hover bob while holding (formation or solo)
+  if (u === 0) {
+    x += Math.sin(E * 1.4 + i * 2.39) * 0.014;
+    y += Math.cos(E * 1.13 + i * 1.71) * 0.014;
+  }
+  return [x, y];
+}
+
+function stageGeom() {
+  var bandH = Math.max(20, Math.round(H * 0.05));
+  return {
+    bandH: bandH,
+    cx: W * 0.5,
+    cy: H * 0.52,
+    R: Math.min(W, H) * 0.17
+  };
+}
+
+// Drone position in stage px at piece time t.
+function dronePos(t, i) {
+  var g = stageGeom();
+  var u = unitPos(effTime(t), i);
+  var x = g.cx + u[0] * g.R, y = g.cy + u[1] * g.R;
+  // occlusion drift: inside the shadow the system loses its grip
+  if (shadow && t < shadow.until) {
+    var dx = x - shadow.x, dy = y - shadow.y, rr = shadow.r;
+    if (dx * dx + dy * dy < rr * rr) {
+      x += Math.sin(t * 2.3 + i * 5.0) * 3.5;
+      y += Math.cos(t * 1.9 + i * 3.3) * 3.5;
+    }
+  }
+  return [x, y];
+}
+
+// ---------- lock rings: seeded snap cadence per drone ----------
+// Periods come from the seed hash; phases are anchored so that at the
+// fixed frame-one offset two rings (drones 0 and 2) are freshly snapped
+// and the rest have already faded (series scripted-first-frame rule).
+var SNAP_AGE0 = [0.25, 2.6, 0.6, 3.1, 2.2];
+function snapPeriod(i) { return 3.7 + hash2(BASE_SEED, i * 7 + 31) * 1.6; }
+function snapPhase(i) {
+  var P = snapPeriod(i);
+  return ((T0 - SNAP_AGE0[i]) % P + P) % P;
+}
+function lastSnap(t, i) {
+  var P = snapPeriod(i), ph = snapPhase(i);
+  if (t < ph) return -1;
+  return ph + Math.floor((t - ph) / P) * P;
+}
+function ringEnv(age) {
+  if (age < 0) return 0;
+  if (age < 0.12) return age / 0.12;
+  if (age < 0.9) return 1;
+  if (age < 2.0) return 1 - (age - 0.9) / 1.1;
+  return 0;
+}
+
+// ---------- 2.4 GHz band: burst envelope ----------
+// Bursts fire at every phrase-phase transition and at visitor taps.
+function burstEnv(t) {
+  var env = 0, k, age;
+  for (k = 0; k < taps.length; k++) {
+    age = t - taps[k];
+    if (age >= 0 && age < 3) env += Math.exp(-age / 0.55);
+  }
+  var E = effTime(t), S = E - t;
+  var lastTap = taps.length ? taps[taps.length - 1] : -10;
+  var offs = [0, O_BREAK, O_SOLO, O_REFORM];
+  var cyc0 = Math.floor((E - 3) / CYCLE), cyc1 = Math.floor(E / CYCLE), c, j, et, rt;
+  for (c = cyc0; c <= cyc1; c++) {
+    for (j = 0; j < offs.length; j++) {
+      et = c * CYCLE + offs[j];
+      if (et > E || et < E - 3) continue;
+      rt = et - S;
+      if (rt < lastTap) continue; // superseded by the tap's own burst
+      age = t - rt;
+      if (age >= 0 && age < 3) env += Math.exp(-age / 0.55);
+    }
+  }
+  return Math.min(env, 1.6);
+}
+
+// ---------- cameras ----------
+// Corner assignment reshuffles with the seed (double-tap reseed).
+function cameraCorners() {
+  var order = [0, 1, 2, 3], rng = mulberry32(seedBase), i, j, tmp;
+  for (i = 3; i > 0; i--) { j = Math.floor(rng() * (i + 1)); tmp = order[i]; order[i] = order[j]; order[j] = tmp; }
+  return order; // camera k sits at corner order[k]: 0 TL, 1 TR, 2 BL, 3 BR
+}
+function cornerPos(corner, g) {
+  var inset = 16, top = g.bandH + 16;
+  if (corner === 0) return [inset, top];
+  if (corner === 1) return [W - inset, top];
+  if (corner === 2) return [inset, H - inset];
+  return [W - inset, H - inset];
+}
+function shadowAt(t) {
+  if (dragging && dragPos) return { x: dragPos[0], y: dragPos[1], r: Math.min(W, H) * 0.13 };
+  if (shadow && t < shadow.until) return { x: shadow.x, y: shadow.y, r: Math.min(W, H) * 0.13 };
+  return null;
+}
+
+// ---------- draw ----------
+function draw(t) {
+  canvas.style.width = W + "px";
+  canvas.style.height = H + "px";
+  var g = stageGeom();
+  ctx.fillStyle = STAGE;
+  ctx.fillRect(0, 0, W, H);
+
+  var sh = shadowAt(t);
+  var i, p;
+
+  // --- scan lines (under everything else) ---
+  var corners = cameraCorners();
+  ctx.lineWidth = 1;
+  for (i = 0; i < 4; i++) {
+    var cp = cornerPos(corners[i], g);
+    var baseAng = Math.atan2(g.cy - cp[1], g.cx - cp[0]);
+    var sweep = Math.sin(t * (0.55 + hash2(seedBase, i * 13 + 41) * 0.5) + hash2(seedBase, i * 13 + 42) * 6.28);
+    var ang = baseAng + sweep * 0.55;
+    var dx = Math.cos(ang), dy = Math.sin(ang);
+    var maxL = Math.max(W, H) * 1.5, step = 12;
+    ctx.strokeStyle = MINT;
+    ctx.globalAlpha = 0.15;
+    ctx.beginPath();
+    var s, x0, y0, x1, y1, mx, my, inSh, pen = false;
+    for (s = 0; s < maxL; s += step) {
+      x0 = cp[0] + dx * s; y0 = cp[1] + dy * s;
+      x1 = cp[0] + dx * (s + step); y1 = cp[1] + dy * (s + step);
+      mx = (x0 + x1) / 2; my = (y0 + y1) / 2;
+      inSh = false;
+      if (sh) {
+        var ddx = mx - sh.x, ddy = my - sh.y;
+        if (ddx * ddx + ddy * ddy < sh.r * sh.r) inSh = true;
+      }
+      if (inSh) { pen = false; continue; }
+      if (!pen) { ctx.moveTo(x0, y0); pen = true; }
+      ctx.lineTo(x1, y1);
+    }
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  // --- shadow zone ---
+  if (sh) {
+    ctx.fillStyle = "#000000";
+    ctx.globalAlpha = 0.35;
+    ctx.beginPath(); ctx.arc(sh.x, sh.y, sh.r, 0, 6.2832); ctx.fill();
+    ctx.globalAlpha = 0.45;
+    ctx.strokeStyle = SYS;
+    ctx.setLineDash([4, 5]);
+    ctx.beginPath(); ctx.arc(sh.x, sh.y, sh.r, 0, 6.2832); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.globalAlpha = 1;
+  }
+
+  // --- lock rings (position captured 100 ms before the snap) ---
+  for (i = 0; i < N_DRONE; i++) {
+    var sn = lastSnap(t, i);
+    if (sn < 0) continue;
+    var age = t - sn, env = ringEnv(age);
+    if (env <= 0) continue;
+    var rp = dronePos(sn - 0.1, i);
+    var rx = rp[0], ry = rp[1], alpha = 0.5 * env;
+    if (sh) {
+      var rdx = rx - sh.x, rdy = ry - sh.y;
+      if (rdx * rdx + rdy * rdy < sh.r * sh.r) {
+        alpha *= 0.4;
+        rx += Math.sin(Math.floor(t * 10) * 1.7 + i * 9.1) * 3;
+        ry += Math.cos(Math.floor(t * 10) * 2.3 + i * 7.7) * 3;
+      }
+    }
+    ctx.strokeStyle = MINT;
+    ctx.globalAlpha = alpha;
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.arc(rx, ry, 9 + Math.min(age, 1) * 2.5, 0, 6.2832); ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  // --- drones with their almost-invisible IR frames ---
+  for (i = 0; i < N_DRONE; i++) {
+    p = dronePos(t, i);
+    var fr = 9 + (PHONE ? 1 : 0);
+    var rot = hash2(BASE_SEED, i * 3 + 51) * 0.6 + t * 0.05;
+    ctx.strokeStyle = AMBER;
+    ctx.globalAlpha = 0.25;
+    ctx.setLineDash([3, 3]);
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (var v = 0; v < 4; v++) {
+      var va = rot + v * Math.PI / 2;
+      var vx = p[0] + Math.cos(va) * fr, vy = p[1] + Math.sin(va) * fr;
+      if (v === 0) ctx.moveTo(vx, vy); else ctx.lineTo(vx, vy);
+    }
+    ctx.closePath(); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.globalAlpha = 0.15;
+    ctx.fillStyle = AMBER;
+    ctx.beginPath(); ctx.arc(p[0], p[1], 5.5, 0, 6.2832); ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.beginPath(); ctx.arc(p[0], p[1], 3, 0, 6.2832); ctx.fill();
+  }
+
+  // --- capture cameras (tripod glyphs) ---
+  ctx.strokeStyle = SYS;
+  ctx.fillStyle = SYS;
+  ctx.lineWidth = 1.2;
+  for (i = 0; i < 4; i++) {
+    var c2 = cornerPos(corners[i], g);
+    var flip = (corners[i] >= 2) ? -1 : 1;
+    ctx.beginPath();
+    ctx.moveTo(c2[0], c2[1] - 5 * flip);
+    ctx.lineTo(c2[0] - 5, c2[1] + 3 * flip);
+    ctx.lineTo(c2[0] + 5, c2[1] + 3 * flip);
+    ctx.closePath(); ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(c2[0], c2[1] + 2 * flip); ctx.lineTo(c2[0] - 5, c2[1] + 9 * flip);
+    ctx.moveTo(c2[0], c2[1] + 2 * flip); ctx.lineTo(c2[0] + 5, c2[1] + 9 * flip);
+    ctx.stroke();
+  }
+
+  // --- 2.4 GHz band along the top ---
+  ctx.fillStyle = BAND;
+  ctx.fillRect(0, 0, W, g.bandH);
+  var envB = burstEnv(t);
+  var amp = g.bandH * (0.10 + 0.20 * Math.min(envB, 1.4));
+  ctx.strokeStyle = WAVE;
+  ctx.globalAlpha = 0.9;
+  ctx.lineWidth = 1.2;
+  ctx.beginPath();
+  for (var bx = 0; bx <= W; bx += 4) {
+    var n = 0.62 * Math.sin(bx * 0.020 + t * 2.2) + 0.38 * Math.sin(bx * 0.047 - t * 3.4);
+    n *= 1 + 0.35 * envB * Math.sin(bx * 0.31 + t * 9.0);
+    var by = g.bandH / 2 + amp * n;
+    if (bx === 0) ctx.moveTo(bx, by); else ctx.lineTo(bx, by);
+  }
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+
+  // --- camera-view ghost panel, bottom-right ---
+  var pw = W * (PHONE ? 0.30 : 0.22), ph = pw * 0.72;
+  var px = W - pw - 14, py = H - ph - 14;
+  ctx.fillStyle = GHOST;
+  ctx.fillRect(px, py, pw, ph);
+  ctx.strokeStyle = SYS;
+  ctx.globalAlpha = 0.6;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(px, py, pw, ph);
+  ctx.globalAlpha = 1;
+  ctx.save();
+  ctx.beginPath(); ctx.rect(px, py, pw, ph); ctx.clip();
+  ctx.fillStyle = WHITE;
+  for (i = 0; i < N_DRONE; i++) {
+    p = dronePos(t, i);
+    ctx.beginPath();
+    ctx.arc(px + (p[0] / W) * pw, py + (p[1] / H) * ph, PHONE ? 1.6 : 2, 0, 6.2832);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+// ---------- audio (lazy, first gesture, guarded) ----------
+var AC = null, rotorGain = null, scanGain = null;
+function ensureAudio() {
+  if (AC) { if (AC.resume) AC.resume(); return; }
+  var Ctor = null;
+  if (typeof window !== "undefined") Ctor = window.AudioContext || window.webkitAudioContext;
+  if (typeof Ctor !== "function") return;
+  try {
+    AC = new Ctor();
+    var master = AC.createGain(); master.gain.value = 0.9; master.connect(AC.destination);
+    // rotor whir bus: high and tiny, the drones are small
+    rotorGain = AC.createGain(); rotorGain.gain.value = 0.012;
+    var lp = AC.createBiquadFilter(); lp.type = "lowpass"; lp.frequency.value = 3200;
+    var o1 = AC.createOscillator(); o1.type = "sine"; o1.frequency.value = 1180;
+    var o2 = AC.createOscillator(); o2.type = "triangle"; o2.frequency.value = 1765;
+    var og = AC.createGain(); og.gain.value = 0.5;
+    o1.connect(og); o2.connect(og); og.connect(lp); lp.connect(rotorGain); rotorGain.connect(master);
+    o1.start(); o2.start();
+    // scan tone: present while the system can see, drops out in shadow
+    scanGain = AC.createGain(); scanGain.gain.value = 0.0;
+    var so = AC.createOscillator(); so.type = "sine"; so.frequency.value = 620;
+    so.connect(scanGain); scanGain.connect(master); so.start();
+    AC._master = master;
+  } catch (e) { AC = null; }
+}
+function blip() {
+  if (!AC) return;
+  var tA = AC.currentTime, o = AC.createOscillator(), gn = AC.createGain();
+  o.type = "square";
+  o.frequency.setValueAtTime(2300, tA);
+  o.frequency.exponentialRampToValueAtTime(1700, tA + 0.08);
+  gn.gain.setValueAtTime(0.05, tA);
+  gn.gain.exponentialRampToValueAtTime(0.0001, tA + 0.09);
+  o.connect(gn); gn.connect(AC._master); o.start(tA); o.stop(tA + 0.1);
+}
+function tickSnd() {
+  if (!AC) return;
+  var tA = AC.currentTime, o = AC.createOscillator(), gn = AC.createGain();
+  o.type = "sine"; o.frequency.value = 3000;
+  gn.gain.setValueAtTime(0.025, tA);
+  gn.gain.exponentialRampToValueAtTime(0.0001, tA + 0.03);
+  o.connect(gn); gn.connect(AC._master); o.start(tA); o.stop(tA + 0.04);
+}
+
+// ---------- interaction ----------
+var dragPos = null, downPos = null, downMoved = false;
+var lastTapT = -10, pendingTapAt = -1;
+function evtPos(e) {
+  var r = null;
+  if (canvas.getBoundingClientRect) r = canvas.getBoundingClientRect();
+  var x = e.clientX != null ? e.clientX : 0, y = e.clientY != null ? e.clientY : 0;
+  if (r) { x -= r.left; y -= r.top; }
+  return [x, y];
+}
+function onDown(e) {
+  ensureAudio();
+  downPos = evtPos(e); dragPos = downPos; downMoved = false; dragging = false;
+}
+function onMove(e) {
+  if (!downPos) return;
+  var p = evtPos(e);
+  var dx = p[0] - downPos[0], dy = p[1] - downPos[1];
+  if (dx * dx + dy * dy > 36) downMoved = true;
+  if (downMoved) { dragging = true; dragPos = p; }
+}
+function onUp(e, tNow) {
+  if (dragging && dragPos) {
+    shadow = { x: dragPos[0], y: dragPos[1], until: tNow + 10 };
+  } else if (downPos) {
+    if (tNow - lastTapT < 0.35) {
+      // double-tap: a new ballet
+      seedBase += 1; lastTapT = -10; pendingTapAt = -1;
+    } else {
+      lastTapT = tNow; pendingTapAt = tNow + 0.35;
+    }
+  }
+  downPos = null; dragPos = null; dragging = false; downMoved = false;
+}
+if (canvas.addEventListener) {
+  canvas.addEventListener("pointerdown", onDown);
+  canvas.addEventListener("pointermove", onMove);
+  canvas.addEventListener("pointerup", function (e) { onUp(e, pieceT); });
+  canvas.addEventListener("pointercancel", function (e) { onUp(e, pieceT); });
+}
+
+// ---------- main loop ----------
+var pieceT = T0, lastTs = -1, prevSegId = -1, prevSnapIdx = [-1, -1, -1, -1, -1];
+function segId(E) {
+  var cyc = Math.floor(E / CYCLE), o = E - cyc * CYCLE;
+  var s = o < O_BREAK ? 0 : o < O_SOLO ? 1 : o < O_REFORM ? 2 : 3;
+  return cyc * 4 + s;
+}
+function frame(ts) {
+  if (lastTs < 0) lastTs = ts;
+  var dt = (ts - lastTs) / 1000; lastTs = ts;
+  if (dt > 0.1) dt = 0.1;
+  if (dt < 0) dt = 0;
+  pieceT += dt;
+  // pending single tap resolves into a command burst
+  if (pendingTapAt > 0 && pieceT >= pendingTapAt) {
+    taps.push(pendingTapAt - 0.35);
+    pendingTapAt = -1;
+    blip();
+  }
+  // audio events crossed since last frame
+  if (AC) {
+    var E = effTime(pieceT), sid = segId(E);
+    if (prevSegId >= 0 && sid !== prevSegId) blip();
+    prevSegId = sid;
+    for (var i = 0; i < N_DRONE; i++) {
+      var P = snapPeriod(i), ph = snapPhase(i);
+      var idx = pieceT < ph ? -1 : Math.floor((pieceT - ph) / P);
+      if (prevSnapIdx[i] >= 0 && idx !== prevSnapIdx[i]) tickSnd();
+      prevSnapIdx[i] = idx;
+    }
+    if (scanGain) scanGain.gain.value = shadowAt(pieceT) ? 0.0 : 0.006;
+  }
+  draw(pieceT);
+  if (typeof requestAnimationFrame === "function") requestAnimationFrame(frame);
+}
+
+fit();
+draw(T0);
+if (typeof requestAnimationFrame === "function") requestAnimationFrame(frame);
+</script>
+</body>
+</html>

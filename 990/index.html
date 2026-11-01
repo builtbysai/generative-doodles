@@ -1,0 +1,798 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Backstage, Lit</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #060708; overflow: hidden; height: 100%; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- constants ----------
+  var COL = {
+    workshop: '#060708',
+    board:    '#0B1410',
+    trace:    '#1E3A2A',
+    lit:      '#7DF9C6',
+    pad:      '#3A3D46',
+    chip:     '#14161C',
+    chipEdge: '#3A3D46',
+    packet:   '#FFFFFF',
+    devFill:  '#14161C',
+    devEdge:  '#3A3D46',
+    devPulse: '#4FD6FF',
+    costume:  '#8A8D84',
+    node:     '#FFC44F'
+  };
+  var STEP = 1 / 120;          // fixed sim step (s)
+  var PREROLL = 2400;          // steps before frame one (= 20 s)
+  var PACKET_SPEED = 280;      // px per second along traces (in layout px)
+  var LIT_DECAY = 1.1;         // seconds a lit trace chunk stays visible
+  var PULSE_DECAY = 0.55;      // seconds a device pulse lasts
+  var NODE_GAP = 0.06;         // seconds between costume node fires
+  var NODE_FLASH = 0.45;       // seconds a costume node stays lit
+
+  // ---------- seeded rng ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 720, H = 720;
+
+  function isPhone() {
+    var sw = 9999, sh = 9999;
+    if (typeof window !== 'undefined' && window.screen) {
+      sw = window.screen.width || 9999;
+      sh = window.screen.height || 9999;
+    }
+    if (Math.min(sw, sh) < 700) return true;
+    return H > W * 1.15; // aspect fallback only
+  }
+
+  function resize() {
+    var w = W, h = H;
+    if (typeof window !== 'undefined') {
+      if (window.visualViewport && window.visualViewport.width) {
+        w = window.visualViewport.width; h = window.visualViewport.height;
+      } else if (window.innerWidth) {
+        w = window.innerWidth; h = window.innerHeight;
+      }
+    }
+    W = Math.max(50, Math.round(w));
+    H = Math.max(50, Math.round(h));
+    canvas.width = W; canvas.height = H;
+    layout();
+  }
+
+  // ---------- world: seeded graph ----------
+  // Board lives in a virtual 1000x1000 space, scaled up so it overflows.
+  var COLS = 9, ROWS = 9;
+  var nodes = [];      // {bx, by} board coords, kind: 'j' junction / 'chip' / 'pad'
+  var edges = [];      // {a, b, hv} hv: 1 = horizontal leg first
+  var adj = [];        // adjacency: node -> [{to, edge}]
+  var chips = [];      // {node, w, h} in board units
+  var seedBase = 990151;
+  var worldSeed = seedBase;
+
+  function buildWorld(seed) {
+    var rng = mulberry32(seed);
+    nodes = []; edges = []; adj = []; chips = [];
+    var i, j, idx;
+    for (j = 0; j < ROWS; j++) {
+      for (i = 0; i < COLS; i++) {
+        var bx = 60 + i * (880 / (COLS - 1)) + (rng() - 0.5) * 26;
+        var by = 60 + j * (880 / (ROWS - 1)) + (rng() - 0.5) * 26;
+        nodes.push({ bx: bx, by: by, kind: 'j' });
+        adj.push([]);
+      }
+    }
+    function nid(i2, j2) { return j2 * COLS + i2; }
+    function addEdge(a, b) {
+      var e = { a: a, b: b, hv: rng() < 0.5 ? 1 : 0 };
+      edges.push(e);
+      adj[a].push({ to: b, edge: edges.length - 1 });
+      adj[b].push({ to: a, edge: edges.length - 1 });
+    }
+    for (j = 0; j < ROWS; j++) {
+      for (i = 0; i < COLS; i++) {
+        if (i < COLS - 1 && rng() < 0.82) addEdge(nid(i, j), nid(i + 1, j));
+        if (j < ROWS - 1 && rng() < 0.82) addEdge(nid(i, j), nid(i, j + 1));
+      }
+    }
+    // guarantee connectivity: BFS, then bridge components
+    for (;;) {
+      var seen = new Array(nodes.length).fill(false);
+      var stack = [0]; seen[0] = true;
+      while (stack.length) {
+        var cur = stack.pop();
+        for (var k = 0; k < adj[cur].length; k++) {
+          var nb = adj[cur][k].to;
+          if (!seen[nb]) { seen[nb] = true; stack.push(nb); }
+        }
+      }
+      var missing = -1;
+      for (i = 0; i < nodes.length; i++) if (!seen[i]) { missing = i; break; }
+      if (missing < 0) break;
+      // connect missing node to nearest seen node
+      var best = -1, bd = 1e18;
+      for (i = 0; i < nodes.length; i++) {
+        if (!seen[i]) continue;
+        var dx = nodes[i].bx - nodes[missing].bx;
+        var dy = nodes[i].by - nodes[missing].by;
+        var d = dx * dx + dy * dy;
+        if (d < bd) { bd = d; best = i; }
+      }
+      addEdge(missing, best);
+    }
+    // node kinds: some become chip anchors, some pads
+    for (i = 0; i < nodes.length; i++) {
+      var r = rng();
+      if (r < 0.16) {
+        nodes[i].kind = 'chip';
+        chips.push({ node: i, w: 54 + rng() * 46, h: 34 + rng() * 30, rot: rng() < 0.5 ? 0 : 1 });
+      } else if (r < 0.46) {
+        nodes[i].kind = 'pad';
+      }
+    }
+    return rng;
+  }
+
+  function bfsPath(src, dst) {
+    if (src === dst) return [src];
+    var prev = new Array(nodes.length).fill(-1);
+    var q = [src]; prev[src] = src;
+    while (q.length) {
+      var cur = q.shift();
+      if (cur === dst) break;
+      for (var k = 0; k < adj[cur].length; k++) {
+        var nb = adj[cur][k].to;
+        if (prev[nb] === -1) { prev[nb] = cur; q.push(nb); }
+      }
+    }
+    if (prev[dst] === -1) return null;
+    var path = [dst];
+    while (path[0] !== src) path.unshift(prev[path[0]]);
+    return path;
+  }
+  function edgeBetween(a, b) {
+    for (var k = 0; k < adj[a].length; k++) if (adj[a][k].to === b) return adj[a][k].edge;
+    return -1;
+  }
+
+  // ---------- layout (screen space, derived from W/H) ----------
+  var scale = 1, ox = 0, oy = 0;      // board -> screen
+  var nodeXY = [];                    // screen positions of graph nodes
+  var edgePaths = [];                 // per edge: {pts:[[x,y]..], cum:[..], len, chunks:[litTime..]}
+  var devices = [];                   // 8 endpoints {x, y, node, kind, pulse}
+  var costume = null;                 // {x, y, s, nodePts:[[x,y]..]}
+  var phone = false;
+  var DEV_KINDS = ['drone', 'spotlight', 'wheelchair', 'ball', 'cube', 'patch', 'projector', 'truck'];
+  var COSTUME_DEV = 5;                // 'patch' endpoint drives the costume
+
+  function b2s(bx, by) { return [ox + bx * scale, oy + by * scale]; }
+
+  function layout() {
+    phone = isPhone();
+    var cover = Math.max(W, H);
+    scale = (cover * 1.22) / 1000;
+    ox = (W - 1000 * scale) / 2;
+    oy = (H - 1000 * scale) / 2;
+    nodeXY = nodes.map(function (n) { return b2s(n.bx, n.by); });
+
+    edgePaths = edges.map(function (e) {
+      var A = nodeXY[e.a], B = nodeXY[e.b];
+      var corner = e.hv ? [B[0], A[1]] : [A[0], B[1]];
+      var pts = [A, corner, B];
+      var cum = [0];
+      for (var i = 1; i < pts.length; i++) {
+        var dx = pts[i][0] - pts[i - 1][0], dy = pts[i][1] - pts[i - 1][1];
+        cum.push(cum[i - 1] + Math.sqrt(dx * dx + dy * dy));
+      }
+      var len = cum[cum.length - 1];
+      var nChunks = Math.max(2, Math.ceil(len / 26));
+      var lit = new Array(nChunks).fill(-1e9);
+      return { pts: pts, cum: cum, len: len, lit: lit };
+    });
+
+    // device anchor positions around the viewport edges
+    var m = Math.max(26, Math.min(W, H) * 0.055);
+    var anchors;
+    if (phone) {
+      anchors = [
+        [m, m], [W / 2, m], [W - m, m],
+        [m, H * 0.42], [W - m, H * 0.42],
+        [m, H - m], [W / 2, H - m], [W - m, H - m]
+      ];
+    } else {
+      anchors = [
+        [m, m], [W / 2, m], [W - m, m],
+        [m, H / 2], [W - m, H / 2],
+        [m, H - m], [W / 2, H - m], [W - m, H - m]
+      ];
+    }
+    devices = anchors.map(function (p, i2) {
+      // nearest graph node to this anchor
+      var best = 0, bd = 1e18;
+      for (var n = 0; n < nodeXY.length; n++) {
+        var dx = nodeXY[n][0] - p[0], dy = nodeXY[n][1] - p[1];
+        var d = dx * dx + dy * dy;
+        if (d < bd) { bd = d; best = n; }
+      }
+      return { x: p[0], y: p[1], node: best, kind: DEV_KINDS[i2], pulse: -1e9 };
+    });
+
+    // costume: right side on desktop, lower right on phones
+    var cs = Math.min(W, H) * (phone ? 0.30 : 0.34);
+    var cx = phone ? W * 0.80 : W * 0.865;
+    var cy = phone ? H * 0.70 : H * 0.52;
+    costume = buildCostume(cx, cy, cs);
+  }
+
+  // costume outline: joint positions in unit space, y down, height 2 units
+  var COSTUME_JOINTS = [
+    [0, -1.0],        // 0 head center (node on crown below)
+    [0, -0.62],       // 1 neck
+    [-0.34, -0.52],   // 2 left shoulder area -> hand path
+    [-0.52, -0.10],   // 3 left elbow
+    [-0.46, 0.34],    // 4 left hand
+    [0.34, -0.52],    // 5 right shoulder
+    [0.52, -0.10],    // 6 right elbow
+    [0.46, 0.34],     // 7 right hand
+    [0, -0.05],       // 8 sternum
+    [0, 0.38],        // 9 pelvis
+    [-0.20, 0.72],    // 10 left knee
+    [-0.24, 1.08],    // 11 left foot
+    [0.20, 0.72],     // 12 right knee
+    [0, -0.80]        // 13 crown
+  ];
+  // sensor node anchors: indices into a polyline walk (limb order for firing)
+  var COSTUME_NODE_ORDER = [13, 2, 3, 4, 5, 6, 7, 8, 1, 9, 10, 12];
+
+  function buildCostume(cx, cy, s) {
+    var u = s / 2.2;
+    function pt(j) { return [cx + COSTUME_JOINTS[j][0] * u, cy + COSTUME_JOINTS[j][1] * u]; }
+    var nodePts = COSTUME_NODE_ORDER.map(function (j) { return pt(j); });
+    return { x: cx, y: cy, u: u, pt: pt, nodePts: nodePts, seqStart: -1e9 };
+  }
+
+  // ---------- simulation ----------
+  var simTime = 0;
+  var packets = [];        // {route:[nodeIds], ei (edge index in route), dist (px along edge), dstDev, srcDev}
+  var spawnTimer = 0;
+  var simRng = null;
+  var reroute = null;      // {aDev, bDev, until, timer}
+  var audioEvents = [];    // queued {type, dev} for the audio layer
+
+  function spawnPacket(srcNode, dstDev, srcDev) {
+    var dstNode = devices[dstDev].node;
+    var path = bfsPath(srcNode, dstNode);
+    if (!path || path.length < 2) return;
+    packets.push({ route: path, ei: 0, dist: 0, dstDev: dstDev, srcDev: (srcDev === undefined ? -1 : srcDev) });
+  }
+
+  function lightEdge(edgeIdx, distPx) {
+    var ep = edgePaths[edgeIdx];
+    if (!ep || ep.len <= 0) return;
+    var n = ep.lit.length;
+    var c = Math.floor((distPx / ep.len) * n);
+    if (c < 0) c = 0; if (c > n - 1) c = n - 1;
+    ep.lit[c] = simTime;
+    if (c > 0) ep.lit[c - 1] = Math.max(ep.lit[c - 1], simTime - 0.12);
+  }
+
+  function arrive(p) {
+    var dev = devices[p.dstDev];
+    dev.pulse = simTime;
+    audioEvents.push({ type: 'dev', dev: p.dstDev });
+    if (p.dstDev === COSTUME_DEV) {
+      costume.seqStart = simTime;
+      audioEvents.push({ type: 'costume' });
+    }
+  }
+
+  function stepSim() {
+    simTime += STEP;
+    // ambient spawns: a source chip/junction node -> a random device
+    spawnTimer -= STEP;
+    if (spawnTimer <= 0) {
+      spawnTimer = 0.55 + simRng() * 1.0;
+      var src = Math.floor(simRng() * nodes.length);
+      var dst = Math.floor(simRng() * devices.length);
+      spawnPacket(src, dst);
+    }
+    // scripted beats so frame one (t = 20 s) is mid-traffic everywhere
+    if (!stepSim.beat1 && simTime >= 18.90) {
+      stepSim.beat1 = true;
+      // one-hop route into the costume endpoint, so its node sequence is
+      // mid-fire when frame one lands at t = 20 s
+      var cn = devices[COSTUME_DEV].node;
+      var srcN = adj[cn].length ? adj[cn][0].to : cn;
+      spawnPacket(srcN, COSTUME_DEV);
+    }
+    if (!stepSim.beat2 && simTime >= 19.30) {
+      stepSim.beat2 = true;
+      var d0 = devices[0].node;
+      var s0 = adj[d0].length ? adj[d0][0].to : d0;
+      spawnPacket(s0, 0);
+    }
+    // reroute window traffic
+    if (reroute) {
+      if (simTime > reroute.until) {
+        reroute = null;
+      } else {
+        reroute.timer -= STEP;
+        if (reroute.timer <= 0) {
+          reroute.timer = 1.1;
+          if (simRng() < 0.5) spawnPacket(devices[reroute.aDev].node, reroute.bDev, reroute.aDev);
+          else spawnPacket(devices[reroute.bDev].node, reroute.aDev, reroute.bDev);
+        }
+      }
+    }
+    // advance packets
+    for (var i = packets.length - 1; i >= 0; i--) {
+      var p = packets[i];
+      var eIdx = edgeBetween(p.route[p.ei], p.route[p.ei + 1]);
+      if (eIdx < 0) { packets.splice(i, 1); continue; }
+      var ep = edgePaths[eIdx];
+      p.dist += PACKET_SPEED * STEP;
+      lightEdge(eIdx, Math.min(p.dist, ep.len));
+      if (p.dist >= ep.len) {
+        p.ei++; p.dist = 0;
+        audioEvents.push({ type: 'hop' });
+        if (p.ei >= p.route.length - 1) {
+          arrive(p);
+          packets.splice(i, 1);
+        }
+      }
+    }
+    if (audioEvents.length > 40) audioEvents.splice(0, audioEvents.length - 40);
+  }
+
+  function resetWorld(seed) {
+    worldSeed = seed;
+    var rng = buildWorld(seed);
+    simRng = mulberry32(seed ^ 0x9E3779B9);
+    layout();
+    packets = [];
+    reroute = null;
+    simTime = 0;
+    spawnTimer = 0.4;
+    stepSim.beat1 = false; stepSim.beat2 = false;
+    for (var i = 0; i < PREROLL; i++) stepSim();
+    audioEvents.length = 0; // preroll is silent history
+    void rng;
+  }
+
+  // ---------- audio (lazy, guarded) ----------
+  var actx = null, master = null;
+  var DEV_FREQ = [660, 523, 440, 587, 392, 494, 698, 349];
+  function ensureAudio() {
+    if (actx) return;
+    if (typeof window === 'undefined') return;
+    var AC = window.AudioContext || window.webkitAudioContext;
+    if (typeof AC !== 'function') return;
+    try {
+      actx = new AC();
+      master = actx.createGain();
+      master.gain.value = 0.16;
+      master.connect(actx.destination);
+    } catch (e) { actx = null; }
+  }
+  function blip(freq, dur, gain, type) {
+    if (!actx || !master) return;
+    try {
+      var o = actx.createOscillator(), g = actx.createGain();
+      o.type = type || 'sine'; o.frequency.value = freq;
+      var t = actx.currentTime;
+      g.gain.setValueAtTime(gain, t);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      o.connect(g); g.connect(master);
+      o.start(t); o.stop(t + dur + 0.02);
+    } catch (e) { /* silent */ }
+  }
+  function drainAudio() {
+    if (!actx) { audioEvents.length = 0; return; }
+    var evs = audioEvents.splice(0, audioEvents.length);
+    for (var i = 0; i < evs.length; i++) {
+      var ev = evs[i];
+      if (ev.type === 'hop') blip(1180 + (i % 5) * 60, 0.05, 0.05, 'triangle');
+      else if (ev.type === 'dev') blip(DEV_FREQ[ev.dev] || 440, 0.28, 0.12, 'sine');
+      else if (ev.type === 'costume') {
+        for (var n = 0; n < 12; n++) {
+          (function (k) {
+            setTimeout(function () { blip(1560, 0.03, 0.05, 'square'); }, k * 60);
+          })(n);
+        }
+      }
+    }
+  }
+
+  // ---------- drawing ----------
+  function drawDeviceGlyph(d) {
+    var s = Math.max(15, Math.min(W, H) * 0.037);
+    var pulseAge = simTime - d.pulse;
+    var pulsing = pulseAge >= 0 && pulseAge < PULSE_DECAY;
+    var edge = pulsing ? COL.devPulse : COL.devEdge;
+    ctx.lineWidth = pulsing ? 2.2 : 1.2;
+    ctx.strokeStyle = edge;
+    ctx.fillStyle = COL.devFill;
+    var x = d.x, y = d.y;
+    ctx.beginPath();
+    switch (d.kind) {
+      case 'drone': // X quadcopter
+        ctx.moveTo(x - s, y - s); ctx.lineTo(x + s, y + s);
+        ctx.moveTo(x + s, y - s); ctx.lineTo(x - s, y + s);
+        ctx.stroke();
+        ctx.beginPath(); ctx.arc(x, y, s * 0.22, 0, 6.2832); ctx.fill(); ctx.stroke();
+        break;
+      case 'spotlight': // triangle head on a stand
+        ctx.moveTo(x - s * 0.7, y - s * 0.8); ctx.lineTo(x + s * 0.7, y - s * 0.8); ctx.lineTo(x, y + s * 0.1); ctx.closePath(); ctx.fill(); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(x, y + s * 0.1); ctx.lineTo(x, y + s * 0.9); ctx.moveTo(x - s * 0.6, y + s * 0.9); ctx.lineTo(x + s * 0.6, y + s * 0.9); ctx.stroke();
+        break;
+      case 'wheelchair': // wheel + frame
+        ctx.arc(x - s * 0.15, y + s * 0.25, s * 0.62, 0, 6.2832); ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(x - s * 0.15, y - s * 0.85); ctx.lineTo(x - s * 0.15, y + s * 0.1); ctx.lineTo(x + s * 0.55, y + s * 0.1); ctx.lineTo(x + s * 0.75, y + s * 0.75);
+        ctx.stroke();
+        break;
+      case 'ball':
+        ctx.arc(x, y, s * 0.8, 0, 6.2832); ctx.fill(); ctx.stroke();
+        ctx.beginPath(); ctx.arc(x, y, s * 0.34, 0, 6.2832); ctx.stroke();
+        break;
+      case 'cube':
+        ctx.rect(x - s * 0.75, y - s * 0.75, s * 1.5, s * 1.5); ctx.fill(); ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(x - s * 0.75, y - s * 0.75); ctx.lineTo(x - s * 0.3, y - s * 1.1); ctx.lineTo(x + s * 1.2, y - s * 1.1); ctx.lineTo(x + s * 0.75, y - s * 0.75);
+        ctx.stroke();
+        break;
+      case 'patch': // rounded rect costume patch
+        ctx.rect(x - s * 0.85, y - s * 0.6, s * 1.7, s * 1.2); ctx.fill(); ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(x - s * 0.4, y, s * 0.14, 0, 6.2832); ctx.arc(x + s * 0.4, y, s * 0.14, 0, 6.2832); ctx.fillStyle = COL.node; ctx.fill();
+        break;
+      case 'projector': // rect + cone
+        ctx.rect(x - s * 0.9, y - s * 0.5, s * 0.95, s); ctx.fill(); ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(x + s * 0.05, y - s * 0.3); ctx.lineTo(x + s * 1.0, y - s * 0.75); ctx.lineTo(x + s * 1.0, y + s * 0.75); ctx.lineTo(x + s * 0.05, y + s * 0.3); ctx.closePath(); ctx.stroke();
+        break;
+      case 'truck': // bed + cab + wheels
+        ctx.rect(x - s * 1.05, y - s * 0.55, s * 1.25, s * 0.95); ctx.fill(); ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(x + s * 0.2, y - s * 0.1); ctx.lineTo(x + s * 0.65, y - s * 0.1); ctx.lineTo(x + s * 1.0, y + s * 0.4); ctx.lineTo(x + s * 0.2, y + s * 0.4); ctx.closePath(); ctx.fill(); ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(x - s * 0.55, y + s * 0.6, s * 0.24, 0, 6.2832); ctx.arc(x + s * 0.55, y + s * 0.6, s * 0.24, 0, 6.2832); ctx.stroke();
+        break;
+    }
+    if (pulsing) {
+      var a = 1 - pulseAge / PULSE_DECAY;
+      ctx.globalAlpha = a * 0.8;
+      ctx.strokeStyle = COL.devPulse;
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.arc(x, y, s * (1.05 + (1 - a) * 0.45), 0, 6.2832); ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function drawCostume() {
+    var c = costume;
+    if (!c) return;
+    var u = c.u;
+    // stand: hanger bar + pole
+    ctx.strokeStyle = COL.costume;
+    ctx.globalAlpha = 0.55;
+    ctx.lineWidth = 1.4;
+    ctx.beginPath();
+    ctx.moveTo(c.x - u * 0.75, c.y - u * 1.28); ctx.lineTo(c.x + u * 0.75, c.y - u * 1.28);
+    ctx.moveTo(c.x, c.y - u * 1.28); ctx.lineTo(c.x, c.y + u * 1.34);
+    ctx.moveTo(c.x - u * 0.55, c.y + u * 1.34); ctx.lineTo(c.x + u * 0.55, c.y + u * 1.34);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    // body outline
+    ctx.strokeStyle = COL.costume;
+    ctx.lineWidth = 1.6;
+    var pt = c.pt;
+    ctx.beginPath(); ctx.arc(pt(0)[0], pt(0)[1], u * 0.21, 0, 6.2832); ctx.stroke(); // head
+    ctx.beginPath();
+    ctx.moveTo(pt(1)[0], pt(1)[1]); ctx.lineTo(pt(8)[0], pt(8)[1]); ctx.lineTo(pt(9)[0], pt(9)[1]); // torso
+    ctx.moveTo(pt(1)[0], pt(1)[1]); ctx.lineTo(pt(2)[0], pt(2)[1]); ctx.lineTo(pt(3)[0], pt(3)[1]); ctx.lineTo(pt(4)[0], pt(4)[1]); // left arm
+    ctx.moveTo(pt(1)[0], pt(1)[1]); ctx.lineTo(pt(5)[0], pt(5)[1]); ctx.lineTo(pt(6)[0], pt(6)[1]); ctx.lineTo(pt(7)[0], pt(7)[1]); // right arm
+    ctx.moveTo(pt(9)[0], pt(9)[1]); ctx.lineTo(pt(10)[0], pt(10)[1]); ctx.lineTo(pt(11)[0], pt(11)[1]); // left leg
+    ctx.moveTo(pt(9)[0], pt(9)[1]); ctx.lineTo(pt(12)[0], pt(12)[1]); ctx.lineTo(pt(11)[0] + (pt(12)[0] - pt(10)[0]), pt(11)[1]); // right leg
+    ctx.stroke();
+    // sensor nodes: fire in sequence after a costume arrival
+    for (var i = 0; i < c.nodePts.length; i++) {
+      var fireT = c.seqStart + i * NODE_GAP;
+      var age = simTime - fireT;
+      var litN = age >= 0 && age < NODE_FLASH;
+      ctx.beginPath();
+      ctx.arc(c.nodePts[i][0], c.nodePts[i][1], litN ? 4.4 : 2.6, 0, 6.2832);
+      if (litN) {
+        ctx.fillStyle = COL.node;
+        ctx.globalAlpha = 1 - age / NODE_FLASH * 0.35;
+        ctx.fill();
+        ctx.globalAlpha = 0.5;
+        ctx.beginPath(); ctx.arc(c.nodePts[i][0], c.nodePts[i][1], 7.5, 0, 6.2832); ctx.strokeStyle = COL.node; ctx.stroke();
+        ctx.globalAlpha = 1;
+      } else {
+        ctx.fillStyle = COL.node;
+        ctx.globalAlpha = 0.55;
+        ctx.fill();
+        ctx.globalAlpha = 1;
+      }
+    }
+  }
+
+  function draw() {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    // workshop floor
+    ctx.fillStyle = COL.workshop;
+    ctx.fillRect(0, 0, W, H);
+    // board (overflows the frame)
+    var bx0 = ox, by0 = oy, bw = 1000 * scale, bh = 1000 * scale;
+    ctx.fillStyle = COL.board;
+    ctx.fillRect(bx0, by0, bw, bh);
+    ctx.strokeStyle = COL.trace;
+    ctx.lineWidth = 1;
+    ctx.strokeRect(bx0 + 14, by0 + 14, bw - 28, bh - 28);
+
+    // traces (base)
+    ctx.strokeStyle = COL.trace;
+    ctx.lineWidth = 1.3;
+    var ei, ep, i;
+    for (ei = 0; ei < edgePaths.length; ei++) {
+      ep = edgePaths[ei];
+      ctx.beginPath();
+      ctx.moveTo(ep.pts[0][0], ep.pts[0][1]);
+      for (i = 1; i < ep.pts.length; i++) ctx.lineTo(ep.pts[i][0], ep.pts[i][1]);
+      ctx.stroke();
+    }
+    // lit trace chunks (mint), fading with age
+    ctx.lineWidth = 2.1;
+    for (ei = 0; ei < edgePaths.length; ei++) {
+      ep = edgePaths[ei];
+      var n = ep.lit.length;
+      for (var cI = 0; cI < n; cI++) {
+        var age = simTime - ep.lit[cI];
+        if (age < 0 || age > LIT_DECAY) continue;
+        var d0 = (cI / n) * ep.len, d1 = ((cI + 1) / n) * ep.len;
+        ctx.globalAlpha = (1 - age / LIT_DECAY) * 0.95;
+        ctx.strokeStyle = COL.lit;
+        ctx.beginPath();
+        var started = false;
+        // walk polyline between d0 and d1
+        for (var sI = 0; sI < ep.pts.length - 1; sI++) {
+          var segA = ep.cum[sI], segB = ep.cum[sI + 1];
+          var lo = Math.max(d0, segA), hi = Math.min(d1, segB);
+          if (hi <= lo) continue;
+          var f0 = segB > segA ? (lo - segA) / (segB - segA) : 0;
+          var f1 = segB > segA ? (hi - segA) / (segB - segA) : 0;
+          var x0 = ep.pts[sI][0] + (ep.pts[sI + 1][0] - ep.pts[sI][0]) * f0;
+          var y0 = ep.pts[sI][1] + (ep.pts[sI + 1][1] - ep.pts[sI][1]) * f0;
+          var x1 = ep.pts[sI][0] + (ep.pts[sI + 1][0] - ep.pts[sI][0]) * f1;
+          var y1 = ep.pts[sI][1] + (ep.pts[sI + 1][1] - ep.pts[sI][1]) * f1;
+          if (!started) { ctx.moveTo(x0, y0); started = true; }
+          ctx.lineTo(x1, y1);
+        }
+        ctx.stroke();
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    // pads
+    ctx.fillStyle = COL.pad;
+    for (i = 0; i < nodes.length; i++) {
+      if (nodes[i].kind !== 'pad') continue;
+      ctx.beginPath(); ctx.arc(nodeXY[i][0], nodeXY[i][1], 3.1, 0, 6.2832); ctx.fill();
+    }
+    // junction dots
+    for (i = 0; i < nodes.length; i++) {
+      if (nodes[i].kind !== 'j') continue;
+      ctx.beginPath(); ctx.arc(nodeXY[i][0], nodeXY[i][1], 1.6, 0, 6.2832); ctx.fill();
+    }
+    // chips
+    for (i = 0; i < chips.length; i++) {
+      var ch = chips[i];
+      var cp = nodeXY[ch.node];
+      var cw = ch.w * scale, chh = ch.h * scale;
+      if (ch.rot) { var tmp = cw; cw = chh; chh = tmp; }
+      ctx.fillStyle = COL.chip;
+      ctx.strokeStyle = COL.chipEdge;
+      ctx.lineWidth = 1.1;
+      ctx.beginPath(); ctx.rect(cp[0] - cw / 2, cp[1] - chh / 2, cw, chh); ctx.fill(); ctx.stroke();
+      // pins
+      ctx.beginPath();
+      var pins = 4;
+      for (var pn = 0; pn < pins; pn++) {
+        var f = (pn + 0.5) / pins;
+        ctx.moveTo(cp[0] - cw / 2 + cw * f, cp[1] - chh / 2);
+        ctx.lineTo(cp[0] - cw / 2 + cw * f, cp[1] - chh / 2 - 4);
+        ctx.moveTo(cp[0] - cw / 2 + cw * f, cp[1] + chh / 2);
+        ctx.lineTo(cp[0] - cw / 2 + cw * f, cp[1] + chh / 2 + 4);
+      }
+      ctx.stroke();
+    }
+
+    // network lines board -> devices
+    ctx.strokeStyle = COL.trace;
+    ctx.lineWidth = 1.1;
+    for (i = 0; i < devices.length; i++) {
+      var np = nodeXY[devices[i].node];
+      ctx.beginPath();
+      ctx.moveTo(np[0], np[1]);
+      ctx.lineTo(devices[i].x, np[1]);
+      ctx.lineTo(devices[i].x, devices[i].y);
+      ctx.stroke();
+    }
+    // devices
+    for (i = 0; i < devices.length; i++) drawDeviceGlyph(devices[i]);
+
+    // costume
+    drawCostume();
+
+    // packets
+    ctx.fillStyle = COL.packet;
+    for (i = 0; i < packets.length; i++) {
+      var p = packets[i];
+      var eIdx = edgeBetween(p.route[p.ei], p.route[p.ei + 1]);
+      if (eIdx < 0) continue;
+      var pp = edgePaths[eIdx];
+      var d = Math.min(p.dist, pp.len);
+      var pos = null;
+      for (var sJ = 0; sJ < pp.pts.length - 1; sJ++) {
+        if (d <= pp.cum[sJ + 1] || sJ === pp.pts.length - 2) {
+          var segLen = pp.cum[sJ + 1] - pp.cum[sJ];
+          var fr = segLen > 0 ? (d - pp.cum[sJ]) / segLen : 0;
+          pos = [pp.pts[sJ][0] + (pp.pts[sJ + 1][0] - pp.pts[sJ][0]) * fr,
+                 pp.pts[sJ][1] + (pp.pts[sJ + 1][1] - pp.pts[sJ][1]) * fr];
+          break;
+        }
+      }
+      if (!pos) continue;
+      ctx.fillRect(pos[0] - 2.6, pos[1] - 2.6, 5.2, 5.2);
+    }
+  }
+
+  // ---------- interaction ----------
+  var lastTapT = -1e9, lastTapX = 0, lastTapY = 0;
+  var dragStart = null, dragDev = -1;
+
+  function nearestDevice(x, y) {
+    var best = -1, bd = 46 * 46;
+    for (var i = 0; i < devices.length; i++) {
+      var dx = devices[i].x - x, dy = devices[i].y - y;
+      var d = dx * dx + dy * dy;
+      if (d < bd) { bd = d; best = i; }
+    }
+    return best;
+  }
+  function pointSegDist(px, py, a, b) {
+    var vx = b[0] - a[0], vy = b[1] - a[1];
+    var wx = px - a[0], wy = py - a[1];
+    var len2 = vx * vx + vy * vy;
+    var t = len2 > 0 ? (wx * vx + wy * vy) / len2 : 0;
+    t = Math.max(0, Math.min(1, t));
+    var dx = wx - t * vx, dy = wy - t * vy;
+    return Math.sqrt(dx * dx + dy * dy);
+  }
+  function probeAt(x, y) {
+    // nearest edge within 14 px: send a diagnostic packet from its far node
+    var bestE = -1, bd = 14;
+    for (var ei = 0; ei < edgePaths.length; ei++) {
+      var ep = edgePaths[ei];
+      for (var s = 0; s < ep.pts.length - 1; s++) {
+        var d = pointSegDist(x, y, ep.pts[s], ep.pts[s + 1]);
+        if (d < bd) { bd = d; bestE = ei; }
+      }
+    }
+    if (bestE < 0) return;
+    var e = edges[bestE];
+    // choose the endpoint whose node is closer to some device, then target nearest device to the other end
+    var devNear = -1, dd = 1e18;
+    for (var i = 0; i < devices.length; i++) {
+      var np = nodeXY[devices[i].node];
+      var ddx = np[0] - x, ddy = np[1] - y;
+      var dd2 = ddx * ddx + ddy * ddy;
+      if (dd2 < dd) { dd = dd2; devNear = i; }
+    }
+    if (devNear < 0) return;
+    // start from whichever edge endpoint is farther from the target device node
+    var tn = devices[devNear].node;
+    var dA = Math.abs(nodes[e.a].bx - nodes[tn].bx) + Math.abs(nodes[e.a].by - nodes[tn].by);
+    var dB = Math.abs(nodes[e.b].bx - nodes[tn].bx) + Math.abs(nodes[e.b].by - nodes[tn].by);
+    spawnPacket(dA > dB ? e.a : e.b, devNear);
+  }
+
+  function evtPos(ev) {
+    var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    var cx = (ev.clientX !== undefined ? ev.clientX : (ev.touches && ev.touches[0] ? ev.touches[0].clientX : 0));
+    var cy = (ev.clientY !== undefined ? ev.clientY : (ev.touches && ev.touches[0] ? ev.touches[0].clientY : 0));
+    return [cx - r.left, cy - r.top];
+  }
+
+  function onDown(ev) {
+    ensureAudio();
+    if (actx && actx.state === 'suspended' && actx.resume) actx.resume();
+    var p = evtPos(ev);
+    dragStart = p;
+    dragDev = nearestDevice(p[0], p[1]);
+    if (ev.preventDefault) ev.preventDefault();
+  }
+  function onUp(ev) {
+    if (!dragStart) return;
+    var p = evtPos(ev);
+    var dx = p[0] - dragStart[0], dy = p[1] - dragStart[1];
+    var moved = Math.sqrt(dx * dx + dy * dy);
+    var endDev = nearestDevice(p[0], p[1]);
+    if (dragDev >= 0 && endDev >= 0 && endDev !== dragDev && moved > 30) {
+      // reroute: traffic between the two devices for 10 s
+      reroute = { aDev: dragDev, bDev: endDev, until: simTime + 10, timer: 0 };
+    } else if (moved <= 12) {
+      // tap (or double-tap)
+      var now = simTime;
+      if (now - lastTapT < 0.35 && Math.abs(p[0] - lastTapX) < 24 && Math.abs(p[1] - lastTapY) < 24) {
+        resetWorld(worldSeed + 1);
+        lastTapT = -1e9;
+      } else {
+        probeAt(p[0], p[1]);
+        lastTapT = now; lastTapX = p[0]; lastTapY = p[1];
+      }
+    }
+    dragStart = null; dragDev = -1;
+    if (ev.preventDefault) ev.preventDefault();
+  }
+
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('touchstart', onDown, { passive: false });
+    canvas.addEventListener('touchend', onUp, { passive: false });
+    canvas.addEventListener('mousedown', onDown);
+    canvas.addEventListener('mouseup', onUp);
+  }
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('resize', resize);
+  }
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', resize);
+  }
+
+  // ---------- boot: deterministic frame one ----------
+  resize();
+  resetWorld(seedBase);
+  draw();
+
+  // ---------- live loop (guarded; fixed steps, capped) ----------
+  var lastMs = -1;
+  function frame(nowMs) {
+    if (typeof nowMs === 'number') {
+      if (lastMs < 0) lastMs = nowMs;
+      var acc = (nowMs - lastMs) / 1000;
+      lastMs = nowMs;
+      if (acc > 0.25) acc = 0.25; // cap catch-up
+      var steps = Math.floor(acc / STEP);
+      for (var i = 0; i < steps; i++) stepSim();
+      if (steps > 0) { draw(); drainAudio(); }
+    }
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+  }
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
