@@ -1,0 +1,646 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Facade, Dreaming</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0A0B12; height: 100%; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // No.950 "Facade, Dreaming" - study #116 refikanadol, PP111 "The Building Dreams".
+  // A building corner in perspective is the constant; data-paint is the
+  // dream that flows over it: streams run left to right across both walls,
+  // warp with the perspective bands, pool and eddy at the curved bays,
+  // avoid the darkest bays, and surge across the whole front every ~90 s.
+  // Tap wakes a bay. Drag is the wind. Double-tap reseeds only the paint:
+  // the architecture is built once from its own master seed before any
+  // paint generation stream exists, so a new dream can never touch it.
+
+  var INDIGO = [27, 42, 107];
+  var STEEL = [58, 74, 122];
+  var SHADOW = [10, 11, 18];
+  var MULLION_RGB = [138, 143, 152];
+  var PAINT = [
+    [255, 42, 157],   // magenta
+    [255, 179, 0],    // gold
+    [39, 230, 255],   // cyan
+    [122, 92, 255]    // violet
+  ];
+  var GROUND = '#0A0B12';
+
+  var SEED_FACADE = 950111;   // master seed: the building, built once
+  var SEED_PAINT = 950222;    // paint generation stream base
+  var SEED_INIT = 950333;     // particle placement stream
+
+  var DT = 1 / 120;           // fixed timestep, 120 Hz
+  var PREROLL = 3000;         // exactly 3000 steps = 25 s before frame one
+  var TRAIL_N = 16;           // trail buffer points per particle
+  var TRAIL_EVERY = 5;        // record a trail point every 5 steps (24 Hz)
+  var NF = 9;                 // floor bands (10 floor lines)
+  var FIRST_SURGE = 4800;     // first surge at step 4800 = 40 s (frame one is calm)
+  var SURGE_PERIOD = 10800;   // a surge every 10800 steps = 90 s
+  var SURGE_LEN = 480;        // surge lasts 480 steps = 4 s
+  var TAP_WINDOW = 42;        // steps (0.35 s) a tap waits to see if it is a double-tap
+  var WAKE_STEPS = 2400;      // a woken bay stays lit 20 s
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  var W = 0, H = 0, MIN_DIM = 0, PHONE = false;
+  var N = 0;
+  var stepCount = 0;
+
+  // ---- deterministic RNG (mulberry32) ----
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function clamp(x, a, b) { return x < a ? a : (x > b ? b : x); }
+  function sstep(x) { x = clamp(x, 0, 1); return x * x * (3 - 2 * x); }
+  function rgb(c, a) { return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a + ')'; }
+  function mixRgb(c1, c2, f) {
+    return [Math.round(c1[0] + (c2[0] - c1[0]) * f),
+            Math.round(c1[1] + (c2[1] - c1[1]) * f),
+            Math.round(c1[2] + (c2[2] - c1[2]) * f)];
+  }
+
+  // ================= FACADE (master seed, built once) =================
+  // A building corner: two facade planes meeting at a vertical corner edge
+  // at CX = 0.63 W, on a horizon at HY = 0.36 H (the brief's vanishing
+  // point is the corner/horizon junction). Each wall's floor lines are
+  // straight segments that kink at the corner: the left wall's lines all
+  // converge on a vanishing point on the horizon to the right (1.5 W,
+  // 0.36 H), the right wall's on one to the left (-0.19 W, 0.36 H), so
+  // floor spacing compresses toward the corner from both sides. Bay lines
+  // on both walls converge on a shared point far below (CX, 4.2 H), so
+  // the verticals stay near-upright and lean gently toward the corner.
+  // A single in-frame vanishing point for both families cannot fill the
+  // frame (the bands collapse into an hourglass wedge on the far side);
+  // the corner is the construction where an in-frame convergence point
+  // and a frame-filling facade coexist.
+  var CX = 0, HY = 0;
+  var WALLS = [];     // per wall: {FL, BY, CORN, TONE, NB, curved:{col:bow}}
+  var EDDIES = [];    // {x, y, R, dir, strength} at curved bays
+  var DARK = [];      // {band, cx, cy, r} repulsion centers of shadow cells
+  var DARK_BY_BAND = []; // band -> indices into DARK (band and neighbours)
+
+  function floorYAt(wall, i, x) { var f = wall.FL[i]; return f.y0 + f.m * x; }
+  function cornerOf(wall, i, j) {
+    var f = wall.FL[i], b = wall.BY[j];
+    var x = (b.b + b.n * f.y0) / (1 - b.n * f.m);
+    return { x: x, y: f.y0 + f.m * x };
+  }
+  function cellCentroid(wall, i, j) {
+    var C = wall.CORN;
+    var a = C[i][j], b = C[i][j + 1], c = C[i + 1][j + 1], d = C[i + 1][j];
+    return { x: (a.x + b.x + c.x + d.x) / 4, y: (a.y + b.y + c.y + d.y) / 4 };
+  }
+
+  function buildFacade() {
+    var rng = mulberry32(SEED_FACADE);
+    CX = 0.63 * W; HY = 0.36 * H;
+    var KC = 0.58;    // floor-span compression toward the horizon at the corner
+    var KR = 1.45;    // floor-span expansion from corner to right edge
+    var i, j, k;
+
+    // floor lines: left-edge height -> corner height -> right-edge height
+    var yL = [], yC = [], yR = [];
+    for (i = 0; i <= NF; i++) {
+      var yl = H * (-0.30 + 1.78 * (i / NF)) + (rng() - 0.5) * 0.024 * H;
+      var yc = HY + (yl - HY) * KC;
+      yL.push(yl); yC.push(yc); yR.push(HY + (yc - HY) * KR);
+    }
+    // bay lines: x = b + n * y, all through the shared low vanishing point
+    function bayLine(xTop) {
+      var n = (CX - xTop) / (4.2 * H);
+      return { b: xTop, n: n };
+    }
+    function makeWall(cols, bayTops, isRight) {
+      var wall = { NB: cols, FL: [], BY: [], CORN: [], TONE: null, curved: {} };
+      for (i = 0; i <= NF; i++) {
+        if (!isRight) wall.FL.push({ y0: yL[i], m: (yC[i] - yL[i]) / CX });
+        else wall.FL.push({ y0: yC[i] - ((yR[i] - yC[i]) / (W - CX)) * CX, m: (yR[i] - yC[i]) / (W - CX) });
+      }
+      for (j = 0; j <= cols; j++) wall.BY.push(bayLine(bayTops[j]));
+      for (i = 0; i <= NF; i++) {
+        wall.CORN.push([]);
+        for (j = 0; j <= cols; j++) wall.CORN[i].push(cornerOf(wall, i, j));
+      }
+      wall.TONE = new Uint8Array(NF * cols);
+      for (i = 0; i < NF * cols; i++) wall.TONE[i] = (rng() < 0.26) ? 1 : 0;
+      return wall;
+    }
+    var topsL = [], topsR = [];
+    for (j = 0; j < 7; j++) topsL.push(W * (-0.25 + 0.75 * (j / 6)) + (rng() - 0.5) * 0.016 * W);
+    topsL.push(CX);                                  // last left bay line = the corner edge
+    topsR.push(CX);                                  // first right bay line = the corner edge
+    for (j = 1; j <= 4; j++) topsR.push(W * (0.74 + 0.56 * ((j - 1) / 3)) + (rng() - 0.5) * 0.016 * W);
+    var left = makeWall(7, topsL, false);
+    var right = makeWall(4, topsR, true);
+    WALLS = [left, right];
+
+    // six shadow cells across both walls (paint avoids them)
+    var picked = 0, guard = 0;
+    DARK = []; DARK_BY_BAND = [];
+    for (i = 0; i < NF; i++) DARK_BY_BAND.push([]);
+    while (picked < 6 && guard++ < 400) {
+      var w = WALLS[(rng() * 2) | 0];
+      var ci = (rng() * NF) | 0, cj = (rng() * w.NB) | 0;
+      if (w.TONE[ci * w.NB + cj] !== 2) {
+        w.TONE[ci * w.NB + cj] = 2;
+        var cen = cellCentroid(w, ci, cj);
+        var idx = DARK.length;
+        DARK.push({ band: ci, cx: cen.x, cy: cen.y, r: 0.085 * MIN_DIM });
+        DARK_BY_BAND[ci].push(idx);
+        if (ci > 0) DARK_BY_BAND[ci - 1].push(idx);
+        if (ci < NF - 1) DARK_BY_BAND[ci + 1].push(idx);
+        picked++;
+      }
+    }
+
+    // curved bays: two seeded columns on the left wall, one on the right;
+    // their mullions bow away from the corner, each carries an eddy centre
+    EDDIES = [];
+    var curvedSpec = [
+      { wall: left, count: 2, lo: 1, hi: 6 },
+      { wall: right, count: 1, lo: 1, hi: 3 }
+    ];
+    for (var s = 0; s < curvedSpec.length; s++) {
+      var spec = curvedSpec[s], w2 = spec.wall, usedC = {};
+      for (k = 0; k < spec.count; k++) {
+        var col = spec.lo + ((rng() * (spec.hi - spec.lo + 1)) | 0);
+        while (usedC[col]) col = spec.lo + ((rng() * (spec.hi - spec.lo + 1)) | 0);
+        usedC[col] = true;
+        var a = w2.CORN[0][col], b = w2.CORN[NF][col];
+        var dx = b.x - a.x, dy = b.y - a.y, len = Math.sqrt(dx * dx + dy * dy) || 1;
+        var px = -dy / len, py = dx / len;
+        var midx = (a.x + b.x) / 2;
+        var bow = (0.55 + rng() * 0.5) * 0.035 * MIN_DIM;
+        if (px * (midx - CX) < 0) bow = -bow;         // bow away from the corner
+        w2.curved[col] = bow;
+        var c1 = cellCentroid(w2, 3, col), c2 = cellCentroid(w2, 4, col), c3 = cellCentroid(w2, 5, col);
+        EDDIES.push({
+          x: (c1.x + c2.x + c3.x) / 3 + px * bow * 0.6,
+          y: (c1.y + c2.y + c3.y) / 3 + py * bow * 0.6,
+          R: 0.17 * MIN_DIM,
+          dir: (rng() < 0.5) ? -1 : 1,
+          strength: 95 + rng() * 40
+        });
+      }
+    }
+  }
+
+  // ================= PAINT (generation streams; facade untouched) =================
+  var PX, PY, VX, VY, SPD, FRAC, POOL;
+  var BAND, HUE;
+  var TRX, TRY;
+  var bandBias = null;   // per floor band speed multiplier (paint generation)
+  var eddyBias = null;   // per eddy strength multiplier (paint generation)
+  var genIndex = 0;
+  var wake = null;       // {wall, band, col, cx, cy, r, start}
+  var pendingTap = null; // {step, x, y}
+  var wind = null;       // {x, y, vx, vy, fadeStep}
+  var events = [];
+
+  function bandYAt(band, frac, x) {
+    var wall = x < CX ? WALLS[0] : WALLS[1];
+    return floorYAt(wall, band, x) * (1 - frac) + floorYAt(wall, band + 1, x) * frac;
+  }
+
+  function reseedPaint(gen) {
+    // Only paint parameters come from this stream: hues, speed jitter,
+    // band biases and eddy biases. The facade was already built from
+    // SEED_FACADE and is never rebuilt here.
+    var rng = mulberry32((SEED_PAINT + Math.imul(gen + 1, 7919)) >>> 0);
+    var i;
+    bandBias = new Float32Array(NF);
+    for (i = 0; i < NF; i++) bandBias[i] = 0.85 + rng() * 0.3;
+    eddyBias = new Float32Array(EDDIES.length);
+    for (i = 0; i < EDDIES.length; i++) eddyBias[i] = 0.8 + rng() * 0.45;
+    var sizeScale = clamp(MIN_DIM / 900, 0.6, 1.3);
+    for (i = 0; i < N; i++) {
+      var h = rng();
+      HUE[i] = h < 0.32 ? 0 : (h < 0.58 ? 1 : (h < 0.84 ? 2 : 3));
+      SPD[i] = (26 + BAND[i] * 1.6 + rng() * 15) * sizeScale;
+    }
+  }
+
+  function initParticles() {
+    PX = new Float32Array(N); PY = new Float32Array(N);
+    VX = new Float32Array(N); VY = new Float32Array(N);
+    SPD = new Float32Array(N); FRAC = new Float32Array(N);
+    POOL = new Float32Array(N);
+    BAND = new Uint8Array(N); HUE = new Uint8Array(N);
+    TRX = new Float32Array(N * TRAIL_N); TRY = new Float32Array(N * TRAIL_N);
+    var rng = mulberry32(SEED_INIT);
+    for (var i = 0; i < N; i++) {
+      BAND[i] = (rng() * NF) | 0;
+      FRAC[i] = 0.18 + rng() * 0.64;
+      PX[i] = rng() * W;
+      PY[i] = bandYAt(BAND[i], FRAC[i], PX[i]);
+      VX[i] = 30; VY[i] = 0;
+      for (var k = 0; k < TRAIL_N; k++) { TRX[i * TRAIL_N + k] = PX[i]; TRY[i * TRAIL_N + k] = PY[i]; }
+    }
+  }
+
+  function refillTrail(i) {
+    for (var k = 0; k < TRAIL_N; k++) { TRX[i * TRAIL_N + k] = PX[i]; TRY[i * TRAIL_N + k] = PY[i]; }
+  }
+
+  // ================= events (consumed by the sim, in step order) =================
+  function inTri(px, py, a, b, c) {
+    var d = (b.y - c.y) * (a.x - c.x) + (c.x - b.x) * (a.y - c.y);
+    if (Math.abs(d) < 1e-9) return false;
+    var u = ((b.y - c.y) * (px - c.x) + (c.x - b.x) * (py - c.y)) / d;
+    var v = ((c.y - a.y) * (px - c.x) + (a.x - c.x) * (py - c.y)) / d;
+    var w = 1 - u - v;
+    return u >= 0 && v >= 0 && w >= 0;
+  }
+  function applyTap(x, y) {
+    var wall = x < CX ? WALLS[0] : WALLS[1];
+    for (var i = 0; i < NF; i++) for (var j = 0; j < wall.NB; j++) {
+      var C = wall.CORN;
+      var a = C[i][j], b = C[i][j + 1], c = C[i + 1][j + 1], d = C[i + 1][j];
+      if (inTri(x, y, a, b, c) || inTri(x, y, a, c, d)) {
+        var cen = cellCentroid(wall, i, j);
+        var rr = Math.max(Math.abs(a.x - c.x), Math.abs(a.y - c.y)) * 0.75 + 0.05 * MIN_DIM;
+        wake = { wall: wall, band: i, col: j, cx: cen.x, cy: cen.y, r: rr, start: stepCount };
+        return;
+      }
+    }
+  }
+
+  function consumeEvents() {
+    while (events.length && events[0].step <= stepCount) {
+      var ev = events.shift();
+      if (ev.type === 'tap') {
+        if (pendingTap && stepCount - pendingTap.step <= TAP_WINDOW) {
+          pendingTap = null;
+          genIndex++;
+          reseedPaint(genIndex);       // a new dream: paint only
+        } else {
+          pendingTap = { step: stepCount, x: ev.x, y: ev.y };
+        }
+      } else if (ev.type === 'wind') {
+        wind = { x: ev.x, y: ev.y, vx: ev.dx * 9, vy: ev.dy * 9, fadeStep: stepCount + 40 };
+      } else if (ev.type === 'windEnd') {
+        if (wind) wind.fadeStep = Math.min(wind.fadeStep, stepCount + 45);
+      }
+    }
+    if (pendingTap && stepCount - pendingTap.step > TAP_WINDOW) {
+      applyTap(pendingTap.x, pendingTap.y);
+      pendingTap = null;
+    }
+    if (wind && stepCount > wind.fadeStep + 45) wind = null;
+  }
+
+  // ================= simulation =================
+  function surgeInfo() {
+    var rel = stepCount - FIRST_SURGE;
+    if (rel < 0) return { on: false, mult: 1, x: -1, f: 0 };
+    var ph = rel % SURGE_PERIOD;
+    if (ph >= SURGE_LEN) return { on: false, mult: 1, x: -1, f: 0 };
+    var f = ph / SURGE_LEN;
+    return { on: true, mult: 1 + 1.2 * Math.sin(Math.PI * f), x: -0.15 * W + f * 1.3 * W, f: f };
+  }
+
+  function stepSim() {
+    consumeEvents();
+    var sg = surgeInfo();
+    var i, e, k;
+    var relaxX = 1 - Math.exp(-3 * DT);
+    var relaxY = 1 - Math.exp(-5 * DT);
+    var wakeAge = wake ? stepCount - wake.start : -1;
+    var wakeOn = wake && wakeAge >= 0 && wakeAge < WAKE_STEPS;
+    var wakeBoostEnv = 0;
+    if (wakeOn) wakeBoostEnv = wakeAge > 1800 ? 1 - (wakeAge - 1800) / 600 : 1;
+    var windStr = 0;
+    if (wind) windStr = clamp((wind.fadeStep + 45 - stepCount) / 45, 0, 1);
+    var windR = 0.38 * MIN_DIM;
+
+    for (i = 0; i < N; i++) {
+      var x = PX[i], y = PY[i], band = BAND[i];
+      var tY = bandYAt(band, FRAC[i], x);
+
+      // eddies at the curved bays: swirl, pool, slow the stream
+      var pool = 0, fx = 0, fy = 0;
+      for (e = 0; e < EDDIES.length; e++) {
+        var ed = EDDIES[e];
+        var ex = x - ed.x, ey = y - ed.y;
+        var d2 = ex * ex + ey * ey;
+        if (d2 < ed.R * ed.R && d2 > 1) {
+          var d = Math.sqrt(d2);
+          var f = 1 - d / ed.R;
+          if (f > pool) pool = f;
+          var sw = ed.strength * eddyBias[e] * f * DT;
+          fx += (-ey / d) * ed.dir * sw + (-ex / d) * 22 * f * DT;
+          fy += (ex / d) * ed.dir * sw + (-ey / d) * 22 * f * DT;
+        }
+      }
+      // the darkest bays repel: streams deflect around their centres
+      var dl = DARK_BY_BAND[band];
+      for (k = 0; k < dl.length; k++) {
+        var dc = DARK[dl[k]];
+        var ddx = x - dc.cx, ddy = y - dc.cy;
+        var dd2 = ddx * ddx + ddy * ddy;
+        if (dd2 < dc.r * dc.r && dd2 > 1) {
+          var dd = Math.sqrt(dd2);
+          var df = (1 - dd / dc.r) * 150 * DT;
+          fx += (ddx / dd) * df; fy += (ddy / dd) * df;
+        }
+      }
+      // the wind: drag force with distance falloff
+      if (wind && windStr > 0) {
+        var wx = x - wind.x, wy = y - wind.y;
+        var wd2 = wx * wx + wy * wy;
+        if (wd2 < windR * windR) {
+          var wf = (1 - Math.sqrt(wd2) / windR) * windStr * 2.2 * DT;
+          fx += wind.vx * wf; fy += wind.vy * wf;
+        }
+      }
+      // a woken bay speeds the paint inside it
+      var boost = 1;
+      if (wakeOn && wakeBoostEnv > 0) {
+        var ax = x - wake.cx, ay = y - wake.cy;
+        if (ax * ax + ay * ay < wake.r * wake.r) boost = 1 + 0.6 * wakeBoostEnv;
+      }
+
+      var targetVx = SPD[i] * bandBias[band] * sg.mult * boost * (1 - 0.55 * pool);
+      VX[i] += (targetVx - VX[i]) * relaxX;
+      VY[i] += ((tY - y) * 4.5 - VY[i]) * relaxY;
+      VX[i] += fx; VY[i] += fy;
+      x += VX[i] * DT; y += VY[i] * DT;
+      POOL[i] = pool;
+
+      if (x > W + 24) {
+        x = -24;
+        y = bandYAt(band, FRAC[i], x);
+        VX[i] = SPD[i] * bandBias[band];
+        VY[i] = 0;
+        PX[i] = x; PY[i] = y;
+        refillTrail(i);
+      } else {
+        if (y < -48) y = -48; else if (y > H + 48) y = H + 48;
+        PX[i] = x; PY[i] = y;
+      }
+    }
+    stepCount++;
+    if (stepCount % TRAIL_EVERY === 0) {
+      var head = (stepCount / TRAIL_EVERY) % TRAIL_N;
+      for (i = 0; i < N; i++) { TRX[i * TRAIL_N + head] = PX[i]; TRY[i * TRAIL_N + head] = PY[i]; }
+    }
+  }
+
+  // ================= drawing =================
+  function cellFill(wall, i, j) {
+    var t = wall.TONE[i * wall.NB + j];
+    var base = t === 2 ? SHADOW : (t === 1 ? STEEL : INDIGO);
+    if (wake && wake.wall === wall && wake.band === i && wake.col === j) {
+      var age = stepCount - wake.start;
+      if (age >= 0 && age < WAKE_STEPS) {
+        var env = sstep(age / 60) * (1 - sstep((age - 1680) / 720));
+        var target = t === 2 ? INDIGO : (t === 1 ? MULLION_RGB : STEEL);
+        return rgb(mixRgb(base, target, env * 0.85), 1);
+      }
+    }
+    return rgb(base, 1);
+  }
+
+  function draw() {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.fillStyle = GROUND;
+    ctx.fillRect(0, 0, W, H);
+    var w, i, j, k;
+
+    // facade cells, wall by wall
+    for (w = 0; w < 2; w++) {
+      var wall = WALLS[w], C = wall.CORN;
+      for (i = 0; i < NF; i++) {
+        for (j = 0; j < wall.NB; j++) {
+          var a = C[i][j], b = C[i][j + 1], c = C[i + 1][j + 1], d = C[i + 1][j];
+          ctx.fillStyle = cellFill(wall, i, j);
+          ctx.beginPath();
+          ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.lineTo(c.x, c.y); ctx.lineTo(d.x, d.y);
+          ctx.closePath(); ctx.fill();
+        }
+      }
+    }
+    // mullions: floor lines kink at the corner; bay lines run between the
+    // top and bottom floor lines of their wall; curved bays bow
+    ctx.strokeStyle = rgb(MULLION_RGB, 0.42);
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (i = 0; i <= NF; i++) {
+      ctx.moveTo(0, floorYAt(WALLS[0], i, 0));
+      ctx.lineTo(CX, floorYAt(WALLS[0], i, CX));
+      ctx.lineTo(W, floorYAt(WALLS[1], i, W));
+    }
+    for (w = 0; w < 2; w++) {
+      var wall2 = WALLS[w], C2 = wall2.CORN;
+      for (j = 0; j <= wall2.NB; j++) {
+        if (w === 1 && j === 0) continue;      // the corner edge is drawn by the left wall
+        var top = C2[0][j], bot = C2[NF][j];
+        if (wall2.curved[j] !== undefined) {
+          var dx = bot.x - top.x, dy = bot.y - top.y, len = Math.sqrt(dx * dx + dy * dy) || 1;
+          var cxp = (top.x + bot.x) / 2 + (-dy / len) * wall2.curved[j];
+          var cyp = (top.y + bot.y) / 2 + (dx / len) * wall2.curved[j];
+          ctx.moveTo(top.x, top.y); ctx.quadraticCurveTo(cxp, cyp, bot.x, bot.y);
+        } else {
+          ctx.moveTo(top.x, top.y); ctx.lineTo(bot.x, bot.y);
+        }
+      }
+    }
+    ctx.stroke();
+
+    // surge band: flat alpha slices, no gradient
+    var sg = surgeInfo();
+    if (sg.on) {
+      var sliceW = 0.05 * W;
+      for (k = -2; k <= 2; k++) {
+        ctx.fillStyle = 'rgba(255,255,255,' + (0.055 * (1 - Math.abs(k) / 3)).toFixed(3) + ')';
+        ctx.fillRect(sg.x + k * sliceW, 0, sliceW, H);
+      }
+    }
+
+    // paint: trails in two alpha bands, then heads
+    var head = ((stepCount / TRAIL_EVERY) | 0) % TRAIL_N;
+    var lw = clamp(MIN_DIM / 900, 0.7, 1.3) * 1.6;
+    ctx.lineWidth = lw;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    var bands = [[15, 8, 0.10], [7, 0, 0.24]];
+    var p, age, slot;
+    for (var b = 0; b < 2; b++) {
+      var aFrom = bands[b][0], aTo = bands[b][1], alpha = bands[b][2];
+      for (p = 0; p < N; p++) {
+        var col = PAINT[HUE[p]];
+        ctx.strokeStyle = rgb(col, alpha);
+        ctx.beginPath();
+        for (age = aFrom; age >= aTo; age--) {
+          slot = (head - age + TRAIL_N * 2) % TRAIL_N;
+          var sx = TRX[p * TRAIL_N + slot], sy = TRY[p * TRAIL_N + slot];
+          if (age === aFrom) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
+        }
+        ctx.stroke();
+      }
+    }
+    var hs = clamp(MIN_DIM / 900, 0.7, 1.25) * 2.4;
+    for (p = 0; p < N; p++) {
+      ctx.fillStyle = rgb(PAINT[HUE[p]], 0.72 + 0.28 * POOL[p]);
+      ctx.fillRect(PX[p] - hs / 2, PY[p] - hs / 2, hs, hs);
+    }
+  }
+
+  // ================= audio (lazy, guarded, silent in QA) =================
+  var AC = (typeof AudioContext !== 'undefined') ? AudioContext
+         : ((typeof webkitAudioContext !== 'undefined') ? webkitAudioContext : null);
+  var ac = null, humGain = null, humFilter = null, noiseGain = null, noisePan = null;
+  function ensureAudio() {
+    if (!AC || ac) return;
+    try {
+      ac = new AC();
+      var master = ac.createGain(); master.gain.value = 0.9; master.connect(ac.destination);
+      humFilter = ac.createBiquadFilter(); humFilter.type = 'lowpass'; humFilter.frequency.value = 180;
+      humGain = ac.createGain(); humGain.gain.value = 0.035;
+      humFilter.connect(humGain); humGain.connect(master);
+      var o1 = ac.createOscillator(); o1.type = 'sine'; o1.frequency.value = 46;
+      var o2 = ac.createOscillator(); o2.type = 'sine'; o2.frequency.value = 92.7;
+      o1.connect(humFilter); o2.connect(humFilter); o1.start(); o2.start();
+      var len = 2 * ac.sampleRate;
+      var buf = ac.createBuffer(1, len, ac.sampleRate);
+      var data = buf.getChannelData(0);
+      for (var i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
+      var src = ac.createBufferSource(); src.buffer = buf; src.loop = true;
+      var bp = ac.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 640; bp.Q.value = 0.8;
+      noiseGain = ac.createGain(); noiseGain.gain.value = 0;
+      src.connect(bp); bp.connect(noiseGain);
+      if (typeof StereoPannerNode !== 'undefined' && ac.createStereoPanner) {
+        noisePan = ac.createStereoPanner(); noiseGain.connect(noisePan); noisePan.connect(master);
+      } else {
+        noiseGain.connect(master);
+      }
+      src.start();
+    } catch (err) { ac = null; }
+  }
+  function audioTick() {
+    if (!ac) return;
+    try {
+      var t = ac.currentTime;
+      var sg = surgeInfo();
+      noiseGain.gain.setTargetAtTime(sg.on ? 0.075 : 0.028, t, 0.4);
+      humFilter.frequency.setTargetAtTime(170 + (sg.on ? 130 : 0) + 18 * Math.sin(stepCount * DT * 0.5), t, 0.5);
+      if (noisePan) {
+        var pan = sg.on ? clamp((sg.x / W) * 2 - 1, -1, 1) * 0.7 : 0.3 * Math.sin(stepCount * DT * 0.07);
+        noisePan.pan.setTargetAtTime(pan, t, 0.3);
+      }
+      if (ac.resume && ac.state === 'suspended') ac.resume();
+    } catch (err) { /* audio is decoration; stay silent */ }
+  }
+
+  // ================= pointer input (recorded as sim events) =================
+  var downInfo = null;
+  function onDown(e) {
+    ensureAudio();
+    downInfo = { x: e.clientX, y: e.clientY, step: stepCount, moved: false, lx: e.clientX, ly: e.clientY };
+  }
+  function onMove(e) {
+    if (!downInfo) return;
+    var dx = e.clientX - downInfo.lx, dy = e.clientY - downInfo.ly;
+    downInfo.lx = e.clientX; downInfo.ly = e.clientY;
+    if (Math.abs(e.clientX - downInfo.x) + Math.abs(e.clientY - downInfo.y) > 8) downInfo.moved = true;
+    if (downInfo.moved && (dx !== 0 || dy !== 0)) {
+      events.push({ step: stepCount, type: 'wind', x: e.clientX, y: e.clientY, dx: dx, dy: dy });
+    }
+  }
+  function onUp(e) {
+    if (!downInfo) return;
+    if (downInfo.moved) {
+      events.push({ step: stepCount, type: 'windEnd' });
+    } else if (stepCount - downInfo.step < 36) {
+      events.push({ step: stepCount, type: 'tap', x: downInfo.x, y: downInfo.y });
+    }
+    downInfo = null;
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+  }
+
+  // ================= layout / init =================
+  function readSize() {
+    var w, h;
+    if (window.visualViewport && window.visualViewport.width) {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    } else { w = window.innerWidth; h = window.innerHeight; }
+    return [Math.max(50, Math.floor(w)), Math.max(50, Math.floor(h))];
+  }
+  function detectPhone() {
+    if (window.screen && window.screen.width) {
+      return Math.min(window.screen.width, window.screen.height) < 700;
+    }
+    return H > W * 1.15;
+  }
+  function init() {
+    var sz = readSize();
+    W = sz[0]; H = sz[1]; MIN_DIM = Math.min(W, H);
+    canvas.width = W; canvas.height = H;
+    PHONE = detectPhone();
+    N = PHONE ? 2000 : 3000;
+    stepCount = 0;
+    events = []; pendingTap = null; wind = null; wake = null; genIndex = 0;
+    buildFacade();          // the building first, from its own master seed
+    initParticles();
+    reseedPaint(0);         // paint generation 0; the facade is already fixed
+    for (var i = 0; i < PREROLL; i++) stepSim();
+    draw();
+  }
+  var resizeTimer = null;
+  function onResize() {
+    if (resizeTimer) clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(function () {
+      var sz = readSize();
+      if (sz[0] !== W || sz[1] !== H) init();
+    }, 120);
+  }
+  if (window.addEventListener) window.addEventListener('resize', onResize);
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', onResize);
+  }
+
+  init();
+
+  // ---- live loop: rAF typeof-guarded; frame one above is synchronous ----
+  var lastTs = -1, acc = 0;
+  function frame(ts) {
+    if (lastTs < 0) lastTs = ts;
+    var el = ts - lastTs; lastTs = ts;
+    if (el > 250) el = 250;
+    acc += el;
+    var steps = Math.floor(acc / (1000 / 120));
+    acc -= steps * (1000 / 120);
+    if (steps > 480) steps = 480;
+    for (var s = 0; s < steps; s++) stepSim();
+    if (steps > 0) draw();
+    audioTick();
+    requestAnimationFrame(frame);
+  }
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

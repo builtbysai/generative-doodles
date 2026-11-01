@@ -1,0 +1,561 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Seventy Heartbeats, One Painting</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0A0508; height: 100%; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="hearts"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ------- palette (strict) -------
+  var FIELD = '#0A0508';
+  var C_REST = [42, 10, 18];       // #2A0A12 rest maroon
+  var C_EMBER = [255, 122, 61];    // #FF7A3D mid ignition
+  var C_IGN = [255, 217, 160];     // #FFD9A0 ignited
+  var C_WARM = [255, 232, 214];    // #FFE8D6 aligned flare
+  var RING = '#FF2244';            // pulse red
+  var WARM_CSS = '#FFE8D6';
+
+  var SEED = 949110;
+  var STEP = 1 / 120;              // fixed timestep, 120 Hz
+  var PREROLL = 2400;              // exactly 20 s of sim before frame one
+  var NVISIT = 17;                 // seeded visitors
+  var MAXVISIT = 24;               // hard cap incl. your heart
+  var RING_LIFE = 2.5;             // s for a ring to expand and fade
+  var RING_MAX = 0.19;             // max ring radius, in S units (~137 px at S=720)
+  var BAND = 0.035;                // ignition band half-width around a ring front
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+  function lerp(a, b, t) { return a + (b - a) * t; }
+
+  var canvas = document.getElementById('hearts');
+  var ctx = canvas.getContext('2d');
+
+  var W = 720, H = 720, S = 720, XR = 1, YR = 1, PHONE = false;
+  var sim = null;
+
+  function viewSize() {
+    var w = 720, h = 720;
+    try {
+      if (window.visualViewport && window.visualViewport.width) {
+        w = window.visualViewport.width; h = window.visualViewport.height;
+      } else if (window.innerWidth) { w = window.innerWidth; h = window.innerHeight; }
+    } catch (e) {}
+    return [Math.max(60, Math.floor(w)), Math.max(60, Math.floor(h))];
+  }
+  function detectPhone(w, h) {
+    var m = 0;
+    try { if (window.screen) m = Math.min(window.screen.width || 0, window.screen.height || 0); } catch (e) {}
+    if (m > 0) return m < 700;
+    return h > w * 1.15;
+  }
+
+  // ------- visitors -------
+  function makeVisitor(rng, xr, yr, addedSeq) {
+    return {
+      x: 0, y: 0,                            // S-space, set by caller
+      bpm: 58 + rng() * 34,                  // 58..92
+      phase: rng() * Math.PI * 2,
+      scale: 0.97 + rng() * 0.06,            // per-beat jitter factor
+      rng: rng,                              // own stream: beat jitter
+      fade: 1, fadeTarget: 1, fadeStep: -1,  // fadeStep = step when fade motion begins
+      addedSeq: addedSeq || 0,               // 0 = original crowd
+      yours: false
+    };
+  }
+  function placeVisitors(rng, list, xr, yr) {
+    // rejection-sample centers with a minimum separation so rings overlap mid-field
+    // without stacking on one point
+    for (var i = 0; i < list.length; i++) {
+      var bx = 0, by = 0, best = -1;
+      for (var a = 0; a < 40; a++) {
+        var x = 0.08 + rng() * 0.84, y = 0.10 + rng() * 0.80;
+        var px = x * xr, py = y * yr;
+        var md = 1e9;
+        for (var j = 0; j < list.length; j++) {
+          if (list[j].x === 0 && list[j].y === 0) continue;
+          var dx = list[j].x - px, dy = list[j].y - py;
+          var d = Math.sqrt(dx * dx + dy * dy);
+          if (d < md) md = d;
+        }
+        if (md > best) { best = md; bx = px; by = py; }
+        if (md > 0.17) break;
+      }
+      list[i].x = bx; list[i].y = by;
+    }
+  }
+  function makeCrowd(rng, xr, yr) {
+    var list = [];
+    for (var i = 0; i < NVISIT; i++) list.push(makeVisitor(rng, xr, yr, 0));
+    placeVisitors(rng, list, xr, yr);
+    return list;
+  }
+
+  // ------- sim -------
+  function makeSim() {
+    var rng = mulberry32(SEED);
+    var s = {
+      step: 0,
+      gen: 0,
+      visitors: makeCrowd(rng, XR, YR),
+      rings: [],               // {x, y, birth (step)}
+      events: [],              // {step, type, ...} consumed in step order
+      sfx: [],                 // beat notifications for the audio layer
+      R: 0, RTrend: 0,
+      rHist: new Float32Array(1200), rIdx: 0, rCount: 0,
+      welcomeStep: -1,
+      addSeq: 0
+    };
+    return s;
+  }
+
+  function activeVisitors(s) {
+    var out = [];
+    for (var i = 0; i < s.visitors.length; i++) {
+      if (s.visitors[i].fade > 0.5) out.push(s.visitors[i]);
+    }
+    return out;
+  }
+
+  function applyEvent(s, ev) {
+    var i, v;
+    if (ev.type === 'addHeart') {
+      s.addSeq++;
+      v = makeVisitor(mulberry32(SEED + 5000 + s.addSeq * 131), XR, YR, s.addSeq);
+      v.x = ev.x; v.y = ev.y; v.bpm = ev.bpm; v.yours = true;
+      v.phase = 0;             // your heart starts on the beat you gave it
+      s.visitors.push(v);
+      s.welcomeStep = s.step + 480;   // strip flashes welcome for 4 s
+      // cap: fade the oldest added visitor (never an original, never the new one)
+      var act = activeVisitors(s);
+      if (act.length > MAXVISIT) {
+        var oldest = null;
+        for (i = 0; i < s.visitors.length; i++) {
+          var u = s.visitors[i];
+          if (u.addedSeq > 0 && u !== v && u.fadeTarget === 1) {
+            if (!oldest || u.addedSeq < oldest.addedSeq) oldest = u;
+          }
+        }
+        if (oldest) { oldest.fadeTarget = 0; oldest.fadeStep = s.step; }
+      }
+    } else if (ev.type === 'reseed') {
+      // old crowd fades one by one over ~6 s; a fresh crowd fades in behind it
+      for (i = 0; i < s.visitors.length; i++) {
+        v = s.visitors[i];
+        if (v.fadeTarget === 1) { v.fadeTarget = 0; v.fadeStep = s.step + i * 30; }
+      }
+      s.gen++;
+      var fresh = makeCrowd(mulberry32(SEED + s.gen * 7919), XR, YR);
+      for (i = 0; i < fresh.length; i++) {
+        fresh[i].fade = 0; fresh[i].fadeTarget = 1;
+        fresh[i].fadeStep = s.step + 90 + i * 24;
+        s.visitors.push(fresh[i]);
+      }
+    }
+  }
+
+  function stepSim(s) {
+    var t = s.step * STEP;
+    // consume due events in order
+    while (s.events.length && s.events[0].step <= s.step) applyEvent(s, s.events.shift());
+
+    // coupling strength: waxes and wanes on a ~120 s cycle (the collective mood)
+    var K = 1.6 + 1.3 * Math.sin(2 * Math.PI * t / 120 - Math.PI / 2);
+
+    // circular mean over the audible crowd
+    var act = activeVisitors(s);
+    var Sx = 0, Sy = 0, i, v;
+    for (i = 0; i < act.length; i++) { Sx += Math.cos(act[i].phase); Sy += Math.sin(act[i].phase); }
+    var n = Math.max(1, act.length);
+    s.R = Math.sqrt(Sx * Sx + Sy * Sy) / n;
+    s.rHist[s.rIdx] = s.R; s.rIdx = (s.rIdx + 1) % s.rHist.length;
+    if (s.rCount < s.rHist.length) s.rCount++;
+    if (s.rCount > 360) {
+      var past = s.rHist[(s.rIdx - 360 + s.rHist.length * 2) % s.rHist.length];
+      s.RTrend = s.R - past;
+    } else s.RTrend = 0;
+
+    // advance phases: own rate (with per-beat jitter scale) + Kuramoto pull to the mean
+    for (i = 0; i < act.length; i++) {
+      v = act[i];
+      var pull = (Sy * Math.cos(v.phase) - Sx * Math.sin(v.phase)) / n; // R*sin(mean - phase)
+      var dphi = (2 * Math.PI * v.bpm / 60) * v.scale * STEP + K * pull * STEP;
+      v.phase += dphi;
+      if (v.phase >= Math.PI * 2) {
+        v.phase -= Math.PI * 2;
+        v.scale = 0.97 + v.rng() * 0.06;      // organic jitter: next beat early or late
+        s.rings.push({ x: v.x, y: v.y, birth: s.step });
+        s.sfx.push({ x: v.x, y: v.y, yours: v.yours });
+      }
+    }
+
+    // fades
+    for (i = 0; i < s.visitors.length; i++) {
+      v = s.visitors[i];
+      if (v.fadeStep >= 0 && s.step >= v.fadeStep && v.fade !== v.fadeTarget) {
+        var dir = v.fadeTarget > v.fade ? 1 : -1;
+        v.fade = clamp(v.fade + dir * STEP / 1.2, 0, 1);
+      }
+    }
+    // drop the fully faded-out
+    for (i = s.visitors.length - 1; i >= 0; i--) {
+      v = s.visitors[i];
+      if (v.fade <= 0 && v.fadeTarget === 0) s.visitors.splice(i, 1);
+    }
+
+    // prune dead rings
+    var maxAge = RING_LIFE / STEP;
+    while (s.rings.length && s.step - s.rings[0].birth > maxAge) s.rings.shift();
+
+    s.step++;
+  }
+
+  function ringRadius(ageSteps) {
+    var u = clamp(ageSteps * STEP / RING_LIFE, 0, 1);
+    return RING_MAX * (1 - (1 - u) * (1 - u));
+  }
+  function statePhrase(s) {
+    if (s.R >= 0.85) return 'in unison';
+    if (s.RTrend < -0.015 && s.R >= 0.35) return 'drifting apart';
+    if (s.R >= 0.60) return 'nearly one heart';
+    if (s.R >= 0.35) return 'drifting toward unison';
+    return 'scattered';
+  }
+
+  // ------- particles -------
+  var particles = [];   // {x, y} in S-space, rebuilt per layout
+  function buildParticles() {
+    var rng = mulberry32(SEED + 42);
+    var target = PHONE ? 1400 : 2000;
+    var nx = Math.max(8, Math.round(Math.sqrt(target * XR / YR)));
+    var ny = Math.max(8, Math.ceil(target / nx));
+    particles = [];
+    for (var gy = 0; gy < ny; gy++) {
+      for (var gx = 0; gx < nx; gx++) {
+        particles.push({
+          x: (gx + 0.5 + (rng() - 0.5) * 0.8) / nx * XR,
+          y: (gy + 0.5 + (rng() - 0.5) * 0.8) / ny * YR
+        });
+      }
+    }
+  }
+
+  // ignition colour table, 33 levels over I in [0, 2]
+  var colTable = [];
+  (function () {
+    function mix(a, b, t) { return [lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t)]; }
+    for (var i = 0; i <= 32; i++) {
+      var I = i / 32 * 2, c = C_REST;
+      c = mix(c, C_EMBER, clamp(I / 0.6, 0, 1));
+      c = mix(c, C_IGN, clamp((I - 0.6) / 0.7, 0, 1));
+      c = mix(c, C_WARM, clamp((I - 1.3) / 0.7, 0, 1));
+      colTable.push('rgb(' + Math.round(c[0]) + ',' + Math.round(c[1]) + ',' + Math.round(c[2]) + ')');
+    }
+  })();
+
+  // ------- interaction state (event layer) -------
+  var pendingTaps = [];        // {step, x, y} in S-space
+  var downInfo = null;         // current pointer press
+  var dragging = false;        // breath-hold drag in progress
+  var timeScale = 1;           // eased by the frame loop
+
+  function pushEvent(ev) {
+    ev.step = sim ? sim.step : 0;
+    if (sim) {
+      // keep the queue ordered by step
+      var i = sim.events.length;
+      while (i > 0 && sim.events[i - 1].step > ev.step) i--;
+      sim.events.splice(i, 0, ev);
+    }
+  }
+  function classifyTaps() {
+    if (!sim || !pendingTaps.length) return;
+    var now = sim.step;
+    var n = pendingTaps.length;
+    // (a) tempo: last 4+ taps regular -> your heart joins
+    if (n >= 4) {
+      var iv = [], ok = true, mean = 0;
+      for (var i = n - 3; i < n; i++) iv.push(pendingTaps[i].step - pendingTaps[i - 1].step);
+      for (i = 0; i < iv.length; i++) {
+        if (iv[i] < 36 || iv[i] > 144) { ok = false; break; }   // 300..1200 ms
+        mean += iv[i];
+      }
+      mean /= iv.length;
+      if (ok) {
+        for (i = 0; i < iv.length; i++) {
+          if (Math.abs(iv[i] - mean) > 0.45 * mean) { ok = false; break; }
+        }
+      }
+      if (ok) {
+        var bpm = clamp(60000 / (mean * STEP * 1000), 40, 180);
+        var last = pendingTaps[n - 1];
+        pushEvent({ type: 'addHeart', x: last.x, y: last.y, bpm: bpm });
+        pendingTaps.length = 0;
+        return;
+      }
+    }
+    // (b) clean double-tap: exactly 2 taps < 300 ms apart, no third within 700 ms
+    if (n === 2) {
+      var gap = pendingTaps[1].step - pendingTaps[0].step;
+      if (gap < 36 && now - pendingTaps[1].step > 84) {
+        pushEvent({ type: 'reseed' });
+        pendingTaps.length = 0;
+        return;
+      }
+      if (gap >= 36 && now - pendingTaps[1].step > 156) pendingTaps.length = 0;
+      return;
+    }
+    // (c) anything else ages out: just the catch-dot, no state change
+    if (now - pendingTaps[n - 1].step > 156) pendingTaps.length = 0;
+  }
+
+  function pointerPos(e) {
+    var r = null;
+    try { r = canvas.getBoundingClientRect(); } catch (err) {}
+    var cx = (e.clientX != null ? e.clientX : 0) - (r ? r.left : 0);
+    var cy = (e.clientY != null ? e.clientY : 0) - (r ? r.top : 0);
+    return [cx / S, cy / S];
+  }
+
+  // ------- audio (lazy, gesture-gated, guarded) -------
+  var actx = null, masterGain = null;
+  function ensureAudio() {
+    if (actx) return;
+    try {
+      var AC = (typeof window !== 'undefined') && (window.AudioContext || window.webkitAudioContext);
+      if (!AC) return;
+      actx = new AC();
+      masterGain = actx.createGain();
+      masterGain.gain.value = 0.5;
+      masterGain.connect(actx.destination);
+    } catch (e) { actx = null; }
+  }
+  function thump() {
+    if (!actx || !masterGain) return;
+    try {
+      var t0 = actx.currentTime;
+      var o = actx.createOscillator(), g = actx.createGain();
+      o.type = 'sine';
+      o.frequency.setValueAtTime(56, t0);
+      o.frequency.exponentialRampToValueAtTime(38, t0 + 0.16);
+      g.gain.setValueAtTime(0.20, t0);
+      g.gain.exponentialRampToValueAtTime(0.001, t0 + 0.20);
+      o.connect(g); g.connect(masterGain);
+      o.start(t0); o.stop(t0 + 0.22);
+    } catch (e) {}
+  }
+  function drainSfx() {
+    if (!sim) return;
+    var beats = sim.sfx;
+    sim.sfx = [];
+    if (!actx || !beats.length) return;
+    try { if (actx.state === 'suspended') actx.resume(); } catch (e) {}
+    // throttle: your heart always sounds; of the rest only the ~6 nearest the centre
+    var cx = XR / 2, cy = YR / 2;
+    beats.sort(function (a, b) {
+      var da = (a.x - cx) * (a.x - cx) + (a.y - cy) * (a.y - cy);
+      var db = (b.x - cx) * (b.x - cx) + (b.y - cy) * (b.y - cy);
+      return (a.yours ? -1e9 : da) - (b.yours ? -1e9 : db);
+    });
+    var lim = Math.min(beats.length, 7);
+    for (var i = 0; i < lim; i++) thump();
+    try { masterGain.gain.value = 0.40 + 0.35 * sim.R; } catch (e) {}
+  }
+
+  // ------- draw -------
+  function draw() {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.fillStyle = FIELD;
+    ctx.fillRect(0, 0, W, H);
+    if (!sim) return;
+    var s = sim;
+    var t = s.step * STEP;
+    var pscale = clamp(S / 720, 0.85, 1.6);
+
+    // particles, ignited by ring fronts
+    var rings = s.rings;
+    var nr = rings.length;
+    var radii = new Float32Array(nr), alphas = new Float32Array(nr);
+    for (var ri = 0; ri < nr; ri++) {
+      var age = s.step - rings[ri].birth;
+      radii[ri] = ringRadius(age);
+      alphas[ri] = 1 - clamp(age * STEP / RING_LIFE, 0, 1);
+    }
+    ctx.globalAlpha = 1;
+    for (var pi = 0; pi < particles.length; pi++) {
+      var p = particles[pi];
+      var I = 0;
+      for (var rj = 0; rj < nr; rj++) {
+        var dx = p.x - rings[rj].x, dy = p.y - rings[rj].y;
+        var d = Math.sqrt(dx * dx + dy * dy);
+        var prox = 1 - Math.abs(d - radii[rj]) / BAND;
+        if (prox > 0) I += prox * (0.25 + 0.75 * alphas[rj]);
+      }
+      var lvl = clamp(Math.round(I / 2 * 32), 0, 32);
+      ctx.fillStyle = colTable[lvl];
+      ctx.globalAlpha = 0.6 + 0.4 * clamp(I, 0, 1);
+      var sz = (1.7 + 1.8 * clamp(I, 0, 1.5) / 1.5) * pscale;
+      ctx.fillRect(p.x * S - sz / 2, p.y * S - sz / 2, sz, sz);
+    }
+
+    // rings
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = RING;
+    for (var rk = 0; rk < nr; rk++) {
+      var u = clamp((s.step - rings[rk].birth) * STEP / RING_LIFE, 0, 1);
+      ctx.globalAlpha = (1 - u) * 0.50;
+      ctx.lineWidth = (2.2 - 1.1 * u) * pscale;
+      ctx.beginPath();
+      ctx.arc(rings[rk].x * S, rings[rk].y * S, radii[rk] * S, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+
+    // visitor centres: a soft pulse riding each phase, spiking just after its beat
+    for (var vi = 0; vi < s.visitors.length; vi++) {
+      var v = s.visitors[vi];
+      if (v.fade <= 0.05) continue;
+      var frac = v.phase / (Math.PI * 2);
+      var pulse = Math.pow(1 - frac, 6);
+      ctx.globalAlpha = v.fade * (0.45 + 0.55 * pulse);
+      ctx.fillStyle = v.yours ? WARM_CSS : '#FF7A3D';
+      var cr = (2.0 + 2.4 * pulse) * pscale;
+      ctx.beginPath();
+      ctx.arc(v.x * S, v.y * S, cr, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // catch-dot while a tap sequence is being collected
+    if (pendingTaps.length) {
+      var last = pendingTaps[pendingTaps.length - 1];
+      var cp = 0.5 + 0.5 * Math.sin(t * 6);
+      ctx.globalAlpha = 0.85;
+      ctx.fillStyle = WARM_CSS;
+      ctx.beginPath();
+      ctx.arc(last.x * S, last.y * S, (2.4 + 1.2 * cp) * pscale, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 0.4 + 0.3 * cp;
+      ctx.strokeStyle = WARM_CSS;
+      ctx.lineWidth = 1.2 * pscale;
+      ctx.beginPath();
+      ctx.arc(last.x * S, last.y * S, (7 + 3 * cp) * pscale, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+
+    // strip: the collective, counted honestly
+    var count = activeVisitors(s).length;
+    var txt;
+    if (s.welcomeStep >= 0 && s.step <= s.welcomeStep) txt = count + ' hearts · welcome';
+    else txt = count + ' hearts · ' + statePhrase(s);
+    ctx.globalAlpha = 0.92;
+    ctx.fillStyle = WARM_CSS;
+    var fs = clamp(S * 0.020, 11, 16);
+    ctx.font = '600 ' + fs + 'px Verdana, Geneva, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillText(txt, W / 2, H - fs * 0.9);
+    ctx.globalAlpha = 1;
+  }
+
+  // ------- pointer wiring -------
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', function (e) {
+      ensureAudio();
+      var p = pointerPos(e);
+      downInfo = { x: p[0], y: p[1], moved: false };
+      dragging = false;
+    });
+    canvas.addEventListener('pointermove', function (e) {
+      if (!downInfo) return;
+      var p = pointerPos(e);
+      var dx = p[0] - downInfo.x, dy = p[1] - downInfo.y;
+      if (!downInfo.moved && Math.sqrt(dx * dx + dy * dy) > 12 / S) {
+        downInfo.moved = true;
+        dragging = true;      // hold a breath
+      }
+    });
+    var endPointer = function (e) {
+      if (!downInfo) return;
+      if (!downInfo.moved && sim) {
+        pendingTaps.push({ step: sim.step, x: downInfo.x, y: downInfo.y });
+        classifyTaps();
+      }
+      downInfo = null;
+      dragging = false;
+    };
+    canvas.addEventListener('pointerup', endPointer);
+    canvas.addEventListener('pointercancel', function () { downInfo = null; dragging = false; });
+  }
+
+  // ------- lifecycle -------
+  function init(w, h) {
+    W = w; H = h; S = Math.min(w, h); XR = w / S; YR = h / S;
+    PHONE = detectPhone(w, h);
+    canvas.width = w;
+    canvas.height = h;
+    buildParticles();
+    sim = makeSim();
+    for (var i = 0; i < PREROLL; i++) stepSim(sim);
+    sim.sfx.length = 0;
+    pendingTaps.length = 0;
+    draw();
+  }
+  function relayout() {
+    var sz = viewSize();
+    if (Math.abs(sz[0] - W) > 2 || Math.abs(sz[1] - H) > 2) init(sz[0], sz[1]);
+  }
+  try { window.addEventListener('resize', relayout); } catch (e) {}
+  try {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', relayout);
+    }
+  } catch (e) {}
+
+  var sz0 = viewSize();
+  init(sz0[0], sz0[1]);
+
+  var raf = (typeof requestAnimationFrame === 'function') ? requestAnimationFrame : null;
+  if (raf) {
+    var acc = 0, lastTs = null;
+    var frame = function (ts) {
+      if (lastTs === null) lastTs = ts;
+      var dt = (ts - lastTs) / 1000;
+      lastTs = ts;
+      if (dt > 0.25) dt = 0.25;
+      if (dt < 0) dt = 0;
+      // breath: time dips toward 0.3 while dragging, eases back over ~2 s after release
+      var target = dragging ? 0.3 : 1;
+      var rate = target < timeScale ? 4.0 : 1.4;
+      timeScale += (target - timeScale) * (1 - Math.exp(-dt * rate));
+      acc += dt * timeScale;
+      var n = Math.floor(acc / STEP);
+      acc -= n * STEP;
+      if (n > 30) { n = 30; acc = 0; }
+      for (var i = 0; i < n; i++) stepSim(sim);
+      classifyTaps();
+      drainSfx();
+      draw();
+      raf(frame);
+    };
+    raf(frame);
+  }
+})();
+</script>
+</body>
+</html>

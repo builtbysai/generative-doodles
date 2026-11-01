@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sixteen Forests, One Canopy</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #06140B; height: 100%; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="canopy"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // Palette (strict)
+  var LEAF  = [45, 255, 143];    // #2DFF8F
+  var DEEP  = [15, 203, 106];    // #0FCB6A
+  var GOLD  = [255, 209, 102];   // #FFD166
+  var FLOOR = '#06140B';
+  var STORM = '#0A2A1A';
+  var MISTC = '191,255,217';     // #BFFFD9
+
+  var SEED = 951112;
+  var STEP = 1 / 120;            // fixed timestep, 120 Hz
+  var PREROLL = 3000;            // 25 s of weather before frame one
+  var LEAVES_DESKTOP = 3200, LEAVES_PHONE = 2200;
+  var MIST_DESKTOP = 300, MIST_PHONE = 200;
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function hash1(i, s) {
+    var h = Math.imul(i, 374761393) ^ Math.imul(s, 668265263);
+    h = Math.imul(h ^ (h >>> 13), 1274126177);
+    return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+  }
+  function hash2(ix, iy, s) {
+    var h = Math.imul(ix, 374761393) ^ Math.imul(iy, 668265263) ^ Math.imul(s, 974634211);
+    h = Math.imul(h ^ (h >>> 13), 1274126177);
+    return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+  }
+  // 1D value noise, deterministic in t
+  function vn1(x, s) {
+    var i = Math.floor(x), f = x - i;
+    var u = f * f * (3 - 2 * f);
+    var a = hash1(i, s), b = hash1(i + 1, s);
+    return a + (b - a) * u;
+  }
+  // 2D value noise
+  function vn2(x, y, s) {
+    var ix = Math.floor(x), iy = Math.floor(y);
+    var fx = x - ix, fy = y - iy;
+    var sx = fx * fx * (3 - 2 * fx), sy = fy * fy * (3 - 2 * fy);
+    var a = hash2(ix, iy, s), b = hash2(ix + 1, iy, s);
+    var c = hash2(ix, iy + 1, s), d = hash2(ix + 1, iy + 1, s);
+    return a + (b - a) * sx + (c - a) * sy + (a - b - c + d) * sx * sy;
+  }
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+  function clamp01(v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
+  function lerp(a, b, u) { return a + (b - a) * u; }
+  function sstep(u) { u = clamp01(u); return u * u * (3 - 2 * u); }
+  function mixc(c1, c2, u) {
+    return 'rgb(' + Math.round(lerp(c1[0], c2[0], u)) + ',' +
+                    Math.round(lerp(c1[1], c2[1], u)) + ',' +
+                    Math.round(lerp(c1[2], c2[2], u)) + ')';
+  }
+  // Brightness palette: 0..0.85 deep->leaf, 0.85..1.35 leaf->gold. 27 stops.
+  var PAL = [];
+  (function () {
+    for (var i = 0; i <= 26; i++) {
+      var b = i / 26 * 1.35;
+      if (b <= 0.85) PAL.push(mixc(DEEP, LEAF, b / 0.85));
+      else PAL.push(mixc(LEAF, GOLD, (b - 0.85) / 0.5));
+    }
+  })();
+
+  var canvas = document.getElementById('canopy');
+  var ctx = canvas.getContext('2d');
+
+  var W = 720, H = 720, PHONE = false;
+  var sim = null;
+
+  function viewSize() {
+    var w = 720, h = 720;
+    try {
+      if (window.visualViewport && window.visualViewport.width) {
+        w = window.visualViewport.width; h = window.visualViewport.height;
+      } else if (window.innerWidth) { w = window.innerWidth; h = window.innerHeight; }
+    } catch (e) {}
+    return [Math.max(60, Math.floor(w)), Math.max(60, Math.floor(h))];
+  }
+  function detectPhone(w, h) {
+    var m = 0;
+    try { if (window.screen) m = Math.min(window.screen.width || 0, window.screen.height || 0); } catch (e) {}
+    if (m > 0) return m < 700;
+    return h > w * 1.15;
+  }
+
+  // ---------- weather ----------
+  function makeWeatherParams(rng) {
+    return {
+      phH: rng() * 100, phL: rng() * 100, phT: rng() * 100,
+      bH: (rng() - 0.5) * 0.26, bL: (rng() - 0.5) * 0.22, bT: (rng() - 0.5) * 0.22
+    };
+  }
+  function channelRaw(p, t, out) {
+    out.hum   = clamp01(0.33 + p.bH + 0.52 * vn1(t / 75 + p.phH, 11));
+    out.light = clamp01(0.28 + p.bL + 0.52 * vn1(t / 58 + p.phL, 23));
+    out.temp  = clamp01(0.38 + p.bT + 0.42 * vn1(t / 105 + p.phT, 37));
+  }
+  var _ca = { hum: 0, light: 0, temp: 0 }, _cb = { hum: 0, light: 0, temp: 0 };
+
+  // Storm envelope + state at time t. Schedule fixed at build (seeded).
+  function stormAt(t) {
+    var starts = sim.stormStarts, e = 0, state = 'CALM', i, S, ph;
+    var lastEnd = -1e9;
+    for (i = 0; i < starts.length; i++) {
+      S = starts[i];
+      if (t < S) break;
+      if (t <= S + 48) {
+        ph = t - S;
+        if (ph < 8) { e = sstep(ph / 8); state = 'STORM BUILDING'; }
+        else { e = Math.max(0, 1 - (ph - 8) / 40); state = 'STORM PASSING'; }
+        return { e: e, state: state };
+      }
+      lastEnd = S + 48;
+    }
+    if (t - lastEnd < 40) state = 'CLEARING';
+    return { e: 0, state: state };
+  }
+
+  function weatherAt(t, out) {
+    channelRaw(sim.wpFrom, t, _ca);
+    if (sim.retuneT > -1e8 && t < sim.retuneT + 30) {
+      channelRaw(sim.wpTo, t, _cb);
+      var u = sstep((t - sim.retuneT) / 30);
+      out.hum = lerp(_ca.hum, _cb.hum, u);
+      out.light = lerp(_ca.light, _cb.light, u);
+      out.temp = lerp(_ca.temp, _cb.temp, u);
+    } else if (sim.retuneT > -1e8) {
+      channelRaw(sim.wpTo, t, out);
+    } else {
+      out.hum = _ca.hum; out.light = _ca.light; out.temp = _ca.temp;
+    }
+    var st = stormAt(t);
+    out.churn = st.e;
+    out.state = st.state;
+    out.hum = clamp01(out.hum + 0.5 * st.e * (1 - out.hum));
+    out.light = out.light * (1 - 0.55 * st.e);
+    return out;
+  }
+
+  // ---------- sim ----------
+  function makeSim(w, h, phone) {
+    var rng = mulberry32(SEED);
+    var nL = phone ? LEAVES_PHONE : LEAVES_DESKTOP;
+    var nM = phone ? MIST_PHONE : MIST_DESKTOP;
+    var s = {
+      steps: 0, t: 0,
+      nL: nL, nM: nM,
+      x: new Float32Array(nL), y: new Float32Array(nL),
+      vx: new Float32Array(nL), vy: new Float32Array(nL),
+      ax: new Float32Array(nL), ay: new Float32Array(nL),
+      ohF: new Float32Array(nL), olF: new Float32Array(nL), otF: new Float32Array(nL),
+      ohT: new Float32Array(nL), olT: new Float32Array(nL), otT: new Float32Array(nL),
+      sz: new Float32Array(nL), ph: new Float32Array(nL),
+      mx: new Float32Array(nM), my: new Float32Array(nM),
+      mvx: new Float32Array(nM), mph: new Float32Array(nM),
+      cols: [], stormStarts: [],
+      wpFrom: null, wpTo: null, retuneT: -1e9,
+      clearings: [],           // {t, x, y, r}
+      gust: null,              // {t, x, y, dx, dy}
+      wx: { hum: 0, light: 0, temp: 0, churn: 0, state: 'CALM' },
+      regime: 0
+    };
+    var i;
+    for (i = 0; i < nL; i++) {
+      var fx = rng();
+      var topF = 0.295 + 0.13 * vn1(fx * 5.3, 77);   // ragged canopy top: no horizon line
+      var fy = topF + (0.985 - topF) * Math.pow(rng(), 0.85);
+      s.ax[i] = fx * w; s.ay[i] = fy * h;
+      s.x[i] = s.ax[i] + (rng() - 0.5) * 30;
+      s.y[i] = s.ay[i] + (rng() - 0.5) * 30;
+      s.ohF[i] = s.ohT[i] = rng();
+      s.olF[i] = s.olT[i] = rng();
+      s.otF[i] = s.otT[i] = rng();
+      s.sz[i] = rng(); s.ph[i] = rng() * 6.2832;
+    }
+    for (i = 0; i < nM; i++) {
+      s.mx[i] = rng() * w;
+      s.my[i] = (0.02 + 0.32 * rng()) * h;
+      s.mvx[i] = 5 + rng() * 10;
+      s.mph[i] = rng() * 6.2832;
+    }
+    var nc = 3 + Math.floor(rng() * 2);   // 3-4 thermal columns
+    for (i = 0; i < nc; i++) s.cols.push({ fx: 0.12 + 0.76 * rng(), r: 0.06 + rng() * 0.07, s: 0.7 + rng() * 0.6 });
+    var st = 110 + rng() * 50;            // first storm ~110-160 s in
+    while (st < 20000) { s.stormStarts.push(st); st += 150 + rng() * 70; }
+    s.wpFrom = makeWeatherParams(rng);
+    s.wpTo = s.wpFrom;
+    // events seeded by sim time: a scripted early clearing so frame one lives
+    return s;
+  }
+
+  var _wx = { hum: 0, light: 0, temp: 0, churn: 0, state: 'CALM' };
+
+  function stepSim() {
+    var s = sim, dt = STEP;
+    s.steps++; s.t = s.steps * STEP;
+    var t = s.t;
+    weatherAt(t, _wx); s.wx = _wx;
+    var hum = _wx.hum, temp = _wx.temp, churn = _wx.churn;
+    var topY = 0.315 * H, botY = 0.995 * H;
+    var ru = 0; // retune blend for leaf offsets
+    if (s.retuneT > -1e8) ru = sstep((t - s.retuneT) / 30);
+    // gust state
+    var g = s.gust, gAge = g ? t - g.t : 1e9;
+    var gOn = g && gAge < 8;
+    var gDecay = gOn ? Math.exp(-gAge / 2.5) : 0;
+    var gR = 0.28 * Math.min(W, H);
+    var i, j;
+    for (i = 0; i < s.nL; i++) {
+      var oh = lerp(s.ohF[i], s.ohT[i], ru);
+      var ot = lerp(s.otF[i], s.otT[i], ru);
+      var effH = clamp01(hum * (0.7 + 0.6 * oh)) ;
+      var effT = temp * (0.7 + 0.6 * ot);
+      var px = s.x[i], py = s.y[i];
+      // flow drift, speed scales with the leaf's own temperature
+      var ang = vn2(px * 0.0035 + s.ph[i] * 0.13, py * 0.0035, 51 + Math.floor(t * 0.05)) * 6.2832;
+      var spd = 5 + 30 * effT;
+      var fxv = Math.cos(ang) * spd, fyv = Math.sin(ang) * spd * 0.55;
+      // breathing wave: slow vertical sine over x, 40 s period
+      fyv += Math.sin(px * 0.005 - t * 0.15708) * 6;
+      // thermal columns: updraft + swirl
+      for (j = 0; j < s.cols.length; j++) {
+        var c = s.cols[j], cx = c.fx * W, cr = c.r * W;
+        var dx = px - cx;
+        if (dx < cr && dx > -cr) {
+          var fall = 1 - Math.abs(dx) / cr;
+          fyv -= 36 * c.s * fall * fall;
+          fxv += Math.sin(t * 0.9 + py * 0.015 + j * 2.1) * 11 * fall;
+        }
+      }
+      // storm churn: seeded per-leaf kicks
+      if (churn > 0.01) {
+        var hh = hash2(i, s.steps >> 2, 7);
+        var ha = hh * 6.2832;
+        fxv += Math.cos(ha) * churn * 55;
+        fyv += Math.sin(ha) * churn * 40;
+      }
+      // gust
+      if (gOn) {
+        var gdx = px - g.x, gdy = py - g.y;
+        var gd = Math.sqrt(gdx * gdx + gdy * gdy);
+        if (gd < gR) {
+          var gf = (1 - gd / gR) * gDecay;
+          fxv += g.dx * 150 * gf; fyv += g.dy * 150 * gf;
+        }
+      }
+      // velocity relaxes toward flow
+      var k = 1 - Math.exp(-dt * 1.6);
+      s.vx[i] += (fxv - s.vx[i]) * k;
+      s.vy[i] += (fyv - s.vy[i]) * k;
+      // clustering: humidity-weighted spring to the leaf's anchor
+      var ks = (1.5 + 13 * effH) * dt;
+      s.vx[i] += (s.ax[i] - px) * ks;
+      s.vy[i] += (s.ay[i] - py) * ks;
+      // damping
+      var damp = Math.exp(-dt * 1.1);
+      s.vx[i] *= damp; s.vy[i] *= damp;
+      px += s.vx[i] * dt; py += s.vy[i] * dt;
+      // soft bounds: keep leaves in the canopy body
+      if (py < topY) s.vy[i] += (topY - py) * 2.2 * dt * 60 * 0.016;
+      if (py > botY) s.vy[i] -= (py - botY) * 2.2 * dt * 60 * 0.016;
+      if (px < -10) px = -10; if (px > W + 10) px = W + 10;
+      if (py < 4) py = 4; if (py > H - 2) py = H - 2;
+      s.x[i] = px; s.y[i] = py;
+    }
+    // mist
+    for (i = 0; i < s.nM; i++) {
+      var mvx = s.mvx[i] + Math.sin(t * 0.23 + s.mph[i]) * 3;
+      var mvy = Math.cos(t * 0.17 + s.mph[i] * 1.7) * 2.2;
+      if (churn > 0.01) { mvx += churn * 26 * Math.sin(s.mph[i] * 3 + t * 0.6); mvy += churn * 7 * Math.cos(s.mph[i] + t * 0.4); }
+      if (gOn) {
+        var mdx = s.mx[i] - g.x, mdy = s.my[i] - g.y;
+        var md = Math.sqrt(mdx * mdx + mdy * mdy);
+        if (md < gR * 1.2) { var mf = (1 - md / (gR * 1.2)) * gDecay; mvx += g.dx * 190 * mf; mvy += g.dy * 190 * mf; }
+      }
+      s.mx[i] += mvx * dt; s.my[i] += mvy * dt;
+      if (s.mx[i] > W + 6) { s.mx[i] = -6; s.my[i] = (0.02 + 0.32 * hash1(i + s.steps, 5)) * H; }
+      if (s.mx[i] < -8) s.mx[i] = -8;
+      if (s.my[i] < 2) s.my[i] = 2;
+      if (s.my[i] > 0.42 * H) s.my[i] = 0.42 * H;
+    }
+    // prune old clearings
+    while (s.clearings.length && t - s.clearings[0].t > 9) s.clearings.shift();
+  }
+
+  // ---------- draw ----------
+  function draw() {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    var s = sim, t = s.t, wx = s.wx;
+    ctx.fillStyle = FLOOR;
+    ctx.fillRect(0, 0, W, H);
+    var ru = s.retuneT > -1e8 ? sstep((t - s.retuneT) / 30) : 0;
+    var fleckT = t * 0.011;
+    var i;
+    // leaves
+    for (i = 0; i < s.nL; i++) {
+      var ol = lerp(s.olF[i], s.olT[i], ru);
+      var effL = wx.light * (0.7 + 0.6 * ol);
+      var fleck = vn2(s.x[i] * 0.0032 + fleckT, s.y[i] * 0.0032, 91);
+      var b = effL * (0.20 + 1.25 * fleck);
+      // clearings: local light spikes
+      for (var ci = 0; ci < s.clearings.length; ci++) {
+        var cl = s.clearings[ci], age = t - cl.t;
+        if (age < 0 || age > 8) continue;
+        var cdx = s.x[i] - cl.x, cdy = s.y[i] - cl.y;
+        var cd2 = cdx * cdx + cdy * cdy;
+        if (cd2 < cl.r * cl.r) {
+          var env = Math.sin(Math.PI * clamp01(age / 8));
+          b += 0.75 * env * (1 - Math.sqrt(cd2) / cl.r);
+        }
+      }
+      var idx = clamp(Math.floor(b / 1.35 * 27), 0, 26);
+      ctx.fillStyle = PAL[idx];
+      var sz = (1.3 + s.sz[i] * 1.7) * (0.75 + 0.45 * clamp01(b));
+      ctx.fillRect(s.x[i] - sz * 0.5, s.y[i] - sz * 0.5, sz, sz);
+    }
+    // mist
+    var mistA = 0.21 * (1 - 0.45 * wx.churn);
+    ctx.fillStyle = 'rgba(' + MISTC + ',' + mistA.toFixed(3) + ')';
+    for (i = 0; i < s.nM; i++) {
+      ctx.fillRect(s.mx[i], s.my[i], 2.4, 2.4);
+    }
+    // storm darkening
+    if (wx.churn > 0.01) {
+      ctx.fillStyle = STORM;
+      ctx.globalAlpha = 0.32 * wx.churn;
+      ctx.fillRect(0, 0, W, H);
+      ctx.globalAlpha = 1;
+    }
+    // sensor strip
+    var fs = clamp(Math.min(W, H) * 0.021, 11, 16);
+    ctx.font = '600 ' + fs.toFixed(1) + 'px "Segoe Print", "Bradley Hand", "Comic Sans MS", Verdana, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'alphabetic';
+    var txt = 'HUMIDITY ' + wx.hum.toFixed(2) + ' · LIGHT ' + wx.light.toFixed(2) +
+              ' · TEMP ' + wx.temp.toFixed(2) + ' · ' + wx.state;
+    ctx.fillStyle = 'rgba(6,20,11,0.55)';
+    var tw = ctx.measureText(txt).width;
+    ctx.fillRect(W * 0.5 - tw * 0.5 - 10, H - fs - 13, tw + 20, fs + 9);
+    ctx.fillStyle = 'rgba(' + MISTC + ',0.92)';
+    ctx.fillText(txt, W * 0.5, H - 10);
+  }
+
+  // ---------- build / resize ----------
+  function build() {
+    var sz = viewSize();
+    W = sz[0]; H = sz[1];
+    PHONE = detectPhone(W, H);
+    canvas.width = W; canvas.height = H;
+    sim = makeSim(W, H, PHONE);
+    for (var i = 0; i < PREROLL; i++) stepSim();
+    draw();
+  }
+
+  // ---------- interaction ----------
+  function addClearing(x, y) {
+    // a clearing also scatters nearby leaves gently outward
+    sim.clearings.push({ t: sim.t, x: x, y: y, r: 0.16 * Math.min(W, H) });
+    var r = 0.16 * Math.min(W, H), i;
+    for (i = 0; i < sim.nL; i++) {
+      var dx = sim.x[i] - x, dy = sim.y[i] - y;
+      var d = Math.sqrt(dx * dx + dy * dy);
+      if (d < r && d > 1) {
+        var f = (1 - d / r) * 26;
+        sim.vx[i] += dx / d * f; sim.vy[i] += dy / d * f;
+      }
+    }
+  }
+  function newForest() {
+    var s = sim;
+    // previous weather target becomes the "from"; offsets freeze as "from"
+    var rng = mulberry32(SEED + (++s.regime) * 7777);
+    s.wpFrom = { phH: s.wpTo.phH, phL: s.wpTo.phL, phT: s.wpTo.phT, bH: s.wpTo.bH, bL: s.wpTo.bL, bT: s.wpTo.bT };
+    s.wpTo = makeWeatherParams(rng);
+    s.retuneT = s.t;
+    var i;
+    for (i = 0; i < s.nL; i++) {
+      s.ohF[i] = s.ohT[i]; s.olF[i] = s.olT[i]; s.otF[i] = s.otT[i];
+      s.ohT[i] = rng(); s.olT[i] = rng(); s.otT[i] = rng();
+    }
+  }
+
+  var downAt = 0, downX = 0, downY = 0, dragging = false, lastTapAt = -1e9, lastX = 0, lastY = 0;
+  function evtPos(e) {
+    var r = { x: 0, y: 0 };
+    if (e && typeof e.clientX === 'number') { r.x = e.clientX; r.y = e.clientY; }
+    return r;
+  }
+  canvas.addEventListener('pointerdown', function (e) {
+    ensureAudio();
+    var p = evtPos(e);
+    downAt = performance.now(); downX = lastX = p.x; downY = lastY = p.y;
+    dragging = true;
+    sim.gust = null;
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (!dragging) return;
+    var p = evtPos(e);
+    var dx = p.x - lastX, dy = p.y - lastY;
+    var m = Math.sqrt(dx * dx + dy * dy);
+    if (m > 2) {
+      sim.gust = { t: sim.t, x: p.x, y: p.y, dx: dx / m, dy: dy / m };
+    }
+    lastX = p.x; lastY = p.y;
+  });
+  canvas.addEventListener('pointerup', function (e) {
+    if (!dragging) return;
+    dragging = false;
+    var p = evtPos(e);
+    var moved = Math.sqrt((p.x - downX) * (p.x - downX) + (p.y - downY) * (p.y - downY));
+    var dtMs = performance.now() - downAt;
+    if (moved < 12 && dtMs < 500) {
+      var now = performance.now();
+      if (now - lastTapAt < 350) { newForest(); lastTapAt = -1e9; }
+      else { addClearing(p.x, p.y); lastTapAt = now; }
+    }
+  });
+
+  // ---------- audio (lazy, guarded; silent in QA) ----------
+  var AC = null, audio = null;
+  try { AC = (typeof AudioContext !== 'undefined') ? AudioContext : ((typeof webkitAudioContext !== 'undefined') ? webkitAudioContext : null); } catch (e) { AC = null; }
+  function ensureAudio() {
+    if (!AC || audio) return;
+    try {
+      var ac = new AC();
+      var master = ac.createGain(); master.gain.value = 0.6; master.connect(ac.destination);
+      // rainforest bed: looped noise through a lowpass
+      var len = ac.sampleRate * 2, buf = ac.createBuffer(1, len, ac.sampleRate);
+      var d = buf.getChannelData(0), sd = 12345;
+      for (var i = 0; i < len; i++) { sd = (Math.imul(sd, 1103515245) + 12345) | 0; d[i] = ((sd >>> 8) / 8388608 - 1) * 0.6; }
+      var src = ac.createBufferSource(); src.buffer = buf; src.loop = true;
+      var lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 500;
+      var bedGain = ac.createGain(); bedGain.gain.value = 0.0;
+      src.connect(lp); lp.connect(bedGain); bedGain.connect(master); src.start();
+      // storm rumble
+      var rum = ac.createOscillator(); rum.type = 'sine'; rum.frequency.value = 46;
+      var rumGain = ac.createGain(); rumGain.gain.value = 0;
+      rum.connect(rumGain); rumGain.connect(master); rum.start();
+      audio = { ac: ac, bedGain: bedGain, lp: lp, rumGain: rumGain, nextChirp: 0 };
+    } catch (e) { audio = null; }
+  }
+  function audioTick() {
+    if (!audio) return;
+    try {
+      var ac = audio.ac, wx = sim.wx, now = ac.currentTime;
+      audio.bedGain.gain.setTargetAtTime(0.03 + 0.11 * wx.hum, now, 0.4);
+      audio.lp.frequency.setTargetAtTime(300 + 900 * wx.hum, now, 0.4);
+      audio.rumGain.gain.setTargetAtTime(0.13 * wx.churn, now, 0.3);
+      // sparse birdlike FM chirps; rate follows light
+      if (now > audio.nextChirp) {
+        audio.nextChirp = now + 0.6 + Math.random() * (4.5 - 3.4 * wx.light);
+        if (Math.random() < wx.light * 1.15) {
+          var o = ac.createOscillator(), g = ac.createGain();
+          var f0 = 2300 + Math.random() * 900;
+          o.type = 'sine';
+          o.frequency.setValueAtTime(f0, now);
+          o.frequency.exponentialRampToValueAtTime(f0 * 1.45, now + 0.07);
+          o.frequency.exponentialRampToValueAtTime(f0 * 0.82, now + 0.19);
+          g.gain.setValueAtTime(0, now);
+          g.gain.linearRampToValueAtTime(0.05, now + 0.03);
+          g.gain.exponentialRampToValueAtTime(0.0001, now + 0.22);
+          o.connect(g); g.connect(ac.destination);
+          o.start(now); o.stop(now + 0.25);
+        }
+      }
+    } catch (e) {}
+  }
+
+  // ---------- run ----------
+  build();
+  try {
+    if (window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', build);
+    window.addEventListener('resize', build);
+  } catch (e) {}
+
+  var lastNow = 0, acc = 0;
+  function tick(now) {
+    if (!lastNow) lastNow = now;
+    var el = (now - lastNow) / 1000;
+    lastNow = now;
+    if (el > 0.25) el = 0.25;
+    acc += el;
+    var n = Math.floor(acc / STEP);
+    if (n > 40) n = 40;               // cap fixed steps per frame
+    acc -= n * STEP;
+    for (var i = 0; i < n; i++) stepSim();
+    if (n > 0) { draw(); audioTick(); }
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(tick);
+  }
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(tick);
+})();
+</script>
+</body>
+</html>
