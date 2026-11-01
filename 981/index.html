@@ -1,0 +1,762 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lobby Feed</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #07080C; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* No.981 "Lobby Feed" (PP142 The Audience Is the Dancer, daito-manabe study)
+   The lobby feeds the stage. Visitor-dots drift in from two lobby doors,
+   cross a capture line where a warm mint scan sweeps them, and are then
+   projected into the tall performance frame at the right as stick-figure
+   dancers, each keeping its muted visitor color as head and waist trim.
+   The frame holds eight; a ninth capture sends the longest-resident dancer
+   out with a bow. The cast is the crowd, forever rotating.
+   Sim: fixed-timestep 120 Hz, mulberry32-seeded. Frame one is the
+   synchronous draw after exactly 4800 pre-roll steps. */
+
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;var t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+
+var DT = 1/120;
+var PREROLL = 4800;
+var CAPACITY = 8;
+
+var COL = {
+  stage: '#07080C',
+  door: '#1A1D24',
+  doorLintel: '#2A2F3A',
+  frame: '#3A3D46',
+  scan: '#7DF9C6',
+  dancer: '#F5F2EA',
+  bow: '#FFD88A',
+  visitors: ['#8A7D6B', '#6B7D8A', '#7D6B8A', '#8A6B6B']
+};
+/* pentatonic capture chimes, one per visitor color */
+var CHIME = [523.25, 587.33, 659.25, 783.99];
+
+var cv = document.getElementById('c');
+var ctx = cv.getContext('2d');
+var W = 0, H = 0;
+
+function resize(){
+  var w = window.innerWidth, h = window.innerHeight;
+  if (window.visualViewport){ w = window.visualViewport.width; h = window.visualViewport.height; }
+  W = w; H = h;
+  cv.width = Math.round(w); cv.height = Math.round(h);
+}
+if (window.visualViewport) window.visualViewport.addEventListener('resize', resize);
+window.addEventListener('resize', resize);
+resize();
+
+function isPhone(){
+  var sw = (window.screen && window.screen.width)  || W;
+  var sh = (window.screen && window.screen.height) || H;
+  if (Math.min(sw, sh) < 700) return true;
+  return H > W * 1.15;
+}
+
+/* ---------------- layout (fractions of frame; no rng) ---------------- */
+function layout(){
+  var unit = Math.min(W, H);
+  var phone = isPhone();
+  var frameW = (phone ? 0.40 : 0.30) * W;
+  var frameX = W - frameW - 0.025 * W;
+  var frameY = 0.15 * H, frameH = 0.71 * H;
+  var doorW = Math.max(34, 0.085 * W), doorH = 0.115 * H;
+  var entrance = { x: frameX - 2, y: 0.64 * H };
+  return {
+    unit: unit, phone: phone,
+    frameX: frameX, frameY: frameY, frameW: frameW, frameH: frameH,
+    floorY: frameY + frameH - 0.045 * H,
+    doorL: { x: 0.075 * W - doorW / 2, y: 0.012 * H, w: doorW, h: doorH },
+    doorR: { x: 0.925 * W - doorW / 2, y: 0.012 * H, w: doorW, h: doorH },
+    entrance: entrance,
+    lineA: { x: 0.34 * W, y: 0.10 * H },
+    lineB: entrance,
+    waypoint: { x: frameX - 0.17 * unit, y: 0.52 * H }
+  };
+}
+
+/* ---------------- sim state ---------------- */
+var rng = mulberry32(981142);
+var sim = {
+  t: 0,
+  visitors: [],   // {x,y,tx,ty,state:'drift'|'approach'|'queue',color,speed,wobF,wobP,scanned,scanT0,bobP}
+  dancers: [],    // {x,y,color,captureT,clock,state:'enter'|'dance'|'bow'|'exit',enterP,bowT,bowDelay,exitT,slotX,slotY,scale,alpha,params}
+  nextSpawnT: 2.2,
+  heraldSent: false,
+  spawnCount: 0,
+  doorAlt: 0,             // 0 = left door next
+  boostUntil: -1,
+  solo: null,             // {dancer, until}
+  audioEvents: []         // {type, color, t}
+};
+var pendingEvents = [];   // pointer events stamped with piece time
+
+function doorSpawnPos(L, doorIdx){
+  var d = doorIdx === 0 ? L.doorL : L.doorR;
+  return { x: d.x + d.w / 2, y: d.y + d.h + 2 };
+}
+
+function spawnVisitor(doorIdx){
+  var L = layout();
+  var p = doorSpawnPos(L, doorIdx);
+  var ci = Math.floor(rng() * 4);
+  sim.visitors.push({
+    x: p.x + (rng() - 0.5) * 6, y: p.y,
+    state: 'drift',
+    color: ci,
+    speed: (0.062 + rng() * 0.014) * L.unit * (0.85 + rng() * 0.3),
+    wobF: 0.7 + rng() * 0.9,
+    wobP: rng() * Math.PI * 2,
+    scanned: false, scanT0: -10,
+    bobP: rng() * Math.PI * 2
+  });
+  sim.spawnCount++;
+}
+
+/* The herald: one visitor whose walk is paced from the actual stage
+   geometry so its scan sweep is mid-crossing at frame one (t = 40).
+   Injected at t = 26 from the left door; its speed solves the drift leg
+   (full speed) plus the approach leg (0.6 speed) to reach the capture
+   zone at t = 39.75. A normal visitor in every other respect. */
+var HERALD_T = 26, HERALD_TARGET = 39.75;
+function spawnHerald(){
+  var L = layout();
+  var p = doorSpawnPos(L, 0);
+  var wp = L.waypoint, ent = L.entrance;
+  var u = 1;
+  for (var s = 0; s <= 200; s++){
+    var uu = s / 200;
+    var px = wp.x + (ent.x - wp.x) * uu, py = wp.y + (ent.y - wp.y) * uu;
+    if (lineDist(L, px, py) < 24){ u = uu; break; }
+  }
+  var dDrift = Math.sqrt((wp.x - p.x) * (wp.x - p.x) + (wp.y - p.y) * (wp.y - p.y));
+  var dAppr = u * Math.sqrt((ent.x - wp.x) * (ent.x - wp.x) + (ent.y - wp.y) * (ent.y - wp.y));
+  var speed = (dDrift + dAppr / 0.6) / (HERALD_TARGET - HERALD_T);
+  var ci = Math.floor(rng() * 4);
+  rng(); rng(); /* keep the draw pattern of a normal spawn */
+  sim.visitors.push({
+    x: p.x, y: p.y,
+    state: 'drift',
+    color: ci,
+    speed: speed,
+    wobF: 0.5 + rng() * 0.4,
+    wobP: rng() * Math.PI * 2,
+    scanned: false, scanT0: -10,
+    bobP: rng() * Math.PI * 2,
+    herald: true
+  });
+  sim.spawnCount++;
+  sim.heraldSent = true;
+}
+
+function spawnInterval(){
+  if (sim.t < sim.boostUntil) return 2.2 + rng() * 1.8;
+  if (sim.spawnCount <= 6) return 4.2 + rng() * 1.8; /* opening rush: the doors have just opened */
+  return 6.5 + rng() * 3.5;
+}
+
+function makeDancer(v, L){
+  var prm = {
+    swayR: 1.6 + rng() * 1.2,
+    stepR: 2.2 + rng() * 1.6,
+    armR: 1.4 + rng() * 1.2,
+    ph1: rng() * Math.PI * 2,
+    ph2: rng() * Math.PI * 2,
+    ph3: rng() * Math.PI * 2,
+    ph4: rng() * Math.PI * 2,
+    style: Math.floor(rng() * 3)
+  };
+  return {
+    x: L.entrance.x, y: L.floorY,
+    color: v.color, captureT: sim.t, clock: rng() * 10,
+    state: 'enter', enterP: 0,
+    bowT: 0, bowDelay: 0, exitT: 0,
+    slotX: L.entrance.x, slotY: L.floorY, rowScale: 1,
+    scale: 0.25, alpha: 0, params: prm
+  };
+}
+
+/* slot fill order: front-centre out, then back row */
+var FILL = [5, 4, 6, 3, 1, 2, 0, 7];
+function slotFor(L, idx){
+  /* slots 0..3 back row, 4..7 front row */
+  var back = idx < 4;
+  var i = back ? idx : idx - 4;
+  var x = L.frameX + L.frameW * (0.16 + 0.225 * i) + (back ? L.frameW * 0.05 : 0);
+  return {
+    x: x,
+    y: L.floorY - (back ? 0.020 * L.unit : 0),
+    scale: back ? 0.82 : 1.0
+  };
+}
+
+function castCount(){
+  var n = 0;
+  for (var i = 0; i < sim.dancers.length; i++){
+    var s = sim.dancers[i].state;
+    if (s === 'enter' || s === 'dance') n++;
+  }
+  return n;
+}
+
+function startBow(d, delay){
+  if (d.state !== 'dance' && d.state !== 'enter') return;
+  d.state = 'bow'; d.bowT = 0; d.bowDelay = delay || 0;
+  if (sim.solo && sim.solo.dancer === d) sim.solo = null;
+  sim.audioEvents.push({ type: 'bow', color: d.color, t: sim.t });
+}
+
+function stepSim(){
+  var L = layout();
+  sim.t += DT;
+
+  /* pointer events, consumed in timestamp order */
+  pendingEvents.sort(function(a, b){ return a.t - b.t; });
+  while (pendingEvents.length && pendingEvents[0].t <= sim.t){
+    applyEvent(pendingEvents.shift(), L);
+  }
+
+  /* spawning */
+  if (!sim.heraldSent && sim.t >= HERALD_T) spawnHerald();
+  if (sim.t >= sim.nextSpawnT){
+    spawnVisitor(sim.doorAlt);
+    sim.doorAlt = 1 - sim.doorAlt;
+    sim.nextSpawnT = sim.t + spawnInterval();
+  }
+
+  stepVisitors(L);
+  stepDancers(L);
+}
+
+function lineSide(L, x, y){
+  var bx = L.lineB.x - L.lineA.x, by = L.lineB.y - L.lineA.y;
+  return bx * (y - L.lineA.y) - by * (x - L.lineA.x);
+}
+function lineDist(L, x, y){
+  var bx = L.lineB.x - L.lineA.x, by = L.lineB.y - L.lineA.y;
+  var len = Math.sqrt(bx * bx + by * by) || 1;
+  return Math.abs(lineSide(L, x, y)) / len;
+}
+
+function stepVisitors(L){
+  var keep = [];
+  for (var i = 0; i < sim.visitors.length; i++){
+    var v = sim.visitors[i];
+    if (v.state === 'queue'){
+      /* wait at the entrance until a cast slot frees */
+      var qi = 0;
+      for (var j = 0; j < sim.visitors.length; j++)
+        if (sim.visitors[j].state === 'queue' && j < i) qi++;
+      v.x += ((L.entrance.x - 6 - qi * 0.022 * L.unit) - v.x) * Math.min(1, DT * 4);
+      v.y += ((L.entrance.y + qi * 0.012 * L.unit) - v.y) * Math.min(1, DT * 4);
+      if (castCount() < CAPACITY){
+        v.state = 'enter';
+        sim.dancers.push(makeDancer(v, L));
+        sim.audioEvents.push({ type: 'capture', color: v.color, t: sim.t });
+        continue; /* visitor consumed */
+      }
+      keep.push(v);
+      continue;
+    }
+    var target = v.state === 'drift' ? L.waypoint : L.entrance;
+    var dx = target.x - v.x, dy = target.y - v.y;
+    var dist = Math.sqrt(dx * dx + dy * dy);
+    if (v.state === 'drift' && dist < 12) v.state = 'approach';
+    else if (v.state === 'approach'){
+      if (!v.scanned && (lineDist(L, v.x, v.y) < 24 || dist < 10)){
+        v.scanned = true; v.scanT0 = sim.t;
+        sim.audioEvents.push({ type: 'scan', color: v.color, t: sim.t });
+      }
+      if (dist < 9){
+        if (castCount() < CAPACITY){
+          sim.dancers.push(makeDancer(v, L));
+          sim.audioEvents.push({ type: 'capture', color: v.color, t: sim.t });
+          continue; /* visitor consumed */
+        }
+        v.state = 'queue';
+        keep.push(v);
+        continue;
+      }
+    }
+    var ang = Math.atan2(dy, dx) + Math.sin(sim.t * v.wobF + v.wobP) * (v.herald ? 0.10 : 0.35);
+    var sp = v.speed * (v.state === 'approach' ? 0.6 : 1) * (sim.t - v.scanT0 < 0.6 && v.scanned ? 0.45 : 1);
+    v.x += Math.cos(ang) * sp * DT;
+    v.y += Math.sin(ang) * sp * DT;
+    keep.push(v);
+  }
+  sim.visitors = keep;
+}
+
+function stepDancers(L){
+  /* slot assignment by capture order */
+  var cast = sim.dancers.filter(function(d){ return d.state === 'enter' || d.state === 'dance'; });
+  cast.sort(function(a, b){ return a.captureT - b.captureT; });
+  for (var i = 0; i < cast.length; i++){
+    var s = slotFor(L, FILL[Math.min(i, 7)]);
+    cast[i].slotX = s.x; cast[i].slotY = s.y; cast[i].rowScale = s.scale;
+  }
+
+  var keep = [];
+  for (var k = 0; k < sim.dancers.length; k++){
+    var d = sim.dancers[k];
+    var soloing = sim.solo && sim.solo.dancer === d && sim.t < sim.solo.until;
+    if (sim.solo && sim.t >= sim.solo.until) sim.solo = null;
+
+    if (d.state === 'enter'){
+      d.enterP = Math.min(1, d.enterP + DT / 0.7);
+      if (d.enterP >= 1) d.state = 'dance';
+    }
+    if (d.state === 'dance' || d.state === 'enter') d.clock += DT;
+
+    var tx = d.slotX, ty = d.slotY, tScale = d.rowScale, tAlpha = 1;
+    if (soloing){ tx = sim.solo.x; ty = L.floorY; tScale = 1.3; }
+    else if (sim.solo && sim.t < sim.solo.until) tAlpha = 0.4;
+    if (d.state === 'enter'){
+      tScale = d.rowScale * (0.25 + 0.75 * d.enterP);
+      tAlpha = Math.min(1, d.enterP * 2);
+    }
+
+    if (d.state === 'bow'){
+      if (d.bowDelay > 0) d.bowDelay -= DT;
+      else {
+        d.bowT += DT;
+        if (d.bowT >= 1.8){ d.state = 'exit'; d.exitT = 0; }
+      }
+    } else if (d.state === 'exit'){
+      d.exitT += DT;
+      var dl = layout();
+      var door = (d.x < W / 2) ? dl.doorL : dl.doorR;
+      var ex = door.x + door.w / 2, ey = door.y + door.h * 0.4;
+      var dx = ex - d.x, dy = ey - d.y;
+      var dd = Math.sqrt(dx * dx + dy * dy) || 1;
+      var esp = 0.09 * L.unit;
+      d.x += dx / dd * esp * DT;
+      d.y += dy / dd * esp * DT;
+      tScale = d.rowScale * Math.max(0.12, 1 - d.exitT / 1.2);
+      tx = d.x; ty = d.y;
+      tAlpha = d.exitT > 3 ? Math.max(0, 1 - (d.exitT - 3) / 2) : 1;
+      if (d.exitT >= 5 || dd < 8) continue; /* gone */
+    }
+
+    var ease = Math.min(1, DT * 3.2);
+    if (d.state !== 'exit'){
+      d.x += (tx - d.x) * ease;
+      d.y += (ty - d.y) * ease;
+    }
+    d.scale += (tScale - d.scale) * Math.min(1, DT * 5);
+    d.alpha += (tAlpha - d.alpha) * Math.min(1, DT * 6);
+    keep.push(d);
+  }
+  sim.dancers = keep;
+
+  /* capacity: a ninth capture sends the longest-resident dancer out */
+  var dancing = sim.dancers.filter(function(d){ return d.state === 'enter' || d.state === 'dance'; });
+  if (dancing.length > CAPACITY){
+    dancing.sort(function(a, b){ return a.captureT - b.captureT; });
+    startBow(dancing[0], 0);
+  }
+}
+
+/* ---------------- pointer events ---------------- */
+var lastTap = { t: -10, x: 0, y: 0 };
+var dragCtx = null;
+
+function applyEvent(ev, L){
+  if (ev.kind === 'admit'){
+    spawnVisitor(ev.door);
+    sim.nextSpawnT = Math.max(sim.nextSpawnT, sim.t + 2.5);
+  } else if (ev.kind === 'clear'){
+    var ds = sim.dancers.filter(function(d){ return d.state === 'dance' || d.state === 'enter'; });
+    for (var i = 0; i < ds.length; i++) startBow(ds[i], i * 0.12);
+    sim.boostUntil = sim.t + 25;
+    sim.solo = null;
+  } else if (ev.kind === 'solo'){
+    var d = ev.dancer;
+    if (d.state === 'dance' || d.state === 'enter'){
+      sim.solo = { dancer: d, until: sim.t + 10, x: ev.x };
+    }
+  } else if (ev.kind === 'soloMove'){
+    if (sim.solo) sim.solo.x = ev.x;
+  } else if (ev.kind === 'soloEnd'){
+    if (sim.solo) sim.solo.until = Math.min(sim.solo.until, sim.t + 10);
+  }
+}
+
+function hitDoor(L, x, y){
+  var ds = [L.doorL, L.doorR];
+  for (var i = 0; i < 2; i++){
+    var d = ds[i];
+    if (x >= d.x - 8 && x <= d.x + d.w + 8 && y >= d.y - 6 && y <= d.y + d.h + 14) return i;
+  }
+  return -1;
+}
+function hitDancer(L, x, y){
+  var best = null, bd = 1e9;
+  for (var i = 0; i < sim.dancers.length; i++){
+    var d = sim.dancers[i];
+    if (d.state !== 'dance' && d.state !== 'enter') continue;
+    var h = 0.075 * L.unit * d.scale;
+    var dx = x - d.x, dy = y - (d.y - h * 0.5);
+    var dist = Math.sqrt(dx * dx + dy * dy);
+    if (dist < h * 0.62 && dist < bd){ bd = dist; best = d; }
+  }
+  return best;
+}
+function frameClampX(L, x){
+  return Math.max(L.frameX + 0.05 * L.frameW, Math.min(L.frameX + 0.95 * L.frameW, x));
+}
+
+function onDown(e){
+  initAudio();
+  var r = cv.getBoundingClientRect ? cv.getBoundingClientRect() : { left: 0, top: 0 };
+  var x = (e.clientX || 0) - r.left, y = (e.clientY || 0) - r.top;
+  var L = layout();
+  var d = hitDancer(L, x, y);
+  dragCtx = { x: x, y: y, dancer: d, moved: false };
+  if (d){
+    pendingEvents.push({ kind: 'solo', dancer: d, x: frameClampX(L, x), t: sim.t });
+  }
+}
+function onMove(e){
+  if (!dragCtx) return;
+  var r = cv.getBoundingClientRect ? cv.getBoundingClientRect() : { left: 0, top: 0 };
+  var x = (e.clientX || 0) - r.left, y = (e.clientY || 0) - r.top;
+  if (Math.abs(x - dragCtx.x) + Math.abs(y - dragCtx.y) > 6) dragCtx.moved = true;
+  if (dragCtx.dancer){
+    var L = layout();
+    pendingEvents.push({ kind: 'soloMove', x: frameClampX(L, x), t: sim.t });
+  }
+}
+function onUp(e){
+  if (!dragCtx) return;
+  var r = cv.getBoundingClientRect ? cv.getBoundingClientRect() : { left: 0, top: 0 };
+  var x = (e.clientX || 0) - r.left, y = (e.clientY || 0) - r.top;
+  var L = layout();
+  if (dragCtx.dancer){
+    pendingEvents.push({ kind: 'soloEnd', t: sim.t });
+  } else if (!dragCtx.moved){
+    if (sim.t - lastTap.t < 0.35 && Math.abs(x - lastTap.x) + Math.abs(y - lastTap.y) < 30){
+      pendingEvents.push({ kind: 'clear', t: sim.t });
+      lastTap.t = -10;
+    } else {
+      var door = hitDoor(L, x, y);
+      if (door >= 0) pendingEvents.push({ kind: 'admit', door: door, t: sim.t });
+      lastTap = { t: sim.t, x: x, y: y };
+    }
+  }
+  dragCtx = null;
+}
+if (cv.addEventListener){
+  cv.addEventListener('pointerdown', onDown);
+  cv.addEventListener('pointermove', onMove);
+  cv.addEventListener('pointerup', onUp);
+}
+
+/* ---------------- audio (lazy, guarded) ---------------- */
+var AC = null, bedGain = null;
+function initAudio(){
+  if (AC) { if (AC.resume) AC.resume(); return; }
+  var Ctor = null;
+  if (typeof AudioContext !== 'undefined') Ctor = AudioContext;
+  else if (typeof webkitAudioContext !== 'undefined') Ctor = webkitAudioContext;
+  if (!Ctor) return;
+  try {
+    AC = new Ctor();
+    /* lobby bed: soft filtered noise murmur */
+    var len = 2 * AC.sampleRate;
+    var buf = AC.createBuffer(1, len, AC.sampleRate);
+    var ch = buf.getChannelData(0);
+    var last = 0;
+    for (var i = 0; i < len; i++){ var w = Math.random() * 2 - 1; last = (last + 0.02 * w) / 1.02; ch[i] = last * 3.2; }
+    var src = AC.createBufferSource(); src.buffer = buf; src.loop = true;
+    var lp = AC.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 420;
+    bedGain = AC.createGain(); bedGain.gain.value = 0.05;
+    src.connect(lp); lp.connect(bedGain); bedGain.connect(AC.destination);
+    src.start();
+  } catch (err) { AC = null; }
+}
+function tone(freq, t0, dur, gain, type){
+  if (!AC) return;
+  try {
+    var o = AC.createOscillator(), g = AC.createGain();
+    o.type = type || 'sine'; o.frequency.value = freq;
+    g.gain.setValueAtTime(0, t0);
+    g.gain.linearRampToValueAtTime(gain, t0 + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    o.connect(g); g.connect(AC.destination);
+    o.start(t0); o.stop(t0 + dur + 0.05);
+  } catch (err) {}
+}
+function playAudioEvent(ev){
+  if (!AC) return;
+  var now = AC.currentTime;
+  try {
+    if (ev.type === 'scan'){
+      var o = AC.createOscillator(), g = AC.createGain();
+      o.type = 'sine';
+      o.frequency.setValueAtTime(300, now);
+      o.frequency.exponentialRampToValueAtTime(920, now + 0.6);
+      g.gain.setValueAtTime(0.045, now);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + 0.65);
+      o.connect(g); g.connect(AC.destination);
+      o.start(now); o.stop(now + 0.7);
+    } else if (ev.type === 'capture'){
+      tone(CHIME[ev.color % 4], now, 0.9, 0.06, 'triangle');
+      tone(CHIME[ev.color % 4] * 2, now, 0.5, 0.02, 'sine');
+    } else if (ev.type === 'bow'){
+      var len = Math.floor(1.1 * AC.sampleRate);
+      var buf = AC.createBuffer(1, len, AC.sampleRate);
+      var ch = buf.getChannelData(0);
+      for (var i = 0; i < len; i++) ch[i] = (Math.random() * 2 - 1) * (0.4 + 0.6 * Math.random());
+      var src = AC.createBufferSource(); src.buffer = buf;
+      var bp = AC.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 1300; bp.Q.value = 0.7;
+      var g2 = AC.createGain();
+      g2.gain.setValueAtTime(0, now);
+      g2.gain.linearRampToValueAtTime(0.05, now + 0.25);
+      g2.gain.exponentialRampToValueAtTime(0.0001, now + 1.1);
+      src.connect(bp); bp.connect(g2); g2.connect(AC.destination);
+      src.start(now);
+    }
+  } catch (err) {}
+}
+function drainAudio(){
+  while (sim.audioEvents.length && sim.audioEvents[0].t <= sim.t){
+    playAudioEvent(sim.audioEvents.shift());
+  }
+  if (sim.audioEvents.length > 200) sim.audioEvents.length = 0;
+}
+
+/* ---------------- pose engine ---------------- */
+function poseAt(d, bowP){
+  var p = d.params, t = d.clock;
+  var lean = Math.sin(t * p.swayR + p.ph1) * 0.6;
+  var bobF = (0.5 + 0.5 * Math.sin(t * p.stepR * 2 + p.ph2)) * 0.030;
+  var stepPh = t * p.stepR + p.ph3;
+  var stepL = Math.cos(stepPh) * 0.085;
+  var stepR = Math.cos(stepPh + Math.PI) * 0.085;
+  var liftL = Math.max(0, Math.sin(stepPh)) * 0.050;
+  var liftR = Math.max(0, -Math.sin(stepPh)) * 0.050;
+  var aL = 0.55 + Math.sin(t * p.armR + p.ph4) * 0.85;
+  var aR = 0.55 + Math.sin(t * p.armR * 1.13 + p.ph4 + 2.1) * 0.85;
+  if (p.style === 1) aL = 1.9 + Math.sin(t * 2.6 + p.ph4) * 0.45;
+  if (p.style === 2) { aL = 1.2 + Math.sin(t * p.armR * 1.4) * 0.5; aR = 1.2 + Math.cos(t * p.armR * 1.4) * 0.5; }
+  var bL = 0.45 + 0.30 * Math.sin(t * p.armR * 1.7 + p.ph1);
+  var bR = 0.45 + 0.30 * Math.cos(t * p.armR * 1.7 + p.ph2);
+  if (bowP > 0){
+    aL = aL * (1 - bowP) + 0.25 * bowP;
+    aR = aR * (1 - bowP) + 0.25 * bowP;
+    bobF *= (1 - bowP);
+    stepL *= (1 - bowP); stepR *= (1 - bowP);
+    liftL *= (1 - bowP); liftR *= (1 - bowP);
+  }
+  return { lean: lean, bobF: bobF, stepL: stepL, stepR: stepR, liftL: liftL, liftR: liftR,
+           aL: aL, aR: aR, bL: bL, bR: bR };
+}
+function bowEnvelope(d){
+  if (d.state !== 'bow' || d.bowDelay > 0) return 0;
+  var t = d.bowT;
+  if (t < 0.9){ var u = t / 0.9; return u * u * (3 - 2 * u); }
+  if (t < 1.2) return 1;
+  var v = (t - 1.2) / 0.6; return 1 - v * v * (3 - 2 * v);
+}
+function glowEnvelope(d){
+  if (d.state !== 'bow' || d.bowDelay > 0) return 0;
+  return Math.sin(Math.min(1, d.bowT / 1.8) * Math.PI);
+}
+
+/* ---------------- drawing ---------------- */
+function drawDoor(L, d){
+  ctx.fillStyle = COL.door;
+  ctx.beginPath();
+  var r = d.w / 2;
+  ctx.moveTo(d.x, d.y + d.h);
+  ctx.lineTo(d.x, d.y + r);
+  ctx.arc(d.x + r, d.y + r, r, Math.PI, 0);
+  ctx.lineTo(d.x + d.w, d.y + d.h);
+  ctx.closePath();
+  ctx.fill();
+  ctx.strokeStyle = COL.doorLintel;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(d.x - 3, d.y + d.h);
+  ctx.lineTo(d.x + d.w + 3, d.y + d.h);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(d.x, d.y + d.h);
+  ctx.lineTo(d.x, d.y + r);
+  ctx.arc(d.x + r, d.y + r, r, Math.PI, 0);
+  ctx.lineTo(d.x + d.w, d.y + d.h);
+  ctx.stroke();
+}
+
+function drawFigure(d, L){
+  var h = 0.075 * L.unit * d.scale;
+  if (h < 1) return;
+  var bowP = bowEnvelope(d);
+  var pose = poseAt(d, bowP);
+  var x = d.x, floorY = d.y;
+  var alpha = Math.max(0, Math.min(1, d.alpha));
+  if (d.state === 'exit' && d.scale <= 0.30){
+    /* shrunk back to a dot on its way out */
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = COL.visitors[d.color];
+    ctx.beginPath(); ctx.arc(x, floorY - h * 0.3, Math.max(1.5, h * 0.14), 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = 1;
+    return;
+  }
+  var glow = glowEnvelope(d);
+  if (glow > 0){
+    var gr = [1.05, 0.78, 0.52], ga = [0.05, 0.06, 0.07];
+    for (var gi = 0; gi < 3; gi++){
+      ctx.globalAlpha = ga[gi] * glow * alpha;
+      ctx.fillStyle = COL.bow;
+      ctx.beginPath(); ctx.arc(x, floorY - h * 0.5, h * gr[gi], 0, Math.PI * 2); ctx.fill();
+    }
+  }
+  var bob = pose.bobF * h;
+  var hip = { x: x - pose.lean * 0.03 * h, y: floorY - 0.50 * h - bob };
+  var neck = { x: x + pose.lean * 0.20 * h + bowP * 0.30 * h, y: floorY - 0.78 * h - bob + bowP * 0.15 * h };
+  var head = { x: neck.x + bowP * 0.09 * h, y: neck.y - 0.115 * h + bowP * 0.05 * h };
+  var headR = 0.085 * h;
+  function limb(side, a1, a2){
+    var ex = neck.x + side * Math.sin(a1) * 0.20 * h;
+    var ey = neck.y + Math.cos(a1) * 0.20 * h;
+    var hx = ex + side * Math.sin(a1 + a2) * 0.18 * h;
+    var hy = ey + Math.cos(a1 + a2) * 0.18 * h;
+    return [{ x: ex, y: ey }, { x: hx, y: hy }];
+  }
+  var armL = limb(-1, pose.aL, pose.bL), armR = limb(1, pose.aR, pose.bR);
+  var footL = { x: x - 0.11 * h + pose.stepL * h, y: floorY - pose.liftL * h };
+  var footR = { x: x + 0.11 * h + pose.stepR * h, y: floorY - pose.liftR * h };
+  var kneeL = { x: (hip.x + footL.x) / 2 - 0.045 * h, y: (hip.y + footL.y) / 2 + 0.01 * h };
+  var kneeR = { x: (hip.x + footR.x) / 2 + 0.045 * h, y: (hip.y + footR.y) / 2 + 0.01 * h };
+
+  ctx.globalAlpha = alpha;
+  ctx.strokeStyle = COL.dancer;
+  ctx.lineWidth = Math.max(1.4, 0.034 * h);
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  function seg(a, b){ ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke(); }
+  seg(hip, kneeL); seg(kneeL, footL);
+  seg(hip, kneeR); seg(kneeR, footR);
+  seg(hip, neck);
+  seg(neck, armL[0]); seg(armL[0], armL[1]);
+  seg(neck, armR[0]); seg(armR[0], armR[1]);
+  /* waist trim in the visitor color */
+  ctx.strokeStyle = COL.visitors[d.color];
+  ctx.lineWidth = Math.max(1.2, 0.045 * h);
+  ctx.beginPath();
+  ctx.moveTo(hip.x - 0.055 * h, hip.y);
+  ctx.lineTo(hip.x + 0.055 * h, hip.y);
+  ctx.stroke();
+  /* head in the visitor color */
+  ctx.fillStyle = COL.visitors[d.color];
+  ctx.beginPath(); ctx.arc(head.x, head.y, headR, 0, Math.PI * 2); ctx.fill();
+  ctx.globalAlpha = 1;
+}
+
+function draw(){
+  var L = layout();
+  ctx.fillStyle = COL.stage;
+  ctx.fillRect(0, 0, W, H);
+  cv.style.width = W + 'px';
+  cv.style.height = H + 'px';
+
+  /* doors */
+  drawDoor(L, L.doorL);
+  drawDoor(L, L.doorR);
+
+  /* capture line: a faint dotted diagonal, a stage marking */
+  ctx.strokeStyle = COL.frame;
+  ctx.globalAlpha = 0.35;
+  ctx.lineWidth = 1;
+  ctx.setLineDash([3, 7]);
+  ctx.beginPath();
+  ctx.moveTo(L.lineA.x, L.lineA.y);
+  ctx.lineTo(L.lineB.x, L.lineB.y);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.globalAlpha = 1;
+
+  /* performance frame */
+  ctx.strokeStyle = COL.frame;
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(L.frameX, L.frameY, L.frameW, L.frameH);
+  ctx.globalAlpha = 0.5;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(L.frameX + 4, L.floorY + 0.020 * L.unit);
+  ctx.lineTo(L.frameX + L.frameW - 4, L.floorY + 0.020 * L.unit);
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+
+  /* visitors */
+  for (var i = 0; i < sim.visitors.length; i++){
+    var v = sim.visitors[i];
+    var r = 0.011 * L.unit;
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.beginPath(); ctx.ellipse(v.x, v.y + r * 0.9, r * 1.1, r * 0.38, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = COL.visitors[v.color];
+    ctx.beginPath(); ctx.arc(v.x, v.y, r, 0, Math.PI * 2); ctx.fill();
+    /* scan sweep: a warm mint bar crossing the visitor */
+    var st = sim.t - v.scanT0;
+    if (v.scanned && st >= 0 && st < 0.6){
+      var p = st / 0.6;
+      var bx = v.x - r - 7 + p * (2 * r + 14);
+      ctx.globalAlpha = 0.26;
+      ctx.fillStyle = COL.scan;
+      ctx.fillRect(bx - 5, v.y - r * 2.1, 10, r * 4.2);
+      ctx.globalAlpha = 0.85;
+      ctx.fillRect(bx - 0.75, v.y - r * 2.1, 1.5, r * 4.2);
+      ctx.globalAlpha = 0.5;
+      ctx.strokeStyle = COL.scan;
+      ctx.lineWidth = 1.2;
+      ctx.beginPath(); ctx.arc(v.x, v.y, r * 1.8, 0, Math.PI * 2); ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  /* dancers, back row first */
+  var sorted = sim.dancers.slice().sort(function(a, b){ return a.rowScale - b.rowScale; });
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(L.frameX - 0.03 * L.unit, L.frameY - 0.02 * L.unit, L.frameW + 0.06 * L.unit, L.frameH + 0.05 * L.unit);
+  ctx.clip();
+  for (var j = 0; j < sorted.length; j++) drawFigure(sorted[j], L);
+  ctx.restore();
+}
+
+/* ---------------- run ---------------- */
+for (var s = 0; s < PREROLL; s++) stepSim();
+sim.audioEvents.length = 0;
+draw();
+
+var lastNow = -1;
+function frame(now){
+  if (lastNow < 0) lastNow = now;
+  var elapsed = Math.min(0.25, (now - lastNow) / 1000);
+  lastNow = now;
+  var steps = Math.round(elapsed / DT);
+  if (steps > 40) steps = 40;
+  for (var i = 0; i < steps; i++) stepSim();
+  drainAudio();
+  draw();
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+}
+if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+
+/* debug hook for QA (not used by the piece itself) */
+if (typeof globalThis !== 'undefined') globalThis.__lf = { sim: sim, layout: layout, stepSim: stepSim, lineDist: lineDist };
+</script>
+</body>
+</html>
