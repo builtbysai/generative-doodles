@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>The Saw Hand</title>
+<style>
+html, body { margin: 0; padding: 0; background: #7a5a34; overflow: hidden; height: 100%; }
+canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  // Round every fading alpha to 4 decimals before stringifying: node-canvas
+  // misparses scientific-notation alphas (e.g. 2.5e-15) as fully opaque.
+  function a4(x) {
+    var v = Math.round(x * 10000) / 10000;
+    if (v < 0) v = 0;
+    if (v > 1) v = 1;
+    return v;
+  }
+  function rgba(r, g, b, a) { return 'rgba(' + r + ',' + g + ',' + b + ',' + a4(a) + ')'; }
+
+  var RUST = [168, 50, 30], RUST_DK = [120, 32, 18], CREAM = [232, 226, 212],
+      STEEL = [138, 143, 148], CEIL = [74, 74, 68], GOLD = [212, 162, 78],
+      WOOD = [122, 90, 52], UNDER = [38, 30, 26];
+
+  var W = 0, H = 0;
+  function isPhone() {
+    var mw = 1e9, mh = 0;
+    if (typeof window !== 'undefined' && window.screen) {
+      mw = Math.min(window.screen.width || 1e9, window.screen.height || 1e9);
+      mh = Math.max(window.screen.width || 0, window.screen.height || 0);
+    }
+    if (mw < 700) return true;
+    return H > W * 1.15;
+  }
+  function resize() {
+    var vw = 0, vh = 0;
+    if (typeof window !== 'undefined' && window.visualViewport &&
+        typeof window.visualViewport.width === 'number') {
+      vw = window.visualViewport.width;
+      vh = window.visualViewport.height;
+    } else if (typeof window !== 'undefined' && typeof window.innerWidth === 'number') {
+      vw = window.innerWidth;
+      vh = window.innerHeight;
+    }
+    if (!vw || !vh) return;
+    W = vw; H = vh;
+    canvas.width = W; canvas.height = H;
+    // Phone rule: centered composition keeps its shape; page ground takes the
+    // piece's own background color (floor wood).
+    if (typeof document !== 'undefined' && document.body) {
+      document.body.style.background = '#7a5a34';
+    }
+  }
+  resize();
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', resize);
+    }
+    if (window.addEventListener) {
+      window.addEventListener('resize', resize);
+    }
+  }
+
+  // ---- Seeded static layout (computed once, never per frame) ----
+  var rng = mulberry32(1407000);
+  // Rug pile stipple, in rug-local coordinates (rug spans -1..1 in x, -0.42..0.42 in y).
+  var stipple = [];
+  for (var i = 0; i < 700; i++) {
+    stipple.push([rng() * 2 - 1, (rng() * 2 - 1) * 0.42, rng()]);
+  }
+  // Underlay stipple, same local frame.
+  var ustipple = [];
+  for (var j = 0; j < 500; j++) {
+    ustipple.push([rng() * 2 - 1, (rng() * 2 - 1) * 0.42, rng()]);
+  }
+  // Saw mobile blades: angle around hub, arm length, kind, sway period/phase.
+  var blades = [];
+  var kinds = ['disc', 'disc', 'handsaw', 'disc', 'handsaw'];
+  for (var k = 0; k < 5; k++) {
+    blades.push({
+      ang: -Math.PI * 0.85 + k * (Math.PI * 0.7 / 4),
+      len: 0.55 + rng() * 0.35,
+      kind: kinds[k],
+      swayP: 7 + rng() * 4,
+      swayPh: rng() * Math.PI * 2,
+      spinPh: rng() * Math.PI * 2
+    });
+  }
+  // Dust motes on the floor.
+  var motes = [];
+  for (var m = 0; m < 40; m++) {
+    motes.push([rng(), rng(), rng()]);
+  }
+
+  // ---- Interaction state (closed-form over recorded events) ----
+  var drags = []; // {t, dx, dy} lift impulses, decayed
+  var dragging = false, dragStartX = 0, dragStartY = 0, dragDX = 0, dragDY = 0;
+  var liftHeld = 0; // current held lift while dragging
+  function liftAt(t) {
+    var l = liftHeld;
+    for (var i = 0; i < drags.length; i++) {
+      var dt = t - drags[i].t;
+      if (dt < 0) continue;
+      l += drags[i].amt * Math.exp(-dt / 1.5);
+    }
+    if (l > 1) l = 1;
+    if (l < 0) l = 0;
+    return l;
+  }
+
+  // ---- Optional low hum: lazy, gesture-gated, dulls while rug is lifted ----
+  var actx = null, humOsc = null, humGain = null, humOn = false;
+  function ensureHum() {
+    if (typeof window === 'undefined') return;
+    var AC = window.AudioContext || window.webkitAudioContext;
+    if (typeof AC !== 'function') return;
+    try {
+      if (!actx) {
+        actx = new AC();
+        humOsc = actx.createOscillator();
+        humOsc.type = 'sine';
+        humOsc.frequency.value = 55;
+        humGain = actx.createGain();
+        humGain.gain.value = 0;
+        humOsc.connect(humGain);
+        humGain.connect(actx.destination);
+        humOsc.start();
+      }
+      if (actx.resume) actx.resume();
+      humOn = true;
+    } catch (e) { /* silent without audio */ }
+  }
+  function dullHum(lift) {
+    if (humGain && actx) {
+      humGain.gain.value = 0.04 * (1 - 0.7 * lift);
+    }
+  }
+  function stopHum() {
+    humOn = false;
+    if (humGain && actx) humGain.gain.value = 0;
+    if (actx && actx.suspend) { try { actx.suspend(); } catch (e) {} }
+  }
+
+  function onDown(x, y) {
+    ensureHum();
+    dragging = true;
+    dragStartX = x; dragStartY = y; dragDX = 0; dragDY = 0;
+  }
+  function onMove(x, y) {
+    if (!dragging) return;
+    dragDX = x - dragStartX; dragDY = y - dragStartY;
+    var d = Math.sqrt(dragDX * dragDX + dragDY * dragDY);
+    liftHeld = Math.min(1, d / 140);
+  }
+  function onUp(t) {
+    if (!dragging) return;
+    dragging = false;
+    drags.push({ t: t, amt: liftHeld });
+    liftHeld = 0;
+    stopHum();
+  }
+
+  // Pointer listeners on the canvas. The QA renderer stubs addEventListener
+  // and never fires these, so frame one is the untouched room.
+  var curT = 0;
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', function (e) {
+      onDown(e.clientX || 0, e.clientY || 0);
+    });
+    canvas.addEventListener('pointermove', function (e) {
+      onMove(e.clientX || 0, e.clientY || 0);
+    });
+    canvas.addEventListener('pointerup', function () { onUp(curT); });
+    canvas.addEventListener('pointercancel', function () { onUp(curT); });
+  }
+
+  // ---- Drawing helpers ----
+  function dot(x, y, s, col) {
+    ctx.fillStyle = col;
+    ctx.fillRect(x - s / 2, y - s / 2, s, s);
+  }
+  function disc(x, y, r, col) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fillStyle = col;
+    ctx.fill();
+  }
+  // Circular saw disc with teeth, drawn as one path with moveTo per tooth.
+  function sawDisc(x, y, r, rot) {
+    var teeth = 18;
+    ctx.beginPath();
+    for (var i = 0; i < teeth; i++) {
+      var a0 = rot + i * Math.PI * 2 / teeth;
+      var a1 = rot + (i + 0.5) * Math.PI * 2 / teeth;
+      var a2 = rot + (i + 1) * Math.PI * 2 / teeth;
+      ctx.moveTo(x + Math.cos(a0) * r, y + Math.sin(a0) * r);
+      ctx.lineTo(x + Math.cos(a1) * (r + r * 0.16), y + Math.sin(a1) * (r + r * 0.16));
+      ctx.lineTo(x + Math.cos(a2) * r, y + Math.sin(a2) * r);
+    }
+    ctx.fillStyle = 'rgb(138,143,148)';
+    ctx.fill();
+    disc(x, y, r * 0.86, 'rgb(138,143,148)');
+    disc(x, y, r * 0.16, 'rgb(74,74,68)');
+  }
+  // Handsaw silhouette: tapered blade with a toothed lower edge.
+  function handSaw(x, y, len, rot) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(rot);
+    ctx.beginPath();
+    ctx.moveTo(0, -len * 0.10);
+    ctx.lineTo(len, -len * 0.02);
+    ctx.lineTo(len, len * 0.10);
+    var n = 10;
+    for (var i = 0; i < n; i++) {
+      var fx = len - (i + 0.5) * len / n;
+      ctx.lineTo(fx, len * 0.10 + len * 0.03);
+      ctx.lineTo(len - (i + 1) * len / n, len * 0.10);
+    }
+    ctx.closePath();
+    ctx.fillStyle = 'rgb(138,143,148)';
+    ctx.fill();
+    ctx.restore();
+  }
+  // One arm of the rug: tapered bezier capsule from (0,0) toward dir, in
+  // local units where arm length ~1. Drawn as a filled path.
+  function armPath(dirX, dirY, bend) {
+    var px = -dirY, py = dirX; // perpendicular
+    // NOTE: no beginPath here — callers combine both arms into one path.
+    ctx.moveTo(px * 0.10, py * 0.10);
+    ctx.bezierCurveTo(
+      dirX * 0.45 + px * 0.22 + bend * px * 0.1, dirY * 0.45 + py * 0.22 + bend * py * 0.1,
+      dirX * 0.8 + px * 0.20, dirY * 0.8 + py * 0.20,
+      dirX * 1.0, dirY * 1.0);
+    ctx.bezierCurveTo(
+      dirX * 1.02 + px * 0.05, dirY * 1.02 + py * 0.05,
+      dirX * 0.95 - px * 0.12, dirY * 0.95 - py * 0.12,
+      dirX * 0.55 - px * 0.10, dirY * 0.55 - py * 0.10);
+    ctx.bezierCurveTo(
+      dirX * 0.25 - px * 0.12, dirY * 0.25 - py * 0.12,
+      -px * 0.10, -py * 0.10,
+      px * 0.10, py * 0.10);
+    ctx.closePath();
+  }
+
+  function draw(t) {
+    curT = t;
+    if (!W || !H) resize();
+    if (!W || !H) return;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    var cx = W / 2;
+    var ceilH = H * 0.34;
+    var lift = liftAt(t);
+    if (humOn) dullHum(lift);
+
+    // Room: ceiling shadow band above, wood floor below.
+    ctx.fillStyle = 'rgb(74,74,68)';
+    ctx.fillRect(0, 0, W, ceilH);
+    ctx.fillStyle = 'rgb(122,90,52)';
+    ctx.fillRect(0, ceilH, W, H - ceilH);
+    // Floor plank seams.
+    ctx.fillStyle = rgba(74, 52, 26, 0.5);
+    for (var py = ceilH + (H - ceilH) * 0.25; py < H; py += (H - ceilH) * 0.25) {
+      ctx.fillRect(0, py, W, 2);
+    }
+    // Dust motes drifting on the floor (seeded, closed-form drift).
+    for (var mi = 0; mi < motes.length; mi++) {
+      var mx = (motes[mi][0] + t * 0.002 * (0.5 + motes[mi][2])) % 1;
+      var my = ceilH + motes[mi][1] * (H - ceilH);
+      dot(mx * W, my, 2, rgba(212, 162, 78, 0.25));
+    }
+
+    // ---- Saw mobile: glacial rotation + per-blade pendulum sway ----
+    var hubX = cx, hubY = ceilH * 0.42;
+    var rot = t * Math.PI * 2 / 120; // one revolution per 120 s
+    var mobR = Math.min(W, H) * 0.30;
+    ctx.strokeStyle = 'rgb(200,196,184)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(hubX, 0);
+    ctx.lineTo(hubX, hubY);
+    ctx.stroke();
+    disc(hubX, hubY, 5, 'rgb(200,196,184)');
+    for (var bi = 0; bi < blades.length; bi++) {
+      var b = blades[bi];
+      var sway = Math.sin(t * Math.PI * 2 / b.swayP + b.swayPh) * 0.06;
+      var ang = b.ang + rot * 0.15 + sway;
+      var bx = hubX + Math.cos(ang) * mobR * b.len;
+      var by = hubY + Math.sin(ang) * mobR * 0.55 + mobR * 0.35;
+      ctx.strokeStyle = 'rgb(200,196,184)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(hubX, hubY);
+      ctx.lineTo(bx, by);
+      ctx.stroke();
+      var br = Math.min(W, H) * 0.045;
+      if (b.kind === 'disc') {
+        sawDisc(bx, by, br, t * 0.05 + b.spinPh);
+      } else {
+        handSaw(bx, by, br * 2.4, ang + Math.PI / 2 + sway * 2);
+      }
+    }
+
+    // ---- Rug: two arms in plan view, center at rug center ----
+    var rugCX = cx, rugCY = ceilH + (H - ceilH) * 0.52;
+    var rugW = Math.min(W * 0.86, 640);
+    var rugH = rugW * 0.42;
+    var liftY = -lift * rugH * 0.10;
+    var liftX = lift * rugW * 0.02;
+
+    // Underlay revealed beneath the lifted rug (drawn first, offset down).
+    if (lift > 0.01) {
+      ctx.save();
+      ctx.translate(rugCX + liftX * 0.5, rugCY + lift * rugH * 0.06);
+      ctx.scale(rugW / 2, rugH / 2);
+      ctx.beginPath();
+      armPath(-0.95, 0.35, -0.2);
+      armPath(0.95, 0.35, 0.2);
+      ctx.fillStyle = 'rgb(38,30,26)';
+      ctx.fill();
+      ctx.restore();
+      // Underlay stipple.
+      for (var ui = 0; ui < ustipple.length; ui++) {
+        var ux = rugCX + liftX * 0.5 + ustipple[ui][0] * rugW / 2;
+        var uy = rugCY + lift * rugH * 0.06 + ustipple[ui][1] * rugH / 2;
+        dot(ux, uy, 2, rgba(232, 226, 212, 0.10 + 0.08 * ustipple[ui][2]));
+      }
+    }
+
+    // Rug body: cream border shape beneath, rust shape above.
+    ctx.save();
+    ctx.translate(rugCX + liftX, rugCY + liftY);
+    ctx.scale(rugW / 2, rugH / 2);
+    ctx.beginPath();
+    armPath(-0.95, 0.35, -0.2);
+    armPath(0.95, 0.35, 0.2);
+    ctx.fillStyle = 'rgb(232,226,212)';
+    ctx.fill();
+    ctx.save();
+    ctx.scale(0.92, 0.88);
+    ctx.beginPath();
+    armPath(-0.95, 0.35, -0.2);
+    armPath(0.95, 0.35, 0.2);
+    ctx.fillStyle = 'rgb(168,50,30)';
+    ctx.fill();
+    ctx.clip();
+    // Pile stipple, clipped to the rug.
+    for (var si = 0; si < stipple.length; si++) {
+      var sx = stipple[si][0], sy = stipple[si][1], sr = stipple[si][2];
+      var col = sr < 0.5 ? rgba(120, 32, 18, 0.55) : rgba(232, 226, 212, 0.28);
+      dot(sx, sy, 0.022, col);
+    }
+    // Faint pile ripple: slow sinusoidal bands, as if absorbing sound.
+    ctx.strokeStyle = rgba(232, 226, 212, 0.07);
+    ctx.lineWidth = 0.02;
+    for (var ri = 0; ri < 5; ri++) {
+      var ry = -0.35 + ri * 0.17 + Math.sin(t * 0.25 + ri) * 0.03;
+      ctx.beginPath();
+      ctx.moveTo(-1, ry);
+      for (var rx = -1; rx <= 1.001; rx += 0.1) {
+        ctx.lineTo(rx, ry + Math.sin(rx * 3 + t * 0.4 + ri) * 0.03);
+      }
+      ctx.stroke();
+    }
+    ctx.restore();
+    ctx.restore();
+
+    // Lift shadow: the rug's cast shadow shifts opposite the lift.
+    if (lift > 0.01) {
+      ctx.fillStyle = rgba(20, 14, 10, 0.25 * lift);
+      ctx.fillRect(rugCX - rugW / 2 + liftX, rugCY + rugH * 0.42, rugW, rugH * 0.06);
+    }
+
+    // ---- Signing hand-shape at the rug's center (pseudo-gestures only) ----
+    var hx = rugCX + liftX, hy = rugCY + liftY;
+    var hs = Math.min(W, H) * 0.075; // hand scale
+    var gest = t * Math.PI * 2 / 12; // 12 s gesture loop
+    var wrist = Math.sin(gest) * 0.14;
+    ctx.save();
+    ctx.translate(hx, hy);
+    ctx.rotate(wrist);
+    // Palm.
+    ctx.beginPath();
+    ctx.moveTo(hs * 0.55, 0);
+    ctx.arc(0, 0, hs * 0.55, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgb(212,162,78)';
+    ctx.fill();
+    // Four fingers: lengths articulate in sequence, never a real sign.
+    for (var fi = 0; fi < 4; fi++) {
+      var fph = gest + fi * 0.7;
+      var ext = 0.55 + 0.45 * (0.5 + 0.5 * Math.sin(fph));
+      var fx = -hs * 0.33 + fi * hs * 0.22;
+      var fl = hs * (0.55 + 0.45 * ext);
+      ctx.fillStyle = 'rgb(212,162,78)';
+      ctx.fillRect(fx - hs * 0.07, -hs * 0.55 - fl, hs * 0.14, fl);
+      dot(fx, -hs * 0.55 - fl, hs * 0.14, 'rgb(212,162,78)');
+    }
+    // Thumb, angled, curling on its own phase.
+    var th = 0.5 + 0.5 * Math.sin(gest * 1.3 + 1.1);
+    ctx.save();
+    ctx.translate(hs * 0.45, hs * 0.15);
+    ctx.rotate(0.7 + th * 0.3);
+    ctx.fillStyle = 'rgb(212,162,78)';
+    ctx.fillRect(-hs * 0.07, -hs * (0.35 + 0.25 * th), hs * 0.14, hs * (0.35 + 0.25 * th));
+    ctx.restore();
+    ctx.restore();
+    // Gold halo ring around the hand, breathing faintly.
+    ctx.beginPath();
+    ctx.moveTo(hx + hs * 1.15, hy);
+    ctx.arc(hx, hy, hs * 1.15, 0, Math.PI * 2);
+    ctx.strokeStyle = rgba(212, 162, 78, 0.25 + 0.10 * Math.sin(t * 0.8));
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+
+  // Determinism: synchronous first frame at a constant phase; the clock
+  // starts only with the rAF loop.
+  draw(0);
+  var started = false, t0 = 0;
+  function loop(ts) {
+    if (!started) { started = true; t0 = ts; }
+    draw((ts - t0) / 1000);
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(loop);
+    }
+  }
+  if (typeof requestAnimationFrame === 'function') {
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
