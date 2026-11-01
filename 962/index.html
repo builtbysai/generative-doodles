@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Follower</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #101116; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+/* No.962 "Follower" — study #118 lauren-lee-mccarthy, PP123.
+   A white dot is followed all day. The follower has no body: it exists only
+   as a red trace, the followed's own path replayed 14 seconds behind.
+   When the followed looks back, the trace vanishes for 5 s and the record
+   keeps a gap. At day's end the day freezes, flashes, and one moment is
+   stamped inside a white border: the only photograph. Then a new day. */
+
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+
+/* ---------- seeded RNG (mulberry32) ---------- */
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/* ---------- palette (strict) ---------- */
+var COL = {
+  ground: '#101116',
+  street: '#23262E',
+  followed: '#F2EFE6',
+  trace: '#FF3B3B',
+  arc: '#4FD6FF',
+  white: '#FFFFFF'
+};
+
+/* ---------- constants ---------- */
+var DT = 1 / 120;              // fixed timestep (s)
+var WORLD = 1000;              // virtual world is WORLD x WORLD units
+var SPEED = 46;                // followed's walking speed, world units / s (~33 px/s at 720)
+var LAG = 14;                  // follower lag, seconds of path history
+var TRACE_SPAN = 180;          // trace fades fresh 0.9 -> old 0.1 over this many seconds
+var DAY_LEN = 360;             // one full day per 6 minutes
+var PHOTO_HOLD = 4;            // photograph freeze duration (s)
+var GLANCE_LEN = 5;            // look-back duration (s)
+var PREROLL = 5400;            // exactly 45 s of sim before frame one
+var BASE_SEED = 962123;
+
+/* ---------- viewport ---------- */
+var viewW = 720, viewH = 720, isPhone = false;
+function measure() {
+  var w = 720, h = 720;
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.width) {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    } else if (window.innerWidth) {
+      w = window.innerWidth; h = window.innerHeight;
+    }
+  }
+  viewW = w; viewH = h;
+  var sw = 9999, sh = 9999;
+  if (typeof window !== 'undefined' && window.screen) {
+    sw = window.screen.width || 9999; sh = window.screen.height || 9999;
+  }
+  isPhone = Math.min(sw, sh) < 700 || (Math.min(w, h) < 700 && h > w * 1.15);
+  var dpr = 1;
+  if (typeof window !== 'undefined' && window.devicePixelRatio) {
+    dpr = Math.min(window.devicePixelRatio, 2);
+  }
+  canvas.width = Math.round(w * dpr);
+  canvas.height = Math.round(h * dpr);
+  canvas.style.width = w + 'px';
+  canvas.style.height = h + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+measure();
+if (typeof window !== 'undefined') {
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { measure(); draw(); });
+  }
+  window.addEventListener('resize', function () { measure(); draw(); });
+}
+
+/* ---------- world state ---------- */
+var COLS = 8, ROWS = 8;
+var rng = null;
+var nodes = [];        // {x, y} in world units
+var adj = [];          // adjacency lists of node indices
+var dayIndex = 0;
+var phase = 'walk';    // 'walk' | 'photo'
+var photoT = 0;
+var dayT = 0;          // seconds into the current day
+var dayStep = 0;       // fixed steps taken this day
+var histX = null, histY = null;   // followed's position, one entry per step
+var walker = null;     // {x, y, cur, next, path[], pauseT}
+var pendingDest = -1;  // node index set by a drag redirect
+var glanceActive = false, glanceEnd = 0, nextGlanceAt = 0;
+var glanceGaps = [];   // {s, e} follower-time intervals erased from the record
+var pendingEvents = []; // {at, type} consumed by the sim in timestamp order
+var stepTicks = 0;     // footstep counter, read by the (browser-only) audio side
+
+function buildCity() {
+  nodes = []; adj = [];
+  var mx = 46, my = 46, cw = (WORLD - 2 * mx) / (COLS - 1), ch = (WORLD - 2 * my) / (ROWS - 1);
+  for (var r = 0; r < ROWS; r++) {
+    for (var c = 0; c < COLS; c++) {
+      var jx = (c === 0 || c === COLS - 1) ? 0 : (rng() - 0.5) * cw * 0.55;
+      var jy = (r === 0 || r === ROWS - 1) ? 0 : (rng() - 0.5) * ch * 0.55;
+      nodes.push({ x: mx + c * cw + jx, y: my + r * ch + jy });
+      adj.push([]);
+    }
+  }
+  for (var r2 = 0; r2 < ROWS; r2++) {
+    for (var c2 = 0; c2 < COLS; c2++) {
+      var i = r2 * COLS + c2;
+      if (c2 + 1 < COLS) { adj[i].push(i + 1); adj[i + 1].push(i); }
+      if (r2 + 1 < ROWS) { adj[i].push(i + COLS); adj[i + COLS].push(i); }
+    }
+  }
+}
+
+function bfsPath(from, to) {
+  if (from === to) return [];
+  var prev = new Array(nodes.length).fill(-1);
+  var q = [from]; prev[from] = from;
+  while (q.length) {
+    var n = q.shift();
+    if (n === to) break;
+    for (var k = 0; k < adj[n].length; k++) {
+      var m = adj[n][k];
+      if (prev[m] === -1) { prev[m] = n; q.push(m); }
+    }
+  }
+  if (prev[to] === -1) return [];
+  var path = [], cur = to;
+  while (cur !== from) { path.unshift(cur); cur = prev[cur]; }
+  return path;
+}
+
+function pickWaypoint() {
+  var t = Math.floor(rng() * nodes.length);
+  if (t === walker.cur) t = (t + 7) % nodes.length;
+  return t;
+}
+
+function newDay() {
+  rng = mulberry32(BASE_SEED + dayIndex * 1013);
+  buildCity();
+  var start = Math.floor(rng() * nodes.length);
+  walker = {
+    x: nodes[start].x, y: nodes[start].y,
+    cur: start, next: -1, path: [], pauseT: 0, distAcc: 0
+  };
+  walker.path = bfsPath(start, pickWaypoint());
+  histX = new Float32Array(Math.ceil(DAY_LEN / DT) + 240);
+  histY = new Float32Array(Math.ceil(DAY_LEN / DT) + 240);
+  histX[0] = walker.x; histY[0] = walker.y;
+  dayT = 0; dayStep = 0;
+  glanceActive = false; glanceGaps = []; pendingEvents = [];
+  pendingDest = -1;
+  nextGlanceAt = 58 + rng() * 30;  // first glance safely after the 45 s preroll
+  phase = 'walk'; photoT = 0;
+}
+
+function startGlance(at) {
+  glanceGaps.push({ s: at - LAG, e: at - LAG + GLANCE_LEN }); // erased from the record
+  glanceActive = true;
+  glanceEnd = at + GLANCE_LEN;
+  onGlanceAudio();
+}
+
+function startPhoto() {
+  phase = 'photo'; photoT = 0;
+  onPhotoAudio();
+}
+
+function onNodeArrive() {
+  walker.cur = walker.next; walker.next = -1;
+  if (pendingDest >= 0) {
+    walker.path = bfsPath(walker.cur, pendingDest);
+    pendingDest = -1;
+    if (!walker.path.length && rng() < 0.3) walker.pauseT = 0.5 + rng() * 1.2;
+    return;
+  }
+  if (!walker.path.length) {
+    if (rng() < 0.3) walker.pauseT = 0.8 + rng() * 2.2;  // linger at the destination corner
+    walker.path = bfsPath(walker.cur, pickWaypoint());
+  } else if (rng() < 0.10) {
+    walker.pauseT = 0.3 + rng() * 0.7;                   // brief pause at some corners
+  }
+}
+
+function stepWalker() {
+  if (walker.pauseT > 0) { walker.pauseT -= DT; return; }
+  if (walker.next < 0) {
+    if (!walker.path.length) { onNodeArrive(); if (!walker.path.length) return; }
+    walker.next = walker.path.shift();
+  }
+  var tx = nodes[walker.next].x, ty = nodes[walker.next].y;
+  var dx = tx - walker.x, dy = ty - walker.y;
+  var d = Math.sqrt(dx * dx + dy * dy);
+  var stepLen = SPEED * DT;
+  var moved = Math.min(d, stepLen);
+  if (d <= stepLen) {
+    walker.x = tx; walker.y = ty;
+    onNodeArrive();
+  } else {
+    walker.x += (dx / d) * stepLen;
+    walker.y += (dy / d) * stepLen;
+  }
+  walker.distAcc += moved;                 // one footstep tick per 16 world units
+  if (walker.distAcc >= 16) { walker.distAcc -= 16; stepTicks++; }
+}
+
+function step() {
+  if (phase === 'photo') {
+    photoT += DT;
+    if (photoT >= PHOTO_HOLD) { dayIndex++; newDay(); }
+    return;
+  }
+  dayT += DT;
+  // consume queued interaction events in timestamp order
+  pendingEvents.sort(function (a, b) { return a.at - b.at; });
+  while (pendingEvents.length && pendingEvents[0].at <= dayT) {
+    var ev = pendingEvents.shift();
+    if (ev.type === 'glance' && !glanceActive) startGlance(dayT);
+    else if (ev.type === 'photo') { startPhoto(); return; }
+  }
+  if (!glanceActive && dayT >= nextGlanceAt) startGlance(dayT);
+  if (glanceActive && dayT >= glanceEnd) {
+    glanceActive = false;
+    nextGlanceAt = dayT + 50 + rng() * 40;
+  }
+  stepWalker();
+  dayStep++;
+  if (dayStep < histX.length) { histX[dayStep] = walker.x; histY[dayStep] = walker.y; }
+  if (dayT >= DAY_LEN) startPhoto();
+}
+
+/* position of the followed at day-local time t (from the per-step record) */
+function posAt(t) {
+  var f = t / DT;
+  var i = Math.floor(f);
+  if (i < 0) i = 0;
+  if (i >= dayStep) return { x: histX[dayStep], y: histY[dayStep] };
+  var fr = f - i;
+  return {
+    x: histX[i] + (histX[i + 1] - histX[i]) * fr,
+    y: histY[i] + (histY[i + 1] - histY[i]) * fr
+  };
+}
+
+function inGap(tau) {
+  for (var i = 0; i < glanceGaps.length; i++) {
+    if (tau >= glanceGaps[i].s && tau <= glanceGaps[i].e) return true;
+  }
+  return false;
+}
+
+/* ---------- drawing ---------- */
+function w2sx(x) { return (x / WORLD) * viewW; }
+function w2sy(y) { return (y / WORLD) * viewH; }
+
+function drawStreets() {
+  var sx = viewW / WORLD;
+  ctx.strokeStyle = COL.street;
+  ctx.lineWidth = Math.max(3, 24 * sx);
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  var r, c, i;
+  for (r = 0; r < ROWS; r++) {
+    for (c = 0; c < COLS; c++) {
+      i = r * COLS + c;
+      if (c === 0) ctx.moveTo(w2sx(nodes[i].x), w2sy(nodes[i].y));
+      else ctx.lineTo(w2sx(nodes[i].x), w2sy(nodes[i].y));
+    }
+  }
+  for (c = 0; c < COLS; c++) {
+    for (r = 0; r < ROWS; r++) {
+      i = r * COLS + c;
+      if (r === 0) ctx.moveTo(w2sx(nodes[i].x), w2sy(nodes[i].y));
+      else ctx.lineTo(w2sx(nodes[i].x), w2sy(nodes[i].y));
+    }
+  }
+  ctx.stroke();
+}
+
+function drawTrace() {
+  if (glanceActive) return;            // looked back: the record hides
+  var tauMax = dayT - LAG;
+  if (tauMax <= 0) return;
+  var tauMin = Math.max(0, tauMax - TRACE_SPAN);
+  var sample = 0.12;                    // seconds between trace points
+  ctx.lineWidth = Math.max(1.6, Math.min(viewW, viewH) * 0.004);
+  ctx.lineCap = 'round';
+  var prev = null, prevAlphaQ = -1;
+  ctx.beginPath();
+  for (var tau = tauMin; tau <= tauMax + 1e-9; tau += sample) {
+    if (inGap(tau)) { prev = null; continue; }   // the gap in the record
+    var p = posAt(tau);
+    var age = tauMax - tau;
+    var a = 0.9 - 0.8 * (age / TRACE_SPAN);
+    var aq = Math.round(a * 20) / 20;
+    var px = w2sx(p.x), py = w2sy(p.y);
+    if (prev && aq === prevAlphaQ) {
+      ctx.lineTo(px, py);
+    } else {
+      if (prev) ctx.stroke();
+      ctx.strokeStyle = 'rgba(255,59,59,' + aq.toFixed(2) + ')';
+      ctx.beginPath();
+      if (prev) ctx.moveTo(prev.x, prev.y);
+      else ctx.moveTo(px, py);
+      ctx.lineTo(px, py);
+      prevAlphaQ = aq;
+    }
+    prev = { x: px, y: py };
+  }
+  ctx.stroke();
+}
+
+function drawDayArc() {
+  var cx = viewW / 2, cy = viewH / 2;
+  var rad = Math.min(viewW, viewH) * 0.5 - Math.max(8, Math.min(viewW, viewH) * 0.02);
+  ctx.strokeStyle = COL.arc;
+  ctx.globalAlpha = 0.5;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(cx, cy, rad, -Math.PI / 2, -Math.PI / 2 + (dayT / DAY_LEN) * Math.PI * 2);
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+}
+
+function drawFollowed() {
+  var px = w2sx(walker.x), py = w2sy(walker.y);
+  var base = Math.min(viewW, viewH);
+  // halo: flat low-alpha disc + ring so the eye can find the followed (recorded deviation)
+  ctx.fillStyle = 'rgba(242,239,230,0.08)';
+  ctx.beginPath(); ctx.arc(px, py, base * 0.016, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = 'rgba(242,239,230,0.22)';
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.arc(px, py, base * 0.016, 0, Math.PI * 2); ctx.stroke();
+  ctx.fillStyle = COL.followed;
+  ctx.beginPath(); ctx.arc(px, py, Math.max(2.4, base * 0.0045), 0, Math.PI * 2); ctx.fill();
+}
+
+function drawPhoto() {
+  // flash: strongest in the first 0.4 s, then gone while the frame is held
+  var fl = Math.max(0, 0.85 * (1 - photoT / 0.4));
+  if (fl > 0) {
+    ctx.fillStyle = 'rgba(255,255,255,' + fl.toFixed(3) + ')';
+    ctx.fillRect(0, 0, viewW, viewH);
+  }
+  var m = Math.min(viewW, viewH) * 0.09;
+  ctx.strokeStyle = COL.white;
+  ctx.lineWidth = 2;
+  ctx.strokeRect(m, m, viewW - 2 * m, viewH - 2 * m);
+}
+
+function draw() {
+  canvas.style.width = viewW + 'px';
+  canvas.style.height = viewH + 'px';
+  ctx.fillStyle = COL.ground;
+  ctx.fillRect(0, 0, viewW, viewH);
+  drawStreets();
+  drawTrace();
+  drawDayArc();
+  drawFollowed();
+  if (phase === 'photo') drawPhoto();
+}
+
+/* ---------- audio (lazy, guarded; sound only after a visitor gesture) ---------- */
+var AC = null, humGain = null, masterGain = null;
+function initAudio() {
+  if (AC) return;
+  try {
+    var Ctor = (typeof window !== 'undefined') && (window.AudioContext || window.webkitAudioContext);
+    if (!Ctor) return;
+    AC = new Ctor();
+    masterGain = AC.createGain(); masterGain.gain.value = 0.9;
+    masterGain.connect(AC.destination);
+    // low city hum: two detuned sines through a lowpass
+    var lp = AC.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 220;
+    humGain = AC.createGain(); humGain.gain.value = 0.035;
+    lp.connect(humGain); humGain.connect(masterGain);
+    [55, 82.4, 110.3].forEach(function (f) {
+      var o = AC.createOscillator(); o.type = 'sine'; o.frequency.value = f;
+      var g = AC.createGain(); g.gain.value = 0.33;
+      o.connect(g); g.connect(lp); o.start();
+    });
+  } catch (e) { AC = null; }
+}
+function tick(freq, gain, dur, when) {
+  if (!AC) return;
+  try {
+    var t0 = AC.currentTime + (when || 0);
+    var o = AC.createOscillator(); o.type = 'triangle'; o.frequency.value = freq;
+    var g = AC.createGain();
+    g.gain.setValueAtTime(0, t0);
+    g.gain.linearRampToValueAtTime(gain, t0 + 0.006);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    o.connect(g); g.connect(masterGain);
+    o.start(t0); o.stop(t0 + dur + 0.05);
+  } catch (e) { /* silent */ }
+}
+var lastTickSeen = 0, tickAlt = false;
+function audioFrame() {
+  if (!AC) return;
+  if (stepTicks !== lastTickSeen) {
+    lastTickSeen = stepTicks;
+    tickAlt = !tickAlt;
+    tick(tickAlt ? 190 : 158, 0.045, 0.07, 0);          // the followed's step
+    tick(tickAlt ? 150 : 126, 0.028, 0.07, 0.23);       // the follower, a beat behind
+  }
+}
+function onGlanceAudio() {
+  if (!AC || !humGain) return;
+  try {
+    var t = AC.currentTime;
+    humGain.gain.cancelScheduledValues(t);
+    humGain.gain.setValueAtTime(humGain.gain.value, t);
+    humGain.gain.linearRampToValueAtTime(0.004, t + 0.15);  // a held breath
+    humGain.gain.linearRampToValueAtTime(0.035, t + 2.0);
+  } catch (e) { /* silent */ }
+}
+function onPhotoAudio() {
+  if (!AC) return;
+  tick(1400, 0.06, 0.05, 0);   // shutter snap
+  tick(660, 0.04, 0.18, 0.03); // flash tone
+}
+
+/* ---------- interaction ---------- */
+var pDown = null, lastTapAt = -10, pendingTapTimer = null;
+function toWorld(cx, cy) {
+  var rx = cx, ry = cy;
+  if (canvas.getBoundingClientRect) {
+    var b = canvas.getBoundingClientRect();
+    rx = cx - b.left; ry = cy - b.top;
+  }
+  return { x: (rx / viewW) * WORLD, y: (ry / viewH) * WORLD };
+}
+function nearestNode(wx, wy) {
+  var best = 0, bd = Infinity;
+  for (var i = 0; i < nodes.length; i++) {
+    var dx = nodes[i].x - wx, dy = nodes[i].y - wy;
+    var d = dx * dx + dy * dy;
+    if (d < bd) { bd = d; best = i; }
+  }
+  return best;
+}
+if (canvas.addEventListener) {
+  canvas.addEventListener('pointerdown', function (e) {
+    initAudio();
+    if (AC && AC.resume) { try { AC.resume(); } catch (err) { /* silent */ } }
+    pDown = { x: e.clientX, y: e.clientY, moved: false };
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (pDown && (Math.abs(e.clientX - pDown.x) > 8 || Math.abs(e.clientY - pDown.y) > 8)) pDown.moved = true;
+  });
+  canvas.addEventListener('pointerup', function (e) {
+    if (!pDown) return;
+    var wasDrag = pDown.moved;
+    pDown = null;
+    if (phase !== 'walk') return;
+    if (wasDrag) {
+      var w = toWorld(e.clientX, e.clientY);
+      pendingDest = nearestNode(w.x, w.y);   // redirect: the followed walks there next
+      return;
+    }
+    // tap: a second tap within 0.35 s of piece time makes it a double-tap
+    if (dayT - lastTapAt < 0.35 && lastTapAt > 0) {
+      pendingEvents = pendingEvents.filter(function (ev) { return ev.type !== 'glance'; });
+      pendingEvents.push({ at: dayT, type: 'photo' });   // photograph, then a new day
+      lastTapAt = -10;
+    } else {
+      lastTapAt = dayT;
+      pendingEvents.push({ at: dayT + 0.35, type: 'glance' }); // look back, unless it becomes a double-tap
+    }
+  });
+}
+
+/* ---------- run ---------- */
+newDay();
+for (var s = 0; s < PREROLL; s++) step();   // exactly 5400 fixed steps: 45 s of day one
+draw();                                      // frame one: synchronous, deterministic
+
+if (typeof requestAnimationFrame === 'function') {
+  var lastTs = null, acc = 0;
+  var loop = function (ts) {
+    if (lastTs === null) lastTs = ts;
+    var elapsed = (ts - lastTs) / 1000;
+    lastTs = ts;
+    if (elapsed > 0.5) elapsed = 0.5;
+    acc += elapsed;
+    var n = 0;
+    while (acc >= DT && n < 30) { step(); acc -= DT; n++; }  // fixed steps, capped
+    if (n === 30) acc = 0;
+    draw();
+    audioFrame();
+    requestAnimationFrame(loop);
+  };
+  requestAnimationFrame(loop);
+}
+</script>
+</body>
+</html>

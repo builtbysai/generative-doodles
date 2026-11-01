@@ -1,0 +1,601 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Crowdpilot</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0C0D12; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  /* No.961 Crowdpilot (study #118 lauren-lee-mccarthy, PP122).
+     A dater walks a corridor graph. It NEVER walks unsteered: every turn
+     comes from a majority vote of three advisors (friend / stranger /
+     hired assistant), held every 2 s of piece time. The fading trail
+     takes the winning advisor's color, so the path is a barcode of who
+     steered. Fixed-timestep sim (120 Hz), 3600 pre-roll steps,
+     deterministic per seed. No words anywhere: chevrons and trails only. */
+
+  // ---------- palette ----------
+  var GROUND = '#0C0D12';
+  var CORRIDOR = '#262A35';
+  var DATER = '#F5F2EA';
+  var ADV = [
+    { name: 'friend',   hex: '#4FD6FF', rgb: [79, 214, 255],  pitch: 740 },
+    { name: 'stranger', hex: '#FF4FD8', rgb: [255, 79, 216],  pitch: 988 },
+    { name: 'assistant', hex: '#FFC44F', rgb: [255, 196, 79], pitch: 587 }
+  ];
+  var TARGET_RGB = [255, 79, 216]; // #FF4FD8
+
+  // ---------- seeded rng (mulberry32) ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- constants ----------
+  var BASE_SEED = 424242;
+  var DT = 1 / 120;              // fixed step (s)
+  var PREROLL = 3600;            // 30 s of performance before frame one
+  var SPEED = 38 / 720;          // world units per second (38 px/s at 720)
+  var VOTE_EVERY = 240;          // steps between votes (2 s)
+  var TRAIL_FADE = 90;           // s for a trail segment to fade out
+  var CONV_FADE = 3;             // s for an old conversation's trail to clear
+  var TARGET_R = 0.042;          // arrival radius around the target point
+
+  // ---------- sim state ----------
+  var stepCount = 0;
+  var simT = 0;
+  var conv = -1;                 // conversation index
+  var rng = null;                // per-conversation stream (graph, votes)
+  var nodes = [];                // {x, y} in world units [0,1]
+  var edges = [];                // {a, b, last} last = step last traversed
+  var adj = [];                  // node -> [edgeIds]
+  var startNode = 0, targetNode = 0;
+  var targetPos = { x: 0, y: 0 }; // draggable; starts on targetNode
+  var personalities = [];        // per advisor: noise scales
+  var dater = null;              // {node, edge, u, from, to, x, y}
+  var pending = null;            // {node, edge} latest vote result
+  var advVote = [-1, -1, -1];    // edge each advisor last voted for
+  var curColor = 0;              // advisor index whose color the trail takes
+  var boostUntil = [-1, -1, -1]; // sim time each advisor's 3x weight ends
+  var trail = [];                // {x, y, t, ci, conv}
+  var convEnd = [];              // conv index -> sim time it ended
+  var bloom = null;              // {x, y, t0} target-reached bloom
+  var lastVoteStep = -VOTE_EVERY;
+
+  function buildConversation(c) {
+    conv = c;
+    rng = mulberry32(BASE_SEED + c * 7919);
+    // --- corridor: jittered 5x4 lattice with a diagonal skew ---
+    var COLS = 5, ROWS = 4;
+    nodes = []; edges = []; adj = [];
+    var id = [];
+    for (var r = 0; r < ROWS; r++) {
+      id.push([]);
+      for (var q = 0; q < COLS; q++) {
+        var bx = 0.10 + 0.80 * (q / (COLS - 1));
+        var by = 0.12 + 0.76 * (r / (ROWS - 1));
+        var x = bx + (rng() - 0.5) * 0.07 + (by - 0.5) * 0.10; // diagonal lean
+        var y = by + (rng() - 0.5) * 0.07;
+        x = Math.max(0.06, Math.min(0.94, x));
+        y = Math.max(0.06, Math.min(0.94, y));
+        id[r].push(nodes.length);
+        nodes.push({ x: x, y: y });
+        adj.push([]);
+      }
+    }
+    function addEdge(a, b) {
+      for (var i = 0; i < adj[a].length; i++) {
+        var e = edges[adj[a][i]];
+        if ((e.a === a && e.b === b) || (e.a === b && e.b === a)) return;
+      }
+      var eid = edges.length;
+      edges.push({ a: a, b: b, last: -1000000 });
+      adj[a].push(eid); adj[b].push(eid);
+    }
+    for (var r2 = 0; r2 < ROWS; r2++) {
+      for (var q2 = 0; q2 < COLS; q2++) {
+        var n = id[r2][q2];
+        if (q2 + 1 < COLS) addEdge(n, id[r2][q2 + 1]);            // right
+        if (r2 + 1 < ROWS) addEdge(n, id[r2 + 1][q2]);            // down
+        if (q2 + 1 < COLS && r2 + 1 < ROWS) addEdge(n, id[r2 + 1][q2 + 1]); // down-right
+      }
+    }
+    // a few seeded cross edges for fork variety
+    for (var k = 0; k < 4; k++) {
+      var a2 = Math.floor(rng() * nodes.length);
+      var best = -1, bestD = 1e9;
+      for (var m = 0; m < nodes.length; m++) {
+        if (m === a2) continue;
+        var dx = nodes[m].x - nodes[a2].x, dy = nodes[m].y - nodes[a2].y;
+        var d = dx * dx + dy * dy;
+        if (d < 0.20 && rng() < 0.5 && d < bestD) { bestD = d; best = m; }
+      }
+      if (best >= 0) addEdge(a2, best);
+    }
+    startNode = id[ROWS - 1][0];            // bottom-left
+    targetNode = id[0][COLS - 1];           // top-right
+    targetPos = { x: nodes[targetNode].x, y: nodes[targetNode].y };
+    // --- personalities (seeded noise temperaments) ---
+    personalities = [
+      { noise: 0.03 + rng() * 0.05 },  // friend: greedy toward target
+      { noise: 0.25 + rng() * 0.40 },  // stranger: novelty seeker
+      { noise: 0.15 + rng() * 0.25 }   // assistant: shortest path, some slack
+    ];
+    dater = { node: startNode, edge: -1, u: 0, from: startNode, to: startNode,
+              x: nodes[startNode].x, y: nodes[startNode].y };
+    pending = null;
+    boostUntil = [-1, -1, -1];
+    lastVoteStep = stepCount - VOTE_EVERY;
+    castVote(startNode); // the first steering happens before the first step
+  }
+
+  function bfsDist(from) {
+    var dist = [];
+    for (var i = 0; i < nodes.length; i++) dist.push(-1);
+    dist[from] = 0;
+    var queue = [from];
+    while (queue.length) {
+      var n = queue.shift();
+      for (var j = 0; j < adj[n].length; j++) {
+        var e = edges[adj[n][j]];
+        var o = e.a === n ? e.b : e.a;
+        if (dist[o] < 0) { dist[o] = dist[n] + 1; queue.push(o); }
+      }
+    }
+    return dist;
+  }
+  function nearestNode(p) {
+    var best = 0, bd = 1e9;
+    for (var i = 0; i < nodes.length; i++) {
+      var dx = nodes[i].x - p.x, dy = nodes[i].y - p.y, d = dx * dx + dy * dy;
+      if (d < bd) { bd = d; best = i; }
+    }
+    return best;
+  }
+
+  // Each advisor picks an outgoing edge at junction node J. Majority
+  // (weighted) wins; the winner's color owns the trail until the next vote.
+  function castVote(J) {
+    var outs = adj[J];
+    if (!outs.length) return;
+    var distT = bfsDist(nearestNode(targetPos));
+    var picks = [];
+    for (var a = 0; a < 3; a++) {
+      var bestE = outs[0], bestS = -1e18;
+      for (var i = 0; i < outs.length; i++) {
+        var e = edges[outs[i]];
+        var far = e.a === J ? e.b : e.a;
+        var s;
+        if (a === 0) {          // friend: end up closer to the date
+          var dx = nodes[far].x - targetPos.x, dy = nodes[far].y - targetPos.y;
+          s = -(dx * dx + dy * dy) + (rng() - 0.5) * personalities[0].noise;
+        } else if (a === 1) {   // stranger: the road less recently walked
+          s = Math.min(stepCount - e.last, 100000) / 1000 + (rng() - 0.5) * personalities[1].noise;
+        } else {                // assistant: shortest graph path
+          s = -(distT[far] < 0 ? 99 : distT[far]) + (rng() - 0.5) * personalities[2].noise;
+        }
+        if (s > bestS) { bestS = s; bestE = outs[i]; }
+      }
+      picks.push(bestE);
+      advVote[a] = bestE;
+    }
+    var tally = {};
+    for (var b = 0; b < 3; b++) {
+      var w = simT < boostUntil[b] ? 3 : 1;
+      tally[picks[b]] = (tally[picks[b]] || 0) + w;
+    }
+    var winE = picks[0], winW = -1;
+    var tied = [];
+    for (var key in tally) {
+      var eid = +key;
+      if (tally[key] > winW) { winW = tally[key]; tied = [eid]; }
+      else if (tally[key] === winW) tied.push(eid);
+    }
+    winE = tied[Math.floor(rng() * tied.length)]; // seeded coin on ties
+    // trail color: the strongest advisor backing the winning edge
+    var winA = 0, winAW = -1;
+    for (var c = 0; c < 3; c++) {
+      if (picks[c] === winE) {
+        var w2 = simT < boostUntil[c] ? 3 : 1;
+        if (w2 > winAW) { winAW = w2; winA = c; }
+      }
+    }
+    if (winE !== (pending && pending.edge)) turnHook(winA);
+    pending = { node: J, edge: winE };
+    curColor = winA;
+    lastVoteStep = stepCount;
+    voteHook(winA);
+  }
+
+  function depart(edgeId) {
+    var e = edges[edgeId];
+    var from = dater.node;
+    var to = e.a === from ? e.b : e.a;
+    e.last = stepCount;
+    dater.edge = edgeId; dater.from = from; dater.to = to; dater.u = 0;
+    dater.node = -1;
+  }
+
+  function arrive(nodeId) {
+    dater.node = nodeId;
+    dater.edge = -1;
+    dater.x = nodes[nodeId].x; dater.y = nodes[nodeId].y;
+    if (pending && pending.node === nodeId) {
+      var e = pending.edge;
+      pending = null;
+      depart(e);
+    } else {
+      castVote(nodeId);         // no steer on file: vote now, then go
+      var e2 = pending.edge;
+      pending = null;
+      depart(e2);
+    }
+  }
+
+  function step() {
+    stepCount++;
+    simT = stepCount * DT;
+    // votes concern the junction the dater will next choose at
+    if (stepCount - lastVoteStep >= VOTE_EVERY) {
+      castVote(dater.edge >= 0 ? dater.to : dater.node);
+    }
+    if (dater.edge < 0) arrive(dater.node); // safety: never idle unsteered
+    var move = SPEED * DT;
+    var guard = 0;
+    while (move > 0 && guard++ < 8) {
+      var e = edges[dater.edge];
+      var A = nodes[dater.from], B = nodes[dater.to];
+      var len = Math.sqrt((B.x - A.x) * (B.x - A.x) + (B.y - A.y) * (B.y - A.y));
+      var remain = (1 - dater.u) * len;
+      if (move < remain) {
+        dater.u += move / len;
+        move = 0;
+      } else {
+        move -= remain;
+        arrive(dater.to);
+      }
+    }
+    if (dater.edge >= 0) {
+      var e2 = edges[dater.edge];
+      var A2 = nodes[dater.from], B2 = nodes[dater.to];
+      dater.x = A2.x + (B2.x - A2.x) * dater.u;
+      dater.y = A2.y + (B2.y - A2.y) * dater.u;
+    }
+    // record the trail (the barcode of who steered)
+    trail.push({ x: dater.x, y: dater.y, t: simT, ci: curColor, conv: conv });
+    // prune dead points
+    while (trail.length && trail[0].conv < conv &&
+           simT - (convEnd[trail[0].conv] || 0) > CONV_FADE + 0.1) trail.shift();
+    while (trail.length && trail[0].conv === conv && simT - trail[0].t > TRAIL_FADE + 1) trail.shift();
+    // reaching the date
+    var dx = dater.x - targetPos.x, dy = dater.y - targetPos.y;
+    if (dx * dx + dy * dy < TARGET_R * TARGET_R) {
+      bloom = { x: targetPos.x, y: targetPos.y, t0: simT };
+      reachHook();
+      convEnd[conv] = simT;
+      buildConversation(conv + 1);
+    }
+  }
+
+  // ---------- canvas / sizing ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0, DPR = 1, PHONE = false;
+
+  function resize() {
+    var vv = window.visualViewport;
+    W = (vv && vv.width) || window.innerWidth || 720;
+    H = (vv && vv.height) || window.innerHeight || 720;
+    DPR = window.devicePixelRatio || 1;
+    var sw = (window.screen && window.screen.width) || W;
+    var sh = (window.screen && window.screen.height) || H;
+    PHONE = Math.min(sw, sh) < 700;
+    if (!window.screen && H > W * 1.15) PHONE = true;
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+  }
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { resize(); draw(); });
+  }
+  window.addEventListener('resize', function () { resize(); draw(); });
+
+  function world() {
+    var S = Math.min(W, H);
+    return { S: S, ox: (W - S) / 2, oy: (H - S) / 2 };
+  }
+  function toPx(p, w) { return { x: w.ox + p.x * w.S, y: w.oy + p.y * w.S }; }
+
+  // ---------- panels (screen space, frame edges) ----------
+  function panelRect(a) {
+    var s = PHONE ? 52 : 58;
+    if (a === 0) return { x: 10, y: H / 2 - s / 2, w: s, h: s };            // left
+    if (a === 1) return { x: W / 2 - s / 2, y: 10, w: s, h: s };            // top
+    return { x: W - 10 - s, y: H / 2 - s / 2, w: s, h: s };                 // right
+  }
+  function dirBucket(dx, dy) {
+    if (Math.abs(dx) > Math.abs(dy)) return dx > 0 ? 2 : 3; // R, L
+    return dy > 0 ? 1 : 0;                                  // D, U
+  }
+  function drawChevron(cx, cy, bucket, size, rgb, alpha) {
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = 'rgb(' + rgb[0] + ',' + rgb[1] + ',' + rgb[2] + ')';
+    ctx.beginPath();
+    if (bucket === 0) { ctx.moveTo(cx, cy - size); ctx.lineTo(cx - size * 0.8, cy + size * 0.6); ctx.lineTo(cx + size * 0.8, cy + size * 0.6); }
+    if (bucket === 1) { ctx.moveTo(cx, cy + size); ctx.lineTo(cx - size * 0.8, cy - size * 0.6); ctx.lineTo(cx + size * 0.8, cy - size * 0.6); }
+    if (bucket === 2) { ctx.moveTo(cx + size, cy); ctx.lineTo(cx - size * 0.6, cy - size * 0.8); ctx.lineTo(cx - size * 0.6, cy + size * 0.8); }
+    if (bucket === 3) { ctx.moveTo(cx - size, cy); ctx.lineTo(cx + size * 0.6, cy - size * 0.8); ctx.lineTo(cx + size * 0.6, cy + size * 0.8); }
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+
+  // ---------- draw ----------
+  function draw() {
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.fillStyle = GROUND;
+    ctx.fillRect(0, 0, W, H);
+    var w = world();
+    var t = simT;
+
+    // corridor hairlines + node specks
+    ctx.strokeStyle = CORRIDOR;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (var i = 0; i < edges.length; i++) {
+      var a = toPx(nodes[edges[i].a], w), b = toPx(nodes[edges[i].b], w);
+      ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
+    }
+    ctx.stroke();
+    ctx.fillStyle = CORRIDOR;
+    for (var n = 0; n < nodes.length; n++) {
+      var np = toPx(nodes[n], w);
+      ctx.beginPath(); ctx.arc(np.x, np.y, 1.6, 0, Math.PI * 2); ctx.fill();
+    }
+
+    // trail: segments colored by the vote winner at their birth,
+    // alpha by age (and by the 3 s clear of a finished conversation)
+    ctx.lineWidth = Math.max(2, w.S * 0.004);
+    ctx.lineCap = 'round';
+    for (var sIdx = 1; sIdx < trail.length; sIdx++) {
+      var p0 = trail[sIdx - 1], p1 = trail[sIdx];
+      if (p0.conv !== p1.conv) continue;
+      var ddx = p1.x - p0.x, ddy = p1.y - p0.y;
+      if (ddx * ddx + ddy * ddy > 0.01) continue; // never draw a jump
+      var alpha = 0.7 * Math.max(0, 1 - (t - p1.t) / TRAIL_FADE);
+      if (p1.conv < conv) {
+        var ce = convEnd[p1.conv];
+        if (ce === undefined) continue;
+        alpha *= Math.max(0, 1 - (t - ce) / CONV_FADE);
+      }
+      if (alpha < 0.02) continue;
+      var rgb = ADV[p1.ci].rgb;
+      ctx.strokeStyle = 'rgba(' + rgb[0] + ',' + rgb[1] + ',' + rgb[2] + ',' + alpha.toFixed(3) + ')';
+      var q0 = toPx(p0, w), q1 = toPx(p1, w);
+      ctx.beginPath(); ctx.moveTo(q0.x, q0.y); ctx.lineTo(q1.x, q1.y); ctx.stroke();
+    }
+
+    // bloom where a date was reached
+    if (bloom) {
+      var ba = t - bloom.t0;
+      if (ba >= 0 && ba < 1.2) {
+        var bp = toPx(bloom, w);
+        ctx.save();
+        ctx.globalAlpha = 0.5 * (1 - ba / 1.2);
+        ctx.strokeStyle = '#FF4FD8';
+        ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.arc(bp.x, bp.y, 6 + ba * 46, 0, Math.PI * 2); ctx.stroke();
+        ctx.restore();
+      }
+    }
+
+    // date-target: magenta dot, gentle pulse
+    var tp = toPx(targetPos, w);
+    var pulse = 1 + 0.25 * Math.sin(2 * Math.PI * t / 1.6);
+    ctx.save();
+    ctx.globalAlpha = 0.25;
+    ctx.fillStyle = '#FF4FD8';
+    ctx.beginPath(); ctx.arc(tp.x, tp.y, 10 * pulse, 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.beginPath(); ctx.arc(tp.x, tp.y, 4.5 * pulse, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+
+    // dater: white dot with a soft under-disc
+    var dp = toPx(dater, w);
+    ctx.save();
+    ctx.globalAlpha = 0.18;
+    ctx.fillStyle = DATER;
+    ctx.beginPath(); ctx.arc(dp.x, dp.y, 9, 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.beginPath(); ctx.arc(dp.x, dp.y, 3.6, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+
+    // advisor panels: four chevron slots each; the current suggestion
+    // flashes at ~4 Hz, the rest sit dim in the advisor's tone
+    var J = dater.edge >= 0 ? dater.to : dater.node;
+    for (var a2 = 0; a2 < 3; a2++) {
+      var r = panelRect(a2);
+      var rgb2 = ADV[a2].rgb;
+      var boosted = t < boostUntil[a2];
+      ctx.save();
+      ctx.fillStyle = 'rgba(' + rgb2[0] + ',' + rgb2[1] + ',' + rgb2[2] + ',' + (boosted ? 0.16 : 0.07) + ')';
+      ctx.strokeStyle = 'rgba(' + rgb2[0] + ',' + rgb2[1] + ',' + rgb2[2] + ',' + (boosted ? 0.85 : 0.35) + ')';
+      ctx.lineWidth = boosted ? 1.6 : 1;
+      var rad = 9;
+      ctx.beginPath();
+      ctx.moveTo(r.x + rad, r.y);
+      ctx.arcTo(r.x + r.w, r.y, r.x + r.w, r.y + r.h, rad);
+      ctx.arcTo(r.x + r.w, r.y + r.h, r.x, r.y + r.h, rad);
+      ctx.arcTo(r.x, r.y + r.h, r.x, r.y, rad);
+      ctx.arcTo(r.x, r.y, r.x + r.w, r.y, rad);
+      ctx.closePath(); ctx.fill(); ctx.stroke();
+      var cx = r.x + r.w / 2, cy = r.y + r.h / 2, off = r.w * 0.24, sz = r.w * 0.10;
+      var voted = -1;
+      if (advVote[a2] >= 0 && edges[advVote[a2]]) {
+        var ev = edges[advVote[a2]];
+        var far = ev.a === J ? ev.b : ev.a;
+        voted = dirBucket(nodes[far].x - nodes[J].x, nodes[far].y - nodes[J].y);
+      }
+      var blinkOn = (t * 4) % 1 < 0.55;
+      var slots = [[cx, cy - off], [cx, cy + off], [cx + off, cy], [cx - off, cy]];
+      for (var bkt = 0; bkt < 4; bkt++) {
+        var isV = bkt === voted;
+        drawChevron(slots[bkt][0], slots[bkt][1], bkt, sz,
+          rgb2, isV ? (blinkOn ? 1 : 0.3) : 0.16);
+      }
+      ctx.restore();
+    }
+  }
+
+  // ---------- audio (lazy, guarded; silent in QA) ----------
+  var AC = null, master = null;
+  function ensureAudio() {
+    if (AC) return;
+    var Ctor = null;
+    if (typeof AudioContext !== 'undefined') Ctor = AudioContext;
+    else if (typeof window !== 'undefined' && window.webkitAudioContext) Ctor = window.webkitAudioContext;
+    if (!Ctor) return;
+    try {
+      AC = new Ctor();
+      master = AC.createGain();
+      master.gain.value = 0.16;
+      master.connect(AC.destination);
+      // the advisor bed: three soft tones, one per advisor
+      var bedFreq = [185, 233, 156];
+      for (var i = 0; i < 3; i++) {
+        var o = AC.createOscillator(), g = AC.createGain();
+        o.type = 'sine'; o.frequency.value = bedFreq[i];
+        g.gain.value = 0.012;
+        o.connect(g); g.connect(master);
+        o.start();
+      }
+    } catch (e) { AC = null; }
+  }
+  function blip(freq, dur, gain) {
+    if (!AC || !master) return;
+    try {
+      var o = AC.createOscillator(), g = AC.createGain();
+      o.type = 'sine'; o.frequency.value = freq;
+      var now = AC.currentTime;
+      g.gain.setValueAtTime(gain, now);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+      o.connect(g); g.connect(master);
+      o.start(now); o.stop(now + dur + 0.02);
+    } catch (e) { /* silent */ }
+  }
+  function whoosh() {
+    if (!AC || !master) return;
+    try {
+      var len = Math.floor(AC.sampleRate * 0.18);
+      var buf = AC.createBuffer(1, len, AC.sampleRate);
+      var d = buf.getChannelData(0);
+      for (var i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / len);
+      var src = AC.createBufferSource(); src.buffer = buf;
+      var f = AC.createBiquadFilter(); f.type = 'bandpass'; f.frequency.value = 900; f.Q.value = 0.8;
+      var g = AC.createGain(); g.gain.value = 0.05;
+      src.connect(f); f.connect(g); g.connect(master);
+      src.start();
+    } catch (e) { /* silent */ }
+  }
+  function voteHook(a) { blip(ADV[a].pitch, 0.35, 0.05); }
+  function turnHook() { whoosh(); }
+  function reachHook() { blip(523, 0.4, 0.06); setTimeoutSafe(function () { blip(784, 0.6, 0.06); }, 140); }
+  function setTimeoutSafe(fn, ms) {
+    if (typeof setTimeout === 'function') { try { setTimeout(fn, ms); } catch (e) { /* noop */ } }
+  }
+
+  // ---------- interaction ----------
+  // Events are applied immediately to sim state (boosts, target, reseed);
+  // their effect enters the deterministic step stream in timestamp order
+  // of arrival, which is the only order a live visitor can produce.
+  var downInfo = null;
+  var lastTapT = -10, lastTapX = 0, lastTapY = 0;
+  function evPos(e) {
+    var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    return { x: (e.clientX || 0) - r.left, y: (e.clientY || 0) - r.top };
+  }
+  function panelAt(p) {
+    for (var a = 0; a < 3; a++) {
+      var r = panelRect(a), m = 14;
+      if (p.x >= r.x - m && p.x <= r.x + r.w + m && p.y >= r.y - m && p.y <= r.y + r.h + m) return a;
+    }
+    return -1;
+  }
+  canvas.addEventListener('pointerdown', function (e) {
+    ensureAudio();
+    if (AC && AC.resume) { try { AC.resume(); } catch (err) { /* noop */ } }
+    var p = evPos(e);
+    var w = world();
+    var tp = toPx(targetPos, w);
+    downInfo = { x: p.x, y: p.y, moved: false,
+                 dragTarget: Math.abs(p.x - tp.x) < 30 && Math.abs(p.y - tp.y) < 30 };
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (!downInfo) return;
+    var p = evPos(e);
+    if (Math.abs(p.x - downInfo.x) + Math.abs(p.y - downInfo.y) > 6) downInfo.moved = true;
+    if (downInfo.dragTarget) {
+      var w = world();
+      targetPos = { x: Math.max(0.03, Math.min(0.97, (p.x - w.ox) / w.S)),
+                    y: Math.max(0.03, Math.min(0.97, (p.y - w.oy) / w.S)) };
+    }
+  });
+  canvas.addEventListener('pointerup', function (e) {
+    if (!downInfo) return;
+    var info = downInfo; downInfo = null;
+    if (info.moved) return;
+    var p = evPos(e);
+    var now = simT;
+    if (now - lastTapT < 0.35 && Math.abs(p.x - lastTapX) + Math.abs(p.y - lastTapY) < 40) {
+      // double-tap: a new conversation now (photograph first, day restarts)
+      convEnd[conv] = simT;
+      buildConversation(conv + 1);
+      lastTapT = -10;
+      return;
+    }
+    lastTapT = now; lastTapX = p.x; lastTapY = p.y;
+    var a = panelAt(p);
+    if (a >= 0) boostUntil[a] = simT + 10; // join the crowd: 3x for 10 s
+  });
+
+  // ---------- run: pre-roll, frame one, live loop ----------
+  buildConversation(0);
+  for (var s = 0; s < PREROLL; s++) step();
+  resize();
+  draw();
+
+  var lastStamp = null, acc = 0;
+  function frame(ts) {
+    if (lastStamp === null) lastStamp = ts;
+    var elapsed = (ts - lastStamp) / 1000;
+    lastStamp = ts;
+    if (elapsed > 0.25) elapsed = 0.25;
+    acc += elapsed;
+    var n = Math.floor(acc / DT);
+    if (n > 24) n = 24; // capped: extreme lag slows the piece, never jumps it
+    acc -= n * DT;
+    for (var i = 0; i < n; i++) step();
+    draw();
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+  }
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

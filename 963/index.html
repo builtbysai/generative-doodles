@@ -1,0 +1,678 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>LAUREN</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0B0C10; overflow: hidden; height: 100%; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- palette ----------
+  var GROUND = '#0B0C10';
+  var PLAN = '#3A4050';
+  var STANDBY = '#2A2E3A';
+  var MINT = '#7DF9C6';
+  var WARM = '#FFC44F';
+  var SPEAK = '#FF4FD8';
+
+  function hexRGB(h) {
+    return [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
+  }
+  function mixRGB(a, b, t) {
+    return 'rgb(' + Math.round(a[0] + (b[0] - a[0]) * t) + ',' +
+      Math.round(a[1] + (b[1] - a[1]) * t) + ',' +
+      Math.round(a[2] + (b[2] - a[2]) * t) + ')';
+  }
+  var STANDBY_RGB = hexRGB(STANDBY), WARM_RGB = hexRGB(WARM), SPEAK_RGB = hexRGB(SPEAK);
+
+  // ---------- seeded RNG (mulberry32) ----------
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- canvas / view ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var viewW = 720, viewH = 720, dpr = 1;
+
+  function isPhone() {
+    var sw = 9999, sh = 9999;
+    if (typeof window !== 'undefined' && window.screen) {
+      sw = window.screen.width || 9999; sh = window.screen.height || 9999;
+    }
+    if (Math.min(sw, sh) < 700) return true;
+    return viewH > viewW * 1.15;
+  }
+
+  function resize() {
+    var vv = (typeof window !== 'undefined' && window.visualViewport) ? window.visualViewport : null;
+    viewW = vv ? vv.width : (window.innerWidth || 720);
+    viewH = vv ? vv.height : (window.innerHeight || 720);
+    dpr = Math.min(2, (typeof window !== 'undefined' && window.devicePixelRatio) || 1);
+    canvas.width = Math.round(viewW * dpr);
+    canvas.height = Math.round(viewH * dpr);
+  }
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', resize);
+    }
+    if (window.addEventListener) window.addEventListener('resize', resize);
+  }
+  resize();
+
+  // normalized [0,1] plan space -> pixels (centered square, page ground around it)
+  function viewTransform() {
+    var s = Math.min(viewW, viewH);
+    return { s: s, ox: (viewW - s) / 2, oy: (viewH - s) / 2 };
+  }
+  function toNorm(px, py) {
+    var t = viewTransform();
+    return { x: (px - t.ox) / t.s, y: (py - t.oy) / t.s };
+  }
+
+  // ---------- house generation ----------
+  var PLAN_MIN = 0.055, PLAN_MAX = 0.945;
+
+  function buildHouse(seed) {
+    var rng = mulberry32(seed);
+    var target = 6 + Math.floor(rng() * 3); // 6..8 rooms
+    var leaves = [{ x0: PLAN_MIN, y0: PLAN_MIN, x1: PLAN_MAX, y1: PLAN_MAX }];
+    var guard = 0;
+    while (leaves.length < target && guard++ < 200) {
+      // split the largest splittable leaf
+      var bi = -1, best = 0;
+      for (var i = 0; i < leaves.length; i++) {
+        var L = leaves[i], w = L.x1 - L.x0, h = L.y1 - L.y0;
+        if (Math.max(w, h) > 0.17 && Math.min(w, h) > 0.10) {
+          var area = w * h;
+          if (area > best) { best = area; bi = i; }
+        }
+      }
+      if (bi < 0) break;
+      var leaf = leaves.splice(bi, 1)[0];
+      var lw = leaf.x1 - leaf.x0, lh = leaf.y1 - leaf.y0;
+      var vertical = lw >= lh;
+      if (vertical) {
+        var cut = leaf.x0 + lw * (0.36 + rng() * 0.28);
+        leaves.push({ x0: leaf.x0, y0: leaf.y0, x1: cut, y1: leaf.y1 });
+        leaves.push({ x0: cut, y0: leaf.y0, x1: leaf.x1, y1: leaf.y1 });
+      } else {
+        var cut2 = leaf.y0 + lh * (0.36 + rng() * 0.28);
+        leaves.push({ x0: leaf.x0, y0: leaf.y0, x1: leaf.x1, y1: cut2 });
+        leaves.push({ x0: leaf.x0, y0: cut2, x1: leaf.x1, y1: leaf.y1 });
+      }
+    }
+    var rooms = leaves.map(function (L, i) {
+      return {
+        id: i, x0: L.x0, y0: L.y0, x1: L.x1, y1: L.y1,
+        cx: (L.x0 + L.x1) / 2, cy: (L.y0 + L.y1) / 2,
+        warmth: 0, exitTime: -999, devices: []
+      };
+    });
+
+    // adjacency + doors on every shared wall segment
+    var adj = rooms.map(function () { return []; });
+    var doors = []; // {a, b, x, y, horiz} horiz=true means wall is horizontal (door crosses up/down)
+    var EPS = 0.0015;
+    for (var a = 0; a < rooms.length; a++) {
+      for (var b = a + 1; b < rooms.length; b++) {
+        var A = rooms[a], B = rooms[b];
+        var door = null;
+        if (Math.abs(A.x1 - B.x0) < EPS || Math.abs(B.x1 - A.x0) < EPS) {
+          var y0 = Math.max(A.y0, B.y0), y1 = Math.min(A.y1, B.y1);
+          if (y1 - y0 > 0.05) {
+            var dx = Math.abs(A.x1 - B.x0) < EPS ? A.x1 : B.x1;
+            var frac = 0.3 + rng() * 0.4;
+            door = { a: a, b: b, x: dx, y: y0 + (y1 - y0) * frac, horiz: false, seg: [y0, y1], wall: dx };
+          }
+        } else if (Math.abs(A.y1 - B.y0) < EPS || Math.abs(B.y1 - A.y0) < EPS) {
+          var x0 = Math.max(A.x0, B.x0), x1 = Math.min(A.x1, B.x1);
+          if (x1 - x0 > 0.05) {
+            var dy = Math.abs(A.y1 - B.y0) < EPS ? A.y1 : B.y1;
+            var frac2 = 0.3 + rng() * 0.4;
+            door = { a: a, b: b, x: x0 + (x1 - x0) * frac2, y: dy, horiz: true, seg: [x0, x1], wall: dy };
+          }
+        }
+        if (door) {
+          doors.push(door);
+          adj[a].push({ to: b, door: door });
+          adj[b].push({ to: a, door: door });
+        }
+      }
+    }
+
+    // wall segments with door gaps cut out
+    var walls = [];
+    function addWall(x0, y0, x1, y1) { walls.push({ x0: x0, y0: y0, x1: x1, y1: y1 }); }
+    // outer boundary
+    addWall(PLAN_MIN, PLAN_MIN, PLAN_MAX, PLAN_MIN);
+    addWall(PLAN_MAX, PLAN_MIN, PLAN_MAX, PLAN_MAX);
+    addWall(PLAN_MAX, PLAN_MAX, PLAN_MIN, PLAN_MAX);
+    addWall(PLAN_MIN, PLAN_MAX, PLAN_MIN, PLAN_MIN);
+    // internal shared edges, one per adjacency pair, gap at the door
+    var seen = {};
+    doors.forEach(function (d) {
+      var key = Math.min(d.a, d.b) + '-' + Math.max(d.a, d.b);
+      if (seen[key]) return; seen[key] = true;
+      var half = 0.026; // door gap half-length
+      if (!d.horiz) {
+        var wy0 = d.seg[0], wy1 = d.seg[1];
+        if (d.y - half > wy0) addWall(d.wall, wy0, d.wall, d.y - half);
+        if (d.y + half < wy1) addWall(d.wall, d.y + half, d.wall, wy1);
+      } else {
+        var wx0 = d.seg[0], wx1 = d.seg[1];
+        if (d.x - half > wx0) addWall(wx0, d.wall, d.x - half, d.wall);
+        if (d.x + half < wx1) addWall(d.x + half, d.wall, wx1, d.wall);
+      }
+    });
+    // leaf edges that are not shared and not outer (should not occur in BSP, kept for safety)
+    rooms.forEach(function (R) {
+      // top/bottom/left/right thin stubs are covered by shared/outer passes in BSP tilings
+      void R;
+    });
+
+    // devices per room: always a light and a speaker, plus a door arc where a door exists, plus 0..1 extra
+    rooms.forEach(function (R) {
+      function inside(margin) {
+        return {
+          x: R.x0 + margin + rng() * Math.max(0.001, (R.x1 - R.x0) - 2 * margin),
+          y: R.y0 + margin + rng() * Math.max(0.001, (R.y1 - R.y0) - 2 * margin)
+        };
+      }
+      var lp = inside(0.035);
+      R.devices.push({ kind: 'light', x: lp.x, y: lp.y, w: 0.034, h: 0.022 });
+      var sp = inside(0.035);
+      R.devices.push({ kind: 'speaker', x: sp.x, y: sp.y, phase: rng() * Math.PI * 2 });
+      var myDoors = doors.filter(function (d) { return d.a === R.id || d.b === R.id; });
+      if (myDoors.length) {
+        var dd = myDoors[Math.floor(rng() * myDoors.length)];
+        R.devices.push({ kind: 'door', x: dd.x, y: dd.y, horiz: dd.horiz, door: dd });
+      }
+      if (rng() < 0.55) {
+        var ep = inside(0.035);
+        var kinds = ['light', 'speaker'];
+        var k = kinds[Math.floor(rng() * kinds.length)];
+        if (k === 'light') R.devices.push({ kind: 'light', x: ep.x, y: ep.y, w: 0.028, h: 0.018 });
+        else R.devices.push({ kind: 'speaker', x: ep.x, y: ep.y, phase: rng() * Math.PI * 2 });
+      }
+    });
+
+    return { seed: seed, rooms: rooms, adj: adj, doors: doors, walls: walls, rng: rng };
+  }
+
+  function bfsPath(house, from, to) {
+    if (from === to) return [from];
+    var prev = {}, q = [from], seen = {};
+    seen[from] = true;
+    while (q.length) {
+      var cur = q.shift();
+      var edges = house.adj[cur];
+      for (var i = 0; i < edges.length; i++) {
+        var n = edges[i].to;
+        if (!seen[n]) {
+          seen[n] = true; prev[n] = cur;
+          if (n === to) {
+            var path = [to], c = to;
+            while (c !== from) { c = prev[c]; path.unshift(c); }
+            return path;
+          }
+          q.push(n);
+        }
+      }
+    }
+    return [from];
+  }
+  function doorBetween(house, a, b) {
+    var edges = house.adj[a];
+    for (var i = 0; i < edges.length; i++) if (edges[i].to === b) return edges[i].door;
+    return null;
+  }
+  function roomAt(house, x, y) {
+    for (var i = 0; i < house.rooms.length; i++) {
+      var R = house.rooms[i];
+      if (x >= R.x0 && x <= R.x1 && y >= R.y0 && y <= R.y1) return R.id;
+    }
+    return -1;
+  }
+
+  // ---------- simulation ----------
+  var DT = 1 / 120;
+  var EYE_SPEED = 55 / 720; // normalized units per second (55 px/s at gallery size)
+  var HOUSE_PERIOD = 300;
+
+  var sim = null;
+  function newSim(seed) {
+    var house = buildHouse(seed);
+    var startRoom = 0, bestD = 1e9;
+    house.rooms.forEach(function (R) {
+      var d = (R.cx - 0.30) * (R.cx - 0.30) + (R.cy - 0.5) * (R.cy - 0.5);
+      if (d < bestD) { bestD = d; startRoom = R.id; }
+    });
+    var s = {
+      house: house, time: 0, houseAge: 0, houseFade: 1,
+      eye: { x: house.rooms[startRoom].cx, y: house.rooms[startRoom].cy, heading: 0 },
+      eyeRoom: startRoom, destRoom: startRoom, path: [startRoom], wpIndex: 0,
+      waypoints: [], visited: {}, trail: [], heat: {}, heatAlpha: 0,
+      requestedRoom: -1, rng: mulberry32(seed * 7919 + 13),
+      lastWarmSet: {}
+    };
+    s.visited[startRoom] = true;
+    chooseDestination(s);
+    // the starting room and the room ahead begin warm: the house is already expecting her
+    warmTargets(s).forEach(function (r) { s.house.rooms[r].warmth = 1; });
+    return s;
+  }
+
+  function chooseDestination(s) {
+    var house = s.house;
+    var unvisited = [];
+    house.rooms.forEach(function (R) { if (!s.visited[R.id]) unvisited.push(R.id); });
+    var pool = unvisited.length ? unvisited : house.rooms.map(function (R) { return R.id; }).filter(function (id) { return id !== s.destRoom; });
+    if (!pool.length) pool = [s.eyeRoom];
+    // nearest by BFS distance, slight seeded jitter
+    var best = pool[0], bestScore = 1e9;
+    pool.forEach(function (id) {
+      var d = bfsPath(house, s.eyeRoom, id).length + s.rng() * 0.6;
+      if (d < bestScore) { bestScore = d; best = id; }
+    });
+    s.destRoom = best;
+    s.path = bfsPath(house, s.eyeRoom, best);
+    buildWaypoints(s);
+  }
+
+  function buildWaypoints(s) {
+    var house = s.house, wps = [];
+    for (var i = 1; i < s.path.length; i++) {
+      var d = doorBetween(house, s.path[i - 1], s.path[i]);
+      if (d) wps.push({ x: d.x, y: d.y, door: true });
+    }
+    var dest = house.rooms[s.destRoom];
+    wps.push({ x: dest.cx, y: dest.cy, door: false });
+    s.waypoints = wps; s.wpIndex = 0;
+  }
+
+  // rooms whose devices should be warm right now:
+  // the room the eye is in, the NEXT room on its route (it pre-empts before she arrives),
+  // a tapped room (extra lead), and any room she left less than 4 s ago (cooling tail).
+  function warmTargets(s) {
+    var set = {};
+    set[s.eyeRoom] = true;
+    var idx = s.path.indexOf(s.eyeRoom);
+    if (idx >= 0 && idx + 1 < s.path.length) set[s.path[idx + 1]] = true;
+    else if (s.path.length > 1 && s.eyeRoom !== s.path[s.path.length - 1]) set[s.path[1]] = true;
+    if (s.requestedRoom >= 0) set[s.requestedRoom] = true;
+    s.house.rooms.forEach(function (R) {
+      if (s.time - R.exitTime < 4 && R.id !== s.eyeRoom) set[R.id] = true;
+    });
+    return Object.keys(set).map(function (k) { return parseInt(k, 10); });
+  }
+
+  function stepSim(s, dt) {
+    s.time += dt; s.houseAge += dt;
+    if (s.houseAge >= HOUSE_PERIOD) {
+      // a new house: reseed, brief dim-out
+      var keepTime = s.time;
+      var fresh = newSim(s.house.seed + 1);
+      fresh.time = keepTime;
+      fresh.houseFade = 0;
+      sim = fresh; s = fresh;
+    }
+    if (s.houseFade < 1) s.houseFade = Math.min(1, s.houseFade + dt / 2);
+
+    var house = s.house, eye = s.eye;
+
+    // route maintenance
+    var rNow = roomAt(house, eye.x, eye.y);
+    if (rNow >= 0 && rNow !== s.eyeRoom) {
+      house.rooms[s.eyeRoom].exitTime = s.time;
+      s.eyeRoom = rNow;
+      s.visited[rNow] = true;
+      if (s.requestedRoom === rNow) s.requestedRoom = -1;
+      // recompute remaining path from here
+      s.path = bfsPath(house, s.eyeRoom, s.destRoom);
+      buildWaypoints(s);
+    }
+
+    // steering toward current waypoint
+    var wp = s.waypoints[s.wpIndex];
+    if (wp) {
+      var dx = wp.x - eye.x, dy = wp.y - eye.y;
+      var dist = Math.sqrt(dx * dx + dy * dy);
+      var arriveR = wp.door ? 0.012 : 0.02;
+      if (dist < arriveR) {
+        s.wpIndex++;
+        if (s.wpIndex >= s.waypoints.length) {
+          if (s.eyeRoom === s.destRoom || roomAt(house, eye.x, eye.y) === s.destRoom) {
+            chooseDestination(s);
+          } else {
+            s.path = bfsPath(house, s.eyeRoom, s.destRoom);
+            buildWaypoints(s);
+          }
+        }
+      } else {
+        var want = Math.atan2(dy, dx);
+        var diff = want - eye.heading;
+        while (diff > Math.PI) diff -= Math.PI * 2;
+        while (diff < -Math.PI) diff += Math.PI * 2;
+        var maxTurn = 3.4 * dt;
+        eye.heading += Math.max(-maxTurn, Math.min(maxTurn, diff));
+        var sp = EYE_SPEED * (0.45 + 0.55 * Math.min(1, dist / 0.05));
+        eye.x += Math.cos(eye.heading) * sp * dt;
+        eye.y += Math.sin(eye.heading) * sp * dt;
+        eye.x = Math.max(PLAN_MIN + 0.012, Math.min(PLAN_MAX - 0.012, eye.x));
+        eye.y = Math.max(PLAN_MIN + 0.012, Math.min(PLAN_MAX - 0.012, eye.y));
+      }
+    }
+
+    // warmth: devices pre-empt for the room ahead, cool 4 s after she leaves
+    var targets = {};
+    warmTargets(s).forEach(function (r) { targets[r] = true; });
+    house.rooms.forEach(function (R) {
+      var goal = targets[R.id] ? 1 : 0;
+      var was = R.warmth;
+      if (goal > was) R.warmth = Math.min(1, was + dt / 0.8);
+      else if (goal < was) R.warmth = Math.max(0, was - dt / 0.8);
+      if (was === 0 && R.warmth > 0 && audioReady) preemptSound();
+    });
+
+    // trail (recorded at 60 Hz) + attention heat
+    if ((Math.round(s.time / dt) & 1) === 0) {
+      s.trail.push({ x: eye.x, y: eye.y, t: s.time });
+      while (s.trail.length && s.time - s.trail[0].t > 62) s.trail.shift();
+    }
+    var cell = 0.039;
+    var key = Math.floor(eye.x / cell) + ':' + Math.floor(eye.y / cell);
+    s.heat[key] = (s.heat[key] || 0) + dt;
+
+    // heat overlay fade (interaction-driven)
+    var heatGoal = pointer.held ? 1 : 0;
+    if (heatGoal > s.heatAlpha) s.heatAlpha = Math.min(1, s.heatAlpha + dt / 0.45);
+    else if (heatGoal < s.heatAlpha) s.heatAlpha = Math.max(0, s.heatAlpha - dt / 0.45);
+
+    return s;
+  }
+
+  // ---------- audio (lazy, guarded) ----------
+  var audioCtx = null, audioReady = false, masterGain = null;
+  function ensureAudio() {
+    if (audioReady) return;
+    try {
+      var AC = (typeof window !== 'undefined') && (window.AudioContext || window.webkitAudioContext);
+      if (!AC || typeof AC !== 'function') return;
+      audioCtx = new AC();
+      masterGain = audioCtx.createGain();
+      masterGain.gain.value = 0.6;
+      masterGain.connect(audioCtx.destination);
+      // soft room tone: looped filtered noise, very low
+      var len = audioCtx.sampleRate * 2;
+      var buf = audioCtx.createBuffer(1, len, audioCtx.sampleRate);
+      var data = buf.getChannelData(0);
+      var r = mulberry32(963);
+      for (var i = 0; i < len; i++) data[i] = r() * 2 - 1;
+      var src = audioCtx.createBufferSource();
+      src.buffer = buf; src.loop = true;
+      var lp = audioCtx.createBiquadFilter();
+      lp.type = 'lowpass'; lp.frequency.value = 220;
+      var g = audioCtx.createGain(); g.gain.value = 0.016;
+      src.connect(lp); lp.connect(g); g.connect(masterGain);
+      src.start();
+      audioReady = true;
+    } catch (e) { audioCtx = null; audioReady = false; }
+  }
+  function tone(freq, t0, dur, vol, type) {
+    if (!audioReady || !audioCtx) return;
+    try {
+      var o = audioCtx.createOscillator(), g = audioCtx.createGain();
+      o.type = type || 'sine'; o.frequency.value = freq;
+      var start = audioCtx.currentTime + t0;
+      g.gain.setValueAtTime(0, start);
+      g.gain.linearRampToValueAtTime(vol, start + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+      o.connect(g); g.connect(masterGain);
+      o.start(start); o.stop(start + dur + 0.05);
+    } catch (e) { /* silence */ }
+  }
+  function preemptSound() {
+    // relay click + warm hum
+    tone(2400, 0, 0.05, 0.03, 'square');
+    tone(110, 0.03, 0.9, 0.028, 'sine');
+  }
+  function doorbellSound() {
+    tone(659, 0, 0.35, 0.05, 'sine');
+    tone(523, 0.16, 0.5, 0.05, 'sine');
+  }
+
+  // ---------- interaction ----------
+  var pointer = { held: false, downX: 0, downY: 0, downT: 0, lastTapT: -10, simT: 0 };
+  function evPos(e) {
+    var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    var cx = (e.clientX !== undefined) ? e.clientX : (e.touches && e.touches[0] ? e.touches[0].clientX : 0);
+    var cy = (e.clientY !== undefined) ? e.clientY : (e.touches && e.touches[0] ? e.touches[0].clientY : 0);
+    return { x: cx - r.left, y: cy - r.top };
+  }
+  function onDown(e) {
+    ensureAudio();
+    if (audioCtx && audioCtx.resume) { try { audioCtx.resume(); } catch (err) {} }
+    var p = evPos(e);
+    pointer.held = true; pointer.downX = p.x; pointer.downY = p.y;
+    pointer.downT = sim ? sim.time : 0;
+  }
+  function onUp(e) {
+    var wasHeld = pointer.held;
+    pointer.held = false;
+    if (!wasHeld || !sim) return;
+    var p = evPos(e);
+    var moved = Math.sqrt((p.x - pointer.downX) * (p.x - pointer.downX) + (p.y - pointer.downY) * (p.y - pointer.downY));
+    var heldFor = sim.time - pointer.downT;
+    if (moved < 14 && heldFor < 0.45) {
+      // a tap
+      if (sim.time - pointer.lastTapT < 0.35) {
+        // double-tap: a new home now
+        pointer.lastTapT = -10;
+        var keepTime = sim.time;
+        sim = newSim(sim.house.seed + 101);
+        sim.time = keepTime; sim.houseAge = 0; sim.houseFade = 0;
+        return;
+      }
+      pointer.lastTapT = sim.time;
+      var n = toNorm(p.x, p.y);
+      var room = roomAt(sim.house, n.x, n.y);
+      if (room >= 0 && room !== sim.eyeRoom) {
+        // request: the eye detours there, its devices pre-empt early
+        sim.destRoom = room;
+        sim.requestedRoom = room;
+        sim.path = bfsPath(sim.house, sim.eyeRoom, room);
+        buildWaypoints(sim);
+        doorbellSound();
+      }
+    }
+  }
+  function onMove(e) { void e; /* drag is hold-based: the heat overlay reads pointer.held */ }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', function () { pointer.held = false; });
+    canvas.addEventListener('pointermove', onMove);
+  }
+
+  // ---------- drawing ----------
+  function draw(s) {
+    canvas.style.width = viewW + 'px';
+    canvas.style.height = viewH + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = GROUND;
+    ctx.fillRect(0, 0, viewW, viewH);
+    var t = viewTransform();
+    function X(x) { return t.ox + x * t.s; }
+    function Y(y) { return t.oy + y * t.s; }
+    function S(v) { return v * t.s; }
+    var fade = s.houseFade;
+    ctx.globalAlpha = fade;
+
+    var house = s.house;
+
+    // heat-map overlay (see through walls) under the plan lines
+    if (s.heatAlpha > 0.003) {
+      var cell = 0.039;
+      ctx.fillStyle = MINT;
+      for (var key in s.heat) {
+        if (!Object.prototype.hasOwnProperty.call(s.heat, key)) continue;
+        var parts = key.split(':');
+        var cx = parseInt(parts[0], 10) * cell, cy = parseInt(parts[1], 10) * cell;
+        var a = Math.min(0.42, s.heat[key] * 0.05) * s.heatAlpha;
+        if (a < 0.004) continue;
+        ctx.globalAlpha = fade * a;
+        ctx.fillRect(X(cx), Y(cy), S(cell) + 1, S(cell) + 1);
+      }
+      ctx.globalAlpha = fade;
+    }
+
+    // walls
+    ctx.strokeStyle = PLAN;
+    ctx.lineWidth = 2;
+    ctx.lineCap = 'square';
+    ctx.beginPath();
+    house.walls.forEach(function (w) {
+      ctx.moveTo(X(w.x0), Y(w.y0));
+      ctx.lineTo(X(w.x1), Y(w.y1));
+    });
+    ctx.stroke();
+
+    // devices
+    house.rooms.forEach(function (R) {
+      var w = R.warmth;
+      R.devices.forEach(function (D) {
+        if (D.kind === 'light') {
+          if (w > 0.01) {
+            ctx.globalAlpha = fade * 0.16 * w;
+            ctx.fillStyle = WARM;
+            ctx.fillRect(X(D.x - D.w * 1.1), Y(D.y - D.h * 1.1), S(D.w * 2.2), S(D.h * 2.2));
+            ctx.globalAlpha = fade;
+          }
+          ctx.fillStyle = mixRGB(STANDBY_RGB, WARM_RGB, w);
+          ctx.fillRect(X(D.x - D.w / 2), Y(D.y - D.h / 2), S(D.w), S(D.h));
+        } else if (D.kind === 'speaker') {
+          var pulse = w > 0.01 ? (0.5 + 0.5 * Math.sin(s.time * 6 + D.phase)) : 0;
+          var rad = 0.0055 + 0.0035 * pulse * w;
+          ctx.fillStyle = mixRGB(STANDBY_RGB, SPEAK_RGB, w);
+          ctx.beginPath();
+          ctx.arc(X(D.x), Y(D.y), Math.max(1.2, S(rad)), 0, Math.PI * 2);
+          ctx.fill();
+          if (w > 0.01) {
+            ctx.globalAlpha = fade * 0.35 * w * (0.4 + 0.6 * pulse);
+            ctx.strokeStyle = SPEAK;
+            ctx.lineWidth = 1.2;
+            ctx.beginPath();
+            ctx.arc(X(D.x), Y(D.y), Math.max(2, S(rad + 0.006 + 0.004 * pulse)), 0, Math.PI * 2);
+            ctx.stroke();
+            ctx.globalAlpha = fade;
+          }
+        } else if (D.kind === 'door') {
+          // arc segment hinged at the door point, swings open with warmth
+          var open = w * (Math.PI / 2.4);
+          var baseA = D.horiz ? Math.PI / 2 : 0;
+          var len = 0.030;
+          ctx.strokeStyle = mixRGB(STANDBY_RGB, WARM_RGB, w);
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          // hinge line (the door leaf) rotated open
+          var a1 = baseA - open;
+          ctx.moveTo(X(D.x), Y(D.y));
+          ctx.lineTo(X(D.x + Math.cos(a1) * len), Y(D.y + Math.sin(a1) * len));
+          ctx.stroke();
+          if (w > 0.01) {
+            ctx.globalAlpha = fade * 0.5 * w;
+            ctx.strokeStyle = WARM;
+            ctx.lineWidth = 1.2;
+            ctx.beginPath();
+            ctx.arc(X(D.x), Y(D.y), S(len), baseA - open, baseA);
+            ctx.stroke();
+            ctx.globalAlpha = fade;
+          }
+        }
+      });
+    });
+
+    // heat trail: the house remembering attention
+    var trail = s.trail;
+    if (trail.length > 1) {
+      ctx.lineWidth = Math.max(1.2, S(0.004));
+      ctx.lineCap = 'round';
+      for (var i = 1; i < trail.length; i++) {
+        var age = s.time - trail[i].t;
+        var a = Math.max(0, 1 - age / 60) * 0.5;
+        if (a < 0.004) continue;
+        ctx.globalAlpha = fade * a;
+        ctx.strokeStyle = MINT;
+        ctx.beginPath();
+        ctx.moveTo(X(trail[i - 1].x), Y(trail[i - 1].y));
+        ctx.lineTo(X(trail[i].x), Y(trail[i].y));
+        ctx.stroke();
+      }
+      ctx.globalAlpha = fade;
+    }
+
+    // the attention eye: mint circle, dark pupil looking along its heading
+    var eye = s.eye;
+    var er = Math.max(4, S(0.017));
+    ctx.fillStyle = MINT;
+    ctx.beginPath();
+    ctx.arc(X(eye.x), Y(eye.y), er, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = MINT;
+    ctx.lineWidth = 1.5;
+    ctx.globalAlpha = fade * 0.55;
+    ctx.beginPath();
+    ctx.arc(X(eye.x), Y(eye.y), er + Math.max(2, S(0.006)), 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.globalAlpha = fade;
+    var px = eye.x + Math.cos(eye.heading) * 0.007;
+    var py = eye.y + Math.sin(eye.heading) * 0.007;
+    ctx.fillStyle = GROUND;
+    ctx.beginPath();
+    ctx.arc(X(px), Y(py), Math.max(2.2, S(0.0075)), 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- run ----------
+  sim = newSim(20261031);
+  for (var i = 0; i < 3000; i++) sim = stepSim(sim, DT); // exactly 3000 fixed steps: 25 s in, mid-tour
+  draw(sim);
+
+  var raf = (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function')
+    ? window.requestAnimationFrame : null;
+  if (raf) {
+    var lastTs = null, acc = 0;
+    var frame = function (ts) {
+      if (lastTs === null) lastTs = ts;
+      var elapsed = Math.min(0.25, (ts - lastTs) / 1000);
+      lastTs = ts;
+      acc += elapsed;
+      var steps = 0;
+      while (acc >= DT && steps < 40) { sim = stepSim(sim, DT); acc -= DT; steps++; }
+      if (steps >= 40) acc = 0;
+      draw(sim);
+      raf(frame);
+    };
+    raf(frame);
+  }
+})();
+</script>
+</body>
+</html>

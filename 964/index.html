@@ -1,0 +1,596 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>24 HOUR HOST</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0B0C10; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+/* No.964 "24 HOUR HOST" - study #118 lauren-lee-mccarthy, PP125.
+   AI-directed social choreography: eight guests drift in a circular room;
+   an unseen AI scans, pairs them into constellations, holds, disperses.
+   The AI is never drawn. Only its scan line and its arrows appear.
+   Deterministic fixed-step sim (120 Hz); frame one is the synchronous
+   draw after exactly 4200 pre-roll steps (cycle second 35, mid-PAIR). */
+
+var GROUND = '#0B0C10';
+var GUEST_COLORS = ['#FF7AB8', '#7AB8FF', '#7DFFB8', '#FFC44F',
+                    '#B87AFF', '#FF9A7A', '#7AFFF0', '#E8FF7A'];
+var HOST_COLOR = '#F5F2EA';   /* derived neutral: prompt names host only via earpiece */
+var SCAN_COLOR = '#4FD6FF';
+var ARROW_COLOR = '#FFFFFF';
+var EARPIECE_COLOR = '#FF3B3B';
+var EARPIECE_USER = '#4FD6FF';
+var RIM_COLOR = '#232733';
+
+var DT = 1 / 120;
+var PREROLL = 4200;           /* exactly 35 s -> frame one inside first PAIR */
+var CYCLE_S = 90;             /* drift 30, scan 3, pair 10, hold 20, disperse 27 */
+var T_SCAN = 30, T_PAIR = 33, T_HOLD = 43, T_DISPERSE = 63;
+
+/* ---------- seeded RNG (mulberry32) ---------- */
+function RNG(seed) { this.s = seed >>> 0; }
+RNG.prototype.next = function () {
+  this.s = (this.s + 0x6D2B79F5) >>> 0;
+  var t = this.s;
+  t = Math.imul(t ^ (t >>> 15), t | 1);
+  t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+};
+RNG.prototype.range = function (a, b) { return a + (b - a) * this.next(); };
+
+/* ---------- canvas / viewport ---------- */
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var viewW = 720, viewH = 720, isPhone = false;
+
+function measure() {
+  var w = 0, h = 0;
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.width) {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    } else if (window.innerWidth) {
+      w = window.innerWidth; h = window.innerHeight;
+    }
+  }
+  if (!w || !h) { w = canvas.width || 720; h = canvas.height || 720; }
+  viewW = w; viewH = h;
+  var scr = (typeof window !== 'undefined') ? window.screen : null;
+  if (scr && scr.width && scr.height) {
+    isPhone = Math.min(scr.width, scr.height) < 700;
+  } else {
+    isPhone = viewH > viewW * 1.15;
+  }
+  if (canvas.width !== Math.round(viewW)) canvas.width = Math.round(viewW);
+  if (canvas.height !== Math.round(viewH)) canvas.height = Math.round(viewH);
+}
+if (typeof window !== 'undefined') {
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { measure(); draw(); });
+  }
+  if (window.addEventListener) {
+    window.addEventListener('resize', function () { measure(); draw(); });
+  }
+}
+
+/* ---------- sim state ---------- */
+var BASE_SEED = 964125;
+var partyCount = 0;
+var rng = null;               /* sim RNG: drawn only inside init/step */
+var guests = [];
+var simStep = 0;              /* total fixed steps taken */
+var cycleStartStep = 0;       /* simStep at which current cycle began */
+var targets = null;           /* per-guest {x,y,gx,gy} while paired */
+var pairStartDist = null;     /* distance at pairing, for arrow fade */
+var pendingUserGroups = null; /* groups (arrays of guest idx) from a drag */
+var userHoldUntil = -1;       /* sim seconds: earpiece is cyan while held */
+var earPulseStart = -10;      /* sim seconds of last order pulse */
+var events = [];              /* {step, type, ...} consumed in step order */
+
+function simTime() { return simStep * DT; }
+function cycleT() { return (simStep - cycleStartStep) * DT; }
+function phase() {
+  var ct = cycleT();
+  if (ct < T_SCAN) return 'drift';
+  if (ct < T_PAIR) return 'scan';
+  if (ct < T_HOLD) return 'pair';
+  if (ct < T_DISPERSE) return 'hold';
+  return 'disperse';
+}
+
+function initParty(seed) {
+  rng = new RNG(seed);
+  guests = [];
+  for (var i = 0; i < 8; i++) {
+    var a = rng.next() * Math.PI * 2;
+    var r = 0.25 + rng.next() * 0.55;
+    guests.push({
+      x: Math.cos(a) * r, y: Math.sin(a) * r,
+      vx: 0, vy: 0,
+      heading: rng.next() * Math.PI * 2,
+      speed: rng.range(0.10, 0.16),
+      soc: rng.next(),                       /* sociability temperament */
+      wA: rng.range(0.5, 1.1), wB: rng.range(0.2, 0.6),
+      pA: rng.next() * Math.PI * 2, pB: rng.next() * Math.PI * 2,
+      bobP: rng.next() * Math.PI * 2
+    });
+    guests[i].vx = Math.cos(guests[i].heading) * guests[i].speed;
+    guests[i].vy = Math.sin(guests[i].heading) * guests[i].speed;
+  }
+  targets = null; pairStartDist = null;
+}
+
+/* Group guests into constellations. Sociability bias: sort by soc desc,
+   the keenest guests anchor the larger clusters. Uses sim RNG only. */
+function computeGroups() {
+  var order = guests.map(function (_, i) { return i; });
+  order.sort(function (a, b) { return guests[b].soc - guests[a].soc; });
+  var patterns = [[3, 3, 2], [2, 2, 4], [2, 3, 3], [4, 4], [2, 2, 2, 2], [3, 2, 3]];
+  var pat = patterns[Math.floor(rng.next() * patterns.length)];
+  var groups = [], k = 0;
+  for (var p = 0; p < pat.length; p++) {
+    var g = [];
+    for (var j = 0; j < pat[p]; j++) g.push(order[k++]);
+    groups.push(g);
+  }
+  return groups;
+}
+
+function assignTargets(groups) {
+  targets = []; pairStartDist = [];
+  var centers = [];
+  for (var gi = 0; gi < groups.length; gi++) {
+    var cx = 0, cy = 0, tries = 0;
+    do {
+      var a = rng.next() * Math.PI * 2, r = rng.next() * 0.48;
+      cx = Math.cos(a) * r; cy = Math.sin(a) * r; tries++;
+    } while (tries < 8 && centers.some(function (c) {
+      var dx = c[0] - cx, dy = c[1] - cy; return dx * dx + dy * dy < 0.16;
+    }));
+    centers.push([cx, cy]);
+    var grp = groups[gi];
+    for (var j = 0; j < grp.length; j++) {
+      var idx = grp[j];
+      var oa = (j / grp.length) * Math.PI * 2 + rng.next() * 0.6;
+      var orad = grp.length === 1 ? 0 : 0.085;
+      var tx = cx + Math.cos(oa) * orad, ty = cy + Math.sin(oa) * orad;
+      targets[idx] = { x: tx, y: ty };
+      var dx = guests[idx].x - tx, dy = guests[idx].y - ty;
+      pairStartDist[idx] = Math.max(0.05, Math.sqrt(dx * dx + dy * dy));
+    }
+  }
+  for (var i = 0; i < 8; i++) if (!targets[i]) {
+    targets[i] = { x: guests[i].x, y: guests[i].y };
+    pairStartDist[i] = 0.05;
+  }
+}
+
+function steer(g, ax, ay, dt) {
+  g.vx += ax * dt; g.vy += ay * dt;
+}
+
+function stepGuestDrift(g, t, dt) {
+  var wob = 0.7 * Math.sin(t * 0.9 * g.wA + g.pA) + 0.5 * Math.sin(t * 0.7 * g.wB + g.pB);
+  g.heading += wob * dt;
+  var dvx = Math.cos(g.heading) * g.speed - g.vx;
+  var dvy = Math.sin(g.heading) * g.speed - g.vy;
+  steer(g, dvx * 1.6, dvy * 1.6, dt);
+}
+
+function contain(g) {
+  var rr = Math.sqrt(g.x * g.x + g.y * g.y);
+  var lim = 0.90;
+  if (rr > lim) {
+    var nx = g.x / rr, ny = g.y / rr;
+    g.x = nx * lim; g.y = ny * lim;
+    var vr = g.vx * nx + g.vy * ny;
+    if (vr > 0) { g.vx -= 1.6 * vr * nx; g.vy -= 1.6 * vr * ny; }
+    g.heading = Math.atan2(g.vy, g.vx);
+  }
+}
+
+function applyEvent(ev) {
+  if (ev.type === 'scanNow') {
+    targets = null;
+    cycleStartStep = simStep - Math.round(T_SCAN * 120);
+    earPulseStart = simTime();
+    audioScan();
+  } else if (ev.type === 'reseed') {
+    partyCount++;
+    initParty(BASE_SEED + partyCount * 7919);
+    cycleStartStep = simStep;
+    pendingUserGroups = null;
+  } else if (ev.type === 'userGroups') {
+    pendingUserGroups = ev.groups;
+    userHoldUntil = simTime() + 10;
+    targets = null;
+    cycleStartStep = simStep - Math.round(T_SCAN * 120);
+    earPulseStart = simTime();
+    audioScan();
+  }
+}
+
+function step() {
+  /* consume due events in timestamp order */
+  for (var e = 0; e < events.length; e++) {
+    if (events[e].step <= simStep) { applyEvent(events[e]); events.splice(e, 1); e--; }
+  }
+  var prevCt = cycleT();
+  simStep++;
+  var ct = cycleT();
+  var t = simTime();
+
+  /* cycle wrap */
+  if (ct >= CYCLE_S) { cycleStartStep += Math.round(CYCLE_S * 120); ct = cycleT(); prevCt = ct; }
+
+  /* scan begins: orders pulse in the host's ear */
+  if (prevCt < T_SCAN && ct >= T_SCAN) { earPulseStart = t; audioScan(); }
+  /* scan ends: pairings computed (user grouping wins if pending) */
+  if (prevCt < T_PAIR && ct >= T_PAIR) {
+    var groups = pendingUserGroups || computeGroups();
+    pendingUserGroups = null;
+    assignTargets(groups);
+    audioChime(groups ? groups.length : 3);
+  }
+  /* hold begins: a fresh whisper of directions */
+  if (prevCt < T_HOLD && ct >= T_HOLD) earPulseStart = t;
+  /* disperse: release */
+  if (prevCt < T_DISPERSE && ct >= T_DISPERSE) {
+    targets = null;
+    for (var i = 0; i < 8; i++) {
+      guests[i].heading = Math.atan2(guests[i].vy, guests[i].vx) + rng.range(-0.7, 0.7);
+    }
+  }
+
+  var ph = phase();
+  for (var j = 0; j < 8; j++) {
+    var g = guests[j];
+    if ((ph === 'pair' || ph === 'hold') && targets && targets[j]) {
+      var tg = targets[j];
+      var bx = tg.x, by = tg.y;
+      if (ph === 'hold') {
+        bx += Math.cos(t * 1.25 + g.bobP) * 0.014;
+        by += Math.sin(t * 1.05 + g.bobP * 1.7) * 0.014;
+      }
+      var dx = bx - g.x, dy = by - g.y;
+      var d = Math.sqrt(dx * dx + dy * dy);
+      var sp = g.speed * 2.4 * Math.min(1, d / 0.22 + 0.12);   /* arrive: ease in */
+      var dvx = (d > 0.0001 ? dx / d * sp : 0) - g.vx;
+      var dvy = (d > 0.0001 ? dy / d * sp : 0) - g.vy;
+      steer(g, dvx * 3.2, dvy * 3.2, DT);
+    } else {
+      stepGuestDrift(g, t, DT);
+    }
+    g.x += g.vx * DT; g.y += g.vy * DT;
+    contain(g);
+  }
+}
+
+/* ---------- audio (lazy, gesture-gated, guarded) ---------- */
+var AC = null, masterGain = null;
+function audioReady() {
+  return typeof AudioContext !== 'undefined' || typeof window !== 'undefined' && typeof window.AudioContext !== 'undefined';
+}
+function ensureAudio() {
+  if (AC || !audioReady()) return;
+  try {
+    var Ctor = (typeof AudioContext !== 'undefined') ? AudioContext : window.AudioContext;
+    AC = new Ctor();
+    masterGain = AC.createGain(); masterGain.gain.value = 0.5;
+    masterGain.connect(AC.destination);
+    /* party bed: looped filtered noise murmur + a low pulse */
+    var len = AC.sampleRate * 2;
+    var buf = AC.createBuffer(1, len, AC.sampleRate);
+    var ch = buf.getChannelData(0);
+    var lp = 0;
+    for (var i = 0; i < len; i++) { var w = Math.random() * 2 - 1; lp += 0.04 * (w - lp); ch[i] = lp * 2.4; }
+    var src = AC.createBufferSource(); src.buffer = buf; src.loop = true;
+    var filt = AC.createBiquadFilter(); filt.type = 'lowpass'; filt.frequency.value = 420;
+    var bedGain = AC.createGain(); bedGain.gain.value = 0.05;
+    var lfo = AC.createOscillator(); lfo.frequency.value = 0.13;
+    var lfoG = AC.createGain(); lfoG.gain.value = 0.02;
+    lfo.connect(lfoG); lfoG.connect(bedGain.gain);
+    src.connect(filt); filt.connect(bedGain); bedGain.connect(masterGain);
+    src.start(); lfo.start();
+    var pulse = AC.createOscillator(); pulse.type = 'sine'; pulse.frequency.value = 54;
+    var pGain = AC.createGain(); pGain.gain.value = 0.012;
+    var pLfo = AC.createOscillator(); pLfo.frequency.value = 0.5;
+    var pLfoG = AC.createGain(); pLfoG.gain.value = 0.010;
+    pLfo.connect(pLfoG); pLfoG.connect(pGain.gain);
+    pulse.connect(pGain); pGain.connect(masterGain);
+    pulse.start(); pLfo.start();
+  } catch (err) { AC = null; }
+}
+function audioScan() {
+  if (!AC) return;
+  try {
+    var o = AC.createOscillator(), g = AC.createGain();
+    o.type = 'sine';
+    o.frequency.setValueAtTime(280, AC.currentTime);
+    o.frequency.exponentialRampToValueAtTime(920, AC.currentTime + 2.8);
+    g.gain.setValueAtTime(0.0001, AC.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.05, AC.currentTime + 0.4);
+    g.gain.exponentialRampToValueAtTime(0.0001, AC.currentTime + 3.0);
+    o.connect(g); g.connect(masterGain); o.start(); o.stop(AC.currentTime + 3.1);
+  } catch (err) {}
+}
+function audioChime(nGroups) {
+  if (!AC) return;
+  try {
+    var base = [392, 494, 587, 784];
+    for (var i = 0; i < nGroups * 2; i++) {
+      var o = AC.createOscillator(), g = AC.createGain();
+      o.type = 'sine'; o.frequency.value = base[i % base.length] * (i >= base.length ? 1.5 : 1);
+      var t0 = AC.currentTime + i * 0.16;
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.exponentialRampToValueAtTime(0.045, t0 + 0.03);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.55);
+      o.connect(g); g.connect(masterGain); o.start(t0); o.stop(t0 + 0.6);
+    }
+  } catch (err) {}
+}
+
+/* ---------- interaction: events are timestamped in sim steps ---------- */
+var pDown = null, pPath = null, lastTapStep = -100000, lastTapX = 0, lastTapY = 0;
+function toWorld(px, py) {
+  var s = Math.min(viewW, viewH);
+  var R = s * 0.44;
+  return [ (px - viewW / 2) / R, (py - viewH / 2) / R ];
+}
+function evtPos(e) {
+  if (e.clientX !== undefined) return [e.clientX, e.clientY];
+  if (e.touches && e.touches[0]) return [e.touches[0].clientX, e.touches[0].clientY];
+  if (e.changedTouches && e.changedTouches[0]) return [e.changedTouches[0].clientX, e.changedTouches[0].clientY];
+  return [0, 0];
+}
+function onDown(e) {
+  ensureAudio();
+  if (AC && AC.state === 'suspended' && AC.resume) AC.resume();
+  var p = evtPos(e);
+  pDown = { x: p[0], y: p[1], step: simStep, moved: false };
+  pPath = [toWorld(p[0], p[1])];
+  if (e.preventDefault) e.preventDefault();
+}
+function onMove(e) {
+  if (!pDown) return;
+  var p = evtPos(e);
+  var dx = p[0] - pDown.x, dy = p[1] - pDown.y;
+  if (dx * dx + dy * dy > 36) pDown.moved = true;
+  if (pDown.moved && pPath) {
+    var w = toWorld(p[0], p[1]);
+    var last = pPath[pPath.length - 1];
+    var ddx = w[0] - last[0], ddy = w[1] - last[1];
+    if (ddx * ddx + ddy * ddy > 0.0009) pPath.push(w);
+  }
+}
+function distToSeg(px, py, ax, ay, bx, by) {
+  var abx = bx - ax, aby = by - ay;
+  var tt = ((px - ax) * abx + (py - ay) * aby) / Math.max(1e-9, abx * abx + aby * aby);
+  tt = Math.max(0, Math.min(1, tt));
+  var cx = ax + abx * tt, cy = ay + aby * tt;
+  var dx = px - cx, dy = py - cy;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+function onUp(e) {
+  if (!pDown) return;
+  var wasDrag = pDown.moved && pPath && pPath.length > 1;
+  if (wasDrag) {
+    /* be the AI: guests within a band of the drawn line pair among themselves */
+    var sel = [];
+    for (var i = 0; i < 8; i++) {
+      var g = guests[i], near = false;
+      for (var s2 = 0; s2 + 1 < pPath.length && !near; s2++) {
+        if (distToSeg(g.x, g.y, pPath[s2][0], pPath[s2][1], pPath[s2 + 1][0], pPath[s2 + 1][1]) < 0.18) near = true;
+      }
+      if (near) sel.push(i);
+    }
+    if (sel.length >= 2) {
+      /* greedy proximity clustering into pairs/triples */
+      var pool = sel.slice(), groups = [];
+      while (pool.length) {
+        var first = pool.shift();
+        var grp = [first];
+        while (grp.length < 3 && pool.length) {
+          var best = -1, bd = 1e9;
+          for (var q = 0; q < pool.length; q++) {
+            var gg = guests[pool[q]];
+            var dd = 0;
+            for (var m = 0; m < grp.length; m++) {
+              var gm = guests[grp[m]];
+              dd += (gg.x - gm.x) * (gg.x - gm.x) + (gg.y - gm.y) * (gg.y - gm.y);
+            }
+            if (dd < bd) { bd = dd; best = q; }
+          }
+          grp.push(pool.splice(best, 1)[0]);
+        }
+        groups.push(grp);
+      }
+      /* unselected guests drift unpaired: give them far solo targets via normal flow */
+      events.push({ step: simStep, type: 'userGroups', groups: groups });
+    } else {
+      events.push({ step: simStep, type: 'scanNow' });
+    }
+  } else {
+    var p = evtPos(e);
+    var dtSteps = simStep - lastTapStep;
+    var ddx = p[0] - lastTapX, ddy = p[1] - lastTapY;
+    if (dtSteps < 42 && ddx * ddx + ddy * ddy < 1600) {
+      events.push({ step: simStep, type: 'reseed' });
+      lastTapStep = -100000;
+    } else {
+      events.push({ step: simStep, type: 'scanNow' });
+      lastTapStep = simStep; lastTapX = p[0]; lastTapY = p[1];
+    }
+  }
+  pDown = null; pPath = null;
+  if (e.preventDefault) e.preventDefault();
+}
+if (canvas.addEventListener) {
+  canvas.addEventListener('pointerdown', onDown);
+  canvas.addEventListener('pointermove', onMove);
+  canvas.addEventListener('pointerup', onUp);
+  canvas.addEventListener('touchstart', onDown, { passive: false });
+  canvas.addEventListener('touchmove', onMove, { passive: false });
+  canvas.addEventListener('touchend', onUp, { passive: false });
+  canvas.addEventListener('mousedown', onDown);
+  canvas.addEventListener('mousemove', onMove);
+  canvas.addEventListener('mouseup', onUp);
+}
+
+/* ---------- draw: pure function of sim state ---------- */
+function draw() {
+  canvas.style.width = viewW + 'px';
+  canvas.style.height = viewH + 'px';
+  var W = viewW, H = viewH;
+  var s = Math.min(W, H);
+  var cx = W / 2, cy = H / 2;
+  var R = s * 0.44;
+  ctx.fillStyle = GROUND;
+  ctx.fillRect(0, 0, W, H);
+
+  /* room rim */
+  ctx.beginPath();
+  ctx.arc(cx, cy, R, 0, Math.PI * 2);
+  ctx.strokeStyle = RIM_COLOR;
+  ctx.lineWidth = Math.max(1, s * 0.0022);
+  ctx.stroke();
+
+  var ph = phase();
+  var ct = cycleT();
+  var t = simTime();
+
+  /* the AI's scan line: crosses the room during SCAN */
+  if (ph === 'scan') {
+    var pr = (ct - T_SCAN) / (T_PAIR - T_SCAN);
+    var lx = cx - R + 2 * R * pr;
+    var half = Math.sqrt(Math.max(0, R * R - (lx - cx) * (lx - cx)));
+    ctx.beginPath();
+    ctx.moveTo(lx, cy - half); ctx.lineTo(lx, cy + half);
+    ctx.strokeStyle = SCAN_COLOR;
+    ctx.globalAlpha = 0.3;
+    ctx.lineWidth = Math.max(1, s * 0.002);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  /* the AI's arrows: guest -> constellation point, during PAIR */
+  if (ph === 'pair' && targets) {
+    for (var i = 0; i < 8; i++) {
+      var g = guests[i], tg = targets[i];
+      if (!tg) continue;
+      var x0 = cx + g.x * R, y0 = cy + g.y * R;
+      var x1 = cx + tg.x * R, y1 = cy + tg.y * R;
+      var mx = (x0 + x1) / 2, my = (y0 + y1) / 2;
+      var nx = -(y1 - y0), ny = (x1 - x0);
+      var nl = Math.sqrt(nx * nx + ny * ny) || 1;
+      var bow = Math.min(46, nl * 0.22);
+      var qx = mx + nx / nl * bow, qy = my + ny / nl * bow;
+      var dNow = Math.sqrt((g.x - tg.x) * (g.x - tg.x) + (g.y - tg.y) * (g.y - tg.y));
+      var fade = Math.max(0, Math.min(1, dNow / pairStartDist[i]));
+      var alpha = 0.8 * (0.25 + 0.75 * fade);
+      ctx.beginPath();
+      ctx.moveTo(x0, y0);
+      ctx.quadraticCurveTo(qx, qy, x1, y1);
+      ctx.strokeStyle = ARROW_COLOR;
+      ctx.globalAlpha = alpha * 0.55;
+      ctx.lineWidth = Math.max(1, s * 0.0018);
+      ctx.stroke();
+      /* arrowhead */
+      var ang = Math.atan2(y1 - qy, x1 - qx);
+      var hs = s * 0.011;
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x1 - hs * Math.cos(ang - 0.42), y1 - hs * Math.sin(ang - 0.42));
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x1 - hs * Math.cos(ang + 0.42), y1 - hs * Math.sin(ang + 0.42));
+      ctx.strokeStyle = ARROW_COLOR;
+      ctx.globalAlpha = alpha;
+      ctx.stroke();
+      /* travelling pulse along the curve */
+      var u = (t * 0.85 + i * 0.173) % 1;
+      var px = (1 - u) * (1 - u) * x0 + 2 * (1 - u) * u * qx + u * u * x1;
+      var py = (1 - u) * (1 - u) * y0 + 2 * (1 - u) * u * qy + u * u * y1;
+      ctx.beginPath();
+      ctx.arc(px, py, Math.max(1.4, s * 0.0032), 0, Math.PI * 2);
+      ctx.fillStyle = ARROW_COLOR;
+      ctx.globalAlpha = alpha;
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  /* the visitor's own scan line, while dragging */
+  if (pDown && pDown.moved && pPath && pPath.length > 1) {
+    ctx.beginPath();
+    for (var k = 0; k < pPath.length; k++) {
+      var wx = cx + pPath[k][0] * R, wy = cy + pPath[k][1] * R;
+      if (k === 0) ctx.moveTo(wx, wy); else ctx.lineTo(wx, wy);
+    }
+    ctx.strokeStyle = SCAN_COLOR;
+    ctx.globalAlpha = 0.55;
+    ctx.lineWidth = Math.max(1, s * 0.0024);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  /* guests */
+  var gr = Math.max(3, s * 0.013);
+  for (var j = 0; j < 8; j++) {
+    var gg = guests[j];
+    ctx.beginPath();
+    ctx.arc(cx + gg.x * R, cy + gg.y * R, gr, 0, Math.PI * 2);
+    ctx.fillStyle = GUEST_COLORS[j];
+    ctx.fill();
+  }
+
+  /* host at the exact center, earpiece glowing */
+  var hr = gr * 1.4;
+  ctx.beginPath();
+  ctx.arc(cx, cy, hr, 0, Math.PI * 2);
+  ctx.fillStyle = HOST_COLOR;
+  ctx.fill();
+  var sincePulse = t - earPulseStart;
+  var pulse = sincePulse >= 0 ? Math.max(0, Math.sin(Math.min(1, sincePulse / 3) * Math.PI)) : 0;
+  var idle = 0.45 + 0.2 * Math.sin(t * 2.2);
+  var earA = Math.min(1, idle + pulse * 0.8);
+  var earR = Math.max(2, s * 0.0045) * (1 + pulse * 0.9);
+  ctx.beginPath();
+  ctx.arc(cx + hr * 0.62, cy - hr * 0.42, earR, 0, Math.PI * 2);
+  ctx.fillStyle = (t < userHoldUntil) ? EARPIECE_USER : EARPIECE_COLOR;
+  ctx.globalAlpha = earA;
+  ctx.fill();
+  ctx.globalAlpha = 1;
+}
+
+/* ---------- boot: deterministic frame one, then live loop ---------- */
+measure();
+initParty(BASE_SEED);
+for (var p = 0; p < PREROLL; p++) step();
+draw();
+
+if (typeof requestAnimationFrame !== 'undefined') {
+  var lastNow = null, acc = 0;
+  var frame = function (now) {
+    if (lastNow === null) lastNow = now;
+    var elapsed = Math.min(0.25, (now - lastNow) / 1000);
+    lastNow = now;
+    acc += elapsed;
+    var n = Math.floor(acc / DT);
+    if (n > 30) n = 30;                     /* cap catch-up steps per frame */
+    acc -= n * DT;
+    for (var i2 = 0; i2 < n; i2++) step();
+    draw();
+    requestAnimationFrame(frame);
+  };
+  requestAnimationFrame(frame);
+}
+</script>
+</body>
+</html>

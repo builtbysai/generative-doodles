@@ -1,0 +1,31 @@
+# No.961 Crowdpilot
+
+Study #118 lauren-lee-mccarthy, PP122. After Crowdpilot (2012) and Social Turkers (2013): a blind date steered live by a remote crowd. Here the conversation is a walk, the votes are the content, and the trail is the record of who was driving.
+
+## Concept
+
+A white dater dot walks a faint corridor graph across a dark field toward a pulsing magenta date-target. It never walks unsteered. Three advisor panels hover at the frame edges (friend in cyan at the left, stranger in magenta at the top, hired assistant in amber at the right), each flashing a chevron suggestion. Every 2 seconds the advisors vote on the outgoing edge at the junction the dater will next face; the majority wins, the dater turns, and from that moment its fading trail takes the winning advisor's color. The path becomes a barcode of cyan, magenta and amber stretches: a conversation remembered only as who steered it. No words anywhere, no chat UI, no speech bubbles. Reaching the target blooms, the old trail clears over 3 seconds, and a new conversation begins with a fresh corridor and fresh advisor temperaments.
+
+## Construction
+
+- Corridor: a seeded 5x4 jittered lattice with a diagonal lean (right, down, and down-right edges per cell, plus up to four seeded cross edges), built in normalized world coordinates so the sim is independent of canvas size. Minimum node degree is 3 by construction, so dead ends effectively do not occur; if the dater ever arrived somewhere with no steer on file, it would hold a vote on the spot rather than wander unsteered.
+- The vote: every 240 steps (2 s at 120 Hz), each advisor scores every outgoing edge at the upcoming junction. The friend minimizes squared distance from the edge's far node to the target. The stranger maximizes time since that edge was last traversed (novelty). The assistant minimizes BFS graph distance from the far node to the node nearest the target. Each score carries a seeded personality noise. Votes tally with weight 3 for a boosted advisor, else 1; ties break by a coin drawn from the same seeded stream. The winning edge is stored as the pending steer and consumed on arrival; the trail color is set to the strongest advisor backing the winning edge.
+- Motion: fixed-timestep 120 Hz sim. The dater moves at 38/720 world units per second (38 px/s at gallery size) along edges, carrying leftover distance across junctions within a step. Trail points are recorded every step with birth time, winner color, and conversation index; segments fade over 90 s and are never drawn across a conversation break or a positional jump.
+- Frame one: exactly 3600 pre-roll steps (30 s) run synchronously at load, so the first frame is already mid-conversation with a developed barcode.
+- Interaction: tapping an advisor panel joins the crowd (that advisor's votes weigh 3x for 10 s; the panel brightens). Dragging the target moves the date: the graph itself is static, so re-routing means the advisors' biases and the BFS shortest path recompute against the new target position (recorded simplification, below). A double-tap ends the conversation and reseeds a new one immediately.
+- Sound: all WebAudio is lazily created inside the first visitor gesture and typeof-guarded. A three-tone advisor bed (one soft sine per advisor), a vote chime at the winning advisor's pitch (740 / 988 / 587 Hz), a filtered-noise whoosh when the winning steer changes, and a two-note cadence (523 then 784 Hz) when the dater reaches the target. The piece renders and runs in complete silence in the QA renderer, which has no AudioContext.
+- House rules: canvas sized from the Visual Viewport API with resize listeners on both visualViewport and window; canvas CSS size pinned in px on every draw; phone detection via window.screen physical size (min dimension under 700 px) with the aspect fallback only; strict palette (ground #0C0D12, corridor #262A35, dater #F5F2EA, target #FF4FD8, advisors #4FD6FF / #FF4FD8 / #FFC44F); no gradients, no shadowBlur, no ctx.filter, no offscreen canvas, no microphone, no visible text except the title.
+
+## QA log
+
+- Rendered with the house node-canvas renderer at 1280x900 (qa-desktop.png), 390x844 (qa-mobile.png), and 720x720 (thumb.png). All three render cleanly in silence.
+- Determinism: thumb.png rendered twice and byte-compared with cmp: identical. The duplicate render was deleted. Frame one derives only from the seeded sim after 3600 fixed steps; no wall clock feeds any drawn state (grep-verified zero hits for Date.now, createElement, gradient, shadowBlur, getUserMedia).
+- Read-back: dark field, faint diagonal corridor hairlines, the white dater mid-corridor, its trail behind it in alternating cyan and magenta stretches (an amber stretch appears under other vote sequences), three edge panels each with one lit chevron (friend up, stranger left, assistant up at frame one) and three dim slots, the magenta target pulsing at the upper right. Mobile keeps all panels inside the frame and clips nothing.
+- Seed note: the first seed tried (961122) had the dater reach the target just before the 30 s mark, so frame one caught the bloom and a brand-new dater instead of a mid-conversation barcode. The seed was changed to 424242, whose frame one is mid-conversation as specced; mechanism and parameter ranges unchanged.
+
+## Deviations
+
+- Vote timing: the brief allows the simplification that advisors vote at junctions. Votes are held every 2 s for the junction the dater will next choose at, and the latest result is consumed on arrival, so the 2 s cadence (and the trail color changes) stays exact while every turn still comes from a vote.
+- Target drag: the corridor graph is the room and does not redraw itself when the date moves. Re-routing is realized as recomputed advisor biases and BFS pathing toward the dragged target position, which is the steering change the piece is about.
+- Trail color ownership: when several advisors back the winning edge, the trail takes the color of the strongest (highest-weight) backer, so a visitor's 3x boost visibly claims the trail.
+- Reaching the target starts the new conversation immediately, with the old trail clearing over 3 s rather than freezing for a photograph; the freeze-frame photograph belongs to the sibling piece (PP123 Follower), and Crowdpilot's own spec asks for a fresh corridor and fresh personalities.
