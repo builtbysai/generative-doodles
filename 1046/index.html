@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A Thousand Devices, One Score</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #070809; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- palette (strict) ----------
+  var COURT = '#070809';
+  var TEMPLE = '#1C1E24';
+  var ZONE_COLORS = ['#FFE9B8', '#FF9D9D', '#9DFFB3', '#7FD4FF', '#FFE9B8'];
+  var CART = '#FFFFFF';
+  var CART_BASE = '#0D0E11';
+  var DRONE = '#FFE9B8';
+  var BOUND = '#FFFFFF';
+  // pentatonic voices, one per zone (A minor pentatonic)
+  var ZONE_FREQ = [220.00, 261.63, 329.63, 293.66, 392.00];
+
+  var LOOP = 65;              // seconds: cart routes and drone crossings divide it
+  var STEP = 1 / 30;          // fixed sim step for the crowd
+  var PREROLL_T = 26;         // frame one lives here, fully developed
+  var PREROLL_STEPS = 780;    // 26 s at 30 Hz
+  var BASE_SEED = 1046207;
+  var NZ = 5;
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- world: logical 1000x1000 courtyard, temple at the center ----------
+  var CX = 500, CY = 500;
+  var TEMPLE_HX = 78, TEMPLE_HY = 60;   // dots are kept out of this rect
+
+  var sites = [];             // zone seeds {x, y}
+  var dots = [];              // crowd {x, y, sp, ph}
+  var boundaryPts = [];       // cached faint zone boundary points
+  var zonePop = [0, 0, 0, 0, 0];
+
+  function zoneAt(x, y) {
+    var best = 0, bd = Infinity;
+    for (var i = 0; i < NZ; i++) {
+      var dx = x - sites[i].x, dy = y - sites[i].y;
+      var d = dx * dx + dy * dy;
+      if (d < bd) { bd = d; best = i; }
+    }
+    return best;
+  }
+
+  // ==== CART MATH BEGIN ====
+  // Three concentric rectangular rings around the temple, one cart per ring.
+  // Each ring is an 8-waypoint axis-aligned circuit traveled at one constant
+  // speed with a hard dwell at every waypoint; the ring timeline sums to
+  // exactly LOOP seconds, so cart position is a closed-form function of t.
+  // Carts never rotate: omni translation only.
+  var RING_BASE = [[160, 122], [295, 228], [428, 332]];
+  function buildCarts(rng) {
+    var rings = [];
+    var r, i;
+    for (r = 0; r < 3; r++) {
+      var hx = RING_BASE[r][0] + (rng() * 2 - 1) * 8;
+      var hy = RING_BASE[r][1] + (rng() * 2 - 1) * 8;
+      var dir = rng() < 0.5 ? 1 : -1;
+      var dwell = 1.0 + rng() * 0.5;
+      var pts = [
+        [-hx, -hy], [0, -hy], [hx, -hy], [hx, 0],
+        [hx, hy], [0, hy], [-hx, hy], [-hx, 0]
+      ];
+      if (dir < 0) pts = [pts[0]].concat(pts.slice(1).reverse());
+      var segs = [], totalLen = 0;
+      for (i = 0; i < 8; i++) {
+        var a = pts[i], b = pts[(i + 1) % 8];
+        var len = Math.abs(b[0] - a[0]) + Math.abs(b[1] - a[1]);
+        segs.push({ ax: a[0], ay: a[1], bx: b[0], by: b[1], len: len });
+        totalLen += len;
+      }
+      var speed = totalLen / (LOOP - 8 * dwell);
+      var tl = [], tt = 0;
+      for (i = 0; i < 8; i++) {
+        var trav = segs[i].len / speed;
+        tl.push({ start: tt, dur: trav, kind: 0, seg: i });
+        tt += trav;
+        tl.push({ start: tt, dur: dwell, kind: 1, seg: i });
+        tt += dwell;
+      }
+      rings.push({ hx: hx, hy: hy, dwell: dwell, segs: segs, speed: speed, tl: tl, phase: rng() * LOOP });
+    }
+    return rings;
+  }
+  var cartRings = [];
+  function cartPosAt(ring, t) {
+    var ph = (t + ring.phase) % LOOP;
+    if (ph < 0) ph += LOOP;
+    var tl = ring.tl;
+    for (var i = 0; i < tl.length; i++) {
+      var e = tl[i];
+      if (ph >= e.start && ph < e.start + e.dur) {
+        var seg = ring.segs[e.seg];
+        if (e.kind === 1) return { x: CX + seg.bx, y: CY + seg.by, moving: false };
+        var u = e.dur > 0 ? (ph - e.start) / e.dur : 0;
+        return {
+          x: CX + seg.ax + (seg.bx - seg.ax) * u,
+          y: CY + seg.ay + (seg.by - seg.ay) * u,
+          moving: true
+        };
+      }
+    }
+    var last = ring.segs[7];
+    return { x: CX + last.bx, y: CY + last.by, moving: false };
+  }
+  // ==== CART MATH END ====
+
+  // ---------- drones: long overhead crossings, closed-form ----------
+  var DRONES = [
+    { x0: -70, y0: 175, x1: 1070, y1: 645, period: 65, phase: 0.0 },
+    { x0: 1070, y0: 830, x1: -70, y1: 295, period: 32.5, phase: 0.35 }
+  ];
+  function dronePosAt(d, t) {
+    var f = (t / d.period + d.phase) % 1;
+    if (f < 0) f += 1;
+    return {
+      x: d.x0 + (d.x1 - d.x0) * f,
+      y: d.y0 + (d.y1 - d.y0) * f,
+      vx: (d.x1 - d.x0) / d.period,
+      vy: (d.y1 - d.y0) / d.period
+    };
+  }
+
+  // ---------- world construction (seeded) ----------
+  var seed = BASE_SEED;
+  var builtPhone = null;
+
+  function buildWorld(s) {
+    var rng = mulberry32(s);
+    // zone sites: four quadrant-ish territories plus one near the heart
+    var base = [
+      [242, 238], [762, 218], [505, 520], [218, 782], [782, 762]
+    ];
+    sites = [];
+    for (var i = 0; i < NZ; i++) {
+      sites.push({
+        x: base[i][0] + (rng() * 2 - 1) * 62,
+        y: base[i][1] + (rng() * 2 - 1) * 62
+      });
+    }
+    cartRings = buildCarts(rng);
+    // the crowd: lights first, seeded uniformly, kept out of the temple
+    var n = phoneNow ? 600 : 1000;
+    dots = [];
+    for (i = 0; i < n; i++) {
+      var x = rng() * 1000, y = rng() * 1000;
+      if (Math.abs(x - CX) < TEMPLE_HX + 16 && Math.abs(y - CY) < TEMPLE_HY + 16) {
+        x = (x + 210) % 1000;
+      }
+      dots.push({ x: x, y: y, sp: 0.6 + rng() * 0.8, ph: rng() * Math.PI * 2 });
+    }
+    // cache the faint zone boundaries on a coarse grid
+    boundaryPts = [];
+    var g = 20, gz = [];
+    for (var gy = 0; gy <= 50; gy++) {
+      gz.push([]);
+      for (var gx = 0; gx <= 50; gx++) gz[gy].push(zoneAt(gx * g, gy * g));
+    }
+    for (gy = 0; gy <= 50; gy++) {
+      for (gx = 0; gx <= 50; gx++) {
+        var z = gz[gy][gx];
+        if (gx < 50 && gz[gy][gx + 1] !== z) boundaryPts.push([gx * g + g / 2, gy * g]);
+        if (gy < 50 && gz[gy + 1][gx] !== z) boundaryPts.push([gx * g, gy * g + g / 2]);
+      }
+    }
+  }
+
+  // ---------- crowd flow: layered sine currents, fixed-step ----------
+  function flowAt(x, y, t) {
+    var k = Math.PI * 2 / 1000;
+    var vx = Math.sin(y * 2 * k + t * 0.21) * 13
+           + Math.sin((x + y) * 1.7 * k - t * 0.13) * 8
+           + Math.cos(y * 3 * k - t * 0.07) * 5;
+    var vy = Math.cos(x * 2 * k - t * 0.17) * 13
+           + Math.sin((x - y) * 1.3 * k + t * 0.11) * 8
+           + Math.sin(x * 3 * k + t * 0.09) * 5;
+    // a slow breathing gather and release on the loop period
+    var br = Math.sin(t * Math.PI * 2 / LOOP) * 3.5;
+    var dx = CX - x, dy = CY - y;
+    var dl = Math.sqrt(dx * dx + dy * dy) || 1;
+    vx += dx / dl * br;
+    vy += dy / dl * br;
+    return [vx, vy];
+  }
+
+  var simT = 0;
+  var dragPts = [];           // recorded pointer events {x, y, t}, logical
+  var soloZone = -1, soloUntil = -1;
+
+  function stepSim() {
+    simT += STEP;
+    var i, j;
+    // prune stale drag points
+    while (dragPts.length && simT - dragPts[0].t > 1.1) dragPts.shift();
+    for (i = 0; i < dots.length; i++) {
+      var d = dots[i];
+      var v = flowAt(d.x, d.y, simT);
+      var vx = v[0] * d.sp, vy = v[1] * d.sp;
+      // drag: the visitor becomes a current, devices stream to the path
+      for (j = 0; j < dragPts.length; j++) {
+        var p = dragPts[j];
+        var age = simT - p.t;
+        var ddx = p.x - d.x, ddy = p.y - d.y;
+        var dd = Math.sqrt(ddx * ddx + ddy * ddy);
+        if (dd < 150 && dd > 0.01) {
+          var pull = (1 - dd / 150) * (1 - age / 1.1) * 260;
+          vx += ddx / dd * pull;
+          vy += ddy / dd * pull;
+        }
+      }
+      d.x += vx * STEP;
+      d.y += vy * STEP;
+      // the temple is respected: push out along the shallowest exit
+      var ex = Math.abs(d.x - CX), ey = Math.abs(d.y - CY);
+      if (ex < TEMPLE_HX + 3 && ey < TEMPLE_HY + 3) {
+        if (TEMPLE_HX + 3 - ex < TEMPLE_HY + 3 - ey) {
+          d.x = CX + (d.x >= CX ? TEMPLE_HX + 3 : -TEMPLE_HX - 3);
+        } else {
+          d.y = CY + (d.y >= CY ? TEMPLE_HY + 3 : -TEMPLE_HY - 3);
+        }
+      }
+      // toroidal wrap: the courtyard has no outside
+      if (d.x < 0) d.x += 1000; else if (d.x >= 1000) d.x -= 1000;
+      if (d.y < 0) d.y += 1000; else if (d.y >= 1000) d.y -= 1000;
+    }
+    if (soloZone >= 0 && simT > soloUntil) soloZone = -1;
+  }
+
+  function preroll() {
+    simT = 0;
+    for (var i = 0; i < PREROLL_STEPS; i++) stepSim();
+  }
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 720, H = 720;
+  var phoneNow = false;
+
+  function isPhone() {
+    var sw = 0, sh = 0;
+    if (typeof window !== 'undefined' && window.screen) {
+      sw = window.screen.width || 0; sh = window.screen.height || 0;
+    }
+    var mn = Math.min(sw, sh);
+    if (mn > 0 && mn < 700) return true;
+    return H > W * 1.15; // aspect fallback only
+  }
+
+  function fit() {
+    var vv = (typeof window !== 'undefined') ? window.visualViewport : null;
+    if (vv && vv.width) { W = vv.width; H = vv.height; }
+    else if (typeof window !== 'undefined' && window.innerWidth) { W = window.innerWidth; H = window.innerHeight; }
+    canvas.width = Math.round(W);
+    canvas.height = Math.round(H);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    var p = isPhone();
+    if (p !== phoneNow) {
+      phoneNow = p;
+      if (builtPhone !== null && builtPhone !== p) {
+        builtPhone = p;
+        buildWorld(seed);
+        dragPts = [];
+        soloZone = -1;
+        preroll();
+      }
+    }
+  }
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', function () { fit(); draw(simT); });
+    }
+    if (window.addEventListener) {
+      window.addEventListener('resize', function () { fit(); draw(simT); });
+    }
+  }
+
+  // ---------- coordinates: logical 1000x1000 plan, centered, contain fit ----------
+  function scale() { return Math.min(W, H) / 1000; }
+  function toPx(x, y) { var s = scale(); return [W / 2 + (x - 500) * s, H / 2 + (y - 500) * s]; }
+  function toLogical(px, py) { var s = scale(); return [(px - W / 2) / s + 500, (py - H / 2) / s + 500]; }
+
+  // ---------- audio (lazy, guarded; first gesture only) ----------
+  var AC = null, zoneOsc = [], zoneGain = [], cartOsc = null, cartGain = null;
+  var droneOsc = null, droneGain = null, lastTickAt = 0;
+  function ensureAudio() {
+    if (AC) { if (AC.resume) { try { AC.resume(); } catch (e) {} } return; }
+    var Ctor = null;
+    if (typeof AudioContext !== 'undefined') Ctor = AudioContext;
+    else if (typeof window !== 'undefined' && window.webkitAudioContext) Ctor = window.webkitAudioContext;
+    if (!Ctor) return;
+    try {
+      AC = new Ctor();
+      var i;
+      for (i = 0; i < NZ; i++) {
+        var o = AC.createOscillator(); o.type = 'sine'; o.frequency.value = ZONE_FREQ[i];
+        var g = AC.createGain(); g.gain.value = 0;
+        o.connect(g); g.connect(AC.destination); o.start();
+        zoneOsc.push(o); zoneGain.push(g);
+      }
+      cartOsc = AC.createOscillator(); cartOsc.type = 'triangle'; cartOsc.frequency.value = 96;
+      cartGain = AC.createGain(); cartGain.gain.value = 0;
+      cartOsc.connect(cartGain); cartGain.connect(AC.destination); cartOsc.start();
+      droneOsc = AC.createOscillator(); droneOsc.type = 'sine'; droneOsc.frequency.value = 1240;
+      droneGain = AC.createGain(); droneGain.gain.value = 0;
+      droneOsc.connect(droneGain); droneGain.connect(AC.destination); droneOsc.start();
+    } catch (e) { AC = null; }
+  }
+  function tick(freq) {
+    if (!AC) return;
+    try {
+      var t = AC.currentTime;
+      var o = AC.createOscillator(), g = AC.createGain();
+      o.type = 'sine'; o.frequency.value = freq;
+      g.gain.setValueAtTime(0.006, t);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.07);
+      o.connect(g); g.connect(AC.destination);
+      o.start(t); o.stop(t + 0.09);
+    } catch (e) {}
+  }
+  function updateAudio() {
+    if (!AC) return;
+    try {
+      var t = AC.currentTime;
+      var total = 0, i;
+      for (i = 0; i < NZ; i++) total += zonePop[i];
+      if (total <= 0) total = 1;
+      for (i = 0; i < NZ; i++) {
+        var share = zonePop[i] / total;
+        var gen = 0.7 + 0.3 * Math.sin(simT * 0.11 + i * 1.7);
+        var target;
+        if (soloZone >= 0) target = (i === soloZone) ? 0.085 : 0.005;
+        else target = (0.012 + 0.05 * share) * gen;
+        zoneGain[i].gain.setTargetAtTime(target, t, 0.4);
+      }
+      var moving = 0;
+      for (i = 0; i < cartRings.length; i++) if (cartPosAt(cartRings[i], simT).moving) moving++;
+      cartGain.gain.setTargetAtTime(moving ? 0.011 : 0.003, t, 0.2);
+      cartOsc.frequency.setTargetAtTime(90 + 10 * moving + 4 * Math.sin(simT * 0.3), t, 0.2);
+      droneGain.gain.setTargetAtTime(0.0032, t, 0.3);
+      // faint individual ticks from the crowd, throttled
+      if (t - lastTickAt > 0.37) {
+        lastTickAt = t;
+        var zi = Math.floor(Math.abs(Math.sin(simT * 12.9898) * 43758.5453) % 1 * NZ);
+        tick(ZONE_FREQ[zi] * 2);
+      }
+    } catch (e) {}
+  }
+
+  // ---------- drawing ----------
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    var s = scale();
+    var i, j, p;
+    ctx.fillStyle = COURT;
+    ctx.fillRect(0, 0, W, H);
+
+    // faint zone boundaries: the score, implied
+    ctx.fillStyle = BOUND;
+    ctx.globalAlpha = 0.05;
+    var bs = Math.max(1.2, 2.6 * s);
+    for (i = 0; i < boundaryPts.length; i++) {
+      p = toPx(boundaryPts[i][0], boundaryPts[i][1]);
+      ctx.fillRect(p[0] - bs / 2, p[1] - bs / 2, bs, bs);
+    }
+    ctx.globalAlpha = 1;
+
+    // temple: simple dark lines at the heart of the courtyard
+    var tw = 70 * s, th = 52 * s, cx = W / 2, cy = H / 2;
+    ctx.strokeStyle = TEMPLE;
+    ctx.lineWidth = Math.max(1.5, 2.2 * s);
+    ctx.strokeRect(cx - tw, cy - th, tw * 2, th * 2);
+    ctx.strokeRect(cx - tw * 0.62, cy - th * 0.62, tw * 1.24, th * 1.24);
+    ctx.beginPath();
+    ctx.moveTo(cx - tw, cy); ctx.lineTo(cx + tw, cy);
+    ctx.moveTo(cx, cy - th); ctx.lineTo(cx, cy + th);
+    ctx.stroke();
+
+    // the crowd: lights first, batched by zone color
+    zonePop = [0, 0, 0, 0, 0];
+    var dotMul = phoneNow ? 1.7 : 1;
+    var core = Math.max(1.5, 3.4 * s * dotMul);
+    var halo = Math.max(2.5, 8.5 * s * dotMul);
+    var solo = soloZone >= 0;
+    for (var pass = 0; pass < 2; pass++) {
+      for (var z = 0; z < NZ; z++) {
+        ctx.fillStyle = ZONE_COLORS[z];
+        if (pass === 0) ctx.globalAlpha = solo ? (z === soloZone ? 0.22 : 0.08) : 0.15;
+        else ctx.globalAlpha = solo ? (z === soloZone ? 0.95 : 0.45) : 0.7;
+        var sz = pass === 0 ? halo : core;
+        for (i = 0; i < dots.length; i++) {
+          var d = dots[i];
+          if (zoneAt(d.x, d.y) !== z) continue;
+          if (pass === 1) zonePop[z]++;
+          var wx = d.x + 3.2 * Math.sin(t * 0.9 + d.ph);
+          var wy = d.y + 3.2 * Math.cos(t * 0.8 + d.ph * 1.7);
+          p = toPx(wx, wy);
+          ctx.fillRect(p[0] - sz / 2, p[1] - sz / 2, sz, sz);
+        }
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    // carts: dark bases that never rotate, bright white domes that ride
+    for (i = 0; i < cartRings.length; i++) {
+      var cp = cartPosAt(cartRings[i], t);
+      p = toPx(cp.x, cp.y);
+      var side = 30 * s * (phoneNow ? 1.3 : 1);
+      ctx.fillStyle = CART_BASE;
+      ctx.fillRect(p[0] - side / 2, p[1] - side / 2, side, side);
+      ctx.strokeStyle = TEMPLE;
+      ctx.lineWidth = 1;
+      ctx.strokeRect(p[0] - side / 2, p[1] - side / 2, side, side);
+      var layers = [[20, 0.12], [13, 0.28], [8, 0.6], [4.6, 1.0]];
+      ctx.fillStyle = CART;
+      for (j = 0; j < layers.length; j++) {
+        ctx.globalAlpha = layers[j][1];
+        ctx.beginPath();
+        ctx.arc(p[0], p[1], Math.max(1, layers[j][0] * s * (phoneNow ? 1.3 : 1)), 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    // drones: warm lights overhead with short motion streaks
+    for (i = 0; i < DRONES.length; i++) {
+      var dp = dronePosAt(DRONES[i], t);
+      ctx.strokeStyle = DRONE;
+      ctx.lineCap = 'round';
+      for (j = 4; j >= 1; j--) {
+        var bx = dp.x - dp.vx * 0.15 * j, by = dp.y - dp.vy * 0.15 * j;
+        var ax = dp.x - dp.vx * 0.15 * (j - 1), ay = dp.y - dp.vy * 0.15 * (j - 1);
+        var pa = toPx(bx, by), pb = toPx(ax, ay);
+        ctx.globalAlpha = 0.38 * (1 - j / 5.5);
+        ctx.lineWidth = Math.max(1.2, 3.4 * s);
+        ctx.beginPath();
+        ctx.moveTo(pa[0], pa[1]);
+        ctx.lineTo(pb[0], pb[1]);
+        ctx.stroke();
+      }
+      p = toPx(dp.x, dp.y);
+      ctx.fillStyle = DRONE;
+      ctx.globalAlpha = 0.25;
+      ctx.beginPath();
+      ctx.arc(p[0], p[1], Math.max(1.5, 7.5 * s), 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 0.9;
+      ctx.beginPath();
+      ctx.arc(p[0], p[1], Math.max(1, 3.2 * s), 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  // ---------- pointer interaction ----------
+  var dragging = false;
+  var downInfo = null;
+  var lastTapT = -10;
+  var lastDragPt = null;
+  function evtLogical(e) {
+    var rx = 0, ry = 0;
+    if (canvas.getBoundingClientRect) {
+      var rect = canvas.getBoundingClientRect();
+      rx = rect.left; ry = rect.top;
+    }
+    return toLogical((e.clientX || 0) - rx, (e.clientY || 0) - ry);
+  }
+  function onDown(e) {
+    ensureAudio();
+    var p = evtLogical(e);
+    dragging = true;
+    downInfo = { x: p[0], y: p[1], moved: false };
+    lastDragPt = p;
+    dragPts.push({ x: p[0], y: p[1], t: simT });
+  }
+  function onMove(e) {
+    if (!dragging) return;
+    var p = evtLogical(e);
+    if (downInfo && (Math.abs(p[0] - downInfo.x) > 6 || Math.abs(p[1] - downInfo.y) > 6)) downInfo.moved = true;
+    if (!lastDragPt || Math.abs(p[0] - lastDragPt[0]) > 8 || Math.abs(p[1] - lastDragPt[1]) > 8) {
+      dragPts.push({ x: p[0], y: p[1], t: simT });
+      if (dragPts.length > 60) dragPts.splice(0, dragPts.length - 60);
+      lastDragPt = p;
+    }
+  }
+  function onUp(e) {
+    if (!downInfo) { dragging = false; return; }
+    dragging = false;
+    var wasDrag = downInfo.moved;
+    downInfo = null;
+    if (wasDrag) return;
+    var p = evtLogical(e);
+    if (simT - lastTapT < 0.35) {
+      // double-tap: a new night
+      seed = (seed * 1664525 + 1013904223) >>> 0;
+      dragPts = [];
+      soloZone = -1;
+      buildWorld(seed);
+      preroll();
+      lastTapT = -10;
+      draw(simT);
+      return;
+    }
+    lastTapT = simT;
+    // tap: solo the zone under the finger for five seconds
+    if (p[0] >= 0 && p[0] < 1000 && p[1] >= 0 && p[1] < 1000) {
+      soloZone = zoneAt(p[0], p[1]);
+      soloUntil = simT + 5;
+    }
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', function () { dragging = false; downInfo = null; });
+  }
+
+  // ---------- boot: build, pre-roll to the developed field, frame one ----------
+  fit();
+  phoneNow = isPhone();
+  builtPhone = phoneNow;
+  buildWorld(seed);
+  preroll();
+  draw(simT);
+
+  if (typeof requestAnimationFrame !== 'undefined') {
+    var lastMs = null, acc = 0;
+    var loopFn = function (ms) {
+      if (lastMs === null) lastMs = ms;
+      var elapsed = (ms - lastMs) / 1000;
+      lastMs = ms;
+      if (elapsed > 0.25) elapsed = 0.25;
+      acc += elapsed;
+      var steps = 0;
+      while (acc >= STEP && steps < 8) { stepSim(); acc -= STEP; steps++; }
+      if (steps === 8) acc = 0;
+      draw(simT);
+      updateAudio();
+      requestAnimationFrame(loopFn);
+    };
+    requestAnimationFrame(loopFn);
+  }
+})();
+</script>
+</body>
+</html>

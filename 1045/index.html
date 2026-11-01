@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>After the Bow</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #060607; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded rng ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- palette (strict) ----------
+  var VENUE = '#060607';
+  var CART = '#FFE9B8';       // cart domes, rest alpha 0.5
+  var SCREEN = '#D8DADE';     // screens, rest alpha 0.3
+  var BALL = '#FFFFFF';       // conveyor balls, rest alpha 0.6
+  var SEAT = '#0A0B0D';
+  var BASE = '#0D0E11';       // cart bases
+  var PLAT = '#101114';       // screen platforms, seat edge, conveyor rail
+
+  var LOOP = 70;              // every schedule divides this
+  var T0 = 21;                // frame one phase
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 720, H = 720, DPR = 1, phoneNow = false;
+
+  function isPhone() {
+    var sw = 0, sh = 0;
+    if (typeof window !== 'undefined' && window.screen) {
+      sw = window.screen.width || 0; sh = window.screen.height || 0;
+    }
+    var mn = Math.min(sw, sh);
+    if (mn > 0 && mn < 700) return true;
+    return H > W * 1.15; // aspect fallback only
+  }
+
+  function fit() {
+    var vv = (typeof window !== 'undefined') ? window.visualViewport : null;
+    if (vv && vv.width) { W = vv.width; H = vv.height; }
+    else if (typeof window !== 'undefined' && window.innerWidth) { W = window.innerWidth; H = window.innerHeight; }
+    DPR = (typeof window !== 'undefined' && window.devicePixelRatio) ? Math.min(window.devicePixelRatio, 2) : 1;
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    phoneNow = isPhone();
+  }
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', function () { fit(); draw(curT); });
+    }
+    if (window.addEventListener) {
+      window.addEventListener('resize', function () { fit(); draw(curT); });
+    }
+  }
+
+  function mod(a, n) { var r = a % n; return r < 0 ? r + n : r; }
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function lerp(a, b, u) { return a + (b - a) * u; }
+
+  // ---------- layout ----------
+  function layout() {
+    var side = phoneNow ? W * 0.035 : W * 0.095;
+    var fy0 = H * 0.045, fy1 = H - H * (phoneNow ? 0.145 : 0.155);
+    return {
+      fx0: side, fy0: fy0,
+      fx1: W - side, fy1: fy1,
+      fw: W - side * 2, fh: fy1 - fy0
+    };
+  }
+
+  // ---------- schedule time (bow pauses freeze the machines) ----------
+  var pauses = []; // {start, dur}
+  function sched(t) {
+    var s = t;
+    for (var i = 0; i < pauses.length; i++) {
+      var p = pauses[i];
+      s -= clamp(t - p.start, 0, p.dur);
+    }
+    return s;
+  }
+  function isPaused(t) {
+    for (var i = 0; i < pauses.length; i++) {
+      if (t >= pauses[i].start && t < pauses[i].start + pauses[i].dur) return true;
+    }
+    return false;
+  }
+
+  // ---------- show flash envelope (double-tap) ----------
+  var shows = []; // {start}
+  function showLevel(t) {
+    var s = 0;
+    for (var i = 0; i < shows.length; i++) {
+      var dt = t - shows[i].start;
+      var e = 0;
+      if (dt >= 0 && dt < 0.8) e = dt / 0.8;
+      else if (dt >= 0.8 && dt < 9) e = 1;
+      else if (dt >= 9 && dt < 12) e = 1 - (dt - 9) / 3;
+      if (e > s) s = e;
+    }
+    return s;
+  }
+
+  // ---------- carts: rectangular waypoint circuits ----------
+  // period divides LOOP; corner dwell at every waypoint; constant velocity.
+  var carts = [];
+  (function buildCarts() {
+    var defs = [
+      { x0: 0.05, y0: 0.34, x1: 0.60, y1: 0.90, P: 35, dwell: 1.1, phase: 3.0, dir: 1 },
+      { x0: 0.14, y0: 0.44, x1: 0.52, y1: 0.80, P: 70, dwell: 1.6, phase: 26.0, dir: -1 },
+      { x0: 0.03, y0: 0.30, x1: 0.66, y1: 0.96, P: 70, dwell: 2.0, phase: 48.0, dir: 1 },
+      { x0: 0.22, y0: 0.52, x1: 0.46, y1: 0.72, P: 14, dwell: 0.5, phase: 5.0, dir: -1 },
+      { x0: 0.08, y0: 0.38, x1: 0.56, y1: 0.86, P: 35, dwell: 0.9, phase: 19.0, dir: -1 }
+    ];
+    for (var i = 0; i < defs.length; i++) {
+      var d = defs[i];
+      var corners = d.dir > 0
+        ? [[d.x0, d.y0], [d.x1, d.y0], [d.x1, d.y1], [d.x0, d.y1]]
+        : [[d.x0, d.y0], [d.x0, d.y1], [d.x1, d.y1], [d.x1, d.y0]];
+      var lens = [];
+      var per = 0;
+      for (var k = 0; k < 4; k++) {
+        var a = corners[k], b = corners[(k + 1) % 4];
+        var L = Math.abs(b[0] - a[0]) + Math.abs(b[1] - a[1]);
+        lens.push(L); per += L;
+      }
+      carts.push({ corners: corners, lens: lens, P: d.P, dwell: d.dwell, phase: d.phase, v: per / (d.P - 4 * d.dwell) });
+    }
+  })();
+
+  function cartPos(c, tt) {
+    var u = mod(tt + c.phase, c.P);
+    for (var k = 0; k < 4; k++) {
+      var a = c.corners[k], b = c.corners[(k + 1) % 4];
+      if (u < c.dwell) return { x: a[0], y: a[1], axis: (b[0] !== a[0]) ? 'h' : 'v', moving: false };
+      u -= c.dwell;
+      var trav = c.lens[k] / c.v;
+      if (u < trav) {
+        var f = (u * c.v) / c.lens[k];
+        return { x: a[0] + (b[0] - a[0]) * f, y: a[1] + (b[1] - a[1]) * f, axis: (b[0] !== a[0]) ? 'h' : 'v', moving: true };
+      }
+      u -= trav;
+    }
+    var c0 = c.corners[0];
+    return { x: c0[0], y: c0[1], axis: 'h', moving: false };
+  }
+
+  // ---------- screens: end-dwell glides with projection blobs ----------
+  var screens = [];
+  (function buildScreens() {
+    var rng = mulberry32(1045206);
+    var defs = [
+      { y: 0.13, xa: 0.10, xb: 0.62, P: 35, dwell: 3.0, phase: 6.0 },
+      { y: 0.20, xa: 0.30, xb: 0.86, P: 70, dwell: 4.0, phase: 31.0 },
+      { y: 0.075, xa: 0.16, xb: 0.52, P: 70, dwell: 5.0, phase: 52.0 }
+    ];
+    var blobP = [10, 14, 17.5, 35];
+    for (var i = 0; i < defs.length; i++) {
+      var blobs = [];
+      for (var j = 0; j < 3; j++) {
+        blobs.push({
+          px: blobP[Math.floor(rng() * 4)], py: blobP[Math.floor(rng() * 4)],
+          fx: rng() * 6.283, fy: rng() * 6.283,
+          ax: 0.22 + rng() * 0.18, ay: 0.16 + rng() * 0.14, r: 0.20 + rng() * 0.13
+        });
+      }
+      screens.push({ y: defs[i].y, xa: defs[i].xa, xb: defs[i].xb, P: defs[i].P, dwell: defs[i].dwell, phase: defs[i].phase, blobs: blobs, darkP: blobP[Math.floor(rng() * 4)], darkF: rng() * 6.283 });
+    }
+  })();
+
+  function glideX(s, tt) {
+    var u = mod(tt + s.phase, s.P);
+    var travel = s.P - 2 * s.dwell, half = travel / 2, v = (s.xb - s.xa) / half;
+    if (u < s.dwell) return s.xa;
+    u -= s.dwell;
+    if (u < half) return s.xa + v * u;
+    u -= half;
+    if (u < s.dwell) return s.xb;
+    u -= s.dwell;
+    return s.xb - v * u;
+  }
+
+  // ---------- conveyor: lemniscate, arc-length table ----------
+  var conv = { cx: 0.815, cy: 0.60, ax: 0.155, ay: 0.096, table: [], total: 0 };
+  (function buildConv() {
+    var N = 1024, pts = [], i;
+    for (i = 0; i <= N; i++) {
+      var th = (i / N) * Math.PI * 2;
+      var sn = Math.sin(th), cs = Math.cos(th), dn = 1 + sn * sn;
+      pts.push([cs / dn, sn * cs / dn]);
+    }
+    var cum = [0];
+    for (i = 1; i <= N; i++) {
+      var dx = pts[i][0] - pts[i - 1][0], dy = pts[i][1] - pts[i - 1][1];
+      cum.push(cum[i - 1] + Math.sqrt(dx * dx + dy * dy));
+    }
+    conv.table = pts; conv.cum = cum; conv.total = cum[N];
+  })();
+  function convPos(dist) {
+    var d = mod(dist, conv.total);
+    var cum = conv.cum, lo = 0, hi = cum.length - 1;
+    while (lo < hi - 1) { var mid = (lo + hi) >> 1; if (cum[mid] <= d) lo = mid; else hi = mid; }
+    var seg = cum[hi] - cum[lo], f = seg > 0 ? (d - cum[lo]) / seg : 0;
+    var a = conv.table[lo], b = conv.table[hi];
+    return [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f];
+  }
+  var balls = [];
+  (function buildBalls() {
+    var laps = [5, 7, 4, 6, 5, 7, 4, 6];
+    var cyc = [7, 10, 14, 5, 10, 7, 14, 10];
+    var rng = mulberry32(1045207);
+    for (var i = 0; i < 8; i++) {
+      balls.push({
+        laps: laps[i], off: (i / 8) * conv.total + (rng() - 0.5) * 0.06 * conv.total,
+        cyc: cyc[i], bf: rng() * 6.283
+      });
+    }
+  })();
+  function ballLevel(b, tt) {
+    var s = 0.5 + 0.5 * Math.sin(6.2831853 * (b.cyc * tt / LOOP) + b.bf);
+    return 0.30 + 0.70 * Math.pow(s, 1.5);
+  }
+
+  // ---------- pointer state (interaction only; frame one has none) ----------
+  var ptr = { down: false, drag: false, x: 0, y: 0, downT: 0, downX: 0, downY: 0, env: 0, endT: -10 };
+  var lastTapT = -10, pendingPause = null;
+  var curT = T0;
+
+  function dragEnv(t) {
+    if (ptr.down && ptr.drag) return 1;
+    var dt = t - ptr.endT;
+    return dt < 0.8 ? Math.max(0, 1 - dt / 0.8) : 0;
+  }
+  function prox(x, y, t) {
+    var e = dragEnv(t);
+    if (e <= 0) return 0;
+    var R = 0.38 * Math.min(W, H);
+    var dx = ptr.x - x, dy = ptr.y - y, d = Math.sqrt(dx * dx + dy * dy);
+    return e * Math.max(0, 1 - d / R);
+  }
+
+  // ---------- audio (lazy, guarded; silent in QA) ----------
+  var AC = null, masterGain = null, humGain = null;
+  function ensureAudio() {
+    if (AC) return;
+    var Ctor = null;
+    if (typeof AudioContext !== 'undefined') Ctor = AudioContext;
+    else if (typeof window !== 'undefined' && window.webkitAudioContext) Ctor = window.webkitAudioContext;
+    if (!Ctor) { AC = false; return; }
+    try {
+      AC = new Ctor();
+      masterGain = AC.createGain(); masterGain.gain.value = 0.6; masterGain.connect(AC.destination);
+      var o1 = AC.createOscillator(); o1.type = 'sine'; o1.frequency.value = 52;
+      var g1 = AC.createGain(); g1.gain.value = 0.018;
+      o1.connect(g1); g1.connect(masterGain); o1.start();
+      var o2 = AC.createOscillator(); o2.type = 'triangle'; o2.frequency.value = 164;
+      humGain = AC.createGain(); humGain.gain.value = 0.005;
+      o2.connect(humGain); humGain.connect(masterGain); o2.start();
+      var o3 = AC.createOscillator(); o3.type = 'sine'; o3.frequency.value = 329;
+      var g3 = AC.createGain(); g3.gain.value = 0.0022;
+      o3.connect(g3); g3.connect(masterGain); o3.start();
+    } catch (e) { AC = false; }
+  }
+  function audioUpdate(t) {
+    if (!AC || AC === false) return;
+    try {
+      var now = AC.currentTime;
+      var target = isPaused(t) ? 0.0 : 0.6;
+      masterGain.gain.setTargetAtTime(target, now, 0.12);
+      if (humGain) humGain.gain.setTargetAtTime(0.004 + 0.005 * showLevel(t), now, 0.3);
+    } catch (e) { /* audio is garnish */ }
+  }
+
+  // ---------- pointer handlers ----------
+  function evtPos(e) {
+    var r = { left: 0, top: 0 };
+    if (canvas.getBoundingClientRect) r = canvas.getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  }
+  function onDown(e) {
+    ensureAudio();
+    if (AC && AC.resume) { try { AC.resume(); } catch (err) {} }
+    var p = evtPos(e);
+    ptr.down = true; ptr.drag = false;
+    ptr.x = p.x; ptr.y = p.y; ptr.downX = p.x; ptr.downY = p.y; ptr.downT = curT;
+  }
+  function onMove(e) {
+    if (!ptr.down) return;
+    var p = evtPos(e);
+    ptr.x = p.x; ptr.y = p.y;
+    if (Math.abs(p.x - ptr.downX) > 6 || Math.abs(p.y - ptr.downY) > 6) ptr.drag = true;
+  }
+  function onUp(e) {
+    if (!ptr.down) return;
+    ptr.down = false; ptr.endT = curT;
+    var wasDrag = ptr.drag;
+    ptr.drag = false;
+    if (wasDrag) return;
+    if (curT - ptr.downT > 0.45) return;
+    // a tap
+    if (curT - lastTapT < 0.30) {
+      // double-tap: the show. Cancel the pending bow if it has not begun.
+      if (pendingPause && pendingPause.start > curT) {
+        var idx = pauses.indexOf(pendingPause);
+        if (idx >= 0) pauses.splice(idx, 1);
+        pendingPause = null;
+      }
+      shows.push({ start: curT });
+      lastTapT = -10;
+    } else {
+      // a bow, scheduled just ahead so a double-tap can still overrule it
+      pendingPause = { start: curT + 0.32, dur: 3 };
+      pauses.push(pendingPause);
+      lastTapT = curT;
+    }
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', function () { ptr.down = false; ptr.drag = false; ptr.endT = curT; });
+  }
+
+  // ---------- seats ----------
+  function drawSeats(L, u) {
+    ctx.fillStyle = SEAT;
+    var rows = phoneNow ? 3 : 4;
+    var sh = Math.max(9, H * 0.020), gapY = Math.max(5, H * 0.008);
+    var sw = Math.max(16, W * 0.028), gapX = Math.max(5, W * 0.006);
+    var yBase = L.fy1 + H * 0.018;
+    var r, x, y;
+    for (r = 0; r < rows; r++) {
+      y = yBase + r * (sh + gapY);
+      var shift = (r % 2) * (sw * 0.3);
+      for (x = W * 0.03 + shift; x + sw < W * 0.985; x += sw + gapX) {
+        ctx.fillRect(x, y, sw, sh + r * 0.8);
+        ctx.fillStyle = PLAT;
+        ctx.fillRect(x, y, sw, 1.2);
+        ctx.fillStyle = SEAT;
+      }
+    }
+    if (!phoneNow) {
+      var colW = Math.max(13, W * 0.020);
+      var cols = [W * 0.018, W * 0.052, W - W * 0.052 - colW, W - W * 0.018 - colW];
+      for (var c = 0; c < cols.length; c++) {
+        for (y = L.fy0 + 4; y + sh < L.fy1 - 2; y += sh + gapY) {
+          ctx.fillRect(cols[c], y, colW, sh);
+          ctx.fillStyle = PLAT;
+          ctx.fillRect(cols[c], y, colW, 1.2);
+          ctx.fillStyle = SEAT;
+        }
+      }
+    }
+  }
+
+  // ---------- drawing ----------
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = VENUE;
+    ctx.fillRect(0, 0, W, H);
+    var L = layout();
+    var tau = sched(t);
+    var show = showLevel(t);
+    var u = Math.min(W, H);
+    var i, k;
+
+    function FX(nx) { return L.fx0 + nx * L.fw; }
+    function FY(ny) { return L.fy0 + ny * L.fh; }
+
+    // cart trails: sampled past positions, ghostly at 0.1
+    ctx.lineWidth = Math.max(1.2, u * 0.0022);
+    ctx.lineCap = 'round';
+    for (i = 0; i < carts.length; i++) {
+      var c = carts[i];
+      var prev = null;
+      for (k = 9; k >= 1; k--) {
+        var sp = cartPos(c, tau - k * 0.55);
+        var sx = FX(sp.x), sy = FY(sp.y);
+        if (prev) {
+          ctx.strokeStyle = CART;
+          ctx.globalAlpha = 0.10 * (1 - k / 10) * (1 + 0.8 * show);
+          ctx.beginPath(); ctx.moveTo(prev[0], prev[1]); ctx.lineTo(sx, sy); ctx.stroke();
+        }
+        prev = [sx, sy];
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    // conveyor: rail, then stamps
+    var ccx = FX(conv.cx), ccy = FY(conv.cy);
+    var cax = conv.ax * L.fw, cay = conv.ay * L.fh;
+    ctx.strokeStyle = PLAT;
+    ctx.lineWidth = Math.max(1, u * 0.0016);
+    ctx.beginPath();
+    for (i = 0; i <= 128; i++) {
+      var th = (i / 128) * Math.PI * 2;
+      var sn = Math.sin(th), cs = Math.cos(th), dn = 1 + sn * sn;
+      var px = ccx + (cs / dn) * cax, py = ccy + (sn * cs / dn) * cay;
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.stroke();
+    for (i = 0; i < balls.length; i++) {
+      var b = balls[i];
+      var spd = b.laps * conv.total / LOOP;
+      for (k = 7; k >= 1; k--) {
+        var past = tau - k * 0.5;
+        var pp = convPos(b.off + spd * past);
+        ctx.fillStyle = BALL;
+        ctx.globalAlpha = 0.10 * (1 - k / 8) * ballLevel(b, past) * (1 + 0.8 * show);
+        ctx.beginPath(); ctx.arc(ccx + pp[0] * cax, ccy + pp[1] * cay, u * 0.006, 0, 6.2831853); ctx.fill();
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    // carts
+    for (i = 0; i < carts.length; i++) {
+      var cp = cartPos(carts[i], tau);
+      var cx = FX(cp.x), cy = FY(cp.y);
+      var q = prox(cx, cy, t);
+      var boost = 1 + 0.55 * q + 0.9 * show;
+      var bw = u * (cp.axis === 'h' ? 0.040 : 0.027);
+      var bh = u * (cp.axis === 'h' ? 0.027 : 0.040);
+      ctx.fillStyle = BASE;
+      ctx.fillRect(cx - bw / 2, cy - bh / 2, bw, bh);
+      // dome leans toward the audience finger
+      var lx = 0, ly = 0;
+      if (q > 0.01) {
+        var dx = ptr.x - cx, dy = ptr.y - cy, dd = Math.sqrt(dx * dx + dy * dy);
+        if (dd > 1) { lx = (dx / dd) * 3 * q; ly = (dy / dd) * 3 * q; }
+      }
+      var r = u * 0.0105;
+      ctx.fillStyle = CART;
+      ctx.globalAlpha = Math.min(1, 0.10 * boost);
+      ctx.beginPath(); ctx.arc(cx + lx, cy + ly, r * 2.7, 0, 6.2831853); ctx.fill();
+      ctx.globalAlpha = Math.min(1, 0.24 * boost);
+      ctx.beginPath(); ctx.arc(cx + lx, cy + ly, r * 1.65, 0, 6.2831853); ctx.fill();
+      ctx.globalAlpha = Math.min(1, (0.5 + 0.5 * show) * (1 + 0.55 * q));
+      ctx.beginPath(); ctx.arc(cx + lx, cy + ly, r, 0, 6.2831853); ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    // screens
+    var swd = u * (phoneNow ? 0.20 : 0.165), sht = u * (phoneNow ? 0.24 : 0.205);
+    for (i = 0; i < screens.length; i++) {
+      var s = screens[i];
+      var gx = FX(glideX(s, tau)), gy = FY(s.y);
+      var sq = prox(gx, gy, t);
+      var sboost = 1 + 0.5 * sq + 0.9 * show;
+      var lean = 0;
+      if (sq > 0.01) lean = clamp((ptr.x - gx) / (0.5 * W), -1, 1) * 0.055 * sq;
+      ctx.fillStyle = PLAT;
+      ctx.fillRect(gx - swd * 0.58, gy + sht * 0.52, swd * 1.16, u * 0.016);
+      ctx.fillRect(gx - u * 0.006, gy + sht * 0.30, u * 0.012, sht * 0.24);
+      ctx.save();
+      ctx.translate(gx, gy);
+      ctx.transform(1, 0, lean, 1, 0, 0);
+      ctx.fillStyle = SCREEN;
+      ctx.globalAlpha = Math.min(0.85, 0.30 * sboost);
+      ctx.fillRect(-swd / 2, -sht / 2, swd, sht);
+      // projections still running inside: soft blobs, screen-local
+      ctx.beginPath(); ctx.rect(-swd / 2, -sht / 2, swd, sht); ctx.clip();
+      for (k = 0; k < s.blobs.length; k++) {
+        var bl = s.blobs[k];
+        var bx = Math.sin(6.2831853 * tau / bl.px + bl.fx) * bl.ax * swd;
+        var by = Math.sin(6.2831853 * tau / bl.py + bl.fy) * bl.ay * sht;
+        var br = bl.r * swd;
+        ctx.globalAlpha = Math.min(0.6, 0.10 * sboost);
+        ctx.beginPath(); ctx.arc(bx, by, br, 0, 6.2831853); ctx.fill();
+        ctx.globalAlpha = Math.min(0.6, 0.16 * sboost);
+        ctx.beginPath(); ctx.arc(bx, by, br * 0.55, 0, 6.2831853); ctx.fill();
+      }
+      ctx.fillStyle = VENUE;
+      var dbx = Math.sin(6.2831853 * tau / s.darkP + s.darkF) * 0.26 * swd;
+      var dby = Math.cos(6.2831853 * tau / (s.darkP * 1.4) + s.darkF) * 0.18 * sht;
+      ctx.globalAlpha = Math.min(0.5, 0.12 * sboost);
+      ctx.beginPath(); ctx.arc(dbx, dby, swd * 0.16, 0, 6.2831853); ctx.fill();
+      ctx.restore();
+      ctx.globalAlpha = 1;
+    }
+
+    // conveyor balls
+    for (i = 0; i < balls.length; i++) {
+      var bb = balls[i];
+      var bspd = bb.laps * conv.total / LOOP;
+      var bp = convPos(bb.off + bspd * tau);
+      var bx2 = ccx + bp[0] * cax, by2 = ccy + bp[1] * cay;
+      var bq = prox(bx2, by2, t);
+      var blvl = ballLevel(bb, tau) * (1 + 0.5 * bq + 0.7 * show);
+      var brad = u * 0.0085;
+      ctx.fillStyle = BALL;
+      ctx.globalAlpha = Math.min(1, 0.16 * blvl);
+      ctx.beginPath(); ctx.arc(bx2, by2, brad * 2.4, 0, 6.2831853); ctx.fill();
+      ctx.globalAlpha = Math.min(1, 0.60 * blvl);
+      ctx.beginPath(); ctx.arc(bx2, by2, brad, 0, 6.2831853); ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    // seats frame the floor last
+    drawSeats(L, u);
+  }
+
+  // ---------- boot: frame one, then the live loop ----------
+  fit();
+  curT = T0;
+  draw(curT);
+
+  if (typeof requestAnimationFrame !== 'undefined') {
+    var startMs = null;
+    var loop = function (ms) {
+      if (startMs === null) startMs = ms;
+      curT = T0 + (ms - startMs) / 1000;
+      draw(curT);
+      audioUpdate(curT);
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
