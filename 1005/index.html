@@ -1,0 +1,543 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>On Cue, Every Night</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #07080C; height: 100%; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- palette ----------
+  var ROOM = '#07080C', STAGE = '#0E1118', COUNT = '#FFFFFF',
+      STATUS = '#7DF9C6', FAULT = '#FF2B2B';
+  var T0 = 14;                  // frame one: fixed offset, mid-show, tracking mid-fault
+
+  // ---------- seeded rng / noise ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function hash1(n) {
+    n = Math.floor(n);
+    n = (n << 13) ^ n;
+    return 1 - ((n * (n * n * 15731 + 789221) + 1376312589) & 0x7fffffff) / 1073741824;
+  }
+  function vnoise(u) {
+    var i = Math.floor(u), f = u - i, s = f * f * (3 - 2 * f);
+    return hash1(i) * (1 - s) + hash1(i + 1) * s;
+  }
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function lerp(a, b, f) { return a + (b - a) * f; }
+
+  // ---------- lanes ----------
+  // body: fill/border tone. line: waveform stroke tone.
+  // network body is the specced #2B3038; its line uses the derived slate
+  // #4A5060 because #2B3038 as a 1px line is nearly invisible on #07080C.
+  var LANES = [
+    { tag: 'CAMERA',     body: '#4FD6FF', line: '#4FD6FF' },
+    { tag: 'PROJECTION', body: '#7DF9C6', line: '#7DF9C6' },
+    { tag: 'TRACKING',   body: '#FFD93B', line: '#FFD93B' },
+    { tag: 'LIGHT',      body: '#FF4FD8', line: '#FF4FD8' },
+    { tag: 'SOUND',      body: '#8A8D84', line: '#8A8D84' },
+    { tag: 'NETWORK',    body: '#2B3038', line: '#4A5060' }
+  ];
+  var seedBase = 1005166;
+  var P = null;
+  function buildParams(seed) {
+    var r = mulberry32(seed);
+    var p = { ph: [], spd: [] };
+    for (var i = 0; i < 6; i++) { p.ph.push(r() * 6.283); p.spd.push(0.85 + r() * 0.3); }
+    return p;
+  }
+  P = buildParams(seedBase);
+
+  // Fault windows repeat on a 47 s seeded pattern per lane (start, end in
+  // pattern seconds). Tracking's first window covers t = 14 so frame one
+  // catches it mid-fault; every other lane is healthy at t = 14.
+  var FAULTS = [
+    [[21.0, 24.5], [38.0, 40.0]],   // camera: stutter
+    [[29.0, 33.5]],                 // projection: sag
+    [[13.2, 17.7], [33.0, 36.0]],   // tracking: dropped frames
+    [[8.0, 11.0], [41.0, 45.5]],    // light: dim
+    [[18.0, 20.5], [36.5, 39.0]],   // sound: dropouts
+    [[24.0, 29.0], [44.0, 46.5]]    // network: flatline
+  ];
+  var PATTERN = 47;
+
+  // fault factor: 1 healthy, 0 faulted; quick attack, slower recovery.
+  // returns {f, flash} where flash is the red onset flash strength.
+  function faultState(lane, t, extra) {
+    var f = 1, flash = 0;
+    var wins = FAULTS[lane];
+    for (var k = 0; k < wins.length; k++) {
+      var base = Math.floor(t / PATTERN) * PATTERN;
+      for (var rep = -1; rep <= 0; rep++) {
+        var s = base + rep * PATTERN + wins[k][0], e = base + rep * PATTERN + wins[k][1];
+        if (t >= s - 0.15 && t <= e + 0.8) {
+          var g = 1;
+          if (t < s) g = 1;
+          else if (t < s + 0.15) g = 1 - (t - s) / 0.15;
+          else if (t < e) g = 0;
+          else g = (t - e) / 0.8;
+          if (g < f) f = g;
+          if (t >= s && t < s + 1.6) { var fa = Math.exp(-(t - s) * 1.8); if (fa > flash) flash = fa; }
+        }
+      }
+    }
+    // stress windows: extra faults on a 23 s pattern while stressed
+    if (extra && t >= extra.from && t < extra.until) {
+      var ph = (t - extra.from) % 23;
+      if (ph > 5 && ph < 7.2) {
+        var g2 = (ph < 5.15) ? 1 - (ph - 5) / 0.15 : (ph > 6.4 ? (ph - 6.4) / 0.8 : 0);
+        if (g2 < f) f = g2;
+        if (ph < 6.6) { var fb = Math.exp(-(ph - 5) * 1.8); if (fb > flash) flash = fb; }
+      }
+    }
+    return { f: f, flash: flash };
+  }
+
+  // ---------- lane signal model (pure functions of scroll time) ----------
+  function rawVal(lane, s, st) {
+    var ph = P.ph[lane], v;
+    switch (lane) {
+      case 0: // camera: jittery
+        v = 0.55 * vnoise(s * 6 + ph * 9 - st * 2.2) + 0.45 * vnoise(s * 23 - st * 6.5 + ph * 4);
+        break;
+      case 1: // projection: smooth
+        v = 0.68 * Math.sin(s * 3.1 + st * 0.9 + ph) + 0.32 * Math.sin(s * 7.3 - st * 0.5 + ph * 2);
+        break;
+      case 2: // tracking: spiky
+        var n = vnoise(s * 10 - st * 6 + ph * 6);
+        v = (n > 0.42) ? 0.88 : n * 0.55 + 0.18 * vnoise(s * 3 - st * 1.3);
+        break;
+      case 3: // light: slow
+        v = 0.82 * Math.sin(st * 0.45 + s * 1.2 + ph) + 0.18 * Math.sin(st * 0.13 + ph * 3);
+        break;
+      case 4: // sound: dense
+        v = 0.52 * vnoise(s * 30 - st * 8 + ph * 8) + 0.34 * vnoise(s * 61 + st * 5);
+        break;
+      default: // network: sparse packets
+        var b = vnoise(s * 1.6 - st * 0.7 + ph * 5);
+        v = (b > 0.70) ? (b - 0.70) * 3.1 : 0.05 * vnoise(s * 9 + st);
+        break;
+    }
+    return clamp(v, -1, 1);
+  }
+  // value with fault applied: faulted lanes fall toward their failure mode
+  function laneVal(lane, s, st, t, extra) {
+    var fs = faultState(lane, t, extra);
+    var v = rawVal(lane, s, st);
+    if (lane === 0 && fs.f < 1) {
+      // camera stutters: signal freezes at the fault's start frame
+      var stF = st - (1 - fs.f) * 0.9;
+      v = lerp(rawVal(lane, s, stF), v, fs.f);
+    } else if (lane === 3 && fs.f < 1) {
+      v = lerp(-0.72, v, fs.f);           // light sags low, not to zero
+    } else {
+      v = v * fs.f;                        // others drop toward flatline
+    }
+    return v;
+  }
+  function health(lane, t, extra) { return faultState(lane, t, extra).f; }
+
+  // ---------- cue cycle ----------
+  var epoch0 = 0;                    // opening night resets this
+  var perfectUntil = -1;             // faults suppressed while t < perfectUntil
+  function cyclePos(t) {
+    var et = t - epoch0;
+    return ((et % 60) + 60) % 60;
+  }
+  function showsDone(t) {
+    var et = t - epoch0;
+    if (et < 25) return 214;
+    return 214 + Math.floor((et - 25) / 60) + 1;
+  }
+  // scroll time: during the 5 s countdown the lanes lock, so scroll time
+  // crawls (5 s of real time becomes 0.8 s of scroll); 1:1 otherwise.
+  function scrollTime(t) {
+    var et = t - epoch0;
+    var cyc = Math.floor(et / 60), c = et - cyc * 60;
+    var pt = (c < 5) ? c * 0.16 : 0.8 + (c - 5);
+    return cyc * 55.8 + pt;
+  }
+
+  // ---------- interaction state ----------
+  var nowT = T0;
+  var inspectLane = -1, inspectUntil = -1;
+  var stress = [null, null, null, null, null, null];
+  var lastTapT = -10, lastTapX = -1, lastTapY = -1;
+  var downInfo = null;
+
+  // ---------- audio (lazy, guarded) ----------
+  var AC = null, laneGain = [], masterGain = null;
+  function initAudio() {
+    if (AC) return;
+    try {
+      if (typeof AudioContext === 'undefined' && typeof webkitAudioContext === 'undefined') return;
+      var Ctx = (typeof AudioContext !== 'undefined') ? AudioContext : webkitAudioContext;
+      AC = new Ctx();
+      masterGain = AC.createGain(); masterGain.gain.value = 0.0;
+      masterGain.connect(AC.destination);
+      var types = ['sawtooth', 'sine', 'triangle', 'sine', 'sawtooth', 'sine'];
+      var freqs = [180, 220, 440, 110, 90, 880];
+      for (var i = 0; i < 6; i++) {
+        var o = AC.createOscillator(), g = AC.createGain();
+        o.type = types[i]; o.frequency.value = freqs[i]; g.gain.value = 0;
+        o.connect(g); g.connect(masterGain); o.start();
+        laneGain.push(g);
+      }
+    } catch (e) { AC = null; }
+  }
+  function updateAudio(t) {
+    if (!AC || !masterGain) return;
+    try {
+      var c = cyclePos(t);
+      var show = (c >= 5 && c < 25);
+      masterGain.gain.setTargetAtTime(show ? 0.5 : 0.22, AC.currentTime, 0.2);
+      for (var i = 0; i < 6; i++) {
+        var h = (t < perfectUntil) ? 1 : health(i, t, stress[i]);
+        laneGain[i].gain.setTargetAtTime(0.02 * h, AC.currentTime, 0.1);
+      }
+    } catch (e) {}
+  }
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 720, H = 720;
+  function viewportSize() {
+    var w, h;
+    if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.width) {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    } else if (typeof window !== 'undefined' && window.innerWidth) {
+      w = window.innerWidth; h = window.innerHeight;
+    } else { w = W; h = H; }
+    return [Math.round(w), Math.round(h)];
+  }
+  function isPhone() {
+    if (typeof window !== 'undefined' && window.screen && window.screen.width) {
+      return Math.min(window.screen.width, window.screen.height) < 700;
+    }
+    return H > W * 1.15;
+  }
+  function resize() {
+    var s = viewportSize(); W = s[0]; H = s[1];
+    canvas.width = W; canvas.height = H;
+    draw(nowT);
+  }
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', resize);
+    }
+    if (window.addEventListener) window.addEventListener('resize', resize);
+  }
+
+  // ---------- layout ----------
+  function layout() {
+    var phone = isPhone();
+    var pad = phone ? 8 : 16;
+    var statusH = phone ? 16 : 20;
+    var stageH = Math.round((H - statusH) * 0.30);
+    var lanesTop = pad, lanesBot = H - statusH - stageH - pad;
+    var gap = phone ? 5 : 8;
+    var laneH = (lanesBot - lanesTop - gap * 5) / 6;
+    var tagW = phone ? 62 : 92;
+    var lanes = [];
+    for (var i = 0; i < 6; i++) {
+      lanes.push({ x: pad + tagW, y: lanesTop + i * (laneH + gap), w: W - pad * 2 - tagW, h: laneH, tagX: pad });
+    }
+    var stage = { x: pad, y: lanesBot + Math.round(pad * 0.6), w: W - pad * 2, h: stageH - Math.round(pad * 0.6) };
+    return { phone: phone, pad: pad, statusH: statusH, lanes: lanes, stage: stage, tagW: tagW };
+  }
+
+  // ---------- drawing ----------
+  function drawWave(lane, rect, t, big) {
+    var L = layoutCache;
+    var st = scrollTime(t);
+    var ex = (t < perfectUntil) ? null : stress[lane];
+    var steps = Math.max(24, Math.floor(rect.w / (big ? 4 : 5)));
+    ctx.beginPath();
+    for (var i = 0; i <= steps; i++) {
+      var s = i / steps * 6;
+      var v = (t < perfectUntil) ? rawVal(lane, s, st) : laneVal(lane, s, st, t, ex);
+      var x = rect.x + (i / steps) * rect.w;
+      var y = rect.y + rect.h / 2 - v * rect.h * 0.42;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.strokeStyle = LANES[lane].line;
+    ctx.globalAlpha = (lane === 5) ? 0.95 : 0.9;
+    ctx.lineWidth = big ? 2.4 : 1.4;
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  var layoutCache = null;
+
+  function drawLane(lane, rect, t) {
+    var ex = (t < perfectUntil) ? null : stress[lane];
+    var fs = (t < perfectUntil) ? { f: 1, flash: 0 } : faultState(lane, t, ex);
+    // channel body
+    ctx.fillStyle = STAGE;
+    ctx.fillRect(rect.x, rect.y, rect.w, rect.h);
+    ctx.strokeStyle = LANES[lane].body;
+    ctx.globalAlpha = 0.35;
+    ctx.lineWidth = 1;
+    ctx.strokeRect(rect.x + 0.5, rect.y + 0.5, rect.w - 1, rect.h - 1);
+    ctx.globalAlpha = 1;
+    // center hairline
+    ctx.strokeStyle = LANES[lane].body;
+    ctx.globalAlpha = 0.14;
+    ctx.beginPath();
+    ctx.moveTo(rect.x, rect.y + rect.h / 2);
+    ctx.lineTo(rect.x + rect.w, rect.y + rect.h / 2);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    drawWave(lane, rect, t, false);
+    // fault: red onset flash on the left edge, fading
+    if (fs.flash > 0.02) {
+      ctx.fillStyle = FAULT;
+      ctx.globalAlpha = fs.flash * 0.85;
+      ctx.fillRect(rect.x, rect.y, 4, rect.h);
+      ctx.globalAlpha = fs.flash * 0.16;
+      ctx.fillRect(rect.x, rect.y, rect.w, rect.h);
+      ctx.globalAlpha = 1;
+    }
+    // faulted: thin red underline while the fault holds
+    if (fs.f < 0.5) {
+      ctx.fillStyle = FAULT;
+      ctx.globalAlpha = 0.55;
+      ctx.fillRect(rect.x, rect.y + rect.h - 2, rect.w, 2);
+      ctx.globalAlpha = 1;
+    }
+    // tag
+    ctx.fillStyle = LANES[lane].body;
+    ctx.globalAlpha = fs.f < 0.5 ? 0.55 : 0.9;
+    ctx.font = (layoutCache.phone ? 8 : 10) + 'px monospace';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(LANES[lane].tag, layoutCache.pad, rect.y + rect.h / 2);
+    ctx.globalAlpha = 1;
+  }
+
+  function figurePose(t) {
+    // the figure is drawn FROM the six lane values at time t
+    var st = scrollTime(t);
+    var ex = function (i) { return (t < perfectUntil) ? null : stress[i]; };
+    var hv = function (i) { return (t < perfectUntil) ? 1 : health(i, t, ex(i)); };
+    var cam = (t < perfectUntil) ? rawVal(0, 3, st) : laneVal(0, 3, st, t, ex(0));
+    var pro = (t < perfectUntil) ? rawVal(1, 3, st) : laneVal(1, 3, st, t, ex(1));
+    var trk = (t < perfectUntil) ? rawVal(2, 3, st) : laneVal(2, 3, st, t, ex(2));
+    var lit = (t < perfectUntil) ? rawVal(3, 3, st) : laneVal(3, 3, st, t, ex(3));
+    var snd = (t < perfectUntil) ? rawVal(4, 3, st) : laneVal(4, 3, st, t, ex(4));
+    var netH = hv(5);
+    var healthy = 0;
+    for (var i = 0; i < 6; i++) if (hv(i) > 0.5) healthy++;
+    return {
+      cam: cam, pro: pro, trk: trk, lit: lit, snd: snd,
+      netH: netH, healthy: healthy,
+      flicker: (netH < 0.5) ? (hash1(Math.floor(t * 24)) > 0.1 ? 0.25 : 1) : 1
+    };
+  }
+
+  function drawFigure(rect, t, inShow) {
+    var c = cyclePos(t);
+    var showT = inShow ? (c - 5) : 0;
+    var cx = rect.x + rect.w / 2, baseY = rect.y + rect.h * 0.78;
+    var scale = rect.h / 150;
+    // trail: past root positions, density from the sound lane
+    var p0 = figurePose(t);
+    var trailN = Math.round(3 + (p0.snd * 0.5 + 0.5) * 13 * (health(4, t, stress[4]) > 0.5 ? 1 : 0.25));
+    ctx.fillStyle = LANES[1].line;
+    for (var k = trailN; k >= 1; k--) {
+      var pk = figurePose(t - k * 0.14);
+      var tx = cx + pk.trk * rect.w * 0.30 + Math.sin(showT * 0.7 + k * 0.4) * 2;
+      var ty = baseY - 26 * scale + pk.cam * 7 * scale;
+      ctx.globalAlpha = 0.05 + 0.10 * (1 - k / (trailN + 1));
+      ctx.beginPath(); ctx.arc(tx, ty, 2.1 * scale, 0, 6.283); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    var px = cx + p0.trk * rect.w * 0.30;
+    var py = baseY - 26 * scale + p0.cam * 7 * scale;
+    var dim = inShow ? 1 : 0.38;
+    var alpha = dim * p0.flicker;
+    // glow: layered flat alpha, size from the light lane
+    var glowR = (9 + (p0.lit * 0.5 + 0.5) * 24) * scale * (inShow ? 1 : 0.6);
+    ctx.fillStyle = LANES[3].line;
+    var layers = [0.05, 0.09, 0.15];
+    for (var g = 0; g < 3; g++) {
+      ctx.globalAlpha = layers[g] * alpha;
+      ctx.beginPath(); ctx.arc(px, py, glowR * (1.5 - g * 0.28), 0, 6.283); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    // body: complexity follows the number of healthy lanes
+    var bodyCol = (health(1, t, stress[1]) > 0.5) ? LANES[1].line : '#8A8D84';
+    var headCol = (health(0, t, stress[0]) > 0.5) ? LANES[0].line : '#8A8D84';
+    ctx.globalAlpha = alpha;
+    if (p0.healthy <= 2) {
+      // starved figure: a point and a stem, still on cue
+      ctx.strokeStyle = bodyCol; ctx.lineWidth = 2 * scale;
+      ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(px, baseY); ctx.stroke();
+      ctx.fillStyle = headCol;
+      ctx.beginPath(); ctx.arc(px, py - 4 * scale, 3.4 * scale, 0, 6.283); ctx.fill();
+    } else {
+      var sw = Math.sin(showT * 1.7) * (inShow ? 1 : 0.3);
+      var hipY = py + 12 * scale, shY = py - 2 * scale;
+      ctx.strokeStyle = bodyCol; ctx.lineWidth = 2.2 * scale;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(px, shY); ctx.lineTo(px, hipY);                       // spine
+      ctx.moveTo(px, shY + 2 * scale);                                 // arms from camera/projection
+      ctx.lineTo(px - (10 + p0.cam * 5) * scale, shY + (7 + sw * 3) * scale);
+      ctx.moveTo(px, shY + 2 * scale);
+      ctx.lineTo(px + (10 + p0.pro * 5) * scale, shY + (7 - sw * 3) * scale);
+      ctx.moveTo(px, hipY);                                            // legs from tracking
+      ctx.lineTo(px - (7 + p0.trk * 4) * scale, baseY);
+      ctx.moveTo(px, hipY);
+      ctx.lineTo(px + (7 - p0.trk * 4) * scale, baseY);
+      ctx.stroke();
+      ctx.fillStyle = headCol;
+      ctx.beginPath(); ctx.arc(px, py - 8 * scale, 4 * scale, 0, 6.283); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawStage(rect, t) {
+    var c = cyclePos(t);
+    var inShow = (c >= 5 && c < 25);
+    var counting = (c < 5);
+    ctx.fillStyle = STAGE;
+    ctx.fillRect(rect.x, rect.y, rect.w, rect.h);
+    ctx.strokeStyle = '#3A3D46';
+    ctx.globalAlpha = 0.6;
+    ctx.strokeRect(rect.x + 0.5, rect.y + 0.5, rect.w - 1, rect.h - 1);
+    ctx.globalAlpha = 1;
+    drawFigure(rect, t, inShow);
+    if (counting) {
+      var n = 5 - Math.floor(c);
+      ctx.fillStyle = COUNT;
+      ctx.globalAlpha = 0.95;
+      ctx.font = 'bold ' + Math.round(rect.h * 0.42) + 'px monospace';
+      ctx.textBaseline = 'top';
+      ctx.fillText('' + n, rect.x + rect.w - Math.round(rect.h * 0.34), rect.y + 8);
+      ctx.globalAlpha = 1;
+    }
+    if (inShow) {
+      ctx.strokeStyle = STATUS;
+      ctx.globalAlpha = 0.25;
+      ctx.strokeRect(rect.x + 2.5, rect.y + 2.5, rect.w - 5, rect.h - 5);
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function draw(t) {
+    nowT = t;
+    var L = layout(); layoutCache = L;
+    ctx.fillStyle = ROOM;
+    ctx.fillRect(0, 0, W, H);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    if (inspectLane >= 0 && t < inspectUntil) {
+      var big = { x: L.pad, y: L.pad, w: W - L.pad * 2, h: H - L.statusH - L.pad * 2 };
+      ctx.fillStyle = STAGE; ctx.fillRect(big.x, big.y, big.w, big.h);
+      ctx.strokeStyle = LANES[inspectLane].body; ctx.globalAlpha = 0.4;
+      ctx.strokeRect(big.x + 0.5, big.y + 0.5, big.w - 1, big.h - 1);
+      ctx.globalAlpha = 1;
+      drawWave(inspectLane, big, t, true);
+      ctx.fillStyle = LANES[inspectLane].body;
+      ctx.font = (L.phone ? 10 : 12) + 'px monospace';
+      ctx.textBaseline = 'top';
+      ctx.fillText(LANES[inspectLane].tag, big.x + 10, big.y + 8);
+    } else {
+      for (var i = 0; i < 6; i++) drawLane(i, L.lanes[i], t);
+      drawStage(L.stage, t);
+    }
+    // status line: the truth of the sim
+    var n = showsDone(t);
+    ctx.fillStyle = STATUS;
+    ctx.globalAlpha = 0.95;
+    ctx.font = (L.phone ? 9 : 11) + 'px monospace';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillText('SHOW ' + n + '/' + n + '. ON CUE.', L.pad, H - 5);
+    ctx.globalAlpha = 1;
+    updateAudio(t);
+  }
+
+  // ---------- pointer ----------
+  function laneAt(x, y) {
+    var L = layout();
+    for (var i = 0; i < 6; i++) {
+      var r = L.lanes[i];
+      if (x >= L.pad && x < W - L.pad && y >= r.y && y < r.y + r.h) return i;
+    }
+    return -1;
+  }
+  function evtPos(e) {
+    var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    return [e.clientX - r.left, e.clientY - r.top];
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', function (e) {
+      initAudio();
+      var p = evtPos(e);
+      downInfo = { x: p[0], y: p[1], t: nowT, lane: laneAt(p[0], p[1]), dragged: false };
+    });
+    canvas.addEventListener('pointermove', function (e) {
+      if (!downInfo) return;
+      var p = evtPos(e);
+      if (Math.abs(p[0] - downInfo.x) + Math.abs(p[1] - downInfo.y) > 10) {
+        if (!downInfo.dragged && downInfo.lane >= 0) {
+          // drag on a lane: stress it for 30 s
+          stress[downInfo.lane] = { from: nowT, until: nowT + 30 };
+        }
+        downInfo.dragged = true;
+      }
+    });
+    canvas.addEventListener('pointerup', function (e) {
+      if (!downInfo) return;
+      var wasDrag = downInfo.dragged;
+      var lane = downInfo.lane;
+      downInfo = null;
+      if (wasDrag) return;
+      // tap
+      if (nowT - lastTapT < 0.35) {
+        // double-tap: opening night
+        epoch0 = nowT;
+        perfectUntil = nowT + 25;
+        inspectLane = -1;
+        for (var i = 0; i < 6; i++) stress[i] = null;
+        lastTapT = -10;
+        return;
+      }
+      lastTapT = nowT;
+      if (lane >= 0) { inspectLane = lane; inspectUntil = nowT + 10; }
+    });
+  }
+
+  // ---------- run ----------
+  var s0 = viewportSize(); W = s0[0]; H = s0[1];
+  canvas.width = W; canvas.height = H;
+  draw(T0);                                    // frame one: fixed phase, synchronous
+  if (typeof requestAnimationFrame === 'function') {
+    var startTs = null;
+    var loop = function (ts) {
+      if (startTs === null) startTs = ts;
+      draw(T0 + (ts - startTs) / 1000);
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>

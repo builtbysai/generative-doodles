@@ -1,0 +1,902 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>System, Not Picture</title>
+<style>
+  html, body { margin:0; padding:0; background:#07080C; height:100%; overflow:hidden; }
+  canvas { display:block; touch-action:none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // No.1007 "System, Not Picture" - study #123 yuya-hanai, PP168 "The Credit
+  // Line": the system shown instead of the image. Left, four live input feeds
+  // (CAMERA / TRACK / DATA / MIC). Center, the machine: four chunky blocks
+  // (SENSE / DETECT / RENDER / OUTPUT) that pulse as data passes through.
+  // Right, the image the system renders - a figure moving through light,
+  // deliberately subordinate: the system column is taller than the picture.
+  // Mint packets travel the flow lines constantly, so the plumbing is never
+  // hidden: feeds enter at SENSE by default, packets walk the blocks in
+  // order, and the figure's phrase advances only when packets arrive at
+  // OUTPUT. Drag a feed onto another block to reroute it; the image changes
+  // character because its feed now skips stages. Tap a block to open it.
+  // Double-tap rebuilds. Everything is a closed-form function of piece time
+  // plus recorded visitor events. Frame one is the synchronous draw at
+  // T0 = 13 s. The MIC feed is simulated data; no microphone is ever used.
+
+  var T0 = 13;
+  var BASE_SEED = 1007168;
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  var ROOM = '#07080C', PANEL = '#14161C', IMG_BG = '#0E1118',
+      EDGE = '#3A3D46', FLOW = '#2B3038', ACTIVE = '#4FD6FF',
+      PULSE = '#7DF9C6', TAG = '#8A8D84', INK = '#F2F4F6',
+      MAGENTA = '#FF4FD8', YELLOW = '#FFD93B', RED = '#FF2B2B',
+      OVERLAY = '#0A0C10';
+  var ACCENTS = ['#4FD6FF', '#FF4FD8', '#7DF9C6', '#FFD93B'];
+
+  var FEED_TAGS = ['CAMERA', 'TRACK', 'DATA', 'MIC'];
+  var BLOCK_TAGS = ['SENSE', 'DETECT', 'RENDER', 'OUTPUT'];
+  // spawn schedules per feed (epoch-local seconds)
+  var FEEDS = [
+    { period: 3.63, phase: 0.83 },
+    { period: 2.90, phase: 1.35 },
+    { period: 4.10, phase: 0.20 },
+    { period: 3.70, phase: 2.60 }
+  ];
+
+  // ---------- deterministic helpers ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  function ihash(n) {
+    var x = Math.imul((n | 0) ^ 0x9E3779B9, 0x85EBCA6B);
+    x ^= x >>> 13; x = Math.imul(x, 0xC2B2AE35); x ^= x >>> 16;
+    return (x >>> 0) / 4294967296;
+  }
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function lerp(a, b, f) { return a + (b - a) * f; }
+  function sstep01(x) { x = clamp(x, 0, 1); return x * x * x * (x * (x * 6 - 15) + 10); }
+  var TAU = Math.PI * 2;
+
+  // ---------- visitor event state (recorded, never integrated) ----------
+  var resets = [];       // absolute piece times of double-tap rebuilds
+  var reroutes = [];     // { t, feed, block } entry-block changes
+  var opens = [];        // { t, block } block openings (10 s each)
+  var pendingTap = null; // block tap waiting out the double-tap window
+  var lastTap = null;
+  var pDown = null;
+  var dragState = { active: false, feed: -1, x: 0, y: 0 };
+  var lastLayout = null;
+  var viewW = 0, viewH = 0, startStamp = null;
+
+  function epochIndexAt(t) {
+    var n = 0;
+    for (var i = 0; i < resets.length; i++) if (resets[i] <= t) n++;
+    return n;
+  }
+  function epochStartAt(t) {
+    var s = 0;
+    for (var i = 0; i < resets.length; i++) if (resets[i] <= t) s = resets[i];
+    return s;
+  }
+  function entryAtAbs(feed, absT) {
+    var epS = epochStartAt(absT), e = 0;
+    for (var i = 0; i < reroutes.length; i++) {
+      var ev = reroutes[i];
+      if (ev.feed === feed && ev.t >= epS && ev.t <= absT) e = ev.block;
+    }
+    return e;
+  }
+  function openAt(t) {
+    var o = null;
+    for (var i = 0; i < opens.length; i++) if (opens[i].t <= t) o = opens[i];
+    if (o && t < o.t + 10) return o;
+    return null;
+  }
+  function commitPending(t) {
+    if (pendingTap && t > pendingTap.t + 0.35) {
+      opens.push({ t: pendingTap.t, block: pendingTap.block });
+      pendingTap = null;
+    }
+  }
+
+  // ---------- layout ----------
+  function computeLayout(w, h) {
+    var phone = false, sw = 0, sh = 0;
+    try { sw = window.screen.width; sh = window.screen.height; } catch (e) {}
+    var mind = Math.min(sw, sh);
+    phone = mind > 0 ? (mind < 700) : (h > w * 1.15);
+    var feeds = [], blocks = [], i;
+    for (i = 0; i < 4; i++) {
+      feeds.push({
+        x: 0.028 * w, y: (0.035 + i * 0.172) * h,
+        w: 0.234 * w, h: 0.148 * h
+      });
+      feeds[i].cx = feeds[i].x + feeds[i].w / 2;
+      feeds[i].cy = feeds[i].y + feeds[i].h / 2;
+      blocks.push({
+        x: 0.322 * w, y: (0.035 + i * 0.224) * h,
+        w: 0.230 * w, h: 0.192 * h
+      });
+      blocks[i].cx = blocks[i].x + blocks[i].w / 2;
+      blocks[i].cy = blocks[i].y + blocks[i].h / 2;
+    }
+    var img = { x: 0.612 * w, y: 0.100 * h, w: 0.360 * w, h: 0.760 * h };
+    img.cx = img.x + img.w / 2; img.cy = img.y + img.h / 2;
+    return {
+      w: w, h: h, phone: phone, U: Math.min(w, h),
+      feeds: feeds, blocks: blocks, img: img,
+      midX: 0.292 * w, imgMidX: 0.582 * w,
+      fs: clamp(Math.round(Math.min(w, h) * 0.021), 8, 12)
+    };
+  }
+
+  // ---------- the four feeds: seeded live generators ----------
+  function camBlobs(lt, ep) {
+    var out = [], i;
+    for (i = 0; i < 5; i++) {
+      var s1 = 0.11 + ihash(ep * 41 + i * 7 + 1) * 0.10;
+      var s2 = 0.07 + ihash(ep * 43 + i * 7 + 2) * 0.09;
+      out.push({
+        nx: 0.5 + 0.30 * Math.sin(lt * TAU * s1 + ihash(ep * 3 + i * 11) * TAU),
+        ny: 0.5 + 0.30 * Math.cos(lt * TAU * s2 + ihash(ep * 5 + i * 13) * TAU),
+        r: 0.17 + 0.11 * Math.sin(lt * TAU * (0.05 + ihash(i * 3 + ep) * 0.06) + i * 1.7),
+        col: ACCENTS[(i + ep) % 4]
+      });
+    }
+    return out;
+  }
+  function camAccent(lt, ep) {
+    var bs = camBlobs(lt, ep), best = bs[0];
+    for (var i = 1; i < bs.length; i++) if (bs[i].r > best.r) best = bs[i];
+    return best.col;
+  }
+  function trackDots(lt, ep) {
+    var out = [], i;
+    for (i = 0; i < 4; i++) {
+      var a = 0.16 + ihash(ep * 17 + i * 5 + 1) * 0.14;
+      var b = 0.13 + ihash(ep * 19 + i * 5 + 2) * 0.15;
+      out.push({
+        nx: Math.sin(lt * TAU * a + ihash(ep * 7 + i * 3) * TAU),
+        ny: Math.sin(lt * TAU * b + ihash(ep * 9 + i * 3 + 1) * TAU)
+      });
+    }
+    return out;
+  }
+  function trackPose(lt, ep) { return trackDots(lt, ep)[0]; }
+  function micY(x01, lt, ep) {
+    var env = 0.62 + 0.38 * Math.sin(lt * TAU / 6.3 + ep * 1.3);
+    return env * (0.58 * Math.sin(x01 * 9 - lt * 3.1 + ep) +
+                  0.30 * Math.sin(x01 * 23 - lt * 7.3 + 1.7 + ep * 2.0) +
+                  0.12 * Math.sin(x01 * 41 + lt * 11.0));
+  }
+
+  // ---------- packet paths ----------
+  // A packet's path is fixed at spawn by the feed's entry block at that
+  // moment: feed edge -> entry block center -> down through the remaining
+  // block centers -> out of OUTPUT -> into the image frame.
+  function buildPath(L, feed, entry) {
+    var f = L.feeds[feed], pts = [], centers = {}, cum = [0], i, j;
+    function push(x, y) {
+      var n = pts.length;
+      if (n && Math.abs(pts[n - 1][0] - x) < 0.01 && Math.abs(pts[n - 1][1] - y) < 0.01) return;
+      pts.push([x, y]);
+      if (n) {
+        var dx = x - pts[n - 1][0], dy = y - pts[n - 1][1];
+        cum.push(cum[cum.length - 1] + Math.sqrt(dx * dx + dy * dy));
+      }
+    }
+    push(f.x + f.w, f.cy);
+    push(L.midX, f.cy);
+    push(L.midX, L.blocks[entry].cy);
+    push(L.blocks[entry].x, L.blocks[entry].cy);
+    push(L.blocks[entry].cx, L.blocks[entry].cy);
+    centers[entry] = cum[cum.length - 1];
+    for (j = entry + 1; j < 4; j++) {
+      push(L.blocks[j].cx, L.blocks[j].cy);
+      centers[j] = cum[cum.length - 1];
+    }
+    push(L.blocks[3].x + L.blocks[3].w, L.blocks[3].cy);
+    push(L.imgMidX, L.blocks[3].cy);
+    push(L.imgMidX, L.img.cy);
+    push(L.img.x, L.img.cy);
+    return { pts: pts, cum: cum, total: cum[cum.length - 1], centers: centers };
+  }
+  function pathPos(path, d) {
+    var pts = path.pts, cum = path.cum, i;
+    if (d <= 0) return { x: pts[0][0], y: pts[0][1] };
+    for (i = 1; i < cum.length; i++) {
+      if (d <= cum[i]) {
+        var f = (d - cum[i - 1]) / Math.max(0.001, cum[i] - cum[i - 1]);
+        return { x: lerp(pts[i - 1][0], pts[i][0], f), y: lerp(pts[i - 1][1], pts[i][1], f) };
+      }
+    }
+    return { x: pts[pts.length - 1][0], y: pts[pts.length - 1][1] };
+  }
+  var pathCache = {};
+  function pathFor(L, feed, entry) {
+    var key = feed + ':' + entry + ':' + L.w + 'x' + L.h;
+    if (!pathCache[key]) pathCache[key] = buildPath(L, feed, entry);
+    return pathCache[key];
+  }
+
+  // alive packets at epoch-local time lt (spawn abs = epStart + s)
+  function alivePackets(L, lt, epStart) {
+    var spd = 0.205 * L.U, out = [], f, k;
+    for (f = 0; f < 4; f++) {
+      var per = FEEDS[f].period, pha = FEEDS[f].phase;
+      var kMin = Math.max(0, Math.floor((lt - 14 - pha) / per));
+      var kMax = Math.floor((lt - pha) / per);
+      for (k = kMin; k <= kMax; k++) {
+        var s = pha + k * per;
+        if (s > lt) continue;
+        var entry = entryAtAbs(f, epStart + s);
+        var path = pathFor(L, f, entry);
+        var d = (lt - s) * spd;
+        if (d > path.total) continue;
+        out.push({ feed: f, k: k, entry: entry, path: path, d: d, spawn: s });
+      }
+    }
+    return out;
+  }
+  function spawnsCount(lt) {
+    var n = 0, f;
+    for (f = 0; f < 4; f++) {
+      if (lt >= FEEDS[f].phase) n += Math.floor((lt - FEEDS[f].phase) / FEEDS[f].period) + 1;
+    }
+    return n;
+  }
+  // OUTPUT arrivals: closed-form over spawn schedules grouped by entry
+  // segments (reroutes within the epoch split a feed's spawns by entry).
+  function arrivalsInfo(L, lt, ep, epStart) {
+    var spd = 0.205 * L.U, count = 0, times = [], f, i;
+    for (f = 0; f < 4; f++) {
+      var cuts = [0];
+      for (i = 0; i < reroutes.length; i++) {
+        var ev = reroutes[i];
+        if (ev.feed === f && ev.t > epStart && ev.t < epStart + lt) cuts.push(ev.t - epStart);
+      }
+      cuts.push(lt + 20);
+      cuts.sort(function (a, b) { return a - b; });
+      for (i = 0; i + 1 < cuts.length; i++) {
+        var segA = cuts[i], segB = Math.min(cuts[i + 1], lt);
+        var entry = entryAtAbs(f, epStart + segA + 0.001);
+        var travel = pathFor(L, f, entry).total / spd;
+        var per = FEEDS[f].period, pha = FEEDS[f].phase;
+        var k0 = Math.max(0, Math.ceil((segA - pha) / per - 1e-9));
+        var k1 = Math.floor((segB - pha) / per + 1e-9);
+        for (var k = k0; k <= k1; k++) {
+          var arr = pha + k * per + travel;
+          if (arr <= lt) { count++; if (arr > lt - 16) times.push(arr); }
+          else if (arr < lt + 16) times.push(arr);
+        }
+      }
+    }
+    times.sort(function (a, b) { return a - b; });
+    var last = -1;
+    for (i = 0; i < times.length; i++) if (times[i] <= lt) last = times[i];
+    return { count: count, last: last };
+  }
+
+  // ---------- the image's figure: phrase fed by OUTPUT arrivals ----------
+  function figurePhase(L, lt, ep, epStart) {
+    var info = arrivalsInfo(L, lt, ep, epStart);
+    if (info.count === 0 || info.last < 0) return { ph: 0.35 * Math.sin(lt * 0.5), arr: 0 };
+    var u = lt - info.last;
+    var ph = (info.count - 1) * 0.85 + 0.85 * (1 - Math.exp(-u * 2.0));
+    return { ph: ph, arr: info.count };
+  }
+  function limb(x, y, ang, len) { return { x: x + Math.cos(ang) * len, y: y + Math.sin(ang) * len }; }
+  // joints in px inside rect R (the image frame or an enlarged stage)
+  function figureJoints(R, ph, tnx, tny) {
+    var s = Math.min(R.h, R.w * 2.2), cx = R.x + R.w / 2, groundY = R.y + R.h * 0.86;
+    var lean = tnx * 0.18 + 0.06 * Math.sin(ph * 0.5);
+    var hip = { x: cx + tnx * R.w * 0.10 + Math.sin(ph * 0.5) * s * 0.02,
+                y: groundY - s * 0.34 + Math.sin(ph * 2) * s * 0.012 };
+    var chest = { x: hip.x + Math.sin(lean) * s * 0.27, y: hip.y - Math.cos(lean) * s * 0.27 };
+    var head = { x: chest.x + Math.sin(lean * 1.4 + tnx * 0.12) * s * 0.105,
+                 y: chest.y - Math.cos(lean * 1.2) * s * 0.105 };
+    var aL = Math.PI / 2 + 1.12 + 0.45 * Math.sin(ph * 0.5 + 1.0);
+    var aR = Math.PI / 2 - 1.12 + 0.45 * Math.sin(ph * 0.5 + 2.4) + tny * 0.45;
+    var elL = limb(chest.x, chest.y, aL, s * 0.185);
+    var haL = limb(elL.x, elL.y, aL - 0.55 - 0.2 * Math.sin(ph), s * 0.165);
+    var elR = limb(chest.x, chest.y, aR, s * 0.185);
+    var haR = limb(elR.x, elR.y, aR + 0.55 + 0.2 * Math.cos(ph * 0.8), s * 0.165);
+    var gL = Math.PI / 2 + 0.34 * Math.sin(ph) + lean * 0.5;
+    var gR = Math.PI / 2 + 0.34 * Math.sin(ph + Math.PI) + lean * 0.5;
+    var knL = limb(hip.x, hip.y, gL, s * 0.175);
+    var ftL = limb(knL.x, knL.y, gL - (0.28 + 0.32 * Math.max(0, Math.sin(ph + 0.7))), s * 0.165);
+    var knR = limb(hip.x, hip.y, gR, s * 0.175);
+    var ftR = limb(knR.x, knR.y, gR - (0.28 + 0.32 * Math.max(0, Math.sin(ph + Math.PI + 0.7))), s * 0.165);
+    return { hip: hip, chest: chest, head: head, headR: s * 0.046,
+             elL: elL, haL: haL, elR: elR, haR: haR,
+             knL: knL, ftL: ftL, knR: knR, ftR: ftR };
+  }
+  function strokePts(pts) {
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (var i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+    ctx.stroke();
+  }
+  function drawFigure(R, ph, tnx, tny, accent, colored, lwScale) {
+    var J = figureJoints(R, ph, tnx, tny);
+    var lw = Math.max(2, Math.min(R.h, R.w * 2.2) * 0.011) * (lwScale || 1);
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    ctx.strokeStyle = INK; ctx.lineWidth = lw; ctx.globalAlpha = 1;
+    strokePts([J.hip, J.knL, J.ftL]);
+    strokePts([J.hip, J.knR, J.ftR]);
+    strokePts([J.hip, J.chest]);
+    strokePts([J.chest, J.elL, J.haL]);
+    if (colored) { ctx.strokeStyle = accent; }
+    strokePts([J.chest, J.elR, J.haR]);
+    ctx.strokeStyle = INK;
+    ctx.beginPath(); ctx.arc(J.head.x, J.head.y, J.headR, 0, TAU); ctx.stroke();
+    if (colored) {
+      ctx.fillStyle = accent;
+      ctx.beginPath(); ctx.arc(J.head.x, J.head.y, J.headR * 0.45, 0, TAU); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    return J;
+  }
+  function drawPool(R, fx, accent, alphaMul) {
+    var gy = R.y + R.h * 0.865;
+    ctx.globalAlpha = 0.10 * alphaMul; ctx.fillStyle = accent;
+    ctx.beginPath(); ctx.ellipse(fx, gy, R.w * 0.30, R.h * 0.045, 0, 0, TAU); ctx.fill();
+    ctx.globalAlpha = 0.10 * alphaMul; ctx.fillStyle = INK;
+    ctx.beginPath(); ctx.ellipse(fx, gy, R.w * 0.17, R.h * 0.026, 0, 0, TAU); ctx.fill();
+    ctx.globalAlpha = 0.25 * alphaMul; ctx.strokeStyle = '#2BD8FF'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.ellipse(fx, gy, R.w * 0.30, R.h * 0.045, 0, 0, TAU); ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- drawing: feeds, blocks, image ----------
+  function panel(r) {
+    ctx.fillStyle = PANEL; ctx.fillRect(r.x, r.y, r.w, r.h);
+    ctx.strokeStyle = EDGE; ctx.lineWidth = 1; ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1);
+  }
+  function tag(txt, x, y, fs, col) {
+    ctx.fillStyle = col || TAG;
+    ctx.font = fs + 'px monospace';
+    ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+    ctx.fillText(txt, x, y);
+  }
+  function contentRect(r, L) { return { x: r.x + 5, y: r.y + L.fs + 10, w: r.w - 10, h: r.h - L.fs - 15 }; }
+
+  function drawFeedContent(f, r, lt, ep, L) {
+    var cr = contentRect(r, L), i;
+    ctx.save();
+    ctx.beginPath(); ctx.rect(cr.x, cr.y, cr.w, cr.h); ctx.clip();
+    if (f === 0) { // CAMERA: drifting soft blobs, layered flat alpha
+      var bs = camBlobs(lt, ep);
+      for (i = 0; i < bs.length; i++) {
+        var b = bs[i], bx = cr.x + b.nx * cr.w, by = cr.y + b.ny * cr.h, br = b.r * cr.h;
+        ctx.fillStyle = b.col;
+        ctx.globalAlpha = 0.10; ctx.beginPath(); ctx.arc(bx, by, br, 0, TAU); ctx.fill();
+        ctx.globalAlpha = 0.16; ctx.beginPath(); ctx.arc(bx, by, br * 0.65, 0, TAU); ctx.fill();
+        ctx.globalAlpha = 0.35; ctx.beginPath(); ctx.arc(bx, by, br * 0.35, 0, TAU); ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+    } else if (f === 1) { // TRACK: dots on a faint grid, with short trails
+      ctx.strokeStyle = FLOW; ctx.lineWidth = 1; ctx.globalAlpha = 0.7;
+      ctx.beginPath();
+      for (i = 1; i < 4; i++) { ctx.moveTo(cr.x + cr.w * i / 4, cr.y); ctx.lineTo(cr.x + cr.w * i / 4, cr.y + cr.h); }
+      for (i = 1; i < 3; i++) { ctx.moveTo(cr.x, cr.y + cr.h * i / 3); ctx.lineTo(cr.x + cr.w, cr.y + cr.h * i / 3); }
+      ctx.stroke(); ctx.globalAlpha = 1;
+      var ds = trackDots(lt, ep), tr, k;
+      for (i = 0; i < ds.length; i++) {
+        for (k = 3; k >= 1; k--) {
+          tr = trackDots(lt - k * 0.14, ep)[i];
+          ctx.fillStyle = ACTIVE; ctx.globalAlpha = 0.10 * (4 - k);
+          ctx.beginPath(); ctx.arc(cr.x + (tr.nx * 0.5 + 0.5) * cr.w, cr.y + (tr.ny * 0.5 + 0.5) * cr.h, 2, 0, TAU); ctx.fill();
+        }
+        ctx.fillStyle = ACTIVE; ctx.globalAlpha = 1;
+        ctx.beginPath(); ctx.arc(cr.x + (ds[i].nx * 0.5 + 0.5) * cr.w, cr.y + (ds[i].ny * 0.5 + 0.5) * cr.h, 2.6, 0, TAU); ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+    } else if (f === 2) { // DATA: scrolling tick stream
+      var bw = 3, gap = 6, off = (lt * 36) % gap, base = Math.floor(lt * 6);
+      for (i = -1; i * gap < cr.w + gap; i++) {
+        var wc = base + i;
+        var hh = (0.18 + 0.78 * ihash(wc * 7 + ep * 131)) * cr.h;
+        ctx.fillStyle = (wc % 9 === 0) ? PULSE : TAG;
+        ctx.globalAlpha = (wc % 9 === 0) ? 0.9 : 0.55;
+        ctx.fillRect(cr.x + i * gap - off, cr.y + cr.h - hh, bw, hh);
+      }
+      ctx.globalAlpha = 1;
+    } else { // MIC: a live waveform (simulated, never a microphone)
+      ctx.strokeStyle = TAG; ctx.lineWidth = 1.4; ctx.beginPath();
+      var N = 40;
+      for (i = 0; i <= N; i++) {
+        var x01 = i / N;
+        var px = cr.x + x01 * cr.w;
+        var py = cr.y + cr.h / 2 + micY(x01, lt, ep) * cr.h * 0.34;
+        if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+      }
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function blockGlyph(j, r, lt, ep) {
+    var cx = r.x + r.w / 2, cy = r.y + r.h * 0.60, u = Math.min(r.w, r.h);
+    ctx.lineWidth = 1.2;
+    if (j === 0) {
+      var cols = [ACCENTS[0], ACCENTS[1], ACCENTS[2]];
+      for (var i = 0; i < 3; i++) {
+        ctx.fillStyle = cols[i]; ctx.globalAlpha = 0.75;
+        ctx.beginPath(); ctx.arc(cx + (i - 1) * u * 0.16, cy + Math.sin(lt * 1.3 + i * 2.1) * u * 0.03, u * 0.045, 0, TAU); ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+    } else if (j === 1) {
+      ctx.strokeStyle = ACTIVE; ctx.globalAlpha = 0.9;
+      var bw = u * 0.15;
+      ctx.strokeRect(cx - bw / 2, cy - bw / 2, bw, bw);
+      ctx.fillStyle = ACTIVE; ctx.beginPath(); ctx.arc(cx, cy, 2.2, 0, TAU); ctx.fill();
+      ctx.globalAlpha = 1;
+    } else if (j === 2) {
+      ctx.strokeStyle = INK; ctx.globalAlpha = 0.85;
+      ctx.beginPath();
+      ctx.moveTo(cx, cy - u * 0.11); ctx.lineTo(cx + u * 0.12, cy + u * 0.09); ctx.lineTo(cx - u * 0.12, cy + u * 0.09);
+      ctx.closePath(); ctx.stroke();
+      ctx.fillStyle = PULSE;
+      var vs = [[0, -0.11], [0.12, 0.09], [-0.12, 0.09]];
+      for (var q = 0; q < 3; q++) { ctx.beginPath(); ctx.arc(cx + vs[q][0] * u, cy + vs[q][1] * u, 1.8, 0, TAU); ctx.fill(); }
+      ctx.globalAlpha = 1;
+    } else {
+      ctx.fillStyle = IMG_BG; ctx.fillRect(cx - u * 0.13, cy - u * 0.10, u * 0.26, u * 0.20);
+      ctx.strokeStyle = EDGE; ctx.strokeRect(cx - u * 0.13, cy - u * 0.10, u * 0.26, u * 0.20);
+      ctx.fillStyle = INK; ctx.beginPath(); ctx.arc(cx, cy + u * 0.01, u * 0.028, 0, TAU); ctx.fill();
+      ctx.strokeStyle = INK; ctx.lineWidth = 1.2;
+      ctx.beginPath(); ctx.moveTo(cx, cy + u * 0.04); ctx.lineTo(cx, cy + u * 0.085); ctx.stroke();
+    }
+  }
+
+  function drawBlock(j, r, glow, L, lt, ep) {
+    ctx.fillStyle = PANEL; ctx.fillRect(r.x, r.y, r.w, r.h);
+    ctx.fillStyle = '#0A0C10'; ctx.fillRect(r.x, r.y, r.w, 5);
+    if (glow > 0.01) {
+      ctx.fillStyle = ACTIVE; ctx.globalAlpha = 0.08 * glow;
+      ctx.fillRect(r.x, r.y, r.w, r.h); ctx.globalAlpha = 1;
+    }
+    ctx.strokeStyle = EDGE; ctx.lineWidth = 1.5;
+    ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1);
+    if (glow > 0.01) {
+      ctx.strokeStyle = ACTIVE; ctx.globalAlpha = glow; ctx.lineWidth = 2.2;
+      ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1); ctx.globalAlpha = 1;
+    }
+    tag(BLOCK_TAGS[j], r.x + 8, r.y + 8, L.fs, glow > 0.3 ? ACTIVE : TAG);
+    // status LED: mint while a packet is inside this block
+    ctx.fillStyle = glow > 0.25 ? PULSE : FLOW;
+    ctx.beginPath(); ctx.arc(r.x + r.w - 12, r.y + 12, 3, 0, TAU); ctx.fill();
+    // ports
+    ctx.fillStyle = FLOW;
+    ctx.fillRect(r.x - 2, r.cy - 3, 4, 6);
+    ctx.fillRect(r.x + r.w - 2, r.cy - 3, 4, 6);
+    // vents
+    ctx.strokeStyle = FLOW; ctx.lineWidth = 1; ctx.beginPath();
+    for (var i = 0; i < 3; i++) {
+      ctx.moveTo(r.x + 8, r.y + r.h - 14 + i * 4);
+      ctx.lineTo(r.x + 8 + r.w * 0.22, r.y + r.h - 14 + i * 4);
+    }
+    ctx.stroke();
+    blockGlyph(j, r, lt, ep);
+  }
+
+  function drawImage(L, lt, ep, epStart, entries) {
+    var R = L.img;
+    ctx.fillStyle = IMG_BG; ctx.fillRect(R.x, R.y, R.w, R.h);
+    ctx.strokeStyle = EDGE; ctx.lineWidth = 1; ctx.strokeRect(R.x + 0.5, R.y + 0.5, R.w - 1, R.h - 1);
+    ctx.save();
+    ctx.beginPath(); ctx.rect(R.x + 1, R.y + 1, R.w - 2, R.h - 2); ctx.clip();
+    var tp = trackPose(lt, ep);
+    var accent = entries[0] >= 1 ? TAG : camAccent(lt, ep);
+    var colored = entries[0] < 1;
+    var st = figurePhase(L, lt, ep, epStart);
+    var ph = st.ph;
+    if (entries[3] >= 2 || entries[1] === 3) ph = Math.floor(ph / 0.28) * 0.28; // raw rhythm / unprocessed pose
+    var fx = R.x + R.w / 2 + tp.nx * R.w * 0.10;
+    drawPool(R, fx, accent, 1);
+    var echoes = entries[2] === 0 ? 2 : (entries[2] === 1 ? 1 : 0);
+    ctx.globalAlpha = 1;
+    for (var q = echoes; q >= 1; q--) {
+      ctx.save();
+      ctx.globalAlpha = q === 1 ? 0.20 : 0.09;
+      ctx.translate(0, 0);
+      var J = figureJoints(R, ph - q * 0.7, tp.nx, tp.ny);
+      ctx.strokeStyle = accent; ctx.lineWidth = Math.max(1.4, Math.min(R.h, R.w * 2.2) * 0.008); ctx.lineCap = 'round';
+      strokePts([J.hip, J.knL, J.ftL]); strokePts([J.hip, J.knR, J.ftR]);
+      strokePts([J.hip, J.chest]); strokePts([J.chest, J.elL, J.haL]); strokePts([J.chest, J.elR, J.haR]);
+      ctx.beginPath(); ctx.arc(J.head.x, J.head.y, J.headR, 0, TAU); ctx.stroke();
+      ctx.restore();
+    }
+    drawFigure(R, ph, tp.nx, tp.ny, accent, colored, 1);
+    if (entries[2] === 3) { // DATA straight to OUTPUT: raw ticks ring the figure
+      ctx.fillStyle = PULSE; ctx.globalAlpha = 0.8;
+      var Jm = figureJoints(R, ph, tp.nx, tp.ny);
+      for (var i = 0; i < 10; i++) {
+        var a = i / 10 * TAU + lt * 0.2;
+        ctx.fillRect(Jm.chest.x + Math.cos(a) * R.h * 0.17 - 1, Jm.chest.y + Math.sin(a) * R.h * 0.17 - 1, 2.4, 2.4);
+      }
+      ctx.globalAlpha = 1;
+    }
+    ctx.restore();
+  }
+
+  // ---------- opened block: the stage's machinery, enlarged ----------
+  function drawOpen(L, lt, ep, epStart, ov) {
+    var m = L.U * 0.03;
+    var R = { x: m, y: m, w: L.w - 2 * m, h: L.h - 2 * m };
+    ctx.fillStyle = OVERLAY; ctx.fillRect(R.x, R.y, R.w, R.h);
+    ctx.strokeStyle = FLOW; ctx.lineWidth = 1.5; ctx.strokeRect(R.x + 0.5, R.y + 0.5, R.w - 1, R.h - 1);
+    tag(BLOCK_TAGS[ov.block], R.x + 12, R.y + 10, L.fs + 2, ACTIVE);
+    var A = { x: R.x + 14, y: R.y + L.fs + 26, w: R.w - 28, h: R.h - L.fs - 44 };
+    var i, j;
+    if (ov.block === 0) { // SENSE: the raw feeds, enlarged
+      for (i = 0; i < 4; i++) {
+        var cell = { x: A.x + (i % 2) * (A.w / 2 + 4), y: A.y + Math.floor(i / 2) * (A.h / 2 + 4),
+                     w: A.w / 2 - 4, h: A.h / 2 - 4 };
+        panel(cell);
+        tag(FEED_TAGS[i], cell.x + 6, cell.y + 5, L.fs, TAG);
+        drawFeedContent(i, cell, lt, ep, L);
+      }
+    } else if (ov.block === 1) { // DETECT: track field with boxes; one target lost briefly
+      ctx.fillStyle = IMG_BG; ctx.fillRect(A.x, A.y, A.w, A.h);
+      ctx.strokeStyle = FLOW; ctx.lineWidth = 1; ctx.globalAlpha = 0.7;
+      ctx.beginPath();
+      for (i = 1; i < 8; i++) { ctx.moveTo(A.x + A.w * i / 8, A.y); ctx.lineTo(A.x + A.w * i / 8, A.y + A.h); }
+      for (i = 1; i < 6; i++) { ctx.moveTo(A.x, A.y + A.h * i / 6); ctx.lineTo(A.x + A.w, A.y + A.h * i / 6); }
+      ctx.stroke(); ctx.globalAlpha = 1;
+      var lost = (lt % 7) > 5.6 && (lt % 7) < 6.3;
+      var ds = trackDots(lt, ep);
+      for (i = 0; i < ds.length; i++) {
+        var px = A.x + (ds[i].nx * 0.5 + 0.5) * A.w, py = A.y + (ds[i].ny * 0.5 + 0.5) * A.h;
+        var isLost = lost && i === 2;
+        ctx.strokeStyle = isLost ? RED : ACTIVE; ctx.lineWidth = 1.5;
+        var bw = A.h * 0.09 * (1 + 0.08 * Math.sin(lt * 6 + i));
+        ctx.strokeRect(px - bw / 2, py - bw / 2, bw, bw);
+        ctx.fillStyle = ACTIVE; ctx.globalAlpha = isLost ? 0.25 : 1;
+        ctx.beginPath(); ctx.arc(px, py, 3.2, 0, TAU); ctx.fill(); ctx.globalAlpha = 1;
+      }
+    } else if (ov.block === 2) { // RENDER: the figure's geometry being built
+      ctx.fillStyle = IMG_BG; ctx.fillRect(A.x, A.y, A.w, A.h);
+      var tp = trackPose(lt, ep), st = figurePhase(L, lt, ep, epStart);
+      var FR = { x: A.x + A.w * 0.18, y: A.y + A.h * 0.06, w: A.w * 0.64, h: A.h * 0.88 };
+      var J = drawFigure(FR, st.ph, tp.nx, tp.ny, camAccent(lt, ep), true, 1.6);
+      ctx.strokeStyle = ACTIVE; ctx.lineWidth = 1; ctx.globalAlpha = 0.8;
+      var keys = ['hip', 'chest', 'head', 'elL', 'haL', 'elR', 'haR', 'knL', 'ftL', 'knR', 'ftR'];
+      for (i = 0; i < keys.length; i++) {
+        if (keys[i] === 'head') continue;
+        ctx.strokeRect(J[keys[i]].x - 4, J[keys[i]].y - 4, 8, 8);
+      }
+      ctx.beginPath(); ctx.arc(J.chest.x, J.chest.y, FR.h * 0.30, 0, TAU); ctx.stroke();
+      ctx.globalAlpha = 0.35;
+      ctx.beginPath(); ctx.arc(J.chest.x, J.chest.y, FR.h * 0.42, 0, TAU); ctx.stroke();
+      ctx.globalAlpha = 1;
+    } else { // OUTPUT: the image's layers, separated
+      var cols = 3, cw = A.w / cols;
+      var entries = [entryAtAbs(0, epStart + lt), entryAtAbs(1, epStart + lt), entryAtAbs(2, epStart + lt), entryAtAbs(3, epStart + lt)];
+      for (j = 0; j < cols; j++) {
+        var cell2 = { x: A.x + j * cw + 5, y: A.y + 6, w: cw - 10, h: A.h - 12 };
+        ctx.fillStyle = IMG_BG; ctx.fillRect(cell2.x, cell2.y, cell2.w, cell2.h);
+        ctx.strokeStyle = EDGE; ctx.strokeRect(cell2.x + 0.5, cell2.y + 0.5, cell2.w - 1, cell2.h - 1);
+        ctx.save();
+        ctx.beginPath(); ctx.rect(cell2.x + 1, cell2.y + 1, cell2.w - 2, cell2.h - 2); ctx.clip();
+        var tp2 = trackPose(lt, ep), st2 = figurePhase(L, lt, ep, epStart);
+        var fx2 = cell2.x + cell2.w / 2 + tp2.nx * cell2.w * 0.10;
+        if (j === 0) drawPool(cell2, fx2, camAccent(lt, ep), 1.6);
+        else if (j === 1) drawFigure(cell2, st2.ph, tp2.nx, tp2.ny, camAccent(lt, ep), entries[0] < 1, 1);
+        else { drawPool(cell2, fx2, camAccent(lt, ep), 1); drawFigure(cell2, st2.ph, tp2.nx, tp2.ny, camAccent(lt, ep), entries[0] < 1, 1); }
+        ctx.restore();
+      }
+    }
+    // remaining-time line
+    var frac = 1 - clamp((lt - (ov.t - epStart)) / 10, 0, 1);
+    ctx.fillStyle = ACTIVE; ctx.globalAlpha = 0.7;
+    ctx.fillRect(R.x, R.y + R.h - 3, R.w * frac, 3);
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- master draw ----------
+  var lastFrame = null; // presentation-only data for the audio edge triggers
+  function draw(t) {
+    var w = viewW, h = viewH;
+    canvas.style.width = w + 'px';
+    canvas.style.height = h + 'px';
+    var L = computeLayout(w, h);
+    lastLayout = L;
+    commitPending(t);
+    var ep = epochIndexAt(t), epStart = epochStartAt(t), lt = t - epStart;
+    var entries = [entryAtAbs(0, t), entryAtAbs(1, t), entryAtAbs(2, t), entryAtAbs(3, t)];
+    var i, j;
+
+    ctx.fillStyle = ROOM;
+    ctx.fillRect(0, 0, w, h);
+
+    var pkts = alivePackets(L, lt, epStart);
+    var glow = [0, 0, 0, 0];
+    for (i = 0; i < pkts.length; i++) {
+      var p = pkts[i];
+      for (j = p.entry; j < 4; j++) {
+        var cd = p.path.centers[j];
+        if (cd === undefined) continue;
+        var g = clamp(1 - Math.abs(p.d - cd) / clamp(0.12 * p.path.total, 90, 190), 0, 1);
+        if (g > glow[j]) glow[j] = g;
+      }
+    }
+
+    // flow lines: feeds to their entry blocks, block to block, out to image
+    ctx.strokeStyle = FLOW; ctx.lineWidth = 1.5; ctx.beginPath();
+    for (i = 0; i < 4; i++) {
+      var f = L.feeds[i], e = L.blocks[entries[i]];
+      ctx.moveTo(f.x + f.w, f.cy);
+      ctx.lineTo(L.midX, f.cy);
+      ctx.lineTo(L.midX, e.cy);
+      ctx.lineTo(e.x, e.cy);
+    }
+    for (j = 0; j < 3; j++) {
+      ctx.moveTo(L.blocks[j].cx, L.blocks[j].y + L.blocks[j].h);
+      ctx.lineTo(L.blocks[j + 1].cx, L.blocks[j + 1].y);
+    }
+    ctx.moveTo(L.blocks[3].x + L.blocks[3].w, L.blocks[3].cy);
+    ctx.lineTo(L.imgMidX, L.blocks[3].cy);
+    ctx.lineTo(L.imgMidX, L.img.cy);
+    ctx.lineTo(L.img.x, L.img.cy);
+    ctx.stroke();
+
+    // input feeds
+    for (i = 0; i < 4; i++) {
+      panel(L.feeds[i]);
+      var tcol = entries[i] > 0 ? ACTIVE : TAG;
+      tag(FEED_TAGS[i], L.feeds[i].x + 6, L.feeds[i].y + 5, L.fs, tcol);
+      if (entries[i] > 0) { // entry pip: this feed now enters a later block
+        ctx.fillStyle = PULSE;
+        ctx.fillRect(L.feeds[i].x + L.feeds[i].w - 9, L.feeds[i].y + 6, 4, 4);
+      }
+      drawFeedContent(i, L.feeds[i], lt, ep, L);
+    }
+
+    // the system
+    for (j = 0; j < 4; j++) drawBlock(j, L.blocks[j], glow[j], L, lt, ep);
+
+    // the image (subordinate: shorter than the system column)
+    drawImage(L, lt, ep, epStart, entries);
+
+    // packets on top: mint squares with a white core, true positions only
+    var psz = clamp(L.U * 0.0075, 4, 7);
+    var detIds = [], arrIds = [];
+    for (i = 0; i < pkts.length; i++) {
+      var pp = pkts[i], pos = pathPos(pp.path, pp.d);
+      ctx.fillStyle = PULSE;
+      ctx.fillRect(pos.x - psz / 2, pos.y - psz / 2, psz, psz);
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillRect(pos.x - 1, pos.y - 1, 2, 2);
+      if (pp.entry <= 1 && pp.path.centers[1] !== undefined && Math.abs(pp.d - pp.path.centers[1]) < 0.05 * L.U) detIds.push(pp.feed * 100000 + pp.k);
+      if (pp.d > pp.path.total - 0.02 * L.U) arrIds.push(pp.feed * 100000 + pp.k);
+    }
+    lastFrame = { detIds: detIds, arrIds: arrIds, glow: glow, spawnTotal: spawnsCount(lt), ep: ep };
+
+    // reroute drag feedback (presentational only)
+    if (dragState.active && lastLayout) {
+      var df = L.feeds[dragState.feed];
+      ctx.strokeStyle = ACTIVE; ctx.globalAlpha = 0.65; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(df.x + df.w, df.cy); ctx.lineTo(dragState.x, dragState.y); ctx.stroke();
+      ctx.globalAlpha = 1;
+      var tb = blockAt(dragState.x, dragState.y);
+      if (tb >= 0) {
+        ctx.strokeStyle = PULSE; ctx.lineWidth = 2;
+        ctx.strokeRect(L.blocks[tb].x - 3, L.blocks[tb].y - 3, L.blocks[tb].w + 6, L.blocks[tb].h + 6);
+      }
+    }
+
+    // credit line: the only sentence in the piece, and it is the truth
+    ctx.fillStyle = TAG;
+    ctx.font = L.fs + 'px monospace';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('SYSTEM: HANAI. IMAGE: SOMEONE ELSE.', w / 2, h * 0.952);
+    ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+
+    var ov = openAt(t);
+    if (ov) drawOpen(L, lt, ep, epStart, ov);
+  }
+
+  function feedAt(x, y) {
+    if (!lastLayout) return -1;
+    for (var i = 0; i < 4; i++) {
+      var r = lastLayout.feeds[i];
+      if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) return i;
+    }
+    return -1;
+  }
+  function blockAt(x, y) {
+    if (!lastLayout) return -1;
+    for (var j = 0; j < 4; j++) {
+      var r = lastLayout.blocks[j];
+      if (x >= r.x - 4 && x <= r.x + r.w + 4 && y >= r.y - 4 && y <= r.y + r.h + 4) return j;
+    }
+    return -1;
+  }
+
+  // ---------- sound: lazy, guarded; four voices through the machine ----------
+  var AC = (typeof AudioContext !== 'undefined') ? AudioContext
+         : ((typeof webkitAudioContext !== 'undefined') ? webkitAudioContext : null);
+  var audio = null;
+  function noiseBuffer(ac) {
+    var buf = ac.createBuffer(1, ac.sampleRate, ac.sampleRate);
+    var ch = buf.getChannelData(0), rng = mulberry32(BASE_SEED);
+    for (var i = 0; i < ch.length; i++) ch[i] = rng() * 2 - 1;
+    return buf;
+  }
+  function ensureAudio() {
+    if (!AC || audio) return;
+    try {
+      var ac = new AC();
+      var filt = ac.createBiquadFilter(); filt.type = 'lowpass'; filt.frequency.value = 1100;
+      var master = ac.createGain(); master.gain.value = 0.6;
+      filt.connect(master); master.connect(ac.destination);
+      var nb = noiseBuffer(ac);
+      var camSrc = ac.createBufferSource(); camSrc.buffer = nb; camSrc.loop = true;
+      var camBP = ac.createBiquadFilter(); camBP.type = 'bandpass'; camBP.frequency.value = 820; camBP.Q.value = 0.7;
+      var camG = ac.createGain(); camG.gain.value = 0.010;
+      camSrc.connect(camBP); camBP.connect(camG); camG.connect(filt); camSrc.start();
+      var micSrc = ac.createBufferSource(); micSrc.buffer = nb; micSrc.loop = true; micSrc.playbackRate.value = 0.5;
+      var micLP = ac.createBiquadFilter(); micLP.type = 'lowpass'; micLP.frequency.value = 300;
+      var micG = ac.createGain(); micG.gain.value = 0.006;
+      micSrc.connect(micLP); micLP.connect(micG); micG.connect(filt); micSrc.start();
+      audio = { ac: ac, filt: filt, micG: micG, prevDet: {}, prevArr: {}, prevSpawn: -1, prevEp: -1 };
+    } catch (e) { audio = null; }
+  }
+  function blip(freq, dur, gain, type) {
+    if (!audio) return;
+    try {
+      var ac = audio.ac, o = ac.createOscillator(), g = ac.createGain();
+      o.type = type; o.frequency.value = freq;
+      g.gain.setValueAtTime(gain, ac.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + dur);
+      o.connect(g); g.connect(audio.filt);
+      o.start(); o.stop(ac.currentTime + dur + 0.02);
+    } catch (e) {}
+  }
+  function updateSounds(t) {
+    if (!audio || !lastFrame || !lastLayout) return;
+    try {
+      var ep = epochIndexAt(t), lt = t - epochStartAt(t);
+      if (audio.prevEp !== ep) { audio.prevDet = {}; audio.prevArr = {}; audio.prevSpawn = -1; audio.prevEp = ep; }
+      var i, id;
+      for (i = 0; i < lastFrame.detIds.length; i++) {
+        id = lastFrame.detIds[i];
+        if (!audio.prevDet[id]) { audio.prevDet[id] = 1; blip(520 + 160 * ihash(id), 0.13, 0.028, 'triangle'); }
+      }
+      for (i = 0; i < lastFrame.arrIds.length; i++) {
+        id = lastFrame.arrIds[i];
+        if (!audio.prevArr[id]) { audio.prevArr[id] = 1; blip(168, 0.20, 0.05, 'sine'); }
+      }
+      if (audio.prevSpawn >= 0 && lastFrame.spawnTotal > audio.prevSpawn) blip(1180, 0.05, 0.012, 'square');
+      audio.prevSpawn = lastFrame.spawnTotal;
+      var amp = Math.abs(micY(0.5, lt, ep));
+      audio.micG.gain.value = 0.004 + 0.020 * amp;
+      var top = 0;
+      for (i = 0; i < 4; i++) if (lastFrame.glow[i] > 0.3) top = i;
+      audio.filt.frequency.value = 700 + 420 * top;
+    } catch (e) {}
+  }
+
+  // ---------- time + loop ----------
+  function nowMs() {
+    if (typeof performance !== 'undefined' && performance.now) return performance.now();
+    return null;
+  }
+  function pieceTime() {
+    if (startStamp === null) return T0;
+    var n = nowMs();
+    if (n === null) return T0;
+    return T0 + (n - startStamp) / 1000;
+  }
+  var rafFn = (typeof requestAnimationFrame !== 'undefined') ? requestAnimationFrame : null;
+  function loop() {
+    var t = pieceTime();
+    draw(t);
+    updateSounds(t);
+    if (rafFn) rafFn(loop);
+  }
+
+  // ---------- sizing (Visual Viewport API) ----------
+  function resize() {
+    var w = 0, h = 0;
+    try {
+      if (window.visualViewport) { w = window.visualViewport.width; h = window.visualViewport.height; }
+    } catch (e) {}
+    if (!w || !h) { w = window.innerWidth || canvas.width || 1280; h = window.innerHeight || canvas.height || 900; }
+    viewW = Math.round(w); viewH = Math.round(h);
+    var dpr = 1;
+    try { dpr = Math.min(2, window.devicePixelRatio || 1); } catch (e) {}
+    canvas.width = Math.round(viewW * dpr);
+    canvas.height = Math.round(viewH * dpr);
+    canvas.style.width = viewW + 'px';
+    canvas.style.height = viewH + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  try {
+    if (window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', resize);
+  } catch (e) {}
+  if (window.addEventListener) window.addEventListener('resize', resize);
+
+  // ---------- interaction ----------
+  function evtPos(ev) {
+    var r = { left: 0, top: 0 };
+    try { r = canvas.getBoundingClientRect(); } catch (e) {}
+    var cx = (ev.clientX !== undefined) ? ev.clientX : (ev.touches && ev.touches[0] ? ev.touches[0].clientX : 0);
+    var cy = (ev.clientY !== undefined) ? ev.clientY : (ev.touches && ev.touches[0] ? ev.touches[0].clientY : 0);
+    return { x: cx - r.left, y: cy - r.top };
+  }
+  function onDown(ev) {
+    ensureAudio();
+    var p = evtPos(ev), t = pieceTime();
+    if (lastTap && (t - lastTap.t) < 0.35 &&
+        Math.sqrt((p.x - lastTap.x) * (p.x - lastTap.x) + (p.y - lastTap.y) * (p.y - lastTap.y)) < 48) {
+      resets.push(t);
+      reroutes = []; opens = []; pendingTap = null; lastTap = null; pDown = null;
+      dragState.active = false;
+      return;
+    }
+    pDown = { t: t, x: p.x, y: p.y, feed: feedAt(p.x, p.y), block: blockAt(p.x, p.y) };
+  }
+  function onMove(ev) {
+    if (!pDown || pDown.feed < 0) return;
+    var p = evtPos(ev);
+    if (Math.sqrt((p.x - pDown.x) * (p.x - pDown.x) + (p.y - pDown.y) * (p.y - pDown.y)) > 10) {
+      dragState.active = true; dragState.feed = pDown.feed;
+      dragState.x = p.x; dragState.y = p.y;
+    }
+  }
+  function onUp(ev) {
+    if (!pDown) { dragState.active = false; return; }
+    var p = evtPos(ev), t = pieceTime();
+    if (dragState.active) {
+      var tb = blockAt(p.x, p.y);
+      if (tb >= 0 && tb !== entryAtAbs(pDown.feed, t)) {
+        reroutes.push({ t: t, feed: pDown.feed, block: tb });
+      }
+      dragState.active = false;
+    } else if (pDown.block >= 0 && !openAt(t)) {
+      pendingTap = { t: t, block: pDown.block };
+      lastTap = { t: t, x: p.x, y: p.y };
+    } else {
+      lastTap = { t: t, x: p.x, y: p.y };
+    }
+    pDown = null;
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+    canvas.addEventListener('mousedown', function (ev) { if (!window.PointerEvent) onDown(ev); });
+    canvas.addEventListener('mousemove', function (ev) { if (!window.PointerEvent) onMove(ev); });
+    canvas.addEventListener('mouseup', function (ev) { if (!window.PointerEvent) onUp(ev); });
+  }
+
+  // ---------- boot: one synchronous fixed-phase frame, then the loop ----------
+  resize();
+  draw(T0);
+  if (rafFn) {
+    startStamp = nowMs();
+    rafFn(loop);
+  }
+})();
+</script>
+</body>
+</html>

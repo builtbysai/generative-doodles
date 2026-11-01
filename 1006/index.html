@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>No Markers. Just Seeing.</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0A0B0F; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="piece"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- setup ----------
+  var canvas = document.getElementById('piece');
+  var ctx = canvas.getContext('2d');
+
+  var FEED = '#0A0B0F';
+  var OBJ = '#FFFFFF';
+  var BOX = '#FFD93B';
+  var TRAJ = '#4FD6FF';
+  var LOST = '#FF2B2B';
+  var LOCK = '#7DF9C6';
+  var CONF = '#8A8D84';
+
+  var DT = 1 / 120;            // fixed sim step (120 Hz)
+  var PREROLL = 2400;          // frame one = state after exactly 2400 steps (20 s)
+  var DET_EVERY = 2;           // detector runs at 60 Hz (every 2 sim steps)
+  var LAG_STEPS = 4;           // box shows detection from 2 detector frames ago (4 sim steps)
+  var TRAJ_MEMORY = 960;       // trajectories kept for 8 s of sim steps
+  var BASE_OBJECTS = 3;
+  var MAX_OBJECTS = 6;
+
+  // Seed: default baked; ?seed= override only used by the QA probe harness.
+  var seed = 1006052;
+  try {
+    var m = /[?&]seed=(\d+)/.exec((typeof location !== 'undefined' && location.search) || '');
+    if (m) seed = parseInt(m[1], 10) >>> 0;
+  } catch (e) {}
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  // Deterministic 2D hash for grain / box jitter (never consumes sim rng).
+  function hash2(x, y) {
+    var h = (x * 374761393 + y * 668265263) | 0;
+    h = Math.imul(h ^ (h >>> 13), 1274126177);
+    return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+  }
+
+  // ---------- viewport ----------
+  var viewW = 300, viewH = 300, dpr = 1;
+  function isPhone(w, h) {
+    var sw = (typeof window !== 'undefined' && window.screen) ? window.screen.width : w;
+    var sh = (typeof window !== 'undefined' && window.screen) ? window.screen.height : h;
+    var minDim = Math.min(sw || w, sh || h);
+    if (minDim > 0 && minDim < 700) return true;
+    return h > w * 1.15;
+  }
+  function fit() {
+    var vv = (typeof window !== 'undefined') ? window.visualViewport : null;
+    var w = vv ? vv.width : (window.innerWidth || 300);
+    var h = vv ? vv.height : (window.innerHeight || 300);
+    viewW = Math.max(50, Math.floor(w));
+    viewH = Math.max(50, Math.floor(h));
+    dpr = Math.min(2, (typeof window !== 'undefined' && window.devicePixelRatio) || 1);
+    canvas.width = Math.floor(viewW * dpr);
+    canvas.height = Math.floor(viewH * dpr);
+  }
+  fit();
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { fit(); draw(); });
+  }
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('resize', function () { fit(); draw(); });
+  }
+
+  // ---------- sim state ----------
+  var rng = null;
+  var step = 0;
+  var objects = [];
+  var audioEvents = [];
+  var live = false; // audio events only fire after the initial pre-roll
+
+  function spawnObject(thrown, x, y, vx, vy) {
+    var o = {
+      x: x, y: y, vx: vx, vy: vy,
+      phase1: rng() * Math.PI * 2, phase2: rng() * Math.PI * 2,
+      f1: 0.5 + rng() * 0.9, f2: 0.4 + rng() * 0.8,
+      curve: 0.25 + rng() * 0.45,
+      cruise: 0.62 + rng() * 0.43,
+      thrown: !!thrown,
+      hist: [],               // recent positions, one per sim step
+      traj: [],               // detected points {x, y, s}
+      mode: 'acquire',        // acquire | track | lost
+      acquireUntil: step + 36, // ~0.3 s to first lock
+      lostUntil: 0,
+      boxX: x, boxY: y,
+      q: 0.72,                // track quality: a fresh track is decent, not proven
+      flashUntil: 0,
+      lockUntil: -1,
+      bornStep: step
+    };
+    return o;
+  }
+
+  function spawnFromEdge() {
+    var edge = Math.floor(rng() * 4);
+    var t = 0.15 + rng() * 0.7;
+    var sp = 0.55 + rng() * 0.55;          // 0.55..1.10 units/s: fast
+    var x, y, vx, vy;
+    var spread = (rng() - 0.5) * 0.7;
+    if (edge === 0) { x = -0.03; y = t; vx = sp; vy = sp * spread; }
+    else if (edge === 1) { x = 1.03; y = t; vx = -sp; vy = sp * spread; }
+    else if (edge === 2) { x = t; y = -0.03; vx = sp * spread; vy = sp; }
+    else { x = t; y = 1.03; vx = sp * spread; vy = -sp; }
+    return spawnObject(false, x, y, vx, vy);
+  }
+
+  function initSim(s, prerollSteps) {
+    seed = s >>> 0;
+    rng = mulberry32(seed);
+    step = 0;
+    objects = [];
+    audioEvents = [];
+    live = false;
+    for (var i = 0; i < BASE_OBJECTS; i++) {
+      // Founding objects start mid-frame on crossing courses so the shift is already on.
+      var o = spawnObject(false,
+        0.2 + rng() * 0.6, 0.2 + rng() * 0.6,
+        (rng() < 0.5 ? -1 : 1) * (0.5 + rng() * 0.5),
+        (rng() - 0.5) * 0.9);
+      o.mode = 'track';
+      o.q = 0.8 + rng() * 0.2;
+      objects.push(o);
+    }
+    for (var k = 0; k < prerollSteps; k++) stepSim();
+    live = true;
+  }
+
+  function emitAudio(kind, idx) {
+    if (live) audioEvents.push({ kind: kind, idx: idx });
+  }
+
+  function stepSim() {
+    step++;
+    var t = step * DT;
+    for (var i = objects.length - 1; i >= 0; i--) {
+      var o = objects[i];
+      // Curved ballistic flight: seeded sinusoidal steering, no markers, no help.
+      var ax = Math.sin(t * o.f1 * Math.PI * 2 + o.phase1) * o.curve;
+      var ay = Math.cos(t * o.f2 * Math.PI * 2 + o.phase2) * o.curve;
+      // Soft containment: a spring wall inside the frame edge bends the duel
+      // back toward mid-frame, so exits are earned by momentum, not constant.
+      // The feed still loses objects, just not every few seconds.
+      if (o.x < 0.14) ax += (0.14 - o.x) * 26;
+      if (o.x > 0.86) ax -= (o.x - 0.86) * 26;
+      if (o.y < 0.14) ay += (0.14 - o.y) * 26;
+      if (o.y > 0.86) ay -= (o.y - 0.86) * 26;
+      o.vx += ax * DT; o.vy += ay * DT;
+      // Keep speed near the object's own fast cruise band.
+      var sp = Math.sqrt(o.vx * o.vx + o.vy * o.vy);
+      if (sp > 0.001) {
+        var ns = sp + (o.cruise - sp) * 0.4 * DT;
+        o.vx *= ns / sp; o.vy *= ns / sp;
+      }
+      o.x += o.vx * DT; o.y += o.vy * DT;
+      o.hist.push({ x: o.x, y: o.y });
+      if (o.hist.length > 12) o.hist.shift();
+
+      // Exit / respawn.
+      if (o.x < -0.08 || o.x > 1.08 || o.y < -0.08 || o.y > 1.08) {
+        if (o.thrown) { objects.splice(i, 1); continue; }
+        var fresh = spawnFromEdge();
+        fresh.mode = 'acquire';
+        objects[i] = fresh;
+        o = fresh;
+      }
+
+      // Detector, at 60 Hz.
+      if (step % DET_EVERY === 0) detectorTick(o, i);
+
+      // Track quality: decays while lost, recovers while tracking.
+      if (o.mode === 'lost') o.q = Math.max(0.05, o.q - 1.2 * DT);
+      else if (o.mode === 'track') o.q = Math.min(1, o.q + 0.12 * DT);
+      else o.q = Math.min(0.85, o.q + 0.20 * DT);
+
+      // Prune trajectory memory.
+      while (o.traj.length && o.traj[0].s < step - TRAJ_MEMORY) o.traj.shift();
+    }
+  }
+
+  function detectorTick(o, idx) {
+    var locked = step < o.lockUntil;
+    if (o.mode === 'acquire') {
+      if (step >= o.acquireUntil) {
+        o.mode = 'track';
+        o.flashUntil = step + 24;
+        emitAudio('acquire', idx);
+      }
+      return;
+    }
+    if (o.mode === 'lost') {
+      if (step >= o.lostUntil) {
+        o.mode = 'track';
+        o.flashUntil = step + 30;
+        emitAudio('reacquire', idx);
+        pushTraj(o);
+      }
+      return;
+    }
+    // mode === 'track': honest lag, position from 2 detector frames ago.
+    var back = Math.min(LAG_STEPS, o.hist.length - 1);
+    var hp = o.hist[o.hist.length - 1 - back];
+    if (hp) { o.boxX = hp.x; o.boxY = hp.y; }
+    pushTraj(o);
+    // Dropout risk: worse at speed and near the edges of the feed.
+    if (!locked) {
+      var sp = Math.sqrt(o.vx * o.vx + o.vy * o.vy);
+      var edgeD = Math.min(o.x, 1 - o.x, o.y, 1 - o.y);
+      var risk = 0.0025 + Math.max(0, sp - 0.9) * 0.02 + (edgeD < 0.045 ? 0.012 : 0);
+      if (rng() < risk) {
+        o.mode = 'lost';
+        o.lostUntil = step + (3 + Math.floor(rng() * 8)) * DET_EVERY; // 3..10 detector frames
+        emitAudio('lost', idx);
+      }
+    }
+  }
+
+  function pushTraj(o) {
+    o.traj.push({ x: o.boxX, y: o.boxY, s: step });
+    if (o.traj.length > 520) o.traj.shift();
+  }
+
+  function confidence() {
+    if (!objects.length) return 0;
+    var sum = 0;
+    for (var i = 0; i < objects.length; i++) sum += objects[i].q;
+    return sum / objects.length;
+  }
+
+  // ---------- audio (lazy, gesture-gated, guarded) ----------
+  var AC = (typeof AudioContext !== 'undefined') ? AudioContext :
+           (typeof webkitAudioContext !== 'undefined') ? webkitAudioContext : null;
+  var actx = null, whoosh = [];
+  function ensureAudio() {
+    if (!AC || actx) return;
+    try {
+      actx = new AC();
+      var len = actx.sampleRate * 1.2;
+      var buf = actx.createBuffer(1, len, actx.sampleRate);
+      var d = buf.getChannelData(0);
+      var r = mulberry32(777);
+      for (var i = 0; i < len; i++) d[i] = r() * 2 - 1;
+      for (var k = 0; k < MAX_OBJECTS; k++) {
+        var src = actx.createBufferSource(); src.buffer = buf; src.loop = true;
+        src.playbackRate.value = 0.8 + k * 0.13;
+        var bp = actx.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 700; bp.Q.value = 1.1;
+        var g = actx.createGain(); g.gain.value = 0;
+        src.connect(bp); bp.connect(g); g.connect(actx.destination);
+        src.start();
+        whoosh.push({ bp: bp, g: g });
+      }
+    } catch (e) { actx = null; }
+  }
+  function blip(f0, f1, dur, gain) {
+    if (!actx) return;
+    try {
+      var t0 = actx.currentTime;
+      var osc = actx.createOscillator(), g = actx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(f0, t0);
+      osc.frequency.exponentialRampToValueAtTime(Math.max(40, f1), t0 + dur);
+      g.gain.setValueAtTime(gain, t0);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      osc.connect(g); g.connect(actx.destination);
+      osc.start(t0); osc.stop(t0 + dur + 0.02);
+    } catch (e) {}
+  }
+  function drainAudio() {
+    for (var i = 0; i < audioEvents.length; i++) {
+      var ev = audioEvents[i];
+      if (ev.kind === 'acquire') blip(620, 940, 0.12, 0.05);
+      else if (ev.kind === 'reacquire') blip(440, 990, 0.16, 0.06);
+      else if (ev.kind === 'lost') blip(520, 170, 0.18, 0.055);
+    }
+    audioEvents.length = 0;
+    if (actx && whoosh.length) {
+      for (var k = 0; k < whoosh.length; k++) {
+        var o = objects[Math.min(k, objects.length - 1)];
+        if (!o) { whoosh[k].g.gain.value = 0; continue; }
+        var sp = Math.sqrt(o.vx * o.vx + o.vy * o.vy);
+        whoosh[k].bp.frequency.value = 380 + sp * 820;
+        whoosh[k].g.gain.value = 0.012 + sp * 0.030;
+      }
+    }
+  }
+
+  // ---------- interaction ----------
+  var downInfo = null, lastTap = null;
+  function toNorm(e) {
+    var r = canvas.getBoundingClientRect();
+    return { x: (e.clientX - r.left) / Math.max(1, r.width), y: (e.clientY - r.top) / Math.max(1, r.height), px: e.clientX - r.left, py: e.clientY - r.top };
+  }
+  function nearestObject(p, maxD) {
+    var best = -1, bd = maxD;
+    for (var i = 0; i < objects.length; i++) {
+      var dx = objects[i].x - p.x, dy = objects[i].y - p.y;
+      var d = Math.sqrt(dx * dx + dy * dy);
+      if (d < bd) { bd = d; best = i; }
+    }
+    return best;
+  }
+  canvas.addEventListener('pointerdown', function (e) {
+    ensureAudio();
+    if (actx && actx.state === 'suspended') { try { actx.resume(); } catch (err) {} }
+    downInfo = { p: toNorm(e), time: (typeof performance !== 'undefined' ? performance.now() : 0) };
+  });
+  canvas.addEventListener('pointerup', function (e) {
+    if (!downInfo) return;
+    var up = toNorm(e);
+    var now = (typeof performance !== 'undefined' ? performance.now() : 0);
+    var dx = up.x - downInfo.p.x, dy = up.y - downInfo.p.y;
+    var distN = Math.sqrt(dx * dx + dy * dy);
+    var dur = Math.max(30, now - downInfo.time);
+    if (distN > 0.035 && dur < 1400) {
+      // Drag = throw: launch a new object along the drag vector.
+      var vx = dx / (dur / 1000) * 0.55, vy = dy / (dur / 1000) * 0.55;
+      var sp = Math.sqrt(vx * vx + vy * vy), cl = Math.min(1.35, Math.max(0.35, sp));
+      vx *= cl / (sp || 1); vy *= cl / (sp || 1);
+      if (objects.length >= MAX_OBJECTS) {
+        for (var i = 0; i < objects.length; i++) if (objects[i].thrown) { objects.splice(i, 1); break; }
+      }
+      if (objects.length < MAX_OBJECTS) objects.push(spawnObject(true, downInfo.p.x, downInfo.p.y, vx, vy));
+      lastTap = null;
+    } else if (distN <= 0.035 && dur < 400) {
+      // Tap.
+      if (lastTap && now - lastTap.time < 380) {
+        initSim((seed + 1) >>> 0, 150); // double-tap: new shift
+        lastTap = null;
+      } else {
+        var idx = nearestObject(up, 0.075);
+        if (idx >= 0) {
+          objects[idx].lockUntil = step + 1200; // 10 s gaze hold, no dropouts
+          emitAudio('acquire', idx);
+        }
+        lastTap = { time: now };
+      }
+    }
+    downInfo = null;
+  });
+
+  // ---------- draw ----------
+  function draw() {
+    var W = viewW, H = viewH;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = FEED;
+    ctx.fillRect(0, 0, W, H);
+    var phone = isPhone(W, H);
+    var u = Math.min(W, H) / 720; // scale unit vs the 720 thumb
+
+    // Trajectories: the detected paths, cyan, breaking where the track broke.
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    for (var pass = 0; pass < 2; pass++) {
+      ctx.strokeStyle = TRAJ;
+      ctx.lineWidth = pass === 0 ? 4.5 * u + 1 : 1.7 * u + 0.6;
+      for (var i = 0; i < objects.length; i++) {
+        var tr = objects[i].traj;
+        for (var j = 1; j < tr.length; j++) {
+          var a = tr[j - 1], b = tr[j];
+          if (b.s - a.s > DET_EVERY * 3) continue; // the gap is the miss, drawn honestly
+          var age = (step - b.s) / TRAJ_MEMORY;
+          ctx.globalAlpha = (pass === 0 ? 0.16 : 0.75) * Math.max(0, 1 - age);
+          ctx.beginPath();
+          ctx.moveTo(a.x * W, a.y * H);
+          ctx.lineTo(b.x * W, b.y * H);
+          ctx.stroke();
+        }
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    // Objects: bright streaks along velocity, no markers.
+    for (var oi = 0; oi < objects.length; oi++) {
+      var o = objects[oi];
+      var hx = o.x * W, hy = o.y * H;
+      var tx = (o.x - o.vx * 0.05) * W, ty = (o.y - o.vy * 0.05) * H;
+      ctx.strokeStyle = OBJ;
+      ctx.lineWidth = 3 * u + 0.8;
+      ctx.globalAlpha = 0.92;
+      ctx.beginPath(); ctx.moveTo(tx, ty); ctx.lineTo(hx, hy); ctx.stroke();
+      ctx.fillStyle = OBJ;
+      ctx.globalAlpha = 1;
+      ctx.beginPath(); ctx.arc(hx, hy, 1.9 * u + 0.5, 0, Math.PI * 2); ctx.fill();
+    }
+
+    // Detection boxes: the system's attention, 2 detector frames late.
+    for (var bi = 0; bi < objects.length; bi++) {
+      var b = objects[bi];
+      if (b.mode === 'acquire') continue; // not yet seen
+      var locked = step < b.lockUntil;
+      var jit = (hash2(bi * 31 + 7, Math.floor(step / DET_EVERY)) - 0.5) * 6;
+      var bw = (46 + jit) * u + 10, bh = (36 - jit * 0.6) * u + 8;
+      var cx = b.boxX * W, cy = b.boxY * H;
+      ctx.lineWidth = 2;
+      if (b.mode === 'lost') ctx.strokeStyle = LOST;
+      else if (locked) ctx.strokeStyle = LOCK;
+      else ctx.strokeStyle = BOX;
+      ctx.globalAlpha = b.mode === 'lost' ? 0.95 : 0.9;
+      ctx.strokeRect(cx - bw / 2, cy - bh / 2, bw, bh);
+      if (step < b.flashUntil) { // re-acquire flash
+        var f = 1 - (b.flashUntil - step) / 30;
+        ctx.globalAlpha = 0.55 * (1 - f);
+        var grow = 4 + f * 10;
+        ctx.strokeRect(cx - bw / 2 - grow, cy - bh / 2 - grow, bw + grow * 2, bh + grow * 2);
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    // Vignette: layered flat-alpha ellipses darkening the corners.
+    ctx.fillStyle = '#000000';
+    var corners = [[0, 0], [W, 0], [0, H], [W, H]];
+    for (var c = 0; c < 4; c++) {
+      for (var L = 0; L < 3; L++) {
+        ctx.globalAlpha = 0.055;
+        ctx.beginPath();
+        ctx.ellipse(corners[c][0], corners[c][1], W * (0.42 + L * 0.10), H * (0.42 + L * 0.10), 0, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    // Grain: seeded speckle on a hash clock (8 buckets per second).
+    var bucket = Math.floor(step / 15);
+    var specks = phone ? 340 : 560;
+    for (var g = 0; g < specks; g++) {
+      var gx = hash2(g * 3 + 1, bucket * 7 + 11) * W;
+      var gy = hash2(g * 5 + 2, bucket * 13 + 5) * H;
+      var ga = hash2(g + 9, bucket + 3);
+      ctx.fillStyle = ga > 0.5 ? '#FFFFFF' : '#000000';
+      ctx.globalAlpha = 0.05 + ga * 0.05;
+      ctx.fillRect(gx, gy, ga > 0.85 ? 2 : 1, 1);
+    }
+    ctx.globalAlpha = 1;
+
+    // Confidence readout: the only text, and it is earned by the sim.
+    ctx.fillStyle = CONF;
+    ctx.font = (phone ? 12 : 11) + 'px monospace';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillText('TRACK ' + confidence().toFixed(2), 14, H - 14);
+
+    // Debug hook for the QA probe (not drawn, not a feature).
+    if (typeof window !== 'undefined') {
+      var modes = [], gaps = 0, pts = 0;
+      for (var d = 0; d < objects.length; d++) {
+        modes.push(objects[d].mode);
+        pts += objects[d].traj.length;
+        for (var dj = 1; dj < objects[d].traj.length; dj++) {
+          if (objects[d].traj[dj].s - objects[d].traj[dj - 1].s > DET_EVERY * 3) gaps++;
+        }
+      }
+      window.__trackDebug = { conf: confidence(), modes: modes, trajPoints: pts, trajGaps: gaps, step: step };
+    }
+  }
+
+  // ---------- run ----------
+  initSim(seed, PREROLL);
+  draw();
+
+  if (typeof requestAnimationFrame !== 'undefined') {
+    var lastNow = null, acc = 0;
+    var loop = function (now) {
+      if (lastNow === null) lastNow = now;
+      var elapsed = Math.min(0.25, (now - lastNow) / 1000);
+      lastNow = now;
+      acc += elapsed;
+      var n = 0;
+      while (acc >= DT && n < 30) { stepSim(); acc -= DT; n++; }
+      if (n === 30) acc = 0;
+      drainAudio();
+      draw();
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
