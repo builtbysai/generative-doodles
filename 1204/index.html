@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Null Sets</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #05060A; overflow: hidden; height: 100%; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- deterministic hashes (seeded only; no Math.random) ----------
+  function h2(a, b) {
+    var x = ((a * 374761393 + b * 668265263) ^ 0x5bf03635) >>> 0;
+    x = Math.imul(x ^ (x >>> 13), 1274126177) >>> 0;
+    return ((x ^ (x >>> 16)) >>> 0) / 4294967296;
+  }
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function lerp(a, b, p) { return a + (b - a) * p; }
+
+  // ---------- constants ----------
+  var T0 = 62;                 // fixed first-frame phase: stanza 2, line 1 compiled + bits falling, line 2 typing, image 3/8 built
+  var STANZA_DUR = 45;         // one stanza per 45 s
+  var ARC_DUR = 180;           // four stanzas = one session arc, then the image resets under the boundary glitch
+  var GLITCH_DUR = 0.8;        // hard glitch at each stanza boundary
+  var FALL_DUR = 2.5;          // a bit's fall from text zone to image zone
+
+  var COL = {
+    field: '#05060A',
+    poem: '#B9BEC7',
+    bit: '#33FF66',
+    sky: '#12308A', skyAlt: '#16388F', skyDeep: '#102A7C',
+    ground: '#0B2060',
+    figure: '#0D0D12',
+    fringe: '#FF2B8D',
+    wrongSky: '#0E3A2A', wrongGround: '#082818', wrongFigure: '#1B4FD8',
+    label: '#39415A',
+    divider: '#161C2C',
+    cellEdge: '#0A0F22',
+    unrevealed: '#06070D'
+  };
+
+  // Walt Whitman, verbatim, public domain.
+  var STANZAS = [
+    [
+      "I celebrate myself, and sing myself,",
+      "And what I assume you shall assume,",
+      "For every atom belonging to me as good belongs to you."
+    ],
+    [
+      "I loafe and invite my soul,",
+      "I lean and loafe at my ease observing a spear of summer grass."
+    ],
+    [
+      "When I heard the learn'd astronomer,",
+      "When the proofs, the figures, were ranged in columns before me,"
+    ],
+    [
+      "Look'd up in perfect silence at the stars."
+    ]
+  ];
+
+  // line schedule inside a stanza: line j completes at 42*(j+1)/(nL+1) seconds,
+  // starts 1.2 s after the previous line compiled (first line at 1.0 s).
+  function lineTimes(st) {
+    var nL = STANZAS[st].length, out = [], prevComp = 0;
+    for (var j = 0; j < nL; j++) {
+      var comp = 42 * (j + 1) / (nL + 1);
+      var start = (j === 0) ? 1.0 : prevComp + 1.2;
+      out.push({ start: start, comp: comp });
+      prevComp = comp;
+    }
+    return out;
+  }
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('cv');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0, DPR = 1;
+
+  var isPhone = false;
+  if (typeof window !== 'undefined' && window.screen) {
+    isPhone = Math.min(window.screen.width || 9999, window.screen.height || 9999) < 700;
+  }
+  function fit() {
+    var vv = (typeof window !== 'undefined') ? window.visualViewport : null;
+    var w = vv ? vv.width : (window.innerWidth || 1280);
+    var h = vv ? vv.height : (window.innerHeight || 800);
+    if (!isPhone && h > w * 1.15) isPhone = true; // aspect fallback
+    DPR = Math.min((typeof window !== 'undefined' && window.devicePixelRatio) || 1, 2);
+    W = w; H = h;
+    canvas.width = Math.round(w * DPR);
+    canvas.height = Math.round(h * DPR);
+    canvas.style.width = w + 'px';   // pin CSS size in fit/draw path
+    canvas.style.height = h + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  }
+  fit();
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', function () { fit(); draw(currentT()); });
+    }
+    window.addEventListener('resize', function () { fit(); draw(currentT()); });
+  }
+
+  var startStamp = (typeof performance !== 'undefined') ? performance.now() : 0;
+  function currentT() { return T0 + (((typeof performance !== 'undefined') ? performance.now() : 0) - startStamp) / 1000; }
+
+  // ---------- scramble state (viewer mistranslations, per absolute stanza) ----------
+  var scrambles = [];   // { stanza: absolute stanza index, x: 0..1 }
+  var dragging = false;
+  function streamZoneHit(x, y) {
+    return y >= H * 0.40 && y < H * 0.60;
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', function (e) {
+      dragging = true;
+      noteScramble(e);
+    });
+    canvas.addEventListener('pointermove', function (e) { if (dragging) noteScramble(e); });
+    canvas.addEventListener('pointerup', function () { dragging = false; });
+    canvas.addEventListener('pointerleave', function () { dragging = false; });
+  }
+  function noteScramble(e) {
+    if (!e || typeof e.clientX !== 'number') return;
+    var x = e.clientX, y = e.clientY;
+    if (!streamZoneHit(x, y)) return;
+    var st = Math.floor(currentT() / STANZA_DUR);
+    // one mark per small x-step, so a drag lays a handful of flipped bits, not a flood
+    for (var i = 0; i < scrambles.length; i++) {
+      if (scrambles[i].stanza === st && Math.abs(scrambles[i].x - x / W) < 0.012) return;
+    }
+    scrambles.push({ stanza: st, x: x / W });
+    if (scrambles.length > 60) scrambles.shift();
+  }
+
+  // ---------- layout ----------
+  function zones() {
+    return {
+      textY: 0, textH: H * 0.40,
+      dataY: H * 0.40, dataH: H * 0.20,
+      imgY: H * 0.60, imgH: H * 0.40
+    };
+  }
+  function poemFont() {
+    var maxLen = 63;
+    var fs = clamp((W * 0.90) / (maxLen * 0.6007), isPhone ? 8 : 10, 21);
+    return fs;
+  }
+
+  // ---------- the composed image scene (drawn per revealed cell, clipped) ----------
+  var CELL_COLS = 12, CELL_ROWS = 8;
+  function cellRank(i) { return h2(i, 7717); }
+
+  function figurePath(cx, baseY, u) {
+    // standing figure glyph; origin at feet centre, u = figure height unit
+    ctx.beginPath();
+    ctx.moveTo(cx - 0.050 * u, baseY - 0.870 * u);
+    ctx.lineTo(cx + 0.050 * u, baseY - 0.870 * u);
+    ctx.lineTo(cx + 0.072 * u, baseY - 0.620 * u);
+    ctx.lineTo(cx + 0.046 * u, baseY - 0.600 * u);
+    ctx.lineTo(cx + 0.056 * u, baseY - 0.300 * u);
+    ctx.lineTo(cx + 0.062 * u, baseY);
+    ctx.lineTo(cx + 0.020 * u, baseY);
+    ctx.lineTo(cx + 0.008 * u, baseY - 0.280 * u);
+    ctx.lineTo(cx - 0.008 * u, baseY - 0.280 * u);
+    ctx.lineTo(cx - 0.020 * u, baseY);
+    ctx.lineTo(cx - 0.062 * u, baseY);
+    ctx.lineTo(cx - 0.056 * u, baseY - 0.300 * u);
+    ctx.lineTo(cx - 0.046 * u, baseY - 0.600 * u);
+    ctx.lineTo(cx - 0.072 * u, baseY - 0.620 * u);
+    ctx.closePath();
+  }
+  function figureHead(cx, baseY, u) {
+    ctx.beginPath();
+    ctx.moveTo(cx + 0.075 * u, baseY - 0.925 * u);
+    ctx.arc(cx, baseY - 0.925 * u, 0.075 * u, 0, Math.PI * 2);
+  }
+
+  function drawFigure(cx, baseY, u, bodyCol, fringeOn, extraOff) {
+    var top = baseY - u, i, off;
+    if (fringeOn) {
+      ctx.save();
+      ctx.globalAlpha = 0.55;
+      ctx.fillStyle = COL.fringe;
+      ctx.translate(4 + extraOff, 0);
+      figurePath(cx, baseY, u); ctx.fill();
+      figureHead(cx, baseY, u); ctx.fill();
+      ctx.restore();
+    }
+    // half-erased: the figure is drawn in horizontal slice bands, each offset,
+    // one band nearly erased -- the erasure is structural, not noise.
+    var bands = 7;
+    for (i = 0; i < bands; i++) {
+      var y0 = top + (u * i) / bands;
+      var y1 = top + (u * (i + 1)) / bands;
+      off = (h2(i, 555) - 0.5) * 16 + extraOff;
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(cx - 0.16 * u, y0, 0.32 * u, y1 - y0 + 0.5);
+      ctx.clip();
+      ctx.globalAlpha = (i === 3) ? 0.30 : 1.0;
+      ctx.fillStyle = bodyCol;
+      ctx.translate(off, 0);
+      figurePath(cx, baseY, u); ctx.fill();
+      figureHead(cx, baseY, u); ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  function drawCellScene(ci, zx, zy, zw, zh, wrong, glitchDx, Z) {
+    var imgH = Z.imgH, imgY = Z.imgY;
+    var horizon = imgY + imgH * 0.58;
+    var figCX = W * 0.46, figBase = horizon + imgH * 0.17, figU = imgH * 0.52;
+    ctx.save();
+    ctx.translate(glitchDx, 0);
+    ctx.beginPath();
+    ctx.rect(zx, zy, zw, zh);
+    ctx.clip();
+    // sky / ground
+    var shade = h2(ci, 31);
+    ctx.fillStyle = wrong ? COL.wrongSky : (shade < 0.4 ? COL.sky : (shade < 0.75 ? COL.skyAlt : COL.skyDeep));
+    ctx.fillRect(zx - Math.abs(glitchDx) - 2, zy, zw + Math.abs(glitchDx) * 2 + 4, zh);
+    ctx.fillStyle = wrong ? COL.wrongGround : COL.ground;
+    if (horizon < zy + zh) ctx.fillRect(zx - 2, Math.max(horizon, zy), zw + 4, zy + zh - Math.max(horizon, zy));
+    // horizon light line
+    if (horizon >= zy && horizon <= zy + zh) {
+      ctx.fillStyle = 'rgba(191,212,255,0.35)';
+      ctx.fillRect(zx - 2, horizon, zw + 4, 1);
+    }
+    // sky specks (bit dust settled into stars)
+    ctx.fillStyle = 'rgba(191,212,255,0.5)';
+    for (var k = 0; k < 3; k++) {
+      var sx = zx + h2(ci * 3 + k, 91) * zw;
+      var sy = zy + h2(ci * 3 + k, 97) * Math.max(1, (horizon - zy));
+      if (sy < horizon && sy >= zy) ctx.fillRect(sx, sy, 1.6, 1.6);
+    }
+    // figure, if this cell intersects its bounding box
+    var fb = { x0: figCX - 0.16 * figU, x1: figCX + 0.16 * figU, y0: figBase - figU, y1: figBase };
+    if (zx < fb.x1 && zx + zw > fb.x0 && zy < fb.y1 && zy + zh > fb.y0) {
+      drawFigure(figCX, figBase, figU, wrong ? COL.wrongFigure : COL.figure, !wrong, wrong ? 10 : 0);
+    }
+    ctx.restore();
+  }
+
+  // ---------- main draw ----------
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    var Z = zones();
+    var arc = t % ARC_DUR;
+    var st = Math.floor(arc / STANZA_DUR);          // stanza index inside the arc, 0..3
+    var absStanza = Math.floor(t / STANZA_DUR);
+    var L = arc - st * STANZA_DUR;                  // local stanza time
+    var times = lineTimes(st);
+    var nL = times.length;
+
+    ctx.fillStyle = COL.field;
+    ctx.fillRect(0, 0, W, H);
+
+    // ----- zone furniture -----
+    ctx.fillStyle = COL.divider;
+    ctx.fillRect(0, Z.dataY, W, 1);
+    ctx.fillRect(0, Z.imgY, W, 1);
+    ctx.fillStyle = COL.label;
+    ctx.font = '600 10px monospace';
+    ctx.textBaseline = 'top';
+    ctx.fillText('T E X T', 10, 8);
+    ctx.fillText('D A T A', 10, Z.dataY + 8);
+    ctx.fillText('I M A G E', 10, Z.imgY + 8);
+
+    // ----- TEXT zone: the poem types, line by line -----
+    var fs = poemFont();
+    ctx.font = fs + 'px monospace';
+    var charW = ctx.measureText('M').width;
+    var x0 = W * 0.06;
+    var lineH = fs * 2.0;
+    var baseY0 = H * 0.115;
+    var compiled = 0, j, k;
+    for (j = 0; j < nL; j++) { if (L >= times[j].comp) compiled++; }
+    for (j = 0; j < nL; j++) {
+      if (L >= times[j].comp) continue;              // compiled lines are gone -- shattered into bits
+      var line = STANZAS[st][j];
+      var span = times[j].comp - times[j].start;
+      var shown = 0;
+      if (L > times[j].start) shown = Math.min(line.length, Math.floor((L - times[j].start) / span * line.length));
+      if (shown <= 0) continue;
+      ctx.fillStyle = COL.poem;
+      ctx.textBaseline = 'alphabetic';
+      var by = baseY0 + j * lineH + fs;
+      ctx.fillText(line.substring(0, shown), x0, by);
+      // block cursor at the typing head
+      if (j === compiled && Math.floor(t * 2) % 2 === 0) {
+        ctx.fillStyle = 'rgba(185,190,199,0.7)';
+        ctx.fillRect(x0 + shown * charW + 2, by - fs * 0.72, charW * 0.72, fs * 0.85);
+      }
+    }
+
+    // ----- DATA zone: ambient drizzle -----
+    var bitFs = Math.max(10, Math.min(13, W * 0.011));
+    ctx.font = bitFs + 'px monospace';
+    ctx.textBaseline = 'alphabetic';
+    var cols = Math.floor(W / 30);
+    for (var c = 0; c < cols; c++) {
+      for (var b = 0; b < 3; b++) {
+        var sp = 0.030 * (0.7 + 0.6 * h2(c, b + 9));
+        var y01 = (h2(c * 7 + b, 41) + t * sp) % 1;
+        var gx = 14 + c * 30 + (h2(c, b + 3) - 0.5) * 10;
+        var gy = Z.dataY + 14 + y01 * (Z.dataH - 22);
+        ctx.fillStyle = 'rgba(51,255,102,0.30)';
+        ctx.fillText(h2(c, Math.floor(t * 2) + b * 13) > 0.5 ? '1' : '0', gx, gy);
+      }
+    }
+
+    // ----- DATA zone: the compiled lines, falling as real bits -----
+    ctx.font = 'bold ' + bitFs + 'px monospace';
+    for (j = 0; j < nL; j++) {
+      if (L < times[j].comp) continue;
+      var src = STANZAS[st][j];
+      var srcBaseY = baseY0 + j * lineH + fs;
+      for (k = 0; k < src.length; k++) {
+        var code = src.charCodeAt(k);
+        var sx = x0 + k * charW + charW * 0.5;
+        for (var bb = 0; bb < 8; bb++) {
+          var seed = k * 8 + bb;
+          var delay = h2(seed, st * 31 + j * 7) * 2.2;
+          var p = (L - times[j].comp - delay) / FALL_DUR;
+          if (p <= 0 || p >= 1) continue;
+          var tx = sx + (h2(seed, 201) - 0.5) * 90;
+          var ty = Z.imgY + h2(seed, 207) * Z.imgH * 0.92;
+          var ease = p * p * (3 - 2 * p);
+          var bx = lerp(sx, tx, ease) + Math.sin(p * 5 + k) * 3 * (1 - p);
+          var by = lerp(srcBaseY, ty, ease);
+          ctx.fillStyle = 'rgba(51,255,102,0.8)';
+          ctx.fillText(((code >> (7 - bb)) & 1) ? '1' : '0', bx, by);
+        }
+      }
+    }
+
+    // ----- IMAGE zone: cells unlock as the poem's bits land -----
+    var revealFrac = st / 4 + (compiled / nL) / 4;
+    var glitching = L < GLITCH_DUR;
+    var cw = W / CELL_COLS, ch = Z.imgH / CELL_ROWS;
+    // which columns has the viewer mistranslated this stanza?
+    var wrongCol = [];
+    for (var si = 0; si < scrambles.length; si++) {
+      if (scrambles[si].stanza === absStanza) wrongCol.push(scrambles[si].x * W);
+    }
+    for (var r = 0; r < CELL_ROWS; r++) {
+      var bandOff = 0;
+      if (glitching) bandOff = (h2(r, Math.floor(t * 12)) - 0.5) * 38 * (1 - L / GLITCH_DUR);
+      for (var cc = 0; cc < CELL_COLS; cc++) {
+        var ci = r * CELL_COLS + cc;
+        var zx = cc * cw, zy = Z.imgY + r * ch;
+        if (cellRank(ci) < revealFrac) {
+          var wrong = false;
+          for (var wi = 0; wi < wrongCol.length; wi++) {
+            if (Math.abs(zx + cw / 2 - wrongCol[wi]) < 48) { wrong = true; break; }
+          }
+          drawCellScene(ci, zx, zy, cw, ch, wrong, bandOff, Z);
+        } else {
+          ctx.fillStyle = COL.unrevealed;
+          ctx.fillRect(zx, zy, cw, ch);
+          ctx.fillStyle = 'rgba(51,255,102,0.16)';
+          ctx.fillRect(zx + h2(ci, 61) * cw * 0.85, zy + h2(ci, 67) * ch * 0.8, 1.6, 1.6);
+          ctx.fillRect(zx + h2(ci, 71) * cw * 0.85, zy + h2(ci, 73) * ch * 0.8, 1.6, 1.6);
+        }
+        ctx.strokeStyle = COL.cellEdge;
+        ctx.lineWidth = 1;
+        ctx.strokeRect(zx + 0.5, zy + 0.5, cw - 1, ch - 1);
+      }
+    }
+
+    // ----- compile flash: one white frame when a line's bits launch -----
+    for (j = 0; j < nL; j++) {
+      if (L >= times[j].comp && L < times[j].comp + 0.045) {
+        ctx.fillStyle = 'rgba(255,255,255,0.9)';
+        ctx.fillRect(0, 0, W, H);
+      }
+    }
+  }
+
+  draw(T0);
+  if (typeof requestAnimationFrame === 'function') {
+    var loop = function () { draw(currentT()); requestAnimationFrame(loop); };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
