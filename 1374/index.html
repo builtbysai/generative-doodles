@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hosted Ceremony</title>
+<style>
+  html, body { margin: 0; padding: 0; overflow: hidden; background: #07090C; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+  // Seeded PRNG (mulberry32). Never Math.random.
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  // Deterministic hash of an integer (for quantized-time flicker).
+  function hash01(n) {
+    var x = (n * 2654435761) >>> 0;
+    x ^= x >>> 13; x = Math.imul(x, 1274126177); x ^= x >>> 16;
+    return (x >>> 0) / 4294967296;
+  }
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  var W = 0, H = 0;
+  var lastT = 0;
+  var startTs = null;
+  var booted = false;
+
+  // Active touches: { id, slot, x, y }
+  // Fading drummers: { slot, fadeStart, lastN }
+  var touches = [];
+  var fading = [];
+  var NSLOTS = 12;
+
+  // Lazily created WebAudio, inside a pointer gesture only.
+  var actx = null;
+  function ensureAudio() {
+    if (actx) return;
+    if (typeof AudioContext !== 'undefined') {
+      try { actx = new AudioContext(); } catch (e) { actx = null; }
+    } else if (typeof webkitAudioContext !== 'undefined') {
+      try { actx = new webkitAudioContext(); } catch (e) { actx = null; }
+    }
+  }
+  // One membrane voice: sine dropping in pitch, short decay.
+  function thump(freq, vol) {
+    if (!actx) return;
+    try {
+      var t0 = actx.currentTime;
+      var osc = actx.createOscillator();
+      var g = actx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(freq, t0);
+      osc.frequency.exponentialRampToValueAtTime(Math.max(30, freq * 0.42), t0 + 0.18);
+      g.gain.setValueAtTime(vol, t0);
+      g.gain.exponentialRampToValueAtTime(0.001, t0 + 0.35);
+      osc.connect(g);
+      g.connect(actx.destination);
+      osc.start(t0);
+      osc.stop(t0 + 0.4);
+    } catch (e) { /* audio is decorative; never crash the piece */ }
+  }
+
+  function viewportSize() {
+    var w, h;
+    if (typeof window !== 'undefined' && window.visualViewport &&
+        typeof window.visualViewport.width === 'number') {
+      w = window.visualViewport.width;
+      h = window.visualViewport.height;
+    } else if (typeof window !== 'undefined') {
+      w = window.innerWidth;
+      h = window.innerHeight;
+    } else {
+      w = 1280; h = 900;
+    }
+    return { w: w, h: h };
+  }
+
+  function resize() {
+    var s = viewportSize();
+    W = s.w; H = s.h;
+    canvas.width = W;
+    canvas.height = H;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+  }
+
+  function isPhone() {
+    if (typeof window !== 'undefined' && window.screen &&
+        typeof window.screen.width === 'number') {
+      var m = Math.min(window.screen.width, window.screen.height);
+      if (m < 700) return true;
+    }
+    return H > W * 1.15;
+  }
+
+  function center() {
+    return { x: W / 2, y: H * 0.50 };
+  }
+  function ringR() {
+    return Math.min(W, H) * 0.32;
+  }
+  function slotPos(slot) {
+    var c = center();
+    var a = -Math.PI / 2 + slot * (Math.PI * 2 / NSLOTS);
+    return { x: c.x + Math.cos(a) * ringR(), y: c.y + Math.sin(a) * ringR(), a: a };
+  }
+  function slotForPoint(x, y) {
+    var c = center();
+    var a = Math.atan2(y - c.y, x - c.x);
+    var idx = Math.round((a + Math.PI / 2) / (Math.PI * 2 / NSLOTS)) % NSLOTS;
+    if (idx < 0) idx += NSLOTS;
+    return idx;
+  }
+  function slotTaken(slot, exceptId) {
+    for (var i = 0; i < touches.length; i++) {
+      if (touches[i].slot === slot && touches[i].id !== exceptId) return true;
+    }
+    return false;
+  }
+  function nearestFreeSlot(want, exceptId) {
+    for (var d = 0; d < NSLOTS; d++) {
+      var s = (want + d) % NSLOTS;
+      if (!slotTaken(s, exceptId)) return s;
+      s = (want - d + NSLOTS * 2) % NSLOTS;
+      if (!slotTaken(s, exceptId)) return s;
+    }
+    return want;
+  }
+
+  function onDown(e) {
+    ensureAudio();
+    var x = (typeof e.clientX === 'number') ? e.clientX : W / 2;
+    var y = (typeof e.clientY === 'number') ? e.clientY : H / 2;
+    var id = (typeof e.pointerId !== 'undefined') ? e.pointerId : 'mouse';
+    for (var i = 0; i < touches.length; i++) {
+      if (touches[i].id === id) return;
+    }
+    var slot = nearestFreeSlot(slotForPoint(x, y), id);
+    // A revived slot stops fading.
+    for (var j = fading.length - 1; j >= 0; j--) {
+      if (fading[j].slot === slot) fading.splice(j, 1);
+    }
+    touches.push({ id: id, slot: slot, x: x, y: y, lastN: -1 });
+    if (typeof e.preventDefault === 'function') { try { e.preventDefault(); } catch (err) {} }
+  }
+  function onMove(e) {
+    var id = (typeof e.pointerId !== 'undefined') ? e.pointerId : 'mouse';
+    for (var i = 0; i < touches.length; i++) {
+      if (touches[i].id === id) {
+        touches[i].x = e.clientX;
+        touches[i].y = e.clientY;
+        touches[i].slot = nearestFreeSlot(slotForPoint(e.clientX, e.clientY), id);
+        return;
+      }
+    }
+  }
+  function onUp(e) {
+    var id = (typeof e.pointerId !== 'undefined') ? e.pointerId : 'mouse';
+    for (var i = touches.length - 1; i >= 0; i--) {
+      if (touches[i].id === id) {
+        fading.push({ slot: touches[i].slot, fadeStart: lastT });
+        touches.splice(i, 1);
+        return;
+      }
+    }
+  }
+
+  // Strike schedule per drummer: period varies by slot (polyrhythm),
+  // phase offset by slot. Returns { s, n } where s = seconds since the
+  // last strike and n = strike index. Closed-form over piece time.
+  function strikeState(slot, t, count) {
+    var period = 0.85 + 0.13 * (slot % 4);
+    if (count > 1) period *= Math.max(0.72, 1 - 0.03 * (count - 1));
+    var phase = slot * 0.37;
+    var x = (t - phase) / period;
+    var n = Math.floor(x);
+    var s = (x - n) * period;
+    return { s: s, n: n, period: period };
+  }
+
+  function drawDrummer(p, alpha, t, count) {
+    var u = Math.min(W, H);
+    var c = center();
+    var face = Math.atan2(c.y - p.y, c.x - p.x); // face the fire
+    var st = strikeState(p.slot, t, count);
+    var striking = st.s < 0.28 ? (1 - st.s / 0.28) : 0;
+    // Single touch = a held breath: slow faint heartbeat on the drum.
+    var heartbeat = 0;
+    if (count === 1) {
+      var hb = t % 1.1;
+      heartbeat = Math.exp(-hb / 0.35) * 0.5;
+    }
+    var glow = Math.max(striking, heartbeat);
+
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.rotate(face + Math.PI / 2);
+    ctx.globalAlpha = alpha;
+    var body = '#26221C';
+    var rim = '#6B6B66';
+    // Seated silhouette: torso, head, arms to the drum.
+    ctx.fillStyle = body;
+    ctx.beginPath();
+    ctx.moveTo(-u * 0.030, u * 0.055);
+    ctx.lineTo(-u * 0.022, -u * 0.020);
+    ctx.lineTo(u * 0.022, -u * 0.020);
+    ctx.lineTo(u * 0.030, u * 0.055);
+    ctx.closePath();
+    ctx.fill();
+    // Head.
+    ctx.beginPath();
+    ctx.moveTo(u * 0.016, -u * 0.020);
+    ctx.arc(0, -u * 0.036, u * 0.016, 0, Math.PI * 2);
+    ctx.fill();
+    // Arms: raise on the strike, rest otherwise.
+    var lift = striking * u * 0.022;
+    ctx.strokeStyle = body;
+    ctx.lineWidth = Math.max(3, u * 0.010);
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(-u * 0.022, -u * 0.005);
+    ctx.lineTo(-u * 0.030, u * 0.030 - lift);
+    ctx.moveTo(u * 0.022, -u * 0.005);
+    ctx.lineTo(u * 0.030, u * 0.030 - lift);
+    ctx.stroke();
+    // Drum: hide circle in front of the figure.
+    ctx.fillStyle = '#B99B6B';
+    ctx.beginPath();
+    ctx.moveTo(u * 0.034, u * 0.048);
+    ctx.arc(0, u * 0.048, u * 0.034, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#7A2E12';
+    ctx.lineWidth = Math.max(1, u * 0.003);
+    ctx.beginPath();
+    ctx.moveTo(u * 0.034, u * 0.048);
+    ctx.arc(0, u * 0.048, u * 0.034, 0, Math.PI * 2);
+    ctx.stroke();
+    // Firelight rim on the drum's fire-facing edge.
+    ctx.strokeStyle = 'rgba(201,106,44,0.55)';
+    ctx.lineWidth = Math.max(1, u * 0.004);
+    ctx.beginPath();
+    ctx.moveTo(u * 0.030, u * 0.048);
+    ctx.arc(0, u * 0.048, u * 0.030, -Math.PI * 0.35, Math.PI * 0.35);
+    ctx.stroke();
+    // Strike ring + glow.
+    if (glow > 0.02) {
+      ctx.strokeStyle = 'rgba(201,106,44,' + (glow * 0.8).toFixed(3) + ')';
+      ctx.lineWidth = Math.max(1, u * 0.004);
+      ctx.beginPath();
+      ctx.moveTo(u * 0.034 * (1 + striking * 0.35), u * 0.048);
+      ctx.arc(0, u * 0.048, u * 0.034 * (1 + striking * 0.35), 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    // Faint smoke-grey outline so the silhouette reads at night.
+    ctx.strokeStyle = 'rgba(107,107,102,0.35)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(-u * 0.030, u * 0.055);
+    ctx.lineTo(-u * 0.022, -u * 0.020);
+    ctx.lineTo(u * 0.022, -u * 0.020);
+    ctx.lineTo(u * 0.030, u * 0.055);
+    ctx.stroke();
+    ctx.restore();
+
+    return st;
+  }
+
+  function draw(t) {
+    var u = Math.min(W, H);
+    var c = center();
+
+    // Night ground.
+    ctx.fillStyle = '#07090C';
+    ctx.fillRect(0, 0, W, H);
+
+    // Ground disc under the fire.
+    ctx.fillStyle = '#0C0F14';
+    ctx.beginPath();
+    ctx.moveTo(c.x + ringR() * 1.25, c.y);
+    ctx.ellipse(c.x, c.y, ringR() * 1.25, ringR() * 0.95, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Fire flicker: seeded function of quantized time, never per-frame random.
+    var q = Math.floor(t / 0.12);
+    var fl = 0.92 + 0.16 * hash01(1374000 + q * 7919);
+    var sway = (hash01(1374000 + q * 131) - 0.5) * u * 0.016;
+
+    // Embers: seeded rising sparks, closed-form over piece time.
+    for (var ei = 0; ei < 24; ei++) {
+      var er = mulberry32(1374000 + ei * 7919);
+      var ex0 = (er() - 0.5) * u * 0.16;
+      var cyc = 6 + er() * 3;
+      // Seeded per-ember phase offset: embers are already spread along
+      // their rise at frame one instead of all sitting at the fire base.
+      var off = er() * cyc;
+      var ph = ((t + off) % cyc) / cyc;
+      var ey = c.y - u * 0.02 - ph * u * 0.30;
+      var ex = c.x + ex0 + Math.sin(ph * 9 + ei) * u * 0.012;
+      var ea = (1 - ph) * 0.7;
+      ctx.fillStyle = 'rgba(201,106,44,' + ea.toFixed(3) + ')';
+      ctx.beginPath();
+      ctx.moveTo(ex + u * 0.003, ey);
+      ctx.arc(ex, ey, u * 0.003, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // Smoke wisps: flat-alpha arcs rising above the fire.
+    for (var wi = 0; wi < 5; wi++) {
+      var wph = ((t / 14) + wi * 0.2) % 1;
+      var wy = c.y - u * 0.10 - wph * u * 0.22;
+      var wx = c.x + Math.sin(wph * 6 + wi * 1.7) * u * 0.03;
+      var wa = (1 - wph) * 0.22;
+      ctx.strokeStyle = 'rgba(107,107,102,' + wa.toFixed(3) + ')';
+      ctx.lineWidth = Math.max(1, u * 0.006);
+      ctx.beginPath();
+      ctx.moveTo(wx - u * 0.02, wy);
+      ctx.arc(wx, wy, u * 0.02, Math.PI * 0.9, Math.PI * 1.9);
+      ctx.stroke();
+    }
+
+    // Drummers: fading ones first, then active ones.
+    for (var fi = fading.length - 1; fi >= 0; fi--) {
+      var f = fading[fi];
+      var fa = 1 - (t - f.fadeStart) / 1.2;
+      if (fa <= 0) { fading.splice(fi, 1); continue; }
+      var fp = slotPos(f.slot);
+      fp.slot = f.slot;
+      drawDrummer(fp, fa, t, touches.length);
+    }
+    var count = touches.length;
+    for (var ti = 0; ti < touches.length; ti++) {
+      var tp = touches[ti];
+      var pos = slotPos(tp.slot);
+      pos.slot = tp.slot;
+      var st = drawDrummer(pos, 1, t, count);
+      // Voice: one membrane thump per strike crossing, only while touched.
+      if (st.n !== tp.lastN) {
+        if (tp.lastN >= 0 && actx) {
+          // Call-and-response: alternate strike pitch across the circle.
+          var freq = (st.n % 2 === 0) ? 110 : 82;
+          thump(freq, count === 1 ? 0.12 : 0.22);
+        }
+        tp.lastN = st.n;
+      }
+    }
+
+    // Fire: outer glow (flat-alpha discs), flame body, ember core.
+    var glowR = u * 0.16 * fl;
+    ctx.fillStyle = 'rgba(201,106,44,0.10)';
+    ctx.beginPath();
+    ctx.moveTo(c.x + glowR, c.y);
+    ctx.arc(c.x, c.y, glowR, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = 'rgba(201,106,44,0.16)';
+    ctx.beginPath();
+    ctx.moveTo(c.x + glowR * 0.6, c.y);
+    ctx.arc(c.x, c.y, glowR * 0.6, 0, Math.PI * 2);
+    ctx.fill();
+    // Flame body: teardrop, swaying with the quantized flicker.
+    var fh = u * 0.115 * fl;
+    var fw = u * 0.055;
+    ctx.fillStyle = '#C96A2C';
+    ctx.beginPath();
+    ctx.moveTo(c.x + sway, c.y - fh);
+    ctx.bezierCurveTo(c.x + sway + fw, c.y - fh * 0.45,
+                      c.x + sway + fw * 0.7, c.y + u * 0.02,
+                      c.x + sway, c.y + u * 0.02);
+    ctx.bezierCurveTo(c.x + sway - fw * 0.7, c.y + u * 0.02,
+                      c.x + sway - fw, c.y - fh * 0.45,
+                      c.x + sway, c.y - fh);
+    ctx.fill();
+    // Ember core.
+    ctx.fillStyle = '#7A2E12';
+    ctx.beginPath();
+    ctx.moveTo(c.x + sway + u * 0.028, c.y + u * 0.02);
+    ctx.ellipse(c.x + sway, c.y - u * 0.005, u * 0.028, u * 0.035, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = 'rgba(217,210,194,0.9)';
+    ctx.beginPath();
+    ctx.moveTo(c.x + sway + u * 0.006, c.y - u * 0.005);
+    ctx.arc(c.x + sway, c.y - u * 0.005, u * 0.006, 0, Math.PI * 2);
+    ctx.fill();
+    // Logs: two crossed dark bars under the flame.
+    ctx.strokeStyle = '#1E1A16';
+    ctx.lineWidth = Math.max(3, u * 0.012);
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(c.x - u * 0.045, c.y + u * 0.028);
+    ctx.lineTo(c.x + u * 0.045, c.y + u * 0.012);
+    ctx.moveTo(c.x + u * 0.045, c.y + u * 0.028);
+    ctx.lineTo(c.x - u * 0.045, c.y + u * 0.012);
+    ctx.stroke();
+
+    // Pin canvas in draw() (house rule).
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+  }
+
+  function loop(ts) {
+    if (startTs === null) startTs = ts;
+    lastT = (ts - startTs) / 1000;
+    draw(lastT);
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(loop);
+    }
+  }
+
+  resize();
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', function () { resize(); draw(lastT); });
+    }
+    if (window.addEventListener) {
+      window.addEventListener('resize', function () { resize(); draw(lastT); });
+    }
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+  }
+
+  // Boot: synchronous first frame at constant phase (unwitnessed: no touches).
+  draw(0);
+  booted = true;
+  if (typeof requestAnimationFrame === 'function') {
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
