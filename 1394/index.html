@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Dreamachine</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #171614; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0;
+
+  // Seeded PRNG (mulberry32). Never Math.random: frame one must be reproducible.
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // Palette
+  var DRUM = '#141312', GOLD = '#f5c542', RED = '#b01e24',
+      SMOKE = '#6b6b66', PAPER = '#e4dfd2', GROUND = '#171614';
+
+  // Drum geometry: wide horizontal band at center.
+  function band() {
+    var top = H * 0.40, bot = H * 0.60;
+    return { top: top, bot: bot, h: bot - top };
+  }
+  // Unwrapped drum circumference, in px (longer than the frame so slots wrap).
+  function circ() { return W * 1.4; }
+
+  // Fixed slot layout: irregular intervals, seeded once (seed 1394000).
+  // A slot: { p (position along circumference, 0..1), w (width frac of circ), h (height frac of band), red (leak flag) }.
+  var SLOTS = (function () {
+    var rng = mulberry32(1394000), slots = [], p = 0;
+    while (p < 1) {
+      var gap = 0.035 + rng() * 0.075;
+      p += gap;
+      if (p >= 1) break;
+      slots.push({
+        p: p,
+        w: 0.006 + rng() * 0.014,
+        h: 0.55 + rng() * 0.40,
+        red: rng() < 0.30
+      });
+    }
+    return slots;
+  })();
+
+  // Pulse character per spin rate: which slots burst strongly, burst widths.
+  // Seed is derived deterministically from the current rate, so the same rate
+  // always yields the same rhythm (the prompt's "regenerates at each rate change").
+  function pulseSeed(rate) {
+    var key = Math.round(rate * 10); // 80..140
+    return 1394000 + key * 7919;
+  }
+  function pulseProfile(rate) {
+    var rng = mulberry32(pulseSeed(rate)), prof = [];
+    for (var i = 0; i < SLOTS.length; i++) {
+      prof.push({ strong: rng() < 0.55, wMul: 0.7 + rng() * 0.9, red: rng() < 0.25 });
+    }
+    return prof;
+  }
+
+  // Recorded events: drag deltas and crossing bursts. All state in draw() is a
+  // closed-form function of piece time plus these recorded lists.
+  var drags = [];   // { t, dx }
+  var bursts = [];  // { t0, x, w, red, strong }
+  var lastScroll = null, lastRateKey = null, down = false, lastX = 0;
+  var audio = null, osc = null, gain = null;
+
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+  // Spin rate (rpm) as a function of piece time and recorded drags.
+  // Drag offset decays with tau 3 s after release; rate clamps to 8..14.
+  function rateAt(t) {
+    var off = 0;
+    for (var i = 0; i < drags.length; i++) {
+      var age = t - drags[i].t;
+      if (age >= 0) off += drags[i].dx * Math.exp(-age / 3);
+    }
+    return clamp(10 + off * 0.02, 8, 14);
+  }
+
+  // Drum scroll (px of surface passed) as an EXACT closed-form integral of the
+  // unclamped drag-offset rate: integral of 10 + 0.02*sum(dx*exp(-(t-ti)/3))
+  // is 10t + 0.06*sum(dx*(1-exp(-(t-ti)/3))). Integrating the clamped rate
+  // would be inexact, and scroll = t*rate(t) goes BACKWARD as the rate decays
+  // (t*rate(t) is not monotonic); this form is always monotonic. The clamped
+  // rate above drives pulse character, trail length, and hum pitch; during
+  // ordinary drags the two agree, and only extreme scrubbing lets scroll run
+  // briefly faster than the reported rate.
+  function scrollAt(t, L) {
+    var s = 10 * t;
+    for (var i = 0; i < drags.length; i++) {
+      var age = t - drags[i].t;
+      if (age >= 0) s += 0.06 * drags[i].dx * (1 - Math.exp(-age / 3));
+    }
+    return (s / 60) * L;
+  }
+
+  function size() {
+    var vv = (typeof visualViewport !== 'undefined' && visualViewport) ? visualViewport : null;
+    W = vv ? vv.width : window.innerWidth;
+    H = vv ? vv.height : window.innerHeight;
+    canvas.width = W; canvas.height = H;
+    canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+  }
+
+  function draw(t) {
+    var b = band(), L = circ();
+    var rate = rateAt(t);
+    var rateNorm = (rate - 8) / 6; // 0..1, trail length grows with rate
+    var scroll = scrollAt(t, L); // px of drum surface passed
+    var prof = pulseProfile(rate);
+
+    ctx.fillStyle = GROUND;
+    ctx.fillRect(0, 0, W, H);
+
+    // Faint smoke streaks drifting across the whole frame (closed-form sines).
+    ctx.fillStyle = SMOKE;
+    for (var s = 0; s < 9; s++) {
+      var sx = ((s * 0.113 + 0.05) * W + Math.sin(t * 0.11 + s * 1.7) * W * 0.03 + W) % W;
+      ctx.globalAlpha = 0.05;
+      ctx.fillRect(sx, 0, Math.max(2, W * 0.004), H);
+    }
+    ctx.globalAlpha = 1;
+
+    // Burst columns left behind by slot crossings (stored history, fading).
+    // Fade duration and retained count grow with rate: the afterimage trail
+    // lengthens as the rate rises. Alpha capped: partial contrast only.
+    var fadeDur = 0.9 + rateNorm * 1.3;
+    var keep = 4 + Math.round(rateNorm * 6);
+    var shown = 0;
+    for (var bi = bursts.length - 1; bi >= 0 && shown < keep; bi--) {
+      var bu = bursts[bi], age = t - bu.t0;
+      if (age < 0) continue;
+      var life = 1 - age / fadeDur;
+      if (life <= 0) continue;
+      shown++;
+      var bw = bu.w * (1 + age * 0.25);
+      ctx.globalAlpha = 0.22 * life * (bu.strong ? 1 : 0.55);
+      ctx.fillStyle = bu.red ? RED : GOLD;
+      ctx.fillRect(bu.x - bw / 2, 0, bw, b.top);
+      ctx.fillRect(bu.x - bw / 2, b.bot, bw, H - b.bot);
+      ctx.globalAlpha = 0.10 * life;
+      ctx.fillStyle = GOLD;
+      ctx.fillRect(bu.x - bw, 0, bw * 0.25, b.top);
+      ctx.fillRect(bu.x - bw, b.bot, bw * 0.25, H - b.bot);
+    }
+    ctx.globalAlpha = 1;
+
+    // Drum band.
+    ctx.fillStyle = DRUM;
+    ctx.fillRect(0, b.top, W, b.h);
+    ctx.fillStyle = SMOKE;
+    ctx.fillRect(0, b.top, W, 2);
+    ctx.fillRect(0, b.bot - 2, W, 2);
+    // Faint ribs across the drum.
+    ctx.globalAlpha = 0.15;
+    for (var r = 0; r < 24; r++) {
+      var rx = ((r / 24) * W + scroll * 0.15) % W;
+      ctx.fillRect(rx, b.top, 1, b.h);
+    }
+    ctx.globalAlpha = 1;
+
+    // Slots: gold light bleeding through the drum, with wash columns above
+    // and below each visible slot. Columns sweep the frame as the drum spins.
+    for (var i = 0; i < SLOTS.length; i++) {
+      var sl = SLOTS[i];
+      var x = (((sl.p * L - scroll) % L) + L) % L - 0.2 * L;
+      if (x < -W * 0.05 || x > W * 1.05) continue;
+      var sw = sl.w * L, sh = sl.h * b.h;
+      var sy = b.top + (b.h - sh) / 2;
+      var pr = prof[i];
+      // Wash columns (capped alpha, functional not decorative).
+      ctx.globalAlpha = 0.10;
+      ctx.fillStyle = GOLD;
+      ctx.fillRect(x - sw * 0.5, 0, sw * 2, b.top);
+      ctx.fillRect(x - sw * 0.5, b.bot, sw * 2, H - b.bot);
+      // Halo + slot core (flat-alpha discs as nested rects, never gradients).
+      ctx.globalAlpha = 0.12;
+      ctx.fillRect(x - sw * 0.8, sy - sh * 0.12, sw * 2.6, sh * 1.24);
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = GOLD;
+      ctx.fillRect(x, sy, sw, sh);
+      if (sl.red || pr.red) {
+        ctx.fillStyle = RED;
+        ctx.fillRect(x + sw, sy + sh * 0.2, Math.max(2, sw * 0.25), sh * 0.6);
+      }
+    }
+
+    // Paper-white register ticks at the drum edges (faint, abstract chrome).
+    ctx.globalAlpha = 0.25;
+    ctx.fillStyle = PAPER;
+    for (var k = 0; k < 5; k++) {
+      var tx = W * (0.1 + k * 0.2);
+      ctx.fillRect(tx, b.top - 6, 2, 6);
+      ctx.fillRect(tx, b.bot, 2, 6);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // Crossing detection: when a slot's screen x passes frame center between
+  // frames, record a burst. Bursts are recorded events; draw() fades them.
+  function step(t) {
+    var L = circ(), rate = rateAt(t);
+    var scroll = scrollAt(t, L);
+    if (lastScroll !== null) {
+      var prof = pulseProfile(rate);
+      for (var i = 0; i < SLOTS.length; i++) {
+        var prev = (((SLOTS[i].p * L - lastScroll) % L) + L) % L - 0.2 * L;
+        var cur = (((SLOTS[i].p * L - scroll) % L) + L) % L - 0.2 * L;
+        // Slots travel leftward, so a crossing is prev right of center and cur
+        // left of it; the small-step guard excludes the wrap jump (+L).
+        if (prev >= W / 2 && cur < W / 2 && (prev - cur) < L / 2) {
+          bursts.push({
+            t0: t, x: W / 2,
+            w: SLOTS[i].w * L * 2.2 * prof[i].wMul,
+            red: prof[i].red, strong: prof[i].strong
+          });
+        }
+      }
+      if (bursts.length > 40) bursts.splice(0, bursts.length - 40);
+    }
+    lastScroll = scroll;
+    lastRateKey = Math.round(rate * 10);
+    draw(t);
+  }
+
+  // Audio: lazy, gesture-gated hum whose pitch tracks the spin rate.
+  function ensureAudio() {
+    if (audio) return;
+    if (typeof AudioContext === 'undefined' && typeof webkitAudioContext === 'undefined') return;
+    var AC = (typeof AudioContext !== 'undefined') ? AudioContext : webkitAudioContext;
+    try {
+      audio = new AC();
+      osc = audio.createOscillator();
+      gain = audio.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = 36 + rateAt(0) * 3;
+      gain.gain.value = 0.04;
+      osc.connect(gain); gain.connect(audio.destination);
+      osc.start();
+    } catch (e) { audio = null; }
+  }
+  function stopAudio() {
+    if (osc) { try { osc.stop(); } catch (e) {} }
+    osc = null; gain = null;
+    if (audio) { try { audio.close(); } catch (e) {} }
+    audio = null;
+  }
+
+  canvas.addEventListener('pointerdown', function (ev) {
+    down = true; lastX = ev.clientX;
+    ensureAudio();
+  });
+  canvas.addEventListener('pointermove', function (ev) {
+    if (!down) return;
+    var dx = ev.clientX - lastX;
+    lastX = ev.clientX;
+    dx = clamp(dx, -50, 50); // one event never injects more than a 1 rpm shift
+    drags.push({ t: now(), dx: dx });
+    if (drags.length > 200) drags.splice(0, drags.length - 200);
+    if (osc) { try { osc.frequency.value = 36 + rateAt(now()) * 3; } catch (e) {} }
+  });
+  function endPointer() { down = false; stopAudio(); }
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', endPointer);
+
+  // Piece clock: boot flag keeps frame one at draw(0); the clock starts only
+  // with the rAF loop.
+  var started = false, t0 = 0, clockT = 0;
+  function now() { return clockT; }
+  function loop(ts) {
+    if (!started) { started = true; t0 = ts; }
+    clockT = (ts - t0) / 1000;
+    step(clockT);
+    if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(loop);
+  }
+
+  size();
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('resize', function () { size(); draw(clockT); });
+    if (typeof visualViewport !== 'undefined' && visualViewport && visualViewport.addEventListener) {
+      visualViewport.addEventListener('resize', function () { size(); draw(clockT); });
+    }
+  }
+  draw(0); // synchronous fixed-phase first frame
+  if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
