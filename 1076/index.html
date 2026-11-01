@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>The Stack</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #E9E9E7; overflow: hidden; height: 100%; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- deterministic RNG ----------
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  var BASE_SEED = 107605;
+  var T0 = 20;               // fixed first-frame phase (seconds)
+  var LOOP = 60;             // seamless 60 s loop
+  var PAIR_SEP = 0.25;       // pairs separated by 25% of frame height
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  var W = 720, H = 720, S = 720, DPR = 1;
+
+  function isPhone() {
+    try {
+      var sw = window.screen ? window.screen.width : 0;
+      var sh = window.screen ? window.screen.height : 0;
+      var mn = Math.min(sw, sh);
+      if (mn > 0 && mn < 700) return true;
+    } catch (e) {}
+    return H > W * 1.15;
+  }
+
+  function resize() {
+    var w, h;
+    if (window.visualViewport && window.visualViewport.width) {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    } else {
+      w = window.innerWidth || 720; h = window.innerHeight || 720;
+    }
+    W = w; H = h; S = Math.min(W, H);
+    DPR = 1;
+    try { DPR = Math.min(window.devicePixelRatio || 1, 2); } catch (e) {}
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+  }
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { resize(); draw(currentT()); });
+  }
+  window.addEventListener('resize', function () { resize(); draw(currentT()); });
+  resize();
+
+  // ---------- airspace: slots ----------
+  // slots[c][p] = y fraction for column c (0..2), pair p (0 upper, 1 lower)
+  function makeSlots(rng) {
+    var s = [];
+    for (var c = 0; c < 3; c++) {
+      var y0 = 0.24 + rng() * 0.16;
+      s.push([y0, y0 + PAIR_SEP]);
+    }
+    return s;
+  }
+  function cloneSlots(s) {
+    return s.map(function (col) { return [col[0], col[1]]; });
+  }
+  function lerpSlots(a, b, k) {
+    var out = [];
+    for (var c = 0; c < 3; c++) out.push([a[c][0] + (b[c][0] - a[c][0]) * k, a[c][1] + (b[c][1] - a[c][1]) * k]);
+    return out;
+  }
+  function midSlots(y) {
+    return [[y, y], [y, y], [y, y]];
+  }
+  function ease(p) { return p * p * (3 - 2 * p); }
+  function clamp01(v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
+
+  var baseSlots = makeSlots(mulberry32(BASE_SEED));
+  var slotEvents = [];   // {t0, type:'restack'|'reseed', slots, midY, dur}
+  var eventSeq = 0;
+
+  function animSlots(start, ev, t) {
+    if (ev.type === 'restack') {
+      var p1 = clamp01((t - ev.t0) / 1.1);
+      if (t - ev.t0 < 1.1) return lerpSlots(start, midSlots(ev.midY), ease(p1));
+      var p2 = clamp01((t - ev.t0 - 1.1) / 1.5);
+      return lerpSlots(midSlots(ev.midY), ev.slots, ease(p2));
+    }
+    return lerpSlots(start, ev.slots, ease(clamp01((t - ev.t0) / ev.dur)));
+  }
+
+  // Slot layout as a pure function of (t, recorded events). No frame integration.
+  function slotsAt(t, upto) {
+    var n = (typeof upto === 'number') ? upto : slotEvents.length;
+    var cur = baseSlots;
+    for (var i = 0; i < n; i++) {
+      var ev = slotEvents[i];
+      if (t < ev.t0) return cur;
+      if (t >= ev.t0 + ev.dur) { cur = ev.slots; continue; }
+      var start = slotsAt(ev.t0, i);
+      return animSlots(start, ev, t);
+    }
+    return cur;
+  }
+  function airspaceIndex(t) {
+    var k = 0;
+    for (var i = 0; i < slotEvents.length; i++) if (slotEvents[i].t0 <= t) k++;
+    return k;
+  }
+
+  // ---------- wind: recorded drag impulses ----------
+  var windEvents = [];   // {t0, vx, vy} px/s at release scale
+  function windAt(t, delay) {
+    var dx = 0, dy = 0;
+    for (var i = 0; i < windEvents.length; i++) {
+      var ev = windEvents[i];
+      var dt = t - delay - ev.t0;
+      if (dt <= 0) continue;
+      if (dt > 6) continue;
+      var h = Math.exp(-dt / 1.15) * Math.sin(4.0 * dt) / 0.72;  // damped-spring impulse response
+      dx += ev.vx * 0.11 * h;
+      dy += ev.vy * 0.11 * h;
+    }
+    var scale = S / 720;
+    dx *= scale; dy *= scale;
+    var maxL = S * 0.10;
+    var m = Math.sqrt(dx * dx + dy * dy);
+    if (m > maxL) { dx = dx / m * maxL; dy = dy / m * maxL; }
+    return { x: dx, y: dy };
+  }
+
+  // ---------- drones ----------
+  // 12 drones: per column, 2 pairs; per pair, 2 drones side by side.
+  var COLX = [0.25, 0.5, 0.75];
+  function droneParams(seedBase, idx) {
+    var rng = mulberry32(seedBase + idx * 977);
+    return {
+      phx: rng() * Math.PI * 2, phy: rng() * Math.PI * 2,
+      kx: 2 + Math.floor(rng() * 3), ky: 2 + Math.floor(rng() * 3),
+      ax: 0.0045 + rng() * 0.002, ay: 0.0032 + rng() * 0.0016,
+      pho: rng() * Math.PI * 2,
+      windK: 0.85 + rng() * 0.3,
+      delay: rng() * 0.06,
+      rot: rng() * Math.PI * 2
+    };
+  }
+
+  function drawDrone(x, y, u, tilt, t, prm) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(tilt);
+
+    // orb on a short mast above the frame
+    var orbY = -u * 1.9;
+    ctx.strokeStyle = 'rgba(19,19,21,0.85)';
+    ctx.lineWidth = Math.max(1, u * 0.14);
+    ctx.beginPath(); ctx.moveTo(0, -u * 0.4); ctx.lineTo(0, orbY + u * 0.4); ctx.stroke();
+
+    // arms
+    ctx.strokeStyle = '#131315';
+    ctx.lineWidth = Math.max(1, u * 0.22);
+    var rx = u * 1.55, ry = u * 0.95;
+    ctx.beginPath();
+    ctx.moveTo(-rx, -ry); ctx.lineTo(rx, ry);
+    ctx.moveTo(-rx, ry); ctx.lineTo(rx, -ry);
+    ctx.stroke();
+
+    // rotor discs + blades (spin is a closed-form function of t)
+    var corners = [[-rx, -ry], [rx, -ry], [-rx, ry], [rx, ry]];
+    for (var i = 0; i < 4; i++) {
+      var cx = corners[i][0], cy = corners[i][1];
+      ctx.strokeStyle = 'rgba(19,19,21,0.5)';
+      ctx.lineWidth = Math.max(1, u * 0.1);
+      ctx.beginPath();
+      ctx.ellipse(cx, cy, u * 0.88, u * 0.24, 0, 0, Math.PI * 2);
+      ctx.stroke();
+      var a = t * 26 + prm.rot + i * 1.7;
+      ctx.strokeStyle = 'rgba(19,19,21,0.75)';
+      ctx.beginPath();
+      ctx.moveTo(cx - Math.cos(a) * u * 0.8, cy - Math.sin(a) * u * 0.2);
+      ctx.lineTo(cx + Math.cos(a) * u * 0.8, cy + Math.sin(a) * u * 0.2);
+      ctx.stroke();
+    }
+
+    // body
+    ctx.fillStyle = '#131315';
+    var bw = u * 1.7, bh = u * 0.85;
+    ctx.beginPath();
+    ctx.rect(-bw / 2, -bh / 2, bw, bh);
+    ctx.fill();
+    ctx.fillStyle = 'rgba(233,233,231,0.16)';
+    ctx.fillRect(-bw / 2, -bh / 2, bw, bh * 0.32);
+
+    // orb: layered flat-alpha circles (no gradients)
+    var pulse = 0.9 + 0.1 * Math.sin((Math.PI * 2) * (3 * t / LOOP) + prm.pho);
+    ctx.fillStyle = 'rgba(207,232,255,' + (0.10 * pulse).toFixed(3) + ')';
+    ctx.beginPath(); ctx.arc(0, orbY, u * 1.55, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = 'rgba(207,232,255,' + (0.22 * pulse).toFixed(3) + ')';
+    ctx.beginPath(); ctx.arc(0, orbY, u * 1.02, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = 'rgba(207,232,255,' + (0.95 * pulse).toFixed(3) + ')';
+    ctx.beginPath(); ctx.arc(0, orbY, u * 0.55, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,0.9)';
+    ctx.beginPath(); ctx.arc(0, orbY, u * 0.22, 0, Math.PI * 2); ctx.fill();
+
+    ctx.restore();
+  }
+
+  // ---------- audio (lazy, gesture-only) ----------
+  var AC = null, washFilter = null, washGain = null, toneGain = null;
+  function initAudio() {
+    if (AC) { try { if (AC.resume) AC.resume(); } catch (e) {} return; }
+    try {
+      var Ctor = (typeof window !== 'undefined') ? (window.AudioContext || window.webkitAudioContext) : null;
+      if (typeof Ctor !== 'function') return;
+      AC = new Ctor();
+      var master = AC.createGain(); master.gain.value = 0.9; master.connect(AC.destination);
+      // rotor wash: looped noise through a bandpass
+      var len = AC.sampleRate * 2;
+      var buf = AC.createBuffer(1, len, AC.sampleRate);
+      var d = buf.getChannelData(0);
+      var r = mulberry32(4242);
+      for (var i = 0; i < len; i++) d[i] = r() * 2 - 1;
+      var src = AC.createBufferSource(); src.buffer = buf; src.loop = true;
+      washFilter = AC.createBiquadFilter(); washFilter.type = 'bandpass'; washFilter.frequency.value = 880; washFilter.Q.value = 0.55;
+      washGain = AC.createGain(); washGain.gain.value = 0.0;
+      src.connect(washFilter); washFilter.connect(washGain); washGain.connect(master);
+      src.start();
+      washGain.gain.setTargetAtTime(0.012, AC.currentTime, 0.6);
+      // low holding tone
+      var osc = AC.createOscillator(); osc.type = 'sine'; osc.frequency.value = 58;
+      var osc2 = AC.createOscillator(); osc2.type = 'sine'; osc2.frequency.value = 116.5;
+      toneGain = AC.createGain(); toneGain.gain.value = 0.0;
+      var g2 = AC.createGain(); g2.gain.value = 0.35;
+      osc.connect(toneGain); osc2.connect(g2); g2.connect(toneGain); toneGain.connect(master);
+      osc.start(); osc2.start();
+      toneGain.gain.setTargetAtTime(0.016, AC.currentTime, 0.8);
+    } catch (e) { AC = null; }
+  }
+  function audioWaver(windMag) {
+    if (!AC) return;
+    try {
+      var k = Math.min(windMag / (S * 0.08), 1);
+      if (washFilter) washFilter.frequency.value = 880 + k * 260;
+      if (toneGain) toneGain.gain.value = 0.016 + k * 0.012;
+      if (washGain) washGain.gain.value = 0.012 + k * 0.008;
+    } catch (e) {}
+  }
+
+  // ---------- draw ----------
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+    // bright studio void
+    ctx.fillStyle = '#E9E9E7';
+    ctx.fillRect(0, 0, W, H);
+
+    var slots = slotsAt(t);
+    var asIdx = airspaceIndex(t);
+    var seedBase = BASE_SEED + asIdx * 131;
+    var u = Math.max(6, S * 0.016);
+    var pairHalf = S * 0.048;
+
+    // altitude lines + labels (the localization system, honest)
+    ctx.font = Math.max(9, Math.round(S * 0.015)) + 'px ui-monospace, Menlo, Consolas, monospace';
+    ctx.textBaseline = 'middle';
+    for (var c = 0; c < 3; c++) {
+      var cxp = COLX[c] * W;
+      for (var p = 0; p < 2; p++) {
+        var yFrac = slots[c][p];
+        var yPx = yFrac * H;
+        ctx.strokeStyle = 'rgba(138,138,136,0.35)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(cxp - S * 0.088, yPx);
+        ctx.lineTo(cxp + S * 0.088, yPx);
+        ctx.stroke();
+        var alt = (1 - yFrac) * 16 + 3;
+        ctx.fillStyle = 'rgba(138,138,136,0.7)';
+        ctx.fillText('ALT ' + alt.toFixed(1) + 'm', cxp + S * 0.098, yPx);
+      }
+    }
+
+    // drones
+    var windSum = 0;
+    var idx = 0;
+    for (var cc = 0; cc < 3; cc++) {
+      for (var pp = 0; pp < 2; pp++) {
+        for (var dd = 0; dd < 2; dd++) {
+          var prm = droneParams(seedBase, idx);
+          var slotX = COLX[cc] * W + (dd === 0 ? -pairHalf : pairHalf);
+          var slotY = slots[cc][pp] * H;
+          var mx = prm.ax * S * Math.sin((Math.PI * 2) * (prm.kx * t / LOOP) + prm.phx);
+          var my = prm.ay * S * Math.sin((Math.PI * 2) * (prm.ky * t / LOOP) + prm.phy);
+          var w = windAt(t, prm.delay);
+          var wx = w.x * prm.windK, wy = w.y * prm.windK;
+          windSum += Math.sqrt(wx * wx + wy * wy);
+          var tilt = Math.max(-0.2, Math.min(0.2, wx * 0.0022));
+          drawDrone(slotX + mx + wx, slotY + my + wy, u, tilt, t, prm);
+          idx++;
+        }
+      }
+    }
+    audioWaver(windSum / 12);
+  }
+
+  // ---------- time ----------
+  var startStamp = null;
+  function nowSec() {
+    if (typeof performance !== 'undefined' && performance.now) return performance.now() / 1000;
+    return Date.now() / 1000;
+  }
+  function currentT() {
+    if (startStamp === null) return T0;
+    return T0 + (nowSec() - startStamp);
+  }
+
+  draw(T0);  // synchronous first frame at fixed phase
+
+  if (typeof requestAnimationFrame === 'function') {
+    startStamp = nowSec();
+    var raf = function () {
+      draw(currentT());
+      requestAnimationFrame(raf);
+    };
+    requestAnimationFrame(raf);
+  }
+
+  // ---------- interaction ----------
+  var dragging = false, downX = 0, downY = 0, downT = 0, lastX = 0, lastY = 0, lastMoveStamp = 0, moved = 0;
+  var lastTapT = -10;
+
+  function evtPos(e) {
+    if (e.clientX !== undefined) return { x: e.clientX, y: e.clientY };
+    if (e.touches && e.touches[0]) return { x: e.touches[0].clientX, y: e.touches[0].clientY };
+    if (e.changedTouches && e.changedTouches[0]) return { x: e.changedTouches[0].clientX, y: e.changedTouches[0].clientY };
+    return { x: 0, y: 0 };
+  }
+
+  canvas.addEventListener('pointerdown', function (e) {
+    initAudio();
+    var p = evtPos(e);
+    dragging = true; moved = 0;
+    downX = lastX = p.x; downY = lastY = p.y;
+    downT = currentT(); lastMoveStamp = nowSec();
+  });
+
+  canvas.addEventListener('pointermove', function (e) {
+    if (!dragging) return;
+    var p = evtPos(e);
+    var st = nowSec();
+    var dt = st - lastMoveStamp;
+    moved += Math.abs(p.x - lastX) + Math.abs(p.y - lastY);
+    if (dt > 0.016) {
+      var vx = (p.x - lastX) / dt, vy = (p.y - lastY) / dt;
+      var sp = Math.sqrt(vx * vx + vy * vy);
+      if (sp > 40) {
+        var cap = 900, k = sp > cap ? cap / sp : 1;
+        windEvents.push({ t0: currentT(), vx: vx * k * 0.55, vy: vy * k * 0.55 });
+        if (windEvents.length > 48) windEvents.shift();
+      }
+      lastMoveStamp = st;
+    }
+    lastX = p.x; lastY = p.y;
+  });
+
+  function endPointer(e) {
+    if (!dragging) return;
+    dragging = false;
+    var t = currentT();
+    var dur = t - downT;
+    if (moved < 8 && dur < 0.45) {
+      // tap / double-tap
+      if (t - lastTapT < 0.35) {
+        // DOUBLE-TAP: new airspace — reseed columns and altitudes
+        eventSeq++;
+        var rngR = mulberry32(BASE_SEED * 31 + eventSeq * 7919);
+        slotEvents.push({ t0: t, type: 'reseed', slots: makeSlots(rngR), midY: 0.42, dur: 1.6 });
+        lastTapT = -10;
+      } else {
+        // TAP: restack — collapse to one altitude, re-form at new seeded heights
+        eventSeq++;
+        var rngS = mulberry32(BASE_SEED * 17 + eventSeq * 104729);
+        var ns = makeSlots(rngS);
+        var mid = (ns[0][0] + ns[1][0] + ns[2][0]) / 3 + PAIR_SEP / 2;
+        slotEvents.push({ t0: t, type: 'restack', slots: ns, midY: mid, dur: 2.6 });
+        lastTapT = t;
+      }
+      if (slotEvents.length > 24) slotEvents.splice(0, slotEvents.length - 24);
+    }
+  }
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', endPointer);
+  window.addEventListener('pointerup', endPointer);
+})();
+</script>
+</body>
+</html>
