@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Counting Coup Census</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #ded8c8; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+  // Seeded PRNG (mulberry32). Never Math.random: frame one and every
+  // session must be reproducible for the byte gate.
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+  function easeOutCubic(u) { u = clamp(u, 0, 1); return 1 - Math.pow(1 - u, 3); }
+  // Pop for a freshly counted cell: overshoot then settle, closed-form.
+  function popScale(u) {
+    if (u <= 0) return 0.01;
+    if (u >= 1) return 1;
+    var s = 1.70158;
+    var p = u - 1;
+    return 1 + (s + 1) * p * p * p + s * p * p;
+  }
+
+  var PAPER = '#ded8c8', INK = '#1c1a17', CLAY = '#a89a86', RED = '#9c3a2a';
+  var COLS = 8, ROWS = 5;
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  if (typeof document !== 'undefined' && document.body && document.body.style) {
+    document.body.style.background = PAPER;
+  }
+
+  var W = 0, H = 0, isPhone = false;
+  var grid = { x: 0, y: 0, w: 0, h: 0, cw: 0, ch: 0 };
+  var cells = [];
+  var downPos = null, lastPos = null, dragging = false, movedTotal = 0;
+
+  function viewportSize() {
+    if (typeof visualViewport !== 'undefined' && visualViewport &&
+        visualViewport.width && visualViewport.height) {
+      return { w: visualViewport.width, h: visualViewport.height };
+    }
+    return { w: window.innerWidth, h: window.innerHeight };
+  }
+  function detectPhone(w, h) {
+    if (typeof window !== 'undefined' && window.screen &&
+        window.screen.width && window.screen.height) {
+      var m = Math.min(window.screen.width, window.screen.height);
+      if (m < 700) return true;
+    }
+    return h > w * 1.15;
+  }
+
+  // Per-cell seeded content: pseudo-glyph marks, tally strokes, clay unit.
+  // Glyphs are invented marks only (bars, dots, chevrons, arcs, ticks) —
+  // never digits, never letterforms, never real data.
+  function buildCellContent(idx) {
+    var rng = mulberry32(1359000 + idx * 7919);
+    var glyphs = [];
+    var nGlyph = 2 + Math.floor(rng() * 3); // 2-4 marks
+    for (var g = 0; g < nGlyph; g++) {
+      glyphs.push({
+        kind: Math.floor(rng() * 6),
+        dx: (rng() - 0.5) * 0.5,
+        dy: (rng() - 0.5) * 0.34,
+        s: 0.10 + rng() * 0.10,
+        red: rng() < 0.22
+      });
+    }
+    var tallies = [];
+    var nTally = 3 + Math.floor(rng() * 3); // 3-5 strokes
+    for (var t = 0; t < nTally; t++) {
+      tallies.push({ dx: (t - (nTally - 1) / 2) * 0.11, red: rng() < 0.25 });
+    }
+    if (rng() < 0.5) tallies.push({ dx: 0, diag: true, red: rng() < 0.25 });
+    return {
+      glyphs: glyphs, tallies: tallies,
+      form: Math.floor(rng() * 12),
+      tone: 200 + Math.floor(rng() * 16) * 28,
+      shade: rng(), rot: (rng() - 0.5) * 0.35
+    };
+  }
+
+  function layout() {
+    var vs = viewportSize();
+    W = vs.w; H = vs.h;
+    isPhone = detectPhone(W, H);
+    canvas.width = W; canvas.height = H;
+    canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+    var mx = isPhone ? W * 0.04 : W * 0.08;
+    var my = isPhone ? H * 0.03 : H * 0.10;
+    var gw = W - mx * 2, gh = H - my * 2;
+    var cw = gw / COLS, ch = gh / ROWS;
+    var cs = Math.min(cw, ch);
+    grid = { x: mx + (gw - cs * COLS) / 2, y: my + (gh - cs * ROWS) / 2,
+             w: cs * COLS, h: cs * ROWS, cw: cs, ch: cs };
+    cells = [];
+    for (var r = 0; r < ROWS; r++) {
+      for (var c = 0; c < COLS; c++) {
+        var idx = r * COLS + c;
+        var old = null;
+        // Preserve counted state across resizes (content is seeded by index).
+        cells.push({
+          idx: idx, col: c, row: r,
+          cx: grid.x + c * cs + cs / 2, cy: grid.y + r * cs + cs / 2,
+          size: cs, content: buildCellContent(idx),
+          counted: false, countedAt: -1
+        });
+        void old;
+      }
+    }
+  }
+
+  // Rebuild geometry but keep counted state (cells are indexed identically).
+  function relayout() {
+    var prev = cells;
+    layout();
+    for (var i = 0; i < cells.length && i < prev.length; i++) {
+      cells[i].counted = prev[i].counted;
+      cells[i].countedAt = prev[i].countedAt;
+    }
+  }
+
+  function drawGlyphMark(ctx2, kind, x, y, s, color) {
+    ctx2.strokeStyle = color; ctx2.fillStyle = color;
+    ctx2.lineWidth = Math.max(1, s * 0.16); ctx2.lineCap = 'round';
+    ctx2.beginPath();
+    if (kind === 0) { // horizontal bar
+      ctx2.moveTo(x - s, y); ctx2.lineTo(x + s, y);
+    } else if (kind === 1) { // vertical tick
+      ctx2.moveTo(x, y - s); ctx2.lineTo(x, y + s);
+    } else if (kind === 2) { // chevron
+      ctx2.moveTo(x - s, y + s * 0.6); ctx2.lineTo(x, y - s * 0.6); ctx2.lineTo(x + s, y + s * 0.6);
+    } else if (kind === 3) { // arc
+      ctx2.moveTo(x + s, y);
+      ctx2.arc(x, y, s, 0, Math.PI, false);
+    } else if (kind === 4) { // dot pair
+      ctx2.fillRect(x - s * 0.7, y - s * 0.2, s * 0.4, s * 0.4);
+      ctx2.fillRect(x + s * 0.3, y - s * 0.2, s * 0.4, s * 0.4);
+      return;
+    } else { // diagonal with dot
+      ctx2.moveTo(x - s * 0.7, y + s * 0.7); ctx2.lineTo(x + s * 0.7, y - s * 0.7);
+      ctx2.fillRect(x + s * 0.9, y - s * 1.1, s * 0.35, s * 0.35);
+      return;
+    }
+    ctx2.stroke();
+  }
+
+  function drawTally(ctx2, x, y, h, color) {
+    ctx2.strokeStyle = color; ctx2.lineWidth = Math.max(1.2, h * 0.07);
+    ctx2.lineCap = 'round';
+    ctx2.beginPath();
+    ctx2.moveTo(x, y - h / 2); ctx2.lineTo(x, y + h / 2);
+    ctx2.stroke();
+  }
+
+  function drawUnit(ctx2, form, x, y, s, shade, rot) {
+    ctx2.save();
+    ctx2.translate(x, y); ctx2.rotate(rot);
+    var light = shade > 0.5;
+    ctx2.fillStyle = light ? '#b5a88f' : CLAY;
+    ctx2.strokeStyle = INK; ctx2.lineWidth = Math.max(1, s * 0.03);
+    function dot(dx, dy, r) {
+      ctx2.beginPath();
+      ctx2.moveTo(dx + r, dy);
+      ctx2.arc(dx, dy, r, 0, Math.PI * 2, false);
+      ctx2.fill();
+    }
+    function disc(dx, dy, r, fill) {
+      ctx2.beginPath();
+      ctx2.moveTo(dx + r, dy);
+      ctx2.arc(dx, dy, r, 0, Math.PI * 2, false);
+      if (fill) ctx2.fill(); else ctx2.stroke();
+    }
+    if (form === 0) { // bead
+      disc(0, 0, s * 0.42, true);
+      ctx2.fillStyle = PAPER; dot(0, 0, s * 0.12);
+    } else if (form === 1) { // whistle: tube + mouthpiece
+      ctx2.fillRect(-s * 0.42, -s * 0.16, s * 0.84, s * 0.32);
+      ctx2.fillRect(s * 0.30, -s * 0.08, s * 0.28, s * 0.16);
+      ctx2.fillStyle = INK; dot(-s * 0.2, 0, s * 0.06);
+    } else if (form === 2) { // fist of clay: blob + knuckles
+      disc(0, s * 0.08, s * 0.36, true);
+      dot(-s * 0.26, -s * 0.22, s * 0.13); dot(0, -s * 0.28, s * 0.13);
+      dot(s * 0.26, -s * 0.22, s * 0.13);
+    } else if (form === 3) { // ring
+      ctx2.strokeStyle = '#7d6f5c';
+      ctx2.lineWidth = Math.max(2, s * 0.14);
+      disc(0, 0, s * 0.38, false);
+    } else if (form === 4) { // coil: concentric arcs
+      ctx2.lineWidth = Math.max(1.5, s * 0.06);
+      var rr;
+      for (rr = 0.38; rr > 0.08; rr -= 0.1) {
+        ctx2.beginPath();
+        ctx2.moveTo(rr * s, 0);
+        ctx2.arc(0, 0, rr * s, 0, Math.PI * 2, false);
+        ctx2.stroke();
+      }
+    } else if (form === 5) { // paddle
+      ctx2.beginPath();
+      ctx2.moveTo(0, -s * 0.45);
+      ctx2.ellipse(0, -s * 0.1, s * 0.30, s * 0.36, 0, 0, Math.PI * 2, false);
+      ctx2.fill();
+      ctx2.fillRect(-s * 0.05, s * 0.22, s * 0.10, s * 0.28);
+    } else if (form === 6) { // pipe: bent tube
+      ctx2.fillRect(-s * 0.42, -s * 0.12, s * 0.6, s * 0.24);
+      ctx2.fillRect(s * 0.08, -s * 0.12, s * 0.24, s * 0.5);
+      ctx2.fillStyle = INK; dot(s * 0.2, s * 0.3, s * 0.06);
+    } else if (form === 7) { // drum
+      ctx2.fillRect(-s * 0.36, -s * 0.18, s * 0.72, s * 0.42);
+      disc(0, -s * 0.18, s * 0.36, true);
+      ctx2.fillStyle = INK; dot(0, -s * 0.18, s * 0.05);
+    } else if (form === 8) { // seed: pointed oval
+      ctx2.beginPath();
+      ctx2.moveTo(0, -s * 0.45);
+      ctx2.quadraticCurveTo(s * 0.38, 0, 0, s * 0.45);
+      ctx2.quadraticCurveTo(-s * 0.38, 0, 0, -s * 0.45);
+      ctx2.fill();
+    } else if (form === 9) { // shard: irregular polygon
+      ctx2.beginPath();
+      ctx2.moveTo(-s * 0.3, -s * 0.4);
+      ctx2.lineTo(s * 0.34, -s * 0.22);
+      ctx2.lineTo(s * 0.22, s * 0.38);
+      ctx2.lineTo(-s * 0.36, s * 0.28);
+      ctx2.closePath(); ctx2.fill();
+    } else if (form === 10) { // knot: two loops
+      ctx2.strokeStyle = '#7d6f5c';
+      ctx2.lineWidth = Math.max(2, s * 0.1);
+      disc(-s * 0.18, 0, s * 0.24, false);
+      disc(s * 0.18, 0, s * 0.24, false);
+    } else { // bowl
+      ctx2.beginPath();
+      ctx2.moveTo(-s * 0.4, -s * 0.2);
+      ctx2.arc(0, -s * 0.2, s * 0.4, 0, Math.PI, false);
+      ctx2.closePath(); ctx2.fill();
+      ctx2.fillRect(-s * 0.44, -s * 0.26, s * 0.88, s * 0.08);
+    }
+    ctx2.restore();
+  }
+
+  function cellAt(x, y) {
+    for (var i = 0; i < cells.length; i++) {
+      var c = cells[i];
+      if (x >= c.cx - c.size / 2 && x <= c.cx + c.size / 2 &&
+          y >= c.cy - c.size / 2 && y <= c.cy + c.size / 2) return c;
+    }
+    return null;
+  }
+
+  function countAlong(x0, y0, x1, y1, t) {
+    var dx = x1 - x0, dy = y1 - y0;
+    var dist = Math.sqrt(dx * dx + dy * dy);
+    var steps = Math.max(1, Math.ceil(dist / 8));
+    for (var s = 0; s <= steps; s++) {
+      var px = x0 + dx * s / steps, py = y0 + dy * s / steps;
+      var c = cellAt(px, py);
+      if (c && !c.counted) { c.counted = true; c.countedAt = t; }
+    }
+  }
+
+  var audioCtx = null;
+  function playTone(freq) {
+    try {
+      var AC = (typeof AudioContext !== 'undefined') ? AudioContext :
+        (typeof webkitAudioContext !== 'undefined' ? webkitAudioContext : null);
+      if (!AC) return;
+      if (!audioCtx) audioCtx = new AC();
+      if (audioCtx.state === 'suspended' && audioCtx.resume) audioCtx.resume();
+      var osc = audioCtx.createOscillator();
+      var gain = audioCtx.createGain();
+      osc.type = 'sine'; osc.frequency.value = freq;
+      var t0 = audioCtx.currentTime;
+      gain.gain.setValueAtTime(0.0001, t0);
+      gain.gain.exponentialRampToValueAtTime(0.25, t0 + 0.03);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.9);
+      osc.connect(gain); gain.connect(audioCtx.destination);
+      osc.start(t0); osc.stop(t0 + 0.95);
+    } catch (e) { /* silent if audio is unavailable */ }
+  }
+
+  function onDown(e) {
+    var x = (e.clientX !== undefined) ? e.clientX : 0;
+    var y = (e.clientY !== undefined) ? e.clientY : 0;
+    downPos = { x: x, y: y }; lastPos = { x: x, y: y };
+    dragging = false; movedTotal = 0;
+  }
+  function onMove(e) {
+    if (!downPos) return;
+    var x = (e.clientX !== undefined) ? e.clientX : 0;
+    var y = (e.clientY !== undefined) ? e.clientY : 0;
+    var dx = x - lastPos.x, dy = y - lastPos.y;
+    movedTotal += Math.sqrt(dx * dx + dy * dy);
+    if (movedTotal > 4) dragging = true;
+    if (dragging) countAlong(lastPos.x, lastPos.y, x, y, pieceTime);
+    lastPos = { x: x, y: y };
+  }
+  function onUp(e) {
+    if (!downPos) return;
+    var x = (e.clientX !== undefined) ? e.clientX : lastPos.x;
+    var y = (e.clientY !== undefined) ? e.clientY : lastPos.y;
+    if (!dragging && movedTotal < 12) {
+      var c = cellAt(x, y);
+      if (c) playTone(c.content.tone);
+    }
+    downPos = null; lastPos = null; dragging = false;
+  }
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('pointerdown', onDown);
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('resize', relayout);
+    if (typeof visualViewport !== 'undefined' && visualViewport &&
+        visualViewport.addEventListener) {
+      visualViewport.addEventListener('resize', relayout);
+    }
+  }
+
+  function draw(t) {
+    ctx.fillStyle = PAPER;
+    ctx.fillRect(0, 0, W, H);
+    // Ledger rules: faint horizontal row lines and vertical column lines.
+    ctx.strokeStyle = 'rgba(28,26,23,0.18)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    var r, c;
+    for (r = 0; r <= ROWS; r++) {
+      var yy = grid.y + r * grid.ch;
+      ctx.moveTo(grid.x, yy); ctx.lineTo(grid.x + grid.w, yy);
+    }
+    for (c = 0; c <= COLS; c++) {
+      var xx = grid.x + c * grid.cw;
+      ctx.moveTo(xx, grid.y); ctx.lineTo(xx, grid.y + grid.h);
+    }
+    ctx.stroke();
+    // Cells.
+    for (var i = 0; i < cells.length; i++) {
+      var cell = cells[i];
+      var cs = cell.size;
+      var ct = cell.content;
+      if (cell.counted) {
+        var u = (t - cell.countedAt) / 0.5;
+        var sc = popScale(u);
+        var fade = 1 - easeOutCubic(u * 2);
+        // Hover shadow: flat-alpha ellipse beneath the unit.
+        ctx.fillStyle = 'rgba(28,26,23,0.20)';
+        ctx.beginPath();
+        ctx.moveTo(cell.cx + cs * 0.30, cell.cy + cs * 0.32);
+        ctx.ellipse(cell.cx, cell.cy + cs * 0.32, cs * 0.30, cs * 0.07, 0, 0, Math.PI * 2, false);
+        ctx.fill();
+        if (fade > 0) {
+          ctx.save();
+          ctx.globalAlpha = fade;
+          drawCellMarks(cell);
+          ctx.restore();
+        }
+        ctx.save();
+        ctx.translate(cell.cx, cell.cy);
+        ctx.scale(sc, sc);
+        ctx.translate(-cell.cx, -cell.cy);
+        drawUnit(ctx, ct.form, cell.cx, cell.cy, cs * 0.52, ct.shade, ct.rot);
+        ctx.restore();
+      } else {
+        drawCellMarks(cell);
+      }
+    }
+  }
+
+  function drawCellMarks(cell) {
+    var cs = cell.size, ct = cell.content, g, tl;
+    for (g = 0; g < ct.glyphs.length; g++) {
+      var gm = ct.glyphs[g];
+      drawGlyphMark(ctx, gm.kind, cell.cx + gm.dx * cs, cell.cy + gm.dy * cs - cs * 0.12,
+        gm.s * cs, gm.red ? RED : INK);
+    }
+    var th = cs * 0.20, ty = cell.cy + cs * 0.24;
+    for (tl = 0; tl < ct.tallies.length; tl++) {
+      var tk = ct.tallies[tl];
+      ctx.strokeStyle = tk.red ? RED : INK;
+      ctx.lineWidth = Math.max(1.2, th * 0.09); ctx.lineCap = 'round';
+      ctx.beginPath();
+      if (tk.diag) {
+        ctx.moveTo(cell.cx - cs * 0.16, ty + th / 2);
+        ctx.lineTo(cell.cx + cs * 0.16, ty - th / 2);
+      } else {
+        ctx.moveTo(cell.cx + tk.dx * cs, ty - th / 2);
+        ctx.lineTo(cell.cx + tk.dx * cs, ty + th / 2);
+      }
+      ctx.stroke();
+    }
+    void drawTally;
+  }
+
+  var pieceTime = 0;
+  var startStamp = 0;
+  var started = false;
+  function loop(ts) {
+    if (!started) { started = true; startStamp = ts; }
+    pieceTime = (ts - startStamp) / 1000;
+    draw(pieceTime);
+    if (typeof requestAnimationFrame !== 'undefined') {
+      requestAnimationFrame(loop);
+    }
+  }
+
+  layout();
+  draw(0); // frame one: the full uncounted ledger, deterministic.
+  if (typeof requestAnimationFrame !== 'undefined') {
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
