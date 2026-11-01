@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<!-- piece-9121-driftward -->
+<title>Driftward</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; overflow:hidden; background:#141722; }
+  #c { position:fixed; inset:0; width:100%; height:100%; display:block; touch-action:none; cursor:crosshair; }
+  #cap { position:fixed; left:18px; bottom:16px; color:rgba(205,210,230,.55);
+    font:11px/1.7 -apple-system,"Segoe UI",system-ui,sans-serif; letter-spacing:.24em;
+    text-transform:uppercase; pointer-events:none; user-select:none; -webkit-user-select:none; }
+  #cap .hint { letter-spacing:.14em; color:rgba(205,210,230,.32); }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="cap">Driftward<br><span class="hint">drag to stir &middot; tap to reseed</span></div>
+<script>
+/* piece-9121-driftward driver core.
+ * Pure functions, no DOM. Runs identically in node (harness) and in the page.
+ * A petal field with intent: petals steer toward a wandering hollow on the
+ * ground, settle where the wind dies near it, and gusts re-lift them. */
+
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+const N_PETALS = 420;
+const DT = 1 / 60;
+
+function groundY(sim, x) {
+  const g = sim.ground;
+  let y = sim.H * 0.86 + g.a1 * Math.sin(x * 0.008 + g.p1) + g.a2 * Math.sin(x * 0.021 + g.p2);
+  const d = (x - sim.hollowX) / g.dipW;
+  y -= g.dipD * Math.exp(-d * d);
+  return y;
+}
+
+function makePetal(rng, sim, airborne) {
+  const upwind = rng() < 0.6;
+  return {
+    x: rng() * sim.W,
+    y: airborne ? rng() * sim.H * 0.55 : rng() * sim.H,
+    vx: (rng() - 0.5) * 40,
+    vy: rng() * 30,
+    rot: rng() * Math.PI * 2,
+    spin: (rng() - 0.5) * 6,
+    size: 4 + rng() * 5,
+    tone: (rng() * 3) | 0,
+    settled: false,
+    p1: rng() * Math.PI * 2,
+    p2: rng() * Math.PI * 2,
+    p3: rng() * Math.PI * 2,
+    flut: 2.5 + rng() * 3.5,
+    dropBias: upwind ? -1 : 1,
+    orbR: 40 + rng() * 160,
+    orbW: (0.12 + rng() * 0.35) * (rng() < 0.5 ? -1 : 1),
+    orbP: rng() * Math.PI * 2
+  };
+}
+
+function createSim(seed, W, H) {
+  const rng = mulberry32(seed);
+  const sim = {
+    seed, W, H, time: 0, rng,
+    petals: [],
+    hollowBase: W * (0.35 + rng() * 0.3),
+    hollowX: 0,
+    gust: 0,
+    gustTarget: 0,
+    nextGustT: 6 + rng() * 10,
+    hp1: rng() * Math.PI * 2,
+    hp2: rng() * Math.PI * 2,
+    wp1: rng() * Math.PI * 2,
+    wp2: rng() * Math.PI * 2,
+    wp3: rng() * Math.PI * 2,
+    ground: {
+      a1: 14 + rng() * 10, a2: 6 + rng() * 6,
+      p1: rng() * Math.PI * 2, p2: rng() * Math.PI * 2,
+      dipW: 52 + rng() * 20, dipD: 24 + rng() * 10
+    },
+    hollowMin: Infinity, hollowMax: -Infinity,
+    settledCount: 0
+  };
+  sim.hollowX = sim.hollowBase;
+  for (let i = 0; i < N_PETALS; i++) sim.petals.push(makePetal(rng, sim, true));
+  return sim;
+}
+
+function settlePetal(sim, p) {
+  p.settled = true;
+  const gy = groundY(sim, p.x);
+  p.y = gy + (sim.rng() - 0.35) * 7;
+  p.x += (sim.rng() - 0.5) * 4;
+  p.rot = (sim.rng() - 0.5) * 0.6;
+  p.vx = 0; p.vy = 0;
+  sim.settledCount++;
+}
+
+function liftPetal(sim, p, vyMin, vyMax) {
+  p.settled = false;
+  sim.settledCount--;
+  p.vy = -(vyMin + sim.rng() * (vyMax - vyMin));
+  p.vx = (sim.rng() - 0.5) * 130;
+  p.y -= 3;
+  p.spin = (sim.rng() - 0.5) * 8;
+}
+
+function stepSim(sim, dt) {
+  const t = sim.time + dt;
+  sim.time = t;
+  const W = sim.W, H = sim.H;
+
+  // Hollow wanders on slow bounded sines.
+  sim.hollowX = sim.hollowBase + 45 * Math.sin(t * 0.021 + sim.hp1) + 20 * Math.sin(t * 0.047 + sim.hp2);
+  if (sim.hollowX < sim.hollowMin) sim.hollowMin = sim.hollowX;
+  if (sim.hollowX > sim.hollowMax) sim.hollowMax = sim.hollowX;
+
+  // Gust: target decays; random bursts arrive on a schedule.
+  if (t > sim.nextGustT) {
+    sim.gustTarget = 1.4 + sim.rng() * 1.8;
+    sim.nextGustT = t + 9 + sim.rng() * 22;
+  }
+  sim.gustTarget *= Math.exp(-dt * 0.7);
+  sim.gust += (sim.gustTarget - sim.gust) * Math.min(1, dt * 3);
+
+  const windBase = 26 + 10 * Math.sin(t * 0.13 + sim.wp1);
+  const windX = windBase * (0.6 + 0.4 * Math.sin(t * 0.07 + sim.wp2)) + sim.gust * 95;
+  const windY = 14 + 8 * Math.sin(t * 0.21 + sim.wp3);
+
+  const sinkX = sim.hollowX;
+  const sinkY = groundY(sim, sim.hollowX) - 30;
+  const hollowGY = groundY(sim, sim.hollowX);
+  const erode = sim.gust > 1.5;
+  const damp = Math.exp(-0.9 * dt);
+
+  for (let i = 0; i < sim.petals.length; i++) {
+    const p = sim.petals[i];
+    if (p.settled) {
+      if (erode && sim.rng() < 0.0011 * sim.gust) liftPetal(sim, p, 60, 200);
+      continue;
+    }
+    // The hollow is a wind shadow: shelter kills wind and turbulence near it,
+    // so petals slow down and drop where the drift gathers.
+    const shx = p.x - sim.hollowX, shy = p.y - hollowGY;
+    const shelter = Math.exp(-(shx * shx + shy * shy) / (75 * 75));
+    const wnd = 1 - 0.88 * shelter;
+    // Intent: steer toward the sink, but each petal loiters on its own slow
+    // orbit around it, so the airborne mass mills as a cloud instead of
+    // stacking on one point.
+    const oa = t * p.orbW + p.orbP;
+    const ltx = sinkX + Math.cos(oa) * p.orbR;
+    const lty = sinkY + Math.sin(oa) * p.orbR * 0.55 - 30;
+    let dx = ltx - p.x, dy = lty - p.y;
+    const d = Math.hypot(dx, dy) || 1;
+    dx /= d; dy /= d;
+    const intent = 85;
+    // Turbulence + flutter (both die inside the shelter).
+    const tx = (46 * Math.sin(t * 1.9 + p.p1) + 20 * Math.sin(t * 4.3 + p.p2)) * wnd;
+    const ty = (38 * Math.sin(t * 1.3 + p.p2) + 16 * Math.sin(t * 3.7 + p.p3)) * wnd;
+    const fl = Math.sin(t * p.flut * Math.PI * 2 + p.p1) * 34 * wnd;
+    const ax = intent * dx + windX * wnd + tx + (-dy) * fl;
+    const ay = intent * dy + windY * wnd + 26 + ty + dx * fl;
+
+    let dampF = damp;
+    const gyPre = groundY(sim, p.x);
+    if (p.y > gyPre - 50) dampF *= Math.exp(-1.6 * dt); // ground drag
+    p.vx = (p.vx + ax * dt) * dampF;
+    p.vy = (p.vy + ay * dt) * dampF;
+    const sp = Math.hypot(p.vx, p.vy);
+    if (sp > 430) { p.vx *= 430 / sp; p.vy *= 430 / sp; }
+
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.rot += p.spin * dt;
+
+    // Ground interaction. Only the hollow's wind shadow lets a petal rest;
+    // everywhere else petals skip along until they reach it.
+    const gy = groundY(sim, p.x);
+    if (p.y >= gy - 3) {
+      if (shelter > 0.4 && sp < 130) {
+        settlePetal(sim, p);
+        continue;
+      }
+      // Skip along the ground.
+      p.y = gy - 3;
+      p.vy = -Math.abs(p.vy) * 0.22;
+      p.vx *= 0.62;
+      p.spin *= 0.7;
+    }
+
+    // Recycle airborne petals that leave the frame.
+    if (p.x < -50) { p.x = W + 40; p.y = sim.rng() * H * 0.5; }
+    else if (p.x > W + 50) { p.x = -40; p.y = sim.rng() * H * 0.5; }
+    if (p.y < -60) { p.y = -50; p.vy = Math.abs(p.vy) * 0.5; }
+    else if (p.y > H + 60) { p.x = sim.rng() * W; p.y = -40; p.vx = (sim.rng() - 0.5) * 40; p.vy = sim.rng() * 30; }
+  }
+}
+
+// Pointer drag: a swirl + push vortex centered on (x, y), strength from
+// pointer velocity (px, py). Disturbs airborne petals, lifts nearby settled ones.
+function applyDragImpulse(sim, x, y, px, py) {
+  const R = 130;
+  const s = Math.min(1.6, Math.hypot(px, py) / 700);
+  if (s < 0.05) return 0;
+  let touched = 0;
+  for (const p of sim.petals) {
+    const dx = p.x - x, dy = p.y - y;
+    const d = Math.hypot(dx, dy);
+    if (d > R || d < 1) continue;
+    const w = 1 - d / R;
+    const nx = dx / d, ny = dy / d;
+    if (p.settled) {
+      if (d < R * 0.55 && sim.rng() < 0.6 * s) liftPetal(sim, p, 30, 120);
+      continue;
+    }
+    const swirl = 300 * s * w;
+    p.vx += (-ny * swirl + nx * 140 * s * w);
+    p.vy += (nx * swirl + ny * 140 * s * w) - 60 * s * w;
+    p.spin += (sim.rng() - 0.5) * 10 * s;
+    touched++;
+  }
+  return touched;
+}
+
+function triggerGust(sim, strength) {
+  sim.gustTarget = Math.max(sim.gustTarget, strength);
+}
+
+function reseedSim(sim, seed) {
+  const fresh = createSim(seed, sim.W, sim.H);
+  for (const k of Object.keys(fresh)) sim[k] = fresh[k];
+}
+
+// ---- Harness helpers ----
+function settledFraction(sim) {
+  return sim.settledCount / sim.petals.length;
+}
+
+function settledCluster(sim) {
+  const hx = sim.hollowX, hy = groundY(sim, sim.hollowX);
+  let within = 0, sx = 0, sy = 0, n = 0;
+  for (const p of sim.petals) {
+    if (!p.settled) continue;
+    n++; sx += p.x; sy += p.y;
+    const d = Math.hypot(p.x - hx, p.y - hy);
+    if (d < 144) within++;
+  }
+  if (!n) return { n: 0, withinFrac: 0, meanDist: 0 };
+  const cx = sx / n, cy = sy / n;
+  let md = 0;
+  for (const p of sim.petals) { if (p.settled) md += Math.hypot(p.x - cx, p.y - cy); }
+  return { n, withinFrac: within / n, meanDist: md / n, cx, cy };
+}
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = {
+    createSim, stepSim, applyDragImpulse, triggerGust, reseedSim,
+    settledFraction, settledCluster, groundY, N_PETALS, DT, mulberry32
+  };
+}
+
+</script>
+<script>
+(function () {
+  "use strict";
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0, DPR = 1;
+
+  function resize() {
+    DPR = Math.min(2, window.devicePixelRatio || 1);
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = Math.round(W * DPR); canvas.height = Math.round(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    if (sim) { sim.W = W; sim.H = H; }
+    buildGrain();
+  }
+
+  var sim = createSim((Date.now() % 2147483647) >>> 0, window.innerWidth, window.innerHeight);
+
+  // Wind streaks: purely visual, advected by the same wind the petals feel,
+  // with a gentle pull toward the sink so the field's convergence is visible.
+  var streaks = [];
+  function spawnStreak(s, anywhere) {
+    s.x = Math.random() * W;
+    s.y = anywhere ? Math.random() * H * 0.92 : (Math.random() < 0.5 ? -10 : Math.random() * H * 0.9);
+    s.life = 160 + Math.random() * 320;
+    s.max = s.life;
+    s.f = 0.7 + Math.random() * 0.6;
+  }
+  function windAt(x, y, t) {
+    var windBase = 26 + 10 * Math.sin(t * 0.13 + sim.wp1);
+    var wx = windBase * (0.6 + 0.4 * Math.sin(t * 0.07 + sim.wp2)) + sim.gust * 95;
+    var wy = 14 + 8 * Math.sin(t * 0.21 + sim.wp3);
+    var sx = sim.hollowX, sy = groundY(sim, sim.hollowX) - 30;
+    var dx = sx - x, dy = sy - y, d = Math.hypot(dx, dy) || 1;
+    var pull = 46 * Math.exp(-d / 620);
+    return [wx + dx / d * pull, wy + dy / d * pull];
+  }
+
+  // Procedural grain: one small noise tile, drawn faintly.
+  var grainCanvas = null;
+  function buildGrain() {
+    grainCanvas = document.createElement('canvas');
+    grainCanvas.width = 128; grainCanvas.height = 128;
+    var g = grainCanvas.getContext('2d');
+    var img = g.createImageData(128, 128);
+    for (var i = 0; i < img.data.length; i += 4) {
+      var v = 118 + Math.random() * 40;
+      img.data[i] = v; img.data[i + 1] = v; img.data[i + 2] = v + 6; img.data[i + 3] = 255;
+    }
+    g.putImageData(img, 0, 0);
+  }
+
+  var TONES = ['#f0b7c4', '#dd8296', '#f6e7df'];
+  var LIGHTS = ['#fadce3', '#f2a9b9', '#fdf4ed'];
+  var RIBS = ['rgba(140,70,85,.4)', 'rgba(120,50,65,.4)', 'rgba(150,110,95,.35)'];
+
+  function drawGround() {
+    ctx.beginPath();
+    ctx.moveTo(0, H);
+    for (var x = 0; x <= W; x += 14) ctx.lineTo(x, groundY(sim, x));
+    ctx.lineTo(W, H);
+    ctx.closePath();
+    ctx.fillStyle = '#0a0c12';
+    ctx.fill();
+    // faint rim light along the ridge so the hollow's dip reads
+    ctx.beginPath();
+    for (var x2 = 0; x2 <= W; x2 += 14) {
+      var y = groundY(sim, x2);
+      if (x2 === 0) ctx.moveTo(x2, y); else ctx.lineTo(x2, y);
+    }
+    ctx.strokeStyle = 'rgba(150,160,200,.14)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  }
+
+  function drawPetal(p) {
+    var s = p.size;
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.rotate(p.rot);
+    if (p.settled) {
+      ctx.fillStyle = 'rgba(0,0,0,.30)';
+      ctx.beginPath();
+      ctx.ellipse(0, s * 0.30, s * 1.02, s * 0.40, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = TONES[p.tone];
+      ctx.beginPath();
+      ctx.ellipse(0, 0, s, s * 0.42, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = LIGHTS[p.tone];
+      ctx.beginPath();
+      ctx.ellipse(s * 0.12, -s * 0.05, s * 0.55, s * 0.24, 0.15, 0, Math.PI * 2);
+      ctx.fill();
+    } else {
+      ctx.strokeStyle = 'rgba(80,35,50,.28)';
+      ctx.lineWidth = 1;
+      ctx.fillStyle = TONES[p.tone];
+      ctx.beginPath();
+      ctx.ellipse(0, 0, s, s * 0.58, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = LIGHTS[p.tone];
+      ctx.beginPath();
+      ctx.ellipse(s * 0.14, -s * 0.06, s * 0.56, s * 0.33, 0.12, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = RIBS[p.tone];
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(-s * 0.72, s * 0.10);
+      ctx.quadraticCurveTo(0, -s * 0.06, s * 0.78, -s * 0.16);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function render() {
+    var t = sim.time;
+    ctx.fillStyle = '#141722';
+    ctx.fillRect(0, 0, W, H);
+
+    // streaks
+    ctx.lineWidth = 1;
+    for (var i = 0; i < streaks.length; i++) {
+      var s = streaks[i];
+      var w = windAt(s.x, s.y, t);
+      var vx = w[0] * s.f, vy = w[1] * s.f;
+      var a = 0.13 * Math.min(1, s.life / 60);
+      ctx.strokeStyle = 'rgba(139,147,184,' + a.toFixed(3) + ')';
+      ctx.beginPath();
+      ctx.moveTo(s.x, s.y);
+      ctx.lineTo(s.x - vx * 0.6, s.y - vy * 0.6);
+      ctx.stroke();
+      s.x += vx * DT; s.y += vy * DT; s.life -= 1;
+      if (s.life <= 0 || s.x < -60 || s.x > W + 60 || s.y > H + 40) spawnStreak(s, false);
+    }
+
+    drawGround();
+
+    var petals = sim.petals;
+    var i;
+    for (i = 0; i < petals.length; i++) if (petals[i].settled) drawPetal(petals[i]);
+    for (i = 0; i < petals.length; i++) if (!petals[i].settled) drawPetal(petals[i]);
+
+    // grain
+    if (grainCanvas) {
+      ctx.save();
+      ctx.globalAlpha = 0.05;
+      var pat = ctx.createPattern(grainCanvas, 'repeat');
+      ctx.fillStyle = pat;
+      ctx.fillRect(0, 0, W, H);
+      ctx.restore();
+    }
+  }
+
+  // Pointer: drag stirs (vortex impulse each frame), tap reseeds.
+  var dragging = false, lastX = 0, lastY = 0, lastT = 0, downX = 0, downY = 0, downT = 0, pvx = 0, pvy = 0;
+  canvas.addEventListener('pointerdown', function (e) {
+    dragging = true;
+    lastX = downX = e.clientX; lastY = downY = e.clientY;
+    lastT = downT = performance.now();
+    pvx = 0; pvy = 0;
+    canvas.setPointerCapture(e.pointerId);
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (!dragging) return;
+    var now = performance.now();
+    var dt = Math.max(1, now - lastT) / 1000;
+    pvx = (e.clientX - lastX) / dt; pvy = (e.clientY - lastY) / dt;
+    lastX = e.clientX; lastY = e.clientY; lastT = now;
+  });
+  function endPointer(e) {
+    if (!dragging) return;
+    dragging = false;
+    var moved = Math.hypot(e.clientX - downX, e.clientY - downY);
+    var held = performance.now() - downT;
+    if (moved < 10 && held < 350) {
+      reseedSim(sim, (Math.random() * 2147483647) >>> 0);
+      for (var i = 0; i < streaks.length; i++) spawnStreak(streaks[i], true);
+    }
+  }
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', endPointer);
+
+  resize();
+  for (var k = 0; k < 70; k++) { var st = {}; spawnStreak(st, true); streaks.push(st); }
+
+  // ?warm=N runs N sim steps before the first frame (used for review shots).
+  try {
+    var warm = parseInt(new URLSearchParams(location.search).get('warm') || '0', 10);
+    for (var q = 0; q < Math.min(warm, 20000); q++) stepSim(sim, DT);
+  } catch (err) { /* ignore */ }
+
+  var last = performance.now(), acc = 0;
+  function frame(now) {
+    var elapsed = Math.min(0.1, (now - last) / 1000);
+    last = now;
+    acc += elapsed;
+    var n = 0;
+    while (acc >= DT && n < 5) { stepSim(sim, DT); acc -= DT; n++; }
+    if (dragging) applyDragImpulse(sim, lastX, lastY, pvx, pvy);
+    render();
+    requestAnimationFrame(frame);
+  }
+  window.addEventListener('resize', resize);
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
