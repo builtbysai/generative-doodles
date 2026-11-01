@@ -1,0 +1,652 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Giochi: The Studio Takes Itself Apart</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #F2EDE2; overflow: hidden; height: 100%; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- constants ----------
+  var PAPER = '#F2EDE2';
+  var WASH = ['#9DB89A', '#D08C60', '#7FA3B8', '#D9A441', '#8C5A6B']; // sage, clay, dusty blue, ochre, plum
+  var DARK = ['#6E8A6C', '#A06A45', '#5D7E93', '#A87F30', '#6E4353']; // darker tones, index-parallel to WASH
+  var TYPES = ['plant', 'chair', 'lamp', 'books', 'mug', 'cat'];
+  var DT = 1 / 120;              // fixed sim timestep (120 Hz)
+  var PREROLL = 2400;            // 20 s of sim before frame one
+  var SAMPLE_EVERY = 15;         // one trail point every 15 steps = 0.125 s
+  var TRAIL_CAP = 400;           // 50 s of trail per sprite
+  var KNOT_SPAN = TRAIL_CAP * SAMPLE_EVERY; // knots live as long as the trail span
+  var FOLLOW_STEPS = 1200;       // 10 s of following
+  var BASE_SEED = 940101;
+
+  // optional seed override (not used by the gallery; frame one uses BASE_SEED)
+  var seedOverride = null;
+  try {
+    var m = /[?&]seed=(\d+)/.exec((typeof location !== 'undefined' && location.search) || '');
+    if (m) seedOverride = parseInt(m[1], 10);
+  } catch (e) { /* no location in some hosts */ }
+
+  // ---------- seeded rng ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('stage');
+  var ctx = canvas.getContext('2d');
+  var viewW = 300, viewH = 300, viewDpr = 1;
+
+  function viewportSize() {
+    var w, h;
+    if (typeof window !== 'undefined' && window.visualViewport &&
+        typeof window.visualViewport.width === 'number') {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    } else if (typeof window !== 'undefined' && typeof window.innerWidth === 'number') {
+      w = window.innerWidth; h = window.innerHeight;
+    }
+    if (!w || !h) { w = 300; h = 300; }
+    return { w: w, h: h };
+  }
+
+  function isPhone() {
+    if (typeof window !== 'undefined' && window.screen &&
+        typeof window.screen.width === 'number' && typeof window.screen.height === 'number') {
+      return Math.min(window.screen.width, window.screen.height) < 700;
+    }
+    var s = viewportSize();
+    return s.h > s.w * 1.15; // aspect fallback only
+  }
+
+  function resize() {
+    var s = viewportSize();
+    viewW = s.w; viewH = s.h;
+    viewDpr = 1;
+    if (typeof window !== 'undefined' && typeof window.devicePixelRatio === 'number') {
+      viewDpr = Math.min(window.devicePixelRatio || 1, 2);
+    }
+    canvas.width = Math.round(viewW * viewDpr);
+    canvas.height = Math.round(viewH * viewDpr);
+    canvas.style.width = viewW + 'px';
+    canvas.style.height = viewH + 'px';
+  }
+
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', function () { resize(); draw(); });
+    }
+    if (window.addEventListener) {
+      window.addEventListener('resize', function () { resize(); draw(); });
+    }
+  }
+
+  // ---------- world generation ----------
+  // World units: height = 1, width = aspect at generation time.
+  var worldW = 1, worldH = 1;
+  var regions = [];   // {pts:[{x,y}...] wobbled outline, ci: wash index, wash: bool}
+  var sites = [];     // voronoi sites {x,y,ci}
+  var sprites = [];
+  var simStep = 0;
+  var generation = 0;
+  var followIdx = -1, followUntil = -1;
+  var pendingEvents = []; // {step, x, y, dx, dy} wind impulses, consumed in step order
+
+  function clipHalf(poly, mx, my, nx, ny) {
+    // keep the side of the bisector where (p - mid) . n <= 0
+    var out = [];
+    for (var i = 0; i < poly.length; i++) {
+      var a = poly[i], b = poly[(i + 1) % poly.length];
+      var da = (a.x - mx) * nx + (a.y - my) * ny;
+      var db = (b.x - mx) * nx + (b.y - my) * ny;
+      if (da <= 0) out.push(a);
+      if ((da < 0 && db > 0) || (da > 0 && db < 0)) {
+        var t = da / (da - db);
+        out.push({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
+      }
+    }
+    return out;
+  }
+
+  function nearestSite(x, y) {
+    var best = 0, bd = Infinity;
+    for (var i = 0; i < sites.length; i++) {
+      var dx = x - sites[i].x, dy = y - sites[i].y, d = dx * dx + dy * dy;
+      if (d < bd) { bd = d; best = i; }
+    }
+    return best;
+  }
+
+  function buildWorld(seed) {
+    var rng = mulberry32(seed);
+    var s0 = viewportSize();
+    worldW = Math.max(0.4, s0.w / s0.h);
+    worldH = 1;
+
+    // --- regions: seeded voronoi-ish cells, clipped to the frame ---
+    // Sites sit on a jittered grid so the cells read as rooms, not wedges.
+    var cols = worldW >= 0.95 ? 3 : 2;
+    var rows = worldW >= 0.95 ? 2 : 3;
+    var nReg = cols * rows; // 6
+    sites = [];
+    var i, j;
+    for (var gy = 0; gy < rows; gy++) {
+      for (var gx = 0; gx < cols; gx++) {
+        sites.push({
+          x: (gx + 0.5) / cols * worldW + (rng() - 0.5) * 0.30 * (worldW / cols),
+          y: (gy + 0.5) / rows + (rng() - 0.5) * 0.30 * (1 / rows),
+          ci: 0
+        });
+      }
+    }
+    // assign wash colors: shuffled palette, cyclic
+    var order = [0, 1, 2, 3, 4];
+    for (i = order.length - 1; i > 0; i--) {
+      j = Math.floor(rng() * (i + 1));
+      var tmp = order[i]; order[i] = order[j]; order[j] = tmp;
+    }
+    for (i = 0; i < nReg; i++) sites[i].ci = order[i % order.length];
+
+    regions = [];
+    for (i = 0; i < nReg; i++) {
+      var poly = [
+        { x: 0, y: 0 }, { x: worldW, y: 0 },
+        { x: worldW, y: worldH }, { x: 0, y: worldH }
+      ];
+      for (j = 0; j < nReg; j++) {
+        if (j === i) continue;
+        var mx = (sites[i].x + sites[j].x) / 2, my = (sites[i].y + sites[j].y) / 2;
+        poly = clipHalf(poly, mx, my, sites[j].x - sites[i].x, sites[j].y - sites[i].y);
+        if (!poly.length) break;
+      }
+      // hand-wobble: displace vertices, split each edge with a jittered midpoint
+      var wob = [];
+      for (var k = 0; k < poly.length; k++) {
+        var a = poly[k], b = poly[(k + 1) % poly.length];
+        var ax = a.x + (rng() - 0.5) * 0.010, ay = a.y + (rng() - 0.5) * 0.010;
+        var ex = b.x - a.x, ey = b.y - a.y;
+        var el = Math.sqrt(ex * ex + ey * ey) || 1;
+        var off = (rng() - 0.5) * 0.016;
+        wob.push({ x: ax, y: ay });
+        wob.push({
+          x: (a.x + b.x) / 2 + (-ey / el) * off,
+          y: (a.y + b.y) / 2 + (ex / el) * off
+        });
+      }
+      regions.push({ pts: wob, ci: sites[i].ci, wash: false });
+    }
+    // 2-3 regions carry the flat light wash
+    var washCount = 2 + Math.floor(rng() * 2);
+    var picked = {};
+    var guard = 0;
+    while (Object.keys(picked).length < Math.min(washCount, nReg) && guard++ < 40) {
+      picked[Math.floor(rng() * nReg)] = true;
+    }
+    for (var key in picked) regions[+key].wash = true;
+
+    // --- sprites ---
+    var count = isPhone() ? 8 : 12;
+    sprites = [];
+    for (i = 0; i < count; i++) {
+      var x = 0.06 + rng() * (worldW - 0.12);
+      var y = 0.08 + rng() * 0.84;
+      var si = nearestSite(x, y);
+      var target = Math.floor(rng() * count);
+      if (target === i) target = (target + 1) % count;
+      sprites.push({
+        type: TYPES[i % TYPES.length],
+        x: x, y: y,
+        vx: (rng() - 0.5) * 0.02, vy: (rng() - 0.5) * 0.02,
+        size: 0.019 + rng() * 0.010,
+        maxSpeed: 0.055 + rng() * 0.040,
+        target: target,
+        roamX: 0.06 + rng() * (worldW - 0.12),
+        roamY: 0.08 + rng() * 0.84,
+        phaseSteps: Math.floor(rng() * 1080),
+        orbitDir: rng() < 0.5 ? -1 : 1,
+        dark: Math.floor(rng() * DARK.length),
+        wobPhase: rng() * Math.PI * 2,
+        wobPhase2: rng() * Math.PI * 2,
+        wobFreq: 1.3 + rng() * 0.9,
+        colorIdx: sites[si].ci,
+        region: si,
+        nextSwitch: Math.round((7 + rng() * 7) * 120),
+        rngSeed: Math.floor(rng() * 1e9),
+        trail: [], // {x, y, c}
+        knots: []  // {x, y, c, step}
+      });
+      var sp = sprites[i];
+      sp.rng = mulberry32(sp.rngSeed);
+      sp.trail.push({ x: sp.x, y: sp.y, c: sp.colorIdx });
+    }
+    simStep = 0;
+    followIdx = -1; followUntil = -1;
+    pendingEvents = [];
+  }
+
+  // ---------- audio (lazy, gesture-gated, guarded) ----------
+  var AC = null, masterGain = null;
+  function ensureAudio() {
+    if (AC) { if (AC.resume) { try { AC.resume(); } catch (e) {} } return; }
+    try {
+      var Ctor = null;
+      if (typeof window !== 'undefined') Ctor = window.AudioContext || window.webkitAudioContext;
+      if (!Ctor) return;
+      AC = new Ctor();
+      masterGain = AC.createGain();
+      masterGain.gain.value = 0.14;
+      masterGain.connect(AC.destination);
+    } catch (e) { AC = null; }
+  }
+  function pluck(freq) {
+    if (!AC || !masterGain) return;
+    try {
+      var t = AC.currentTime;
+      var o = AC.createOscillator(), g = AC.createGain();
+      o.type = 'triangle'; o.frequency.value = freq;
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(0.10, t + 0.012);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.20);
+      o.connect(g); g.connect(masterGain);
+      o.start(t); o.stop(t + 0.22);
+    } catch (e) {}
+  }
+  function tick() {
+    if (!AC || !masterGain) return;
+    try {
+      var t = AC.currentTime;
+      var o = AC.createOscillator(), g = AC.createGain();
+      o.type = 'square'; o.frequency.value = 1900;
+      g.gain.setValueAtTime(0.05, t);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.045);
+      o.connect(g); g.connect(masterGain);
+      o.start(t); o.stop(t + 0.05);
+    } catch (e) {}
+  }
+  function shimmer() {
+    if (!AC || !masterGain) return;
+    try {
+      var t = AC.currentTime;
+      [1560, 2340].forEach(function (f, idx) {
+        var o = AC.createOscillator(), g = AC.createGain();
+        o.type = 'sine'; o.frequency.value = f;
+        g.gain.setValueAtTime(0.0001, t + idx * 0.05);
+        g.gain.exponentialRampToValueAtTime(0.035, t + idx * 0.05 + 0.02);
+        g.gain.exponentialRampToValueAtTime(0.0001, t + idx * 0.05 + 0.30);
+        o.connect(g); g.connect(masterGain);
+        o.start(t + idx * 0.05); o.stop(t + idx * 0.05 + 0.32);
+      });
+    } catch (e) {}
+  }
+
+  // ---------- simulation ----------
+  function stepSim() {
+    simStep++;
+
+    // consume recorded events in step order
+    while (pendingEvents.length && pendingEvents[0].step <= simStep) {
+      var ev = pendingEvents.shift();
+      for (var q = 0; q < sprites.length; q++) {
+        var sq = sprites[q];
+        var dxq = sq.x - ev.x, dyq = sq.y - ev.y;
+        var dq = Math.sqrt(dxq * dxq + dyq * dyq);
+        if (dq < 0.11) {
+          var fall = 1 - dq / 0.11;
+          sq.vx += ev.dx * fall; sq.vy += ev.dy * fall;
+        }
+      }
+    }
+
+    for (var i = 0; i < sprites.length; i++) {
+      var sp = sprites[i];
+      // Behaviour cycle (9 s): chase the target sprite, then roam to a point
+      // of its own. The alternation keeps the studio spread across the map
+      // instead of collapsing into one pursuing knot.
+      var cyc = (simStep + sp.phaseSteps) % 1080;
+      var goalX, goalY, orbiting = false;
+      if (cyc < 630) {
+        var tg = sprites[sp.target];
+        goalX = tg.x; goalY = tg.y; orbiting = true;
+      } else {
+        goalX = sp.roamX; goalY = sp.roamY;
+        var rdx = goalX - sp.x, rdy = goalY - sp.y;
+        if (rdx * rdx + rdy * rdy < 0.05 * 0.05) {
+          sp.roamX = 0.06 + sp.rng() * (worldW - 0.12);
+          sp.roamY = 0.08 + sp.rng() * 0.84;
+          goalX = sp.roamX; goalY = sp.roamY;
+        }
+      }
+      var dx = goalX - sp.x, dy = goalY - sp.y;
+      var dist = Math.sqrt(dx * dx + dy * dy) || 0.0001;
+      var ux = dx / dist, uy = dy / dist;
+      var desX, desY;
+      if (orbiting && dist <= 0.085) {
+        // close to the quarry: slow down and orbit it briefly; the chase never ends
+        var tx = -uy * sp.orbitDir, ty = ux * sp.orbitDir;
+        desX = tx * sp.maxSpeed * 0.55 + ux * sp.maxSpeed * 0.15;
+        desY = ty * sp.maxSpeed * 0.55 + uy * sp.maxSpeed * 0.15;
+      } else if (!orbiting && dist < 0.06) {
+        desX = ux * sp.maxSpeed * (dist / 0.06);
+        desY = uy * sp.maxSpeed * (dist / 0.06);
+      } else {
+        desX = ux * sp.maxSpeed; desY = uy * sp.maxSpeed;
+      }
+      // separation: sprites keep a little personal space
+      for (var o = 0; o < sprites.length; o++) {
+        if (o === i) continue;
+        var so = sprites[o];
+        var sx = sp.x - so.x, sy = sp.y - so.y;
+        var sd = Math.sqrt(sx * sx + sy * sy);
+        if (sd > 0.0001 && sd < 0.06) {
+          var push = (0.06 - sd) / 0.06 * sp.maxSpeed * 1.4;
+          desX += (sx / sd) * push; desY += (sy / sd) * push;
+        }
+      }
+      // wander jitter (deterministic: functions of the step count)
+      var t = simStep * DT;
+      var wob = Math.sin(t * sp.wobFreq + sp.wobPhase) * 0.55 +
+                Math.sin(t * sp.wobFreq * 0.37 + sp.wobPhase2) * 0.45;
+      var ca = Math.cos(wob * 0.65), sa = Math.sin(wob * 0.65);
+      var rx = desX * ca - desY * sa, ry = desX * sa + desY * ca;
+      desX = rx; desY = ry;
+      // soft bounds: steer back inside
+      var M = 0.06;
+      if (sp.x < M) desX += (M - sp.x) * 2.0;
+      if (sp.x > worldW - M) desX -= (sp.x - (worldW - M)) * 2.0;
+      if (sp.y < M) desY += (M - sp.y) * 2.0;
+      if (sp.y > worldH - M) desY -= (sp.y - (worldH - M)) * 2.0;
+
+      var k = Math.min(1, DT * 2.4);
+      sp.vx += (desX - sp.vx) * k;
+      sp.vy += (desY - sp.vy) * k;
+      sp.x += sp.vx * DT;
+      sp.y += sp.vy * DT;
+      if (sp.x < 0.015) sp.x = 0.015;
+      if (sp.x > worldW - 0.015) sp.x = worldW - 0.015;
+      if (sp.y < 0.015) sp.y = 0.015;
+      if (sp.y > worldH - 0.015) sp.y = worldH - 0.015;
+
+      // trail sampling
+      if (simStep % SAMPLE_EVERY === 0) {
+        sp.trail.push({ x: sp.x, y: sp.y, c: sp.colorIdx });
+        if (sp.trail.length > TRAIL_CAP) sp.trail.shift();
+        var ns = nearestSite(sp.x, sp.y);
+        if (ns !== sp.region) {
+          sp.region = ns;
+          if (AC && regions[ns] && regions[ns].wash) shimmer();
+        }
+      }
+
+      // tired point: the line leaves its color mid-stroke
+      if (simStep >= sp.nextSwitch) {
+        var nc = Math.floor(sp.rng() * (WASH.length - 1));
+        if (nc >= sp.colorIdx) nc++;
+        sp.colorIdx = nc;
+        sp.knots.push({ x: sp.x, y: sp.y, c: nc, step: simStep });
+        sp.nextSwitch = simStep + Math.round((7 + sp.rng() * 7) * 120);
+        if (AC) tick();
+      }
+    }
+
+    // gentle patter of plucks, one sprite at a time, live only
+    if (AC && simStep % 48 === 0 && sprites.length) {
+      var spr = sprites[Math.floor(simStep / 48) % sprites.length];
+      pluck(340 + (0.030 - spr.size) * 9000);
+    }
+  }
+
+  function preroll() {
+    for (var i = 0; i < PREROLL; i++) stepSim();
+  }
+
+  // ---------- drawing ----------
+  function drawSprite(sp, S) {
+    var s = sp.size * S;
+    var col = DARK[sp.dark];
+    ctx.fillStyle = col;
+    ctx.strokeStyle = col;
+    if (sp.type === 'plant') {
+      ctx.lineWidth = Math.max(1.2, s * 0.10);
+      ctx.beginPath(); ctx.moveTo(0, s * 0.9); ctx.lineTo(0, -s * 0.5); ctx.stroke();
+      var leafA = [-0.65, 0, 0.65];
+      for (var i = 0; i < 3; i++) {
+        ctx.save();
+        ctx.translate(0, -s * (0.35 + i * 0.28));
+        ctx.rotate(leafA[i]);
+        ctx.beginPath(); ctx.ellipse(0, -s * 0.34, s * 0.20, s * 0.40, 0, 0, Math.PI * 2); ctx.fill();
+        ctx.restore();
+      }
+      ctx.fillRect(-s * 0.42, s * 0.78, s * 0.84, s * 0.26); // pot
+    } else if (sp.type === 'chair') {
+      ctx.fillRect(-s * 0.45, -s * 1.0, s * 0.30, s * 1.05);  // back
+      ctx.fillRect(-s * 0.45, -s * 0.05, s * 1.05, s * 0.26); // seat
+      ctx.fillRect(-s * 0.40, s * 0.21, s * 0.18, s * 0.80);  // leg
+      ctx.fillRect(s * 0.42, s * 0.21, s * 0.18, s * 0.80);   // leg
+    } else if (sp.type === 'lamp') {
+      ctx.beginPath();
+      ctx.moveTo(0, -s * 1.0); ctx.lineTo(s * 0.62, -s * 0.15); ctx.lineTo(-s * 0.62, -s * 0.15);
+      ctx.closePath(); ctx.fill();                            // shade
+      ctx.lineWidth = Math.max(1.2, s * 0.10);
+      ctx.beginPath(); ctx.moveTo(0, -s * 0.15); ctx.lineTo(0, s * 0.85); ctx.stroke();
+      ctx.fillRect(-s * 0.45, s * 0.85, s * 0.90, s * 0.16);  // base
+    } else if (sp.type === 'books') {
+      ctx.fillRect(-s * 0.62, s * 0.42, s * 1.24, s * 0.30);
+      ctx.fillRect(-s * 0.52, s * 0.10, s * 1.08, s * 0.30);
+      ctx.fillRect(-s * 0.44, -s * 0.22, s * 0.92, s * 0.30);
+    } else if (sp.type === 'mug') {
+      ctx.fillRect(-s * 0.48, -s * 0.52, s * 0.96, s * 1.10);
+      ctx.lineWidth = Math.max(1.2, s * 0.13);
+      ctx.beginPath(); ctx.arc(s * 0.62, s * 0.03, s * 0.34, -Math.PI / 2, Math.PI / 2); ctx.stroke();
+    } else { // cat, rotated to heading
+      var ang = Math.atan2(sp.vy, sp.vx);
+      ctx.rotate(ang);
+      ctx.beginPath(); ctx.ellipse(0, 0, s * 0.95, s * 0.58, 0, 0, Math.PI * 2); ctx.fill(); // body
+      ctx.beginPath(); ctx.arc(s * 0.85, -s * 0.18, s * 0.42, 0, Math.PI * 2); ctx.fill();   // head
+      ctx.beginPath();
+      ctx.moveTo(s * 0.58, -s * 0.48); ctx.lineTo(s * 0.72, -s * 0.82); ctx.lineTo(s * 0.86, -s * 0.52);
+      ctx.closePath(); ctx.fill();                                                            // ear
+      ctx.beginPath();
+      ctx.moveTo(s * 0.94, -s * 0.52); ctx.lineTo(s * 1.12, -s * 0.80); ctx.lineTo(s * 1.16, -s * 0.44);
+      ctx.closePath(); ctx.fill();                                                            // ear
+      ctx.lineWidth = Math.max(1.2, s * 0.12);
+      ctx.beginPath(); ctx.moveTo(-s * 0.9, 0); ctx.quadraticCurveTo(-s * 1.35, -s * 0.3, -s * 1.25, -s * 0.75); ctx.stroke(); // tail
+    }
+  }
+
+  function draw() {
+    // house rule: pin the canvas CSS size on every draw
+    canvas.style.width = viewW + 'px';
+    canvas.style.height = viewH + 'px';
+    ctx.setTransform(viewDpr, 0, 0, viewDpr, 0, 0);
+    ctx.fillStyle = PAPER;
+    ctx.fillRect(0, 0, viewW, viewH);
+
+    var S = Math.min(viewW / worldW, viewH / worldH); // px per world unit
+    var ox = (viewW - worldW * S) / 2, oy = (viewH - worldH * S) / 2;
+    function X(x) { return ox + x * S; }
+    function Y(y) { return oy + y * S; }
+
+    // regions (flat matte)
+    var i, j;
+    for (i = 0; i < regions.length; i++) {
+      var r = regions[i];
+      ctx.beginPath();
+      for (j = 0; j < r.pts.length; j++) {
+        if (j === 0) ctx.moveTo(X(r.pts[j].x), Y(r.pts[j].y));
+        else ctx.lineTo(X(r.pts[j].x), Y(r.pts[j].y));
+      }
+      ctx.closePath();
+      ctx.fillStyle = WASH[r.ci];
+      ctx.fill();
+      if (r.wash) {
+        ctx.fillStyle = 'rgba(255,255,255,0.2)';
+        ctx.fill();
+      }
+    }
+
+    // trails: fresh from the history buffers every frame
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    for (i = 0; i < sprites.length; i++) {
+      var sp = sprites[i];
+      var pts = sp.trail;
+      var bright = (i === followIdx && simStep < followUntil) ? 0.22 : 0;
+      ctx.lineWidth = Math.max(1.4, 0.0035 * S);
+      for (j = 1; j < pts.length; j++) {
+        var frac = j / (pts.length - 1 || 1);
+        ctx.strokeStyle = WASH[pts[j].c];
+        ctx.globalAlpha = 0.16 + 0.60 * frac + bright;
+        ctx.beginPath();
+        ctx.moveTo(X(pts[j - 1].x), Y(pts[j - 1].y));
+        ctx.lineTo(X(pts[j].x), Y(pts[j].y));
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+      // knots: the exact points where a line got tired of its color
+      for (j = 0; j < sp.knots.length; j++) {
+        var kn = sp.knots[j];
+        var age = (simStep - kn.step) / KNOT_SPAN;
+        if (age > 1) continue;
+        ctx.globalAlpha = 0.95 - 0.45 * age;
+        ctx.fillStyle = WASH[kn.c];
+        ctx.beginPath();
+        ctx.arc(X(kn.x), Y(kn.y), Math.max(2, 0.006 * S), 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    // sprites
+    for (i = 0; i < sprites.length; i++) {
+      ctx.save();
+      ctx.translate(X(sprites[i].x), Y(sprites[i].y));
+      drawSprite(sprites[i], S);
+      ctx.restore();
+    }
+
+    // follow ring
+    if (followIdx >= 0 && followIdx < sprites.length && simStep < followUntil) {
+      var fs = sprites[followIdx];
+      var rr = fs.size * S * 2.1 * (1 + 0.06 * Math.sin(simStep * DT * 3.2));
+      ctx.beginPath(); ctx.arc(X(fs.x), Y(fs.y), rr, 0, Math.PI * 2);
+      ctx.strokeStyle = 'rgba(35,33,28,0.25)';
+      ctx.lineWidth = 3.5;
+      ctx.stroke();
+      ctx.beginPath(); ctx.arc(X(fs.x), Y(fs.y), rr, 0, Math.PI * 2);
+      ctx.strokeStyle = 'rgba(255,255,255,0.9)';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+  }
+
+  // ---------- interaction ----------
+  function toWorld(cx, cy) {
+    var S = Math.min(viewW / worldW, viewH / worldH);
+    var ox = (viewW - worldW * S) / 2, oy = (viewH - worldH * S) / 2;
+    return { x: (cx - ox) / S, y: (cy - oy) / S, S: S };
+  }
+  var pDown = null, lastTapT = -1000, lastWindPt = null;
+
+  function onDown(e) {
+    ensureAudio();
+    var p = toWorld(e.clientX, e.clientY);
+    pDown = { x: p.x, y: p.y, t: e.timeStamp || 0, moved: 0 };
+    lastWindPt = { x: p.x, y: p.y };
+  }
+  function onMove(e) {
+    if (!pDown) return;
+    var p = toWorld(e.clientX, e.clientY);
+    var ddx = p.x - pDown.x, ddy = p.y - pDown.y;
+    pDown.moved = Math.max(pDown.moved, Math.sqrt(ddx * ddx + ddy * ddy));
+    if (lastWindPt) {
+      var wx = p.x - lastWindPt.x, wy = p.y - lastWindPt.y;
+      var wl = Math.sqrt(wx * wx + wy * wy);
+      if (wl > 0.012) {
+        // the wind: a recorded impulse, consumed by the sim in step order
+        var cap = 0.30, sc = wl > cap ? cap / wl : 1;
+        pendingEvents.push({
+          step: simStep + 1, x: p.x, y: p.y,
+          dx: wx * sc * 2.2, dy: wy * sc * 2.2
+        });
+        pendingEvents.sort(function (a, b) { return a.step - b.step; });
+        lastWindPt = { x: p.x, y: p.y };
+      }
+    }
+  }
+  function onUp(e) {
+    if (!pDown) return;
+    var p = toWorld(e.clientX, e.clientY);
+    var dur = (e.timeStamp || 0) - pDown.t;
+    var wasTap = dur < 350 && pDown.moved < 0.02;
+    pDown = null; lastWindPt = null;
+    if (!wasTap) return;
+    var now = e.timeStamp || 0;
+    if (now - lastTapT < 350) {
+      // double-tap: rearrange the studio (new layout, new pairings, same pre-roll)
+      generation++;
+      buildWorld((seedOverride !== null ? seedOverride : BASE_SEED) + generation * 1013);
+      preroll();
+      draw();
+      lastTapT = -1000;
+      return;
+    }
+    lastTapT = now;
+    // tap: follow the nearest sprite, if any is near
+    var best = -1, bd = Infinity;
+    for (var i = 0; i < sprites.length; i++) {
+      var dx = sprites[i].x - p.x, dy = sprites[i].y - p.y;
+      var d = dx * dx + dy * dy;
+      if (d < bd) { bd = d; best = i; }
+    }
+    if (best >= 0 && bd < 0.045 * 0.045) {
+      followIdx = best;
+      followUntil = simStep + FOLLOW_STEPS;
+      draw();
+    }
+  }
+
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', function () { pDown = null; lastWindPt = null; });
+  }
+
+  // ---------- boot: build, pre-roll, frame one, then the live loop ----------
+  resize();
+  buildWorld(seedOverride !== null ? seedOverride : BASE_SEED);
+  preroll();
+  draw(); // frame one: the synchronous draw after exactly 2400 steps
+
+  if (typeof requestAnimationFrame === 'function') {
+    var lastTs = null, acc = 0;
+    var frame = function (ts) {
+      if (lastTs === null) lastTs = ts;
+      var el = (ts - lastTs) / 1000;
+      lastTs = ts;
+      if (el > 0.1) el = 0.1;
+      acc += el;
+      var n = 0;
+      while (acc >= DT && n < 30) { stepSim(); acc -= DT; n++; }
+      if (n === 30) acc = 0;
+      draw();
+      requestAnimationFrame(frame);
+    };
+    requestAnimationFrame(frame);
+  }
+})();
+</script>
+</body>
+</html>
