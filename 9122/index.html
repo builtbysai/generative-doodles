@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<!-- piece-9122-windstack -->
+<title>Windstack</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #0b0e1c; }
+  #sky { display: block; width: 100vw; height: 100vh; touch-action: none; cursor: crosshair; }
+  #hint {
+    position: fixed; left: 0; right: 0; bottom: 14px; text-align: center;
+    font: 12px/1.4 -apple-system, "Segoe UI", system-ui, sans-serif;
+    letter-spacing: 0.08em; color: rgba(215, 222, 245, 0.55);
+    pointer-events: none; transition: opacity 1.2s ease; user-select: none;
+    padding: 0 12px;
+  }
+  @media (max-width: 480px) {
+    #hint { font-size: 11px; letter-spacing: 0.04em; bottom: 10px; }
+  }
+</style>
+</head>
+<body>
+<canvas id="sky"></canvas>
+<div id="hint">drag shifts the wind &middot; tap releases a balloon &middot; double-tap reseeds the sky</div>
+<script>
+// Windstack driver core — pure functions, no DOM. Shared verbatim by index.html.
+'use strict';
+
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+const LANE_COUNT = 6;
+const START_BALLOONS = 18;
+const MAX_BALLOONS = 28;
+const RECYCLE_TOP = -80;
+
+// Build the wind column: lanes with thickness fractions summing to 1,
+// each lane: dir (+1/-1), speed px/s, gust phase.
+function buildLanes(rand, H) {
+  const lanes = [];
+  // random thickness fractions, min 0.10, normalized to sum 1
+  const raw = [];
+  let sum = 0;
+  for (let i = 0; i < LANE_COUNT; i++) { const v = 0.10 + rand() * 0.12; raw.push(v); sum += v; }
+  let y = 0;
+  for (let i = 0; i < LANE_COUNT; i++) {
+    const frac = raw[i] / sum;
+    let dir = rand() < 0.5 ? -1 : 1;
+    let speed = 8 + rand() * 62; // 8..70
+    // enforce C1 vs previous lane: differ by >=12 or direction differs
+    if (i > 0) {
+      const p = lanes[i - 1];
+      if (dir === p.dir && Math.abs(speed - p.speed) < 12) {
+        if (rand() < 0.5) {
+          dir = -dir;
+        } else {
+          const ns = speed >= p.speed ? p.speed + 12 : p.speed - 12;
+          if (ns > 70 || ns < 8) dir = -dir; else speed = ns;
+        }
+      }
+    }
+    lanes.push({
+      y0: y, y1: y + frac * H,
+      dir, speed,
+      gustPhase: rand() * Math.PI * 2,
+      thickness: frac,
+    });
+    y += frac * H;
+  }
+  lanes[LANE_COUNT - 1].y1 = H;
+  return lanes;
+}
+
+// Pure: which lane contains height y (clamped).
+function laneAt(lanes, y) {
+  if (y <= lanes[0].y0) return 0;
+  for (let i = 0; i < lanes.length; i++) {
+    if (y < lanes[i].y1) return i;
+  }
+  return lanes.length - 1;
+}
+
+// Pure: wind horizontal velocity at (y, t) for lane index li.
+function laneWind(lanes, li, y, t) {
+  const L = lanes[li];
+  const gust = 18 * Math.sin((2 * Math.PI * t) / 7 + y * 0.01 + L.gustPhase);
+  return L.dir * L.speed + gust;
+}
+
+function makeBalloon(rand, W, H, id, x, y) {
+  return {
+    id,
+    x: x !== undefined ? x : rand() * W,
+    y: y !== undefined ? y : rand() * H,
+    buoyancy: 14 + rand() * 20,          // 14..34 px/s rise
+    swayAmp: 4 + rand() * 10,
+    swayFreq: 0.4 + rand() * 0.8,
+    phase: rand() * Math.PI * 2,
+    size: 26 + rand() * 30,              // envelope height px
+    shape: Math.floor(rand() * 3),       // 0 round, 1 tall oval, 2 pear
+    pigment: Math.floor(rand() * 5),
+    vx: 0,
+  };
+}
+
+function buildSky(seed, W, H) {
+  const rand = mulberry32(seed);
+  const lanes = buildLanes(rand, H);
+  const balloons = [];
+  for (let i = 0; i < START_BALLOONS; i++) balloons.push(makeBalloon(rand, W, H, i));
+  return { seed, W, H, t: 0, lanes, balloons, nextId: START_BALLOONS, rand };
+}
+
+// Pure-ish step: advances sky by dt seconds. Mutates sky (called from render loop
+// and from the node harness).
+function stepSky(sky, dt) {
+  sky.t += dt;
+  const { lanes, balloons, W, H } = sky;
+  for (const b of balloons) {
+    const li = laneAt(lanes, b.y);
+    const wind = laneWind(lanes, li, b.y, sky.t);
+    b.vx = wind;
+    b.x += (b.vx + Math.sin(sky.t * b.swayFreq + b.phase) * b.swayAmp) * dt;
+    b.y -= b.buoyancy * dt;
+    // horizontal wrap with margin
+    const m = 60;
+    if (b.x < -m) b.x += W + 2 * m;
+    if (b.x > W + m) b.x -= W + 2 * m;
+    // recycle at top
+    if (b.y < RECYCLE_TOP) {
+      b.y = H + 40 + sky.rand() * 60;
+      b.x = sky.rand() * W;
+      b.buoyancy = 14 + sky.rand() * 20;
+    }
+  }
+}
+
+// Disturb: vertical drag shifts lane boundaries by dy px total (clamped so every
+// lane keeps >= 6% of H). Returns total applied shift.
+function shiftLanes(sky, dy) {
+  const H = sky.H;
+  const minT = 0.06 * H;
+  const lanes = sky.lanes;
+  // shift boundaries: move each interior boundary by dy scaled, then clamp
+  const bounds = [];
+  for (let i = 1; i < lanes.length; i++) bounds.push(lanes[i].y0);
+  let applied = 0;
+  for (let k = 0; k < bounds.length; k++) {
+    let nb = bounds[k] + dy;
+    const lo = (k === 0 ? 0 : bounds[k - 1]) + minT;
+    const hi = (k === bounds.length - 1 ? H : bounds[k + 1]) - minT;
+    // clamp against already-shifted neighbors sequentially
+    const prevB = k === 0 ? 0 : bounds[k - 1];
+    const nextB = k === bounds.length - 1 ? H : bounds[k + 1];
+    nb = Math.max(prevB + minT, Math.min(nextB - minT, nb));
+    applied += nb - bounds[k];
+    bounds[k] = nb;
+  }
+  for (let i = 0; i < lanes.length; i++) {
+    lanes[i].y0 = i === 0 ? 0 : bounds[i - 1];
+    lanes[i].y1 = i === lanes.length - 1 ? H : bounds[i];
+    lanes[i].thickness = (lanes[i].y1 - lanes[i].y0) / H;
+  }
+  return applied;
+}
+
+// Gust impulse near point (px, py), radius r: adds horizontal velocity kick.
+// Implemented as immediate x displacement decaying — stored per balloon as kick.
+function gustKick(sky, px, py, dx) {
+  const r = 140;
+  for (const b of sky.balloons) {
+    const d = Math.hypot(b.x - px, b.y - py);
+    if (d < r) b.x += dx * (1 - d / r) * 0.6;
+  }
+}
+
+// Tap: release a balloon at (x, y). At cap, replaces the oldest (index 0).
+function releaseBalloon(sky, x, y) {
+  const b = makeBalloon(sky.rand, sky.W, sky.H, sky.nextId++, x, y);
+  b.buoyancy = 20 + sky.rand() * 14; // released balloons rise eagerly
+  if (sky.balloons.length >= MAX_BALLOONS) {
+    sky.balloons.shift();
+  }
+  sky.balloons.push(b);
+  return b;
+}
+
+function reseedSky(sky, newSeed) {
+  const fresh = buildSky(newSeed, sky.W, sky.H);
+  sky.seed = newSeed;
+  sky.lanes = fresh.lanes;
+  sky.balloons = fresh.balloons;
+  sky.nextId = fresh.nextId;
+  sky.rand = fresh.rand;
+  sky.t = 0;
+}
+
+// Export for node harness; in browser the same file is inlined so names are global.
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = {
+    mulberry32, buildLanes, laneAt, laneWind, makeBalloon, buildSky,
+    stepSky, shiftLanes, gustKick, releaseBalloon, reseedSky,
+    LANE_COUNT, START_BALLOONS, MAX_BALLOONS,
+  };
+}
+
+</script>
+<script>
+(function () {
+  'use strict';
+  var canvas = document.getElementById('sky');
+  var ctx = canvas.getContext('2d');
+  var hint = document.getElementById('hint');
+
+  var PIGMENTS = ['#C96F4A', '#D9A441', '#E6D9BE', '#7A8B6F', '#8E3B46'];
+  var BG = '#0b0e1c';
+  var W = 0, H = 0, DPR = 1;
+
+  var SEED = 20261101;
+  var sky = null;
+  var streams = [];   // visual wind dashes: {x, y, lane}
+  var stars = [];     // {x, y, r, tw}
+  var farRidge = [];  // distant ridge silhouette (behind balloons)
+  var nearRidge = []; // near ridge silhouette (balloons rise from behind it)
+
+  function ridgePoints(vr, baseY, maxH) {
+    var pts = [];
+    var x = -20;
+    pts.push([x, baseY + 40]);
+    while (x < W + 20) {
+      var segW = 70 + vr() * 200;
+      var top = baseY - vr() * maxH;
+      var inset = 0.12 + vr() * 0.18;
+      pts.push([x + segW * inset, baseY + 40]);
+      pts.push([x + segW * (inset + 0.04), top]);
+      pts.push([x + segW * (1 - inset - 0.04), top]);
+      pts.push([x + segW * (1 - inset), baseY + 40]);
+      x += segW;
+    }
+    pts.push([W + 20, baseY + 40]);
+    return pts;
+  }
+
+  function drawRidge(pts, fill, edge) {
+    ctx.beginPath();
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    for (var i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+    ctx.closePath();
+    ctx.fillStyle = fill;
+    ctx.fill();
+    if (edge) {
+      ctx.strokeStyle = edge;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(pts[0][0], pts[0][1]);
+      for (var j = 1; j < pts.length; j++) ctx.lineTo(pts[j][0], pts[j][1]);
+      ctx.stroke();
+    }
+  }
+
+  function buildVisuals() {
+    var vr = mulberry32(sky.seed + 1);
+    streams = [];
+    for (var li = 0; li < sky.lanes.length; li++) {
+      var L = sky.lanes[li];
+      var n = Math.max(12, Math.floor(W / 36));
+      for (var k = 0; k < n; k++) {
+        streams.push({ x: vr() * W, y: L.y0 + vr() * (L.y1 - L.y0), lane: li });
+      }
+    }
+    stars = [];
+    var ns = Math.floor(W * H / 9000);
+    for (var s = 0; s < ns; s++) {
+      stars.push({ x: vr() * W, y: vr() * H * 0.92, r: vr() < 0.85 ? 1 : 1.6, tw: vr() * 6.28 });
+    }
+    // two-tier mesa ridge along the bottom
+    farRidge = ridgePoints(vr, H * 0.945, H * 0.045);
+    nearRidge = ridgePoints(vr, H * 0.978, H * 0.075);
+  }
+
+  function resize() {
+    DPR = Math.min(2, window.devicePixelRatio || 1);
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = Math.floor(W * DPR); canvas.height = Math.floor(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    hint.innerHTML = W < 520
+      ? 'drag shifts the wind &middot; tap releases &middot; double-tap reseeds'
+      : 'drag shifts the wind &middot; tap releases a balloon &middot; double-tap reseeds the sky';
+    var keepSeed = sky ? sky.seed : SEED;
+    sky = buildSky(keepSeed, W, H);
+    buildVisuals();
+  }
+
+  function envelopePath(b) {
+    var w = b.size * 0.82, h = b.size;
+    ctx.beginPath();
+    if (b.shape === 0) {
+      ctx.ellipse(0, 0, w / 2, h / 2, 0, 0, 6.2832);
+    } else if (b.shape === 1) {
+      ctx.ellipse(0, 0, w * 0.38, h / 2, 0, 0, 6.2832);
+    } else {
+      // pear: narrow mouth at bottom, full crown
+      ctx.moveTo(-w * 0.14, h * 0.30);
+      ctx.bezierCurveTo(-w * 0.52, h * 0.18, -w * 0.5, -h * 0.28, 0, -h * 0.5);
+      ctx.bezierCurveTo(w * 0.5, -h * 0.28, w * 0.52, h * 0.18, w * 0.14, h * 0.30);
+      ctx.quadraticCurveTo(0, h * 0.38, -w * 0.14, h * 0.30);
+    }
+  }
+
+  function drawBalloon(b) {
+    var h = b.size, w = b.size * 0.82;
+    ctx.save();
+    ctx.translate(b.x, b.y);
+    var tilt = Math.max(-0.22, Math.min(0.22, b.vx * 0.0016));
+    ctx.rotate(tilt);
+    // envelope
+    envelopePath(b);
+    ctx.fillStyle = PIGMENTS[b.pigment % PIGMENTS.length];
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = 'rgba(8, 6, 18, 0.55)';
+    ctx.stroke();
+    // gore seams
+    ctx.strokeStyle = 'rgba(8, 6, 18, 0.18)';
+    ctx.lineWidth = 1;
+    for (var g = -1; g <= 1; g += 2) {
+      ctx.beginPath();
+      ctx.moveTo(g * w * 0.18, -h * 0.42);
+      ctx.quadraticCurveTo(g * w * 0.30, 0, g * w * 0.10, h * 0.30);
+      ctx.stroke();
+    }
+    // tethers + basket
+    var mouthY = h * 0.34, basketY = h * 0.52, bw = w * 0.20;
+    ctx.strokeStyle = 'rgba(10, 8, 16, 0.8)';
+    ctx.lineWidth = 1.4;
+    ctx.beginPath();
+    ctx.moveTo(-w * 0.10, mouthY); ctx.lineTo(-bw / 2, basketY);
+    ctx.moveTo(w * 0.10, mouthY); ctx.lineTo(bw / 2, basketY);
+    ctx.stroke();
+    ctx.fillStyle = '#2e2318';
+    ctx.beginPath();
+    ctx.moveTo(-bw / 2, basketY); ctx.lineTo(bw / 2, basketY);
+    ctx.lineTo(bw * 0.36, basketY + 11); ctx.lineTo(-bw * 0.36, basketY + 11);
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+
+  function frame(now) {
+    var dt = Math.min(0.05, (now - (frame.last || now)) / 1000);
+    frame.last = now;
+    stepSky(sky, dt);
+    var t = sky.t;
+
+    ctx.fillStyle = BG;
+    ctx.fillRect(0, 0, W, H);
+
+    // stars
+    for (var i = 0; i < stars.length; i++) {
+      var st = stars[i];
+      var a = 0.25 + 0.35 * (0.5 + 0.5 * Math.sin(t * 0.9 + st.tw));
+      ctx.fillStyle = 'rgba(210, 218, 245,' + a.toFixed(3) + ')';
+      ctx.fillRect(st.x, st.y, st.r, st.r);
+    }
+
+    // wind streams, advected by the same lane wind the balloons feel
+    ctx.lineWidth = 1;
+    for (var s = 0; s < streams.length; s++) {
+      var d = streams[s];
+      var L = sky.lanes[d.lane];
+      var wv = laneWind(sky.lanes, d.lane, d.y, t);
+      d.x += wv * dt;
+      var m = 30;
+      if (d.x < -m) d.x += W + 2 * m;
+      if (d.x > W + m) d.x -= W + 2 * m;
+      // keep dash inside its lane after a drag-shift
+      if (d.y < L.y0 || d.y > L.y1) {
+        var span = Math.max(1, L.y1 - L.y0);
+        d.y = L.y0 + (((d.y - L.y0) % span) + span) % span;
+      }
+      var len = 4 + Math.min(22, Math.abs(L.speed) * 0.32);
+      var alpha = 0.08 + Math.min(0.10, Math.abs(L.speed) / 700);
+      ctx.strokeStyle = 'rgba(190, 200, 235,' + alpha.toFixed(3) + ')';
+      ctx.beginPath();
+      ctx.moveTo(d.x - len / 2, d.y);
+      ctx.lineTo(d.x + len / 2, d.y);
+      ctx.stroke();
+    }
+
+    // lane boundaries + edge direction ticks
+    ctx.strokeStyle = 'rgba(190, 200, 235, 0.10)';
+    ctx.lineWidth = 1;
+    for (var li = 1; li < sky.lanes.length; li++) {
+      var by = sky.lanes[li].y0;
+      ctx.beginPath(); ctx.moveTo(0, by); ctx.lineTo(W, by); ctx.stroke();
+    }
+    ctx.font = '11px system-ui, sans-serif';
+    for (var q = 0; q < sky.lanes.length; q++) {
+      var Lq = sky.lanes[q];
+      var cy = (Lq.y0 + Lq.y1) / 2;
+      ctx.fillStyle = 'rgba(190, 200, 235, 0.30)';
+      var arrow = Lq.dir > 0 ? '\u25B8' : '\u25C2';
+      ctx.fillText(arrow, 8, cy + 4);
+      ctx.fillText(arrow, W - 18, cy + 4);
+    }
+
+    // distant ridge, then balloons, then near ridge (they rise from behind it)
+    drawRidge(farRidge, '#10132a', 'rgba(150, 160, 200, 0.10)');
+
+    // balloons
+    for (var bi = 0; bi < sky.balloons.length; bi++) drawBalloon(sky.balloons[bi]);
+
+    drawRidge(nearRidge, '#04050a', 'rgba(150, 160, 200, 0.14)');
+
+    requestAnimationFrame(frame);
+  }
+
+  // ---- interaction: drag disturbs, tap releases, double-tap reseeds ----
+  var pDown = null, lastTap = 0, hintHidden = false;
+  function hideHint() {
+    if (!hintHidden) { hintHidden = true; hint.style.opacity = '0'; }
+  }
+  setTimeout(hideHint, 9000);
+
+  canvas.addEventListener('pointerdown', function (e) {
+    pDown = { x: e.clientX, y: e.clientY, t: performance.now(), moved: 0, lx: e.clientX, ly: e.clientY };
+    canvas.setPointerCapture(e.pointerId);
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (!pDown) return;
+    var dx = e.clientX - pDown.lx, dy = e.clientY - pDown.ly;
+    pDown.moved += Math.abs(dx) + Math.abs(dy);
+    if (pDown.moved > 12) {
+      hideHint();
+      shiftLanes(sky, dy);                    // vertical drag reorganizes the wind
+      if (Math.abs(dx) > 1) gustKick(sky, e.clientX, e.clientY, dx * 2.2); // horizontal drag gusts
+    }
+    pDown.lx = e.clientX; pDown.ly = e.clientY;
+  });
+  canvas.addEventListener('pointerup', function (e) {
+    if (!pDown) return;
+    var quick = performance.now() - pDown.t < 350;
+    if (pDown.moved <= 12 && quick) {
+      hideHint();
+      var now = performance.now();
+      if (now - lastTap < 350) {
+        reseedSky(sky, (Math.random() * 1e9) | 0); // double-tap: a new sky
+        buildVisuals();
+        lastTap = 0;
+      } else {
+        releaseBalloon(sky, e.clientX, e.clientY); // tap: release a balloon here
+        lastTap = now;
+      }
+    }
+    pDown = null;
+  });
+  window.addEventListener('resize', resize);
+  resize();
+  // debug hook for headless interaction tests (invisible to visitors)
+  window.__windstack = {
+    sky: function () { return sky; },
+    shiftLanes: shiftLanes,
+    releaseBalloon: releaseBalloon,
+    reseedSky: reseedSky,
+    laneAt: laneAt
+  };
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
