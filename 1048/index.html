@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Five White Cubes</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #08090B; height: 100%; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+/*
+ * No.1048 "Five White Cubes" (study #129 katsuhiko-harada, PP209
+ * "The Omni-Wheel Origin"). Five identical white cubes on a dark floor,
+ * moving holonomically: position and orientation are separate schedules.
+ * A cube strafes sideways while slowly rotating, translates without
+ * turning, stops dead, rotates in place (the omni signature), then sets
+ * off sideways. No turning arcs, no banking: motion a car cannot do.
+ * Every route is a closed-form list of legs over a 60 s loop, so frame
+ * one (fixed phase T0 = 18 s) and every trail are analytic functions of
+ * piece time plus recorded gesture events.
+ */
+
+// ---------- palette (strict) ----------
+var FLOOR  = '#08090B';
+var CUBEC  = '#F2F2F0';
+var SHADOW = '#1A1C20';
+var TRAILC = '#7FD4FF';
+var TICKC  = '#FFE9B8';
+
+// ---------- constants ----------
+var LOOP = 60;
+var T0 = 18;
+var WORLD = 1000;
+var CUBE_SIZE = 48;      // world units
+var TRAIL_WIN = 7;       // seconds of recorded path per cube
+var TICK_WIN = 1.1;      // seconds a correction tick stays visible
+
+// ==== PURE MODEL BEGIN ====
+// ---------- seeded rng ----------
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+function smooth(u) { return u * u * (3 - 2 * u); }
+
+// ---------- holonomic route generation ----------
+// A route is a list of legs covering exactly LOOP seconds.
+//   move leg: position lerps P0 -> P1 at constant velocity; orientation
+//             drifts linearly by dth (independent of the travel direction:
+//             the cube may face anywhere while it translates).
+//   spin leg: position fixed; orientation turns by dth with a smoothstep
+//             ease (motors ramp, hold, settle). The omni signature.
+// Orientation is chained leg to leg (th0), and after generation a small
+// correction is distributed across all legs so total rotation closes to
+// a whole number of turns: the loop is seamless in orientation too.
+function buildRoute(rnd) {
+  var legs = [];
+  var px = 180 + rnd() * 640, py = 180 + rnd() * 640;
+  var sx = px, sy = py;
+  var thetaInit = rnd() * Math.PI * 2;
+  var t = 0, guard = 0;
+  while (t < 50 && guard++ < 60) {
+    var ang = rnd() * Math.PI * 2;
+    var dist = 170 + rnd() * 300;
+    var nx = clamp(px + Math.cos(ang) * dist, 120, 880);
+    var ny = clamp(py + Math.sin(ang) * dist, 120, 880);
+    var d = Math.hypot(nx - px, ny - py);
+    if (d < 70) continue;
+    var dur = d / (52 + rnd() * 32);
+    var drift = rnd() < 0.45 ? (rnd() - 0.5) * 1.4 : 0;
+    legs.push({ type: 'move', dur: dur, x0: px, y0: py, x1: nx, y1: ny, dth: drift });
+    t += dur; px = nx; py = ny;
+    if (rnd() < 0.38 && t < 52) {
+      var sd = 1.1 + rnd() * 1.1;
+      var steps = (1 + Math.floor(rnd() * 3)) * (Math.PI / 2);
+      if (rnd() < 0.5) steps = -steps;
+      legs.push({ type: 'spin', dur: sd, x0: px, y0: py, x1: px, y1: py, dth: steps });
+      t += sd;
+    }
+  }
+  var dh = Math.hypot(sx - px, sy - py);
+  if (dh > 30) {
+    legs.push({ type: 'move', dur: dh / 62, x0: px, y0: py, x1: sx, y1: sy, dth: 0 });
+    t += dh / 62;
+  }
+  // scale durations so the legs cover exactly LOOP seconds
+  var k = LOOP / t, tt = 0, R = 0, i, L;
+  for (i = 0; i < legs.length; i++) { L = legs[i]; L.dur *= k; L.t0 = tt; tt += L.dur; R += L.dth; }
+  // distribute the orientation closure correction, proportional to duration
+  var corr = Math.round(R / (2 * Math.PI)) * 2 * Math.PI - R;
+  var th = thetaInit;
+  for (i = 0; i < legs.length; i++) {
+    L = legs[i];
+    L.dth += corr * (L.dur / LOOP);
+    L.th0 = th;
+    th += L.dth;
+  }
+  return { legs: legs, thetaInit: thetaInit };
+}
+function buildRoutes(s) {
+  var rnd = mulberry32(s);
+  var routes = [];
+  for (var i = 0; i < 5; i++) routes.push(buildRoute(rnd));
+  return routes;
+}
+// closed-form state of one route at loop time tt (already reduced mod LOOP)
+function stateAt(route, tt) {
+  var legs = route.legs;
+  var L = legs[legs.length - 1];
+  for (var i = 0; i < legs.length; i++) {
+    if (tt >= legs[i].t0 && tt < legs[i].t0 + legs[i].dur) { L = legs[i]; break; }
+  }
+  var u = clamp((tt - L.t0) / L.dur, 0, 1);
+  if (L.type === 'spin') {
+    return { x: L.x0, y: L.y0, th: L.th0 + L.dth * smooth(u), type: 'spin', u: u, leg: L };
+  }
+  return {
+    x: L.x0 + (L.x1 - L.x0) * u,
+    y: L.y0 + (L.y1 - L.y0) * u,
+    th: L.th0 + L.dth * u, type: 'move', u: u, leg: L
+  };
+}
+// seconds since the most recent leg boundary (a waypoint correction)
+function boundaryAge(route, tt) {
+  var best = Infinity;
+  for (var i = 0; i < route.legs.length; i++) {
+    var age = tt - route.legs[i].t0;
+    if (age < 0) age += LOOP;
+    if (age < best) best = age;
+  }
+  return best;
+}
+// ==== PURE MODEL END ====
+
+// ---------- piece state (events only; frame one is pre-input) ----------
+var seed = 2718; // chosen by probe: at T0 two cubes are mid-spin, three ticks are lit
+var routes = buildRoutes(seed);
+var holds = [[], [], [], [], []];   // per cube: list of hold start times
+var dragEvents = [];                // {t0, pushes: {cubeIndex: [x, y]}}
+
+function schedT(i, t) {
+  var shift = 0, hs = holds[i];
+  for (var j = 0; j < hs.length; j++) shift += clamp(t - hs[j], 0, 3);
+  return t - shift;
+}
+function dragOffset(i, t) {
+  var ox = 0, oy = 0;
+  for (var j = 0; j < dragEvents.length; j++) {
+    var ev = dragEvents[j], p = ev.pushes[i];
+    if (!p) continue;
+    var tau = t - ev.t0;
+    if (tau < 0 || tau > 6) continue;
+    var env = tau < 0.25 ? tau / 0.25 : Math.exp(-(tau - 0.25) / 1.3);
+    ox += p[0] * env; oy += p[1] * env;
+  }
+  return [ox, oy];
+}
+function cubePos(i, t) {
+  var st = stateAt(routes[i], ((schedT(i, t) % LOOP) + LOOP) % LOOP);
+  var off = dragOffset(i, t);
+  return { x: st.x + off[0], y: st.y + off[1], th: st.th, type: st.type };
+}
+function cubeSpeed(i, t) {
+  var e = 0.02;
+  var a = cubePos(i, t + e), b = cubePos(i, t - e);
+  return Math.hypot(a.x - b.x, a.y - b.y) / (2 * e);
+}
+
+// ---------- canvas / viewport ----------
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var W = 720, H = 720, DPR = 1;
+
+function isPhone() {
+  var sw = 0, sh = 0;
+  if (typeof window !== 'undefined' && window.screen) { sw = window.screen.width || 0; sh = window.screen.height || 0; }
+  var mn = Math.min(sw, sh);
+  if (mn > 0 && mn < 700) return true;
+  return H > W * 1.15;
+}
+function fit() {
+  var vv = (typeof window !== 'undefined') ? window.visualViewport : null;
+  if (vv && vv.width) { W = vv.width; H = vv.height; }
+  else if (typeof window !== 'undefined' && window.innerWidth) { W = window.innerWidth; H = window.innerHeight; }
+  DPR = (typeof window !== 'undefined' && window.devicePixelRatio) ? Math.min(window.devicePixelRatio, 2) : 1;
+  canvas.width = Math.round(W * DPR);
+  canvas.height = Math.round(H * DPR);
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+}
+if (typeof window !== 'undefined') {
+  if (window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', function () { fit(); draw(currentT); });
+  if (window.addEventListener) window.addEventListener('resize', function () { fit(); draw(currentT); });
+}
+// world (1000x1000) fitted to the smaller dimension, centered; the floor
+// color fills the whole canvas, so the floor is full-bleed at any size
+function viewScale() { return Math.min(W, H) / WORLD; }
+function toScreen(p) { var s = viewScale(); return [(W - WORLD * s) / 2 + p[0] * s, (H - WORLD * s) / 2 + p[1] * s]; }
+function toWorld(x, y) { var s = viewScale(); return [(x - (W - WORLD * s) / 2) / s, (y - (H - WORLD * s) / 2) / s]; }
+
+// ---------- drawing ----------
+function draw(t) {
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = FLOOR;
+  ctx.fillRect(0, 0, W, H);
+  var s = viewScale();
+  var lw = Math.max(0.6, s / 0.72); // normalize widths to the 720 thumb
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  var i, j;
+  // trails: the record. Sampled from the same closed-form position
+  // function as the cubes themselves, backwards over the window.
+  ctx.strokeStyle = TRAILC;
+  for (i = 0; i < 5; i++) {
+    var steps = 38, prev = null;
+    for (j = steps; j >= 0; j--) {
+      var age = (j / steps) * TRAIL_WIN;
+      var pos = cubePos(i, t - age);
+      var p = toScreen([pos.x, pos.y]);
+      if (prev) {
+        var frac = 1 - age / TRAIL_WIN;
+        ctx.globalAlpha = 0.35 * Math.pow(frac, 1.3);
+        ctx.lineWidth = (0.7 + 1.8 * frac) * lw;
+        ctx.beginPath();
+        ctx.moveTo(prev[0], prev[1]);
+        ctx.lineTo(p[0], p[1]);
+        ctx.stroke();
+      }
+      prev = p;
+    }
+  }
+  // cubes
+  var S = CUBE_SIZE * s;
+  for (i = 0; i < 5; i++) {
+    var c = cubePos(i, t);
+    var cp = toScreen([c.x, c.y]);
+    // wheel shadow: a dark plate under the body, offset by the light
+    ctx.globalAlpha = 0.55;
+    ctx.fillStyle = SHADOW;
+    ctx.fillRect(cp[0] - S / 2 + 3 * lw, cp[1] - S / 2 + 4 * lw, S, S);
+    // body, rotated to its own heading (independent of travel direction)
+    ctx.save();
+    ctx.translate(cp[0], cp[1]);
+    ctx.rotate(c.th);
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = CUBEC;
+    ctx.fillRect(-S / 2, -S / 2, S, S);
+    // omni wheel housings: four corner marks plus one front edge mark,
+    // identical on every cube; they are what makes the heading legible
+    ctx.globalAlpha = 0.85;
+    ctx.fillStyle = SHADOW;
+    var wm = S * 0.17, io = S / 2 - S * 0.09 - wm;
+    ctx.fillRect(-io - wm, -io - wm, wm, wm);
+    ctx.fillRect(io, -io - wm, wm, wm);
+    ctx.fillRect(-io - wm, io, wm, wm);
+    ctx.fillRect(io, io, wm, wm);
+    ctx.fillRect(S / 2 - S * 0.09 - wm * 0.7, -wm / 2, wm * 0.7, wm);
+    ctx.restore();
+    // correction tick: a warm diamond at the front corner, flashing at
+    // each leg boundary (stop, rotate, set off) and decaying after it
+    var tt = ((schedT(i, t) % LOOP) + LOOP) % LOOP;
+    var ageB = boundaryAge(routes[i], tt);
+    if (ageB < TICK_WIN) {
+      var ta = 1 - ageB / TICK_WIN;
+      var co = Math.cos(c.th), si = Math.sin(c.th);
+      var kx = cp[0] + (co * S / 2 - si * (-S / 2));
+      var ky = cp[1] + (si * S / 2 + co * (-S / 2));
+      ctx.save();
+      ctx.translate(kx, ky);
+      ctx.rotate(Math.PI / 4);
+      ctx.globalAlpha = ta;
+      ctx.fillStyle = TICKC;
+      var td = 4.6 * lw * (0.7 + 0.5 * ta);
+      ctx.fillRect(-td / 2, -td / 2, td, td);
+      ctx.restore();
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+// ---------- audio (lazy, gesture-gated, guarded) ----------
+var AC = null, audioNodes = null;
+function ensureAudio() {
+  if (AC) { if (AC.resume) { try { AC.resume(); } catch (e) {} } return; }
+  var Ctor = null;
+  if (typeof AudioContext !== 'undefined') Ctor = AudioContext;
+  else if (typeof window !== 'undefined' && window.webkitAudioContext) Ctor = window.webkitAudioContext;
+  if (!Ctor) return;
+  try {
+    AC = new Ctor();
+    var master = AC.createGain(); master.gain.value = 0.12; master.connect(AC.destination);
+    var humOsc = AC.createOscillator(); humOsc.type = 'sine'; humOsc.frequency.value = 44;
+    var humGain = AC.createGain(); humGain.gain.value = 0.045;
+    humOsc.connect(humGain); humGain.connect(master); humOsc.start();
+    var whineOsc = AC.createOscillator(); whineOsc.type = 'triangle'; whineOsc.frequency.value = 120;
+    var whineGain = AC.createGain(); whineGain.gain.value = 0.0;
+    whineOsc.connect(whineGain); whineGain.connect(master); whineOsc.start();
+    audioNodes = { master: master, whineOsc: whineOsc, whineGain: whineGain };
+  } catch (e) { AC = null; audioNodes = null; }
+}
+function spinClick() {
+  if (!AC || !audioNodes) return;
+  try {
+    var t0 = AC.currentTime;
+    var o = AC.createOscillator(); o.type = 'square'; o.frequency.value = 1900;
+    var g = AC.createGain();
+    g.gain.setValueAtTime(0.028, t0);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.03);
+    o.connect(g); g.connect(audioNodes.master);
+    o.start(t0); o.stop(t0 + 0.04);
+  } catch (e) {}
+}
+
+// ---------- interaction (recorded events only; frame one is pre-input) ----------
+var currentT = T0;
+var startStamp = null;
+var downInfo = null;
+var lastPtr = null;
+var lastDragStamp = -10;
+var lastTapT = -10;
+var lastClickT = -10;
+
+function pieceT(nowMs) { return T0 + (nowMs - startStamp) / 1000; }
+function ptrWorld(e) {
+  var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+  return toWorld(e.clientX - r.left, e.clientY - r.top);
+}
+function addDragEvent(wp, dir) {
+  var pushes = {}, any = false, i;
+  for (i = 0; i < 5; i++) {
+    var p = cubePos(i, currentT);
+    var d = Math.hypot(p.x - wp[0], p.y - wp[1]);
+    if (d < 330) {
+      var wgt = Math.pow(1 - d / 330, 1.5);
+      pushes[i] = [dir[0] * 90 * wgt, dir[1] * 90 * wgt];
+      any = true;
+    }
+  }
+  if (any) dragEvents.push({ t0: currentT, pushes: pushes });
+  dragEvents = dragEvents.filter(function (ev) { return currentT - ev.t0 < 8; });
+  if (dragEvents.length > 200) dragEvents = dragEvents.slice(dragEvents.length - 200);
+}
+if (canvas.addEventListener) {
+  canvas.addEventListener('pointerdown', function (e) {
+    ensureAudio();
+    var wp = ptrWorld(e);
+    downInfo = { t: currentT, moved: false };
+    lastPtr = wp;
+    lastDragStamp = currentT;
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (!downInfo) return;
+    var wp = ptrWorld(e);
+    var dx = wp[0] - lastPtr[0], dy = wp[1] - lastPtr[1];
+    var len = Math.hypot(dx, dy);
+    if (len > 2) downInfo.moved = true;
+    if (downInfo.moved && currentT - lastDragStamp > 0.09) {
+      lastDragStamp = currentT;
+      if (len > 0.5) addDragEvent(wp, [dx / len, dy / len]);
+    }
+    lastPtr = wp;
+  });
+  canvas.addEventListener('pointerup', function (e) {
+    if (!downInfo) return;
+    var wasDrag = downInfo.moved || (currentT - downInfo.t > 0.4);
+    downInfo = null;
+    if (wasDrag) return;
+    // tap
+    if (currentT - lastTapT < 0.35) {
+      // double-tap: new routes
+      seed = (seed * 1664525 + 1013904223) >>> 0;
+      routes = buildRoutes(seed);
+      holds = [[], [], [], [], []];
+      dragEvents = [];
+      lastTapT = -10;
+      draw(currentT);
+      return;
+    }
+    lastTapT = currentT;
+    var wp = ptrWorld(e), best = -1, bd = 62, i;
+    for (i = 0; i < 5; i++) {
+      var p = cubePos(i, currentT);
+      var d = Math.hypot(p.x - wp[0], p.y - wp[1]);
+      if (d < bd) { bd = d; best = i; }
+    }
+    if (best >= 0) holds[best].push(currentT); // freeze 3 s, schedule shifts
+  });
+  canvas.addEventListener('pointercancel', function () { downInfo = null; });
+}
+
+// ---------- boot: frame one at fixed phase, then the live loop ----------
+fit();
+draw(T0);
+
+if (typeof requestAnimationFrame !== 'undefined') {
+  var loop = function (ms) {
+    if (startStamp === null) startStamp = ms;
+    currentT = pieceT(ms);
+    if (AC && audioNodes) {
+      var vmax = 0, anySpin = false, i;
+      for (i = 0; i < 5; i++) {
+        var v = cubeSpeed(i, currentT);
+        if (v > vmax) vmax = v;
+        if (cubePos(i, currentT).type === 'spin') anySpin = true;
+      }
+      try {
+        audioNodes.whineOsc.frequency.setTargetAtTime(90 + vmax * 1.7, AC.currentTime, 0.08);
+        audioNodes.whineGain.gain.setTargetAtTime(vmax > 4 ? 0.016 : 0.0, AC.currentTime, 0.1);
+      } catch (e) {}
+      if (anySpin && currentT - lastClickT > 0.14) { lastClickT = currentT; spinClick(); }
+    }
+    draw(currentT);
+    requestAnimationFrame(loop);
+  };
+  requestAnimationFrame(loop);
+}
+</script>
+</body>
+</html>

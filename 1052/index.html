@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Position Is Wire Length</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #060708; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded rng ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- palette (strict) ----------
+  var STAGE = '#060708';
+  var WIRE  = '#4A4E55';
+  var CUBE  = '#F5F0E6';
+  var PULSE = '#FFE9B8';
+
+  // ---------- rig constants ----------
+  var LOOP = 65;                 // seconds, seamless
+  var T0 = 19;                   // frame-one phase: a handoff is mid-slide
+  var SLOTS = 6;                 // ceiling anchor slots
+  var HAND_TIMES = [5, 18, 31, 44, 57];  // handoff starts (2 s each)
+  var HAND_DUR = 2;
+  var RETURN_T = 61.5, RETURN_DUR = 2;   // silent slide home before loop wrap
+
+  var seed = 1052213;
+  var rig = null;        // { slots:[x..], cubes:[cube..], handedCubeAt:[idx..] }
+  var wireLen = [];      // last computed wire lengths per cube [l1, l2] (for audio)
+
+  // cube: { wp:[[x,y]..], K, phase, a1 (fixed slot), a2keys:[[t, slotFloat]..],
+  //         handed:bool, handTime, size }
+  function buildRig(s) {
+    var rng = mulberry32(s);
+    var slots = [];
+    for (var i = 0; i < SLOTS; i++) slots.push(0.08 + 0.84 * (i / (SLOTS - 1)));
+
+    // choose 5 distinct cubes to be handed, one per handoff time
+    var order = [0,1,2,3,4,5,6,7,8,9];
+    for (var j = order.length - 1; j > 0; j--) {
+      var k = Math.floor(rng() * (j + 1)), tmp = order[j]; order[j] = order[k]; order[k] = tmp;
+    }
+    var handedCubeAt = order.slice(0, 5);
+
+    var cubes = [];
+    for (var c = 0; c < 10; c++) {
+      var K = 4 + Math.floor(rng() * 3);           // 4..6 waypoints
+      var wp = [];
+      for (var w = 0; w < K; w++) {
+        wp.push([0.07 + rng() * 0.86, 0.20 + rng() * 0.60]);
+      }
+      var a1 = Math.floor(rng() * SLOTS);
+      var a2 = Math.floor(rng() * SLOTS);
+      if (a2 === a1) a2 = (a2 + 1 + Math.floor(rng() * (SLOTS - 1))) % SLOTS;
+      var hi = handedCubeAt.indexOf(c);
+      var keys = [[0, a2]];
+      if (hi >= 0) {
+        var th = HAND_TIMES[hi];
+        var a2b = Math.floor(rng() * SLOTS);
+        if (a2b === a1 || a2b === a2) a2b = (a2 + 2) % SLOTS;
+        if (a2b === a1) a2b = (a2b + 1) % SLOTS;
+        keys.push([th, a2], [th + HAND_DUR, a2b], [RETURN_T, a2b], [RETURN_T + RETURN_DUR, a2]);
+      }
+      keys.push([LOOP, a2]);
+      cubes.push({
+        wp: wp, K: K, phase: rng() * LOOP,
+        a1: a1, a2keys: keys, handed: hi >= 0, handTime: hi >= 0 ? HAND_TIMES[hi] : -1,
+        size: 0.016 + rng() * 0.010
+      });
+    }
+    return { slots: slots, cubes: cubes, handedCubeAt: handedCubeAt };
+  }
+
+  // ---------- closed-form state ----------
+  function smooth(u) { return u * u * (3 - 2 * u); }
+  function lerp(a, b, u) { return a + (b - a) * u; }
+
+  function cubePos(cube, t) {
+    var leg = LOOP / cube.K;
+    var lt = (t + cube.phase) % LOOP;
+    var idx = Math.floor(lt / leg);
+    var local = (lt - idx * leg) / leg;          // 0..1 within leg
+    var a = cube.wp[idx], b = cube.wp[(idx + 1) % cube.K];
+    if (local < 0.45) return [a[0], a[1]];       // dwell: hanging still
+    var u = smooth((local - 0.45) / 0.55);       // glide
+    return [lerp(a[0], b[0], u), lerp(a[1], b[1], u)];
+  }
+
+  function slotFloatAt(cube, t) {
+    var keys = cube.a2keys;
+    var tt = ((t % LOOP) + LOOP) % LOOP;
+    for (var i = 0; i < keys.length - 1; i++) {
+      var tA = keys[i][0], tB = keys[i + 1][0];
+      if (tt >= tA && tt <= tB) {
+        if (tB === tA) return keys[i + 1][1];
+        return lerp(keys[i][1], keys[i + 1][1], smooth((tt - tA) / (tB - tA)));
+      }
+    }
+    return keys[keys.length - 1][1];
+  }
+
+  function handoffPulse(cube, t) {
+    // warm pulse while this cube is being handed, plus a short decay after
+    if (!cube.handed) return 0;
+    var tt = ((t % LOOP) + LOOP) % LOOP;
+    var d = tt - cube.handTime;
+    if (d >= 0 && d <= HAND_DUR) return Math.sin(Math.PI * (d / HAND_DUR));
+    if (d > HAND_DUR && d < HAND_DUR + 1.2) return Math.max(0, 1 - (d - HAND_DUR) / 1.2) * 0.6;
+    return 0;
+  }
+
+  // ---------- interaction state (recorded events only) ----------
+  var gusts = [];        // {t, x, y, dx, dy} pointer samples while dragging
+  var traces = [];       // {cube, t} tap traces, 3 s
+  var dragging = false, lastTapT = -10, lastTapX = 0, lastTapY = 0, downT = 0, downX = 0, downY = 0, moved = false;
+
+  function gustOffset(cube, pos, t) {
+    var ox = 0, oy = 0;
+    for (var i = 0; i < gusts.length; i++) {
+      var g = gusts[i], age = t - g.t;
+      if (age < 0 || age > 6) continue;
+      var dx = pos[0] - g.x, dy = pos[1] - g.y;
+      var d2 = dx * dx + dy * dy;
+      var infl = Math.exp(-d2 / 0.02);
+      if (infl < 0.01) continue;
+      var env = Math.exp(-age / 2.2) * Math.sin(2 * Math.PI * age / 1.7);
+      ox += g.dx * infl * env * 0.9;
+      oy += g.dy * infl * env * 0.5 + Math.abs(g.dx) * infl * env * 0.3;
+    }
+    return [ox, oy];
+  }
+
+  function traceLevel(cubeIdx, t) {
+    var lvl = 0;
+    for (var i = 0; i < traces.length; i++) {
+      if (traces[i].cube === cubeIdx) {
+        var age = t - traces[i].t;
+        if (age >= 0 && age < 3) lvl = Math.max(lvl, age < 2.4 ? 1 : 1 - (age - 2.4) / 0.6);
+      }
+    }
+    return lvl;
+  }
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 720, H = 720, DPR = 1;
+
+  function isPhone() {
+    var sw = 0, sh = 0;
+    try {
+      if (typeof window !== 'undefined' && window.screen) { sw = window.screen.width || 0; sh = window.screen.height || 0; }
+    } catch (e) {}
+    var mn = Math.min(sw, sh);
+    if (mn > 0 && mn < 700) return true;
+    return H > W * 1.15;
+  }
+
+  function fit() {
+    try {
+      var vv = (typeof window !== 'undefined') ? window.visualViewport : null;
+      if (vv && vv.width) { W = vv.width; H = vv.height; }
+      else if (typeof window !== 'undefined' && window.innerWidth) { W = window.innerWidth; H = window.innerHeight; }
+      DPR = (typeof window !== 'undefined' && window.devicePixelRatio) ? Math.min(window.devicePixelRatio, 2) : 1;
+    } catch (e) {}
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+  }
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', function () { fit(); draw(pieceT); });
+    }
+    if (window.addEventListener) {
+      window.addEventListener('resize', function () { fit(); draw(pieceT); });
+    }
+  }
+
+  // ---------- drawing ----------
+  var pieceT = T0;
+
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = STAGE;
+    ctx.fillRect(0, 0, W, H);
+
+    var S = Math.min(W, H);
+    var ceilY = 0.035 * H;
+    var floorY = 0.90 * H;
+
+    // floor plane line, low in the frame (the volume seen slightly from above)
+    ctx.strokeStyle = WIRE; ctx.globalAlpha = 0.28; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(0.03 * W, floorY); ctx.lineTo(0.97 * W, floorY); ctx.stroke();
+    ctx.globalAlpha = 0.12;
+    ctx.beginPath(); ctx.moveTo(0.03 * W, floorY + 0.035 * H); ctx.lineTo(0.97 * W, floorY + 0.035 * H); ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    // ceiling rail + anchor slots
+    ctx.strokeStyle = WIRE; ctx.globalAlpha = 0.45;
+    ctx.beginPath(); ctx.moveTo(0.03 * W, ceilY); ctx.lineTo(0.97 * W, ceilY); ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    var positions = [], i, c;
+    for (i = 0; i < rig.cubes.length; i++) {
+      c = rig.cubes[i];
+      var p = cubePos(c, t);
+      var off = gustOffset(i, p, t);
+      positions.push([ (p[0] + off[0]) * W, (p[1] + off[1]) * H ]);
+    }
+
+    // wires first (the rig is the drawing), both wires per cube, always
+    wireLen = [];
+    var lens = [];
+    for (i = 0; i < rig.cubes.length; i++) {
+      c = rig.cubes[i];
+      var cx = positions[i][0], cy = positions[i][1];
+      var ax1 = rig.slots[c.a1] * W;
+      var sf = slotFloatAt(c, t);
+      var ax2 = (0.08 + 0.84 * (sf / (SLOTS - 1))) * W;
+      var tl = traceLevel(i, t);
+      var l1 = Math.sqrt((cx - ax1) * (cx - ax1) + (cy - ceilY) * (cy - ceilY));
+      var l2 = Math.sqrt((cx - ax2) * (cx - ax2) + (cy - ceilY) * (cy - ceilY));
+      lens.push([l1, l2]);
+      ctx.lineWidth = 1;
+      var aBase = 0.6 + 0.4 * tl;
+      ctx.strokeStyle = WIRE; ctx.globalAlpha = aBase;
+      ctx.beginPath(); ctx.moveTo(ax1, ceilY); ctx.lineTo(cx, cy); ctx.stroke();
+      // second wire: during a traced handoff/slide the moving wire takes the pulse tone
+      var pulse = handoffPulse(c, t);
+      if (tl > 0) { ctx.strokeStyle = PULSE; ctx.globalAlpha = 0.35 + 0.65 * tl; }
+      else if (pulse > 0.15) { ctx.strokeStyle = PULSE; ctx.globalAlpha = 0.35 + 0.5 * pulse; }
+      ctx.beginPath(); ctx.moveTo(ax2, ceilY); ctx.lineTo(cx, cy); ctx.stroke();
+      ctx.globalAlpha = 1;
+      // anchor ticks
+      ctx.fillStyle = WIRE; ctx.globalAlpha = 0.9;
+      ctx.fillRect(ax1 - 2, ceilY - 3, 4, 6);
+      ctx.fillRect(ax2 - 2, ceilY - 3, 4, 6);
+      ctx.globalAlpha = 1;
+    }
+    wireLen = lens;
+
+    // cubes: halo (layered alpha squares) + body + handoff pulse
+    for (i = 0; i < rig.cubes.length; i++) {
+      c = rig.cubes[i];
+      var px = positions[i][0], py = positions[i][1];
+      var sz = c.size * S * 2;
+      var pul = handoffPulse(c, t);
+      ctx.fillStyle = CUBE;
+      ctx.globalAlpha = 0.05; ctx.fillRect(px - sz * 1.5, py - sz * 1.5, sz * 3, sz * 3);
+      ctx.globalAlpha = 0.10; ctx.fillRect(px - sz * 1.05, py - sz * 1.05, sz * 2.1, sz * 2.1);
+      ctx.globalAlpha = 0.16; ctx.fillRect(px - sz * 0.8, py - sz * 0.8, sz * 1.6, sz * 1.6);
+      ctx.globalAlpha = 1;
+      ctx.fillRect(px - sz / 2, py - sz / 2, sz, sz);
+      // top face hint (the volume, seen slightly from above)
+      ctx.globalAlpha = 0.55;
+      ctx.beginPath();
+      ctx.moveTo(px - sz / 2, py - sz / 2);
+      ctx.lineTo(px - sz / 2 + sz * 0.22, py - sz / 2 - sz * 0.22);
+      ctx.lineTo(px + sz / 2 + sz * 0.22, py - sz / 2 - sz * 0.22);
+      ctx.lineTo(px + sz / 2, py - sz / 2);
+      ctx.closePath(); ctx.fill();
+      ctx.globalAlpha = 1;
+      if (pul > 0.02) {
+        ctx.fillStyle = PULSE;
+        ctx.globalAlpha = 0.18 * pul;
+        ctx.fillRect(px - sz * 1.9, py - sz * 1.9, sz * 3.8, sz * 3.8);
+        ctx.globalAlpha = 0.5 * pul;
+        ctx.fillRect(px - sz * 0.28, py - sz * 0.28, sz * 0.56, sz * 0.56);
+        ctx.globalAlpha = 1;
+      }
+    }
+  }
+
+  // ---------- audio (lazy, guarded; voices pitched by wire length) ----------
+  var AC = null, voices = [];
+  function audio() {
+    if (AC) return AC;
+    var Ctor = null;
+    try {
+      if (typeof AudioContext !== 'undefined') Ctor = AudioContext;
+      else if (typeof window !== 'undefined' && window.webkitAudioContext) Ctor = window.webkitAudioContext;
+    } catch (e) {}
+    if (!Ctor) return null;
+    try { AC = new Ctor(); } catch (e) { AC = null; }
+    if (AC) {
+      for (var i = 0; i < 10; i++) {
+        var o = AC.createOscillator(), g = AC.createGain();
+        o.type = 'sine'; o.frequency.value = 500;
+        g.gain.value = 0.0;
+        o.connect(g); g.connect(AC.destination);
+        o.start();
+        voices.push({ o: o, g: g });
+      }
+    }
+    return AC;
+  }
+  function chime() {
+    if (!AC) return;
+    var t = AC.currentTime;
+    [880, 1318].forEach(function (f, j) {
+      var o = AC.createOscillator(), g = AC.createGain();
+      o.type = 'sine'; o.frequency.value = f;
+      g.gain.setValueAtTime(0.05, t + j * 0.09);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + j * 0.09 + 0.8);
+      o.connect(g); g.connect(AC.destination);
+      o.start(t + j * 0.09); o.stop(t + j * 0.09 + 0.85);
+    });
+  }
+  function audioFrame() {
+    if (!AC || !voices.length || !wireLen.length) return;
+    var diag = Math.sqrt(W * W + H * H);
+    for (var i = 0; i < 10 && i < wireLen.length; i++) {
+      var avg = (wireLen[i][0] + wireLen[i][1]) / 2 / diag;   // 0..~0.8
+      var f = 190 + 720 * Math.max(0, 1 - avg * 1.6);          // longer wire: lower string
+      voices[i].o.frequency.value = f;
+      voices[i].g.gain.value = 0.012;
+    }
+  }
+
+  // ---------- pointer interaction ----------
+  function toNorm(e) {
+    var rect = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    return { x: (e.clientX - rect.left) / W, y: (e.clientY - rect.top) / H };
+  }
+  var lastGX = 0, lastGY = 0, lastSample = 0;
+  function onDown(e) {
+    audio();
+    var p = toNorm(e);
+    dragging = true; moved = false;
+    downT = pieceT; downX = p.x; downY = p.y;
+    lastGX = p.x; lastGY = p.y; lastSample = 0;
+  }
+  function onMove(e) {
+    if (!dragging) return;
+    var p = toNorm(e);
+    if (Math.abs(p.x - downX) + Math.abs(p.y - downY) > 0.01) moved = true;
+    if (pieceT - lastSample > 0.07) {
+      gusts.push({ t: pieceT, x: p.x, y: p.y, dx: p.x - lastGX, dy: p.y - lastGY });
+      if (gusts.length > 240) gusts.splice(0, gusts.length - 240);
+      lastSample = pieceT;
+    }
+    lastGX = p.x; lastGY = p.y;
+  }
+  function onUp(e) {
+    if (!dragging) return;
+    dragging = false;
+    var p = toNorm(e);
+    if (moved) return;
+    // tap vs double-tap
+    if (pieceT - lastTapT < 0.4 && Math.abs(p.x - lastTapX) + Math.abs(p.y - lastTapY) < 0.05) {
+      seed = (seed * 1664525 + 1013904223) >>> 0;
+      rig = buildRig(seed);
+      gusts = []; traces = [];
+      lastTapT = -10;
+      draw(pieceT);
+      return;
+    }
+    lastTapT = pieceT; lastTapX = p.x; lastTapY = p.y;
+    // nearest cube within reach: trace its wires
+    var best = -1, bd = 1e9;
+    for (var i = 0; i < rig.cubes.length; i++) {
+      var cp = cubePos(rig.cubes[i], pieceT);
+      var d = Math.abs(cp[0] - p.x) + Math.abs(cp[1] - p.y);
+      if (d < bd) { bd = d; best = i; }
+    }
+    if (best >= 0 && bd < 0.16) traces.push({ cube: best, t: pieceT });
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', function () { dragging = false; });
+  }
+
+  // ---------- boot: frame one at fixed phase, then the loop ----------
+  fit();
+  rig = buildRig(seed);
+  pieceT = T0;
+  draw(pieceT);
+
+  if (typeof requestAnimationFrame !== 'undefined') {
+    var startMs = null, lastHandIdx = -1;
+    var loopFn = function (ms) {
+      if (startMs === null) startMs = ms;
+      pieceT = T0 + (ms - startMs) / 1000;
+      draw(pieceT);
+      audioFrame();
+      // handoff chimes as the loop crosses each handoff start
+      var tt = ((pieceT % LOOP) + LOOP) % LOOP;
+      for (var j = 0; j < HAND_TIMES.length; j++) {
+        var d = tt - HAND_TIMES[j];
+        if (d > 0 && d < 0.1 && lastHandIdx !== j) { lastHandIdx = j; chime(); }
+        if (d > 1) { /* reset handled by index change on next pass */ }
+      }
+      requestAnimationFrame(loopFn);
+    };
+    requestAnimationFrame(loopFn);
+  }
+})();
+</script>
+</body>
+</html>

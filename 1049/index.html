@@ -1,0 +1,521 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Camera Move, Flown</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #060607; height: 100%; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------------- utils ----------------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function frac(v) { return v - Math.floor(v); }
+  function smooth01(x) { x = clamp(x, 0, 1); return x * x * (3 - 2 * x); }
+
+  // ---------------- constants ----------------
+  var WORLD_W = 160, WORLD_H = 100;      // world units; world scales to fit the viewport
+  var LOOP_T = 55;                       // seconds for one full traversal of the spline
+  var DT = 1 / 120;                      // fixed physics step
+  var PREROLL = 2400;                    // frame one = state after exactly 2400 steps (T = 20 s)
+  var VIEW_OFF = 19, VIEW_CYCLE = 32;    // register cycle; tuned so T = 20 s is solid execution view
+  var NKEYS = 9, SEG_SAMPLES = 90;
+  var BASE_SEED = 1049212;
+  var PHASE_LEAD = 0.02;                 // author marker sits this much phase past the sharpest bend at frame one
+
+  var COL = {
+    authBg: [11, 12, 14],                // #0B0C0E
+    execBg: [6, 6, 7],                   // #060607
+    spline: '#7FD4FF',
+    node: '#FFFFFF',
+    drone: '#2A2C30',
+    payload: '#FFE9B8',
+    err: '#FF6B6B'
+  };
+
+  // ---------------- canvas / viewport ----------------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var VW = 720, VH = 720, DPR = 1, PHONE = false;
+
+  function isPhone() {
+    var sw = 0, sh = 0;
+    if (typeof window !== 'undefined' && window.screen) {
+      sw = window.screen.width || 0; sh = window.screen.height || 0;
+    }
+    var mn = Math.min(sw, sh);
+    if (mn > 0 && mn < 700) return true;
+    return VH > VW * 1.15; // aspect fallback only
+  }
+
+  function fit() {
+    var vv = (typeof window !== 'undefined') ? window.visualViewport : null;
+    if (vv && vv.width) { VW = vv.width; VH = vv.height; }
+    else if (typeof window !== 'undefined' && window.innerWidth) { VW = window.innerWidth; VH = window.innerHeight; }
+    DPR = (typeof window !== 'undefined' && window.devicePixelRatio) ? Math.min(window.devicePixelRatio, 2) : 1;
+    var pw = Math.round(VW * DPR), ph = Math.round(VH * DPR);
+    if (canvas.width !== pw) canvas.width = pw;
+    if (canvas.height !== ph) canvas.height = ph;
+    canvas.style.width = VW + 'px';
+    canvas.style.height = VH + 'px';
+    PHONE = isPhone();
+  }
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', function () { fit(); draw(); });
+    }
+    if (window.addEventListener) {
+      window.addEventListener('resize', function () { fit(); draw(); });
+    }
+  }
+
+  // world to screen mapping (contain fit, centered)
+  function view() {
+    var s = Math.min(VW / WORLD_W, VH / WORLD_H);
+    return { s: s, ox: (VW - WORLD_W * s) / 2, oy: (VH - WORLD_H * s) / 2 };
+  }
+
+  // ---------------- spline ----------------
+  var seed = BASE_SEED;
+  var keys = [];          // keyframe points {x, y}
+  var pts = [];           // sampled polyline points
+  var cum = [];           // cumulative arc length, length pts.length + 1
+  var curv = [];          // curvature per sample
+  var totalLen = 1, maxK = 0.0001;
+  var PHASE0 = 0;         // global phase offset so frame one lands on a bend
+
+  // designed camera move (long top sweep, tight right hook, dipping bottom run),
+  // with seeded jitter and a seed-chosen mirror variant on reseed
+  var BASE_KEYS = [
+    [16, 58], [38, 30], [72, 20], [108, 24], [140, 38],
+    [147, 63], [116, 84], [76, 78], [40, 86]
+  ];
+  function buildKeys(s) {
+    var rng = mulberry32(s);
+    var variant = ((s % 4) + 4) % 4;
+    keys = [];
+    for (var i = 0; i < NKEYS; i++) {
+      var bx = BASE_KEYS[i][0], by = BASE_KEYS[i][1];
+      if (variant === 1 || variant === 3) bx = WORLD_W - bx;
+      if (variant === 2 || variant === 3) by = WORLD_H - by;
+      var x = bx + (rng() - 0.5) * 7;
+      var y = by + (rng() - 0.5) * 7;
+      keys.push({ x: clamp(x, 10, 150), y: clamp(y, 8, 92) });
+    }
+  }
+
+  function buildTable() {
+    pts = [];
+    var i, j;
+    for (i = 0; i < NKEYS; i++) {
+      var p0 = keys[(i + NKEYS - 1) % NKEYS], p1 = keys[i];
+      var p2 = keys[(i + 1) % NKEYS], p3 = keys[(i + 2) % NKEYS];
+      for (j = 0; j < SEG_SAMPLES; j++) {
+        var t = j / SEG_SAMPLES, t2 = t * t, t3 = t2 * t;
+        // Catmull-Rom through p1..p2
+        var x = 0.5 * ((2 * p1.x) + (-p0.x + p2.x) * t + (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * t2 + (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * t3);
+        var y = 0.5 * ((2 * p1.y) + (-p0.y + p2.y) * t + (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * t2 + (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * t3);
+        pts.push({ x: x, y: y });
+      }
+    }
+    var M = pts.length;
+    cum = [0];
+    for (i = 0; i < M; i++) {
+      var a = pts[i], b = pts[(i + 1) % M];
+      var dx = b.x - a.x, dy = b.y - a.y;
+      cum.push(cum[i] + Math.sqrt(dx * dx + dy * dy));
+    }
+    totalLen = cum[M];
+    curv = [];
+    maxK = 0.0001;
+    for (i = 0; i < M; i++) {
+      var A = pts[(i + M - 1) % M], B = pts[i], C = pts[(i + 1) % M];
+      var abx = B.x - A.x, aby = B.y - A.y;
+      var acx = C.x - A.x, acy = C.y - A.y;
+      var bcx = C.x - B.x, bcy = C.y - B.y;
+      var cross = Math.abs(abx * acy - aby * acx);
+      var d1 = Math.sqrt(abx * abx + aby * aby), d2 = Math.sqrt(bcx * bcx + bcy * bcy), d3 = Math.sqrt(acx * acx + acy * acy);
+      var k = (d1 * d2 * d3 > 0) ? (2 * cross) / (d1 * d2 * d3) : 0;
+      curv.push(k);
+      if (k > maxK) maxK = k;
+    }
+  }
+
+  // choose PHASE0 so that at T = PREROLL * DT the author marker is just past the sharpest bend
+  function computePhase0() {
+    var M = pts.length, best = 0, bestV = -1, i, j;
+    for (i = 0; i < M; i++) {
+      var sum = 0;
+      for (j = -6; j <= 6; j++) sum += curv[(i + j + M) % M];
+      if (sum > bestV) { bestV = sum; best = i; }
+    }
+    var pStar = cum[best] / totalLen;    // arc phase of sharpest bend
+    PHASE0 = frac(pStar - (PREROLL * DT) / LOOP_T + PHASE_LEAD);
+  }
+
+  function pointAt(u) {
+    u = frac(u);
+    var d = u * totalLen, M = pts.length;
+    var lo = 0, hi = M;
+    while (lo < hi - 1) { var mid = (lo + hi) >> 1; if (cum[mid] <= d) lo = mid; else hi = mid; }
+    var segLen = cum[lo + 1] - cum[lo];
+    var f = segLen > 0 ? (d - cum[lo]) / segLen : 0;
+    var a = pts[lo], b = pts[(lo + 1) % M];
+    return { x: a.x + (b.x - a.x) * f, y: a.y + (b.y - a.y) * f, tx: b.x - a.x, ty: b.y - a.y, idx: lo };
+  }
+  function curvAt(u) {
+    var p = pointAt(u);
+    return curv[p.idx] / maxK;           // 0..1 normalized curvature
+  }
+
+  // ---------------- drones (spring-damper pursuit sim) ----------------
+  var DRONE_CFG = [
+    { k: 0.55, z: 0.80, stag: 0.016, sag: 0.0 },
+    { k: 0.20, z: 0.60, stag: 0.036, sag: 0.10 },
+    { k: 0.085, z: 0.45, stag: 0.060, sag: 0.20 }
+  ];
+  var drones = [];
+  var T = 0;                              // sim time in seconds; frame one at T = PREROLL * DT
+  var errSum = 0, errMax = 0, errCount = 0, errFrame = [0, 0, 0];
+
+  function authorPhase() { return frac(T / LOOP_T + PHASE0); }
+  function targetFor(cfg) {
+    var p = pointAt(authorPhase() - cfg.stag);
+    var tl = Math.sqrt(p.tx * p.tx + p.ty * p.ty) || 1;
+    var spd = totalLen / LOOP_T;
+    return { x: p.x, y: p.y, vx: (p.tx / tl) * spd, vy: (p.ty / tl) * spd };
+  }
+  function resetDrones() {
+    drones = [];
+    for (var i = 0; i < DRONE_CFG.length; i++) {
+      var cfg = DRONE_CFG[i];
+      var tg = targetFor(cfg);
+      drones.push({ x: tg.x, y: tg.y, vx: tg.vx, vy: tg.vy, heading: Math.atan2(tg.vy, tg.vx), tx: tg.x, ty: tg.y, err: 0 });
+    }
+  }
+
+  // ---------------- register (view) state ----------------
+  var blend = 0;                          // 0 = execution, 1 = authoring
+  var override = null;                    // {target, until}
+  var pendingTap = null;                  // {time}
+  function cycleGoal() {
+    var vp = (T + VIEW_OFF) % VIEW_CYCLE;
+    if (vp < 14) return 0;
+    if (vp < 16) return smooth01((vp - 14) / 2);
+    if (vp < 30) return 1;
+    return 1 - smooth01((vp - 30) / 2);
+  }
+
+  var stepCount = 0;
+  function step(prerolling) {
+    T += DT; stepCount++;
+    var i, cfg, d, tg;
+    for (i = 0; i < drones.length; i++) {
+      cfg = DRONE_CFG[i]; d = drones[i];
+      tg = targetFor(cfg);
+      var c = 2 * cfg.z * Math.sqrt(cfg.k);
+      var ax = cfg.k * (tg.x - d.x) + c * (tg.vx - d.vx);
+      var ay = cfg.k * (tg.y - d.y) + c * (tg.vy - d.vy) + cfg.sag;
+      d.vx += ax * DT; d.vy += ay * DT;
+      d.x += d.vx * DT; d.y += d.vy * DT;
+      var sp = Math.sqrt(d.vx * d.vx + d.vy * d.vy);
+      if (sp > 0.4) d.heading = Math.atan2(d.vy, d.vx);
+      d.tx = tg.x; d.ty = tg.y;
+      d.err = Math.sqrt((tg.x - d.x) * (tg.x - d.x) + (tg.y - d.y) * (tg.y - d.y));
+      if (stepCount > 600) { errSum += d.err; errCount++; if (d.err > errMax) errMax = d.err; }
+    }
+    // register blend
+    if (override && T > override.until) override = null;
+    var goal = override ? override.target : cycleGoal();
+    if (prerolling) blend = goal;
+    else {
+      var rate = DT / 2;                  // full crossfade in 2 s
+      if (blend < goal) blend = Math.min(goal, blend + rate);
+      else if (blend > goal) blend = Math.max(goal, blend - rate);
+    }
+    // deferred single tap (lets a double tap overrule it)
+    if (pendingTap && T - pendingTap.time > 0.35) {
+      var cur = override ? override.target : (blend >= 0.5 ? 1 : 0);
+      override = { target: cur >= 0.5 ? 0 : 1, until: T + 14 };
+      pendingTap = null;
+    }
+  }
+
+  // ---------------- audio (lazy, guarded; gesture only) ----------------
+  var AC = null, aGlide = null, aGlideGain = null, aWhir = null, aWhirGain = null, aShimA = null, aShimB = null, aShimGain = null;
+  function ensureAudio() {
+    if (AC) { if (AC.resume) AC.resume(); return; }
+    var Ctor = null;
+    if (typeof AudioContext !== 'undefined') Ctor = AudioContext;
+    else if (typeof window !== 'undefined' && window.webkitAudioContext) Ctor = window.webkitAudioContext;
+    if (!Ctor) return;
+    try {
+      AC = new Ctor();
+      var master = AC.createGain(); master.gain.value = 0.6; master.connect(AC.destination);
+      aGlide = AC.createOscillator(); aGlide.type = 'sine'; aGlide.frequency.value = 180;
+      aGlideGain = AC.createGain(); aGlideGain.gain.value = 0.045;
+      aGlide.connect(aGlideGain); aGlideGain.connect(master); aGlide.start();
+      aWhir = AC.createOscillator(); aWhir.type = 'sawtooth'; aWhir.frequency.value = 80;
+      var lp = AC.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 420;
+      aWhirGain = AC.createGain(); aWhirGain.gain.value = 0.012;
+      aWhir.connect(lp); lp.connect(aWhirGain); aWhirGain.connect(master); aWhir.start();
+      aShimA = AC.createOscillator(); aShimA.type = 'sine'; aShimA.frequency.value = 620;
+      aShimB = AC.createOscillator(); aShimB.type = 'sine'; aShimB.frequency.value = 627;
+      aShimGain = AC.createGain(); aShimGain.gain.value = 0.0;
+      aShimA.connect(aShimGain); aShimB.connect(aShimGain); aShimGain.connect(master);
+      aShimA.start(); aShimB.start();
+    } catch (e) { AC = null; }
+  }
+  function updateAudio() {
+    if (!AC) return;
+    var t = AC.currentTime;
+    var kn = curvAt(authorPhase());
+    aGlide.frequency.setTargetAtTime(150 + 420 * kn, t, 0.08);
+    var sp = 0, te = 0, i;
+    for (i = 0; i < drones.length; i++) {
+      sp += Math.sqrt(drones[i].vx * drones[i].vx + drones[i].vy * drones[i].vy);
+      te += drones[i].err;
+    }
+    sp /= drones.length;
+    aWhir.frequency.setTargetAtTime(65 + sp * 11, t, 0.08);
+    aWhirGain.gain.setTargetAtTime(0.006 + clamp(sp / 14, 0, 1) * 0.014, t, 0.1);
+    aShimGain.gain.setTargetAtTime(clamp(te / 46, 0, 1) * 0.035, t, 0.12);
+  }
+
+  // ---------------- drawing ----------------
+  function drawSpline(v, alpha, widthPx, glow) {
+    var i, M = pts.length;
+    if (glow) {
+      ctx.strokeStyle = COL.spline; ctx.globalAlpha = alpha * 0.14; ctx.lineWidth = widthPx + 4;
+      ctx.beginPath();
+      for (i = 0; i <= M; i++) { var g = pts[i % M]; var gx = v.ox + g.x * v.s, gy = v.oy + g.y * v.s; if (i === 0) ctx.moveTo(gx, gy); else ctx.lineTo(gx, gy); }
+      ctx.stroke();
+    }
+    ctx.strokeStyle = COL.spline; ctx.globalAlpha = alpha; ctx.lineWidth = widthPx;
+    ctx.beginPath();
+    for (i = 0; i <= M; i++) { var p = pts[i % M]; var px = v.ox + p.x * v.s, py = v.oy + p.y * v.s; if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py); }
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  function drawDrone(v, d, layerA) {
+    var X = v.ox + d.x * v.s, Y = v.oy + d.y * v.s;
+    var ds = (PHONE ? 1.4 : 1.0);
+    // payload glow: layered flat alpha (no gradients)
+    var glowR = [3.4, 2.4, 1.5], glowA = [0.08, 0.14, 0.22], gi;
+    ctx.fillStyle = COL.payload;
+    for (gi = 0; gi < 3; gi++) {
+      ctx.globalAlpha = glowA[gi] * layerA;
+      ctx.beginPath(); ctx.arc(X, Y, glowR[gi] * ds * v.s, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.save();
+    ctx.translate(X, Y); ctx.rotate(d.heading); ctx.scale(v.s * ds, v.s * ds);
+    // rotors
+    ctx.fillStyle = COL.drone; ctx.globalAlpha = 0.9 * layerA;
+    var rx = [-1.55, 1.55], ry = [-1.1, 1.1], a, b;
+    for (a = 0; a < 2; a++) for (b = 0; b < 2; b++) {
+      ctx.beginPath(); ctx.arc(rx[a], ry[b], 0.55, 0, Math.PI * 2); ctx.fill();
+    }
+    // body
+    ctx.globalAlpha = layerA;
+    ctx.beginPath();
+    var bw = 1.5, bh = 1.0, r = 0.45;
+    ctx.moveTo(-bw + r, -bh); ctx.lineTo(bw - r, -bh); ctx.arc(bw - r, -bh + r, r, -Math.PI / 2, 0);
+    ctx.lineTo(bw, bh - r); ctx.arc(bw - r, bh - r, r, 0, Math.PI / 2);
+    ctx.lineTo(-bw + r, bh); ctx.arc(-bw + r, bh - r, r, Math.PI / 2, Math.PI);
+    ctx.lineTo(-bw, -bh + r); ctx.arc(-bw + r, -bh + r, r, Math.PI, Math.PI * 1.5);
+    ctx.fill();
+    ctx.strokeStyle = COL.node; ctx.globalAlpha = 0.20 * layerA; ctx.lineWidth = 0.10;
+    ctx.stroke();
+    // camera payload
+    ctx.fillStyle = COL.payload; ctx.globalAlpha = 0.95 * layerA;
+    ctx.beginPath(); ctx.arc(0.35, 0, 0.5, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
+  function draw() {
+    canvas.style.width = VW + 'px';
+    canvas.style.height = VH + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    var v = view();
+    // background: lerp between register tones by blend
+    var br = Math.round(lerpC(COL.execBg[0], COL.authBg[0], blend));
+    var bg = Math.round(lerpC(COL.execBg[1], COL.authBg[1], blend));
+    var bb = Math.round(lerpC(COL.execBg[2], COL.authBg[2], blend));
+    ctx.fillStyle = 'rgb(' + br + ',' + bg + ',' + bb + ')';
+    ctx.fillRect(0, 0, VW, VH);
+
+    var execA = 1 - blend, authA = blend;
+    var i, d;
+
+    if (execA > 0.001) {
+      // execution view: dim spline ghost, error connectors, drones
+      drawSpline(v, 0.20 * execA, 1.5, false);
+      // target dots
+      ctx.fillStyle = COL.spline;
+      for (i = 0; i < drones.length; i++) {
+        d = drones[i];
+        ctx.globalAlpha = 0.75 * execA;
+        ctx.beginPath(); ctx.arc(v.ox + d.tx * v.s, v.oy + d.ty * v.s, 2.2, 0, Math.PI * 2); ctx.fill();
+      }
+      // error connectors: the gap, honestly rendered
+      ctx.strokeStyle = COL.err; ctx.lineWidth = 1.2;
+      for (i = 0; i < drones.length; i++) {
+        d = drones[i];
+        ctx.globalAlpha = 0.4 * execA;
+        ctx.beginPath();
+        ctx.moveTo(v.ox + d.x * v.s, v.oy + d.y * v.s);
+        ctx.lineTo(v.ox + d.tx * v.s, v.oy + d.ty * v.s);
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+      for (i = 0; i < drones.length; i++) drawDrone(v, drones[i], execA);
+    }
+
+    if (authA > 0.001) {
+      // authoring view: the editor: spline, keyframe nodes, author marker
+      drawSpline(v, 0.95 * authA, 1.5, true);
+      ctx.fillStyle = COL.node;
+      for (i = 0; i < keys.length; i++) {
+        ctx.globalAlpha = 0.9 * authA;
+        ctx.beginPath(); ctx.arc(v.ox + keys[i].x * v.s, v.oy + keys[i].y * v.s, 3, 0, Math.PI * 2); ctx.fill();
+        ctx.globalAlpha = 0.35 * authA;
+        ctx.beginPath(); ctx.arc(v.ox + keys[i].x * v.s, v.oy + keys[i].y * v.s, 6, 0, Math.PI * 2); ctx.strokeStyle = COL.node; ctx.lineWidth = 1; ctx.stroke();
+      }
+      var ap = pointAt(authorPhase());
+      var AX = v.ox + ap.x * v.s, AY = v.oy + ap.y * v.s;
+      ctx.fillStyle = COL.spline; ctx.globalAlpha = 0.16 * authA;
+      ctx.beginPath(); ctx.arc(AX, AY, 10, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = COL.node; ctx.globalAlpha = 0.95 * authA; ctx.lineWidth = 1.6;
+      ctx.beginPath(); ctx.arc(AX, AY, 6, 0, Math.PI * 2); ctx.stroke();
+      ctx.fillStyle = COL.node;
+      ctx.beginPath(); ctx.arc(AX, AY, 2.4, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+  }
+  function lerpC(a, b, t) { return a + (b - a) * t; }
+
+  // ---------------- interaction ----------------
+  var dragKey = -1, dragMoved = false, downX = 0, downY = 0, downStamp = 0, lastTapStamp = -10000;
+  function toWorld(e) {
+    var rect = { left: 0, top: 0 };
+    if (canvas.getBoundingClientRect) rect = canvas.getBoundingClientRect();
+    var cx = (typeof e.clientX === 'number') ? e.clientX - rect.left : 0;
+    var cy = (typeof e.clientY === 'number') ? e.clientY - rect.top : 0;
+    var v = view();
+    return { x: (cx - v.ox) / v.s, y: (cy - v.oy) / v.s, cx: cx, cy: cy };
+  }
+  function onDown(e) {
+    ensureAudio();
+    var w = toWorld(e);
+    downX = w.cx; downY = w.cy; dragMoved = false;
+    downStamp = (typeof e.timeStamp === 'number') ? e.timeStamp : 0;
+    dragKey = -1;
+    var best = 34, i;
+    for (i = 0; i < keys.length; i++) {
+      var dx = keys[i].x - w.x, dy = keys[i].y - w.y;
+      var dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist < best) { best = dist; dragKey = i; }
+    }
+  }
+  function onMove(e) {
+    if (dragKey < 0) return;
+    var w = toWorld(e);
+    if (Math.abs(w.cx - downX) > 7 || Math.abs(w.cy - downY) > 7) dragMoved = true;
+    if (dragMoved) {
+      keys[dragKey].x = clamp(w.x, 8, 152);
+      keys[dragKey].y = clamp(w.y, 6, 94);
+      buildTable();
+      draw();
+    }
+  }
+  function onUp(e) {
+    var wasDrag = dragMoved && dragKey >= 0;
+    dragKey = -1; dragMoved = false;
+    if (wasDrag) return;
+    var stamp = (typeof e.timeStamp === 'number') ? e.timeStamp : 0;
+    if (stamp - lastTapStamp < 350) {
+      // double tap: new path
+      lastTapStamp = -10000;
+      pendingTap = null;
+      seed = (Math.imul(seed, 1664525) + 1013904223) | 0;
+      buildKeys(seed);
+      buildTable();
+      computePhase0();
+      resetDrones();
+      draw();
+      return;
+    }
+    lastTapStamp = stamp;
+    pendingTap = { time: T };
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', function () { dragKey = -1; dragMoved = false; });
+  }
+
+  // ---------------- boot: build, pre-roll, frame one ----------------
+  fit();
+  buildKeys(seed);
+  buildTable();
+  computePhase0();
+  resetDrones();
+  var s0;
+  for (s0 = 0; s0 < PREROLL; s0++) step(true);
+  for (s0 = 0; s0 < drones.length; s0++) errFrame[s0] = drones[s0].err;
+  draw();
+
+  // QA / probe stats (harmless in the browser)
+  try {
+    globalThis.__CMF_STATS = {
+      totalLen: totalLen,
+      phase0: PHASE0,
+      authorPhaseAtFrameOne: authorPhase(),
+      frameErrors: errFrame.slice(),
+      meanErr: errCount ? errSum / errCount : 0,
+      maxErr: errMax
+    };
+  } catch (e) {}
+
+  // ---------------- live loop ----------------
+  if (typeof requestAnimationFrame === 'function') {
+    var lastMs = null, acc = 0;
+    var loop = function (ms) {
+      if (lastMs === null) lastMs = ms;
+      var el = (ms - lastMs) / 1000;
+      lastMs = ms;
+      if (el > 0.25) el = 0.25;
+      acc += el;
+      var n = Math.floor(acc / DT);
+      if (n > 30) n = 30;
+      acc -= n * DT;
+      var i;
+      for (i = 0; i < n; i++) step(false);
+      draw();
+      updateAudio();
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>

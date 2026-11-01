@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>As If Well-Trained Birds</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #050506; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded rng ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- palette (strict) ----------
+  var VOID = '#050506';
+  var DRONE = '#1E2024';
+  var ORB = '#DCE9FF';
+  var TRAIL = '#7FD4FF';
+  var FIGURE = '#0A0B0D';
+
+  // ---------- sim constants ----------
+  var STEP = 1 / 120;            // fixed sim step, seconds
+  var PREROLL = 2160;            // 18 s at 120 Hz: frame one lives here
+  var BASE_SEED = 1051212;
+  var N = 24;
+  var WORLD = 1000;              // virtual world is WORLD x WORLD units
+  var PHRASE_STEPS = 960;        // one score phrase = 8 s
+  var TRAIL_EVERY = 3;           // sample a trail point every 3 steps
+  var TRAIL_LEN = 38;            // ~0.95 s of wake per drone
+
+  var seed = BASE_SEED;
+  var simStep = 0;
+  var drones = [];
+  var patterns = [];
+  var freezeUntilStep = -1;
+  var FIG = { x: 500, y: 668 };  // the still figure, center-low
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 720, H = 720, DPR = 1;
+  var phoneNow = false;
+
+  function isPhone() {
+    var sw = 0, sh = 0;
+    if (typeof window !== 'undefined' && window.screen) {
+      sw = window.screen.width || 0; sh = window.screen.height || 0;
+    }
+    var mn = Math.min(sw, sh);
+    if (mn > 0 && mn < 700) return true;
+    return H > W * 1.15; // aspect fallback only
+  }
+
+  function fit() {
+    var vv = (typeof window !== 'undefined') ? window.visualViewport : null;
+    if (vv && vv.width) { W = vv.width; H = vv.height; }
+    else if (typeof window !== 'undefined' && window.innerWidth) { W = window.innerWidth; H = window.innerHeight; }
+    DPR = (typeof window !== 'undefined' && window.devicePixelRatio) ? Math.min(window.devicePixelRatio, 2) : 1;
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    phoneNow = isPhone();
+  }
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', function () { fit(); draw(); });
+    }
+    if (window.addEventListener) {
+      window.addEventListener('resize', function () { fit(); draw(); });
+    }
+  }
+
+  // world -> screen transform (contain fit, centered)
+  function view() {
+    var s = Math.min(W, H) / WORLD;
+    return { s: s, ox: (W - WORLD * s) / 2, oy: (H - WORLD * s) / 2 };
+  }
+  function toWorld(px, py) {
+    var v = view();
+    return { x: (px - v.ox) / v.s, y: (py - v.oy) / v.s };
+  }
+
+  // ---------- the score ----------
+  // Each phrase is a formation pattern around the figure. A drone's mark is
+  // patternCenter + patternOffset(i, phrase). The flock is pulled toward its
+  // marks (the score) while boid rules keep it bird-like (the tension).
+  function buildScore(rng) {
+    patterns = [];
+    // pattern: {centers:[[x,y],...], rx, ry, arc0, arc1, swirl}
+    var defs = [
+      { centers: [[332, 468]], rx: 150, ry: 92,  arc0: -0.4, arc1: 2.6, swirl: 1 },   // arc left
+      { centers: [[500, 372]], rx: 205, ry: 80,  arc0: 0.15, arc1: 3.0, swirl: -1 },  // overhead dome
+      { centers: [[668, 468]], rx: 150, ry: 92,  arc0: 0.55, arc1: 3.55, swirl: 1 },  // arc right
+      { centers: [[348, 512], [652, 512]], rx: 88, ry: 64, arc0: 0, arc1: 6.283, swirl: -1 }, // split pairs
+      { centers: [[500, 556]], rx: 218, ry: 150, arc0: 0, arc1: 6.283, swirl: 1 },    // ring around figure
+      { centers: [[500, 300]], rx: 285, ry: 66,  arc0: 0.1, arc1: 3.1, swirl: -1 }    // high veil
+    ];
+    for (var p = 0; p < defs.length; p++) {
+      var d = defs[p];
+      patterns.push({
+        centers: d.centers, rx: d.rx, ry: d.ry,
+        arc0: d.arc0, arc1: d.arc1, swirl: d.swirl,
+        phaseJitter: rng() * 0.9
+      });
+    }
+  }
+
+  function markFor(i, phraseIdx) {
+    var pat = patterns[phraseIdx % patterns.length];
+    var ci = pat.centers.length > 1 ? (i < N / 2 ? 0 : 1) : 0;
+    var c = pat.centers[ci];
+    var frac = pat.centers.length > 1 ? (i % (N / 2)) / (N / 2) : i / N;
+    var d = drones[i];
+    // each drone's mark slowly orbits the pattern center: the formation
+    // is a wheel, not a parking grid (the score proposes, the birds dispose)
+    var orb = d ? (d.orbitPhase + d.orbitRate * simStep * STEP) : 0;
+    var a = pat.arc0 + (pat.arc1 - pat.arc0) * frac + pat.phaseJitter + orb;
+    return {
+      x: c[0] + Math.cos(a) * pat.rx,
+      y: c[1] + Math.sin(a) * pat.ry,
+      cx: c[0], cy: c[1], swirl: pat.swirl
+    };
+  }
+
+  // ---------- flock construction ----------
+  function build(s) {
+    var rng = mulberry32(s);
+    buildScore(rng);
+    drones = [];
+    for (var i = 0; i < N; i++) {
+      var ang = rng() * Math.PI * 2;
+      var rad = 120 + rng() * 220;
+      drones.push({
+        x: FIG.x + Math.cos(ang) * rad,
+        y: 430 + Math.sin(ang) * rad * 0.55,
+        vx: (rng() - 0.5) * 60,
+        vy: (rng() - 0.5) * 60,
+        orbitPhase: rng() * Math.PI * 2,
+        orbitRate: (0.05 + rng() * 0.09) * (rng() < 0.5 ? -1 : 1),
+        trail: []
+      });
+    }
+    simStep = 0;
+    freezeUntilStep = -1;
+  }
+
+  // ---------- pointer / wind state ----------
+  var wind = null; // {x, y, px, py} in world coords while dragging
+
+  // ---------- audio (lazy, guarded) ----------
+  var AC = null, whirGain = null, toneOsc = null, toneGain = null;
+  function audio() {
+    if (AC) return AC;
+    var Ctor = null;
+    if (typeof AudioContext !== 'undefined') Ctor = AudioContext;
+    else if (typeof window !== 'undefined' && window.webkitAudioContext) Ctor = window.webkitAudioContext;
+    if (!Ctor) return null;
+    try {
+      AC = new Ctor();
+      // faint layered whir: filtered noise
+      var len = AC.sampleRate * 1.2;
+      var buf = AC.createBuffer(1, len, AC.sampleRate);
+      var ch = buf.getChannelData(0);
+      var r = mulberry32(777);
+      for (var i = 0; i < len; i++) ch[i] = r() * 2 - 1;
+      var src = AC.createBufferSource();
+      src.buffer = buf; src.loop = true;
+      var bp = AC.createBiquadFilter();
+      bp.type = 'bandpass'; bp.frequency.value = 2400; bp.Q.value = 0.7;
+      whirGain = AC.createGain(); whirGain.gain.value = 0.0;
+      src.connect(bp); bp.connect(whirGain); whirGain.connect(AC.destination);
+      src.start();
+      // the luminous tone: brightens as the flock tightens
+      toneOsc = AC.createOscillator();
+      toneOsc.type = 'sine'; toneOsc.frequency.value = 620;
+      toneGain = AC.createGain(); toneGain.gain.value = 0.0;
+      toneOsc.connect(toneGain); toneGain.connect(AC.destination);
+      toneOsc.start();
+    } catch (e) { AC = null; }
+    return AC;
+  }
+  function updateAudio() {
+    if (!AC || !toneGain) return;
+    // mean pairwise spread of the flock: tight flock -> brighter tone
+    var cx = 0, cy = 0, i;
+    for (i = 0; i < N; i++) { cx += drones[i].x; cy += drones[i].y; }
+    cx /= N; cy /= N;
+    var spread = 0;
+    for (i = 0; i < N; i++) {
+      var dx = drones[i].x - cx, dy = drones[i].y - cy;
+      spread += Math.sqrt(dx * dx + dy * dy);
+    }
+    spread /= N;
+    var tight = Math.max(0, Math.min(1, (300 - spread) / 220));
+    var t = AC.currentTime;
+    toneGain.gain.setTargetAtTime(0.012 + tight * 0.05, t, 0.2);
+    toneOsc.frequency.setTargetAtTime(540 + tight * 260, t, 0.2);
+    whirGain.gain.setTargetAtTime(0.015 + tight * 0.012, t, 0.2);
+  }
+
+  // ---------- simulation ----------
+  var MAXV = 150, MINV = 62;
+
+  function stepSim() {
+    if (simStep < freezeUntilStep) { simStep++; return; }
+    var phraseIdx = Math.floor(simStep / PHRASE_STEPS);
+    var i, j, d, o;
+    // centroid
+    var cx = 0, cy = 0, cvx = 0, cvy = 0;
+    for (i = 0; i < N; i++) { cx += drones[i].x; cy += drones[i].y; cvx += drones[i].vx; cvy += drones[i].vy; }
+    cx /= N; cy /= N; cvx /= N; cvy /= N;
+
+    for (i = 0; i < N; i++) {
+      d = drones[i];
+      var fx = 0, fy = 0;
+      var near = 0, ax = 0, ay = 0, avx = 0, avy = 0;
+      for (j = 0; j < N; j++) {
+        if (j === i) continue;
+        o = drones[j];
+        var dx = d.x - o.x, dy = d.y - o.y;
+        var dist2 = dx * dx + dy * dy;
+        if (dist2 < 100 * 100 && dist2 > 0.01) {
+          near++;
+          ax += o.x; ay += o.y; avx += o.vx; avy += o.vy;
+          if (dist2 < 48 * 48) {
+            var dist = Math.sqrt(dist2);
+            var push = (48 - dist) / 48 * 300;
+            fx += (dx / dist) * push;
+            fy += (dy / dist) * push;
+          }
+        }
+      }
+      if (near > 0) {
+        // cohesion + alignment (local rules)
+        fx += ((ax / near) - d.x) * 0.55;
+        fy += ((ay / near) - d.y) * 0.55;
+        fx += ((avx / near) - d.vx) * 1.1;
+        fy += ((avy / near) - d.vy) * 1.1;
+      }
+      // the score: steer toward this drone's mark for the current phrase
+      // (deliberately weaker than the boid terms: tension, not obedience)
+      var m = markFor(i, phraseIdx);
+      fx += (m.x - d.x) * 0.8;
+      fy += (m.y - d.y) * 0.8;
+      // swirl around the pattern center: the wheel keeps turning
+      var sx = -(d.y - m.cy), sy = (d.x - m.cx);
+      var sl = Math.sqrt(sx * sx + sy * sy) || 1;
+      fx += (sx / sl) * 62 * m.swirl;
+      fy += (sy / sl) * 62 * m.swirl;
+      // stay devoted: soft pull of the whole flock toward the figure's airspace
+      fx += (FIG.x - cx) * 0.05;
+      fy += ((FIG.y - 170) - cy) * 0.05;
+      // the wind: drag bends flight around the finger
+      if (wind) {
+        var wx = d.x - wind.x, wy = d.y - wind.y;
+        var wd = Math.sqrt(wx * wx + wy * wy);
+        if (wd < 260 && wd > 1) {
+          var wgt = (1 - wd / 260);
+          // curved deflection: radial push + tangential bend
+          fx += (wx / wd) * wgt * 190 + (-(wy / wd)) * wgt * 130;
+          fy += (wy / wd) * wgt * 190 + ( (wx / wd)) * wgt * 130;
+        }
+      }
+      d.vx += fx * STEP;
+      d.vy += fy * STEP;
+      // clamp speed
+      var sp = Math.sqrt(d.vx * d.vx + d.vy * d.vy) || 1;
+      if (sp > MAXV) { d.vx = d.vx / sp * MAXV; d.vy = d.vy / sp * MAXV; }
+      else if (sp < MINV) { d.vx = d.vx / sp * MINV; d.vy = d.vy / sp * MINV; }
+      d.x += d.vx * STEP;
+      d.y += d.vy * STEP;
+      // soft bounds: steer back into the studio
+      if (d.x < 60) d.vx += 130 * STEP * 4;
+      if (d.x > 940) d.vx -= 130 * STEP * 4;
+      if (d.y < 50) d.vy += 130 * STEP * 4;
+      if (d.y > 880) d.vy -= 130 * STEP * 4;
+      // trail sampling (stored buffer, never canvas fade)
+      if (simStep % TRAIL_EVERY === 0) {
+        d.trail.push({ x: d.x, y: d.y });
+        if (d.trail.length > TRAIL_LEN) d.trail.shift();
+      }
+    }
+    simStep++;
+  }
+
+  // ---------- drawing ----------
+  function drawFigure(v) {
+    var x = FIG.x, y = FIG.y;
+    var u = v.s * 10; // figure scale unit (~ height 92 world units)
+    ctx.save();
+    ctx.translate(v.ox + x * v.s, v.oy + y * v.s);
+    ctx.scale(v.s, v.s);
+    // silhouette outline: torso, legs, both arms raised (Tempest's pose)
+    function bodyPath() {
+      ctx.beginPath();
+      ctx.moveTo(-7, -78);
+      ctx.lineTo(-30, -102);   // left arm raised, out and up
+      ctx.lineTo(-24.5, -108.5);
+      ctx.lineTo(-6.5, -90);
+      ctx.lineTo(-6.8, -52);   // left side of torso
+      ctx.lineTo(-12.5, 0);    // left leg, planted wide
+      ctx.lineTo(-5.5, 0);
+      ctx.lineTo(-1.5, -36);   // inner legs
+      ctx.lineTo(1.5, -36);
+      ctx.lineTo(5.5, 0);
+      ctx.lineTo(12.5, 0);     // right leg
+      ctx.lineTo(6.8, -52);    // right side of torso
+      ctx.lineTo(6.5, -90);
+      ctx.lineTo(24.5, -108.5); // right arm raised
+      ctx.lineTo(30, -102);
+      ctx.lineTo(7, -78);
+      ctx.closePath();
+    }
+    // rim: the orb-light edge (trail tone, very low alpha)
+    ctx.strokeStyle = TRAIL;
+    ctx.globalAlpha = 0.30;
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    ctx.arc(0, -86, 8.2, 0, Math.PI * 2);
+    ctx.stroke();
+    bodyPath();
+    ctx.stroke();
+    // body fill (darker than the void)
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = FIGURE;
+    ctx.beginPath();
+    ctx.arc(0, -86, 7.2, 0, Math.PI * 2);
+    ctx.fill();
+    bodyPath();
+    ctx.fill();
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
+  function draw() {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = VOID;
+    ctx.fillRect(0, 0, W, H);
+    var v = view();
+    var i, k, d;
+
+    // orb trails (stored buffers)
+    ctx.lineCap = 'round';
+    for (i = 0; i < N; i++) {
+      d = drones[i];
+      var tr = d.trail;
+      for (k = 1; k < tr.length; k++) {
+        var f = k / tr.length;
+        ctx.strokeStyle = TRAIL;
+        ctx.globalAlpha = 0.30 * f;
+        ctx.lineWidth = Math.max(1, 2.6 * v.s * f);
+        ctx.beginPath();
+        ctx.moveTo(v.ox + tr[k - 1].x * v.s, v.oy + tr[k - 1].y * v.s);
+        ctx.lineTo(v.ox + tr[k].x * v.s, v.oy + tr[k].y * v.s);
+        ctx.stroke();
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    drawFigure(v);
+
+    // drones + orbs
+    for (i = 0; i < N; i++) {
+      d = drones[i];
+      var x = v.ox + d.x * v.s, y = v.oy + d.y * v.s;
+      var heading = Math.atan2(d.vy, d.vx);
+      // tiny quad outline, rotated to heading
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.rotate(heading);
+      ctx.strokeStyle = DRONE;
+      ctx.globalAlpha = 1;
+      ctx.lineWidth = Math.max(1, 1.3 * v.s);
+      var b = 6.2 * v.s;
+      ctx.strokeRect(-b, -b * 0.72, b * 2, b * 1.44);
+      // rotor ticks
+      ctx.beginPath();
+      ctx.moveTo(-b - 2.4 * v.s, -b * 0.72); ctx.lineTo(-b + 2.0 * v.s, -b * 0.72);
+      ctx.moveTo(b - 2.0 * v.s, -b * 0.72); ctx.lineTo(b + 2.4 * v.s, -b * 0.72);
+      ctx.moveTo(-b - 2.4 * v.s, b * 0.72); ctx.lineTo(-b + 2.0 * v.s, b * 0.72);
+      ctx.moveTo(b - 2.0 * v.s, b * 0.72); ctx.lineTo(b + 2.4 * v.s, b * 0.72);
+      ctx.stroke();
+      ctx.restore();
+      // the payload orb, riding on top: layered halo + full core
+      var oy = y - 7.5 * v.s;
+      ctx.fillStyle = ORB;
+      ctx.globalAlpha = 0.07;
+      ctx.beginPath(); ctx.arc(x, oy, 13.5 * v.s, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = 0.16;
+      ctx.beginPath(); ctx.arc(x, oy, 8.2 * v.s, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = 0.42;
+      ctx.beginPath(); ctx.arc(x, oy, 4.6 * v.s, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = 1.0;
+      ctx.beginPath(); ctx.arc(x, oy, 2.7 * v.s, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- pointer interaction ----------
+  var downAt = null, downPos = null, lastTapStep = -100000, lastTapPos = null, moved = false;
+  function evtPos(e) {
+    var rect = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+  }
+  function onDown(e) {
+    audio();
+    if (AC && AC.resume) { try { AC.resume(); } catch (err) {} }
+    var p = evtPos(e);
+    downPos = p; moved = false;
+    var w = toWorld(p.x, p.y);
+    wind = { x: w.x, y: w.y };
+  }
+  function onMove(e) {
+    if (!wind || !downPos) return;
+    var p = evtPos(e);
+    if (Math.abs(p.x - downPos.x) > 6 || Math.abs(p.y - downPos.y) > 6) moved = true;
+    if (moved) {
+      var w = toWorld(p.x, p.y);
+      wind.x = w.x; wind.y = w.y;
+    }
+  }
+  function onUp(e) {
+    var wasDrag = moved;
+    wind = null;
+    if (wasDrag || !downPos) { downPos = null; return; }
+    var p = evtPos(e);
+    // double-tap: reseed formation and score
+    if (lastTapPos && (simStep - lastTapStep) < 42 &&
+        Math.abs(p.x - lastTapPos.x) < 44 && Math.abs(p.y - lastTapPos.y) < 44) {
+      seed = (seed * 1664525 + 1013904223) >>> 0;
+      build(seed);
+      for (var s = 0; s < PREROLL; s++) stepSim();
+      lastTapStep = -100000; lastTapPos = null;
+      draw();
+      downPos = null;
+      return;
+    }
+    lastTapStep = simStep; lastTapPos = p;
+    // tap: stillness, the flock holds for 3 s (360 steps)
+    freezeUntilStep = simStep + 360;
+    downPos = null;
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', function () { wind = null; downPos = null; });
+  }
+
+  // ---------- boot: pre-roll, frame one, live loop ----------
+  fit();
+  phoneNow = isPhone();
+  build(seed);
+  for (var s0 = 0; s0 < PREROLL; s0++) stepSim();
+  draw();
+
+  if (typeof requestAnimationFrame !== 'undefined') {
+    var lastMs = null, acc = 0;
+    var loop = function (ms) {
+      if (lastMs === null) lastMs = ms;
+      var elapsed = (ms - lastMs) / 1000;
+      lastMs = ms;
+      if (elapsed > 0.25) elapsed = 0.25;
+      acc += elapsed;
+      var steps = Math.floor(acc / STEP);
+      if (steps > 30) steps = 30;
+      acc -= steps * STEP;
+      if (acc > STEP * 30) acc = 0;
+      for (var i = 0; i < steps; i++) stepSim();
+      draw();
+      updateAudio();
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>

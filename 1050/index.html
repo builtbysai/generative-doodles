@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Measure, Correct, Move</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #07080A; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded rng ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- palette (strict) ----------
+  var FIELD = '#07080A';
+  var GHOST = '#3A4A5A';
+  var TRUTH = '#FFFFFF';
+  var PULSE = '#FFE9B8';
+  var WPCOL = '#7FD4FF';
+
+  // ---------- sim constants ----------
+  var DT = 1 / 120;            // fixed step, seconds
+  var PREROLL = 3000;          // 25 s at 120 Hz: frame one lives here
+  var TICK_STEPS = 96;         // correction tick every 0.8 s
+  var LOOP = 50;               // trace record length, seconds
+  var REC_EVERY = 3;           // record a trace point every 3 steps (40 Hz)
+  var BASE_SEED = 1050211;
+  var TAU = Math.PI * 2;
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 720, H = 720, DPR = 1;
+
+  function isPhone() {
+    var sw = 0, sh = 0;
+    if (typeof window !== 'undefined' && window.screen) {
+      sw = window.screen.width || 0; sh = window.screen.height || 0;
+    }
+    var mn = Math.min(sw, sh);
+    if (mn > 0 && mn < 700) return true;
+    return H > W * 1.15; // aspect fallback only
+  }
+
+  function fit() {
+    var vv = (typeof window !== 'undefined') ? window.visualViewport : null;
+    if (vv && vv.width) { W = vv.width; H = vv.height; }
+    else if (typeof window !== 'undefined' && window.innerWidth) { W = window.innerWidth; H = window.innerHeight; }
+    DPR = (typeof window !== 'undefined' && window.devicePixelRatio) ? Math.min(window.devicePixelRatio, 2) : 1;
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+  }
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', function () { fit(); draw(); });
+    }
+    if (window.addEventListener) {
+      window.addEventListener('resize', function () { fit(); draw(); });
+    }
+  }
+
+  // ---------- spline helpers ----------
+  // Closed Catmull-Rom through waypoints, densely sampled, arc-length table.
+  function buildSpline(wps, per) {
+    var n = wps.length, pts = [], i, k;
+    for (i = 0; i < n; i++) {
+      var p0 = wps[(i + n - 1) % n], p1 = wps[i], p2 = wps[(i + 1) % n], p3 = wps[(i + 2) % n];
+      for (k = 0; k < per; k++) {
+        var u = k / per, u2 = u * u, u3 = u2 * u;
+        pts.push({
+          x: 0.5 * ((2 * p1.x) + (-p0.x + p2.x) * u + (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * u2 + (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * u3),
+          y: 0.5 * ((2 * p1.y) + (-p0.y + p2.y) * u + (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * u2 + (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * u3)
+        });
+      }
+    }
+    var cum = [0], total = 0, j;
+    for (j = 1; j <= pts.length; j++) {
+      var a = pts[j - 1], b = pts[j % pts.length];
+      total += Math.sqrt((b.x - a.x) * (b.x - a.x) + (b.y - a.y) * (b.y - a.y));
+      cum.push(total);
+    }
+    return { pts: pts, cum: cum, total: total };
+  }
+
+  function splineAt(sp, s) {
+    var L = sp.total;
+    s = ((s % L) + L) % L;
+    var cum = sp.cum, lo = 0, hi = cum.length - 1;
+    while (lo < hi - 1) { var mid = (lo + hi) >> 1; if (cum[mid] <= s) lo = mid; else hi = mid; }
+    var seg = cum[hi] - cum[lo];
+    var u = seg > 0 ? (s - cum[lo]) / seg : 0;
+    var a = sp.pts[lo % sp.pts.length], b = sp.pts[hi % sp.pts.length];
+    return { x: a.x + (b.x - a.x) * u, y: a.y + (b.y - a.y) * u };
+  }
+
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+
+  // ---------- audio (lazy, guarded) ----------
+  var AC = null, lastClickAt = 0;
+  function ensureAudio() {
+    if (AC) return AC;
+    var Ctor = null;
+    if (typeof AudioContext !== 'undefined') Ctor = AudioContext;
+    else if (typeof window !== 'undefined' && window.webkitAudioContext) Ctor = window.webkitAudioContext;
+    if (!Ctor) return null;
+    try {
+      AC = new Ctor();
+      // the field: a low tone under everything
+      var o = AC.createOscillator(), g = AC.createGain();
+      o.type = 'sine'; o.frequency.value = 52;
+      g.gain.value = 0.012;
+      o.connect(g); g.connect(AC.destination);
+      o.start();
+    } catch (e) { AC = null; }
+    return AC;
+  }
+  function clickSound(err, disturbed) {
+    if (!AC) return;
+    var now = AC.currentTime;
+    if (now - lastClickAt < 0.03) return;
+    lastClickAt = now;
+    try {
+      var o = AC.createOscillator(), g = AC.createGain();
+      o.type = 'sine';
+      o.frequency.value = clamp(480 + err * 9000, 480, 1400);
+      g.gain.setValueAtTime(disturbed ? 0.05 : 0.028, now);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + 0.06);
+      o.connect(g); g.connect(AC.destination);
+      o.start(now); o.stop(now + 0.08);
+    } catch (e) { /* silent */ }
+  }
+
+  // ---------- the system ----------
+  var sim = null;
+
+  function makeNode(rng, idx) {
+    var cx = 0.5 + (rng() - 0.5) * 0.34;
+    var cy = 0.5 + (rng() - 0.5) * 0.34;
+    var rx = 0.20 + rng() * 0.22;
+    var ry = 0.18 + rng() * 0.22;
+    var nw = 5 + Math.floor(rng() * 3);
+    var baseA = rng() * TAU;
+    var wps = [], k;
+    for (k = 0; k < nw; k++) {
+      var a = baseA + (k / nw) * TAU;
+      var rr = 0.72 + rng() * 0.5;
+      wps.push({
+        x: clamp(cx + Math.cos(a) * rx * rr, 0.07, 0.93),
+        y: clamp(cy + Math.sin(a) * ry * rr, 0.07, 0.93)
+      });
+    }
+    var sp = buildSpline(wps, 36);
+    var lapDur = 40 + rng() * 18;              // 40-58 s per lap
+    var speed = sp.total / lapDur;
+    var s0 = rng() * sp.total;
+    var p0 = splineAt(sp, s0);
+    var p1 = splineAt(sp, s0 + 0.01);
+    var tl = Math.sqrt((p1.x - p0.x) * (p1.x - p0.x) + (p1.y - p0.y) * (p1.y - p0.y)) || 1;
+    var node = {
+      rng: mulberry32((BASE_SEED ^ (idx * 7919 + 13)) >>> 0),
+      wps: wps, sp: sp, s: s0, speed: speed,
+      pos: { x: p0.x, y: p0.y },
+      vel: { x: (p1.x - p0.x) / tl * speed, y: (p1.y - p0.y) / tl * speed },
+      drift: { x: 0, y: 0 },
+      nextTickStep: 24 + idx * 13,            // node 0 ticks at step 24 + 96k: step 3000 is one
+      trace: [],
+      lastErr: 0
+    };
+    rollDrift(node);
+    return node;
+  }
+
+  function rollDrift(node) {
+    var ang = node.rng() * TAU;
+    var mag = (0.38 + node.rng() * 0.42) * node.speed;
+    node.drift.x = Math.cos(ang) * mag;
+    node.drift.y = Math.sin(ang) * mag;
+  }
+
+  function buildSim(seed) {
+    var rng = mulberry32(seed);
+    sim = {
+      t: 0, step: 0, seed: seed,
+      nodes: [],
+      pulses: [],
+      ghostFlashUntil: -1,
+      disturb: { x: 0, y: 0, until: -1 },
+      lastTapStep: -100000
+    };
+    for (var i = 0; i < 6; i++) sim.nodes.push(makeNode(rng, i));
+  }
+
+  function stepSim() {
+    sim.step++;
+    sim.t = sim.step * DT;
+    var i, node;
+    for (i = 0; i < sim.nodes.length; i++) {
+      node = sim.nodes[i];
+      node.s += node.speed * DT;
+      var P = splineAt(node.sp, node.s);
+      var ahead = splineAt(node.sp, node.s + node.speed * 0.9);
+      var dx = ahead.x - node.pos.x, dy = ahead.y - node.pos.y;
+      var dl = Math.sqrt(dx * dx + dy * dy) || 1;
+      var desX = dx / dl * node.speed, desY = dy / dl * node.speed;
+
+      // drag disturbance: nodes near the finger drift harder
+      var dFac = 1;
+      if (sim.t < sim.disturb.until) {
+        var ddx = node.pos.x - sim.disturb.x, ddy = node.pos.y - sim.disturb.y;
+        if (ddx * ddx + ddy * ddy < 0.28 * 0.28) dFac = 2.4;
+      }
+
+      if (sim.step >= node.nextTickStep) {
+        // CORRECTION TICK: measure the error, snap the heading to the plan,
+        // and pull the position partway back: the trace kinks here, unsmoothed.
+        var ex = node.pos.x - P.x, ey = node.pos.y - P.y;
+        node.lastErr = Math.sqrt(ex * ex + ey * ey);
+        node.pos.x -= ex * 0.3; node.pos.y -= ey * 0.3;
+        node.vel.x = desX; node.vel.y = desY;
+        sim.pulses.push({
+          x: node.pos.x, y: node.pos.y, t: sim.t,
+          mag: node.lastErr * (dFac > 1 ? 1.7 : 1)
+        });
+        clickSound(node.lastErr, dFac > 1);
+        rollDrift(node);
+        node.nextTickStep += TICK_STEPS;
+      } else {
+        // between ticks: ease toward plan-plus-drift; the error grows
+        var k = 1 - Math.exp(-DT * 1.1);
+        node.vel.x += (desX + node.drift.x * dFac - node.vel.x) * k;
+        node.vel.y += (desY + node.drift.y * dFac - node.vel.y) * k;
+      }
+      node.pos.x += node.vel.x * DT;
+      node.pos.y += node.vel.y * DT;
+
+      // record the truth
+      if (sim.step % REC_EVERY === 0) {
+        node.trace.push({ x: node.pos.x, y: node.pos.y, t: sim.t });
+        while (node.trace.length && sim.t - node.trace[0].t > LOOP) node.trace.shift();
+      }
+    }
+    // prune dead pulses
+    while (sim.pulses.length && sim.t - sim.pulses[0].t > 0.75) sim.pulses.shift();
+  }
+
+  // ---------- drawing ----------
+  function draw() {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = FIELD;
+    ctx.fillRect(0, 0, W, H);
+    var S = Math.min(W, H);
+    var i, j, node;
+
+    // ghosts: the plan
+    var gAlpha = 0.25;
+    if (sim.t < sim.ghostFlashUntil) {
+      gAlpha = 0.25 + 0.58 * clamp((sim.ghostFlashUntil - sim.t) / 3, 0, 1);
+    }
+    ctx.strokeStyle = GHOST;
+    ctx.globalAlpha = gAlpha;
+    ctx.lineWidth = Math.max(1, S * 0.0016);
+    for (i = 0; i < sim.nodes.length; i++) {
+      var pts = sim.nodes[i].sp.pts;
+      ctx.beginPath();
+      for (j = 0; j <= pts.length; j++) {
+        var p = pts[j % pts.length];
+        if (j === 0) ctx.moveTo(p.x * W, p.y * H); else ctx.lineTo(p.x * W, p.y * H);
+      }
+      ctx.stroke();
+    }
+
+    // traces: the truth, bright, kinked, fading by age in steps
+    ctx.strokeStyle = TRUTH;
+    ctx.lineWidth = Math.max(1, S * 0.0022);
+    ctx.lineJoin = 'round';
+    var BUCKETS = 10;
+    for (i = 0; i < sim.nodes.length; i++) {
+      node = sim.nodes[i];
+      var tr = node.trace;
+      var curB = -1;
+      ctx.beginPath();
+      for (j = 1; j < tr.length; j++) {
+        var age = sim.t - tr[j - 1].t;
+        var b = Math.floor(clamp(age / LOOP, 0, 0.999) * BUCKETS);
+        if (b !== curB) {
+          if (curB >= 0) ctx.stroke();
+          ctx.globalAlpha = 0.9 * Math.pow(1 - (b + 0.5) / BUCKETS, 1.15);
+          ctx.beginPath();
+          ctx.moveTo(tr[j - 1].x * W, tr[j - 1].y * H);
+          curB = b;
+        }
+        ctx.lineTo(tr[j].x * W, tr[j].y * H);
+      }
+      if (curB >= 0) ctx.stroke();
+    }
+
+    // waypoints: the targets
+    ctx.fillStyle = WPCOL;
+    ctx.globalAlpha = 0.9;
+    var wr = Math.max(1.6, S * 0.0035);
+    for (i = 0; i < sim.nodes.length; i++) {
+      var wps = sim.nodes[i].wps;
+      for (j = 0; j < wps.length; j++) {
+        ctx.beginPath();
+        ctx.arc(wps[j].x * W, wps[j].y * H, wr, 0, TAU);
+        ctx.fill();
+      }
+    }
+
+    // correction pulses: the feedback, biting
+    for (i = 0; i < sim.pulses.length; i++) {
+      var pu = sim.pulses[i];
+      var ageF = clamp((sim.t - pu.t) / 0.75, 0, 1);
+      var px = pu.x * W, py = pu.y * H;
+      var rMax = (0.012 + pu.mag * 1.5) * S;
+      ctx.strokeStyle = PULSE;
+      ctx.globalAlpha = 0.85 * (1 - ageF);
+      ctx.lineWidth = Math.max(1, S * 0.002);
+      ctx.beginPath();
+      ctx.arc(px, py, Math.max(0.5, ageF * rMax), 0, TAU);
+      ctx.stroke();
+      ctx.fillStyle = PULSE;
+      ctx.globalAlpha = (1 - ageF) * (0.5 + clamp(pu.mag * 9, 0, 0.5));
+      ctx.beginPath();
+      ctx.arc(px, py, Math.max(1, S * 0.006 * (1 - ageF * 0.5)), 0, TAU);
+      ctx.fill();
+    }
+
+    // nodes: glowing heads of the truth
+    for (i = 0; i < sim.nodes.length; i++) {
+      node = sim.nodes[i];
+      var nx = node.pos.x * W, ny = node.pos.y * H;
+      var nr = Math.max(2, S * 0.0045);
+      ctx.fillStyle = TRUTH;
+      ctx.globalAlpha = 0.07;
+      ctx.beginPath(); ctx.arc(nx, ny, nr * 3.2, 0, TAU); ctx.fill();
+      ctx.globalAlpha = 0.16;
+      ctx.beginPath(); ctx.arc(nx, ny, nr * 1.9, 0, TAU); ctx.fill();
+      ctx.globalAlpha = 1;
+      ctx.beginPath(); ctx.arc(nx, ny, nr, 0, TAU); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- interaction ----------
+  function toNorm(e) {
+    var r = { left: 0, top: 0, width: W, height: H };
+    if (canvas.getBoundingClientRect) r = canvas.getBoundingClientRect();
+    return {
+      x: (e.clientX - r.left) / (r.width || W),
+      y: (e.clientY - r.top) / (r.height || H)
+    };
+  }
+  var downInfo = null;
+  function onDown(e) {
+    ensureAudio();
+    var p = toNorm(e);
+    downInfo = { x: p.x, y: p.y, moved: false };
+    sim.disturb.x = p.x; sim.disturb.y = p.y; sim.disturb.until = sim.t + 0.6;
+  }
+  function onMove(e) {
+    if (!downInfo) return;
+    var p = toNorm(e);
+    if (Math.abs(p.x - downInfo.x) > 0.015 || Math.abs(p.y - downInfo.y) > 0.015) downInfo.moved = true;
+    if (downInfo.moved) {
+      sim.disturb.x = p.x; sim.disturb.y = p.y; sim.disturb.until = sim.t + 0.6;
+    }
+  }
+  function onUp(e) {
+    if (!downInfo) return;
+    var wasDrag = downInfo.moved;
+    downInfo = null;
+    sim.disturb.until = -1;
+    if (wasDrag) return;
+    // tap
+    if (sim.step - sim.lastTapStep < 42) { // double-tap (~0.35 s): new plan
+      buildSim((sim.seed * 1664525 + 1013904223) >>> 0);
+      for (var s = 0; s < PREROLL; s++) stepSim();
+      sim.lastTapStep = -100000;
+      draw();
+      return;
+    }
+    sim.lastTapStep = sim.step;
+    sim.ghostFlashUntil = sim.t + 3; // the plan, revealed
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', function () { downInfo = null; if (sim) sim.disturb.until = -1; });
+  }
+
+  // ---------- boot: pre-roll, frame one, live loop ----------
+  fit();
+  buildSim(BASE_SEED);
+  for (var s0 = 0; s0 < PREROLL; s0++) stepSim();
+  draw();
+
+  if (typeof requestAnimationFrame !== 'undefined') {
+    var lastMs = null;
+    var loopFn = function (ms) {
+      if (lastMs === null) lastMs = ms;
+      var elapsed = (ms - lastMs) / 1000;
+      lastMs = ms;
+      if (elapsed > 0.25) elapsed = 0.25;
+      var steps = Math.round(elapsed / DT);
+      if (steps > 30) steps = 30;
+      for (var q = 0; q < steps; q++) stepSim();
+      draw();
+      requestAnimationFrame(loopFn);
+    };
+    requestAnimationFrame(loopFn);
+  }
+})();
+</script>
+</body>
+</html>
