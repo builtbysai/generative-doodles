@@ -1,0 +1,530 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Written, Then Unread</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #F5F1E6; height: 100%; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------------- seeded RNG ----------------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------------- palette / moods ----------------
+  var PAPER = '#F5F1E6', INK = '#2E2A24', INK2 = '#8A8578', RED = '#B23A2E';
+  var MOODS = [
+    { name: 'calm',     writeDur: 90,  weight: 1.6, wobble: 0.35, spacing: 1.00 },
+    { name: 'restless', writeDur: 55,  weight: 1.2, wobble: 1.00, spacing: 0.92 },
+    { name: 'tender',   writeDur: 125, weight: 2.2, wobble: 0.50, spacing: 1.12 }
+  ];
+  var HOLD = 15, TURN = 1.6, OFFSET = 34.2; // frame one = ~35-38% into a calm write (share varies slightly with page size)
+
+  // ---------------- canvas / viewport ----------------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var viewW = 300, viewH = 300, isPhone = false;
+  var layoutCache = {};
+
+  function resize() {
+    var vv = window.visualViewport;
+    var w = vv ? vv.width : window.innerWidth;
+    var h = vv ? vv.height : window.innerHeight;
+    viewW = Math.max(60, Math.floor(w));
+    viewH = Math.max(60, Math.floor(h));
+    canvas.width = viewW;
+    canvas.height = viewH;
+    canvas.style.width = viewW + 'px';
+    canvas.style.height = viewH + 'px';
+    var scr = window.screen;
+    if (scr && scr.width) isPhone = Math.min(scr.width, scr.height) < 700;
+    else isPhone = viewH > viewW * 1.15;
+    layoutCache = {};
+  }
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', resize);
+  }
+  if (window.addEventListener) window.addEventListener('resize', resize);
+
+  // ---------------- events / timeline ----------------
+  var events = [];   // committed: {type:'tap'|'dtap', time}
+  var guides = [];   // {t0, t1(null while active), dy}
+  var pendingTap = null;
+  var curT = 0;
+  var frontBaseY = 0; // baseline of the line currently being written (for drag guide)
+
+  function loopDur(m) { return MOODS[m].writeDur + HOLD + TURN; }
+
+  // Pure function of (t, events): which entry, which mood, local time in the loop.
+  function stateAt(t) {
+    var entry = 0, mood = 0, start = -OFFSET, ei = 0, guard = 0;
+    while (guard++ < 200000) {
+      var end = start + loopDur(mood);
+      var ev = ei < events.length ? events[ei] : null;
+      if (ev && ev.time <= t && ev.time >= start && ev.time < end) {
+        if (ev.type === 'tap') { mood = (mood + 1) % MOODS.length; start = ev.time; ei++; continue; }
+        if (ev.type === 'dtap') { entry += 1; start = ev.time; ei++; continue; }
+      }
+      if (t < end) return { entry: entry, mood: mood, local: t - start };
+      entry += 1; start = end;
+    }
+    return { entry: entry, mood: mood, local: 0 };
+  }
+
+  function guideDy(t) {
+    for (var i = guides.length - 1; i >= 0; i--) {
+      var g = guides[i];
+      if (g.t0 <= t) {
+        if (g.t1 === null || t < g.t1) return g.dy;
+        return g.dy * Math.exp(-(t - g.t1) / 0.45);
+      }
+    }
+    return 0;
+  }
+
+  // ---------------- layout generation ----------------
+  // A layout depends only on (entry, size). Mood is applied at draw time:
+  // per-point jitter vectors are stored unit-scale and multiplied by the
+  // mood wobble; x positions scale around each line's start by mood spacing;
+  // line weight and write speed come from the mood. So a mood tap keeps the
+  // same page seed and only changes the hand.
+  function buildLayout(entry) {
+    var rng = mulberry32(941000 + entry * 7919);
+    var W = viewW, H = viewH;
+    var lh = Math.max(15, Math.min(30, H / 29));
+    var xh = lh * 0.40;
+    var ruleX = W * 0.085, x0 = W * 0.135, x1 = W * 0.945;
+    var topY = H * 0.075, botY = H * 0.905;
+    var strokes = [];
+    var paraMarks = []; // cumulative lengths where journaling paragraphs begin
+    var cum = 0;
+    var lineId = 0;
+
+    function jit() { return [(rng() * 2 - 1) * xh * 0.13, (rng() * 2 - 1) * xh * 0.11]; }
+    function pushStroke(pts, color, line, base, lx0, wScale) {
+      var j = [], len = 0, i;
+      for (i = 0; i < pts.length; i++) {
+        j.push(jit());
+        if (i > 0) len += Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]);
+      }
+      strokes.push({ pts: pts, jit: j, color: color, line: line, base: base, lx0: lx0, w: wScale || 1, cumStart: cum, len: len });
+      cum += len;
+    }
+
+    // ---- stroke vocabulary (local shapes, absolute coords out) ----
+    function primDown(sx, sw, base, s) {
+      var top = xh * s * (0.55 + rng() * 0.35);
+      if (rng() < 0.10) top = xh * s * 1.45; // ascender
+      return [[sx + sw * 0.18, base - top], [sx + sw * 0.45, base - xh * s * 0.38], [sx + sw * 0.64, base - 1]];
+    }
+    function primHump(sx, sw, base, s) {
+      return [[sx + sw * 0.04, base - 1], [sx + sw * 0.24, base - xh * s * 0.62], [sx + sw * 0.55, base - xh * s * 0.68], [sx + sw * 0.80, base - xh * s * 0.22], [sx + sw * 0.98, base - 1]];
+    }
+    function primWave(sx, sw, base, s) {
+      return [[sx, base - 1], [sx + sw * 0.28, base - xh * s * 0.42], [sx + sw * 0.52, base - 1], [sx + sw * 0.78, base - xh * s * 0.36], [sx + sw, base - 1]];
+    }
+    function primBowl(sx, sw, base, s) {
+      var cx = sx + sw * 0.5, cy = base - xh * s * 0.34, r = Math.min(sw * 0.46, xh * s * 0.36), pts = [], k, a;
+      for (k = 0; k <= 5; k++) { a = 2.6 - k * 1.02; pts.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r * 0.92]); }
+      return pts;
+    }
+    function primHook(sx, sw, base, s) {
+      return [[sx + sw * 0.78, base - xh * s * 0.92], [sx + sw * 0.42, base - xh * s * 0.35], [sx + sw * 0.20, base - 1], [sx + sw * 0.52, base + xh * s * 0.08]];
+    }
+    function primDesc(sx, sw, base, s) {
+      return [[sx + sw * 0.35, base - xh * s * 0.75], [sx + sw * 0.40, base - 1], [sx + sw * 0.34, base + xh * s * 0.42], [sx + sw * 0.06, base + xh * s * 0.52]];
+    }
+    var PRIMS = [primHump, primBowl, primHook, primWave, primDown, primBowl];
+
+    // One glyph: 1-3 primitives across its width, optional i-dot (never a letter).
+    function genGlyph(x, base, s, color, line, lx0) {
+      var gw = xh * s * (0.48 + rng() * 0.50);
+      var n = 1 + Math.floor(rng() * 3);
+      var sw = gw / n;
+      for (var i = 0; i < n; i++) {
+        var p;
+        if (rng() < 0.09) p = primDesc(x + i * sw, sw, base, s);
+        else p = PRIMS[Math.floor(rng() * PRIMS.length)](x + i * sw, sw, base, s);
+        pushStroke(p, color, line, base, lx0, 1);
+      }
+      if (rng() < 0.12) { // floating dot, like a pen lift mark
+        var dx = x + gw * (0.3 + rng() * 0.4), dy = base - xh * s * 1.14, r = xh * 0.055, dp = [], k, a;
+        for (k = 0; k <= 4; k++) { a = k * Math.PI / 2; dp.push([dx + Math.cos(a) * r, dy + Math.sin(a) * r]); }
+        pushStroke(dp, color, line, base, lx0, 1.5);
+      }
+      return gw;
+    }
+
+    // One word: 3-9 glyphs, cursive joins at the baseline between some glyphs.
+    function genWord(x, base, s, color, line, lx0) {
+      var n = 3 + Math.floor(rng() * 7);
+      var cx = x, prevEnd = -1;
+      for (var i = 0; i < n; i++) {
+        if (prevEnd >= 0 && rng() < 0.35) {
+          pushStroke([[prevEnd, base - xh * 0.05], [(prevEnd + cx) / 2, base + xh * 0.03], [cx + 1, base - xh * 0.05]], color, line, base, lx0, 0.8);
+        }
+        var gw = genGlyph(cx, base, s, color, line, lx0);
+        prevEnd = cx + gw * 0.92;
+        cx += gw + xh * 0.12;
+      }
+      return (cx - x) + xh * 0.45; // advance incl. word gap (at spacing 1.0)
+    }
+
+    // A line of stroke-words filling [lx, rx]; the first word always lands.
+    function genLine(lx, rx, base, s, color) {
+      lineId++;
+      var cx = lx, first = true, before;
+      while (true) {
+        before = strokes.length;
+        var adv = genWord(cx, base, s, color, lineId, lx);
+        if (!first && cx + adv > rx) { strokes.length = before; cum = strokes.length ? strokes[strokes.length - 1].cumStart + strokes[strokes.length - 1].len : 0; break; }
+        cx += adv;
+        first = false;
+        if (cx > rx - xh * 1.2) break;
+      }
+    }
+
+    // Sweeping flourish (salutation tail / sign-off underline): flat sine arc.
+    function genFlourish(x, base, w, amp, color, line) {
+      var pts = [], k;
+      for (k = 0; k <= 6; k++) pts.push([x + w * k / 6, base + Math.sin(k / 6 * Math.PI * 1.35) * amp * (1 - k / 9)]);
+      pushStroke(pts, color, line, base, x, 1.05);
+    }
+
+    var y = topY + xh;
+
+    // ---- (a1) TIMELINE experiment, second ink ----
+    (function () {
+      lineId++;
+      var spineY = y + xh * 0.4, i;
+      var spine = [[x0, spineY]];
+      for (i = 1; i <= 5; i++) spine.push([x0 + (x1 - x0) * i / 6, spineY + (rng() - 0.5) * 2]);
+      spine.push([x1, spineY]);
+      pushStroke(spine, INK2, lineId, spineY, x0, 0.85);
+      var nCl = 5 + Math.floor(rng() * 2);
+      for (i = 0; i < nCl; i++) {
+        var cxp = x0 + (x1 - x0) * (i + 0.5) / nCl + (rng() - 0.5) * xh;
+        pushStroke([[cxp, spineY], [cxp + 1, spineY + xh * 0.55]], INK2, lineId, spineY, x0, 0.9);
+        // small cluster of glyphs hanging below the spine
+        var gx = cxp - xh * 0.8, gbase = spineY + lh * 0.92, ng = 2 + Math.floor(rng() * 3);
+        for (var g = 0; g < ng; g++) gx += genGlyph(gx, gbase, 0.8, INK2, lineId, x0) + xh * 0.06;
+      }
+      y = spineY + lh * 1.55;
+    })();
+
+    y += lh * 0.55;
+
+    // ---- (a2) LETTER format, second ink ----
+    (function () {
+      var indent = W * 0.05;
+      // salutation: a few larger glyphs + flourish
+      lineId++;
+      var sx = x0 + indent, i;
+      for (i = 0; i < 4; i++) sx += genGlyph(sx, y, 1.15, INK2, lineId, x0 + indent) + xh * 0.07;
+      genFlourish(sx + xh * 0.3, y + xh * 0.15, W * 0.10, xh * 0.5, INK2, lineId);
+      y += lh * 1.05;
+      // body: three lines at a narrower measure
+      for (i = 0; i < 3; i++) { genLine(x0 + indent * 0.4, x1 - W * 0.10, y, 0.95, INK2); y += lh * 1.0; }
+      // sign-off: short glyphs + long underline sweep
+      lineId++;
+      var ox = x0 + indent;
+      for (i = 0; i < 3; i++) ox += genGlyph(ox, y, 1.05, INK2, lineId, x0 + indent) + xh * 0.07;
+      genFlourish(x0 + indent - xh * 0.2, y + xh * 0.42, W * 0.17, xh * 0.4, INK2, lineId);
+      y += lh * 0.9;
+    })();
+
+    y += lh * 0.35;
+
+    // ---- (a3) BULLET LIST, second ink ----
+    (function () {
+      var nb = 3 + Math.floor(rng() * 2), i;
+      for (i = 0; i < nb; i++) {
+        lineId++;
+        var dx = x0 + xh * 0.3, dy = y - xh * 0.32, r = xh * 0.11, dp = [], k, a;
+        for (k = 0; k <= 5; k++) { a = k * Math.PI * 2 / 5; dp.push([dx + Math.cos(a) * r, dy + Math.sin(a) * r]); }
+        pushStroke(dp, INK2, lineId, y, x0, 1.7);
+        // short stroke-line after the dot (generated into this same line id)
+        var cx = x0 + xh * 1.25, target = cx + (x1 - x0) * (0.42 + rng() * 0.3), first = true;
+        while (true) {
+          var before = strokes.length;
+          var adv = genWord(cx, y, 0.92, INK2, lineId, x0);
+          if (!first && cx + adv > target) { strokes.length = before; cum = strokes.length ? strokes[strokes.length - 1].cumStart + strokes[strokes.length - 1].len : 0; break; }
+          cx += adv; first = false;
+          if (cx > target - xh) break;
+        }
+        y += lh * 0.98;
+      }
+    })();
+
+    y += lh * 0.6;
+
+    // ---- (b) FREE JOURNALING, main ink ----
+    (function () {
+      var firstPara = true;
+      while (y < botY - lh * 0.4) {
+        paraMarks.push(cum);
+        var pl = 3 + Math.floor(rng() * 3);
+        for (var i = 0; i < pl && y < botY - lh * 0.4; i++) {
+          var lx = (i === 0 && !firstPara) ? x0 + xh * 1.2 : x0;
+          if (i === 0 && firstPara) lx = x0;
+          genLine(lx, x1, y, 1, INK);
+          y += lh * (0.98 + rng() * 0.10);
+        }
+        firstPara = false;
+        y += lh * 0.45;
+      }
+    })();
+
+    return { strokes: strokes, total: cum, paraMarks: paraMarks, lh: lh, xh: xh, ruleX: ruleX, topY: topY };
+  }
+
+  function getLayout(entry) {
+    var key = entry + '_' + viewW + 'x' + viewH;
+    if (!layoutCache[key]) layoutCache[key] = buildLayout(entry);
+    return layoutCache[key];
+  }
+
+  // ---------------- drawing ----------------
+  function renderPt(s, i, mood) {
+    var p = s.pts[i], j = s.jit[i];
+    return [s.lx0 + (p[0] - s.lx0) * mood.spacing + j[0] * mood.wobble, p[1] + j[1] * mood.wobble];
+  }
+
+  // Draw a stroke up to length budget L from its start; returns end point or null.
+  function strokeUpTo(s, L, mood, dy, wgt) {
+    if (L <= 0) return null;
+    var n = s.pts.length, acc = 0, i, a, b, pt;
+    ctx.beginPath();
+    pt = renderPt(s, 0, mood); ctx.moveTo(pt[0], pt[1] + dy);
+    var end = pt;
+    for (i = 1; i < n; i++) {
+      a = s.pts[i - 1]; b = s.pts[i];
+      var seg = Math.hypot(b[0] - a[0], b[1] - a[1]);
+      if (acc + seg <= L) {
+        pt = renderPt(s, i, mood); ctx.lineTo(pt[0], pt[1] + dy); end = pt; acc += seg;
+      } else {
+        var f = seg > 0 ? (L - acc) / seg : 0;
+        var mid = { pts: [[a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f]], jit: [[s.jit[i - 1][0] + (s.jit[i][0] - s.jit[i - 1][0]) * f, s.jit[i - 1][1] + (s.jit[i][1] - s.jit[i - 1][1]) * f]], lx0: s.lx0 };
+        pt = renderPt(mid, 0, mood); ctx.lineTo(pt[0], pt[1] + dy); end = pt; acc = L;
+        break;
+      }
+    }
+    ctx.stroke();
+    return [end[0], end[1] + dy];
+  }
+
+  function drawPage(layout, frac, mood, t, withNib, guideOn) {
+    ctx.fillStyle = PAPER;
+    ctx.fillRect(0, 0, viewW, viewH);
+    // margin rule (the notebook spine line), faintly wobbling, always present
+    ctx.strokeStyle = RED; ctx.lineWidth = 1.4; ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(layout.ruleX, viewH * 0.045);
+    ctx.lineTo(layout.ruleX + 1, viewH * 0.5);
+    ctx.lineTo(layout.ruleX, viewH * 0.955);
+    ctx.stroke();
+
+    var F = frac * layout.total;
+    var strokes = layout.strokes;
+    // find the front stroke / line
+    var fi = 0;
+    while (fi < strokes.length && strokes[fi].cumStart + strokes[fi].len <= F) fi++;
+    var frontLine = fi < strokes.length ? strokes[fi].line : -1;
+    var dy = guideOn ? guideDy(t) : 0;
+    var nib = null, i, s;
+    ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    for (i = 0; i < strokes.length; i++) {
+      s = strokes[i];
+      if (s.cumStart >= F) break;
+      var wgt = 0;
+      if (dy !== 0 && s.line === frontLine) {
+        var prox = 1 - Math.min(1, Math.abs((s.cumStart + s.len / 2) - F) / (layout.total * 0.05));
+        wgt = 0.45 + 0.55 * prox;
+      }
+      ctx.strokeStyle = s.color;
+      ctx.lineWidth = mood.weight * s.w * (layout.lh / 24);
+      var e = strokeUpTo(s, Math.min(s.len, F - s.cumStart), mood, dy * wgt, wgt);
+      if (e) nib = e;
+      if (s.line === frontLine && fi === i) frontBaseY = s.base;
+    }
+    if (withNib && nib) {
+      ctx.fillStyle = INK;
+      ctx.beginPath(); ctx.arc(nib[0], nib[1], Math.max(2, layout.lh * 0.09), 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = PAPER;
+      ctx.beginPath(); ctx.arc(nib[0] - 0.8, nib[1] - 0.8, Math.max(0.7, layout.lh * 0.028), 0, Math.PI * 2); ctx.fill();
+    }
+    return F;
+  }
+
+  function draw(t) {
+    canvas.style.width = viewW + 'px';
+    canvas.style.height = viewH + 'px';
+    var st = stateAt(t);
+    var mood = MOODS[st.mood];
+    var layout = getLayout(st.entry);
+    var wd = mood.writeDur;
+    if (st.local < wd) {
+      lastFront = drawPage(layout, st.local / wd, mood, t, true, true);
+    } else if (st.local < wd + HOLD) {
+      lastFront = drawPage(layout, 1, mood, t, true, false);
+    } else {
+      var p = (st.local - wd - HOLD) / TURN;
+      var next = getLayout(st.entry + 1);
+      var bx = viewW * (1 - p);
+      drawPage(next, 0, mood, t, false, false);
+      ctx.save();
+      ctx.beginPath(); ctx.rect(0, 0, bx, viewH); ctx.clip();
+      drawPage(layout, 1, mood, t, false, false);
+      ctx.restore();
+      // soft page edge: flat alpha strips, no gradient
+      ctx.fillStyle = 'rgba(46,42,36,0.10)'; ctx.fillRect(bx - 13, 0, 13, viewH);
+      ctx.fillStyle = 'rgba(46,42,36,0.16)'; ctx.fillRect(bx - 3, 0, 3, viewH);
+      ctx.fillStyle = 'rgba(255,255,255,0.35)'; ctx.fillRect(bx, 0, 2, viewH);
+      lastFront = layout.total;
+      if (turnKey !== st.entry) { turnKey = st.entry; swish(); }
+    }
+    lastEntry = st.entry; lastMood = st.mood; lastLocal = st.local;
+  }
+
+  // ---------------- audio (lazy, guarded, gesture-only) ----------------
+  var AC = null, scratchGain = null, scratchFilter = null, dipUntil = -1;
+  var lastFront = 0, lastEntry = -1, lastMood = 0, lastLocal = 0, turnKey = -1;
+
+  function audioCtor() {
+    try { return window.AudioContext || window.webkitAudioContext; } catch (e) { return undefined; }
+  }
+  function ensureAudio() {
+    if (AC) { if (AC.resume) AC.resume(); return; }
+    var Ctor = audioCtor();
+    if (typeof Ctor === 'undefined') return;
+    try {
+      AC = new Ctor();
+      var len = AC.sampleRate * 1.2, buf = AC.createBuffer(1, len, AC.sampleRate), d = buf.getChannelData(0), i;
+      var r = mulberry32(941);
+      for (i = 0; i < len; i++) d[i] = r() * 2 - 1;
+      var src = AC.createBufferSource(); src.buffer = buf; src.loop = true;
+      scratchFilter = AC.createBiquadFilter(); scratchFilter.type = 'bandpass'; scratchFilter.frequency.value = 1500; scratchFilter.Q.value = 0.8;
+      scratchGain = AC.createGain(); scratchGain.gain.value = 0;
+      src.connect(scratchFilter); scratchFilter.connect(scratchGain); scratchGain.connect(AC.destination);
+      src.start();
+    } catch (e) { AC = null; }
+  }
+  function swish() {
+    if (!AC) return;
+    try {
+      var len = AC.sampleRate * 0.9, buf = AC.createBuffer(1, len, AC.sampleRate), d = buf.getChannelData(0), i;
+      var r = mulberry32(77);
+      for (i = 0; i < len; i++) d[i] = (r() * 2 - 1) * (1 - i / len);
+      var src = AC.createBufferSource(); src.buffer = buf;
+      var f = AC.createBiquadFilter(); f.type = 'bandpass'; f.Q.value = 1.1;
+      f.frequency.setValueAtTime(420, AC.currentTime);
+      f.frequency.linearRampToValueAtTime(1300, AC.currentTime + 0.8);
+      var g = AC.createGain(); g.gain.value = 0.12;
+      src.connect(f); f.connect(g); g.connect(AC.destination);
+      src.start();
+    } catch (e) { /* silent */ }
+  }
+  function updateAudio() {
+    if (!AC || !scratchGain) return;
+    var mood = MOODS[lastMood];
+    var writing = lastLocal < mood.writeDur;
+    // paragraph pause: front crossing a paragraph mark dips the scratch
+    var layout = getLayout(lastEntry);
+    if (writing && lastEntry >= 0) {
+      for (var i = 0; i < layout.paraMarks.length; i++) {
+        var m = layout.paraMarks[i];
+        if (m > prevFrontSeen && m <= lastFront) dipUntil = curT + 0.3;
+      }
+    }
+    prevFrontSeen = lastFront;
+    var target = 0;
+    if (writing) {
+      target = lastMood === 1 ? 0.030 : (lastMood === 2 ? 0.016 : 0.020);
+      if (curT < dipUntil) target *= 0.25;
+    }
+    try {
+      scratchGain.gain.setTargetAtTime(target, AC.currentTime, 0.06);
+      scratchFilter.frequency.setTargetAtTime(lastMood === 1 ? 2600 : (lastMood === 2 ? 1000 : 1500), AC.currentTime, 0.1);
+    } catch (e) { /* silent */ }
+  }
+  var prevFrontSeen = 0;
+
+  // ---------------- interaction ----------------
+  function evPos(e) {
+    var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  }
+  var pdown = null;
+  function handleTap() {
+    if (pendingTap && curT - pendingTap.time <= 0.32) {
+      events.push({ type: 'dtap', time: pendingTap.time });
+      pendingTap = null;
+    } else {
+      if (pendingTap) events.push({ type: 'tap', time: pendingTap.time });
+      pendingTap = { time: curT };
+    }
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', function (e) {
+      ensureAudio();
+      var p = evPos(e);
+      pdown = { x: p.x, y: p.y, t: curT, moved: false, guide: null };
+      if (e.preventDefault) e.preventDefault();
+    });
+    canvas.addEventListener('pointermove', function (e) {
+      if (!pdown) return;
+      var p = evPos(e);
+      if (Math.abs(p.x - pdown.x) + Math.abs(p.y - pdown.y) > 7) pdown.moved = true;
+      if (pdown.moved) {
+        if (!pdown.guide) { pdown.guide = { t0: curT, t1: null, dy: 0 }; guides.push(pdown.guide); }
+        var lhNow = getLayout(stateAt(curT).entry).lh;
+        var dyv = p.y - frontBaseY;
+        if (dyv > lhNow * 2.2) dyv = lhNow * 2.2;
+        if (dyv < -lhNow * 2.2) dyv = -lhNow * 2.2;
+        pdown.guide.dy = dyv;
+      }
+    });
+    function endPointer() {
+      if (!pdown) return;
+      if (pdown.guide) { pdown.guide.t1 = curT; pdown.guide.dy = pdown.guide.dy; }
+      else if (curT - pdown.t < 0.5) handleTap();
+      pdown = null;
+    }
+    canvas.addEventListener('pointerup', endPointer);
+    canvas.addEventListener('pointercancel', endPointer);
+  }
+
+  // ---------------- run ----------------
+  resize();
+  draw(0);
+  var firstTs = null;
+  function frame(ts) {
+    if (firstTs === null) firstTs = ts;
+    curT = (ts - firstTs) / 1000;
+    if (pendingTap && curT - pendingTap.time > 0.32) {
+      events.push({ type: 'tap', time: pendingTap.time });
+      pendingTap = null;
+    }
+    draw(curT);
+    updateAudio();
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+  }
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
