@@ -1,0 +1,596 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Pinnannousu</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#040506; overflow:hidden; }
+  canvas { display:block; touch-action:none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  /* ------- Pinnannousu (Jussi Ängeslevä, 2024) -------
+     A climate elegy performed by a machine, on a closed-form 150 s loop.
+     CARVE (0-45 s): a jointed robot arm (silhouette, one amber joint
+     light) traces the outline of an ice block while the block's
+     superellipse outline morphs from rectangle to lens; ice dust falls
+     from the cut, a pure function of the carve parameter.
+     LIGHT + MELT (45-150 s): a spotlight behind the finished lens throws
+     a "+2" glyph of light onto the back wall, drawn in horizontal row
+     slices whose offsets are a melt-warp function. The lens slumps, the
+     glyph sags, drips and stretches, and a puddle of light grows on the
+     floor until the loop fades to a fresh block. Dragging during the
+     light phase bends the glyph; double-tap starts a fresh block now.
+     No offscreen canvas, no gradients: everything is drawn directly,
+     every frame, from seeded data and closed-form functions of t. */
+
+  var PHASE = 71.0;              // fixed first-frame phase (melt ~15%)
+  var CYCLE = 150.0;             // full performance loop, seconds
+  var CARVE_END = 45.0;          // carve phase length
+  var TPI = Math.PI * 2;
+
+  // Palette — nothing else.
+  var BLACK = '#040506';         // gallery black
+  var WALL = '#0A0D10';          // back wall
+  var ICE = '#BFD8E8';           // ice
+  var REFR = '#EAF6FF';          // bright refractions
+  var CORE = '#2E5A7A';          // deep blue core
+  var ROBOT = '#1A1D22';         // robot silhouette
+  var AMBER = '#D8A24A';         // the one joint light
+  var GLYPH = '#F0F8FF';         // projected glyph
+  var PUDDLE = '#6A8AA0';        // melt puddle
+
+  /* ---------------- seeded rng ---------------- */
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function seedFromQuery() {
+    try {
+      var s = (typeof location !== 'undefined' && location.search) || '';
+      var m = /[?&]seed=(\d+)/.exec(s);
+      if (m) return parseInt(m[1], 10) >>> 0;
+    } catch (e) { /* no location: fall through */ }
+    return 1132;
+  }
+
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function lerp(a, b, f) { return a + (b - a) * f; }
+  function sstep(f) { f = clamp(f, 0, 1); return f * f * (3 - 2 * f); }
+
+  /* ---------------- per-cycle seeded scene ----------------
+     Everything irregular in the piece is derived here from one seed:
+     lens facet lines, glyph row jitters, drip columns, dust motes. */
+  var ROWS = 26;
+  function genScene(seed) {
+    var rng = mulberry32(seed * 7919 + 13);
+    var facets = [], i;
+    for (i = 0; i < 7; i++) {
+      facets.push({
+        ang: rng() * TPI,
+        r0: 0.86 + rng() * 0.10,       // start near rim (fraction of a)
+        r1: 0.25 + rng() * 0.40,       // end toward centre
+        a: 0.05 + rng() * 0.09
+      });
+    }
+    var arcs = [];
+    for (i = 0; i < 3; i++) {
+      arcs.push({
+        rF: 0.52 + i * 0.19 + rng() * 0.05,
+        a0: rng() * TPI, span: 0.7 + rng() * 1.3,
+        a: 0.26 - i * 0.07
+      });
+    }
+    var rowJit = [];
+    for (i = 0; i < ROWS; i++) rowJit.push(rng() * 2 - 1);
+    var drips = [];
+    for (i = 0; i < 5; i++) {
+      drips.push({
+        fx: 0.10 + rng() * 0.80,       // across the glyph box
+        startF: 0.35 + rng() * 0.55,   // where in the glyph it leaks
+        lenS: 0.55 + rng() * 0.75,
+        wS: 0.7 + rng() * 0.7
+      });
+    }
+    var dust = [];
+    for (i = 0; i < 90; i++) {
+      dust.push({
+        phi: rng(), life: 0.8 + rng() * 1.4,
+        drift: (rng() * 2 - 1), fall: 0.7 + rng() * 0.6,
+        size: 0.8 + rng() * 1.8
+      });
+    }
+    return { facets: facets, arcs: arcs, rowJit: rowJit, drips: drips, dust: dust };
+  }
+
+  /* ---------------- canvas / viewport ---------------- */
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0, DPR = 1, PHONE = false;
+
+  function fit() {
+    var w, h;
+    if (typeof window !== 'undefined' && window.visualViewport) {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    } else if (typeof window !== 'undefined') {
+      w = window.innerWidth; h = window.innerHeight;
+    } else { w = 720; h = 720; }
+    DPR = 1;
+    if (typeof window !== 'undefined' && window.devicePixelRatio) {
+      DPR = Math.min(window.devicePixelRatio, 2);
+    }
+    W = Math.max(50, Math.round(w)); H = Math.max(50, Math.round(h));
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    // Phone: window.screen physical size, min dimension < 700px;
+    // aspect fallback only if screen is missing.
+    var sw = 0, sh = 0;
+    if (typeof window !== 'undefined' && window.screen) {
+      sw = window.screen.width || 0; sh = window.screen.height || 0;
+    }
+    if (sw && sh) PHONE = Math.min(sw, sh) < 700;
+    else PHONE = (H > W * 1.15) && Math.min(W, H) < 700;
+  }
+
+  /* ---------------- interaction state ----------------
+     Visitor input is recorded as timestamped samples; everything the
+     piece does with it is a closed-form function of the samples and t. */
+  var seedBase = seedFromQuery();
+  var epoch = 0;                 // absolute t at which the current block began (cycle 0)
+  var dragSamples = [];          // {dx, dy, t} spotlight offsets, units of u
+  var dragStart = null;          // {x, y} pointer position where the drag began
+  var lastTapT = -10, lastTapX = 0, lastTapY = 0;
+  var sceneCache = { key: -1, scene: null };
+
+  var startStamp = null;
+  function nowT() {
+    var ms;
+    if (typeof performance !== 'undefined' && performance.now) ms = performance.now();
+    else ms = Date.now();
+    if (startStamp === null) startStamp = ms;
+    return PHASE + (ms - startStamp) / 1000;
+  }
+
+  function sceneFor(cycleIdx) {
+    var key = seedBase * 100000 + cycleIdx;
+    if (sceneCache.key !== key) {
+      sceneCache = { key: key, scene: genScene(seedBase + cycleIdx) };
+    }
+    return sceneCache.scene;
+  }
+
+  // Spotlight offset at time t: latest drag value, held ~1 s, then a
+  // slow exponential relax back to centre. Closed-form in the samples.
+  function spotOffset(t) {
+    if (!dragSamples.length) return { x: 0, y: 0 };
+    var s = dragSamples[dragSamples.length - 1];
+    var f = Math.exp(-Math.max(0, t - s.t - 1.0) / 3.5);
+    return { x: s.dx * f, y: s.dy * f };
+  }
+
+  /* ---------------- geometry ----------------
+     The composition lives on a square stage of side u = min(W, H),
+     centred vertically: on tall phones the gallery sits mid-frame
+     instead of stretching apart (house pattern for centred pieces). */
+  function stageTop() { var u = Math.min(W, H); return Math.max(0, (H - u) / 2); }
+  function floorY() { return stageTop() + 0.78 * Math.min(W, H); }
+
+  // Superellipse outline point at angle th; exponent n (9 = block, 2 = lens).
+  function outlinePoint(cx, cy, a, b, n, th) {
+    var c = Math.cos(th), s = Math.sin(th), e = 2 / n;
+    var x = a * Math.sign(c) * Math.pow(Math.abs(c), e);
+    var y = b * Math.sign(s) * Math.pow(Math.abs(s), e);
+    return { x: cx + x, y: cy + y };
+  }
+
+  // Full lens/block state at cycle time et.
+  function lensState(et) {
+    var u = Math.min(W, H), cx = W * 0.5, fy = floorY();
+    var k = clamp(et / CARVE_END, 0, 1);            // carve progress
+    var q = clamp((et - CARVE_END) / (CYCLE - CARVE_END), 0, 1); // melt progress
+    var m = sstep(q);                                // melt amount 0..1
+    var slumpY = 1 - 0.52 * Math.pow(m, 1.2);
+    var slumpX = 1 + 0.32 * m;
+    var b = 0.185 * u * slumpY;
+    var a = 0.155 * u * slumpX;
+    return {
+      u: u, cx: cx, fy: fy, k: k, q: q, m: m,
+      a: a, b: b, cy: fy - b,
+      n: 9 - 7 * k,                                  // superellipse exponent
+      light: sstep((et - CARVE_END) / 1.5)           // spotlight ramp-in
+    };
+  }
+
+  // Where the drill tip is at cycle time tc (carve phase only).
+  function tipPos(tc, L) {
+    var k = clamp(tc / CARVE_END, 0, 1);
+    var th = -1.25 + 2.5 * k;                        // sweeps the right outline
+    var cx = W * 0.5, b = 0.185 * L.u, a = 0.155 * L.u;
+    var cy = L.fy - b, n = 9 - 7 * k;
+    var p = outlinePoint(cx, cy, a, b, n, th);
+    var dx = p.x - cx, dy = p.y - cy;
+    var dl = Math.sqrt(dx * dx + dy * dy) || 1;
+    return {
+      x: p.x + (dx / dl) * 0.012 * L.u + Math.sin(tc * 39) * 0.0016 * L.u,
+      y: p.y + (dy / dl) * 0.012 * L.u + Math.cos(tc * 47) * 0.0016 * L.u
+    };
+  }
+
+  // Robot arm joints at cycle time et. During carve the wrist is solved
+  // by analytic 2-bone IK toward the drill target; during melt the arm
+  // rests in a folded FK pose; the two are blended across 43-47 s.
+  function armPose(et, tt, L) {
+    var u = L.u;
+    var S = { x: 0.87 * W, y: L.fy - 0.05 * u };
+    var L1 = 0.32 * u, L2 = 0.28 * u, L3 = 0.11 * u;
+
+    // --- carve pose (IK) ---
+    var T = tipPos(Math.min(et, CARVE_END - 0.001), L);
+    var dx = T.x - S.x, dy = T.y - S.y;
+    var dl = Math.sqrt(dx * dx + dy * dy) || 1;
+    var Q = { x: T.x + (dx / dl) * L3 * 0.55, y: T.y + (dy / dl) * L3 * 0.55 };
+    var qx = Q.x - S.x, qy = Q.y - S.y;
+    var d = clamp(Math.sqrt(qx * qx + qy * qy), Math.abs(L1 - L2) + 1, L1 + L2 - 1);
+    var along = (L1 * L1 - L2 * L2 + d * d) / (2 * d);
+    var hh = Math.sqrt(Math.max(0, L1 * L1 - along * along));
+    var ux = qx / (Math.sqrt(qx * qx + qy * qy) || 1), uy = qy / (Math.sqrt(qx * qx + qy * qy) || 1);
+    var mx = S.x + ux * along, my = S.y + uy * along;
+    // elbow on the upper side (smaller y)
+    var e1 = { x: mx - uy * hh, y: my + ux * hh };
+    var e2 = { x: mx + uy * hh, y: my - ux * hh };
+    var Ec = e1.y < e2.y ? e1 : e2;
+    var carve = { S: S, E: Ec, Wp: Q, T: T };
+
+    // --- parked pose (FK), folded, with a whisper of idle sway ---
+    var sway = Math.sin(tt * 0.5) * 0.010;
+    var A1 = -2.0 + sway, A2 = A1 + 2.6, A3 = A2 + 0.9;
+    var Ep = { x: S.x + L1 * Math.cos(A1), y: S.y + L1 * Math.sin(A1) };
+    var Wp2 = { x: Ep.x + L2 * Math.cos(A2), y: Ep.y + L2 * Math.sin(A2) };
+    var Tp = { x: Wp2.x + L3 * Math.cos(A3), y: Wp2.y + L3 * Math.sin(A3) };
+    var park = { S: S, E: Ep, Wp: Wp2, T: Tp };
+
+    var b = sstep((et - 43) / 4);
+    function mix(p, q2) { return { x: lerp(p.x, q2.x, b), y: lerp(p.y, q2.y, b) }; }
+    return { S: S, E: mix(carve.E, park.E), Wp: mix(carve.Wp, park.Wp), T: mix(carve.T, park.T) };
+  }
+
+  /* ---------------- drawing helpers ----------------
+     Every ellipse/circle gets its own path: node-canvas renders batched
+     ellipse subpaths as connected polygons (house lesson, №1120). */
+  function ell(x, y, rx, ry, fill, alpha) {
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = fill;
+    ctx.beginPath();
+    ctx.ellipse(x, y, Math.max(0.1, rx), Math.max(0.1, ry), 0, 0, TPI);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+  function dot(x, y, r, fill, alpha) {
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = fill;
+    ctx.beginPath();
+    ctx.arc(x, y, Math.max(0.1, r), 0, TPI);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+  function seg(x1, y1, x2, y2, wdt, fill, alpha) {
+    ctx.globalAlpha = alpha;
+    ctx.strokeStyle = fill;
+    ctx.lineWidth = wdt;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  /* ---------------- the piece ---------------- */
+  function draw(tt) {
+    var raw = tt - epoch;
+    var cycleIdx = Math.floor(raw / CYCLE);
+    var et = raw - cycleIdx * CYCLE;
+    var sc = sceneFor(cycleIdx);
+    var L = lensState(et);
+    var u = L.u, cx = L.cx, fy = L.fy, m = L.m;
+    var spot = spotOffset(tt);
+
+    // room
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = BLACK;
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = WALL;
+    ctx.fillRect(0, stageTop(), W, fy - stageTop());
+    ctx.globalAlpha = 0.05;
+    ctx.fillStyle = ICE;
+    ctx.fillRect(0, fy, W, 1);
+    ctx.globalAlpha = 1;
+
+    /* ----- projected glyph (on the wall, behind the lens) ----- */
+    var fontSize = 0.30 * u;
+    var gy0 = stageTop() + 0.085 * u;
+    var glyphH = fontSize * 0.78;
+    if (L.light > 0.003) {
+      ctx.font = '700 ' + fontSize + 'px Arial, Helvetica, sans-serif';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'alphabetic';
+      var gw = ctx.measureText('+2').width;
+      var gx = cx - gw / 2;
+      var baseY = gy0 + fontSize * 0.70;
+      var diss = 0.94 - 0.55 * m * m;                    // dissolves late
+      // bloom of projected light on the wall (three stepped layers,
+      // no gradients in this house)
+      var bloomF = (0.35 + 0.65 * diss) * L.light;
+      ell(cx, gy0 + glyphH * 0.5, gw * 1.05, fontSize * 0.88, GLYPH, 0.020 * bloomF);
+      ell(cx, gy0 + glyphH * 0.5, gw * 0.85, fontSize * 0.72, GLYPH, 0.032 * bloomF);
+      ell(cx, gy0 + glyphH * 0.5, gw * 0.55, fontSize * 0.45, GLYPH, 0.040 * bloomF);
+      // halo pass: four faint copies
+      var haloA = 0.045 * L.light * diss;
+      ctx.fillStyle = GLYPH;
+      ctx.globalAlpha = haloA;
+      ctx.fillText('+2', gx - 1.5, baseY); ctx.fillText('+2', gx + 1.5, baseY);
+      ctx.fillText('+2', gx, baseY - 1.5); ctx.fillText('+2', gx, baseY + 1.5);
+      ctx.globalAlpha = 1;
+      // row slices with melt warp
+      var rowH = glyphH / ROWS;
+      var warpAmp = u * (0.0022 + 0.05 * Math.pow(m, 1.6));
+      for (var i = 0; i < ROWS; i++) {
+        var f = i / (ROWS - 1);
+        var offX = sc.rowJit[i] * warpAmp
+          + Math.sin(f * 7.0 + tt * 0.8) * u * 0.0010 * (0.5 + m)
+          + spot.x * u * (0.35 + 0.65 * f) * 0.6;
+        var offY = f * f * u * 0.10 * Math.pow(m, 1.4) + spot.y * u * f * 0.3;
+        var shimmer = 0.92 + 0.08 * Math.sin(tt * 2 + i * 1.7);
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(gx - u * 0.06, gy0 + i * rowH - 0.5, gw + u * 0.12, rowH + 1);
+        ctx.clip();
+        ctx.globalAlpha = 0.88 * L.light * diss * shimmer;
+        ctx.fillStyle = GLYPH;
+        ctx.fillText('+2', gx + offX, baseY + offY);
+        ctx.restore();
+      }
+      ctx.globalAlpha = 1;
+      // drip streaks leaking from the glyph as it melts
+      if (m > 0.08) {
+        var dripA = clamp((m - 0.08) / 0.3, 0, 1);
+        for (var dI = 0; dI < sc.drips.length; dI++) {
+          var dr = sc.drips[dI];
+          var dxp = gx + dr.fx * gw;
+          var dy0 = gy0 + dr.startF * glyphH + (dr.startF * dr.startF) * u * 0.10 * Math.pow(m, 1.4);
+          var dLen = u * (0.02 + 0.30 * Math.pow(m, 1.3)) * dr.lenS;
+          var dw = Math.max(1, 0.006 * u * dr.wS);
+          var steps = 3;
+          for (var sI = 0; sI < steps; sI++) {
+            var sy0 = dy0 + (dLen / steps) * sI;
+            if (sy0 > fy) break;
+            ctx.globalAlpha = 0.10 * dripA * (1 - sI / steps * 0.6);
+            ctx.fillStyle = GLYPH;
+            ctx.fillRect(dxp - dw / 2, sy0, dw, Math.min(dLen / steps, fy - sy0));
+          }
+          ctx.globalAlpha = 1;
+          var ey = Math.min(dy0 + dLen, fy);
+          dot(dxp, ey, dw * 0.9, GLYPH, 0.14 * dripA);
+        }
+      }
+    }
+
+    /* ----- melt puddle on the floor ----- */
+    if (m > 0.02) {
+      var pA = sstep((m - 0.02) / 0.2);
+      var prx = u * (0.06 + 0.34 * Math.pow(m, 1.25));
+      var pcy = fy + 0.035 * u;
+      ell(cx, pcy, prx * 1.15, prx * 0.23, PUDDLE, 0.08 * pA);
+      ell(cx, pcy, prx, prx * 0.20, PUDDLE, 0.13 * pA);
+      ell(cx, pcy, prx * 0.55, prx * 0.11, GLYPH, 0.10 * m * pA); // the light itself, pooled
+    }
+
+    /* ----- the ice: block becoming lens, then slumping ----- */
+    // body
+    ctx.beginPath();
+    var STEPS = 44;
+    for (var si = 0; si <= STEPS; si++) {
+      var th = (si / STEPS) * TPI;
+      var p = outlinePoint(cx, L.cy, L.a, L.b, L.n, th);
+      if (si === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+    }
+    ctx.closePath();
+    ctx.globalAlpha = 0.16 + 0.05 * L.k;
+    ctx.fillStyle = ICE;
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    // deep blue core
+    ell(cx, L.cy, L.a * 0.58, L.b * 0.58, CORE, 0.32 + 0.10 * L.k);
+    ell(cx, L.cy, L.a * 0.34, L.b * 0.34, CORE, 0.22);
+    // rim
+    ctx.beginPath();
+    for (si = 0; si <= STEPS; si++) {
+      th = (si / STEPS) * TPI;
+      p = outlinePoint(cx, L.cy, L.a, L.b, L.n, th);
+      if (si === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+    }
+    ctx.closePath();
+    ctx.globalAlpha = 0.5;
+    ctx.strokeStyle = REFR;
+    ctx.lineWidth = Math.max(1, 0.0035 * u);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    // refraction arcs (drawn in a y-squashed space so they hug the lens)
+    for (var aI = 0; aI < sc.arcs.length; aI++) {
+      var arc = sc.arcs[aI];
+      ctx.save();
+      ctx.translate(cx, L.cy);
+      ctx.scale(1, L.b / L.a);
+      ctx.globalAlpha = arc.a * (0.45 + 0.55 * L.k) * (1 - 0.4 * m);
+      ctx.strokeStyle = REFR;
+      ctx.lineWidth = Math.max(1, 0.004 * u) / (L.b / L.a);
+      ctx.beginPath();
+      ctx.arc(0, 0, L.a * arc.rF, arc.a0 + tt * 0.02, arc.a0 + tt * 0.02 + arc.span);
+      ctx.stroke();
+      ctx.restore();
+    }
+    ctx.globalAlpha = 1;
+    // facet lines
+    for (var fI = 0; fI < sc.facets.length; fI++) {
+      var fc = sc.facets[fI];
+      var fx0 = cx + Math.cos(fc.ang) * L.a * fc.r0;
+      var fy0 = L.cy + Math.sin(fc.ang) * L.b * fc.r0;
+      var fx1 = cx + Math.cos(fc.ang) * L.a * fc.r1;
+      var fy1 = L.cy + Math.sin(fc.ang) * L.b * fc.r1;
+      seg(fx0, fy0, fx1, fy1, Math.max(1, 0.0022 * u), REFR, fc.a * (0.4 + 0.6 * L.k));
+    }
+    // glint — shifts with the dragged spotlight
+    var glx = cx - L.a * 0.35 + spot.x * u * 0.3;
+    var gly = L.cy - L.b * 0.38 + spot.y * u * 0.2;
+    ell(glx, gly, 0.028 * u, 0.016 * u, REFR, 0.35 + 0.40 * L.light);
+    ell(glx, gly, 0.013 * u, 0.008 * u, REFR, 0.55 + 0.35 * L.light);
+
+    /* ----- robot arm (in front of the ice it works on) ----- */
+    var arm = armPose(et, tt, L);
+    // pedestal
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = ROBOT;
+    ctx.beginPath();
+    ctx.moveTo(arm.S.x - 0.035 * u, fy);
+    ctx.lineTo(arm.S.x + 0.035 * u, fy);
+    ctx.lineTo(arm.S.x + 0.020 * u, arm.S.y);
+    ctx.lineTo(arm.S.x - 0.020 * u, arm.S.y);
+    ctx.closePath();
+    ctx.fill();
+    seg(arm.S.x, arm.S.y, arm.E.x, arm.E.y, 0.030 * u, ROBOT, 1);
+    seg(arm.E.x, arm.E.y, arm.Wp.x, arm.Wp.y, 0.024 * u, ROBOT, 1);
+    seg(arm.Wp.x, arm.Wp.y, arm.T.x, arm.T.y, 0.013 * u, ROBOT, 1);
+    dot(arm.S.x, arm.S.y, 0.020 * u, ROBOT, 1);
+    dot(arm.E.x, arm.E.y, 0.017 * u, ROBOT, 1);
+    dot(arm.Wp.x, arm.Wp.y, 0.014 * u, ROBOT, 1);
+    // the one amber joint light, at the elbow
+    dot(arm.E.x, arm.E.y, 0.0165 * u, AMBER, 0.10);
+    dot(arm.E.x, arm.E.y, 0.010 * u, AMBER, 0.22);
+    dot(arm.E.x, arm.E.y, 0.0055 * u, AMBER, 1);
+
+    /* ----- ice dust while carving (pure function of the cut) ----- */
+    var dustLevel = clamp(1 - Math.max(0, et - 43) / 2, 0, 1) * clamp(et / 0.5, 0, 1);
+    if (dustLevel > 0.003 && et < CARVE_END + 2) {
+      var nDust = PHONE ? 55 : sc.dust.length;
+      ctx.fillStyle = REFR;
+      for (var dJ = 0; dJ < nDust; dJ++) {
+        var dp = sc.dust[dJ];
+        var ageF = (et / dp.life + dp.phi) % 1;
+        var age = ageF * dp.life;
+        var ts = et - age;
+        if (ts < 0) continue;
+        var sp = tipPos(ts, L);
+        var px = sp.x + dp.drift * age * 0.02 * u + Math.sin(age * 9 + dp.phi * 20) * 0.002 * u;
+        var py = sp.y + 0.22 * u * ageF * ageF * dp.fall;
+        if (py > fy) py = fy;
+        ctx.globalAlpha = 0.55 * (1 - ageF) * dustLevel;
+        var sz = dp.size * (0.6 + u / 900);
+        ctx.fillRect(px - sz / 2, py - sz / 2, sz, sz);
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    /* ----- cycle seam: fade out to a fresh block, fade in ----- */
+    var fade = Math.min(sstep(et / 1.2), 1 - sstep((et - 146.5) / 3));
+    if (fade < 1) {
+      ctx.globalAlpha = 1 - clamp(fade, 0, 1);
+      ctx.fillStyle = BLACK;
+      ctx.fillRect(0, 0, W, H);
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  /* ---------------- events ---------------- */
+  function evPos(e) {
+    var r = { x: 0, y: 0 };
+    if (e.clientX !== undefined) { r.x = e.clientX; r.y = e.clientY; }
+    return r;
+  }
+  function recordDrag(e, t) {
+    var p = evPos(e);
+    if (!dragStart) dragStart = p;
+    var u = Math.min(W, H) || 1;
+    var dx = clamp((p.x - dragStart.x) / u, -0.35, 0.35);
+    var dy = clamp((p.y - dragStart.y) / u, -0.35, 0.35);
+    dragSamples.push({ dx: dx, dy: dy, t: t });
+    if (dragSamples.length > 400) dragSamples.splice(0, dragSamples.length - 400);
+  }
+  function onDown(e) {
+    var t = nowT();
+    var p = evPos(e);
+    if (t - lastTapT < 0.35 && Math.abs(p.x - lastTapX) < 30 && Math.abs(p.y - lastTapY) < 30) {
+      // double-tap: a fresh block, a new seed
+      seedBase += 1;
+      epoch = t;
+      dragSamples = [];
+      dragStart = null;
+      lastTapT = -10;
+    } else {
+      lastTapT = t; lastTapX = p.x; lastTapY = p.y;
+      dragStart = p;
+      recordDrag(e, t);
+    }
+    if (e.preventDefault) e.preventDefault();
+  }
+  function onMove(e) {
+    if (dragStart) recordDrag(e, nowT());
+  }
+  function onUp() { dragStart = null; }
+
+  function addListeners() {
+    if (!canvas.addEventListener) return;
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+    canvas.addEventListener('touchstart', function (e) {
+      if (e.touches && e.touches[0]) onDown(e.touches[0]);
+      if (e.preventDefault) e.preventDefault();
+    }, { passive: false });
+    canvas.addEventListener('touchmove', function (e) {
+      if (e.touches && e.touches[0]) recordDrag(e.touches[0], nowT());
+      if (e.preventDefault) e.preventDefault();
+    }, { passive: false });
+    canvas.addEventListener('touchend', onUp);
+  }
+
+  function addResize() {
+    function onR() { fit(); draw(nowT()); }
+    if (typeof window !== 'undefined' && window.visualViewport &&
+        window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', onR);
+    }
+    if (typeof window !== 'undefined' && window.addEventListener) {
+      window.addEventListener('resize', onR);
+    }
+  }
+
+  /* ---------------- boot ---------------- */
+  fit();
+  addListeners();
+  addResize();
+  draw(PHASE);
+  if (typeof requestAnimationFrame === 'function') {
+    var tick = function () {
+      draw(nowT());
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Delta Phi</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#05070A; overflow:hidden; }
+  canvas { display:block; touch-action:none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  /* ------- Delta Phi (Jussi Ängeslevä, 2013) -------
+     A dark wall. At its centre, a chrome-plated surface milled with a
+     wavy facet field — flowing ridges and dimples, apparently abstract.
+     A spotlight sweeps slowly across it; facets whose milled angle
+     matches the light flare in a travelling specular band. Around the
+     chrome, in the darkness, caustic flecks shimmer — and hidden in
+     that shimmer are Greek letters. Each glyph exists only in the
+     reflected light: it resolves when the sweep angle reaches its
+     sweet spot and dissolves back into flecks as the light moves on.
+     The glyph is never on the surface; optics is the message.
+     Drag to hold the light yourself; double-tap reseeds the milling
+     and the hidden sequence. No gradients anywhere: facet tones are
+     mixed per cell, the cone is stacked translucent triangles, the
+     flecks are plain rects under 'lighter'. */
+
+  var PHASE = 30.0;              // fixed first-frame phase (seconds):
+                                 // sweep angle is exactly 0 there, the
+                                 // sweet spot of the first glyph
+  var SWEEP = 30.0;              // seconds per full light sweep
+  var AMP = 0.95;                // sweep amplitude (light angle, rad-ish)
+  var TPI = Math.PI * 2;
+
+  // Palette
+  var WALL = '#05070A';
+  var FACET_SHADOW = [28, 33, 41];     // #1C2129
+  var FACET_CHROME = [154, 162, 173];  // #9AA2AD
+  var FACET_CATCH  = [232, 238, 245];  // #E8EEF5
+  var GOLD = [232, 200, 118];          // #E8C876
+  var CONE = '#2A3442';
+
+  var GLYPH_CHARS = ['Δ', 'Φ', 'Ψ', 'Ω', 'λ'];
+  // glyph slots on the dark wall around the chrome (frame fractions)
+  var SLOTS = [
+    { x: 0.105, y: 0.50 },   // left of the chrome
+    { x: 0.895, y: 0.44 },   // right of the chrome
+    { x: 0.50,  y: 0.105 },  // above
+    { x: 0.14,  y: 0.885 },  // below left
+    { x: 0.86,  y: 0.875 }   // below right
+  ];
+
+  /* ---------------- seeded rng ---------------- */
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function seedFromQuery() {
+    try {
+      var s = (typeof location !== 'undefined' && location.search) || '';
+      var m = /[?&]seed=(\d+)/.exec(s);
+      if (m) return parseInt(m[1], 10) >>> 0;
+    } catch (e) { /* no location: fall through */ }
+    return 1131;
+  }
+
+  function mix(a, b, f) {
+    return [Math.round(a[0] + (b[0] - a[0]) * f),
+            Math.round(a[1] + (b[1] - a[1]) * f),
+            Math.round(a[2] + (b[2] - a[2]) * f)];
+  }
+  function rgb(c) { return 'rgb(' + c[0] + ',' + c[1] + ',' + c[2] + ')'; }
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+  function smooth(v) { v = clamp(v, 0, 1); return v * v * (3 - 2 * v); }
+
+  /* ---------------- world generation ----------------
+     Facets live on a fixed grid in normalised chrome coordinates, so
+     one milling serves every viewport. Per cell we precompute:
+       phi  — the light angle at which this facet flares (its milled
+              tilt; mostly a function of u so the flare forms a band
+              that travels, perturbed by the heightfield gradient)
+       amb  — base shading from a fixed top-left key light
+     The heightfield is an analytic wavy sum whose phases/frequencies
+     come from the seed; gradients are finite differences of it. */
+  var COLS = 52, ROWS = 34;
+
+  var world = null;
+  function buildWorld(seed) {
+    var rng = mulberry32(seed);
+    var P = {
+      fx1: 1.1 + rng() * 0.9, fy1: 1.0 + rng() * 0.8,
+      fx2: 1.6 + rng() * 1.2, fx3: 2.6 + rng() * 1.6, fy3: 2.2 + rng() * 1.4,
+      p1: rng() * TPI, p2: rng() * TPI, p3: rng() * TPI, p4: rng() * TPI
+    };
+    function height(u, v) {
+      return Math.sin(u * P.fx1 * TPI + P.p1) * Math.cos(v * P.fy1 * TPI + P.p2)
+           + 0.55 * Math.sin((u * 0.7 + v) * P.fx2 * TPI + P.p3)
+           + 0.30 * Math.sin(u * P.fx3 * TPI - v * P.fy3 * TPI + P.p4);
+    }
+    var cells = [];
+    var eps = 0.012;
+    for (var r = 0; r < ROWS; r++) {
+      for (var c = 0; c < COLS; c++) {
+        var u = (c + 0.5) / COLS, v = (r + 0.5) / ROWS;
+        var gx = (height(u + eps, v) - height(u - eps, v)) / (2 * eps);
+        var gy = (height(u, v + eps) - height(u, v - eps)) / (2 * eps);
+        var gxN = gx / (1 + Math.abs(gx)), gyN = gy / (1 + Math.abs(gy));
+        var phi = clamp(-0.95 + 1.9 * u + 0.38 * gxN, -1.15, 1.15);
+        var amb = clamp(0.5 + 0.5 * (-gxN * 0.6 - gyN * 0.8), 0, 1);
+        amb = 0.12 + 0.68 * amb + (rng() - 0.5) * 0.07;
+        cells.push({ u: u, v: v, phi: phi, amb: clamp(amb, 0.04, 0.9) });
+      }
+    }
+
+    // Glyphs: the first char always takes the left slot with sweet
+    // spot 0 (so frame one resolves it); the rest are shuffled over
+    // the remaining slots and spread sweet spots.
+    var restChars = GLYPH_CHARS.slice(1);
+    var restSlots = [1, 2, 3, 4];
+    var restSweets = [-0.62, 0.62, -1.0, 1.0];
+    for (var i = restChars.length - 1; i > 0; i--) {
+      var j = Math.floor(rng() * (i + 1));
+      var tmp = restChars[i]; restChars[i] = restChars[j]; restChars[j] = tmp;
+      tmp = restSlots[i]; restSlots[i] = restSlots[j]; restSlots[j] = tmp;
+      tmp = restSweets[i]; restSweets[i] = restSweets[j]; restSweets[j] = tmp;
+    }
+    var glyphs = [{
+      ch: GLYPH_CHARS[0], slot: 0, sweet: 0,
+      x: SLOTS[0].x, y: SLOTS[0].y, ph: rng() * TPI
+    }];
+    for (var g = 0; g < restChars.length; g++) {
+      var s = SLOTS[restSlots[g]];
+      glyphs.push({
+        ch: restChars[g], slot: restSlots[g],
+        sweet: restSweets[g] + (rng() - 0.5) * 0.1,
+        x: s.x + (rng() - 0.5) * 0.02, y: s.y + (rng() - 0.5) * 0.02,
+        ph: rng() * TPI
+      });
+    }
+
+    // Caustic flecks on the dark wall (never inside the chrome rect,
+    // in normalised frame coords with a small margin).
+    var flecks = [];
+    var guard = 0;
+    while (flecks.length < 240 && guard++ < 4000) {
+      var fx = rng(), fy = rng();
+      if (fx > 0.185 && fx < 0.815 && fy > 0.185 && fy < 0.815) continue;
+      flecks.push({
+        x: fx, y: fy, r: 0.8 + rng() * 1.9,
+        ph: rng() * TPI, m: 1 + Math.floor(rng() * 4),
+        sp: 0.4 + rng() * 1.1, pale: rng() < 0.2
+      });
+    }
+    return { cells: cells, glyphs: glyphs, flecks: flecks };
+  }
+
+  /* ---------------- canvas / viewport ---------------- */
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0, DPR = 1, PHONE = false;
+
+  function fit() {
+    var w, h;
+    if (typeof window !== 'undefined' && window.visualViewport) {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    } else if (typeof window !== 'undefined') {
+      w = window.innerWidth; h = window.innerHeight;
+    } else { w = 720; h = 720; }
+    DPR = 1;
+    if (typeof window !== 'undefined' && window.devicePixelRatio) {
+      DPR = Math.min(window.devicePixelRatio, 2);
+    }
+    W = Math.max(50, Math.round(w)); H = Math.max(50, Math.round(h));
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    // Phone: window.screen physical size, min dimension < 700px;
+    // aspect fallback only if screen is missing.
+    var sw = 0, sh = 0;
+    if (typeof window !== 'undefined' && window.screen) {
+      sw = window.screen.width || 0; sh = window.screen.height || 0;
+    }
+    if (sw && sh) PHONE = Math.min(sw, sh) < 700;
+    else PHONE = (H > W * 1.15) && Math.min(W, H) < 700;
+  }
+
+  /* ---------------- interaction state ----------------
+     The light angle is a closed-form sweep plus a phase shift. A drag
+     holds the angle directly (recorded from the pointer); on release
+     the phase shift is recomputed so the sweep resumes from exactly
+     the angle the visitor left it at. Double-tap reseeds. */
+  var seed = seedFromQuery();
+  world = buildWorld(seed);
+  var phaseShift = 0;
+  var dragging = false, dragA = 0;
+  var lastTapT = -10, lastTapX = 0, lastTapY = 0;
+
+  var startStamp = null;
+  function nowT() {
+    var ms;
+    if (typeof performance !== 'undefined' && performance.now) ms = performance.now();
+    else ms = Date.now();
+    if (startStamp === null) startStamp = ms;
+    return PHASE + (ms - startStamp) / 1000;
+  }
+
+  function lightAngle(t) {
+    if (dragging) return dragA;
+    return AMP * Math.sin(TPI * t / SWEEP + phaseShift);
+  }
+
+  function angleFromX(x) {
+    return clamp(((x / Math.max(1, W)) - 0.5) * 2.1, -AMP, AMP);
+  }
+
+  function reseed() {
+    seed = (seed + 7919) >>> 0;
+    world = buildWorld(seed);
+  }
+
+  function onDown(e) {
+    var x = e.clientX, y = e.clientY, t = nowT();
+    if (t - lastTapT < 0.35 && Math.abs(x - lastTapX) < 48 && Math.abs(y - lastTapY) < 48) {
+      reseed();
+      lastTapT = -10;
+      dragging = false;
+      return;
+    }
+    lastTapT = t; lastTapX = x; lastTapY = y;
+    dragging = true;
+    dragA = angleFromX(x);
+  }
+  function onMove(e) {
+    if (dragging) dragA = angleFromX(e.clientX);
+  }
+  function onUp() {
+    if (!dragging) return;
+    dragging = false;
+    var tr = nowT();
+    // choose the asin branch whose sweep direction matches the
+    // direction the sweep had just before the drag took over
+    var dirBefore = Math.cos(TPI * tr / SWEEP + phaseShift) >= 0 ? 1 : -1;
+    var base = Math.asin(clamp(dragA / AMP, -1, 1));
+    var ph = (dirBefore > 0 ? base : Math.PI - base) - TPI * tr / SWEEP;
+    phaseShift = ph;
+  }
+
+  function addListeners() {
+    if (!canvas.addEventListener) return;
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+    canvas.addEventListener('touchstart', function (e) {
+      if (e.touches && e.touches[0]) onDown(e.touches[0]);
+      if (e.preventDefault) e.preventDefault();
+    });
+    canvas.addEventListener('touchmove', function (e) {
+      if (e.touches && e.touches[0]) onMove(e.touches[0]);
+      if (e.preventDefault) e.preventDefault();
+    });
+    canvas.addEventListener('touchend', function (e) {
+      onUp();
+      if (e.preventDefault) e.preventDefault();
+    });
+  }
+
+  function addResize() {
+    var onR = function () { fit(); };
+    if (typeof window !== 'undefined' && window.visualViewport &&
+        window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', onR);
+    }
+    if (typeof window !== 'undefined' && window.addEventListener) {
+      window.addEventListener('resize', onR);
+    }
+  }
+
+  /* ---------------- frame ---------------- */
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+    var a = lightAngle(t);
+    var minD = Math.min(W, H);
+
+    // the dark wall
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = WALL;
+    ctx.fillRect(0, 0, W, H);
+
+    // chrome rect: middle ~60% of the frame
+    var cx0 = W * 0.20, cy0 = H * 0.20, cw = W * 0.60, ch = H * 0.60;
+    var ccx = cx0 + cw / 2;
+    var bandX = ccx + (a / AMP) * cw * 0.5;
+
+    // spotlight cone (stacked translucent triangles, no gradient):
+    // source hovers off-frame above the band; fan lands on the chrome.
+    var sx = bandX, sy = -H * 0.08;
+    ctx.fillStyle = CONE;
+    var fan = [[0.17, 0.08], [0.11, 0.07], [0.055, 0.085]];
+    for (var f = 0; f < fan.length; f++) {
+      ctx.globalAlpha = fan[f][1];
+      ctx.beginPath();
+      ctx.moveTo(sx, sy);
+      ctx.lineTo(bandX - cw * fan[f][0], cy0 + ch * 0.06);
+      ctx.lineTo(bandX + cw * fan[f][0], cy0 + ch * 0.06);
+      ctx.closePath();
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // facet field: per-cell tone = milled base shading, flaring to the
+    // bright catch where the cell's milled angle meets the light angle
+    var cellW = cw / COLS, cellH = ch / ROWS;
+    var cells = world.cells;
+    for (var i = 0; i < cells.length; i++) {
+      var cell = cells[i];
+      var d = Math.abs(a - cell.phi);
+      var sp = clamp(1 - d / 0.5, 0, 1);
+      sp = sp * sp * sp;
+      var base = mix(FACET_SHADOW, FACET_CHROME, cell.amb);
+      var col = sp > 0.003 ? mix(base, FACET_CATCH, sp * 0.95) : base;
+      ctx.fillStyle = rgb(col);
+      ctx.fillRect(cx0 + (cell.u * COLS - 0.5) * cellW - 0.4,
+                   cy0 + (cell.v * ROWS - 0.5) * cellH - 0.4,
+                   cellW + 0.8, cellH + 0.8);
+    }
+    // chrome edge: dark seat line + a whisper of top highlight
+    ctx.strokeStyle = 'rgba(0,0,0,0.6)';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(cx0, cy0, cw, ch);
+    ctx.strokeStyle = 'rgba(232,238,245,0.08)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(cx0, cy0 + 1); ctx.lineTo(cx0 + cw, cy0 + 1);
+    ctx.stroke();
+
+    // caustic flecks: shimmer = interference of light angle and time;
+    // flecks near the currently-resolving glyph brighten with it
+    var glyphs = world.glyphs;
+    var legs = [];
+    for (var g = 0; g < glyphs.length; g++) {
+      var dl = Math.abs(a - glyphs[g].sweet);
+      legs.push(smooth(1 - dl / 0.38));
+    }
+    ctx.globalCompositeOperation = 'lighter';
+    var flecks = world.flecks;
+    for (var k = 0; k < flecks.length; k++) {
+      var fl = flecks[k];
+      var fl2 = 0.5 + 0.5 * Math.sin(fl.ph + fl.m * a * 3 + t * fl.sp * 0.7);
+      var al = 0.04 + 0.26 * fl2 * fl2;
+      for (var g2 = 0; g2 < glyphs.length; g2++) {
+        if (legs[g2] < 0.05) continue;
+        var dx = fl.x - glyphs[g2].x, dy = fl.y - glyphs[g2].y;
+        var prox = Math.exp(-(dx * dx + dy * dy) / 0.008);
+        al *= 1 + legs[g2] * prox * 1.6;
+      }
+      ctx.globalAlpha = clamp(al, 0, 0.85);
+      ctx.fillStyle = fl.pale ? '#E8EEF5' : '#E8C876';
+      var fr = fl.r * (PHONE ? 1.25 : 1) * (minD / 800 + 0.4);
+      ctx.fillRect(fl.x * W - fr / 2, fl.y * H - fr / 2, fr, fr);
+    }
+
+    // hidden glyphs: each exists only in the reflected light.
+    // near its sweet spot it is one crisp pass; off it, it smears
+    // into offset ghost passes that melt into the fleck shimmer.
+    var fs = minD * 0.135;
+    ctx.font = '600 ' + fs.toFixed(1) + 'px Georgia, "Times New Roman", serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#E8C876';
+    for (var gi = 0; gi < glyphs.length; gi++) {
+      var gl = glyphs[gi], leg = legs[gi];
+      if (leg < 0.02) continue;
+      var flick = 0.92 + 0.08 * Math.sin(t * 7 + gl.ph);
+      var alpha = Math.pow(leg, 1.5) * 0.95 * flick;
+      var gx = gl.x * W, gy = gl.y * H;
+      if (leg > 0.8) {
+        ctx.globalAlpha = clamp(alpha, 0, 1);
+        ctx.fillText(gl.ch, gx, gy);
+      } else {
+        var j = (1 - leg) * fs * 0.07 + 1;
+        var offs = [[-j, 0], [j, 0], [0, -j], [0, j], [0, 0]];
+        ctx.globalAlpha = clamp(alpha * 0.34, 0, 1);
+        for (var o = 0; o < offs.length; o++) {
+          ctx.fillText(gl.ch, gx + offs[o][0], gy + offs[o][1]);
+        }
+      }
+    }
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  /* ---------------- run ---------------- */
+  fit();
+  addListeners();
+  addResize();
+  draw(PHASE); // synchronous first frame at the fixed phase
+
+  if (typeof requestAnimationFrame === 'function') {
+    var loop = function () {
+      draw(nowT());
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
