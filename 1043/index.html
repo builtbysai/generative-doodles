@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Piste, Watched</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #070709; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------------- constants ----------------
+  var TAU = Math.PI * 2;
+  var LOOP = 45;            // bout loop, seconds
+  var T0 = 14;              // frame one phase: mid-exchange
+  var RIB_T = 3.0;          // ribbon history window, seconds
+  var RIB_N = 110;          // ribbon samples per fencer
+
+  var VENUE = '#070709';
+  var PISTE = '#0E0F12';
+  var PLINE = '#23252B';
+  var CAM = '#14151A';
+  var STAND = '#0B0C0E';
+  var FENCER = '#0A0B0D';
+  var WARM = '#FFE9B8';     // fencer A trajectory
+  var COOL = '#7FD4FF';     // fencer B trajectory
+  var WHITE = '#FFFFFF';
+
+  // ---------------- seeded rng ----------------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------------- bout parameters (seeded around a tuned exchange) ----
+  var seed = 1043204;
+  var P = null;
+  function buildParams(s) {
+    var rnd = mulberry32(s);
+    function j(v, amt) { return v + (rnd() * 2 - 1) * amt; }
+    P = {
+      aBase: j(0.430, 0.008), bBase: j(0.600, 0.008),
+      aPh1: j(0.0, 0.15), aPh2: j(1.3, 0.15), aPh3: j(-1.88, 0.10),
+      bPh1: j(0.7, 0.15), bPh2: j(2.1, 0.15), bPh3: j(1.26, 0.10),
+      lungePh: j(0.200, 0.025),
+      aAng1: j(0.4, 0.15), aAng2: j(2.0, 0.15),
+      bAng1: j(1.1, 0.15), bAng2: j(0.3, 0.15),
+      aLane: j(-0.22, 0.04), bLane: j(0.22, 0.04)
+    };
+  }
+  buildParams(seed);
+
+  // ---------------- canvas / viewport ----------------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 720, H = 720, DPR = 1, phone = false;
+
+  function isPhone() {
+    var sw = 0, sh = 0;
+    if (typeof window !== 'undefined' && window.screen) {
+      sw = window.screen.width || 0; sh = window.screen.height || 0;
+    }
+    var mn = Math.min(sw, sh);
+    if (mn > 0 && mn < 700) return true;
+    return H > W * 1.15;
+  }
+
+  function fit() {
+    var vv = (typeof window !== 'undefined') ? window.visualViewport : null;
+    if (vv && vv.width) { W = vv.width; H = vv.height; }
+    else if (typeof window !== 'undefined' && window.innerWidth) { W = window.innerWidth; H = window.innerHeight; }
+    DPR = (typeof window !== 'undefined' && window.devicePixelRatio) ? Math.min(window.devicePixelRatio, 2) : 1;
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    phone = isPhone();
+  }
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', function () { fit(); draw(); });
+    }
+    if (window.addEventListener) {
+      window.addEventListener('resize', function () { fit(); draw(); });
+    }
+  }
+
+  function geo() {
+    var ph = Math.max(56, Math.min(H * 0.16, 180));
+    return { cy: H * 0.5, ph: ph, top: H * 0.5 - ph / 2, bot: H * 0.5 + ph / 2 };
+  }
+
+  // ---------------- bout choreography (closed form in local time) ----
+  // Lunge envelope: wrapped gaussian bump, 9 cycles per loop (one per 5 s).
+  function bump(ph) {
+    var d = Math.abs(ph - Math.round(ph));
+    return Math.exp(-(d * d) / (2 * 0.045 * 0.045));
+  }
+  function lungeEnv(f, lt) {
+    return bump(9 * lt / LOOP + P.lungePh + (f === 1 ? 0.015 : 0));
+  }
+
+  // Fencer state at local time lt. x/lane are normalized; ang in radians
+  // (pixel space, 0 = straight at the opponent); reach is a fraction of W.
+  function state(f, lt) {
+    var u = lt / LOOP;
+    var env = lungeEnv(f, lt);
+    var x, ang, lane, facing;
+    if (f === 0) {
+      facing = 1; lane = P.aLane;
+      x = P.aBase
+        + 0.055 * Math.sin(TAU * 3 * u + P.aPh1)
+        + 0.030 * Math.sin(TAU * 5 * u + P.aPh2)
+        + 0.045 * Math.sin(TAU * 9 * u + P.aPh3)
+        + 0.050 * env;
+      ang = (0.55 * Math.sin(TAU * 5 * u + P.aAng1)
+           + 0.30 * Math.sin(TAU * 9 * u + P.aAng2)) * (1 - 0.78 * env);
+    } else {
+      facing = -1; lane = P.bLane;
+      x = P.bBase
+        - 0.050 * Math.sin(TAU * 3 * u + P.bPh1)
+        - 0.028 * Math.sin(TAU * 7 * u + P.bPh2)
+        - 0.045 * Math.sin(TAU * 9 * u + P.bPh3)
+        - 0.050 * env;
+      ang = (0.55 * Math.sin(TAU * 5 * u + P.bAng1)
+           + 0.30 * Math.sin(TAU * 9 * u + P.bAng2)) * (1 - 0.78 * env);
+    }
+    return { x: x, lane: lane, ang: ang, reach: 0.055 + 0.042 * env, env: env, facing: facing };
+  }
+
+  function shoulderPx(f, lt, g) {
+    var st = state(f, lt);
+    return { x: st.x * W, y: g.cy + st.lane * g.ph * 0.5, st: st };
+  }
+
+  function tipPx(f, lt, g) {
+    var sh = shoulderPx(f, lt, g);
+    var r = sh.st.reach * W;
+    return {
+      x: sh.x + Math.cos(sh.st.ang) * r * sh.st.facing,
+      y: sh.y + Math.sin(sh.st.ang) * r,
+      sx: sh.x, sy: sh.y, st: sh.st
+    };
+  }
+
+  function tipSpeed(f, lt, g) {
+    var e = 0.03;
+    var a = tipPx(f, lt - e, g), b = tipPx(f, lt + e, g);
+    var dx = b.x - a.x, dy = b.y - a.y;
+    return Math.sqrt(dx * dx + dy * dy) / (2 * e);
+  }
+
+  function zoneOf(f, lt) {
+    var st = state(f, lt);
+    var z = Math.floor(st.x * 12);
+    return z < 0 ? 0 : (z > 11 ? 11 : z);
+  }
+
+  // ---------------- interaction / clock state ----------------
+  var clock = T0;                 // piece clock (audio + envelopes)
+  var localT = [T0, T0];          // per-fencer local time (drag slows it)
+  var ageScale = 1;               // ribbon decay scale (tap freezes decay)
+  var freezeUntil = -1;
+  var pointer = { down: false, x: 0, y: 0 };
+  var downAt = null, downClock = 0, lastTapClock = -10;
+  var lastZone = [-1, -1];
+  var stepPhase = [0, 0];
+
+  // ---------------- audio (lazy, guarded; silent in QA) ----------------
+  var AC = null, whineOsc = [null, null], whineGain = [null, null];
+  function initAudio() {
+    if (AC) { if (AC.resume) { try { AC.resume(); } catch (e) {} } return; }
+    var Ctor = null;
+    if (typeof AudioContext !== 'undefined') Ctor = AudioContext;
+    else if (typeof window !== 'undefined' && window.webkitAudioContext) Ctor = window.webkitAudioContext;
+    if (!Ctor) return;
+    try {
+      AC = new Ctor();
+      for (var i = 0; i < 2; i++) {
+        var o = AC.createOscillator(), gn = AC.createGain();
+        o.type = 'sine'; o.frequency.value = 1400 + i * 500;
+        gn.gain.value = 0;
+        o.connect(gn); gn.connect(AC.destination);
+        o.start();
+        whineOsc[i] = o; whineGain[i] = gn;
+      }
+    } catch (e) { AC = null; }
+  }
+  function blip(freq, dur, gain, type) {
+    if (!AC) return;
+    try {
+      var t = AC.currentTime;
+      var o = AC.createOscillator(), g = AC.createGain();
+      o.type = type || 'sine';
+      o.frequency.setValueAtTime(freq, t);
+      g.gain.setValueAtTime(gain, t);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      o.connect(g); g.connect(AC.destination);
+      o.start(t); o.stop(t + dur + 0.02);
+    } catch (e) {}
+  }
+  function click() { blip(2100, 0.05, 0.018, 'square'); }        // camera handoff
+  function stepTick(f) { blip(f === 0 ? 760 : 690, 0.03, 0.007, 'triangle'); } // footwork
+
+  // ---------------- drawing ----------------
+  function drawRibbon(f, g) {
+    var lt = localT[f];
+    var col = f === 0 ? WARM : COOL;
+    var pts = [], i, s, tp, spd;
+    for (i = 0; i <= RIB_N; i++) {
+      s = (i / RIB_N) * RIB_T;                 // age, seconds into the past
+      tp = tipPx(f, lt - s, g);
+      spd = tipSpeed(f, lt - s, g);
+      pts.push({ x: tp.x, y: tp.y, age: s, spd: spd });
+    }
+    // glow pass: one wide, faint polyline under the ribbon
+    ctx.strokeStyle = col;
+    ctx.globalAlpha = 0.10;
+    ctx.lineWidth = Math.max(5, W * 0.010);
+    ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    ctx.beginPath();
+    for (i = 0; i < pts.length; i++) {
+      if (i === 0) ctx.moveTo(pts[i].x, pts[i].y); else ctx.lineTo(pts[i].x, pts[i].y);
+    }
+    ctx.stroke();
+    // ribbon body: per-segment quads, width follows tip speed, alpha fades
+    // with effective age (ageScale compresses ages while decay is frozen).
+    for (i = 0; i < pts.length - 1; i++) {
+      var a = pts[i], b = pts[i + 1];
+      var dx = b.x - a.x, dy = b.y - a.y;
+      var len = Math.sqrt(dx * dx + dy * dy) || 1;
+      var nx = -dy / len, ny = dx / len;
+      var wa = Math.min(13, 1.6 + a.spd * 0.006) * (1 - 0.45 * (a.age / RIB_T));
+      var wb = Math.min(13, 1.6 + b.spd * 0.006) * (1 - 0.45 * (b.age / RIB_T));
+      var eff = Math.min(1, (a.age * ageScale) / RIB_T);
+      ctx.globalAlpha = 0.85 * Math.pow(1 - eff, 1.4);
+      ctx.fillStyle = col;
+      ctx.beginPath();
+      ctx.moveTo(a.x + nx * wa, a.y + ny * wa);
+      ctx.lineTo(b.x + nx * wb, b.y + ny * wb);
+      ctx.lineTo(b.x - nx * wb, b.y - ny * wb);
+      ctx.lineTo(a.x - nx * wa, a.y - ny * wa);
+      ctx.closePath();
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawFencer(f, g) {
+    var lt = localT[f];
+    var tp = tipPx(f, lt, g);
+    var st = tp.st;
+    var len = Math.max(17, W * 0.030);
+    var backX = tp.sx - st.facing * len * 0.58;
+    var frontX = tp.sx + st.facing * len * 0.42;
+    ctx.strokeStyle = FENCER;
+    ctx.fillStyle = FENCER;
+    // blade: hand to tip
+    ctx.globalAlpha = 1;
+    ctx.lineWidth = Math.max(1.4, W * 0.0018);
+    ctx.beginPath();
+    ctx.moveTo(tp.sx + st.facing * len * 0.30, tp.sy);
+    ctx.lineTo(tp.x, tp.y);
+    ctx.stroke();
+    // body dash
+    ctx.lineWidth = Math.max(4.5, W * 0.006);
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(backX, tp.sy);
+    ctx.lineTo(frontX, tp.sy);
+    ctx.stroke();
+    // head dot
+    ctx.beginPath();
+    ctx.arc(frontX, tp.sy - Math.max(2.5, W * 0.004), Math.max(2.2, W * 0.0034), 0, TAU);
+    ctx.fill();
+  }
+
+  function draw() {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    var g = geo();
+    var i, f;
+
+    // venue
+    ctx.fillStyle = VENUE;
+    ctx.fillRect(0, 0, W, H);
+
+    // piste
+    ctx.fillStyle = PISTE;
+    ctx.fillRect(0, g.top, W, g.ph);
+
+    // coverage zones: pulse where a fencer stands
+    var active = {};
+    for (f = 0; f < 2; f++) active[zoneOf(f, localT[f])] = true;
+    var zw = W / 12;
+    for (var z in active) {
+      var pulse = 0.55 + 0.45 * Math.sin(TAU * clock / 1.1 + (z | 0) * 0.7);
+      ctx.fillStyle = WHITE;
+      ctx.globalAlpha = 0.10 * pulse;
+      ctx.fillRect((z | 0) * zw + 1, g.top, zw - 2, g.ph);
+    }
+    ctx.globalAlpha = 1;
+
+    // center line
+    ctx.fillStyle = PLINE;
+    ctx.fillRect(0, g.cy - 0.5, W, 1);
+
+    // trajectories (the content)
+    drawRibbon(0, g);
+    drawRibbon(1, g);
+
+    // cameras: 12 per side, stands toward the piste
+    var camW = Math.max(9, Math.min(W / 12 * 0.42, 30));
+    var camH = camW * 0.62;
+    var gap = Math.max(12, H * 0.028);
+    for (i = 0; i < 12; i++) {
+      var cx = (i + 0.5) * zw;
+      var hot = active[i] ? (0.55 + 0.45 * Math.sin(TAU * clock / 1.1 + i * 0.7)) : 0;
+      // stands
+      ctx.strokeStyle = STAND;
+      ctx.lineWidth = Math.max(1.5, camW * 0.10);
+      ctx.beginPath();
+      ctx.moveTo(cx, g.top - gap + 2); ctx.lineTo(cx, g.top);
+      ctx.moveTo(cx, g.bot); ctx.lineTo(cx, g.bot + gap - 2);
+      ctx.stroke();
+      // boxes
+      ctx.fillStyle = CAM;
+      ctx.fillRect(cx - camW / 2, g.top - gap - camH, camW, camH);
+      ctx.fillRect(cx - camW / 2, g.bot + gap, camW, camH);
+      if (hot > 0) {
+        ctx.fillStyle = WHITE;
+        ctx.globalAlpha = 0.28 * hot;
+        ctx.fillRect(cx - camW / 2, g.top - gap - camH, camW, camH);
+        ctx.fillRect(cx - camW / 2, g.bot + gap, camW, camH);
+        ctx.globalAlpha = 1;
+      }
+      // lens dot
+      ctx.fillStyle = STAND;
+      var lr = Math.max(1.2, camW * 0.10);
+      ctx.beginPath(); ctx.arc(cx, g.top - gap - camH / 2, lr, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.arc(cx, g.bot + gap + camH / 2, lr, 0, TAU); ctx.fill();
+    }
+
+    // fencers last: shadows over their own light
+    drawFencer(0, g);
+    drawFencer(1, g);
+  }
+
+  // ---------------- pointer ----------------
+  function evtPos(e) {
+    var r = { left: 0, top: 0 };
+    if (canvas.getBoundingClientRect) r = canvas.getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  }
+  function onDown(e) {
+    initAudio();
+    var p = evtPos(e);
+    pointer.down = true; pointer.x = p.x; pointer.y = p.y;
+    downAt = p; downClock = clock;
+  }
+  function onMove(e) {
+    if (!pointer.down) return;
+    var p = evtPos(e);
+    pointer.x = p.x; pointer.y = p.y;
+  }
+  function onUp(e) {
+    if (!pointer.down) return;
+    pointer.down = false;
+    var p = evtPos(e);
+    var moved = downAt ? Math.sqrt((p.x - downAt.x) * (p.x - downAt.x) + (p.y - downAt.y) * (p.y - downAt.y)) : 99;
+    downAt = null;
+    if (moved > 8 || clock - downClock > 0.45) return;   // it was a drag
+    // tap
+    if (clock - lastTapClock < 0.35) {
+      // double tap: new bout
+      seed = (seed * 1664525 + 1013904223) >>> 0;
+      buildParams(seed);
+      lastTapClock = -10;
+    } else {
+      // a touch: freeze ribbon decay at its brightest for ~2.5 s
+      freezeUntil = clock + 2.5;
+      lastTapClock = clock;
+    }
+    draw();
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', function () { pointer.down = false; downAt = null; });
+  }
+
+  // ---------------- boot: frame one, then the live loop ----------------
+  fit();
+  draw();
+
+  if (typeof requestAnimationFrame !== 'undefined') {
+    var lastMs = null;
+    var loop = function (ms) {
+      if (lastMs === null) lastMs = ms;
+      var dt = (ms - lastMs) / 1000;
+      lastMs = ms;
+      if (dt > 0.25) dt = 0.25;
+      if (dt > 0) {
+        clock += dt;
+        var g = geo();
+        for (var f = 0; f < 2; f++) {
+          var scale = 1;
+          if (pointer.down) {
+            var sh = shoulderPx(f, localT[f], g);
+            var dxp = Math.abs(pointer.x - sh.x);
+            var inBand = pointer.y > g.top - H * 0.10 && pointer.y < g.bot + H * 0.10;
+            if (inBand && dxp < W * 0.17) scale = 0.22;   // local slow time
+          }
+          localT[f] += dt * scale;
+          // audio: handoff clicks, footwork, blade whines
+          var zn = zoneOf(f, localT[f]);
+          if (lastZone[f] !== -1 && zn !== lastZone[f]) click();
+          lastZone[f] = zn;
+          var tp = tipPx(f, localT[f], g);
+          var spd = tipSpeed(f, localT[f], g);
+          stepPhase[f] += dt * (1.2 + Math.abs(tp.st.x) * 0 + spd * 0.004);
+          if (stepPhase[f] >= 1) { stepPhase[f] -= 1; if (spd > 60) stepTick(f); }
+          if (AC && whineGain[f]) {
+            try {
+              whineOsc[f].frequency.value = 1100 + spd * 1.6 + f * 420;
+              whineGain[f].gain.value = Math.min(0.012, spd * 0.000012);
+            } catch (e) {}
+          }
+        }
+        var target = (clock < freezeUntil) ? 0.12 : 1;
+        ageScale += (target - ageScale) * Math.min(1, dt * 6);
+      }
+      draw();
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>

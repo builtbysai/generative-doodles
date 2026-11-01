@@ -1,0 +1,460 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Light, Ferried</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #08090B; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- palette (strict) ----------
+  var VENUE = '#08090B';
+  var TEMPLE = '#1C1E24';
+  var BASE = '#0D0E11';
+  var DOME_WARM = '#FFE9B8';
+  var DOME_COOL = '#7FD4FF';
+  var TRAIL_WARM = '#FFB347';
+  var TRAIL_COOL = '#4FA8FF';
+  var MARK = '#FFFFFF';
+
+  var LOOP = 60;              // seconds, seamless: every circuit divides it
+  var T0 = 20;                // frame one phase
+  var BASE_SEED = 1040201;
+
+  // ==== FLEET MATH BEGIN ====
+  // Pure, DOM-free. A fleet is four concentric rectangular rings around the
+  // temple, three carts per ring. Each ring is an 8-waypoint axis-aligned
+  // circuit (corners and edge midpoints). A cart travels each segment at one
+  // constant speed, stops hard for a fixed dwell at every waypoint, and the
+  // ring timeline sums to exactly LOOP seconds, so position is a closed-form
+  // function of loop phase. Carts never rotate: omni translation only.
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  var RING_BASE = [[150, 115], [250, 195], [350, 275], [450, 360]];
+  function buildFleet(seed) {
+    var rng = mulberry32(seed);
+    var rings = [];
+    var r, i;
+    for (r = 0; r < 4; r++) {
+      var hx = RING_BASE[r][0] + (rng() * 2 - 1) * 10;
+      var hy = RING_BASE[r][1] + (rng() * 2 - 1) * 10;
+      var dir = rng() < 0.5 ? 1 : -1;
+      var dwell = 0.5 + rng() * 0.6;
+      var pts = [
+        [-hx, -hy], [0, -hy], [hx, -hy], [hx, 0],
+        [hx, hy], [0, hy], [-hx, hy], [-hx, 0]
+      ];
+      if (dir < 0) pts = [pts[0]].concat(pts.slice(1).reverse());
+      var segs = [], totalLen = 0;
+      for (i = 0; i < 8; i++) {
+        var a = pts[i], b = pts[(i + 1) % 8];
+        var len = Math.abs(b[0] - a[0]) + Math.abs(b[1] - a[1]);
+        segs.push({ ax: a[0], ay: a[1], bx: b[0], by: b[1], len: len });
+        totalLen += len;
+      }
+      var speed = totalLen / (LOOP - 8 * dwell);
+      var tl = [], tt = 0;
+      for (i = 0; i < 8; i++) {
+        var trav = segs[i].len / speed;
+        tl.push({ start: tt, dur: trav, kind: 0, seg: i });
+        tt += trav;
+        tl.push({ start: tt, dur: dwell, kind: 1, seg: i });
+        tt += dwell;
+      }
+      rings.push({ hx: hx, hy: hy, dir: dir, dwell: dwell, pts: pts, segs: segs, speed: speed, tl: tl, total: tt });
+    }
+    var carts = [], idx = 0;
+    for (r = 0; r < 4; r++) {
+      for (i = 0; i < 3; i++) {
+        carts.push({ ring: r, offset: i * (LOOP / 3) + (rng() * 2 - 1) * 3, warm: (idx % 2 === 0), idx: idx });
+        idx++;
+      }
+    }
+    return { rings: rings, carts: carts };
+  }
+  function cartPosAt(fleet, cart, t) {
+    var ring = fleet.rings[cart.ring];
+    var ph = (t + cart.offset) % LOOP;
+    if (ph < 0) ph += LOOP;
+    var tl = ring.tl;
+    for (var i = 0; i < tl.length; i++) {
+      var e = tl[i];
+      if (ph >= e.start && ph < e.start + e.dur) {
+        var seg = ring.segs[e.seg];
+        if (e.kind === 1) return { x: seg.bx, y: seg.by, moving: false, dx: 0, dy: 0 };
+        var u = e.dur > 0 ? (ph - e.start) / e.dur : 0;
+        return {
+          x: seg.ax + (seg.bx - seg.ax) * u,
+          y: seg.ay + (seg.by - seg.ay) * u,
+          moving: true,
+          dx: Math.sign(seg.bx - seg.ax), dy: Math.sign(seg.by - seg.ay)
+        };
+      }
+    }
+    var last = ring.segs[7];
+    return { x: last.bx, y: last.by, moving: false, dx: 0, dy: 0 };
+  }
+  // ==== FLEET MATH END ====
+
+  var seed = BASE_SEED;
+  var fleet = buildFleet(seed);
+  var pieceT = T0;
+  var roadblocks = [];        // recorded drag events {x, y, t} in logical units
+  var flashes = [];           // recorded tap events {cart, t}
+  var dragging = false;
+  var downInfo = null;
+  var lastTapT = -10;
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 720, H = 720;
+  var phoneNow = false;
+  var sizeMul = 1;
+
+  function isPhone() {
+    var sw = 0, sh = 0;
+    if (typeof window !== 'undefined' && window.screen) {
+      sw = window.screen.width || 0; sh = window.screen.height || 0;
+    }
+    var mn = Math.min(sw, sh);
+    if (mn > 0 && mn < 700) return true;
+    return H > W * 1.15; // aspect fallback only
+  }
+
+  function fit() {
+    var vv = (typeof window !== 'undefined') ? window.visualViewport : null;
+    if (vv && vv.width) { W = vv.width; H = vv.height; }
+    else if (typeof window !== 'undefined' && window.innerWidth) { W = window.innerWidth; H = window.innerHeight; }
+    canvas.width = Math.round(W);
+    canvas.height = Math.round(H);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    phoneNow = isPhone();
+    sizeMul = phoneNow ? 1.3 : 1;
+  }
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', function () { fit(); draw(pieceT); });
+    }
+    if (window.addEventListener) {
+      window.addEventListener('resize', function () { fit(); draw(pieceT); });
+    }
+  }
+
+  // ---------- coordinates: logical 1000x1000 plan, centered ----------
+  function scale() { return Math.min(W, H) / 1000; }
+  function toPx(x, y) { var s = scale(); return [W / 2 + x * s, H / 2 + y * s]; }
+  function toLogical(px, py) { var s = scale(); return [(px - W / 2) / s, (py - H / 2) / s]; }
+
+  // ---------- recorded-event offsets (roadblock detours) ----------
+  function offsetAt(x, y, t) {
+    var ox = 0, oy = 0;
+    for (var i = 0; i < roadblocks.length; i++) {
+      var rb = roadblocks[i];
+      var age = t - rb.t;
+      if (age < 0 || age > 2.2) continue;
+      var dx = x - rb.x, dy = y - rb.y;
+      var d = Math.sqrt(dx * dx + dy * dy);
+      if (d >= 170) continue;
+      if (d < 0.001) { dx = 1; dy = 0; d = 1; }
+      var push = (1 - d / 170) * 46 * (1 - age / 2.2);
+      ox += dx / d * push;
+      oy += dy / d * push;
+    }
+    return [ox, oy];
+  }
+  function drawnPos(cart, t) {
+    var p = cartPosAt(fleet, cart, t);
+    var o = offsetAt(p.x, p.y, t);
+    return { x: p.x + o[0], y: p.y + o[1], moving: p.moving };
+  }
+  function flashAt(idx, t) {
+    var f = 0;
+    for (var i = 0; i < flashes.length; i++) {
+      if (flashes[i].cart !== idx) continue;
+      var age = t - flashes[i].t;
+      if (age < 0 || age > 1.1) continue;
+      var v = 1 - age / 1.1;
+      if (v * v > f) f = v * v;
+    }
+    return f;
+  }
+  function pruneEvents() {
+    roadblocks = roadblocks.filter(function (rb) { return pieceT - rb.t <= 2.2; });
+    if (roadblocks.length > 80) roadblocks = roadblocks.slice(roadblocks.length - 80);
+    flashes = flashes.filter(function (fl) { return pieceT - fl.t <= 1.1; });
+  }
+
+  // ---------- audio (lazy, guarded; first gesture only) ----------
+  var AC = null, humW = null, humC = null, humWG = null, humCG = null;
+  var lastChimeAt = 0, nearPairs = {};
+  function ensureAudio() {
+    if (AC) { if (AC.resume) { try { AC.resume(); } catch (e) {} } return; }
+    var Ctor = null;
+    if (typeof AudioContext !== 'undefined') Ctor = AudioContext;
+    else if (typeof window !== 'undefined' && window.webkitAudioContext) Ctor = window.webkitAudioContext;
+    if (!Ctor) return;
+    try {
+      AC = new Ctor();
+      var len = 2 * AC.sampleRate;
+      var buf = AC.createBuffer(1, len, AC.sampleRate);
+      var ch = buf.getChannelData(0);
+      for (var i = 0; i < len; i++) ch[i] = Math.random() * 2 - 1;
+      var src = AC.createBufferSource();
+      src.buffer = buf; src.loop = true;
+      var lp = AC.createBiquadFilter();
+      lp.type = 'lowpass'; lp.frequency.value = 320;
+      var ag = AC.createGain(); ag.gain.value = 0.012;
+      src.connect(lp); lp.connect(ag); ag.connect(AC.destination);
+      src.start();
+      humW = AC.createOscillator(); humW.type = 'sine'; humW.frequency.value = 82;
+      humWG = AC.createGain(); humWG.gain.value = 0;
+      humW.connect(humWG); humWG.connect(AC.destination); humW.start();
+      humC = AC.createOscillator(); humC.type = 'sine'; humC.frequency.value = 124;
+      humCG = AC.createGain(); humCG.gain.value = 0;
+      humC.connect(humCG); humCG.connect(AC.destination); humC.start();
+    } catch (e) { AC = null; }
+  }
+  function chime(freq) {
+    if (!AC) return;
+    try {
+      var t = AC.currentTime;
+      var o = AC.createOscillator(), g = AC.createGain();
+      o.type = 'sine'; o.frequency.value = freq;
+      g.gain.setValueAtTime(0.045, t);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.6);
+      o.connect(g); g.connect(AC.destination);
+      o.start(t); o.stop(t + 0.65);
+      var o2 = AC.createOscillator(), g2 = AC.createGain();
+      o2.type = 'sine'; o2.frequency.value = freq * 2;
+      g2.gain.setValueAtTime(0.014, t);
+      g2.gain.exponentialRampToValueAtTime(0.0001, t + 0.4);
+      o2.connect(g2); g2.connect(AC.destination);
+      o2.start(t); o2.stop(t + 0.45);
+    } catch (e) {}
+  }
+  function updateAudio() {
+    if (!AC) return;
+    try {
+      var i, j;
+      var sumW = 0, nW = 0, sumC = 0, nC = 0;
+      var pos = [];
+      for (i = 0; i < fleet.carts.length; i++) {
+        var c = fleet.carts[i];
+        var dp = drawnPos(c, pieceT);
+        pos.push(dp);
+        var sp = dp.moving ? fleet.rings[c.ring].speed : 0;
+        if (c.warm) { sumW += sp; nW++; } else { sumC += sp; nC++; }
+      }
+      var t = AC.currentTime;
+      var fW = 82 * (0.85 + 0.45 * (nW ? sumW / nW : 0) / 65);
+      var fC = 124 * (0.85 + 0.45 * (nC ? sumC / nC : 0) / 65);
+      humW.frequency.setTargetAtTime(fW, t, 0.1);
+      humC.frequency.setTargetAtTime(fC, t, 0.1);
+      humWG.gain.setTargetAtTime(nW && sumW > 0 ? 0.016 : 0.004, t, 0.15);
+      humCG.gain.setTargetAtTime(nC && sumC > 0 ? 0.016 : 0.004, t, 0.15);
+      // crossing chimes: a pair entering close range is a passing, noted once
+      var nowNear = {};
+      for (i = 0; i < pos.length; i++) {
+        for (j = i + 1; j < pos.length; j++) {
+          var dx = pos[i].x - pos[j].x, dy = pos[i].y - pos[j].y;
+          if (dx * dx + dy * dy < 120 * 120) {
+            var key = i + ':' + j;
+            nowNear[key] = true;
+            if (!nearPairs[key] && pieceT - lastChimeAt > 0.25) {
+              lastChimeAt = pieceT;
+              chime(520 + ((i * 12 + j) % 8) * 40);
+            }
+          }
+        }
+      }
+      nearPairs = nowNear;
+    } catch (e) {}
+  }
+
+  // ---------- drawing ----------
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    var s = scale();
+    ctx.fillStyle = VENUE;
+    ctx.fillRect(0, 0, W, H);
+
+    var i, j, p;
+
+    // waypoint marks: the circuits, dying faint
+    ctx.fillStyle = MARK;
+    ctx.globalAlpha = 0.08;
+    for (i = 0; i < fleet.rings.length; i++) {
+      var pts = fleet.rings[i].pts;
+      for (j = 0; j < pts.length; j++) {
+        p = toPx(pts[j][0], pts[j][1]);
+        ctx.beginPath();
+        ctx.arc(p[0], p[1], Math.max(1.4, 2.4 * s), 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    // temple: simple dark lines at the heart of the plan
+    var tw = 70 * s, th = 52 * s, cx = W / 2, cy = H / 2;
+    ctx.strokeStyle = TEMPLE;
+    ctx.lineWidth = Math.max(1.5, 2.2 * s);
+    ctx.strokeRect(cx - tw, cy - th, tw * 2, th * 2);
+    ctx.strokeRect(cx - tw * 0.62, cy - th * 0.62, tw * 1.24, th * 1.24);
+    ctx.beginPath();
+    ctx.moveTo(cx - tw, cy); ctx.lineTo(cx + tw, cy);
+    ctx.moveTo(cx, cy - th); ctx.lineTo(cx, cy + th);
+    ctx.stroke();
+
+    // trails: position buffers sampled from the closed-form past, never a fade
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    var TRAIL_SPAN = 6, TRAIL_STEP = 0.35;
+    for (i = 0; i < fleet.carts.length; i++) {
+      var cart = fleet.carts[i];
+      ctx.strokeStyle = cart.warm ? TRAIL_WARM : TRAIL_COOL;
+      ctx.lineWidth = Math.max(1.2, 3.2 * s * sizeMul);
+      var prev = null, prevAge = 0;
+      for (var age = TRAIL_STEP; age <= TRAIL_SPAN + 0.001; age += TRAIL_STEP) {
+        var dp = drawnPos(cart, t - age);
+        var pp = toPx(dp.x, dp.y);
+        if (prev) {
+          ctx.globalAlpha = 0.25 * (1 - prevAge / TRAIL_SPAN);
+          ctx.beginPath();
+          ctx.moveTo(prev[0], prev[1]);
+          ctx.lineTo(pp[0], pp[1]);
+          ctx.stroke();
+        }
+        prev = pp; prevAge = age;
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    // carts: dark square bases that never rotate, glowing domes that ride
+    for (i = 0; i < fleet.carts.length; i++) {
+      var c2 = fleet.carts[i];
+      var d2 = drawnPos(c2, t);
+      p = toPx(d2.x, d2.y);
+      var fl = flashAt(c2.idx, t);
+      var side = 30 * s * sizeMul;
+      ctx.fillStyle = BASE;
+      ctx.fillRect(p[0] - side / 2, p[1] - side / 2, side, side);
+      ctx.strokeStyle = TEMPLE;
+      ctx.lineWidth = 1;
+      ctx.strokeRect(p[0] - side / 2, p[1] - side / 2, side, side);
+      var dome = c2.warm ? DOME_WARM : DOME_COOL;
+      var grow = 1 + 0.9 * fl;
+      var layers = [
+        [21, 0.10], [14, 0.20], [8.5, 0.45], [5, 1.0]
+      ];
+      ctx.fillStyle = dome;
+      for (j = 0; j < layers.length; j++) {
+        ctx.globalAlpha = Math.min(1, layers[j][1] * (1 + 0.8 * fl));
+        ctx.beginPath();
+        ctx.arc(p[0], p[1], Math.max(1, layers[j][0] * s * sizeMul * grow), 0, Math.PI * 2);
+        ctx.fill();
+      }
+      if (fl > 0.03) {
+        ctx.fillStyle = MARK;
+        ctx.globalAlpha = fl * 0.9;
+        ctx.beginPath();
+        ctx.arc(p[0], p[1], Math.max(1, 3.2 * s * sizeMul), 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  // ---------- pointer interaction ----------
+  function evtLogical(e) {
+    var rx = 0, ry = 0;
+    if (canvas.getBoundingClientRect) {
+      var rect = canvas.getBoundingClientRect();
+      rx = rect.left; ry = rect.top;
+    }
+    return toLogical((e.clientX || 0) - rx, (e.clientY || 0) - ry);
+  }
+  function onDown(e) {
+    ensureAudio();
+    var p = evtLogical(e);
+    dragging = true;
+    downInfo = { x: p[0], y: p[1], moved: false };
+    roadblocks.push({ x: p[0], y: p[1], t: pieceT });
+    pruneEvents();
+  }
+  function onMove(e) {
+    if (!dragging) return;
+    var p = evtLogical(e);
+    if (downInfo && (Math.abs(p[0] - downInfo.x) > 6 || Math.abs(p[1] - downInfo.y) > 6)) downInfo.moved = true;
+    roadblocks.push({ x: p[0], y: p[1], t: pieceT });
+    pruneEvents();
+  }
+  function onUp(e) {
+    if (!downInfo) { dragging = false; return; }
+    dragging = false;
+    var wasDrag = downInfo.moved;
+    downInfo = null;
+    if (wasDrag) return;
+    var p = evtLogical(e);
+    if (pieceT - lastTapT < 0.35) {
+      seed = (seed * 1664525 + 1013904223) >>> 0;
+      fleet = buildFleet(seed);
+      roadblocks = [];
+      flashes = [];
+      lastTapT = -10;
+      draw(pieceT);
+      return;
+    }
+    lastTapT = pieceT;
+    var best = -1, bd = 60;
+    for (var i = 0; i < fleet.carts.length; i++) {
+      var dp = drawnPos(fleet.carts[i], pieceT);
+      var dx = dp.x - p[0], dy = dp.y - p[1];
+      var d = Math.sqrt(dx * dx + dy * dy);
+      if (d < bd) { bd = d; best = i; }
+    }
+    if (best >= 0) flashes.push({ cart: best, t: pieceT });
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', function () { dragging = false; downInfo = null; });
+  }
+
+  // ---------- boot: frame one at the fixed phase, then the live loop ----------
+  fit();
+  draw(pieceT);
+
+  if (typeof requestAnimationFrame !== 'undefined') {
+    var startMs = null;
+    var loopFn = function (ms) {
+      if (startMs === null) startMs = ms;
+      pieceT = T0 + (ms - startMs) / 1000;
+      pruneEvents();
+      draw(pieceT);
+      updateAudio();
+      requestAnimationFrame(loopFn);
+    };
+    requestAnimationFrame(loopFn);
+  }
+})();
+</script>
+</body>
+</html>

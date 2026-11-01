@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Screens, Unsynced</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #08080A; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded rng ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- palette (strict) ----------
+  var STAGE = '#08080A';
+  var SCREEN = '#E8EAEE';
+  var LOCKWHITE = '#FFFFFF';
+  var PLATFORM = '#101114';
+  var BLOBINK = '#0B0C0E';
+  var HUES = ['#7FD4FF', '#FFB3C8', '#B8FF9D'];
+
+  var LOOP = 60;              // seconds, seamless
+  var T0 = 17;                // frame one phase: mid FREE phase, screens unsynced
+  var BASE_SEED = 1044205;
+
+  var seed = BASE_SEED;
+  var screens = [];
+  var dancers = [];
+  var overrides = [];         // per screen: null or {mode:'lock'|'free', since:t, prevBase}
+  var condDrag = null;        // live conductor drag {x, y, since}
+  var condRelease = null;     // last released conductor {x, y, t0}
+  var pointer = { down: false, x: 0, y: 0, tDown: 0, moved: false };
+  var lastTap = { t: -10, x: 0, y: 0 };
+  var pieceT = T0;
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 720, H = 720;
+  var phoneNow = false;
+
+  function isPhone() {
+    var sw = 0, sh = 0;
+    if (typeof window !== 'undefined' && window.screen) {
+      sw = window.screen.width || 0; sh = window.screen.height || 0;
+    }
+    var mn = Math.min(sw, sh);
+    if (mn > 0 && mn < 700) return true;
+    return H > W * 1.15; // aspect fallback only
+  }
+
+  function fit() {
+    var vv = (typeof window !== 'undefined') ? window.visualViewport : null;
+    if (vv && vv.width) { W = vv.width; H = vv.height; }
+    else if (typeof window !== 'undefined' && window.innerWidth) { W = window.innerWidth; H = window.innerHeight; }
+    canvas.width = Math.round(W);
+    canvas.height = Math.round(H);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    phoneNow = isPhone();
+  }
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', function () { fit(); draw(pieceT); });
+    }
+    if (window.addEventListener) {
+      window.addEventListener('resize', function () { fit(); draw(pieceT); });
+    }
+  }
+
+  // ---------- sync schedule ----------
+  // Global master clock breathes on the 60 s loop:
+  //   [0,10)  locked   offsets held at zero, screens bright
+  //   [10,16) release  offsets ease out to their wander
+  //   [16,44) free     offsets wander, screens dim and varied
+  //   [44,50) gather   offsets ease back to zero
+  //   [50,60) locked
+  function smooth01(u) { u = Math.max(0, Math.min(1, u)); return u * u * (3 - 2 * u); }
+  function freeAmount(lt) {
+    if (lt < 10) return 0;
+    if (lt < 16) return smooth01((lt - 10) / 6);
+    if (lt < 44) return 1;
+    if (lt < 50) return 1 - smooth01((lt - 44) / 6);
+    return 0;
+  }
+
+  // ---------- choreography build (seeded) ----------
+  // Route legs chosen so every full cycle divides the 60 s loop:
+  // 2 * (travel + dwell) is one of 12, 15, 20, 30.
+  var LEGS = [
+    { travel: 4.5, dwell: 1.5 },   // cycle 12
+    { travel: 6.0, dwell: 1.5 },   // cycle 15
+    { travel: 7.5, dwell: 2.5 },   // cycle 20
+    { travel: 9.0, dwell: 1.0 },   // cycle 20
+    { travel: 12.0, dwell: 3.0 },  // cycle 30
+    { travel: 13.5, dwell: 1.5 }   // cycle 30
+  ];
+  var WANDER_T = [30, 20, 60, 15, 12];  // wander periods, all divide 60
+
+  function buildAll(s) {
+    var rng = mulberry32(s);
+    screens = [];
+    overrides = [];
+    var homes = [0.12, 0.31, 0.50, 0.69, 0.87];
+    var tops = [0.20, 0.15, 0.23, 0.17, 0.21];
+    for (var i = 0; i < 5; i++) {
+      var leg = LEGS[Math.floor(rng() * LEGS.length)];
+      var L = 0.07 + rng() * 0.09;                    // glide length, fraction of W
+      var hx = homes[i] + (rng() - 0.5) * 0.03;
+      var cyc = 2 * (leg.travel + leg.dwell);
+      screens.push({
+        hx: hx,
+        top: tops[i] + (rng() - 0.5) * 0.02,
+        L: L,
+        v: L / leg.travel,                            // constant velocity, fraction of W per s
+        dwell: leg.dwell,
+        cyc: cyc,
+        phase: Math.floor(rng() * cyc * 2) / 2,       // seeded route phase
+        wanderAmp: 1.2 + rng() * 1.2,                 // seconds of sync offset at full free
+        wanderT: WANDER_T[i],
+        wanderPh: rng() * Math.PI * 2,
+        freePh: rng() * Math.PI * 2,                  // free-phase brightness variation
+        basePal: Math.floor(rng() * 3),
+        palOff: Math.floor(rng() * 20),
+        blobs: [
+          { a: [12, 15, 20, 30][Math.floor(rng() * 4)], b: [15, 20, 30, 60][Math.floor(rng() * 4)], p1: rng() * 6.283, p2: rng() * 6.283, r: 0.30 + rng() * 0.14 },
+          { a: [15, 20, 30, 60][Math.floor(rng() * 4)], b: [12, 20, 30][Math.floor(rng() * 3)], p1: rng() * 6.283, p2: rng() * 6.283, r: 0.24 + rng() * 0.12 },
+          { a: [20, 30, 60][Math.floor(rng() * 3)], b: [12, 15, 30][Math.floor(rng() * 3)], p1: rng() * 6.283, p2: rng() * 6.283, r: 0.20 + rng() * 0.10 }
+        ]
+      });
+      overrides.push(null);
+    }
+    dancers = [];
+    var dHome = [0.30, 0.52, 0.72];
+    for (var d = 0; d < 3; d++) {
+      dancers.push({
+        cx: dHome[d] + (rng() - 0.5) * 0.04,
+        amp: 0.035 + rng() * 0.03,
+        period: [60, 30, 60][d],
+        ph: rng() * Math.PI * 2,
+        stepP: 0.82 + rng() * 0.25,
+        stepPh: rng() * Math.PI * 2
+      });
+    }
+    condDrag = null;
+    condRelease = null;
+  }
+
+  // ---------- closed-form state ----------
+  // Constant velocity out, dwell, constant velocity back, dwell. Hard stops.
+  function routeX(sc, rt, scaleL) {
+    var L = sc.L * scaleL;
+    var x0 = sc.hx - L / 2, x1 = sc.hx + L / 2;
+    var v = L / (sc.cyc / 2 - sc.dwell);              // travel time = cyc/2 - dwell
+    var travel = L / v;
+    var u = ((rt + sc.phase) % sc.cyc + sc.cyc) % sc.cyc;
+    if (u < travel) return x0 + v * u;
+    if (u < travel + sc.dwell) return x1;
+    if (u < 2 * travel + sc.dwell) return x1 - v * (u - travel - sc.dwell);
+    return x0;
+  }
+  function routeSpeed(sc, rt, scaleL) {
+    var d = 0.05;
+    return Math.abs(routeX(sc, rt + d, scaleL) - routeX(sc, rt - d, scaleL)) / (2 * d);
+  }
+
+  function screenGeom() {
+    return {
+      w: (phoneNow ? 0.155 : 0.102) * W,
+      h: (phoneNow ? 0.40 : 0.50) * H,
+      scaleL: phoneNow ? 0.7 : 1
+    };
+  }
+
+  function baseFree(i, lt) {
+    var ov = overrides[i];
+    if (!ov) return freeAmount(lt);
+    var target = ov.mode === 'lock' ? 0 : 1;
+    var w = smooth01((pieceT - ov.since) / 0.8);
+    return ov.prevBase + (target - ov.prevBase) * w;
+  }
+
+  function conductorStrength(i, t, cxPx, cyPx) {
+    var best = 0;
+    var R = 0.34 * Math.min(W, H);
+    function prox(x, y) {
+      var dx = x - cxPx, dy = y - cyPx;
+      var d = Math.sqrt(dx * dx + dy * dy);
+      return Math.max(0, 1 - d / R);
+    }
+    if (condDrag) {
+      var env = Math.min(1, (t - condDrag.since) / 0.35);
+      best = Math.max(best, prox(condDrag.x, condDrag.y) * env);
+    }
+    if (condRelease) {
+      var age = t - condRelease.t0;
+      if (age < 1.6) best = Math.max(best, prox(condRelease.x, condRelease.y) * (1 - age / 1.6));
+    }
+    return Math.max(0, Math.min(1, best));
+  }
+
+  // Full state of screen i at piece time t. Two passes: position without the
+  // conductor first (proximity needs a position), then with it applied.
+  function screenState(i, t) {
+    var sc = screens[i];
+    var g = screenGeom();
+    // clamp the glide so the panel never leaves the frame: the effective
+    // travel shrinks to the room the home position actually has.
+    var halfW = g.w / (2 * W);
+    var lo = halfW + 0.010, hi = 1 - halfW - 0.010;
+    var maxHalf = Math.min(sc.hx - lo, hi - sc.hx);
+    if (maxHalf < 0.02) maxHalf = 0.02;
+    var scaleEff = Math.min(sc.L * g.scaleL, 2 * maxHalf) / sc.L;
+    var lt = ((t % LOOP) + LOOP) % LOOP;
+    var base = baseFree(i, lt);
+    var wander = sc.wanderAmp * Math.sin(6.2831853 * lt / sc.wanderT + sc.wanderPh);
+    var off0 = base * wander;
+    var x0 = routeX(sc, t + off0, scaleEff);
+    var cxPx = x0 * W, cyPx = (sc.top + (g.h / H) / 2) * H;
+    var cond = conductorStrength(i, t, cxPx, cyPx);
+    var freeEff = base * (1 - cond);
+    var off = freeEff * wander;
+    var x = routeX(sc, t + off, scaleEff);
+    var freeAlpha = 0.375 + 0.125 * Math.sin(6.2831853 * lt / 30 + sc.freePh);
+    var alpha = (0.7 * (1 - freeEff) + freeAlpha * freeEff) + cond * 0.10;
+    if (alpha > 0.78) alpha = 0.78;
+    var pal = (sc.basePal + Math.floor((lt + sc.palOff) / 20)) % 3;
+    return {
+      x: x, top: sc.top, off: off, freeEff: freeEff, cond: cond,
+      alpha: alpha, pal: pal, speed: routeSpeed(sc, t + off, scaleEff)
+    };
+  }
+
+  function dancerState(d, t) {
+    var dn = dancers[d];
+    var x = dn.cx + dn.amp * Math.sin(6.2831853 * t / dn.period + dn.ph);
+    var step = 6.2831853 * t / dn.stepP + dn.stepPh;
+    return { x: x, step: step };
+  }
+
+  // ---------- audio (lazy, guarded; first gesture only) ----------
+  var AC = null, voices = [], lastStepIdx = [-1, -1, -1];
+  function ensureAudio() {
+    if (AC) { try { if (AC.resume) AC.resume(); } catch (e) {} return; }
+    var Ctor = null;
+    if (typeof AudioContext !== 'undefined') Ctor = AudioContext;
+    else if (typeof window !== 'undefined' && window.webkitAudioContext) Ctor = window.webkitAudioContext;
+    if (!Ctor) return;
+    try {
+      AC = new Ctor();
+      var master = AC.createGain();
+      master.gain.value = 0.9;
+      master.connect(AC.destination);
+      voices = [];
+      for (var i = 0; i < 5; i++) {
+        var o = AC.createOscillator(), g = AC.createGain();
+        o.type = 'sine';
+        o.frequency.value = 196 * (1 + (i - 2) * 0.0012);
+        g.gain.value = 0;
+        o.connect(g); g.connect(master);
+        o.start();
+        voices.push({ osc: o, gain: g, base: 196 * (1 + (i - 2) * 0.0012) });
+      }
+    } catch (e) { AC = null; voices = []; }
+  }
+  function click(hi) {
+    if (!AC) return;
+    try {
+      var t = AC.currentTime;
+      var o = AC.createOscillator(), g = AC.createGain();
+      o.type = 'sine';
+      o.frequency.setValueAtTime(hi ? 92 : 74, t);
+      g.gain.setValueAtTime(0.045, t);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.07);
+      o.connect(g); g.connect(AC.destination);
+      o.start(t); o.stop(t + 0.09);
+    } catch (e) {}
+  }
+  function audioEvents(t, states) {
+    if (!AC || !voices.length) return;
+    try {
+      var lt = ((t % LOOP) + LOOP) % LOOP;
+      var lockGlow = 1 - freeAmount(lt);
+      var now = AC.currentTime;
+      for (var i = 0; i < 5; i++) {
+        var v = voices[i], st = states[i];
+        var f = v.base * (1 + st.off * 0.05) * (1 + st.speed * 0.35);
+        v.osc.frequency.setTargetAtTime(f, now, 0.08);
+        var g = 0.006 + lockGlow * 0.016 + st.cond * 0.008;
+        v.gain.gain.setTargetAtTime(g, now, 0.1);
+      }
+      for (var d = 0; d < 3; d++) {
+        var idx = Math.floor(dancerState(d, t).step / Math.PI);
+        if (lastStepIdx[d] >= 0 && idx !== lastStepIdx[d]) click(d % 2 === 0);
+        lastStepIdx[d] = idx;
+      }
+    } catch (e) {}
+  }
+
+  // ---------- drawing ----------
+  function ellipse(cx, cy, rx, ry) {
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, rx, ry, 0, 0, 6.2831853);
+    ctx.fill();
+  }
+
+  function drawScreen(i, st, g) {
+    var sc = screens[i];
+    var sw = g.w, sh = g.h;
+    var x = st.x * W - sw / 2, y = sc.top * H;
+    var baseY = y + sh;
+
+    // soft halo behind the panel, layered flat alpha
+    ctx.fillStyle = LOCKWHITE;
+    ctx.globalAlpha = 0.028 * (st.alpha / 0.7);
+    ctx.fillRect(x - 7, y - 7, sw + 14, sh + 14);
+    ctx.globalAlpha = 0.02 * (st.alpha / 0.7);
+    ctx.fillRect(x - 13, y - 13, sw + 26, sh + 26);
+    ctx.globalAlpha = 1;
+
+    // ground shadow
+    ctx.fillStyle = '#000000';
+    ctx.globalAlpha = 0.35;
+    ellipse(st.x * W, baseY + 0.040 * H, sw * 0.72, 0.010 * H);
+    ctx.globalAlpha = 0.2;
+    ellipse(st.x * W, baseY + 0.040 * H, sw * 0.95, 0.016 * H);
+    ctx.globalAlpha = 1;
+
+    // platform: mast, base, wheels. The honest vehicle under the canvas.
+    ctx.fillStyle = PLATFORM;
+    ctx.fillRect(st.x * W - 0.006 * W, baseY, 0.012 * W, 0.012 * H);
+    var bw = sw * 1.28, bh = 0.030 * H;
+    ctx.fillRect(st.x * W - bw / 2, baseY + 0.012 * H, bw, bh);
+    var wr = 0.009 * H;
+    ctx.beginPath(); ctx.arc(st.x * W - bw * 0.32, baseY + 0.012 * H + bh + wr * 0.7, wr, 0, 6.2831853); ctx.fill();
+    ctx.beginPath(); ctx.arc(st.x * W + bw * 0.32, baseY + 0.012 * H + bh + wr * 0.7, wr, 0, 6.2831853); ctx.fill();
+    ctx.fillStyle = SCREEN;
+    ctx.globalAlpha = 0.10;
+    ctx.fillRect(st.x * W - bw / 2, baseY + 0.012 * H, bw, 1.5);
+    ctx.globalAlpha = 1;
+
+    // panel body
+    ctx.fillStyle = SCREEN;
+    ctx.globalAlpha = st.alpha;
+    ctx.fillRect(x, y, sw, sh);
+    // lock whitening wash
+    ctx.fillStyle = LOCKWHITE;
+    ctx.globalAlpha = (1 - st.freeEff) * 0.16 + st.cond * 0.08;
+    ctx.fillRect(x, y, sw, sh);
+    ctx.globalAlpha = 1;
+
+    // abstract projection: soft hue blobs in screen-local coordinates,
+    // clipped to the panel so the imagery rides with the screen.
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(x, y, sw, sh);
+    ctx.clip();
+    for (var b = 0; b < 3; b++) {
+      var bl = sc.blobs[b];
+      var hue = HUES[(st.pal + b) % 3];
+      var u = 0.5 + 0.30 * Math.sin(6.2831853 * pieceT / bl.a + bl.p1);
+      var v = 0.48 + 0.32 * Math.sin(6.2831853 * pieceT / bl.b + bl.p2);
+      var cx = x + u * sw, cy = y + v * sh;
+      var r = bl.r * sw;
+      ctx.fillStyle = hue;
+      ctx.globalAlpha = 0.09; ellipse(cx, cy, r, r * 0.85);
+      ctx.globalAlpha = 0.13; ellipse(cx, cy, r * 0.68, r * 0.58);
+      ctx.globalAlpha = 0.18; ellipse(cx, cy, r * 0.40, r * 0.34);
+    }
+    ctx.restore();
+    ctx.globalAlpha = 1;
+
+    // rim and top edge
+    ctx.strokeStyle = LOCKWHITE;
+    ctx.globalAlpha = 0.10 + st.alpha * 0.22;
+    ctx.lineWidth = 1;
+    ctx.strokeRect(x + 0.5, y + 0.5, sw - 1, sh - 1);
+    ctx.globalAlpha = 0.16 + st.alpha * 0.2;
+    ctx.fillStyle = LOCKWHITE;
+    ctx.fillRect(x, y, sw, 2);
+    ctx.globalAlpha = 1;
+  }
+
+  function drawDancer(d, st) {
+    var bh = 0.19 * H;
+    var feetY = 0.80 * H;
+    var cx = st.x * W;
+    var s = st.step;
+    var bob = 0.045 * Math.abs(Math.sin(s)) * bh;
+    var oy = feetY - bob;
+    var swing = Math.sin(s);
+    // skeleton points in units of bh, origin at feet center, y up negative
+    var pts = [
+      [0, -0.98, 1.7],                       // head
+      [0, -0.86, 1.1],                       // neck
+      [0, -0.74, 1.1], [0, -0.63, 1.1],      // chest
+      [0, -0.50, 1.1],                       // pelvis
+      [-0.10, -0.80, 1.0], [0.10, -0.80, 1.0],   // shoulders
+      [-0.17, -0.58 + 0.05 * swing, 1.0], [0.17, -0.58 - 0.05 * swing, 1.0], // hands
+      [-0.07, -0.28 + 0.05 * swing, 1.0], [0.07, -0.28 - 0.05 * swing, 1.0], // knees
+      [-0.09, -0.03 + 0.05 * Math.max(0, swing), 1.0],
+      [0.09, -0.03 + 0.05 * Math.max(0, -swing), 1.0],                      // feet
+      [0, -0.56, 0.9]                        // sternum
+    ];
+    // contact shadow so the guest sits on the floor
+    ctx.fillStyle = '#000000';
+    ctx.globalAlpha = 0.3;
+    ellipse(cx, feetY + 2, bh * 0.30, bh * 0.045);
+    ctx.fillStyle = BLOBINK;
+    ctx.globalAlpha = 0.92;
+    var r0 = 0.020 * bh + 1.3;
+    for (var k = 0; k < pts.length; k++) {
+      ctx.beginPath();
+      ctx.arc(cx + pts[k][0] * bh, oy + pts[k][1] * bh, r0 * pts[k][2], 0, 6.2831853);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function draw(t) {
+    pieceT = t;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.fillStyle = STAGE;
+    ctx.fillRect(0, 0, W, H);
+
+    // floor line
+    ctx.fillStyle = PLATFORM;
+    ctx.fillRect(0, 0.80 * H, W, 1.5);
+
+    var g = screenGeom();
+    var states = [];
+    var i;
+    for (i = 0; i < 5; i++) states.push(screenState(i, t));
+    for (i = 0; i < 5; i++) drawScreen(i, states[i], g);
+    for (i = 0; i < 3; i++) drawDancer(i, dancerState(i, t));
+    return states;
+  }
+
+  // ---------- interaction ----------
+  function evPos(e) {
+    var rect = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+  }
+  function hitScreen(x, y, t) {
+    var g = screenGeom();
+    for (var i = 4; i >= 0; i--) {
+      var st = screenState(i, t);
+      var sx = st.x * W - g.w / 2, sy = screens[i].top * H;
+      if (x >= sx && x <= sx + g.w && y >= sy && y <= sy + g.h) return i;
+    }
+    return -1;
+  }
+  function onDown(e) {
+    ensureAudio();
+    var p = evPos(e);
+    pointer.down = true; pointer.x = p.x; pointer.y = p.y;
+    pointer.tDown = pieceT; pointer.moved = false;
+    condDrag = { x: p.x, y: p.y, since: pieceT };
+  }
+  function onMove(e) {
+    if (!pointer.down) return;
+    var p = evPos(e);
+    if (Math.abs(p.x - pointer.x) > 6 || Math.abs(p.y - pointer.y) > 6) pointer.moved = true;
+    pointer.x = p.x; pointer.y = p.y;
+    if (condDrag) { condDrag.x = p.x; condDrag.y = p.y; }
+  }
+  function onUp(e) {
+    if (!pointer.down) return;
+    pointer.down = false;
+    var p = evPos(e);
+    if (condDrag) { condRelease = { x: condDrag.x, y: condDrag.y, t0: pieceT }; condDrag = null; }
+    var isTap = !pointer.moved && (pieceT - pointer.tDown) < 0.35;
+    if (!isTap) return;
+    // double tap: new choreography
+    if (pieceT - lastTap.t < 0.33) {
+      seed = (seed + 104729) >>> 0;
+      buildAll(seed);
+      lastTap.t = -10;
+      draw(pieceT);
+      return;
+    }
+    lastTap = { t: pieceT, x: p.x, y: p.y };
+    var idx = hitScreen(p.x, p.y, pieceT);
+    if (idx >= 0) {
+      var lt = ((pieceT % LOOP) + LOOP) % LOOP;
+      var prev = baseFree(idx, lt);
+      var cur = overrides[idx];
+      var nowMode;
+      if (cur) nowMode = cur.mode === 'lock' ? 'free' : 'lock';
+      else nowMode = freeAmount(lt) > 0.5 ? 'lock' : 'free';
+      overrides[idx] = { mode: nowMode, since: pieceT, prevBase: prev };
+    }
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', function () {
+      pointer.down = false;
+      if (condDrag) { condRelease = { x: condDrag.x, y: condDrag.y, t0: pieceT }; condDrag = null; }
+    });
+  }
+
+  // ---------- boot: frame one, then the loop ----------
+  fit();
+  buildAll(seed);
+  draw(T0);
+
+  if (typeof requestAnimationFrame !== 'undefined') {
+    var startStamp = null;
+    var loopFn = function (ms) {
+      if (startStamp === null) startStamp = ms;
+      var t = T0 + (ms - startStamp) / 1000;
+      var states = draw(t);
+      audioEvents(t, states);
+      requestAnimationFrame(loopFn);
+    };
+    requestAnimationFrame(loopFn);
+  }
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Balls Know the Route</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #060607; height: 100%; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  var FIELD = '#060607';
+  var RAIL = '#1A1B1E';
+  var HUES = ['#FFFFFF', '#FFE9B8', '#7FD4FF', '#FF6B6B', '#9DFF7F'];
+  var LOOP = 55;          // seconds, the conveyor's full cycle
+  var T0 = 16;            // frame one lives at this fixed phase
+  var NB = 16;            // balls
+  var STAMP_DT = 0.4;     // stamp cadence, seconds of travel
+  var STAMP_LIFE = 4;     // stamp fade, seconds
+  var NSTAMP = Math.floor(STAMP_LIFE / STAMP_DT); // 10 stamps per ball, the ring buffer's depth
+
+  // ---------- seeded rng ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- the rail: lemniscate of Bernoulli, arc-length table ----------
+  function lemn(th) {
+    var s = Math.sin(th), c = Math.cos(th);
+    var d = 1 + s * s;
+    return [c / d, s * c / d];
+  }
+  var SEG = 2048, cum = [0], pts = [];
+  (function buildRail() {
+    var prev = lemn(0), total = 0, i, p;
+    pts.push(prev);
+    for (i = 1; i <= SEG; i++) {
+      p = lemn((i / SEG) * Math.PI * 2);
+      total += Math.hypot(p[0] - prev[0], p[1] - prev[1]);
+      cum.push(total); pts.push(p); prev = p;
+    }
+  })();
+  var RAIL_LEN = cum[SEG];
+  function railPoint(u) { // u: arc-length fraction 0..1 -> unit lemniscate point
+    u = ((u % 1) + 1) % 1;
+    var target = u * RAIL_LEN, lo = 0, hi = SEG;
+    while (lo < hi) { var mid = (lo + hi) >> 1; if (cum[mid] < target) lo = mid + 1; else hi = mid; }
+    var i = Math.max(1, lo), span = cum[i] - cum[i - 1] || 1;
+    var f = (target - cum[i - 1]) / span;
+    var a = pts[i - 1], b = pts[i];
+    return [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f];
+  }
+
+  // ---------- balls ----------
+  var LAP_CHOICES = [2, 3, 3, 4, 4, 5, 5, 6];       // whole laps per 55 s loop: positions close exactly
+  var BLINK_M = [61, 42, 28, 18, 14, 11, 9];        // blink period = 55/m s: ~0.9, 1.3, 2.0, 3.1, 3.9, 5.0, 6.1
+  var balls = [];
+  var reseedCount = 0;
+
+  function buildBalls(seed) {
+    var rnd = mulberry32(seed);
+    balls = [];
+    for (var i = 0; i < NB; i++) {
+      var laps = LAP_CHOICES[Math.floor(rnd() * LAP_CHOICES.length)];
+      var m = BLINK_M[Math.floor(rnd() * BLINK_M.length)];
+      balls.push({
+        hue: HUES[i % HUES.length],
+        off: (i / NB + (rnd() - 0.5) * 0.03 + 1) % 1,   // seeded spread along the rail
+        speed: laps / LOOP,                              // laps per second, in u units
+        period: LOOP / m,                                // blink period, divides the loop
+        duty: 0.3 + rnd() * 0.45,                        // on-fraction of each blink
+        phase: rnd(),                                    // blink phase offset
+        boostPhase: 0,                                   // extra u from drag dispatch (interaction only)
+        boost: 0,                                        // current speed multiplier excess
+        holdUntil: -1                                    // tap hold: steady glow until this t
+      });
+    }
+  }
+  buildBalls(1041202);
+
+  function ballU(b, t) { return b.off + b.speed * t + b.boostPhase; }
+  function blinkLevel(b, t) {
+    if (t < b.holdUntil) return 1;
+    var ph = (((t / b.period) + b.phase) % 1 + 1) % 1;
+    var edge = 0.15; // smooth attack/release, fraction of period
+    if (ph < b.duty) {
+      var a = Math.min(ph / edge, 1), r = Math.min((b.duty - ph) / edge, 1);
+      return Math.max(0, Math.min(a, r));
+    }
+    return 0;
+  }
+  var DIM = 0.12; // a ball between blinks: faintly present, never gone
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 720, H = 720, phone = false;
+
+  function measure() {
+    var vv = (typeof window !== 'undefined') ? window.visualViewport : null;
+    if (vv && vv.width) { W = vv.width; H = vv.height; }
+    else if (typeof window !== 'undefined' && window.innerWidth) { W = window.innerWidth; H = window.innerHeight; }
+    var sw = 0, sh = 0;
+    if (typeof window !== 'undefined' && window.screen) { sw = window.screen.width || 0; sh = window.screen.height || 0; }
+    var mn = Math.min(sw, sh);
+    phone = (mn > 0 && mn < 700) ? true : (H > W * 1.15);
+    canvas.width = W; canvas.height = H;
+  }
+  function onResize() { measure(); draw(currentT); }
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', onResize);
+    if (window.addEventListener) window.addEventListener('resize', onResize);
+  }
+
+  // world transform: unit lemniscate x in [-1,1], y in [-0.36,0.36]; fit width to 84% of frame
+  function xform() {
+    var s = (W * 0.84) / 2;               // unit x -> px scale (lemniscate half-width is 1)
+    if (s * 0.72 > H * 0.8) s = (H * 0.8) / 0.72; // keep the eight whole on short frames
+    return { cx: W / 2, cy: H / 2, s: s };
+  }
+  function toPx(p, xf) { return [xf.cx + p[0] * xf.s, xf.cy + p[1] * xf.s]; }
+
+  // ---------- audio (lazy, guarded; first gesture only) ----------
+  var AC = null, shimmerGain = null;
+  function ensureAudio() {
+    if (AC) { if (AC.resume) AC.resume(); return; }
+    var Ctor = null;
+    if (typeof AudioContext !== 'undefined') Ctor = AudioContext;
+    else if (typeof window !== 'undefined' && window.webkitAudioContext) Ctor = window.webkitAudioContext;
+    if (!Ctor) return;
+    try {
+      AC = new Ctor();
+      var o = AC.createOscillator(), g = AC.createGain(), f = AC.createBiquadFilter();
+      o.type = 'sine'; o.frequency.value = 55;
+      f.type = 'lowpass'; f.frequency.value = 220;
+      g.gain.value = 0.0;
+      o.connect(f); f.connect(g); g.connect(AC.destination);
+      o.start();
+      shimmerGain = g; // the cloud's low shimmer, faded in under the piece
+      g.gain.linearRampToValueAtTime(0.015, AC.currentTime + 2);
+    } catch (e) { AC = null; }
+  }
+  function blip(freq, dur, vol) {
+    if (!AC) return;
+    try {
+      var t = AC.currentTime, o = AC.createOscillator(), g = AC.createGain();
+      o.type = 'sine'; o.frequency.value = freq;
+      g.gain.setValueAtTime(vol, t);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      o.connect(g); g.connect(AC.destination);
+      o.start(t); o.stop(t + dur + 0.02);
+    } catch (e) {}
+  }
+
+  // ---------- drawing ----------
+  var currentT = T0;
+  function disc(x, y, r, color, alpha) {
+    if (alpha <= 0 || r <= 0) return;
+    ctx.globalAlpha = alpha; ctx.fillStyle = color;
+    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+  function draw(t) {
+    currentT = t;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.fillStyle = FIELD; ctx.fillRect(0, 0, W, H);
+    var xf = xform();
+    var ballR = Math.max(3, Math.min(W, H) * 0.011);
+
+    // rail: the circuit, nearly invisible
+    ctx.strokeStyle = RAIL; ctx.lineWidth = Math.max(1, Math.min(W, H) * 0.0022);
+    ctx.beginPath();
+    for (var i = 0; i <= 240; i++) {
+      var p = toPx(railPoint(i / 240), xf);
+      if (i === 0) ctx.moveTo(p[0], p[1]); else ctx.lineTo(p[0], p[1]);
+    }
+    ctx.stroke();
+
+    // stamps: each ball's last NSTAMP cadence positions, computed closed-form from t.
+    // This is exactly the content of the capped ring buffer (16 x 10 stamps), derived
+    // analytically so frame one is deterministic without any accumulated state.
+    var b, j, age, tp, lv;
+    for (b = 0; b < NB; b++) {
+      var bl = balls[b];
+      for (j = NSTAMP; j >= 1; j--) {
+        age = j * STAMP_DT;
+        tp = t - age;
+        lv = DIM + (1 - DIM) * blinkLevel(bl, tp);
+        var sp = toPx(railPoint(ballU(bl, tp)), xf);
+        var fade = 1 - age / STAMP_LIFE;
+        disc(sp[0], sp[1], ballR * 1.6, bl.hue, 0.14 * fade * lv);
+        disc(sp[0], sp[1], ballR * 1.0, bl.hue, 0.26 * fade * lv);
+      }
+    }
+
+    // balls: dispatched units, bright on their interval, dim between
+    for (b = 0; b < NB; b++) {
+      var bb = balls[b];
+      var bp = toPx(railPoint(ballU(bb, t)), xf);
+      var L = DIM + (1 - DIM) * blinkLevel(bb, t);
+      disc(bp[0], bp[1], ballR * 3.0, bb.hue, 0.07 * L);
+      disc(bp[0], bp[1], ballR * 1.8, bb.hue, 0.16 * L);
+      disc(bp[0], bp[1], ballR, bb.hue, 0.25 + 0.75 * L);
+      disc(bp[0], bp[1], ballR * 0.45, '#FFFFFF', 0.35 * L);
+    }
+  }
+
+  // ---------- interaction ----------
+  var dragging = false, lastTapT = -10, lastTapX = 0, lastTapY = 0;
+  function evtPos(e) {
+    var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    return [e.clientX - r.left, e.clientY - r.top];
+  }
+  function nearestBall(x, y, maxDist) {
+    var xf = xform(), best = -1, bd = maxDist;
+    for (var i = 0; i < NB; i++) {
+      var p = toPx(railPoint(ballU(balls[i], currentT)), xf);
+      var d = Math.hypot(p[0] - x, p[1] - y);
+      if (d < bd) { bd = d; best = i; }
+    }
+    return best;
+  }
+  function onDown(e) {
+    ensureAudio();
+    var p = evtPos(e), now = currentT;
+    if (now - lastTapT < 0.35 && Math.hypot(p[0] - lastTapX, p[1] - lastTapY) < 30) {
+      // double-tap: new dispatch
+      reseedCount++;
+      buildBalls(1041202 + reseedCount * 7919);
+      lastTapT = -10;
+      draw(currentT);
+      return;
+    }
+    lastTapT = now; lastTapX = p[0]; lastTapY = p[1];
+    dragging = true;
+    var idx = nearestBall(p[0], p[1], Math.min(W, H) * 0.06);
+    if (idx >= 0) { balls[idx].holdUntil = now + 5; blip(660 + balls[idx].speed * 900, 0.25, 0.03); }
+  }
+  function onMove(e) {
+    if (!dragging) return;
+    var p = evtPos(e);
+    // dispatch surge: balls near the finger speed up briefly
+    var xf = xform(), R = Math.min(W, H) * 0.16;
+    for (var i = 0; i < NB; i++) {
+      var bp = toPx(railPoint(ballU(balls[i], currentT)), xf);
+      var d = Math.hypot(bp[0] - p[0], bp[1] - p[1]);
+      if (d < R) balls[i].boost = Math.max(balls[i].boost, 1.6 * (1 - d / R));
+    }
+  }
+  function onUp() { dragging = false; }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+  }
+
+  // ---------- boot: frame one at the fixed phase, then the loop ----------
+  measure();
+  draw(T0);
+
+  var prevBlink = balls.map(function (b) { return blinkLevel(b, T0); });
+  if (typeof requestAnimationFrame !== 'undefined') {
+    var startMs = null;
+    var frame = function (ms) {
+      if (startMs === null) startMs = ms;
+      var t = T0 + (ms - startMs) / 1000;
+      // integrate drag boosts into per-ball phase (interaction only; zero before any input)
+      var dt = Math.min(0.05, t - currentT);
+      for (var i = 0; i < NB; i++) {
+        var b = balls[i];
+        if (b.boost > 0.001) {
+          b.boostPhase += b.speed * b.boost * dt;
+          b.boost *= Math.pow(0.4, dt); // surge settles back to the dispatched interval
+        }
+        var lv = blinkLevel(b, t);
+        if (AC && prevBlink[i] < 0.5 && lv >= 0.5) blip(300 + b.speed * 2600, 0.06, 0.012); // blink click
+        prevBlink[i] = lv;
+      }
+      draw(t);
+      requestAnimationFrame(frame);
+    };
+    requestAnimationFrame(frame);
+  }
+})();
+</script>
+</body>
+</html>
