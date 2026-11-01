@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>The Changing Sky</title>
+<style>
+html, body { margin: 0; padding: 0; background: #0d0f14; overflow: hidden; height: 100%; }
+canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  // Round every fading alpha to 4 decimals before stringifying: node-canvas
+  // misparses scientific-notation alphas (e.g. 2.5e-15) as fully opaque.
+  function a4(x) {
+    var v = Math.round(x * 10000) / 10000;
+    if (v < 0) v = 0;
+    if (v > 1) v = 1;
+    return v;
+  }
+  function rgba(r, g, b, a) { return 'rgba(' + r + ',' + g + ',' + b + ',' + a4(a) + ')'; }
+
+  var W = 0, H = 0, S = 1;
+  function resize() {
+    var vw = 0, vh = 0;
+    if (typeof window !== 'undefined' && window.visualViewport &&
+        typeof window.visualViewport.width === 'number') {
+      vw = window.visualViewport.width;
+      vh = window.visualViewport.height;
+    } else if (typeof window !== 'undefined' && typeof window.innerWidth === 'number') {
+      vw = window.innerWidth;
+      vh = window.innerHeight;
+    }
+    if (!vw || !vh) return;
+    W = vw; H = vh;
+    S = Math.min(W, H);
+    canvas.width = W;
+    canvas.height = H;
+    draw(lastT);
+  }
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', resize);
+    }
+    if (window.addEventListener) {
+      window.addEventListener('resize', resize);
+    }
+  }
+
+  // --- Shapes: seeded pseudo-gesture light paths, normalized to min-dimension units.
+  var NEON = [[63, 210, 200], [245, 197, 66], [212, 42, 138]];
+  function makeShape(idx) {
+    var rng = mulberry32(1404000 + idx * 7919);
+    var col = NEON[((idx % 3) + 3) % 3];
+    var cfx = 0.5 + (rng() - 0.5) * 0.42;
+    var cfy = 0.5 + (rng() - 0.5) * 0.34;
+    var base = 0.10 + rng() * 0.10;
+    var sweep = Math.PI * (1.1 + rng() * 0.9);
+    var a0 = rng() * Math.PI * 2;
+    var f1 = 0.5 + rng(), f2 = 0.5 + rng(), p1 = rng() * 6.28, p2 = rng() * 6.28;
+    var N = 26, ox = [], oy = [];
+    for (var k = 0; k < N; k++) {
+      var u = k / (N - 1), ang = a0 + u * sweep;
+      var r = base * (1 + 0.28 * Math.sin(u * 6.28 * f1 + p1) + 0.18 * Math.sin(u * 12.56 * f2 + p2));
+      ox.push(Math.cos(ang) * r);
+      oy.push(Math.sin(ang) * r * 0.8);
+    }
+    return { cfx: cfx, cfy: cfy, ox: ox, oy: oy, col: col };
+  }
+  function shapePoints(sh) {
+    var cx = sh.cfx * W, cy = sh.cfy * H, pts = [];
+    for (var i = 0; i < sh.ox.length; i++) {
+      pts.push([cx + sh.ox[i] * S, cy + sh.oy[i] * S]);
+    }
+    return pts;
+  }
+  function pointOn(pts, u) {
+    if (u <= 0) return pts[0];
+    if (u >= 1) return pts[pts.length - 1];
+    var f = u * (pts.length - 1), i = Math.floor(f), t = f - i;
+    var p0 = pts[i], p1 = pts[Math.min(i + 1, pts.length - 1)];
+    return [p0[0] + (p1[0] - p0[0]) * t, p0[1] + (p1[1] - p0[1]) * t];
+  }
+  function tangentOn(pts, u) {
+    var e = 0.02;
+    var a = pointOn(pts, Math.max(0, u - e)), b = pointOn(pts, Math.min(1, u + e));
+    return Math.atan2(b[1] - a[1], b[0] - a[0]);
+  }
+
+  // Constellation: pre-seeded so frame one already hangs shapes (ages 25/15/5 s).
+  var constellation = [];
+  (function () {
+    var seeds = [[-3, -25], [-2, -15], [-1, -5]];
+    for (var i = 0; i < seeds.length; i++) {
+      constellation.push({ sh: makeShape(seeds[i][0]), born: seeds[i][1], drag: false });
+    }
+  })();
+  var pushedThrough = 0; // shape indices already moved into the constellation
+  var dragShapes = [];   // { nx: [...], ny: [...], col, born }
+  var nextDragCol = 0;
+
+  // Pointer: drag draws with the hands; the path becomes a constellation shape.
+  var dragging = false, dragPts = [], pointer = null;
+  function canvasPos(ev) {
+    var r = { left: 0, top: 0 };
+    if (canvas.getBoundingClientRect) { try { r = canvas.getBoundingClientRect(); } catch (e) {} }
+    return [ev.clientX - r.left, ev.clientY - r.top];
+  }
+  canvas.addEventListener('pointerdown', function (ev) {
+    dragging = true; dragPts = [];
+    var p = canvasPos(ev);
+    dragPts.push(p); pointer = p;
+    draw(lastT);
+  });
+  canvas.addEventListener('pointermove', function (ev) {
+    var p = canvasPos(ev);
+    pointer = p;
+    if (dragging) {
+      var last = dragPts[dragPts.length - 1];
+      if (!last || Math.abs(p[0] - last[0]) + Math.abs(p[1] - last[1]) > 6) dragPts.push(p);
+      draw(lastT);
+    }
+  });
+  function endDrag() {
+    if (dragging && dragPts.length >= 3) {
+      var nx = [], ny = [];
+      for (var i = 0; i < dragPts.length; i++) {
+        nx.push(dragPts[i][0] / W);
+        ny.push(dragPts[i][1] / H);
+      }
+      dragShapes.push({ nx: nx, ny: ny, col: NEON[nextDragCol % 3], born: lastT });
+      nextDragCol++;
+      if (constellation.length + dragShapes.length > 40) {
+        if (dragShapes.length > 1) dragShapes.shift();
+        else constellation.shift();
+      }
+    }
+    dragging = false; dragPts = []; pointer = null;
+    draw(lastT);
+  }
+  canvas.addEventListener('pointerup', endDrag);
+  canvas.addEventListener('pointercancel', endDrag);
+
+  function strokeShape(pts, col, alpha, lw) {
+    if (pts.length < 2) return;
+    ctx.strokeStyle = rgba(col[0], col[1], col[2], alpha);
+    ctx.lineWidth = lw;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.beginPath();
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    for (var i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+    ctx.stroke();
+  }
+  function drawShapeGlow(pts, col, alpha) {
+    // Flat-alpha halo pass + core pass; never gradients, never canvas-fade.
+    strokeShape(pts, col, alpha * 0.16, Math.max(2, 0.014 * S));
+    strokeShape(pts, col, alpha, Math.max(1.5, 0.004 * S));
+  }
+
+  function drawHand(x, y, ang, s) {
+    // Parametric silhouette: palm ellipse + 4 fingers + thumb, filled in
+    // silhouette ink with a faint rim so the hand reads on near-black.
+    // Dots/arcs: every arc gets its own beginPath + moveTo (node-canvas quirk).
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(ang + Math.PI / 2);
+    var palmW = 0.055 * s, palmH = 0.075 * s;
+    ctx.fillStyle = '#1a1a18';
+    ctx.beginPath();
+    ctx.moveTo(0, -palmH);
+    ctx.ellipse(0, 0, palmW, palmH, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, -palmH);
+    ctx.ellipse(0, 0, palmW, palmH, 0, 0, Math.PI * 2);
+    ctx.stroke();
+    var fingerL = [0.075, 0.085, 0.080, 0.060];
+    for (var i = 0; i < 4; i++) {
+      var fx = -palmW * 0.7 + i * (palmW * 1.4 / 3);
+      var wob = Math.sin(lastT * 1.7 + i * 1.3) * 0.004 * s;
+      ctx.fillRect(fx - 0.008 * s, -palmH - fingerL[i] * s + wob, 0.016 * s, fingerL[i] * s);
+    }
+    ctx.save();
+    ctx.rotate(0.7);
+    ctx.fillRect(-palmW - 0.012 * s, -0.01 * s, 0.016 * s, 0.055 * s);
+    ctx.restore();
+    ctx.restore();
+  }
+
+  var lastT = 0;
+  function draw(t) {
+    lastT = t;
+    if (!W || !H) return;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.fillStyle = '#0d0f14';
+    ctx.fillRect(0, 0, W, H);
+
+    // Move completed shapes into the constellation.
+    var curIdx = Math.floor(t / 8);
+    while (pushedThrough < curIdx) {
+      constellation.push({ sh: makeShape(pushedThrough), born: (pushedThrough + 1) * 8, drag: false });
+      pushedThrough++;
+    }
+
+    // Constellation: fade to a floor, never fully clear, only thin.
+    for (var i = 0; i < constellation.length; i++) {
+      var c = constellation[i];
+      var age = t - c.born;
+      var al = 0.06 + 0.94 * Math.exp(-age / 10);
+      drawShapeGlow(shapePoints(c.sh), c.sh.col, al);
+    }
+    for (var j = 0; j < dragShapes.length; j++) {
+      var d = dragShapes[j];
+      var pts = [];
+      for (var k = 0; k < d.nx.length; k++) pts.push([d.nx[k] * W, d.ny[k] * H]);
+      var al2 = 0.06 + 0.94 * Math.exp(-(t - d.born) / 10);
+      drawShapeGlow(pts, d.col, al2);
+    }
+
+    // Current shape, drawn progressively by the hands.
+    var u = (t % 8) / 8;
+    var cur = makeShape(curIdx);
+    var curPts = shapePoints(cur);
+    var shown = Math.max(2, Math.floor(u * (curPts.length - 1)) + 1);
+    var prog = curPts.slice(0, shown);
+    if (dragging && dragPts.length >= 2) {
+      drawShapeGlow(dragPts, NEON[nextDragCol % 3], 1);
+    } else {
+      drawShapeGlow(prog, cur.col, 1);
+    }
+
+    // Hands: drawing hand on the live point, second hand trailing the path.
+    var tip, tang, tip2, tang2;
+    if (dragging && pointer) {
+      tip = pointer; tang = 0;
+      tip2 = [pointer[0] - 0.09 * S, pointer[1] + 0.05 * S]; tang2 = 0.3;
+    } else {
+      tip = pointOn(curPts, u); tang = tangentOn(curPts, u);
+      var u2 = Math.max(0, u - 0.15);
+      tip2 = pointOn(curPts, u2); tang2 = tangentOn(curPts, u2);
+      tip2 = [tip2[0] - 0.10 * S, tip2[1] + 0.06 * S];
+    }
+    drawHand(tip2[0], tip2[1], tang2, S);
+    drawHand(tip[0], tip[1], tang, S);
+  }
+
+  resize();
+  draw(0);
+  var startTime = null;
+  function loop(ts) {
+    if (startTime === null) startTime = ts;
+    var t = (ts - startTime) / 1000;
+    draw(t);
+    if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(loop);
+  }
+  if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

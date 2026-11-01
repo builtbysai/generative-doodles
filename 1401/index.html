@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Room Tone</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #e8e2d4; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  // ---------- seeded PRNG (mulberry32) ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  var SEED = 1401000;
+  var rng = mulberry32(SEED);
+
+  // ---------- palette ----------
+  var WALL = [232, 226, 212];
+  var FLOOR = [211, 203, 182];
+  var HVAC = [154, 154, 146];
+  var HVAC_DARK = [122, 122, 114];
+  var DUST = [212, 162, 78];
+  var TEAL = [46, 143, 134];
+  var UMBER = [74, 56, 38];
+
+  function a4(x) { return Math.round(x * 10000) / 10000; }
+  function rgba(rgb, a) { return 'rgba(' + rgb[0] + ',' + rgb[1] + ',' + rgb[2] + ',' + a4(a) + ')'; }
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0;
+  var phone = false;
+
+  function viewportSize() {
+    var vv = (typeof window !== 'undefined' && window.visualViewport) ? window.visualViewport : null;
+    if (vv && vv.width && vv.height) return { w: vv.width, h: vv.height };
+    return { w: window.innerWidth, h: window.innerHeight };
+  }
+  function sizeCanvas() {
+    var s = viewportSize();
+    W = s.w; H = s.h;
+    canvas.width = Math.round(W); canvas.height = Math.round(H);
+    var minDim = Math.min(window.screen.width, window.screen.height);
+    phone = minDim < 700 || (H > W * 1.15 && minDim < 900);
+  }
+  sizeCanvas();
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', sizeCanvas);
+    }
+    window.addEventListener('resize', sizeCanvas);
+  }
+
+  // ---------- seeded scene data ----------
+  var MOTES = [];
+  for (var i = 0; i < 64; i++) {
+    MOTES.push({
+      x: rng(), y: rng(),
+      s: 2 + rng() * 3,
+      ph: rng() * Math.PI * 2,
+      sp: 0.05 + rng() * 0.12,
+      tw: 0.3 + rng() * 0.7
+    });
+  }
+  // Vibration event schedule: long still stretches, then a wave.
+  // Event k starts at T_k = 9 + k*17 + jitter_k (seeded), each lasting ~9 s.
+  var EVENTS = [];
+  for (var k = 0; k < 40; k++) {
+    EVENTS.push({ t0: 9 + k * 17 + rng() * 6, amp: 0.7 + rng() * 0.5 });
+  }
+  // Lateral passing waves (a door elsewhere, a plane passing, a breath).
+  var SWEEPS = [];
+  for (var j = 0; j < 20; j++) {
+    SWEEPS.push({ t0: 26 + j * 37 + rng() * 10, dir: (j % 2 === 0) ? 1 : -1 });
+  }
+
+  // ---------- interaction: drag presses record ----------
+  var record = { active: false, lastEnd: -1e9, drags: [] };
+  var audioCtx = null, audioOn = false;
+  function ensureAudio() {
+    if (audioOn) return;
+    if (typeof AudioContext === 'undefined' && typeof webkitAudioContext === 'undefined') return;
+    try {
+      var AC = (typeof AudioContext !== 'undefined') ? AudioContext : webkitAudioContext;
+      audioCtx = new AC();
+      var osc = audioCtx.createOscillator();
+      osc.type = 'sine'; osc.frequency.value = 55;
+      var g = audioCtx.createGain(); g.gain.value = 0.0;
+      osc.connect(g); g.connect(audioCtx.destination);
+      osc.start();
+      g.gain.linearRampToValueAtTime(0.015, audioCtx.currentTime + 1.5);
+      audioOn = true;
+    } catch (e) { /* silent without audio */ }
+  }
+  function onDown(e) {
+    record.active = true;
+    record.drags.push({ t: now, x: e.clientX || 0, y: e.clientY || 0 });
+    ensureAudio();
+  }
+  function onMove(e) {
+    if (record.active) record.drags.push({ t: now, x: e.clientX || 0, y: e.clientY || 0 });
+  }
+  function onUp() {
+    if (record.active) { record.active = false; record.lastEnd = now; }
+  }
+  canvas.addEventListener('pointerdown', onDown);
+  canvas.addEventListener('pointermove', onMove);
+  canvas.addEventListener('pointerup', onUp);
+  canvas.addEventListener('pointercancel', onUp);
+
+  // ---------- time ----------
+  var now = 0;         // piece time in seconds (closed-form clock)
+  var t0 = null;       // rAF anchor
+  var booted = false;
+
+  function recordBoost(t) {
+    // 1 while recording, decaying over 4 s after release.
+    if (record.active) return 1;
+    var age = t - record.lastEnd;
+    if (age < 0 || age > 4) return 0;
+    return Math.exp(-age / 1.6);
+  }
+
+  function draw(t) {
+    now = t;
+    var w = W, h = H;
+    if (!w || !h) return;
+    canvas.style.width = w + 'px';
+    canvas.style.height = h + 'px';
+
+    // Room: back wall full frame, floor band, baseboard.
+    ctx.fillStyle = rgba(WALL, 1);
+    ctx.fillRect(0, 0, w, h);
+    var floorY = Math.round(h * 0.72);
+    ctx.fillStyle = rgba(FLOOR, 1);
+    ctx.fillRect(0, floorY, w, h - floorY);
+    ctx.fillStyle = rgba(UMBER, 0.55);
+    ctx.fillRect(0, floorY, w, 2);
+
+    var cx = w / 2, cy = h * 0.46;
+    var bw = Math.min(w * 0.30, 340, h * 0.42), bh = bw * 0.88;
+    var bx = cx - bw / 2, by = cy - bh / 2;
+
+    // Central boxy structure (covered HVAC unit) with offset shadow.
+    ctx.fillStyle = rgba(UMBER, 0.18);
+    ctx.fillRect(bx + 10, by + 12, bw, bh);
+    ctx.fillStyle = rgba(HVAC, 1);
+    ctx.fillRect(bx, by, bw, bh);
+    ctx.fillStyle = rgba(HVAC_DARK, 1);
+    ctx.fillRect(bx, by, bw, 3);
+    ctx.fillRect(bx, by, 3, bh);
+    // Vent grille slats.
+    var slats = 6;
+    for (var s = 0; s < slats; s++) {
+      var sy = by + bh * 0.22 + s * (bh * 0.09);
+      ctx.fillStyle = rgba(HVAC_DARK, 0.9);
+      ctx.fillRect(bx + bw * 0.12, sy, bw * 0.76, Math.max(2, bh * 0.02));
+    }
+    // Small panel seam.
+    ctx.fillStyle = rgba(HVAC_DARK, 0.5);
+    ctx.fillRect(bx + bw * 0.5, by + bh * 0.12, 1, bh * 0.76);
+
+    var boost = recordBoost(t);
+    var maxR = Math.min(w, h) * 0.46;
+
+    // Vibration rings radiating from the structure, fading before the walls.
+    for (var e = 0; e < EVENTS.length; e++) {
+      var ev = EVENTS[e];
+      var age = t - ev.t0;
+      if (age < 0 || age > 9) continue;
+      var r = age * maxR / 9;
+      var a = 0.34 * ev.amp * Math.exp(-age / 3.2);
+      if (a < 0.004) continue;
+      ctx.strokeStyle = rgba(TEAL, a);
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(cx + r, cy);
+      ctx.arc(cx, cy, r, 0, Math.PI * 2);
+      ctx.stroke();
+      // Second, trailing ring.
+      var r2 = r * 0.82;
+      ctx.strokeStyle = rgba(TEAL, a * 0.5);
+      ctx.beginPath();
+      ctx.moveTo(cx + r2, cy);
+      ctx.arc(cx, cy, r2, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+
+    // Record replay: the last few seconds of vibration replay as visible ripples.
+    if (boost > 0.01) {
+      for (var e2 = 0; e2 < EVENTS.length; e2++) {
+        var ev2 = EVENTS[e2];
+        var age2 = t - ev2.t0;
+        if (age2 < 0 || age2 > 6) continue;
+        var rr = age2 * maxR / 9;
+        var aa = 0.30 * boost * Math.exp(-age2 / 3.2);
+        if (aa < 0.004) continue;
+        ctx.strokeStyle = rgba(TEAL, aa);
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.moveTo(cx + rr, cy);
+        ctx.arc(cx, cy, rr, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    }
+
+    // Lateral passing waves: a soft band sweeping across the room.
+    for (var j2 = 0; j2 < SWEEPS.length; j2++) {
+      var sw = SWEEPS[j2];
+      var sa = t - sw.t0;
+      if (sa < 0 || sa > 7) continue;
+      var px = (sw.dir === 1) ? (-0.1 + sa / 7 * 1.2) * w : (1.1 - sa / 7 * 1.2) * w;
+      var env = Math.sin(Math.PI * Math.min(1, sa / 7));
+      ctx.fillStyle = rgba(TEAL, 0.05 * env);
+      ctx.fillRect(px - w * 0.06, 0, w * 0.12, h);
+    }
+
+    // Dust motes drifting slowly; brighten while recording.
+    var dustA = 0.35 + 0.45 * boost;
+    for (var m = 0; m < MOTES.length; m++) {
+      var mo = MOTES[m];
+      var mx = (mo.x * w + Math.sin(t * mo.sp + mo.ph) * 14) % w;
+      if (mx < 0) mx += w;
+      var my = (mo.y * h + Math.cos(t * mo.sp * 0.8 + mo.ph) * 10) % h;
+      if (my < 0) my += h;
+      var tw = 0.5 + 0.5 * Math.sin(t * mo.tw + mo.ph);
+      ctx.fillStyle = rgba(DUST, dustA * (0.4 + 0.6 * tw));
+      ctx.fillRect(mx, my, mo.s, mo.s);
+    }
+  }
+
+  // First frame at a constant phase, clock starts with the rAF loop.
+  draw(0);
+  booted = true;
+
+  function loop(ts) {
+    if (t0 === null) t0 = ts;
+    var t = (ts - t0) / 1000;
+    draw(t);
+    if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(loop);
+  }
+  if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Quasi-Closed Captions</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #e4dfd2; overflow: hidden; height: 100%; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // Seeded PRNG (mulberry32). Never Math.random.
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(1400000);
+
+  // Round fading alphas to 4 decimals before stringifying (node-canvas quirk:
+  // scientific-notation alphas like 2.5e-15 parse as opaque).
+  function a4(x) {
+    if (x < 0) x = 0; if (x > 1) x = 1;
+    return Math.round(x * 10000) / 10000;
+  }
+  function rgba(r, g, b, a) {
+    return 'rgba(' + r + ',' + g + ',' + b + ',' + a4(a) + ')';
+  }
+
+  var PLYWOOD = '#b08a5e', STEEL = '#8a8f94', TEAL = '#2e8f86',
+      MAGENTA = '#c23b6e', SHADOW = '#4a4a44', PAPER = '#e4dfd2';
+  var KALEIDO = ['#2e8f86', '#c23b6e', '#e4dfd2', '#4a4a44', '#b08a5e', '#2e8f86'];
+
+  // ---- Viewport (Visual Viewport API, pinned canvas) ----
+  var W = 0, H = 0;
+  function size() {
+    var vv = (typeof window !== 'undefined') ? window.visualViewport : null;
+    if (vv && vv.width && vv.height) { W = vv.width; H = vv.height; }
+    else { W = window.innerWidth; H = window.innerHeight; }
+    canvas.width = W; canvas.height = H;
+    canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+  }
+  size();
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', size);
+    }
+    if (window.addEventListener) window.addEventListener('resize', size);
+  }
+  // Phone detection: physical screen size, aspect fallback only.
+  var isPhone = false;
+  if (typeof window !== 'undefined' && window.screen) {
+    var minDim = Math.min(window.screen.width, window.screen.height);
+    isPhone = minDim < 700;
+    if (!isPhone && H > W * 1.15) isPhone = true;
+  }
+
+  // ---- Hanging frames (seeded layout, varied depths) ----
+  var frames = [];
+  var anchorFracs = [0.10, 0.30, 0.52, 0.72, 0.89];
+  var chainFracs = [0.16, 0.28, 0.20, 0.34, 0.24];
+  var sizeFracs = [0.155, 0.125, 0.175, 0.115, 0.14];
+  for (var i = 0; i < 5; i++) {
+    frames.push({
+      anchorX: anchorFracs[i],
+      chainLen: chainFracs[i],
+      wFrac: sizeFracs[i],
+      hFrac: 0, // replaced below: height derives from width, see frameH()
+      period: 5.5 + rng() * 3.5,
+      phase: rng() * Math.PI * 2,
+      amp: 0.05 + rng() * 0.05,
+      rot: (0.05 + rng() * 0.08) * (rng() < 0.5 ? 1 : -1),
+      wedgeOff: Math.floor(rng() * 6),
+      grain: rng() * Math.PI * 2,
+      impulses: [],
+      dragX: 0,
+      dragging: false
+    });
+  }
+
+  // ---- Drooping necklace chains (wind chimes that never chime) ----
+  var necklaces = [];
+  for (var n = 0; n < 2; n++) {
+    var nx = 0.18 + n * 0.52 + rng() * 0.08;
+    necklaces.push({
+      x0: nx, x1: nx + 0.14 + rng() * 0.05,
+      sag: 0.10 + rng() * 0.05,
+      period: 6 + rng() * 4,
+      phase: rng() * Math.PI * 2,
+      beads: 5 + Math.floor(rng() * 3)
+    });
+  }
+
+  // ---- Floating hoops (quiet portals) ----
+  var hoops = [];
+  for (var h = 0; h < 2; h++) {
+    hoops.push({
+      x: 0.22 + h * 0.48 + rng() * 0.06,
+      y: 0.52 + rng() * 0.12,
+      r: 0.055 + rng() * 0.02,
+      period: 9 + rng() * 5,
+      phase: rng() * Math.PI * 2,
+      drift: 0.03 + rng() * 0.02
+    });
+  }
+
+  // Frame height derives from width (fixed 1.1 aspect) so portrait phones
+  // keep desktop proportions instead of stretching tall.
+  function frameH(f) { return f.wFrac * W * 1.1; }
+
+  // ---- Frame pose: closed-form pendulum + decaying drag impulses ----
+  function framePose(f, t) {
+    var ang = f.amp * Math.sin(2 * Math.PI * t / f.period + f.phase);
+    for (var k = 0; k < f.impulses.length; k++) {
+      var im = f.impulses[k];
+      var dt = t - im.t0;
+      if (dt >= 0) {
+        ang += im.amp * Math.exp(-dt / 2.5) * Math.sin(2 * Math.PI * dt / f.period);
+      }
+    }
+    if (f.dragging) ang += f.dragX;
+    var chainPx = f.chainLen * H;
+    var cx = f.anchorX * W + Math.sin(ang) * chainPx;
+    var cy = chainPx * Math.cos(ang) + frameH(f) / 2;
+    return { cx: cx, cy: cy, ang: ang, chainPx: chainPx };
+  }
+
+  function drawChain(x0, y0, x1, y1, links) {
+    // Small link rects along a gently sagging curve (dots as rects).
+    for (var s = 0; s <= links; s++) {
+      var u = s / links;
+      var lx = x0 + (x1 - x0) * u + Math.sin(Math.PI * u) * 3;
+      var ly = y0 + (y1 - y0) * u;
+      ctx.fillStyle = STEEL;
+      ctx.fillRect(lx - 2, ly - 2, 4, 4);
+    }
+  }
+
+  function drawFrame(f, pose) {
+    var fw = f.wFrac * W, fh = frameH(f);
+    var x = pose.cx - fw / 2, y = pose.cy - fh / 2;
+    // Plywood border with grain ticks.
+    ctx.fillStyle = PLYWOOD;
+    ctx.fillRect(x, y, fw, fh);
+    ctx.fillStyle = rgba(74, 56, 38, 0.25);
+    for (var g = 0; g < 4; g++) {
+      var gy = y + fh * (0.15 + 0.22 * g) + Math.sin(f.grain + g) * 2;
+      ctx.fillRect(x + 3, gy, fw - 6, 1);
+    }
+    // Kaleidoscope window: seeded rotating flat color fields.
+    var inset = Math.min(fw, fh) * 0.14;
+    var wx = x + inset, wy = y + inset, ww = fw - inset * 2, wh = fh - inset * 2;
+    var ccx = wx + ww / 2, ccy = wy + wh / 2;
+    var rad = Math.sqrt(ww * ww + wh * wh) / 2;
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(wx, wy, ww, wh);
+    ctx.clip();
+    var wedges = 8;
+    var rotA = pose.ang * 0.3 + f.rot * (lastT);
+    for (var wI = 0; wI < wedges; wI++) {
+      var a0 = rotA + wI * (Math.PI * 2 / wedges);
+      var a1 = rotA + (wI + 1) * (Math.PI * 2 / wedges);
+      ctx.fillStyle = KALEIDO[(f.wedgeOff + wI) % KALEIDO.length];
+      ctx.beginPath();
+      ctx.moveTo(ccx, ccy);
+      ctx.lineTo(ccx + Math.cos(a0) * rad, ccy + Math.sin(a0) * rad);
+      ctx.lineTo(ccx + Math.cos(a1) * rad, ccy + Math.sin(a1) * rad);
+      ctx.closePath();
+      ctx.fill();
+    }
+    // Inner ring echo.
+    ctx.fillStyle = rgba(228, 223, 210, 0.35);
+    ctx.beginPath();
+    ctx.arc(ccx, ccy, rad * 0.28, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+    // Inner border line.
+    ctx.strokeStyle = rgba(74, 56, 38, 0.5);
+    ctx.lineWidth = 1;
+    ctx.strokeRect(wx, wy, ww, wh);
+  }
+
+  var lastT = 0;
+
+  function draw(t) {
+    lastT = t;
+    ctx.fillStyle = PAPER;
+    ctx.fillRect(0, 0, W, H);
+
+    // ---- Shadows first: long flat-alpha projections, fixed light angle ----
+    for (var i = 0; i < frames.length; i++) {
+      var f = frames[i];
+      var p = framePose(f, t);
+      var fw = f.wFrac * W, fh = frameH(f);
+      var dx = fh * 0.55, dy = fh * 0.75;
+      ctx.fillStyle = rgba(74, 74, 68, 0.16);
+      ctx.fillRect(p.cx - fw / 2 + dx, p.cy - fh / 2 + dy, fw, fh);
+    }
+    for (var hi = 0; hi < hoops.length; hi++) {
+      var hp = hoops[hi];
+      var hx = (hp.x + Math.sin(2 * Math.PI * t / hp.period + hp.phase) * hp.drift) * W;
+      var hy = hp.y * H + Math.sin(2 * Math.PI * t / (hp.period * 1.3) + hp.phase) * H * 0.02;
+      ctx.fillStyle = rgba(74, 74, 68, 0.12);
+      ctx.beginPath();
+      ctx.arc(hx + hp.r * W * 0.5, hy + hp.r * W * 0.7, hp.r * W, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // ---- Necklace chains with spider-web shadows ----
+    for (var ni = 0; ni < necklaces.length; ni++) {
+      var nc = necklaces[ni];
+      var sway = Math.sin(2 * Math.PI * t / nc.period + nc.phase) * W * 0.008;
+      var topY = H * 0.02;
+      var midX = (nc.x0 + nc.x1) / 2 * W + sway;
+      var midY = topY + nc.sag * H;
+      // Shadow curve, offset down-right.
+      ctx.strokeStyle = rgba(74, 74, 68, 0.12);
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(nc.x0 * W + 14, topY + 18);
+      ctx.quadraticCurveTo(midX + 14, midY + 18, nc.x1 * W + 14, topY + 18);
+      ctx.stroke();
+      // Chain links along the droop.
+      for (var b = 0; b <= 24; b++) {
+        var u = b / 24;
+        var qx = (1 - u) * (1 - u) * nc.x0 * W + 2 * (1 - u) * u * midX + u * u * nc.x1 * W;
+        var qy = (1 - u) * (1 - u) * topY + 2 * (1 - u) * u * midY + u * u * topY;
+        ctx.fillStyle = STEEL;
+        ctx.fillRect(qx - 2, qy - 2, 4, 4);
+      }
+      // Beads hanging from the droop.
+      for (var bd = 0; bd < nc.beads; bd++) {
+        var bu = (bd + 0.5) / nc.beads;
+        var bx = (1 - bu) * (1 - bu) * nc.x0 * W + 2 * (1 - bu) * bu * midX + bu * bu * nc.x1 * W;
+        var by = (1 - bu) * (1 - bu) * topY + 2 * (1 - bu) * bu * midY + bu * bu * topY;
+        ctx.fillStyle = (bd % 2 === 0) ? TEAL : MAGENTA;
+        ctx.fillRect(bx - 3, by + 6, 6, 6);
+      }
+    }
+
+    // ---- Frames on their chains ----
+    for (var fi = 0; fi < frames.length; fi++) {
+      var fr = frames[fi];
+      var pose = framePose(fr, t);
+      var topX = pose.cx, topY = pose.cy - frameH(fr) / 2;
+      drawChain(fr.anchorX * W, 0, topX, topY, 16);
+      drawFrame(fr, pose);
+    }
+
+    // ---- Floating hoops ----
+    for (var hj = 0; hj < hoops.length; hj++) {
+      var ho = hoops[hj];
+      var ox = (ho.x + Math.sin(2 * Math.PI * t / ho.period + ho.phase) * ho.drift) * W;
+      var oy = ho.y * H + Math.sin(2 * Math.PI * t / (ho.period * 1.3) + ho.phase) * H * 0.02;
+      var orad = ho.r * W;
+      ctx.strokeStyle = STEEL;
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(ox, oy, orad, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.fillStyle = rgba(46, 143, 134, 0.18);
+      ctx.beginPath();
+      ctx.arc(ox, oy, orad * 0.7, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  // ---- Interaction: drag a frame to set it swinging ----
+  var dragFrame = null, dragStartX = 0, dragStartY = 0, dragMoved = 0;
+  function hitFrame(px, py) {
+    for (var i = 0; i < frames.length; i++) {
+      var p = framePose(frames[i], lastT);
+      var fw = frames[i].wFrac * W, fh = frameH(frames[i]);
+      if (Math.abs(px - p.cx) <= fw / 2 + 12 && Math.abs(py - p.cy) <= fh / 2 + 12) return frames[i];
+    }
+    return null;
+  }
+  function onDown(e) {
+    var px = e.clientX, py = e.clientY;
+    if (typeof px !== 'number') return;
+    var f = hitFrame(px, py);
+    if (f) {
+      dragFrame = f; dragStartX = px; dragStartY = py; dragMoved = 0;
+      f.dragging = true; f.dragX = 0;
+    }
+  }
+  function onMove(e) {
+    if (!dragFrame) return;
+    var px = e.clientX;
+    if (typeof px !== 'number') return;
+    var dx = px - dragStartX;
+    dragMoved = Math.max(dragMoved, Math.abs(dx));
+    // Drag displacement becomes a pendulum angle while held.
+    dragFrame.dragX = dx / (dragFrame.chainLen * H);
+    if (dragFrame.dragX > 0.6) dragFrame.dragX = 0.6;
+    if (dragFrame.dragX < -0.6) dragFrame.dragX = -0.6;
+  }
+  function onUp(e) {
+    if (!dragFrame) return;
+    var f = dragFrame;
+    f.dragging = false;
+    // Release: the held angle becomes a decaying swing impulse.
+    f.impulses.push({ t0: lastT, amp: f.dragX });
+    if (f.impulses.length > 8) f.impulses.shift();
+    f.dragX = 0;
+    dragFrame = null;
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+  }
+
+  // ---- Boot: frame one is draw(0); clock starts only with the rAF loop ----
+  draw(0);
+  var startTime = 0, started = false;
+  function loop(ts) {
+    if (!started) { started = true; startTime = ts; }
+    var t = (ts - startTime) / 1000;
+    draw(t);
+    if (typeof requestAnimationFrame !== 'undefined') {
+      requestAnimationFrame(loop);
+    }
+  }
+  if (typeof requestAnimationFrame !== 'undefined') {
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>

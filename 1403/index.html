@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Skater's Score</title>
+<style>
+html,body{margin:0;padding:0;overflow:hidden;background:#c8c4b8;}
+canvas{display:block;}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function(){
+'use strict';
+// ---------- seeded PRNG (mulberry32), pure per query, never Math.random ----------
+function mulberry32(a){
+  return function(){
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    var t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+function seededVal(seed){
+  return mulberry32(seed)();
+}
+// Round fading alphas to 4 decimals before stringifying (node-canvas quirk:
+// scientific-notation alphas like 2.5e-15 parse as fully opaque).
+function a4(x){
+  if (x <= 0) return 0;
+  if (x >= 1) return 1;
+  return Math.round(x * 10000) / 10000;
+}
+function rgba(hex, alpha){
+  var r = parseInt(hex.slice(1, 3), 16);
+  var g = parseInt(hex.slice(3, 5), 16);
+  var b = parseInt(hex.slice(5, 7), 16);
+  return 'rgba(' + r + ',' + g + ',' + b + ',' + a4(alpha) + ')';
+}
+
+// ---------- palette ----------
+var COL = {
+  concrete: '#9a9a92', concreteDark: '#7a7a72', board: '#b08a5e',
+  gold: '#f5c542', ink: '#1a1a18', sky: '#c8c4b8', fall: '#b01e24',
+  skin: '#c89a72', rail: '#5a5a52'
+};
+
+// ---------- canvas / viewport ----------
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var W = 0, H = 0;
+function size(){
+  var vv = (typeof window !== 'undefined' && window.visualViewport) ? window.visualViewport : null;
+  var w = vv ? vv.width : window.innerWidth;
+  var h = vv ? vv.height : window.innerHeight;
+  W = w; H = h;
+  canvas.width = w; canvas.height = h;
+  canvas.style.width = w + 'px'; canvas.style.height = h + 'px';
+}
+size();
+if (typeof window !== 'undefined' && window.addEventListener) {
+  window.addEventListener('resize', function(){ size(); });
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function(){ size(); });
+  }
+}
+function isPhone(){
+  if (typeof window !== 'undefined' && window.screen) {
+    var m = Math.min(window.screen.width, window.screen.height);
+    if (m < 700) return true;
+  }
+  return H > W * 1.15;
+}
+
+// ---------- layout (functions of W, H) ----------
+function layout(){
+  var skyH = H * 0.33;
+  var groundY = H * 0.86;
+  var railX0 = W * 0.55, railX1 = W * 0.78;
+  var railY = groundY - H * 0.13;
+  var staffTop = H * 0.055, staffGap = H * 0.042;
+  return { skyH: skyH, groundY: groundY, railX0: railX0, railX1: railX1,
+    railY: railY, staffTop: staffTop, staffGap: staffGap,
+    entryX: W * 0.08, scroll: W * 0.022 };
+}
+function groundProfile(x, L){
+  // Two smooth concrete mounds (ramps) rising off the flat ground line.
+  var g = L.groundY;
+  var bumps = [
+    { c: W * 0.20, w: W * 0.11, h: H * 0.085 },
+    { c: W * 0.88, w: W * 0.09, h: H * 0.06 }
+  ];
+  for (var i = 0; i < bumps.length; i++) {
+    var b = bumps[i];
+    var d = (x - b.c) / b.w;
+    if (d > -1 && d < 1) {
+      var p = 0.5 + 0.5 * Math.cos(Math.PI * d);
+      g -= b.h * p;
+    }
+  }
+  return g;
+}
+
+// ---------- skaters: closed-form schedules ----------
+var CYCLE = 18;
+var SPAN = 0; // set per frame from W
+var SKATERS = [
+  { x0: 0.02, vFrac: 0.055, board: COL.board, body: COL.ink },
+  { x0: 0.55, vFrac: 0.047, board: COL.gold, body: COL.ink }
+];
+// Recorded events (drag re-routes, taps) — state, never frame-integrated motion.
+var routeEvents = []; // {t, skater, count}
+var dragState = null; // {skater, startX, startY, lastX, lastY, moved}
+var replay = null; // {type, t0}
+var audioCtx = null;
+var lastAudioT = 0;
+
+function routeCountAt(skater, t){
+  var n = 0;
+  for (var i = 0; i < routeEvents.length; i++) {
+    if (routeEvents[i].skater === skater && routeEvents[i].t <= t) n++;
+  }
+  return n;
+}
+function offsetAt(skater, t){
+  // Lateral re-route offset recorded on drag release; 0 before any drag.
+  var off = 0;
+  for (var i = 0; i < routeEvents.length; i++) {
+    if (routeEvents[i].skater === skater && routeEvents[i].t <= t) off = routeEvents[i].off;
+  }
+  return off;
+}
+function baseX(skater, t, L){
+  var span = W + 240;
+  var v = span * SKATERS[skater].vFrac;
+  var x = SKATERS[skater].x0 * W + offsetAt(skater, t) + v * t;
+  x = ((x % span) + span) % span;
+  return x - 120;
+}
+function trickType(skater, cycle, slot, routeCount){
+  // slot 0 = ollie slot, slot 1 = seeded slot, slot 2 = grind/ollie slot.
+  var seed = 1403000 + skater * 7919 + cycle * 104729 + slot * 31 + routeCount * 9176;
+  var r = seededVal(seed);
+  if (slot === 0) return 'ollie';
+  if (slot === 1) return r < 0.62 ? 'ollie' : 'fall';
+  return 'ollie';
+}
+// Events for one skater in one cycle. Returns array of {kind, land, tCenter, win0, win1}.
+function cycleEvents(skater, cycle, L){
+  var start = cycle * CYCLE;
+  var rc = routeCountAt(skater, start);
+  var evs = [];
+  evs.push({ kind: 'ollie', land: start + 4, tC: start + 4, win0: start + 3.3, win1: start + 4 });
+  var t2 = trickType(skater, cycle, 1, rc);
+  evs.push({ kind: t2, land: start + 9, tC: start + 9, win0: start + 8.3, win1: start + 10.2 });
+  // Grind event: only if the skater's base path crosses the rail centre in-cycle.
+  var span = W + 240;
+  var v = span * SKATERS[skater].vFrac;
+  var off = offsetAt(skater, start);
+  var railC = (L.railX0 + L.railX1) / 2;
+  var target = railC + 120 - SKATERS[skater].x0 * W - off;
+  var k = Math.ceil((v * start - target) / span);
+  var tCross = (target + k * span) / v;
+  if (tCross >= start + 1 && tCross <= start + CYCLE - 1) {
+    evs.push({ kind: 'grind', land: tCross + 0.9, tC: tCross, win0: tCross - 0.9, win1: tCross + 0.9 });
+  } else {
+    evs.push({ kind: 'ollie', land: start + 13, tC: start + 13, win0: start + 12.3, win1: start + 13 });
+  }
+  return evs;
+}
+function eventsAround(skater, t, L){
+  var c = Math.floor(t / CYCLE);
+  var out = [];
+  for (var k = c - 1; k <= c + 1; k++) {
+    if (k < 0) continue;
+    var evs = cycleEvents(skater, k, L);
+    for (var i = 0; i < evs.length; i++) out.push(evs[i]);
+  }
+  return out;
+}
+// Staff notes visible at time t: closed-form over every landed event so far.
+function notesAt(t, L){
+  var notes = [];
+  var maxCycle = Math.floor(t / CYCLE);
+  for (var s = 0; s < SKATERS.length; s++) {
+    for (var c = 0; c <= maxCycle; c++) {
+      var evs = cycleEvents(s, c, L);
+      for (var i = 0; i < evs.length; i++) {
+        var ev = evs[i];
+        if (ev.land > t) continue;
+        var x = L.entryX + (t - ev.land) * L.scroll;
+        if (x > W * 0.97) continue;
+        var laneSeed = 1403000 + s * 7919 + c * 104729 + i * 31 + routeCountAt(s, c * CYCLE) * 9176;
+        var lane = Math.floor(seededVal(laneSeed + 7) * 5);
+        notes.push({ kind: ev.kind, x: x, lane: lane, land: ev.land });
+      }
+    }
+  }
+  return notes;
+}
+
+// ---------- drawing helpers ----------
+function line(x0, y0, x1, y1, color, w){
+  ctx.strokeStyle = color;
+  ctx.lineWidth = w;
+  ctx.beginPath();
+  ctx.moveTo(x0, y0);
+  ctx.lineTo(x1, y1);
+  ctx.stroke();
+}
+function rect(x, y, w, h, color){
+  ctx.fillStyle = color;
+  ctx.fillRect(x, y, w, h);
+}
+function dot(x, y, r, color){
+  // Dots as filled rects (node-canvas quirk: batched arcs connect).
+  rect(x - r, y - r, r * 2, r * 2, color);
+}
+function circle(x, y, r, color){
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arc(x, y, r, 0, Math.PI * 2);
+  ctx.fill();
+}
+function smooth(a, b, x){
+  if (x <= a) return 0;
+  if (x >= b) return 1;
+  var p = (x - a) / (b - a);
+  return p * p * (3 - 2 * p);
+}
+
+// Draw a parametric skater figure. Origin at board centre, facing right.
+// tilt: board/figure rotation in radians; yOff: airborne height (negative = up).
+function drawSkater(x, y, s, tilt, body, board, ghost){
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(tilt);
+  var ink = ghost ? COL.gold : body;
+  var deck = ghost ? COL.gold : board;
+  // board
+  rect(-s * 1.9, -s * 0.28, s * 3.8, s * 0.42, deck);
+  dot(-s * 1.2, s * 0.22, Math.max(1, s * 0.16), ink);
+  dot(s * 1.2, s * 0.22, Math.max(1, s * 0.16), ink);
+  // legs
+  line(-s * 0.25, -s * 1.6, -s * 1.0, -s * 0.2, ink, Math.max(1.5, s * 0.16));
+  line(-s * 0.25, -s * 1.6, s * 0.9, -s * 0.2, ink, Math.max(1.5, s * 0.16));
+  // torso
+  line(-s * 0.25, -s * 1.6, -s * 0.15, -s * 3.4, ink, Math.max(1.5, s * 0.18));
+  // arms
+  line(-s * 0.15, -s * 3.1, -s * 1.1, -s * 2.4, ink, Math.max(1.5, s * 0.14));
+  line(-s * 0.15, -s * 3.1, s * 1.0, -s * 2.7, ink, Math.max(1.5, s * 0.14));
+  // head
+  circle(s * 0.15, -s * 4.0, s * 0.55, ghost ? COL.gold : COL.skin);
+  ctx.restore();
+}
+
+// ---------- audio (lazy, gesture-gated only) ----------
+function ensureAudio(){
+  if (audioCtx) return;
+  if (typeof AudioContext !== 'undefined') {
+    try { audioCtx = new AudioContext(); } catch (e) { audioCtx = null; }
+  } else if (typeof webkitAudioContext !== 'undefined') {
+    try { audioCtx = new webkitAudioContext(); } catch (e) { audioCtx = null; }
+  }
+}
+function tick(kind){
+  if (!audioCtx) return;
+  try {
+    var o = audioCtx.createOscillator();
+    var g = audioCtx.createGain();
+    o.type = 'square';
+    o.frequency.value = kind === 'grind' ? 700 : (kind === 'fall' ? 180 : 1200);
+    g.gain.setValueAtTime(0.04, audioCtx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + (kind === 'grind' ? 0.25 : 0.06));
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start(); o.stop(audioCtx.currentTime + 0.3);
+  } catch (e) { /* silent */ }
+}
+
+// ---------- pointer interaction ----------
+function skaterAt(x, y, t, L){
+  for (var s = 0; s < SKATERS.length; s++) {
+    var pos = skaterPos(s, t, L);
+    if (Math.abs(x - pos.x) < Math.max(50, W * 0.06) && Math.abs(y - pos.y) < H * 0.12) return s;
+  }
+  return -1;
+}
+function onDown(e){
+  ensureAudio();
+  var x = e.clientX, y = e.clientY;
+  var s = skaterAt(x, y, nowT, layout());
+  dragState = { skater: s, startX: x, startY: y, lastX: x, lastY: y, moved: 0 };
+}
+function onMove(e){
+  if (!dragState) return;
+  dragState.moved += Math.abs(e.clientX - dragState.lastX) + Math.abs(e.clientY - dragState.lastY);
+  dragState.lastX = e.clientX; dragState.lastY = e.clientY;
+}
+function onUp(e){
+  if (!dragState) return;
+  var d = dragState;
+  dragState = null;
+  var L = layout();
+  if (d.skater >= 0 && d.moved > 40) {
+    // Re-route: skater resumes from the release x and the trick sequence re-seeds.
+    var span = W + 240;
+    var v = span * SKATERS[d.skater].vFrac;
+    var raw = d.lastX + 120 - SKATERS[d.skater].x0 * W - v * nowT;
+    var off = ((raw % span) + span) % span;
+    routeEvents.push({ t: nowT, skater: d.skater, count: routeCountAt(d.skater, nowT) + 1, off: off });
+  } else if (d.moved < 14) {
+    // Tap: hit a staff note to replay that trick in slow motion.
+    var notes = notesAt(nowT, L);
+    for (var i = 0; i < notes.length; i++) {
+      var ny = L.staffTop + notes[i].lane * L.staffGap;
+      if (Math.abs(d.lastX - notes[i].x) < 30 && Math.abs(d.lastY - ny) < 26) {
+        replay = { type: notes[i].kind, t0: nowT };
+        return;
+      }
+    }
+  }
+}
+if (canvas.addEventListener) {
+  canvas.addEventListener('pointerdown', onDown);
+  canvas.addEventListener('pointermove', onMove);
+  canvas.addEventListener('pointerup', onUp);
+}
+
+// ---------- skater position (closed-form over piece time + recorded drags) ----------
+function skaterPos(s, t, L){
+  var bx = baseX(s, t, L);
+  var gy = groundProfile(Math.max(0, Math.min(W, bx)), L);
+  var y = gy, x = bx, tilt = 0, airborne = 0;
+  // While a skater is being dragged, it follows the pointer (re-route in progress).
+  if (dragState && dragState.skater === s) {
+    var dx = Math.max(0, Math.min(W, dragState.lastX));
+    return { x: dx, y: groundProfile(dx, L), tilt: 0, baseX: bx, airborne: 0 };
+  }
+  var evs = eventsAround(s, t, L);
+  for (var i = 0; i < evs.length; i++) {
+    var ev = evs[i];
+    if (t < ev.win0 || t > ev.win1) continue;
+    if (ev.kind === 'ollie') {
+      var p = (t - ev.win0) / (ev.win1 - ev.win0);
+      var h = 4 * p * (1 - p);
+      y -= h * H * 0.07;
+      tilt = (p - 0.5) * 0.45;
+      airborne = h;
+    } else if (ev.kind === 'grind') {
+      var pg = (t - ev.win0) / (ev.win1 - ev.win0);
+      var w = smooth(0, 0.3, pg) * (1 - smooth(0.7, 1, pg));
+      var railLerp = L.railX0 + (L.railX1 - L.railX0) * pg;
+      x = bx * (1 - w) + railLerp * w;
+      y = gy * (1 - w) + L.railY * w;
+      tilt = 0;
+    } else if (ev.kind === 'fall') {
+      // Fall window: land at tC; tip ramps in [tC, tC+0.3], holds, recovers by tC+1.2.
+      var ft = t - ev.tC;
+      if (ft >= 0) {
+        var ang = 1.35 * smooth(0, 0.3, ft) * (1 - smooth(0.8, 1.2, ft));
+        tilt = ang;
+      }
+    }
+  }
+  return { x: x, y: y, tilt: tilt, baseX: bx, airborne: airborne };
+}
+
+// ---------- main draw (pure function of t) ----------
+var nowT = 0;
+function draw(t){
+  nowT = t;
+  var L = layout();
+  var s = Math.min(W / 1280, H / 900);
+  if (s <= 0) s = 1;
+  var u = Math.max(6, 13 * s + 4); // skater scale
+
+  // Sky wash + staff zone
+  rect(0, 0, W, L.skyH + H * 0.02, COL.sky);
+  // Park: concrete field
+  rect(0, L.skyH, W, H - L.skyH, COL.concrete);
+  // Ground shading bands (flat fills, never gradients)
+  rect(0, L.groundY + 2, W, H - L.groundY, COL.concreteDark);
+
+  // Staff: 5 lines across the sky
+  for (var li = 0; li < 5; li++) {
+    var ly = L.staffTop + li * L.staffGap;
+    line(0, ly, W, ly, COL.ink, Math.max(1, 1.4 * s));
+  }
+  // Staff notes: glyphs keyed to trick type, drifting rightward
+  var notes = notesAt(t, L);
+  for (var ni = 0; ni < notes.length; ni++) {
+    var n = notes[ni];
+    var ny = L.staffTop + n.lane * L.staffGap;
+    var col = n.kind === 'fall' ? COL.fall : COL.gold;
+    var dark = n.kind === 'fall' ? COL.fall : COL.ink;
+    if (n.kind === 'ollie') {
+      line(n.x, ny - 7 * s, n.x, ny + 7 * s, dark, Math.max(1.5, 2 * s));
+      dot(n.x, ny, Math.max(1.5, 2 * s), col);
+    } else if (n.kind === 'grind') {
+      line(n.x - 14 * s, ny, n.x + 14 * s, ny, dark, Math.max(1.5, 2 * s));
+      dot(n.x, ny, Math.max(1.5, 2 * s), col);
+    } else {
+      // fall splash: 8 radiating ticks
+      for (var k = 0; k < 8; k++) {
+        var ang = k * Math.PI / 4;
+        line(n.x, ny, n.x + Math.cos(ang) * 9 * s, ny + Math.sin(ang) * 9 * s, col, Math.max(1.5, 2 * s));
+      }
+      dot(n.x, ny, Math.max(1.5, 2.2 * s), col);
+    }
+  }
+
+  // Ramps (flat concrete mounds)
+  ctx.fillStyle = COL.concreteDark;
+  ctx.beginPath();
+  ctx.moveTo(W * 0.09, L.groundY);
+  ctx.lineTo(W * 0.20, L.groundY - H * 0.085);
+  ctx.lineTo(W * 0.31, L.groundY);
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle = COL.concreteDark;
+  ctx.beginPath();
+  ctx.moveTo(W * 0.79, L.groundY);
+  ctx.lineTo(W * 0.88, L.groundY - H * 0.06);
+  ctx.lineTo(W * 0.97, L.groundY);
+  ctx.closePath(); ctx.fill();
+
+  // Rail
+  line(L.railX0, L.railY, L.railX1, L.railY, COL.rail, Math.max(2, 3 * s));
+  line(L.railX0 + 6, L.railY, L.railX0 + 6, L.groundY, COL.rail, Math.max(2, 2.5 * s));
+  line(L.railX1 - 6, L.railY, L.railX1 - 6, L.groundY, COL.rail, Math.max(2, 2.5 * s));
+
+  // Dust motes: seeded dots keyed by quantized time
+  var q = Math.floor(t / 0.5);
+  for (var di = 0; di < 42; di++) {
+    var dx = seededVal(1403000 + di * 7919 + q * 13) * W;
+    var dy = L.skyH + seededVal(1403000 + di * 7919 + q * 29 + 3) * (H - L.skyH);
+    dot(dx, dy, Math.max(1, 1.6 * s), rgba('#e8e2d4', 0.35));
+  }
+
+  // Grind sparks (seeded by quantized time, only while a grind is active)
+  for (var si = 0; si < SKATERS.length; si++) {
+    var evs = eventsAround(si, t, L);
+    for (var ei = 0; ei < evs.length; ei++) {
+      if (evs[ei].kind === 'grind' && t >= evs[ei].win0 && t <= evs[ei].win1) {
+        var pos = skaterPos(si, t, L);
+        for (var sp = 0; sp < 6; sp++) {
+          var sx = pos.x - 10 * s + seededVal(1403000 + sp * 7919 + q * 17) * 22 * s;
+          var sy = pos.y + seededVal(1403000 + sp * 7919 + q * 23 + 5) * 10 * s;
+          dot(sx, sy, Math.max(1, 1.5 * s), rgba(COL.gold, 0.85));
+        }
+      }
+    }
+  }
+
+  // Skaters
+  for (var s2 = 0; s2 < SKATERS.length; s2++) {
+    var p2 = skaterPos(s2, t, L);
+    drawSkater(p2.x, p2.y, u, p2.tilt, SKATERS[s2].body, SKATERS[s2].board, false);
+  }
+
+  // Ghost slow-motion replay of a tapped note
+  if (replay) {
+    var rp = (t - replay.t0) / 4;
+    if (rp >= 0 && rp <= 1) {
+      var gx = W * 0.5, gy = L.groundY;
+      var gt = 0;
+      if (replay.type === 'ollie') {
+        var h = 4 * rp * (1 - rp);
+        gy -= h * H * 0.07;
+        gt = (rp - 0.5) * 0.45;
+      } else if (replay.type === 'grind') {
+        gx = L.railX0 + (L.railX1 - L.railX0) * rp;
+        gy = L.railY;
+      } else {
+        gt = 1.35 * smooth(0, 0.25, rp) * (1 - smooth(0.65, 1, rp));
+      }
+      drawSkater(gx, gy, u * 1.15, gt, COL.gold, COL.gold, true);
+      // Replay halo ring
+      ctx.strokeStyle = rgba(COL.gold, a4(0.5 * (1 - rp)));
+      ctx.lineWidth = Math.max(1, 2 * s);
+      ctx.beginPath();
+      ctx.moveTo(gx + 34 * s, gy - 20 * s);
+      ctx.arc(gx, gy - 20 * s, 34 * s, 0, Math.PI * 2);
+      ctx.stroke();
+    } else if (rp > 1) {
+      replay = null;
+    }
+  }
+
+  // Landing ticks: fire once per landing when audio exists (gesture-gated only)
+  if (audioCtx) {
+    for (var s3 = 0; s3 < SKATERS.length; s3++) {
+      var evs3 = eventsAround(s3, t, L);
+      for (var e3 = 0; e3 < evs3.length; e3++) {
+        if (evs3[e3].land > lastAudioT && evs3[e3].land <= t) tick(evs3[e3].kind);
+      }
+    }
+    lastAudioT = t;
+  }
+}
+
+// ---------- boot: frame one is draw(0); clock starts with the rAF loop ----------
+draw(0);
+var t0 = null;
+function loop(ts){
+  if (t0 === null) t0 = ts;
+  draw((ts - t0) / 1000);
+  if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(loop);
+}
+if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
