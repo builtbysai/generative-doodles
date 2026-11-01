@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>The Input Is a Whisper</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #07080C; height: 100%; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // Palette (strict)
+  var FIELD = '#07080C';
+  var EDGE  = '#3A3D46';
+  var WHIS  = '#8A8D84';
+  var WAVE  = '#4FD6FF';
+  var BREATH = '#FF4FD8';
+  var CUR   = '#7DF9C6';
+
+  var TAU = Math.PI * 2;
+  var STEP = 1 / 120;              // fixed sim step (seconds)
+  var PREROLL = 1920;              // 16 s of sim before frame one
+  var HIST_MAX = 1080;             // 9 s of waveform channel history
+  var HIST_DRAW = 720;             // 6 s drawn across the frame
+  var RING_LIFE = 4.6;             // seconds a breath ring lives
+  var AMP = 50;                    // the amplification: x50
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+  // ---- sizing: Visual Viewport API, listeners on visualViewport AND window ----
+  var W = 300, H = 300, PHONE = false;
+  function computeSize() {
+    var w = 300, h = 300;
+    if (typeof window !== 'undefined' && window.visualViewport) {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    } else if (typeof window !== 'undefined') {
+      w = window.innerWidth; h = window.innerHeight;
+    }
+    W = Math.max(60, Math.floor(w || 300));
+    H = Math.max(60, Math.floor(h || 300));
+    canvas.width = W;
+    canvas.height = H;
+    var sw = (typeof window !== 'undefined' && window.screen && window.screen.width) || W;
+    var sh = (typeof window !== 'undefined' && window.screen && window.screen.height) || H;
+    PHONE = Math.min(sw, sh) < 700 || (H > W * 1.15 && Math.min(W, H) < 700);
+  }
+  function onResize() { computeSize(); draw(); }
+  if (typeof window !== 'undefined' && window.addEventListener) window.addEventListener('resize', onResize);
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', onResize);
+  }
+
+  // ---- the whisper: seeded micro-signal, pure data, never pixels, never a mic ----
+  function genWhisper(seed) {
+    var r = mulberry32(seed);
+    function comp() {
+      var a = [];
+      for (var i = 0; i < 3; i++) {
+        a.push({ amp: 0.6 + r() * 1.6, w: TAU * (0.35 + r() * 1.5), p: r() * TAU });
+      }
+      // one fast, small component: its velocity gives the channels their tremor texture
+      a.push({ amp: 0.22 + r() * 0.15, w: TAU * (3.0 + r() * 2.0), p: r() * TAU });
+      return a;
+    }
+    var linePh = [], i;
+    for (i = 0; i < 9; i++) linePh.push(r() * TAU);
+    var speck = [];
+    for (i = 0; i < 3; i++) {
+      speck.push({ p1: r() * TAU, p2: r() * TAU, s1: 0.5 + r() * 0.9, s2: 0.4 + r() * 0.8, rad: 6 + r() * 6 });
+    }
+    return {
+      tx: comp(), ty: comp(),
+      breathT: 4.6 + r() * 1.8,
+      breathP: r() * TAU,
+      curlA: r() * TAU, curlB: r() * TAU, curlC: r() * TAU,
+      linePh: linePh, speck: speck
+    };
+  }
+  function tremorAt(P, t, deriv) {
+    var x = 0, y = 0, i, c;
+    for (i = 0; i < P.tx.length; i++) {
+      c = P.tx[i];
+      if (deriv) x += c.amp * c.w * Math.cos(c.w * t + c.p); else x += c.amp * Math.sin(c.w * t + c.p);
+      c = P.ty[i];
+      if (deriv) y += c.amp * c.w * Math.cos(c.w * t + c.p); else y += c.amp * Math.sin(c.w * t + c.p);
+    }
+    return { x: x, y: y };
+  }
+  function breathB(P, t) { return 0.5 + 0.5 * Math.sin(TAU * (t / P.breathT) + P.breathP); }
+  function breathDB(P, t) { return 0.5 * (TAU / P.breathT) * Math.cos(TAU * (t / P.breathT) + P.breathP); }
+
+  // ---- state ----
+  var S = null;
+  function newState(seed) {
+    var r = mulberry32(1004);
+    var parts = [];
+    for (var i = 0; i < 350; i++) {
+      parts.push({ x: r(), y: r(), a: 0.25 + r() * 0.55, s: 0.7 + r() * 0.6 });
+    }
+    return {
+      t: 0, seed: seed, P: genWhisper(seed),
+      A: 1,               // activity envelope: 1 whispering, 0 silenced
+      silStart: -1000,
+      hist: [],           // Y channel samples (sensor px/s), one per step
+      rings: [],          // breath rings {birth}
+      parts: parts,
+      gains: { wave: 1, breath: 1, cur: 1 },
+      boost: null,        // lane key currently boosted by a drag
+      prevDB: 1
+    };
+  }
+
+  // ---- audio: lazy, guarded, created only inside a visitor gesture ----
+  var AC = null, swellGain = null;
+  function initAudio() {
+    if (AC) return;
+    try {
+      var Ctor = null;
+      if (typeof window !== 'undefined') Ctor = window.AudioContext || window.webkitAudioContext;
+      if (typeof Ctor !== 'function') return;
+      AC = new Ctor();
+      var len = 2 * AC.sampleRate;
+      var buf = AC.createBuffer(1, len, AC.sampleRate);
+      var d = buf.getChannelData(0);
+      var rr = mulberry32(77);
+      for (var i = 0; i < len; i++) d[i] = rr() * 2 - 1;
+      var src = AC.createBufferSource();
+      src.buffer = buf; src.loop = true;
+      var bp = AC.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 700; bp.Q.value = 0.6;
+      var g = AC.createGain(); g.gain.value = 0.010;         // the whisper: near-silent texture
+      src.connect(bp); bp.connect(g); g.connect(AC.destination);
+      src.start();
+      var osc = AC.createOscillator(); osc.type = 'sine'; osc.frequency.value = 92;
+      swellGain = AC.createGain(); swellGain.gain.value = 0;
+      osc.connect(swellGain); swellGain.connect(AC.destination);
+      osc.start();
+    } catch (e) { AC = null; swellGain = null; }
+  }
+  function audioChime() {
+    if (!AC) return;
+    try {
+      var o = AC.createOscillator(); o.type = 'sine';
+      o.frequency.value = 1250 + (S.seed % 5) * 90;
+      var g = AC.createGain();
+      var now = AC.currentTime;
+      g.gain.setValueAtTime(0.008, now);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + 0.7);
+      o.connect(g); g.connect(AC.destination);
+      o.start(now); o.stop(now + 0.75);
+    } catch (e) { /* silence is fine */ }
+  }
+
+  // ---- simulation ----
+  function step() {
+    var dt = STEP;
+    S.t += dt;
+    var sil = (S.t >= S.silStart && S.t < S.silStart + 5);
+    var target = sil ? 0 : 1;
+    S.A += (target - S.A) * (1 - Math.exp(-dt * 1.8));   // lanes decay to black over ~2 s of silence
+
+    var vel = tremorAt(S.P, S.t, true);
+    var chx = clamp(vel.x, -30, 30) * S.A;              // X channel (sensor px/s)
+    var chy = clamp(vel.y, -30, 30) * S.A;              // Y channel
+
+    S.hist.push(chy);
+    if (S.hist.length > HIST_MAX) S.hist.shift();
+
+    var db = breathDB(S.P, S.t);
+    if (S.prevDB > 0 && db <= 0 && S.A > 0.5) {         // breath peak: a ring is born
+      S.rings.push({ birth: S.t });
+      audioChime();
+    }
+    S.prevDB = db;
+
+    var keys = ['wave', 'breath', 'cur'], i, k, tgt, tau;
+    for (i = 0; i < 3; i++) {
+      k = keys[i];
+      tgt = (S.boost === k) ? 2.3 : 1;
+      tau = tgt > S.gains[k] ? 0.35 : 5.0;              // fast lean-in, ~15 s ease back
+      S.gains[k] += (tgt - S.gains[k]) * (1 - Math.exp(-dt / tau));
+    }
+
+    // CURRENT lane: particles advected by a seeded curl field + the X channel x50
+    var P = S.P, t = S.t;
+    var drift = chx * AMP * 0.05;                       // px/s on a 1000 px reference frame
+    var speedScale = (0.2 + 0.8 * S.A) * S.gains.cur;
+    for (i = 0; i < S.parts.length; i++) {
+      var p = S.parts[i];
+      var nx = p.x, ny = p.y;
+      var cx = Math.sin(ny * 5.1 + t * 0.35 + P.curlA) + 0.6 * Math.cos(nx * 4.3 - t * 0.22 + P.curlB);
+      var cy = Math.cos(nx * 4.7 - t * 0.30 + P.curlC) + 0.6 * Math.sin(ny * 3.9 + t * 0.26 + P.curlA);
+      var vx = (cx * 14 + drift) * speedScale;
+      var vy = (cy * 14) * speedScale;
+      p.x += vx * STEP / 1000 * p.s;
+      p.y += vy * STEP / 1000 * p.s;
+      if (p.x < 0) p.x += 1; if (p.x > 1) p.x -= 1;
+      if (p.y < 0) p.y += 1; if (p.y > 1) p.y -= 1;
+    }
+    // prune dead rings
+    while (S.rings.length && S.t - S.rings[0].birth > RING_LIFE) S.rings.shift();
+  }
+
+  // ---- drawing ----
+  function draw() {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    var cx = W / 2, cy = H / 2;
+    var t = S.t, P = S.P;
+    ctx.fillStyle = FIELD;
+    ctx.fillRect(0, 0, W, H);
+
+    // BREATH lane (behind everything): layered-alpha concentric rings, no gradients
+    var b = breathB(P, t);
+    var maxR = Math.min(W, H) * 0.55 + 40;
+    ctx.fillStyle = BREATH;
+    ctx.globalAlpha = 0.045 * S.A * S.gains.breath;
+    ctx.beginPath(); ctx.arc(cx, cy, 26 + 30 * b, 0, TAU); ctx.fill();
+    ctx.globalAlpha = 1;
+    var i, age, fr, rr2, aa;
+    for (i = 0; i < S.rings.length; i++) {
+      age = t - S.rings[i].birth;
+      if (age < 0 || age > RING_LIFE) continue;
+      fr = age / RING_LIFE;
+      rr2 = maxR * (1 - (1 - fr) * (1 - fr));
+      aa = (1 - fr) * 0.30 * S.gains.breath;
+      ctx.strokeStyle = BREATH;
+      ctx.lineWidth = 1.5;
+      ctx.globalAlpha = aa;        ctx.beginPath(); ctx.arc(cx, cy, rr2, 0, TAU); ctx.stroke();
+      ctx.globalAlpha = aa * 0.6;  ctx.beginPath(); ctx.arc(cx, cy, Math.max(1, rr2 - 7), 0, TAU); ctx.stroke();
+      ctx.globalAlpha = aa * 0.35; ctx.beginPath(); ctx.arc(cx, cy, Math.max(1, rr2 - 14), 0, TAU); ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+
+    // CURRENT lane: mint particle drift
+    ctx.fillStyle = CUR;
+    var alphaScale = clamp(S.gains.cur, 0.4, 1.6) * (0.35 + 0.65 * S.A);
+    for (i = 0; i < S.parts.length; i++) {
+      var p = S.parts[i];
+      ctx.globalAlpha = p.a * alphaScale;
+      ctx.fillRect(p.x * W, p.y * H, 1.6, 1.6);
+    }
+    ctx.globalAlpha = 1;
+
+    // WAVEFORM lane: the Y channel history, amplified x50, as a seismic band
+    var n = Math.min(HIST_DRAW, S.hist.length);
+    if (n > 1) {
+      var bandH = H * 0.17;
+      var wGain = clamp(S.gains.wave, 0.5, 1.9);
+      ctx.strokeStyle = WAVE;
+      ctx.lineWidth = 1.5;
+      ctx.globalAlpha = 0.85;
+      ctx.beginPath();
+      for (i = 0; i < n; i++) {
+        var v = S.hist[S.hist.length - n + i];
+        var x = (i / (HIST_DRAW - 1)) * W;
+        // x50 amplification with soft (tanh) compression so the trace stays organic, never clipped flat
+        var z = (v * AMP * 0.16 * wGain) / bandH;
+        var y = cy + bandH * (Math.exp(2 * z) - 1) / (Math.exp(2 * z) + 1);
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+
+    // The sensor: a tiny circle at center. The input stays tiny and quiet.
+    var R = PHONE ? 21 : 23;
+    var tp = tremorAt(P, t, false);
+    var live = 0.2 + 0.8 * S.A;
+    ctx.save();
+    ctx.beginPath(); ctx.arc(cx, cy, R, 0, TAU); ctx.clip();
+    ctx.strokeStyle = WHIS;
+    ctx.lineWidth = 1;
+    ctx.globalAlpha = 0.8;
+    ctx.beginPath();
+    for (i = 0; i < 9; i++) {
+      var lx = cx + (i - 4) * 4 + tp.x * (0.3 + 0.7 * S.A);
+      var ly = cy + tp.y * (0.3 + 0.7 * S.A) + 2.4 * Math.sin(i * 1.7 + t * 6.5 + P.linePh[i]) * live;
+      if (i === 0) ctx.moveTo(lx, ly); else ctx.lineTo(lx, ly);
+    }
+    ctx.stroke();
+    // breath dot inside the sensor
+    ctx.fillStyle = WHIS;
+    ctx.globalAlpha = (0.2 + 0.6 * b) * (0.15 + 0.85 * S.A);
+    ctx.beginPath(); ctx.arc(cx, cy + 9, 1.3 + 2.0 * b, 0, TAU); ctx.fill();
+    // micro-jitter specks
+    for (i = 0; i < 3; i++) {
+      var sp = P.speck[i];
+      ctx.globalAlpha = (0.30 + 0.25 * Math.sin(t * 3 + sp.p1)) * live;
+      ctx.beginPath();
+      ctx.arc(cx + sp.rad * Math.sin(t * sp.s1 + sp.p1), cy + sp.rad * 0.7 * Math.cos(t * sp.s2 + sp.p2), 0.8, 0, TAU);
+      ctx.fill();
+    }
+    ctx.restore();
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = EDGE;
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.arc(cx, cy, R, 0, TAU); ctx.stroke();
+
+    // The label: the only text, and it is the truth.
+    ctx.fillStyle = WHIS;
+    ctx.font = '10px "Courier New", monospace';
+    ctx.textAlign = 'center';
+    ctx.globalAlpha = 0.9;
+    ctx.fillText('INPUT: WHISPER. OUTPUT: ROOM.', cx, H - 12);
+    ctx.globalAlpha = 1;
+
+    if (AC && swellGain) {
+      try { swellGain.gain.value = 0.010 * b * S.A; } catch (e) { /* ignore */ }
+    }
+  }
+
+  // ---- interaction ----
+  function reseed() {
+    S.seed += 7919;
+    S.P = genWhisper(S.seed);
+    S.hist.length = 0;
+    S.rings.length = 0;
+    S.prevDB = 1;
+  }
+  var down = null, lastTap = -10;
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', function (e) {
+      initAudio();
+      if (AC && AC.resume) { try { AC.resume(); } catch (err) { /* ignore */ } }
+      down = { x: e.clientX, y: e.clientY, t: S.t, moved: false };
+    });
+    canvas.addEventListener('pointermove', function (e) {
+      if (!down) return;
+      var dx = e.clientX - down.x, dy = e.clientY - down.y;
+      if (dx * dx + dy * dy > 64) {
+        down.moved = true;
+        // Lane-gain drag mapping: vertical thirds of the frame.
+        // Top third = WAVEFORM, middle third = CURRENT, bottom third = BREATH.
+        S.boost = down.y < H / 3 ? 'wave' : (down.y < (2 * H) / 3 ? 'cur' : 'breath');
+      }
+    });
+    canvas.addEventListener('pointerup', function (e) {
+      if (!down) return;
+      var d = down; down = null; S.boost = null;
+      if (d.moved) return;
+      if (S.t - d.t > 0.45) return;
+      if (S.t - lastTap < 0.38) {           // double-tap: silence
+        S.silStart = S.t;
+        lastTap = -10;
+        return;
+      }
+      lastTap = S.t;
+      var dx = e.clientX - W / 2, dy = e.clientY - H / 2;
+      if (dx * dx + dy * dy < 42 * 42) reseed();   // tap the sensor: a new whisper
+    });
+    canvas.addEventListener('pointercancel', function () { down = null; S.boost = null; });
+  }
+
+  // ---- boot: pre-roll the sim so frame one is mid-whisper, then draw synchronously ----
+  computeSize();
+  S = newState(20240);
+  for (var s = 0; s < PREROLL; s++) step();
+  draw();
+
+  var lastNow = null, acc = 0;
+  function frame(now) {
+    if (lastNow === null) lastNow = now;
+    var el = (now - lastNow) / 1000;
+    lastNow = now;
+    if (el > 0.25) el = 0.25;
+    if (el < 0) el = 0;
+    acc += el;
+    var n = 0;
+    while (acc >= STEP && n < 30) { step(); acc -= STEP; n++; }
+    draw();
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+  }
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

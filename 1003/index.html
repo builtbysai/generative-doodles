@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>A Light That Does Not Exist</title>
+<style>
+  html, body { margin:0; padding:0; background:#05060A; height:100%; overflow:hidden; }
+  canvas { display:block; touch-action:none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // No.1003 "A Light That Does Not Exist" - Perfume "Reframe" (2019), the
+  // virtual shadow system: a virtual illuminant renders a figure's silhouette
+  // separately from the figure. One white figure dances center-left, lit by
+  // nothing. On the back wall at right, its shadow exists anyway: the same
+  // pose half a second stale, stretched, 2x large, cast from a source point
+  // that wanders invisibly. The shadow lags, sometimes detaches and wanders
+  // off on its own for a few seconds, and every ~45 s a second lamp that is
+  // not there adds a second shadow from another angle. The only trace of the
+  // "light" is a pale pool sliding along the floor.
+  // Everything is a closed-form function of piece time plus recorded visitor
+  // events (drags move the source, a tap pins the shadow, a double-tap
+  // reseeds). Frame one is the synchronous draw at T0 = 11 s.
+
+  var T0 = 11;
+  var BASE_SEED = 1003164;
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  var STAGE = '#05060A', FIGURE = '#F2F4F6', WALL = '#0E1118',
+      SHADOW1 = '#2B3038', SHADOW2 = '#3A3D46', POOL = '#141A22',
+      POOL_EDGE = 'rgba(43,216,255,0.30)', GRID = '#14161C';
+
+  // ---------- deterministic helpers ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  function ihash(n) {
+    var x = Math.imul((n | 0) ^ 0x9E3779B9, 0x85EBCA6B);
+    x ^= x >>> 13; x = Math.imul(x, 0xC2B2AE35); x ^= x >>> 16;
+    return (x >>> 0) / 4294967296;
+  }
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function lerp(a, b, f) { return a + (b - a) * f; }
+  function sstep01(x) { x = clamp(x, 0, 1); return x * x * x * (x * (x * 6 - 15) + 10); }
+  var TAU = Math.PI * 2;
+
+  // ---------- visitor event state (recorded, never integrated) ----------
+  var resets = [];       // absolute piece times of double-tap reseeds
+  var pins = [];         // { t } shadow pins, chronological
+  var drags = [];        // { t0, t1 (-1 while live), pts: [[t, x, y], ...] }
+  var pendingTap = null; // tap waiting out the double-tap window
+  var lastTap = null;
+  var dragCur = null;
+  var lastLayout = null;
+  var viewW = 0, viewH = 0, startStamp = null;
+
+  function epochIndexAt(t) {
+    var n = 0;
+    for (var i = 0; i < resets.length; i++) if (resets[i] <= t) n++;
+    return n;
+  }
+  function epochStartAt(t) {
+    var s = 0;
+    for (var i = 0; i < resets.length; i++) if (resets[i] <= t) s = resets[i];
+    return s;
+  }
+
+  // ---------- the invisible source: seeded wander + drag override ----------
+  function wanderAt(ep, lt) {
+    var p1 = ihash(ep * 31 + 1) * TAU, p2 = ihash(ep * 31 + 2) * TAU, p3 = ihash(ep * 31 + 3) * TAU;
+    return {
+      nx: 0.31 + 0.085 * Math.sin(lt * TAU / 47 + p1) + 0.028 * Math.sin(lt * TAU / 13.7 + p2),
+      ny: 0.205 + 0.050 * Math.sin(lt * TAU / 39 + p3) + 0.018 * Math.cos(lt * TAU / 11.3 + p1)
+    };
+  }
+  function source2At(ep, lt, L) {
+    var nx = 0.80 + 0.035 * Math.sin(lt * TAU / 53 + ihash(ep * 7 + 3) * TAU);
+    var ny = 0.15 + 0.030 * Math.sin(lt * TAU / 41 + 2.1);
+    return { x: nx * L.w, y: ny * L.h };
+  }
+  function sourceAt(t, L) {
+    var ep = epochIndexAt(t), lt = t - epochStartAt(t);
+    var w = wanderAt(ep, lt), wx = w.nx * L.w, wy = w.ny * L.h;
+    var d = null;
+    for (var i = 0; i < drags.length; i++) if (drags[i].t0 <= t) d = drags[i];
+    if (!d) return { x: wx, y: wy };
+    if (d.t1 < 0 || t <= d.t1) {
+      var p = d.pts[0];
+      for (var j = 0; j < d.pts.length; j++) if (d.pts[j][0] <= t) p = d.pts[j];
+      return { x: p[1], y: p[2] };
+    }
+    var since = t - d.t1;
+    if (since < 4) {
+      var e = sstep01(since / 4), end = d.pts[d.pts.length - 1];
+      return { x: lerp(end[1], wx, e), y: lerp(end[2], wy, e) };
+    }
+    return { x: wx, y: wy };
+  }
+
+  // ---------- detachments + second-light windows (seeded schedules) ----------
+  function detachAt(ep, lt) {
+    var res = { amt: 0, dx: 0, dy: 0 };
+    for (var k = 0; k < 400; k++) {
+      var st = 20 + k * 31 + ihash(ep * 131 + k * 17 + 5) * 7;
+      if (st > lt) break;
+      var dur = 3 + ihash(ep * 57 + k * 29 + 11) * 2;
+      if (lt <= st + dur) {
+        var ph = (lt - st) / dur;
+        var env = Math.min(sstep01((lt - st) / 0.7), sstep01((st + dur - lt) / 0.7));
+        var dir = ihash(ep * 77 + k * 13 + 3) > 0.5 ? 1 : -1;
+        var sw = Math.sin(Math.PI * clamp(ph, 0, 1));
+        res.amt = clamp(env, 0, 1);
+        res.dx = dir * 0.15 * sw * res.amt;
+        res.dy = -0.05 * sw * res.amt;
+      }
+    }
+    return res;
+  }
+  function secondAlpha(ep, lt) {
+    for (var k = 0; k < 400; k++) {
+      var st = 45 + k * 47 + ihash(ep * 97 + k * 41 + 7) * 5;
+      if (st > lt) break;
+      if (lt <= st + 10) return Math.min(sstep01((lt - st) / 1), sstep01((st + 10 - lt) / 1));
+    }
+    return 0;
+  }
+
+  // ---------- choreography: seeded keyframe poses, eased ----------
+  var poseCache = { ep: -1, frames: null };
+  function keyframes(ep) {
+    if (poseCache.ep === ep) return poseCache.frames;
+    var rnd = mulberry32(BASE_SEED ^ (ep * 7919 + 13));
+    var frames = [];
+    for (var k = 0; k < 7; k++) {
+      frames.push({
+        sway: (rnd() * 2 - 1) * 0.045, bob: (rnd() * 2 - 1) * 0.020,
+        lean: -0.14 + rnd() * 0.36, head: (rnd() * 2 - 1) * 0.28,
+        aL: -0.4 + rnd() * 2.6, bL: rnd() * 1.7 - 0.15,
+        aR: -0.4 + rnd() * 2.6, bR: rnd() * 1.7 - 0.15,
+        lL: -0.42 + rnd() * 0.85, kL: rnd() * 0.95,
+        lR: -0.42 + rnd() * 0.85, kR: rnd() * 0.95
+      });
+    }
+    poseCache = { ep: ep, frames: frames };
+    return frames;
+  }
+  function poseAt(ep, lt) {
+    var P = 12, K = 7, frames = keyframes(ep);
+    var ph = ((lt % P) + P) % P;
+    var seg = ph / (P / K), i0 = Math.floor(seg) % K, i1 = (i0 + 1) % K;
+    var s = sstep01(seg - Math.floor(seg));
+    var a = frames[i0], b = frames[i1], o = {}, key;
+    for (key in a) o[key] = lerp(a[key], b[key], s);
+    return o;
+  }
+
+  // ---------- skeleton: forward kinematics, local units of figure height ----------
+  // Origin at the pelvis, y down. Feet rest near y = +0.52, head near y = -0.53.
+  function skeleton(p) {
+    var tx = Math.sin(p.lean), ty = -Math.cos(p.lean);
+    var px = Math.cos(p.lean), py = Math.sin(p.lean);
+    var pelvis = { x: 0, y: 0 };
+    var chest = { x: tx * 0.30, y: ty * 0.30 };
+    var neck = { x: chest.x + tx * 0.095, y: chest.y + ty * 0.095 };
+    var ha = p.lean + p.head;
+    var head = { x: neck.x + Math.sin(ha) * 0.082, y: neck.y - Math.cos(ha) * 0.082, r: 0.056 };
+    var shB = { x: tx * 0.265, y: ty * 0.265 };
+    var shL = { x: shB.x - px * 0.088, y: shB.y - py * 0.088 };
+    var shR = { x: shB.x + px * 0.088, y: shB.y + py * 0.088 };
+    function arm(sh, a, b) {
+      var ex = sh.x + Math.sin(a) * 0.165, ey = sh.y + Math.cos(a) * 0.165;
+      return [{ x: ex, y: ey }, { x: ex + Math.sin(a + b) * 0.155, y: ey + Math.cos(a + b) * 0.155 }];
+    }
+    function leg(hip, b, k) {
+      var kx = hip.x + Math.sin(b) * 0.26, ky = hip.y + Math.cos(b) * 0.26;
+      var fx = kx + Math.sin(b - k) * 0.26, fy = ky + Math.cos(b - k) * 0.26;
+      return [{ x: kx, y: ky }, { x: fx, y: fy }, { x: fx + 0.06, y: fy + 0.014 }];
+    }
+    var aL = arm(shL, p.aL, p.bL), aR = arm(shR, p.aR, p.bR);
+    var hipL = { x: -0.052, y: 0.012 }, hipR = { x: 0.052, y: 0.012 };
+    var lL = leg(hipL, p.lL, p.kL), lR = leg(hipR, p.lR, p.kR);
+    return {
+      pelvis: pelvis, chest: chest, neck: neck, head: head,
+      shL: shL, elL: aL[0], haL: aL[1], shR: shR, elR: aR[0], haR: aR[1],
+      hipL: hipL, kneeL: lL[0], footL: lL[1], toeL: lL[2],
+      hipR: hipR, kneeR: lR[0], footR: lR[1], toeR: lR[2]
+    };
+  }
+  var PTKEYS = ['pelvis', 'chest', 'neck', 'shL', 'elL', 'haL', 'shR', 'elR', 'haR',
+                'hipL', 'kneeL', 'footL', 'toeL', 'hipR', 'kneeR', 'footR', 'toeR'];
+  function xform(sk, rx, ry, sx, sy, shear) {
+    var P = {}, i, k;
+    for (i = 0; i < PTKEYS.length; i++) {
+      k = PTKEYS[i];
+      P[k] = { x: rx + sk[k].x * sx - sk[k].y * sx * shear, y: ry + sk[k].y * sy };
+    }
+    P.head = { x: rx + sk.head.x * sx - sk.head.y * sx * shear, y: ry + sk.head.y * sy, r: sk.head.r * sx };
+    return P;
+  }
+  function lerpJoints(A, B, f) {
+    var P = {}, i, k;
+    for (i = 0; i < PTKEYS.length; i++) {
+      k = PTKEYS[i];
+      P[k] = { x: lerp(A[k].x, B[k].x, f), y: lerp(A[k].y, B[k].y, f) };
+    }
+    P.head = { x: lerp(A.head.x, B.head.x, f), y: lerp(A.head.y, B.head.y, f), r: lerp(A.head.r, B.head.r, f) };
+    return P;
+  }
+
+  function figureJoints(t, L) {
+    var ep = epochIndexAt(t), lt = t - epochStartAt(t);
+    var prm = poseAt(ep, lt), sk = skeleton(prm);
+    var rx = L.figX + prm.sway * L.fh;
+    var ry = L.floorY - 0.52 * L.fh + prm.bob * L.fh;
+    return { P: xform(sk, rx, ry, L.fh, L.fh, 0), wUnit: L.fh };
+  }
+
+  // The shadow: the pose from 0.5 s ago, projected from the invisible source.
+  function shadowJoints(t, L, which) {
+    var ep = epochIndexAt(t), lt = t - epochStartAt(t);
+    var prm = poseAt(ep, lt - 0.5), sk = skeleton(prm);
+    var src = which === 1 ? sourceAt(t, L) : source2At(ep, lt, L);
+    var gain = which === 1 ? 0.9 : 0.55;
+    var sizeF = which === 1 ? 2.05 : 1.80;
+    var baseStretch = which === 1 ? 1.20 : 1.05;
+    var rootX = clamp(L.figX + (L.figX - src.x) * gain + 0.38 * L.w, 0.03 * L.w, 0.97 * L.w);
+    var sfh = L.fh * sizeF * clamp(1 + (0.24 - src.y / L.h) * 0.5, 0.88, 1.16);
+    var stretch = clamp(baseStretch + (src.y / L.h - 0.22) * 1.5, 0.85, 2.05);
+    var dy = 0;
+    if (which === 1) {
+      var dr = detachAt(ep, lt);
+      rootX += dr.dx * L.w;
+      dy = dr.dy * L.h;
+    }
+    var rootY = L.floorY - 0.52 * sfh * stretch + dy;
+    var shear = clamp((L.figX - src.x) / L.w, -0.6, 0.6) * 0.22;
+    return { P: xform(sk, rootX, rootY, sfh, sfh * stretch, shear), wUnit: sfh };
+  }
+
+  // ---------- body drawing (thick round strokes; shadow gets soft passes) ----------
+  var SEGS = [
+    ['hipL', 'kneeL', 0.052, 0.5], ['kneeL', 'footL', 0.044, 0.5], ['footL', 'toeL', 0.030, 0.5],
+    ['shL', 'elL', 0.050, 0.5], ['elL', 'haL', 0.042, 0.5],
+    ['pelvis', 'hipL', 0.060, 0.6], ['chest', 'shL', 0.055, 0.6],
+    ['pelvis', 'chest', 0.088, 1], ['chest', 'neck', 0.068, 1],
+    ['pelvis', 'hipR', 0.060, 0.9], ['chest', 'shR', 0.055, 0.9],
+    ['hipR', 'kneeR', 0.056, 1], ['kneeR', 'footR', 0.047, 1], ['footR', 'toeR', 0.032, 1],
+    ['shR', 'elR', 0.054, 1], ['elR', 'haR', 0.045, 1]
+  ];
+  function drawBody(P, wUnit, color, passes, alphaMul) {
+    ctx.strokeStyle = color; ctx.fillStyle = color;
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    for (var pi = 0; pi < passes.length; pi++) {
+      var wm = passes[pi][0], am = passes[pi][1] * alphaMul;
+      for (var i = 0; i < SEGS.length; i++) {
+        var s = SEGS[i];
+        ctx.globalAlpha = s[3] * am;
+        ctx.lineWidth = Math.max(1, s[2] * wUnit * wm);
+        ctx.beginPath();
+        ctx.moveTo(P[s[0]].x, P[s[0]].y);
+        ctx.lineTo(P[s[1]].x, P[s[1]].y);
+        ctx.stroke();
+      }
+      ctx.globalAlpha = am;
+      ctx.beginPath();
+      ctx.arc(P.head.x, P.head.y, Math.max(0.8, P.head.r * wm), 0, TAU);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+  var SHADOW_PASSES = [[1.5, 0.30], [1.22, 0.45], [1.0, 0.80]];
+
+  // ---------- the light pool: layered flat-alpha ellipses, no gradient ----------
+  function ellipsePath(cx, cy, rx, ry) {
+    ctx.beginPath();
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.scale(1, ry / rx);
+    ctx.arc(0, 0, rx, 0, TAU);
+    ctx.restore();
+  }
+  function drawPool(t, L) {
+    var src = sourceAt(t, L);
+    var cx = clamp(L.w * 0.42 + (src.x / L.w - 0.31) * L.w * 0.9, L.w * 0.08, L.w * 0.92);
+    var cy = L.floorY + L.h * 0.062;
+    var rx = L.w * 0.125 * clamp(1 + (src.y / L.h - 0.2) * 0.9, 0.8, 1.35);
+    var ry = rx * 0.17;
+    ctx.fillStyle = POOL;
+    ctx.globalAlpha = 0.45; ellipsePath(cx, cy, rx, ry); ctx.fill();
+    ctx.globalAlpha = 0.50; ellipsePath(cx, cy, rx * 0.70, ry * 0.70); ctx.fill();
+    ctx.globalAlpha = 0.55; ellipsePath(cx, cy, rx * 0.42, ry * 0.42); ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = POOL_EDGE; ctx.lineWidth = 1.5;
+    ellipsePath(cx, cy, rx, ry); ctx.stroke();
+  }
+
+  // ---------- pins ----------
+  function commitPin(t) {
+    if (pendingTap && t > pendingTap.t + 0.35) {
+      if (pendingTap.onShadow) pins.push({ t: pendingTap.t });
+      pendingTap = null;
+    }
+  }
+  function pinState(t) {
+    if (!pins.length) return null;
+    var p = pins[pins.length - 1];
+    if (p.t > t) return null;
+    if (t < p.t + 10) return { pinT: p.t, blend: 0 };
+    if (t < p.t + 10.8) return { pinT: p.t, blend: sstep01((t - p.t - 10) / 0.8) };
+    return null;
+  }
+
+  // ---------- layout ----------
+  function computeLayout(w, h) {
+    var phone = false, sw = 0, sh = 0;
+    try { sw = window.screen.width; sh = window.screen.height; } catch (e) {}
+    var mind = Math.min(sw, sh);
+    phone = mind > 0 ? (mind < 700) : (h > w * 1.15);
+    return {
+      w: w, h: h, phone: phone, U: Math.min(w, h),
+      wallX: w * (phone ? 0.30 : 0.34),
+      floorY: h * 0.80,
+      fh: h * 0.30,
+      figX: w * (phone ? 0.22 : 0.24)
+    };
+  }
+
+  // ---------- scene ----------
+  function draw(t) {
+    var w = viewW, h = viewH;
+    canvas.style.width = w + 'px';
+    canvas.style.height = h + 'px';
+    var L = computeLayout(w, h);
+    lastLayout = L;
+    commitPin(t);
+    var ep = epochIndexAt(t), lt = t - epochStartAt(t);
+
+    ctx.fillStyle = STAGE;
+    ctx.fillRect(0, 0, w, h);
+    ctx.fillStyle = WALL;
+    ctx.fillRect(L.wallX, 0, w - L.wallX, h);
+
+    // faint hairline grid on the wall
+    ctx.strokeStyle = GRID; ctx.lineWidth = 1; ctx.globalAlpha = 1;
+    ctx.beginPath();
+    var g = Math.max(34, L.U * 0.105), gx, gy;
+    for (gx = Math.ceil(L.wallX / g) * g; gx < w; gx += g) { ctx.moveTo(gx, 0); ctx.lineTo(gx, h); }
+    for (gy = g; gy < h; gy += g) { ctx.moveTo(L.wallX, gy); ctx.lineTo(w, gy); }
+    ctx.stroke();
+    // floor line
+    ctx.globalAlpha = 0.7;
+    ctx.beginPath(); ctx.moveTo(0, L.floorY); ctx.lineTo(w, L.floorY); ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    // second virtual light: a second shadow, different angle, no lamp
+    var sa = secondAlpha(ep, lt);
+    if (sa > 0.01) {
+      var s2 = shadowJoints(t, L, 2);
+      drawBody(s2.P, s2.wUnit, SHADOW2, SHADOW_PASSES, sa);
+    }
+
+    // primary shadow (possibly pinned)
+    var live = shadowJoints(t, L, 1);
+    var P = live.P, wU = live.wUnit;
+    var pin = pinState(t);
+    if (pin) {
+      var fr = shadowJoints(pin.pinT, L, 1);
+      P = lerpJoints(fr.P, live.P, pin.blend);
+      wU = lerp(fr.wUnit, live.wUnit, pin.blend);
+    }
+    drawBody(P, wU, SHADOW1, SHADOW_PASSES, 1);
+
+    // the light's only footprint, then the figure it cannot be lighting
+    drawPool(t, L);
+    var fig = figureJoints(t, L);
+    drawBody(fig.P, fig.wUnit, FIGURE, [[1, 1]], 1);
+  }
+
+  // ---------- sound: lazy, guarded; the shadow echoes 0.5 s late ----------
+  var AC = (typeof AudioContext !== 'undefined') ? AudioContext
+         : ((typeof webkitAudioContext !== 'undefined') ? webkitAudioContext : null);
+  var audio = null;
+  function ensureAudio() {
+    if (!AC || audio) return;
+    try {
+      var ac = new AC();
+      var master = ac.createGain(); master.gain.value = 0.9; master.connect(ac.destination);
+      var oscF = ac.createOscillator(); oscF.type = 'sine'; oscF.frequency.value = 170;
+      var gF = ac.createGain(); gF.gain.value = 0.0;
+      oscF.connect(gF); gF.connect(master);
+      var delay = ac.createDelay(1.0); delay.delayTime.value = 0.5;
+      var fb = ac.createGain(); fb.gain.value = 0.25;
+      var gEcho = ac.createGain(); gEcho.gain.value = 0.5;
+      gF.connect(delay); delay.connect(fb); fb.connect(delay); delay.connect(gEcho); gEcho.connect(master);
+      var oscS = ac.createOscillator(); oscS.type = 'triangle'; oscS.frequency.value = 85;
+      var gS = ac.createGain(); gS.gain.value = 0.0;
+      oscS.connect(gS); gS.connect(delay);
+      oscF.start(); oscS.start();
+      audio = { ac: ac, oscF: oscF, gF: gF, oscS: oscS, gS: gS };
+    } catch (e) { audio = null; }
+  }
+  function updateSounds(t) {
+    if (!audio || !lastLayout) return;
+    try {
+      var L = lastLayout;
+      var a = figureJoints(t, L).P, b = figureJoints(Math.max(0, t - 0.06), L).P;
+      var dh = Math.sqrt((a.haR.x - b.haR.x) * (a.haR.x - b.haR.x) + (a.haR.y - b.haR.y) * (a.haR.y - b.haR.y));
+      var dp = Math.sqrt((a.pelvis.x - b.pelvis.x) * (a.pelvis.x - b.pelvis.x) + (a.pelvis.y - b.pelvis.y) * (a.pelvis.y - b.pelvis.y));
+      var speed = (dh + dp) / 0.06 / L.fh;
+      var base = 150 + clamp(speed, 0, 2.2) * 70;
+      var ep = epochIndexAt(t), lt = t - epochStartAt(t);
+      var det = detachAt(ep, lt).amt;
+      audio.oscF.frequency.value = base;
+      audio.gF.gain.value = 0.045 + Math.min(0.03, speed * 0.02);
+      audio.oscS.frequency.value = base * 0.5 * (1 + 0.05 * det);
+      audio.gS.gain.value = 0.030;
+    } catch (e) {}
+  }
+
+  // ---------- time + loop ----------
+  function nowMs() {
+    if (typeof performance !== 'undefined' && performance.now) return performance.now();
+    return null;
+  }
+  function pieceTime() {
+    if (startStamp === null) return T0;
+    var n = nowMs();
+    if (n === null) return T0;
+    return T0 + (n - startStamp) / 1000;
+  }
+  var rafFn = (typeof requestAnimationFrame !== 'undefined') ? requestAnimationFrame : null;
+  function loop() {
+    var t = pieceTime();
+    draw(t);
+    updateSounds(t);
+    if (rafFn) rafFn(loop);
+  }
+
+  // ---------- sizing (Visual Viewport API) ----------
+  function resize() {
+    var w = 0, h = 0;
+    try {
+      if (window.visualViewport) { w = window.visualViewport.width; h = window.visualViewport.height; }
+    } catch (e) {}
+    if (!w || !h) { w = window.innerWidth || canvas.width || 1280; h = window.innerHeight || canvas.height || 900; }
+    viewW = Math.round(w); viewH = Math.round(h);
+    var dpr = 1;
+    try { dpr = Math.min(2, window.devicePixelRatio || 1); } catch (e) {}
+    canvas.width = Math.round(viewW * dpr);
+    canvas.height = Math.round(viewH * dpr);
+    canvas.style.width = viewW + 'px';
+    canvas.style.height = viewH + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  try {
+    if (window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', resize);
+  } catch (e) {}
+  if (window.addEventListener) window.addEventListener('resize', resize);
+
+  // ---------- interaction ----------
+  var pDown = null;
+  function evtPos(ev) {
+    var r = { left: 0, top: 0 };
+    try { r = canvas.getBoundingClientRect(); } catch (e) {}
+    var cx = (ev.clientX !== undefined) ? ev.clientX : (ev.touches && ev.touches[0] ? ev.touches[0].clientX : 0);
+    var cy = (ev.clientY !== undefined) ? ev.clientY : (ev.touches && ev.touches[0] ? ev.touches[0].clientY : 0);
+    return { x: cx - r.left, y: cy - r.top };
+  }
+  function pointInShadow(x, y, t) {
+    if (!lastLayout) return false;
+    var sj = shadowJoints(t, lastLayout, 1), P = sj.P;
+    var minX = 1e9, maxX = -1e9, minY = 1e9, maxY = -1e9, i, k;
+    for (i = 0; i < PTKEYS.length; i++) {
+      k = PTKEYS[i];
+      if (P[k].x < minX) minX = P[k].x; if (P[k].x > maxX) maxX = P[k].x;
+      if (P[k].y < minY) minY = P[k].y; if (P[k].y > maxY) maxY = P[k].y;
+    }
+    var m = 30;
+    return x >= minX - m && x <= maxX + m && y >= minY - m && y <= maxY + m;
+  }
+  function onDown(ev) {
+    ensureAudio();
+    if (dragCur) { dragCur.t1 = pieceTime(); dragCur = null; }
+    var p = evtPos(ev), t = pieceTime();
+    pDown = { t: t, x: p.x, y: p.y };
+  }
+  function onMove(ev) {
+    if (!pDown) return;
+    var p = evtPos(ev), t = pieceTime();
+    if (!dragCur && Math.sqrt((p.x - pDown.x) * (p.x - pDown.x) + (p.y - pDown.y) * (p.y - pDown.y)) > 6) {
+      dragCur = { t0: pDown.t, t1: -1, pts: [[pDown.t, pDown.x, pDown.y]] };
+      drags.push(dragCur);
+    }
+    if (dragCur) {
+      var last = dragCur.pts[dragCur.pts.length - 1];
+      if (Math.abs(p.x - last[1]) + Math.abs(p.y - last[2]) > 3 || t - last[0] > 0.05) dragCur.pts.push([t, p.x, p.y]);
+    }
+  }
+  function onUp(ev) {
+    if (!pDown) return;
+    var p = evtPos(ev), t = pieceTime();
+    if (dragCur) {
+      dragCur.t1 = t;
+      dragCur = null;
+    } else {
+      var isDouble = lastTap && (t - lastTap.t) < 0.35 &&
+        Math.sqrt((p.x - lastTap.x) * (p.x - lastTap.x) + (p.y - lastTap.y) * (p.y - lastTap.y)) < 48;
+      if (isDouble) {
+        resets.push(t);
+        pins = []; drags = []; pendingTap = null; lastTap = null;
+      } else {
+        pendingTap = { t: t, x: p.x, y: p.y, onShadow: pointInShadow(p.x, p.y, t) };
+        lastTap = { t: t, x: p.x, y: p.y };
+      }
+    }
+    pDown = null;
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+    canvas.addEventListener('mousedown', function (ev) { if (!window.PointerEvent) onDown(ev); });
+    canvas.addEventListener('mousemove', function (ev) { if (!window.PointerEvent) onMove(ev); });
+    canvas.addEventListener('mouseup', function (ev) { if (!window.PointerEvent) onUp(ev); });
+  }
+
+  // ---------- boot: one synchronous fixed-phase frame, then the loop ----------
+  resize();
+  draw(T0);
+  if (rafFn) {
+    startStamp = nowMs();
+    rafFn(loop);
+  }
+})();
+</script>
+</body>
+</html>

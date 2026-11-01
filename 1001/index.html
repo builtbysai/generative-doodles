@@ -1,0 +1,509 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>The Stage Is a Medium</title>
+<style>
+  html, body { margin:0; padding:0; background:#0A0D12; height:100%; overflow:hidden; }
+  canvas { display:block; touch-action:none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // No.1001 "The Stage Is a Medium" - dancers inside a field of volumetric blocks.
+  // Three white silhouettes move slowly through the middle of a dark room while
+  // ~300 translucent boxes tumble around them in projected 3D. Bodies displace
+  // the medium: boxes near a figure are deflected and leave a brighter wake.
+  // Every ~36 s the whole field exhales outward for 4 s and the colors cool.
+  // Boxes run on a fixed-step 120 Hz sim (seeded); figures are closed-form
+  // choreography. Frame one is the synchronous draw after exactly 2400 steps.
+
+  var ROOM = '#0A0D12', FIG = '#F2F4F6', FIGEDGE = '#2BD8FF',
+      BOXEDGE = '#7DE3FF', LIT = '#E8FBFF', WAKE = '#2BD8FF', COOL = '#141A22';
+
+  var DT = 1 / 120, PREROLL = 2400; // 20 s of sim before frame one
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ---------- deterministic helpers ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function lerp(a, b, f) { return a + (b - a) * f; }
+  function smooth(f) { return f * f * (3 - 2 * f); }
+
+  // ---------- view ----------
+  var viewW = 1280, viewH = 900, isPhone = false;
+  function detectPhone() {
+    var sw = 0, sh = 0;
+    try { sw = window.screen.width; sh = window.screen.height; } catch (e) {}
+    if (sw && sh) return Math.min(sw, sh) < 700;
+    return viewH > viewW * 1.15;
+  }
+  function resize() {
+    var w = 0, h = 0;
+    try {
+      if (window.visualViewport) { w = window.visualViewport.width; h = window.visualViewport.height; }
+    } catch (e) {}
+    if (!w || !h) { w = window.innerWidth || 1280; h = window.innerHeight || 900; }
+    viewW = Math.round(w); viewH = Math.round(h);
+    isPhone = detectPhone();
+    var dpr = 1;
+    try { dpr = Math.min(2, window.devicePixelRatio || 1); } catch (e) {}
+    canvas.width = Math.round(viewW * dpr);
+    canvas.height = Math.round(viewH * dpr);
+    canvas.style.width = viewW + 'px';
+    canvas.style.height = viewH + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  if (window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', resize);
+  if (window.addEventListener) window.addEventListener('resize', resize);
+
+  function unit() { return Math.min(viewW, viewH) * 0.46; }
+  // perspective factor by depth d (0 far, 1 near)
+  function persp(d) { return 0.5 + 0.85 * d; }
+  var cam = { x: 0, y: 0 };
+  function projX(x, d) { return viewW / 2 + (x - cam.x) * unit() * persp(d); }
+  function projY(y, d) { return viewH / 2 + (y - cam.y) * unit() * persp(d); }
+
+  // ---------- world state ----------
+  var seedBase = 1001162;
+  var simTime = 0;
+  var boxes = [], figures = [];
+  var trackIdx = -1, trackUntil = -1;
+  var tilt = { x: 0, y: 0 };
+  var pendingTick = false;
+
+  var POSE_KEYS = ['lean', 'crouch', 'head', 'shL', 'elL', 'shR', 'elR', 'hipL', 'kneeL', 'hipR', 'kneeR'];
+  function makePose(rng, kind) {
+    var p;
+    if (kind === 0) {          // neutral
+      p = { lean: 0.05, crouch: 0.00, head: 0.00, shL: 0.15, elL: -0.20, shR: -0.15, elR: -0.20, hipL: 0.10, kneeL: 0.10, hipR: -0.10, kneeR: 0.15 };
+    } else if (kind === 1) {   // reach
+      p = { lean: -0.08, crouch: 0.00, head: -0.10, shL: 0.30, elL: -0.30, shR: -2.65, elR: -0.20, hipL: 0.16, kneeL: 0.06, hipR: -0.14, kneeR: 0.20 };
+    } else if (kind === 2) {   // fold
+      p = { lean: 0.78, crouch: 0.15, head: 0.25, shL: 0.95, elL: -0.25, shR: 0.90, elR: -0.30, hipL: 0.22, kneeL: 0.55, hipR: 0.10, kneeR: 0.62 };
+    } else if (kind === 3) {   // turn, arms wide
+      p = { lean: 0.02, crouch: 0.02, head: 0.35, shL: 1.25, elL: -0.15, shR: -1.25, elR: -0.15, hipL: 0.36, kneeL: 0.08, hipR: -0.36, kneeR: 0.08 };
+    } else {                   // step, one leg lifted
+      p = { lean: 0.10, crouch: 0.03, head: 0.05, shL: -0.55, elL: -0.35, shR: 0.55, elR: -0.25, hipL: 0.52, kneeL: 0.75, hipR: -0.08, kneeR: 0.12 };
+    }
+    for (var i = 0; i < POSE_KEYS.length; i++) p[POSE_KEYS[i]] += (rng() - 0.5) * 0.22;
+    return p;
+  }
+
+  function buildWorld(seed) {
+    var rng = mulberry32(seed);
+    figures = [];
+    for (var i = 0; i < 3; i++) {
+      var order = [0, 1, 2, 3, 4];
+      // seeded shuffle of the phrase order per figure
+      for (var k = order.length - 1; k > 0; k--) {
+        var j = Math.floor(rng() * (k + 1)), tmp = order[k]; order[k] = order[j]; order[j] = tmp;
+      }
+      var poses = [];
+      for (var m = 0; m < 5; m++) poses.push(makePose(rng, order[m]));
+      figures.push({
+        cx: -0.38 + i * 0.38 + (rng() - 0.5) * 0.12,
+        cy: 0.02 + (rng() - 0.5) * 0.22,
+        ax: 0.10 + rng() * 0.10, ay: 0.05 + rng() * 0.06,
+        t1: 26 + rng() * 14, t2: 19 + rng() * 11, t3: 7 + rng() * 5,
+        p1: rng() * 6.283, p2: rng() * 6.283, p3: rng() * 6.283,
+        period: 16 + rng() * 6, phase: rng() * 20,
+        turnRate: 0.05 + rng() * 0.05, turnPhase: rng() * 6.283,
+        poses: poses,
+        joints: null, speed: 0, sx: 0, sy: 0
+      });
+    }
+    boxes = [];
+    var n = isPhone ? 220 : 300;
+    for (var b = 0; b < n; b++) {
+      boxes.push({
+        x: (rng() * 2 - 1) * 1.9,
+        y: (rng() * 2 - 1) * 1.35,
+        d: Math.pow(rng(), 1.25),               // bias toward far, still some near
+        vx: (rng() - 0.5) * 0.030,
+        vy: (rng() - 0.5) * 0.022,
+        dvx: 0, dvy: 0,
+        wob: rng() * 6.283, wobF: 0.15 + rng() * 0.3, wobA: 0.006 + rng() * 0.010,
+        rot: rng() * 6.283, rotV: (rng() - 0.5) * 0.5,
+        size: 0.06 + rng() * 0.14,
+        lit: (b % 20 === 0),
+        wake: 0,
+        hx: [], hy: []
+      });
+    }
+    // draw far to near: sort once by depth (depth is fixed per box)
+    boxes.sort(function (a, b2) { return a.d - b2.d; });
+  }
+
+  // ---------- figure choreography (closed form in t) ----------
+  var SEG = { thigh: 0.16, shin: 0.16, upper: 0.13, fore: 0.13, torso: 0.20, neck: 0.075 };
+  function choreo(fig, t) {
+    var rx = fig.cx + fig.ax * Math.sin(6.2832 * t / fig.t1 + fig.p1) + 0.06 * Math.sin(6.2832 * t / fig.t3 + fig.p3);
+    var ry = fig.cy + fig.ay * Math.sin(6.2832 * t / fig.t2 + fig.p2);
+    var u = ((t + fig.phase) % fig.period) / fig.period;
+    var segF = u * 5, si = Math.floor(segF) % 5, sf = smooth(segF - Math.floor(segF));
+    var A = fig.poses[si], B = fig.poses[(si + 1) % 5], pose = {};
+    for (var i = 0; i < POSE_KEYS.length; i++) pose[POSE_KEYS[i]] = lerp(A[POSE_KEYS[i]], B[POSE_KEYS[i]], sf);
+    var f = Math.sin(6.2832 * t * fig.turnRate + fig.turnPhase);
+    var sx = (f < 0 ? -1 : 1) * (0.35 + 0.65 * Math.abs(f)); // facing, eased through the turn
+    var py = ry + pose.crouch * 0.5;
+    function limb(ang, len) { return [Math.sin(ang) * sx * len, Math.cos(ang) * len]; }
+    var pelvis = [rx, py];
+    var neck = [rx + Math.sin(pose.lean) * sx * SEG.torso, py - Math.cos(pose.lean) * SEG.torso];
+    var head = [neck[0] + Math.sin(pose.lean + pose.head) * sx * SEG.neck, neck[1] - Math.cos(pose.lean + pose.head) * SEG.neck];
+    var elL = limb(pose.shL, SEG.upper), elR = limb(pose.shR, SEG.upper);
+    var elbL = [neck[0] + elL[0], neck[1] + elL[1]], elbR = [neck[0] + elR[0], neck[1] + elR[1]];
+    var haL = limb(pose.shL + pose.elL, SEG.fore), haR = limb(pose.shR + pose.elR, SEG.fore);
+    var handL = [elbL[0] + haL[0], elbL[1] + haL[1]], handR = [elbR[0] + haR[0], elbR[1] + haR[1]];
+    var knL = limb(pose.hipL, SEG.thigh), knR = limb(pose.hipR, SEG.thigh);
+    var kneeL = [pelvis[0] + knL[0], pelvis[1] + knL[1]], kneeR = [pelvis[0] + knR[0], pelvis[1] + knR[1]];
+    var ftL = limb(pose.hipL - pose.kneeL, SEG.shin), ftR = limb(pose.hipR - pose.kneeR, SEG.shin);
+    var footL = [kneeL[0] + ftL[0], kneeL[1] + ftL[1]], footR = [kneeR[0] + ftR[0], kneeR[1] + ftR[1]];
+    return {
+      pelvis: pelvis, neck: neck, head: head,
+      elbL: elbL, elbR: elbR, handL: handL, handR: handR,
+      kneeL: kneeL, kneeR: kneeR, footL: footL, footR: footR,
+      body: [head, neck, pelvis, handL, handR, footL, footR]
+    };
+  }
+
+  // ---------- exhale envelope ----------
+  function exhaleAt(t) {
+    var c = t % 36;
+    return c < 4 ? Math.sin(Math.PI * c / 4) : 0;
+  }
+
+  // ---------- sim step ----------
+  function stepSim() {
+    simTime += DT;
+    var i, j, b, fig;
+    for (i = 0; i < figures.length; i++) {
+      fig = figures[i];
+      var prev = fig.joints;
+      fig.joints = choreo(fig, simTime);
+      if (prev) {
+        var dx = fig.joints.pelvis[0] - prev.pelvis[0], dy = fig.joints.pelvis[1] - prev.pelvis[1];
+        fig.speed = Math.sqrt(dx * dx + dy * dy) / DT;
+      }
+    }
+    var ex = exhaleAt(simTime);
+    var stepCount = Math.round(simTime / DT);
+    for (i = 0; i < boxes.length; i++) {
+      b = boxes[i];
+      var wx = b.vx + Math.sin(simTime * b.wobF + b.wob) * b.wobA;
+      var wy = b.vy + Math.cos(simTime * b.wobF * 0.9 + b.wob) * b.wobA;
+      // deflection from figure bodies
+      var df = 0.45 + 0.55 * b.d;
+      for (j = 0; j < figures.length; j++) {
+        var pts = figures[j].joints.body;
+        for (var q = 0; q < pts.length; q++) {
+          var ddx = b.x - pts[q][0], ddy = b.y - pts[q][1];
+          var dist2 = ddx * ddx + ddy * ddy, R = 0.30;
+          if (dist2 < R * R && dist2 > 1e-6) {
+            var dist = Math.sqrt(dist2), s = (1 - dist / R) * 2.6 * df;
+            b.dvx += (ddx / dist) * s * DT * 13;
+            b.dvy += (ddy / dist) * s * DT * 13;
+            var before = b.wake;
+            b.wake = Math.min(1, b.wake + s * DT * 14);
+            if (before < 0.75 && b.wake >= 0.75) pendingTick = true;
+          }
+        }
+      }
+      if (ex > 0) {
+        var rl = Math.sqrt(b.x * b.x + b.y * b.y) || 1;
+        b.dvx += (b.x / rl) * ex * 0.55 * DT;
+        b.dvy += (b.y / rl) * ex * 0.55 * DT;
+      }
+      b.dvx += tilt.x * DT * 0.8;
+      b.dvy += tilt.y * DT * 0.8;
+      b.x += (wx + b.dvx) * DT;
+      b.y += (wy + b.dvy) * DT;
+      var decay = Math.exp(-DT * 2.2);
+      b.dvx *= decay; b.dvy *= decay;
+      b.wake *= Math.exp(-DT * 0.5);
+      b.rot += b.rotV * DT;
+      var wrapped = false;
+      if (b.x > 2.0) { b.x -= 4.0; wrapped = true; } else if (b.x < -2.0) { b.x += 4.0; wrapped = true; }
+      if (b.y > 1.5) { b.y -= 3.0; wrapped = true; } else if (b.y < -1.5) { b.y += 3.0; wrapped = true; }
+      if (wrapped) { b.hx.length = 0; b.hy.length = 0; }
+      if (stepCount % 2 === 0) {
+        b.hx.push(b.x); b.hy.push(b.y);
+        if (b.hx.length > 13) { b.hx.shift(); b.hy.shift(); }
+      }
+    }
+    // camera: ease toward the tracked figure or back to center
+    var tx = 0, ty = 0;
+    if (trackIdx >= 0 && simTime < trackUntil && figures[trackIdx]) {
+      tx = figures[trackIdx].joints.pelvis[0] * 0.6;
+      ty = figures[trackIdx].joints.pelvis[1] * 0.6;
+    }
+    var cf = 1 - Math.exp(-DT * 1.5);
+    cam.x += (tx - cam.x) * cf;
+    cam.y += (ty - cam.y) * cf;
+    // pour tilt settles over ~3 s
+    var tf = Math.exp(-DT / 1.0);
+    tilt.x *= tf; tilt.y *= tf;
+  }
+
+  // ---------- drawing ----------
+  function drawBox(b) {
+    var cx = projX(b.x, b.d), cy = projY(b.y, b.d);
+    var hs = b.size * unit() * (0.30 + 1.0 * b.d) * 0.5;
+    if (cx < -hs * 2 || cx > viewW + hs * 2 || cy < -hs * 2 || cy > viewH + hs * 2) return;
+    var c = Math.cos(b.rot), s = Math.sin(b.rot);
+    function corner(px, py) { return [cx + (px * c - py * s) * hs, cy + (px * s + py * c) * hs]; }
+    var f = [corner(-1, -1), corner(1, -1), corner(1, 1), corner(-1, 1)];
+    function pathOf(pts) {
+      ctx.beginPath();
+      ctx.moveTo(pts[0][0], pts[0][1]);
+      for (var i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+      ctx.closePath();
+    }
+    if (b.d > 0.55) {
+      var ox = hs * 0.34, oy = -hs * 0.30, bk = [];
+      for (var i = 0; i < 4; i++) bk.push([f[i][0] + ox, f[i][1] + oy]);
+      ctx.strokeStyle = BOXEDGE; ctx.globalAlpha = 0.28; ctx.lineWidth = 1;
+      pathOf(bk); ctx.stroke();
+      ctx.beginPath();
+      for (var k = 0; k < 4; k++) { ctx.moveTo(f[k][0], f[k][1]); ctx.lineTo(bk[k][0], bk[k][1]); }
+      ctx.stroke();
+    }
+    ctx.fillStyle = BOXEDGE; ctx.globalAlpha = 0.08;
+    pathOf(f); ctx.fill();
+    ctx.strokeStyle = BOXEDGE; ctx.globalAlpha = 0.5; ctx.lineWidth = 1;
+    pathOf(f); ctx.stroke();
+    if (b.lit) {
+      var g = [corner(-0.45, -0.45), corner(0.45, -0.45), corner(0.45, 0.45), corner(-0.45, 0.45)];
+      ctx.fillStyle = LIT; ctx.globalAlpha = 0.45;
+      pathOf(g); ctx.fill();
+      ctx.globalAlpha = 0.85;
+      ctx.fillRect(cx - 1.5, cy - 1.5, 3, 3);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawWake(b) {
+    if (b.wake < 0.12 || b.hx.length < 2) return;
+    ctx.strokeStyle = WAKE;
+    ctx.globalAlpha = 0.25 * Math.min(1, b.wake * 1.35);
+    ctx.lineWidth = 1.6 + b.d * 2.4;
+    ctx.beginPath();
+    for (var i = 0; i < b.hx.length; i++) {
+      var px = projX(b.hx[i], b.d), py = projY(b.hy[i], b.d);
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.lineTo(projX(b.x, b.d), projY(b.y, b.d));
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  function seg(a, b2, w) {
+    ctx.beginPath();
+    ctx.moveTo(a[0], a[1]); ctx.lineTo(b2[0], b2[1]);
+    ctx.lineWidth = w; ctx.stroke();
+  }
+  function drawFigure(fig) {
+    var J = fig.joints, d = 0.6, u = unit() * persp(d);
+    function P(p) { return [projX(p[0], d), projY(p[1], d)]; }
+    var pelvis = P(J.pelvis), neck = P(J.neck), head = P(J.head);
+    fig.sx = pelvis[0]; fig.sy = pelvis[1];
+    var limbW = 0.034 * u, torsoW = 0.05 * u;
+    var parts = [
+      [pelvis, neck, torsoW],
+      [neck, P(J.elbL), limbW], [P(J.elbL), P(J.handL), limbW * 0.85],
+      [neck, P(J.elbR), limbW], [P(J.elbR), P(J.handR), limbW * 0.85],
+      [pelvis, P(J.kneeL), limbW], [P(J.kneeL), P(J.footL), limbW * 0.85],
+      [pelvis, P(J.kneeR), limbW], [P(J.kneeR), P(J.footR), limbW * 0.85]
+    ];
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    ctx.strokeStyle = FIGEDGE; ctx.globalAlpha = 0.22;
+    for (var i = 0; i < parts.length; i++) seg(parts[i][0], parts[i][1], parts[i][2] * 1.6);
+    ctx.globalAlpha = 1; ctx.strokeStyle = FIG;
+    for (var k = 0; k < parts.length; k++) seg(parts[k][0], parts[k][1], parts[k][2]);
+    var hr = 0.052 * u;
+    ctx.beginPath(); ctx.arc(head[0], head[1], hr, 0, 6.2832);
+    ctx.fillStyle = FIG; ctx.fill();
+    ctx.strokeStyle = FIGEDGE; ctx.globalAlpha = 0.55; ctx.lineWidth = 1.5; ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  function draw() {
+    canvas.style.width = viewW + 'px';
+    canvas.style.height = viewH + 'px';
+    ctx.fillStyle = ROOM;
+    ctx.fillRect(0, 0, viewW, viewH);
+    var i;
+    for (i = 0; i < boxes.length; i++) if (boxes[i].d < 0.45) { drawWake(boxes[i]); drawBox(boxes[i]); }
+    for (i = 0; i < figures.length; i++) drawFigure(figures[i]);
+    for (i = 0; i < boxes.length; i++) if (boxes[i].d >= 0.45) { drawWake(boxes[i]); drawBox(boxes[i]); }
+    var ex = exhaleAt(simTime);
+    if (ex > 0.01) {
+      ctx.fillStyle = COOL;
+      ctx.globalAlpha = ex * 0.30;
+      ctx.fillRect(0, 0, viewW, viewH);
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  // ---------- audio (lazy, gesture-gated, guarded) ----------
+  var AC = null, droneOsc = [], droneGain = [], swellGain = null;
+  function initAudio() {
+    if (AC) return;
+    try {
+      var Ctor = (typeof AudioContext !== 'undefined') ? AudioContext :
+                 (typeof window !== 'undefined' && window.webkitAudioContext) ? window.webkitAudioContext : null;
+      if (!Ctor) return;
+      AC = new Ctor();
+      var master = AC.createGain(); master.gain.value = 0.6; master.connect(AC.destination);
+      for (var i = 0; i < 3; i++) {
+        var o = AC.createOscillator(), g = AC.createGain();
+        o.type = 'sine'; o.frequency.value = 58 + i * 17; g.gain.value = 0.0;
+        o.connect(g); g.connect(master); o.start();
+        droneOsc.push(o); droneGain.push(g);
+      }
+      var len = AC.sampleRate * 2, buf = AC.createBuffer(1, len, AC.sampleRate), ch = buf.getChannelData(0);
+      var r = mulberry32(777);
+      for (var n = 0; n < len; n++) ch[n] = r() * 2 - 1;
+      var src = AC.createBufferSource(); src.buffer = buf; src.loop = true;
+      var flt = AC.createBiquadFilter(); flt.type = 'lowpass'; flt.frequency.value = 320;
+      swellGain = AC.createGain(); swellGain.gain.value = 0;
+      src.connect(flt); flt.connect(swellGain); swellGain.connect(master); src.start();
+      AC._master = master;
+    } catch (e) { AC = null; }
+  }
+  var lastTickAt = 0;
+  function playTick() {
+    if (!AC) return;
+    try {
+      var now = AC.currentTime;
+      if (now - lastTickAt < 0.08) return;
+      lastTickAt = now;
+      var o = AC.createOscillator(), g = AC.createGain();
+      o.type = 'triangle'; o.frequency.value = 2100 + Math.random() * 600;
+      g.gain.setValueAtTime(0.05, now);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + 0.06);
+      o.connect(g); g.connect(AC._master); o.start(now); o.stop(now + 0.07);
+    } catch (e) {}
+  }
+  function updateAudio() {
+    if (!AC) return;
+    try {
+      if (AC.resume) AC.resume();
+      for (var i = 0; i < 3; i++) {
+        var sp = figures[i] ? figures[i].speed : 0;
+        droneOsc[i].frequency.value = 52 + i * 17 + clamp(sp, 0, 1.2) * 55;
+        droneGain[i].gain.value = 0.016;
+      }
+      if (swellGain) swellGain.gain.value = exhaleAt(simTime) * 0.10;
+      if (pendingTick) { pendingTick = false; playTick(); }
+    } catch (e) {}
+  }
+
+  // ---------- interaction ----------
+  function evPos(ev) {
+    var x = 0, y = 0;
+    try {
+      var rect = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : null;
+      if (rect) { x = ev.clientX - rect.left; y = ev.clientY - rect.top; }
+      else { x = ev.offsetX || 0; y = ev.offsetY || 0; }
+    } catch (e) {}
+    return { x: x, y: y };
+  }
+  var pDown = null, lastTap = { t: -10, x: 0, y: 0 };
+  function onDown(ev) {
+    initAudio();
+    var p = evPos(ev);
+    pDown = { x: p.x, y: p.y, t: simTime, moved: false, lx: p.x, ly: p.y };
+  }
+  function onMove(ev) {
+    if (!pDown) return;
+    var p = evPos(ev);
+    var dx = p.x - pDown.lx, dy = p.y - pDown.ly;
+    if (Math.abs(p.x - pDown.x) + Math.abs(p.y - pDown.y) > 14) pDown.moved = true;
+    if (pDown.moved) {
+      var u = unit();
+      tilt.x = clamp(tilt.x + dx / u * 1.4, -0.6, 0.6);
+      tilt.y = clamp(tilt.y + dy / u * 1.4, -0.6, 0.6);
+    }
+    pDown.lx = p.x; pDown.ly = p.y;
+  }
+  function onUp(ev) {
+    if (!pDown) return;
+    var wasDrag = pDown.moved;
+    var p = evPos(ev);
+    pDown = null;
+    if (wasDrag) return;
+    var dt = simTime - lastTap.t;
+    var dd = Math.abs(p.x - lastTap.x) + Math.abs(p.y - lastTap.y);
+    if (dt < 0.4 && dd < 48) {
+      // double-tap: new phrase, new field
+      seedBase += 1;
+      buildWorld(seedBase * 7919 + 13);
+      trackIdx = -1; trackUntil = -1;
+      for (var i = 0; i < PREROLL; i++) stepSim();
+      lastTap = { t: -10, x: 0, y: 0 };
+      return;
+    }
+    lastTap = { t: simTime, x: p.x, y: p.y };
+    for (var i = 0; i < figures.length; i++) {
+      var f = figures[i];
+      if (f.sx !== undefined && Math.abs(p.x - f.sx) < 70 && Math.abs(p.y - f.sy) < 90) {
+        trackIdx = i; trackUntil = simTime + 10;
+        return;
+      }
+    }
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+    canvas.addEventListener('mousedown', function (ev) { if (typeof PointerEvent === 'undefined') onDown(ev); });
+    canvas.addEventListener('mousemove', function (ev) { if (typeof PointerEvent === 'undefined') onMove(ev); });
+    canvas.addEventListener('mouseup', function (ev) { if (typeof PointerEvent === 'undefined') onUp(ev); });
+  }
+
+  // ---------- boot and loop ----------
+  resize();
+  buildWorld(seedBase * 7919 + 13);
+  for (var s = 0; s < PREROLL; s++) stepSim();
+  draw(); // frame one: synchronous, fixed-phase, after exactly 2400 steps
+
+  var rafFn = (typeof requestAnimationFrame !== 'undefined') ? requestAnimationFrame : null;
+  var lastStamp = -1, acc = 0;
+  function nowMs() {
+    try { if (typeof performance !== 'undefined' && performance.now) return performance.now(); } catch (e) {}
+    return 0;
+  }
+  function loop() {
+    var now = nowMs();
+    if (lastStamp < 0) lastStamp = now;
+    var elapsed = Math.min(0.1, Math.max(0, (now - lastStamp) / 1000));
+    lastStamp = now;
+    acc += elapsed;
+    var steps = 0;
+    while (acc >= DT && steps < 24) { stepSim(); acc -= DT; steps++; }
+    if (steps === 24) acc = 0;
+    draw();
+    updateAudio();
+    if (rafFn) rafFn(loop);
+  }
+  if (rafFn) rafFn(loop);
+})();
+</script>
+</body>
+</html>

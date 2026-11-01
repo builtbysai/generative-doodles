@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Draw What the Blade Does</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #04050A; height: 100%; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- constants / palette ----------
+  var FIELD = '#04050A';
+  var PISTE = '#14161C';
+  var HEAD = [255, 255, 255];
+  var RIBBONS = [[255, 43, 43], [43, 216, 255], [255, 255, 255]]; // red, cyan, white
+  var NAMES = ['red', 'cyan', 'white'];
+
+  var DT = 1 / 120;            // fixed timestep
+  var PREROLL = 1440;          // steps before frame one (12 s)
+  var TRAIL = 720;             // samples kept per mover (6 s at 120 Hz)
+  var TRAIL_SECONDS = 6;
+
+  // ---------- seeded rng ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- sim ----------
+  // Field units: 1 unit = piste height; x spans [0, AX] where AX = piste aspect.
+  // AX is set from layout at build time; physics is isotropic in these units.
+  var AX = 1;
+  var seedBase = 1000161;
+  var sim = null;
+
+  function buildSim(seed) {
+    var rng = mulberry32(seed);
+    var movers = [];
+    var defs = [
+      { speed: 0.62, steer: 3.2, max: 0.95 },   // red
+      { speed: 0.78, steer: 3.6, max: 1.15 },   // cyan
+      { speed: 1.00, steer: 4.2, max: 1.45 }    // white: the fastest
+    ];
+    for (var i = 0; i < 3; i++) {
+      var a = (i / 3) * Math.PI * 2 + rng() * 0.8;
+      var px = AX * (0.5 + 0.30 * Math.cos(a));
+      var py = 0.5 + 0.30 * Math.sin(a);
+      var va = rng() * Math.PI * 2;
+      movers.push({
+        x: px, y: py,
+        vx: Math.cos(va) * defs[i].speed, vy: Math.sin(va) * defs[i].speed,
+        tx: AX * rng(), ty: rng(),
+        targetTimer: 0, wanderTimer: 0.5 + rng() * 1.2,
+        speed: defs[i].speed, steer: defs[i].steer, max: defs[i].max,
+        bx: new Float32Array(TRAIL), by: new Float32Array(TRAIL),
+        head: 0, count: 0,
+        crossCool: [0, 0, 0]
+      });
+    }
+    return {
+      rng: rng, movers: movers, step: 0,
+      flashes: [],          // {x, y, step}
+      follow: -1, followUntil: -1,
+      pendingTicks: 0
+    };
+  }
+
+  function pushSample(m) {
+    m.bx[m.head] = m.x; m.by[m.head] = m.y;
+    m.head = (m.head + 1) % TRAIL;
+    if (m.count < TRAIL) m.count++;
+  }
+  // sample k steps back from the newest (0 = newest)
+  function sampleAt(m, back) {
+    var idx = (m.head - 1 - back + TRAIL * 2) % TRAIL;
+    return [m.bx[idx], m.by[idx]];
+  }
+
+  function stepSim(live) {
+    var s = sim, rng = s.rng, ms = s.movers, i, j;
+    s.step++;
+    // pointer well (drag = stir), evaluated from current pointer state
+    var well = pointer.active ? pointer : null;
+    for (i = 0; i < 3; i++) {
+      var m = ms[i];
+      // wander target relocation
+      m.targetTimer -= DT;
+      var dx = m.tx - m.x, dy = m.ty - m.y;
+      var dTarget = Math.sqrt(dx * dx + dy * dy);
+      if (dTarget < 0.06 || m.targetTimer <= 0) {
+        m.tx = 0.06 + rng() * (AX - 0.12);
+        m.ty = 0.06 + rng() * 0.88;
+        m.targetTimer = 1.1 + rng() * 1.5;
+        dx = m.tx - m.x; dy = m.ty - m.y; dTarget = Math.sqrt(dx * dx + dy * dy) || 1;
+      }
+      // spring steer toward target at this mover's cruising speed
+      var ax = (dx / dTarget * m.speed - m.vx) * m.steer;
+      var ay = (dy / dTarget * m.speed - m.vy) * m.steer;
+      // pairwise duel forces: engage at range, repel up close
+      for (j = 0; j < 3; j++) {
+        if (j === i) continue;
+        var o = ms[j];
+        var ox = o.x - m.x, oy = o.y - m.y;
+        var od = Math.sqrt(ox * ox + oy * oy) || 0.0001;
+        var ux = ox / od, uy = oy / od;
+        if (od < 0.10) { ax -= ux * (0.10 - od) * 26; ay -= uy * (0.10 - od) * 26; }
+        else if (od < 0.48) { ax += ux * 0.30; ay += uy * 0.30; }
+      }
+      // seeded wander kicks
+      m.wanderTimer -= DT;
+      if (m.wanderTimer <= 0) {
+        m.wanderTimer = 0.8 + rng() * 1.1;
+        var sp = Math.sqrt(m.vx * m.vx + m.vy * m.vy) || 1;
+        var kick = (rng() - 0.5) * 0.55;
+        ax += (-m.vy / sp) * kick / DT * 0.12;
+        ay += (m.vx / sp) * kick / DT * 0.12;
+      }
+      // drag well: curve around the finger
+      if (well) {
+        var wx = m.x - well.x, wy = m.y - well.y;
+        var wd = Math.sqrt(wx * wx + wy * wy);
+        if (wd < 0.24 && wd > 0.0001) {
+          var fall = (0.24 - wd) / 0.24;
+          ax += (-wy / wd) * fall * 2.4 + (wx / wd) * fall * 0.7;
+          ay += (wx / wd) * fall * 2.4 + (wy / wd) * fall * 0.7;
+        }
+      }
+      m.vx += ax * DT; m.vy += ay * DT;
+      // speed clamp: never stall, never exceed the mover's max
+      var v = Math.sqrt(m.vx * m.vx + m.vy * m.vy);
+      if (v > m.max) { m.vx *= m.max / v; m.vy *= m.max / v; }
+      else if (v < 0.22 && v > 0.0001) { m.vx *= 0.22 / v; m.vy *= 0.22 / v; }
+      m.x += m.vx * DT; m.y += m.vy * DT;
+      // edge reflection inside the piste bounds
+      if (m.x < 0.015) { m.x = 0.015; m.vx = Math.abs(m.vx) * 0.94; }
+      if (m.x > AX - 0.015) { m.x = AX - 0.015; m.vx = -Math.abs(m.vx) * 0.94; }
+      if (m.y < 0.015) { m.y = 0.015; m.vy = Math.abs(m.vy) * 0.94; }
+      if (m.y > 0.985) { m.y = 0.985; m.vy = -Math.abs(m.vy) * 0.94; }
+      pushSample(m);
+      if (m.crossCool[0] > 0) m.crossCool[0] -= DT;
+      if (m.crossCool[1] > 0) m.crossCool[1] -= DT;
+      if (m.crossCool[2] > 0) m.crossCool[2] -= DT;
+    }
+    // crossing detection: head vs the other movers' trails, plus head vs head
+    for (i = 0; i < 3; i++) {
+      var h = ms[i];
+      for (j = 0; j < 3; j++) {
+        if (j === i || h.crossCool[j] > 0) continue;
+        var t2 = ms[j], hit = false, hx = 0, hy = 0;
+        var hd = Math.sqrt((t2.x - h.x) * (t2.x - h.x) + (t2.y - h.y) * (t2.y - h.y));
+        if (hd < 0.022) { hit = true; hx = (h.x + t2.x) / 2; hy = (h.y + t2.y) / 2; }
+        if (!hit) {
+          for (var b = 10; b < t2.count; b += 10) {
+            var p = sampleAt(t2, b);
+            var ddx = p[0] - h.x, ddy = p[1] - h.y;
+            if (ddx * ddx + ddy * ddy < 0.00023) { hit = true; hx = h.x; hy = h.y; break; }
+          }
+        }
+        if (hit) {
+          s.flashes.push({ x: hx, y: hy, step: s.step });
+          h.crossCool[j] = 0.45;
+          if (live) s.pendingTicks++;
+        }
+      }
+    }
+    // prune old flashes
+    while (s.flashes.length && (s.step - s.flashes[0].step) > 90) s.flashes.shift();
+    if (s.flashes.length > 48) s.flashes.splice(0, s.flashes.length - 48);
+  }
+
+  // ---------- pointer state (events, consumed by the sim) ----------
+  var pointer = { active: false, x: 0, y: 0 };
+  var downInfo = null, lastTapStep = -1000, lastTapX = 0, lastTapY = 0;
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 720, H = 720;
+
+  function viewportSize() {
+    var w, h;
+    if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.width) {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    } else if (typeof window !== 'undefined' && window.innerWidth) {
+      w = window.innerWidth; h = window.innerHeight;
+    } else { w = W; h = H; }
+    return [Math.round(w), Math.round(h)];
+  }
+  function isPhone() {
+    if (typeof window !== 'undefined' && window.screen && window.screen.width) {
+      return Math.min(window.screen.width, window.screen.height) < 700;
+    }
+    return H > W * 1.15;
+  }
+  function pisteRect() {
+    var mx = W * 0.055, my = H * 0.055;
+    return { x: mx, y: my, w: W - 2 * mx, h: H - 2 * my };
+  }
+  function resize() {
+    var s = viewportSize(); W = s[0]; H = s[1];
+    canvas.width = W; canvas.height = H;
+    canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+    draw();
+  }
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', resize);
+    }
+    if (window.addEventListener) window.addEventListener('resize', resize);
+  }
+  function toSim(px, py) {
+    var r = pisteRect();
+    return [(px - r.x) / r.h, (py - r.y) / r.h];
+  }
+
+  // ---------- draw ----------
+  function rgba(c, a) { return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a + ')'; }
+
+  function draw() {
+    var r = pisteRect();
+    var scale = Math.max(0.55, Math.min(1.15, Math.min(W, H) / 720));
+    canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+    ctx.fillStyle = FIELD;
+    ctx.fillRect(0, 0, W, H);
+    // piste outline: hairline, barely there
+    ctx.strokeStyle = PISTE;
+    ctx.lineWidth = 1;
+    ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1);
+    // a second, inner hairline to suggest the piste's long rectangle
+    ctx.globalAlpha = 0.55;
+    ctx.strokeRect(r.x + r.w * 0.04 + 0.5, r.y + r.h * 0.06 + 0.5, r.w * 0.92 - 1, r.h * 0.88 - 1);
+    ctx.globalAlpha = 1;
+
+    var following = sim.follow >= 0 && sim.step < sim.followUntil;
+    var i, m, k;
+    // ribbons: oldest first so heads land on top
+    for (i = 0; i < 3; i++) {
+      m = sim.movers[i];
+      var dim = (following && sim.follow !== i) ? 0.35 : 1;
+      var col = RIBBONS[i];
+      var n = m.count;
+      var RUN = 9;
+      for (var start = n - 1; start >= 0; start -= RUN) {
+        var end = Math.max(0, start - RUN);   // share one sample with the next run: no gaps
+        var midBack = (start + end) / 2;
+        var age = midBack * DT;
+        var f = 1 - age / TRAIL_SECONDS;
+        if (f <= 0) continue;
+        var alpha = Math.pow(f, 1.55) * 0.92 * dim;
+        ctx.strokeStyle = rgba(col, alpha);
+        ctx.lineWidth = Math.max(0.4, f * 5 * scale);
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        ctx.beginPath();
+        for (k = start; k >= end; k--) {
+          var p = sampleAt(m, k);
+          var X = r.x + p[0] * r.h, Y = r.y + p[1] * r.h;
+          if (k === start) ctx.moveTo(X, Y); else ctx.lineTo(X, Y);
+        }
+        ctx.stroke();
+      }
+    }
+    // crossing flashes: bright nodes where paths braid
+    for (i = 0; i < sim.flashes.length; i++) {
+      var fl = sim.flashes[i];
+      var fa = 1 - (sim.step - fl.step) * DT / 0.5;
+      if (fa <= 0) continue;
+      var FX = r.x + fl.x * r.h, FY = r.y + fl.y * r.h;
+      ctx.fillStyle = rgba(HEAD, 0.20 * fa);
+      ctx.beginPath(); ctx.arc(FX, FY, 6.5 * scale, 0, 6.2832); ctx.fill();
+      ctx.fillStyle = rgba(HEAD, 0.85 * fa);
+      ctx.beginPath(); ctx.arc(FX, FY, 2.4 * scale, 0, 6.2832); ctx.fill();
+    }
+    // heads: a dim streak and the one constant, the bright marker dot
+    for (i = 0; i < 3; i++) {
+      m = sim.movers[i];
+      var prev = sampleAt(m, 3);
+      var HX = r.x + m.x * r.h, HY = r.y + m.y * r.h;
+      var PX = r.x + prev[0] * r.h, PY = r.y + prev[1] * r.h;
+      ctx.strokeStyle = rgba(HEAD, 0.35);
+      ctx.lineWidth = Math.max(1, 1.6 * scale);
+      ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(PX, PY); ctx.lineTo(HX, HY); ctx.stroke();
+      ctx.fillStyle = rgba(HEAD, 1);
+      ctx.beginPath(); ctx.arc(HX, HY, Math.max(1.6, 2 * scale), 0, 6.2832); ctx.fill();
+    }
+  }
+
+  // ---------- audio (lazy, guarded; visual is complete in silence) ----------
+  var AC = null, whistles = [];
+  function ensureAudio() {
+    if (AC) { try { if (AC.resume) AC.resume(); } catch (e) {} return; }
+    var Ctor = null;
+    if (typeof AudioContext !== 'undefined') Ctor = AudioContext;
+    else if (typeof window !== 'undefined' && window.webkitAudioContext) Ctor = window.webkitAudioContext;
+    if (!Ctor) return;
+    try {
+      AC = new Ctor();
+      for (var i = 0; i < 3; i++) {
+        var o = AC.createOscillator(), g = AC.createGain();
+        o.type = 'sine'; o.frequency.value = 640 + i * 120;
+        g.gain.value = 0;
+        o.connect(g); g.connect(AC.destination); o.start();
+        whistles.push({ o: o, g: g });
+      }
+    } catch (e) { AC = null; whistles = []; }
+  }
+  function playTick() {
+    if (!AC) return;
+    try {
+      var o = AC.createOscillator(), g = AC.createGain();
+      o.type = 'triangle'; o.frequency.value = 2350;
+      var t = AC.currentTime;
+      g.gain.setValueAtTime(0.06, t);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.07);
+      o.connect(g); g.connect(AC.destination);
+      o.start(t); o.stop(t + 0.08);
+    } catch (e) {}
+  }
+  function updateAudio() {
+    if (!AC || !whistles.length) return;
+    try {
+      var t = AC.currentTime;
+      for (var i = 0; i < 3; i++) {
+        var m = sim.movers[i];
+        var v = Math.sqrt(m.vx * m.vx + m.vy * m.vy);
+        whistles[i].o.frequency.setTargetAtTime(420 + v * 640, t, 0.06);
+        whistles[i].g.gain.setTargetAtTime(0.011, t, 0.1);
+      }
+      while (sim.pendingTicks > 0) { playTick(); sim.pendingTicks--; }
+    } catch (e) {}
+  }
+
+  // ---------- interaction ----------
+  function nearestRibbon(px, py) {
+    var best = -1, bestD = 0.035;
+    for (var i = 0; i < 3; i++) {
+      var m = sim.movers[i];
+      for (var b = 0; b < m.count; b += 4) {
+        var p = sampleAt(m, b);
+        var dx = p[0] - px, dy = p[1] - py;
+        var d = Math.sqrt(dx * dx + dy * dy);
+        if (d < bestD) { bestD = d; best = i; }
+      }
+    }
+    return best;
+  }
+  function reseed() {
+    seedBase = (seedBase * 1103515245 + 12345) & 0x7fffffff;
+    var r = pisteRect();
+    AX = r.w / r.h;
+    sim = buildSim(seedBase);
+    for (var k = 0; k < PREROLL; k++) stepSim(false);
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', function (e) {
+      ensureAudio();
+      var px = (typeof e.clientX === 'number') ? e.clientX : e.offsetX;
+      var py = (typeof e.clientY === 'number') ? e.clientY : e.offsetY;
+      var sp = toSim(px, py);
+      pointer.active = true; pointer.x = sp[0]; pointer.y = sp[1];
+      downInfo = { x: sp[0], y: sp[1], step: sim.step, moved: false };
+    });
+    canvas.addEventListener('pointermove', function (e) {
+      if (!pointer.active) return;
+      var px = (typeof e.clientX === 'number') ? e.clientX : e.offsetX;
+      var py = (typeof e.clientY === 'number') ? e.clientY : e.offsetY;
+      var sp = toSim(px, py);
+      pointer.x = sp[0]; pointer.y = sp[1];
+      if (downInfo && Math.abs(sp[0] - downInfo.x) + Math.abs(sp[1] - downInfo.y) > 0.03) downInfo.moved = true;
+    });
+    canvas.addEventListener('pointerup', function (e) {
+      var wasDrag = downInfo && downInfo.moved;
+      pointer.active = false;
+      if (!downInfo || wasDrag) { downInfo = null; return; }
+      // a tap
+      if (sim.step - lastTapStep < 42) {           // double-tap: a new bout
+        reseed();
+        lastTapStep = -1000;
+        downInfo = null;
+        draw();
+        return;
+      }
+      lastTapStep = sim.step; lastTapX = downInfo.x; lastTapY = downInfo.y;
+      var hit = nearestRibbon(downInfo.x, downInfo.y);
+      if (hit >= 0) { sim.follow = hit; sim.followUntil = sim.step + 1200; }
+      downInfo = null;
+    });
+  }
+
+  // ---------- run ----------
+  var s0 = viewportSize(); W = s0[0]; H = s0[1];
+  canvas.width = W; canvas.height = H;
+  canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+  var r0 = pisteRect();
+  AX = r0.w / r0.h;
+  sim = buildSim(seedBase);
+  for (var k = 0; k < PREROLL; k++) stepSim(false);
+  draw();                                        // frame one: fixed pre-roll, synchronous
+
+  if (typeof requestAnimationFrame === 'function') {
+    var lastTs = null, acc = 0;
+    var loop = function (ts) {
+      if (lastTs === null) lastTs = ts;
+      var elapsed = (ts - lastTs) / 1000;
+      lastTs = ts;
+      if (elapsed > 0.25) elapsed = 0.25;
+      acc += elapsed;
+      var steps = 0;
+      while (acc >= DT && steps < 12) { stepSim(true); acc -= DT; steps++; }
+      if (steps === 12) acc = 0;                 // cap: never spiral
+      draw();
+      updateAudio();
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>

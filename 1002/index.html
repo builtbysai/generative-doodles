@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Grows With the Audience</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#07080C; overflow:hidden; }
+  canvas { display:block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+/*
+  No.1002 "Grows With the Audience" (study #123 yuya-hanai, PP163 Mitsua).
+  A contribution wall of seeded scribble marks on the left; a model on the
+  right that trains ONLY on marks a visitor has opted in. Gray marks never
+  train. The piece opens with a founding audience: six marks contributed by
+  earlier visitors, already green when you arrive.
+*/
+var T0 = 30;              // frame one is the synchronous draw at this piece time
+var PASS = 4;             // seconds per training pass
+var SEED = 1002163;
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var W = 300, H = 300, PHONE = false;
+var currentT = T0;
+var visitorEvents = [];   // {mark, time} opt-ins made by this visitor
+var auditStart = -1;
+var LAY = null;
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    var t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+/* ---- founding audience: six prior contributions, seeded into the timeline ---- */
+var founding = (function () {
+  var rng = mulberry32(SEED ^ 0x9e37);
+  var pool = [], i;
+  for (i = 0; i < 24; i++) pool.push(i);
+  var chosen = [];
+  for (var k = 0; k < 6; k++) chosen.push(pool.splice(Math.floor(rng() * pool.length), 1)[0]);
+  var times = [4, 8.5, 12, 16.5, 21, 25.5];
+  var evs = [];
+  for (var k2 = 0; k2 < 6; k2++) {
+    var m = chosen[k2];
+    var tm = Math.max(times[k2] + rng() * 1.2, (m - 5) + 1.5); // never before the mark exists
+    evs.push({ mark: m, time: tm });
+  }
+  return evs;
+})();
+
+function spawnOf(i) { return i - 5; }                 // mark i appears at t = i-5 (one per second)
+function markCount(t) { var n = Math.floor(t + 5) + 1; return n < 0 ? 0 : n; }
+
+/* ---- seeded scribbles: one polyline study per mark, generated from its index ---- */
+var scribbleCache = [];
+function scribble(i) {
+  if (scribbleCache[i]) return scribbleCache[i];
+  var rng = mulberry32((SEED ^ Math.imul(i + 1, 2654435761)) >>> 0);
+  var type = Math.floor(rng() * 5);
+  var pts = [], n, k, f, a, r;
+  if (type === 0) {                                    // spiral
+    n = 42; var turns = 2 + Math.floor(rng() * 2), ph = rng() * 6.283;
+    for (k = 0; k < n; k++) { f = k / (n - 1); a = ph + f * turns * 6.283; r = 0.06 + f * 0.40; pts.push([0.5 + Math.cos(a) * r, 0.5 + Math.sin(a) * r]); }
+  } else if (type === 1) {                             // wave
+    n = 26; var amp = 0.14 + rng() * 0.16, per = 3 + Math.floor(rng() * 3), ph2 = rng() * 6.283;
+    for (k = 0; k < n; k++) { f = k / (n - 1); pts.push([0.08 + f * 0.84, 0.5 + Math.sin(ph2 + f * per * 6.283) * amp]); }
+  } else if (type === 2) {                             // zigzag hatch
+    n = 30; var amp2 = 0.10 + rng() * 0.14, per2 = 5 + Math.floor(rng() * 4);
+    for (k = 0; k < n; k++) { f = k / (n - 1); pts.push([0.5 + ((k % 2) ? 1 : -1) * amp2 * Math.abs(Math.sin(f * per2 * 3.14159)), 0.12 + f * 0.76]); }
+  } else if (type === 3) {                             // wobbling loop
+    n = 36; var rx = 0.30 + rng() * 0.12, ry = 0.30 + rng() * 0.12, ph3 = rng() * 6.283, wob = 0.03 + rng() * 0.05;
+    for (k = 0; k < n; k++) { f = k / (n - 1); a = ph3 + f * 6.283; pts.push([0.5 + Math.cos(a) * (rx + Math.sin(a * 3) * wob), 0.5 + Math.sin(a) * (ry + Math.cos(a * 2) * wob)]); }
+  } else {                                             // wandering walk
+    n = 30; var x = 0.5, y = 0.5, ang = rng() * 6.283, step = 0.09;
+    for (k = 0; k < n; k++) {
+      pts.push([x, y]); ang += (rng() - 0.5) * 1.5;
+      x += Math.cos(ang) * step; y += Math.sin(ang) * step;
+      x = Math.max(0.08, Math.min(0.92, x)); y = Math.max(0.08, Math.min(0.92, y));
+    }
+  }
+  scribbleCache[i] = pts;
+  return pts;
+}
+
+/* ---- consent state: the opted-in set as of a given piece time ---- */
+function optedSet(X) {
+  var seen = {}, list = [], all = founding.concat(visitorEvents), j, m;
+  for (j = 0; j < all.length; j++) {
+    if (all[j].time <= X && !seen[all[j].mark]) { seen[all[j].mark] = true; list.push(all[j].mark); }
+  }
+  list.sort(function (a, b) { return a - b; });
+  return list;
+}
+function skillFor(count) { return Math.min(0.92, count * 0.05); }  // skill rises ONLY with opt-in count
+function auditActive(t) { return auditStart >= 0 && (t - auditStart) < 6; }
+
+function computeLayout() {
+  var pad = Math.max(8, Math.min(W, H) * 0.03);
+  var bottom = 34;
+  var divX = Math.round(W * (PHONE ? 0.48 : 0.5));
+  var wall = { x: pad, y: pad, w: divX - pad * 1.5, h: H - bottom - pad };
+  var cols = 7;
+  var cell = wall.w / cols;
+  var rowsVis = Math.max(1, Math.floor(wall.h / cell));
+  var model = { x: divX + pad * 0.5, y: pad, w: W - divX - pad * 1.5, h: H - bottom - pad };
+  var barW = PHONE ? 24 : 44;
+  var gap = Math.max(6, Math.min(W, H) * 0.015);
+  var S = Math.min(model.w - barW - gap, model.h * 0.86);
+  var panel = { x: model.x, y: model.y + (model.h - S) * 0.32, s: S };
+  var bars = { x: panel.x + S + gap, y: panel.y, w: barW, h: S };
+  LAY = { pad: pad, bottom: bottom, divX: divX, wall: wall, cols: cols, cell: cell, rowsVis: rowsVis, panel: panel, bars: bars, model: model };
+}
+
+function drawWall(t) {
+  var wall = LAY.wall, cell = LAY.cell, cols = LAY.cols;
+  var count = markCount(t);
+  var rows = Math.ceil(count / cols);
+  var off = Math.max(0, rows - LAY.rowsVis);
+  LAY.rowOff = off;
+  var set = optedSet(t), oset = {}, j;
+  for (j = 0; j < set.length; j++) oset[set[j]] = true;
+  var audit = auditActive(t);
+  ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  for (var i = 0; i < count; i++) {
+    var row = Math.floor(i / cols) - off;
+    if (row < 0) continue;
+    var col = i % cols;
+    var cx = wall.x + col * cell, cy = wall.y + row * cell;
+    var isOpt = !!oset[i];
+    if (isOpt) {                                       // soft halo: layered flat alpha behind the mark
+      ctx.fillStyle = '#7DF9C6';
+      ctx.globalAlpha = audit ? 0.16 : 0.10;
+      ctx.beginPath(); ctx.arc(cx + cell / 2, cy + cell / 2, cell * 0.46, 0, 6.2832); ctx.fill();
+      ctx.globalAlpha = audit ? 0.14 : 0.08;
+      ctx.beginPath(); ctx.arc(cx + cell / 2, cy + cell / 2, cell * 0.32, 0, 6.2832); ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+    var pts = scribble(i);
+    var prog = Math.min(1, Math.max(0, (t - spawnOf(i)) / 0.8));
+    var segs = Math.max(1, Math.floor(prog * (pts.length - 1)));
+    var inset = cell * 0.2, span = cell * 0.6;
+    ctx.strokeStyle = isOpt ? '#7DF9C6' : '#8A8D84';
+    ctx.globalAlpha = audit ? (isOpt ? 1 : 0.25) : (isOpt ? 0.95 : 0.8);
+    ctx.lineWidth = Math.max(1, cell * 0.045);
+    ctx.beginPath();
+    for (var k = 0; k <= segs; k++) {
+      var px = cx + inset + pts[k][0] * span, py = cy + inset + pts[k][1] * span;
+      if (k === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+}
+
+function blend(f) {                                    // early magenta to late mint, by skill
+  var r = Math.round(255 + (125 - 255) * f);
+  var g = Math.round(79 + (249 - 79) * f);
+  var b = Math.round(216 + (198 - 216) * f);
+  return 'rgb(' + r + ',' + g + ',' + b + ')';
+}
+
+function drawModel(t) {
+  var frozen = auditActive(t);
+  var mt = frozen ? auditStart : t;
+  var p = Math.floor(mt / PASS), ps = p * PASS;
+  var set = optedSet(ps);                              // the attempt uses the opt-in set as of pass start
+  var skill = skillFor(set.length);
+  var panel = LAY.panel;
+  ctx.fillStyle = '#0A0C10';
+  ctx.fillRect(panel.x, panel.y, panel.s, panel.s);
+  ctx.strokeStyle = frozen ? 'rgba(255,255,255,0.35)' : '#3A3D46';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(panel.x, panel.y, panel.s, panel.s);
+  ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  var k, q;
+  if (set.length === 0) {                              // starved model: pure noise, it refuses to fake learning
+    var rng0 = mulberry32((SEED ^ Math.imul(p + 7, 7919)) >>> 0);
+    ctx.strokeStyle = '#FF4FD8'; ctx.globalAlpha = 0.8;
+    ctx.lineWidth = Math.max(1.1, panel.s * 0.006);
+    for (var b = 0; b < 9; b++) {
+      var bx = panel.x + panel.s * (0.15 + rng0() * 0.7), by = panel.y + panel.s * (0.15 + rng0() * 0.7);
+      ctx.beginPath(); ctx.moveTo(bx, by);
+      for (q = 0; q < 7; q++) { bx += (rng0() - 0.5) * panel.s * 0.16; by += (rng0() - 0.5) * panel.s * 0.16; ctx.lineTo(bx, by); }
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  } else {
+    var rng = mulberry32((SEED ^ Math.imul(p + 1, 1013904223)) >>> 0);
+    var K = Math.min(set.length, 5);
+    var idxs = set.slice(), chosen = [];
+    for (k = 0; k < K; k++) chosen.push(idxs.splice(Math.floor(rng() * idxs.length), 1)[0]);
+    var jit = (1 - skill) * 0.14;                      // noise falls as the contributed set grows
+    var drop = (1 - skill) * 0.30;
+    ctx.strokeStyle = blend(skill);
+    ctx.lineWidth = Math.max(1.1, panel.s * 0.006);
+    ctx.globalAlpha = 0.9;
+    for (k = 0; k < chosen.length; k++) {
+      var cx = panel.x + panel.s * (0.24 + 0.52 * rng());
+      var cy = panel.y + panel.s * (0.24 + 0.52 * rng());
+      var sz = panel.s * (0.36 + 0.22 * rng());
+      var pts = scribble(chosen[k]);                   // the same strokes, redrawn by the model
+      ctx.beginPath();
+      for (q = 0; q < pts.length; q++) {
+        var px = cx + (pts[q][0] - 0.5) * sz + (rng() * 2 - 1) * jit * sz;
+        var py = cy + (pts[q][1] - 0.5) * sz + (rng() * 2 - 1) * jit * sz;
+        if (q === 0) ctx.moveTo(px, py);
+        else if (rng() < drop) ctx.moveTo(px, py);     // broken segments at low skill
+        else ctx.lineTo(px, py);
+      }
+      ctx.stroke();
+    }
+    var nn = Math.round((1 - skill) * 5);              // residual noise strokes, fading with skill
+    ctx.globalAlpha = 0.45;
+    for (var n2 = 0; n2 < nn; n2++) {
+      var nx = panel.x + rng() * panel.s, ny = panel.y + rng() * panel.s;
+      ctx.beginPath(); ctx.moveTo(nx, ny);
+      ctx.lineTo(nx + (rng() - 0.5) * panel.s * 0.2, ny + (rng() - 0.5) * panel.s * 0.2);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+  /* layer bars: the forward pass lights them in sequence */
+  var bars = LAY.bars, gapB = 4;
+  var bh = (bars.h - gapB * 4) / 5;
+  var phase = (mt - ps) / PASS;
+  var active = Math.min(4, Math.floor(phase * 5));
+  for (var b2 = 0; b2 < 5; b2++) {
+    var by2 = bars.y + b2 * (bh + gapB);
+    ctx.fillStyle = (b2 === active && !frozen) ? '#4FD6FF' : '#14161C';
+    ctx.fillRect(bars.x, by2, bars.w, bh);
+    ctx.strokeStyle = '#3A3D46'; ctx.lineWidth = 1;
+    ctx.strokeRect(bars.x, by2, bars.w, bh);
+  }
+}
+
+function drawCounter(t) {
+  var n = optedSet(t).length;
+  ctx.fillStyle = '#FFFFFF';
+  ctx.font = (PHONE ? 10 : 11) + 'px monospace';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+  ctx.fillText('TRAINED ON ' + n + ' MARKS (ALL OPTED IN)', W / 2, H - 12);
+}
+
+function draw(t) {
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  ctx.fillStyle = '#07080C';
+  ctx.fillRect(0, 0, W, H);
+  computeLayout();
+  ctx.strokeStyle = '#3A3D46'; ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(LAY.divX, LAY.pad);
+  ctx.lineTo(LAY.divX, H - LAY.bottom);
+  ctx.stroke();
+  drawWall(t);
+  drawModel(t);
+  drawCounter(t);
+}
+
+/* ---- audio: lazy, gesture-gated, typeof-guarded; the visual is complete in silence ---- */
+var AC = null;
+function ensureAudio() {
+  try {
+    if (typeof AudioContext === 'undefined' && typeof webkitAudioContext === 'undefined') return;
+    if (!AC) { var Ctor = (typeof AudioContext !== 'undefined') ? AudioContext : webkitAudioContext; AC = new Ctor(); }
+    if (AC.state === 'suspended' && AC.resume) AC.resume();
+  } catch (e) { AC = null; }
+}
+function tone(freq, dur, vol) {
+  if (!AC) return;
+  try {
+    var o = AC.createOscillator(), g = AC.createGain();
+    o.type = 'sine'; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, AC.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, AC.currentTime + dur);
+    o.connect(g); g.connect(AC.destination);
+    o.start(); o.stop(AC.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+function passSound() {
+  if (!AC) return;
+  var skill = skillFor(optedSet(currentT).length);
+  var base = 200 + skill * 500;                       // clarity follows dataset size
+  tone(base, 0.25, 0.03);
+  tone(base * 1.5, 0.2, 0.02);
+  tone(base * 2, 0.15, 0.015);
+}
+
+/* ---- interaction: consent is the only input that trains ---- */
+function markAt(x, y) {
+  if (!LAY) return -1;
+  var wall = LAY.wall, cell = LAY.cell, cols = LAY.cols;
+  if (x < wall.x || x > wall.x + wall.w || y < wall.y || y > wall.y + wall.h) return -1;
+  var col = Math.floor((x - wall.x) / cell);
+  var row = Math.floor((y - wall.y) / cell) + (LAY.rowOff || 0);
+  var idx = row * cols + col;
+  if (idx < 0 || idx >= markCount(currentT)) return -1;
+  return idx;
+}
+function optIn(idx) {
+  if (idx < 0) return;
+  var set = optedSet(currentT), j;
+  for (j = 0; j < set.length; j++) if (set[j] === idx) return;   // already contributed
+  visitorEvents.push({ mark: idx, time: currentT });
+  tone(520 + (set.length % 12) * 30, 0.35, 0.045);               // the contribution landing
+}
+function evtPos(e) {
+  if (canvas.getBoundingClientRect) {
+    var r = canvas.getBoundingClientRect();
+    return { x: (e.clientX - r.left) * (W / r.width), y: (e.clientY - r.top) * (H / r.height) };
+  }
+  return { x: e.clientX, y: e.clientY };
+}
+var ptr = null, lastModelTap = -10;
+canvas.addEventListener('pointerdown', function (e) {
+  ensureAudio();
+  var p = evtPos(e);
+  ptr = { x: p.x, y: p.y, lx: p.x, ly: p.y, moved: false };
+  if (p.x < LAY.divX) optIn(markAt(p.x, p.y));
+});
+canvas.addEventListener('pointermove', function (e) {
+  if (!ptr) return;
+  var p = evtPos(e);
+  if (Math.abs(p.x - ptr.x) + Math.abs(p.y - ptr.y) > 8) ptr.moved = true;
+  if (p.x < LAY.divX) {                                  // drag across the wall: mass opt-in along the path
+    var steps = Math.max(1, Math.ceil(Math.hypot(p.x - ptr.lx, p.y - ptr.ly) / 8));
+    for (var s = 1; s <= steps; s++) {
+      optIn(markAt(ptr.lx + (p.x - ptr.lx) * s / steps, ptr.ly + (p.y - ptr.ly) * s / steps));
+    }
+  }
+  ptr.lx = p.x; ptr.ly = p.y;
+});
+window.addEventListener('pointerup', function (e) {
+  if (!ptr) return;
+  var p = evtPos(e);
+  if (!ptr.moved && p.x >= LAY.divX) {                   // tap on the model side
+    if (currentT - lastModelTap < 0.45) { auditStart = currentT; lastModelTap = -10; }
+    else lastModelTap = currentT;
+  }
+  ptr = null;
+});
+
+/* ---- sizing: Visual Viewport API, listeners on visualViewport and window ---- */
+function resize() {
+  var w = (window.visualViewport && window.visualViewport.width) || window.innerWidth || 300;
+  var h = (window.visualViewport && window.visualViewport.height) || window.innerHeight || 300;
+  W = Math.round(w); H = Math.round(h);
+  canvas.width = W; canvas.height = H;
+  var sw = (window.screen && window.screen.width) || W;
+  var sh = (window.screen && window.screen.height) || H;
+  PHONE = Math.min(sw, sh) < 700 || H > W * 1.15;
+  draw(currentT);
+}
+if (window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', resize);
+window.addEventListener('resize', resize);
+resize();
+
+/* ---- main loop: frame one is the fixed-offset draw; rAF is guarded ---- */
+draw(T0);
+var startStamp = null, lastPass = Math.floor(T0 / PASS);
+function frame(stamp) {
+  if (startStamp === null) startStamp = stamp;
+  currentT = T0 + (stamp - startStamp) / 1000;
+  var p = Math.floor(currentT / PASS);
+  if (p !== lastPass) { lastPass = p; passSound(); }
+  draw(currentT);
+  requestAnimationFrame(frame);
+}
+if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+</script>
+</body>
+</html>
