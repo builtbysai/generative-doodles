@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Can a Spotlight Fly?</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #050608; overflow: hidden; height: 100%; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* No.985 "Can a Spotlight Fly?" — one drone, one warm light, a dark void.
+   Fixed-step sim (120 Hz), seeded, pre-rolled to t = 14 s for frame one.
+   All drawn state comes from sim steps and closed-form functions of sim
+   time; frame one never touches the wall clock. */
+
+// ---------- seeded rng ----------
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function hash2(a, b) { // deterministic per-index hash -> [0,1)
+  var h = Math.imul(a ^ 0x9E3779B9, 2654435761) ^ Math.imul(b + 1, 40503);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+
+// ---------- palette ----------
+var VOID = "#050608", DRONE = "#101216", ROTOR = "#3A3D46";
+var CONE = "#FFD88A", CORE = "#FFE9B8", POOL = "#FFD88A";
+var DUST = "#FFFFFF", RIPPLE = "#FFFFFF";
+
+var BASE_SEED = 985146;
+var DT = 1 / 120;
+var FLOOR_Y = 0.865; // normalized floor line
+
+// ---------- waypoint timeline ----------
+// Segments alternate move / hold. The opening segments are hand-set so
+// frame one (t = 14 s) is composed; later segments come from the seed.
+function buildTimeline(seed) {
+  var rng = mulberry32(seed);
+  var segs = [];
+  function move(x0, y0, x1, y1, dur) { segs.push({ kind: 0, x0: x0, y0: y0, x1: x1, y1: y1, dur: dur, t0: 0 }); }
+  function hold(dur) { segs.push({ kind: 1, dur: dur, t0: 0 }); }
+  // opening choreography (hand-set)
+  move(0.30, 0.34, 0.44, 0.26, 4.2);
+  hold(2.2);
+  move(0.44, 0.26, 0.365, 0.275, 4.0);
+  hold(1.2);
+  move(0.365, 0.275, 0.40, 0.25, 1.2); // arrival at pathT 12.8 -> settle ripple
+  hold(3.6);
+  // seeded continuation, chained from the last point
+  var px = 0.40, py = 0.25;
+  for (var i = 0; i < 240; i++) {
+    var nx = 0.14 + rng() * 0.66;
+    var ny = 0.16 + rng() * 0.30;
+    var dist = Math.hypot(nx - px, ny - py);
+    move(px, py, nx, ny, 2.6 + dist * 5.5 + rng() * 1.2);
+    hold(1.4 + rng() * 2.4);
+    px = nx; py = ny;
+  }
+  var acc = 0;
+  for (var j = 0; j < segs.length; j++) { segs[j].t0 = acc; acc += segs[j].dur; }
+  return { segs: segs, total: acc };
+}
+function smooth(u) { return u * u * (3 - 2 * u); }
+function timelinePos(tl, t) {
+  var tt = t % tl.total;
+  var segs = tl.segs;
+  // binary search for the segment containing tt
+  var lo = 0, hi = segs.length - 1;
+  while (lo < hi) {
+    var mid = (lo + hi + 1) >> 1;
+    if (segs[mid].t0 <= tt) lo = mid; else hi = mid - 1;
+  }
+  var s = segs[lo];
+  var u = (tt - s.t0) / s.dur;
+  if (s.kind === 1) {
+    // hold: position is the end of the previous move
+    var prev = segs[(lo + segs.length - 1) % segs.length];
+    var px = prev.kind === 0 ? prev.x1 : prev.x0;
+    var py = prev.kind === 0 ? prev.y1 : prev.y0;
+    return { x: px, y: py, seg: lo, u: u, moving: false };
+  }
+  var e = smooth(Math.min(1, Math.max(0, u)));
+  return { x: s.x0 + (s.x1 - s.x0) * e, y: s.y0 + (s.y1 - s.y0) * e, seg: lo, u: u, moving: u < 1 };
+}
+function segEndTime(tl, idx) { return tl.segs[idx].t0 + tl.segs[idx].dur; }
+
+// ---------- dust ----------
+var MOTES = [];
+var CLUSTERS = [];
+(function initDust() {
+  var rng = mulberry32(BASE_SEED ^ 0xD057);
+  for (var i = 0; i < 200; i++) {
+    MOTES.push({
+      x: rng(), y: 0.06 + rng() * 0.90,
+      ph: rng() * Math.PI * 2, sp: 0.05 + rng() * 0.10,
+      ax: 0.004 + rng() * 0.010, ay: 0.003 + rng() * 0.008,
+      r: 0.6 + rng() * 1.1
+    });
+  }
+  for (var k = 0; k < 4; k++) {
+    CLUSTERS.push({
+      x: 0.18 + rng() * 0.64, y: 0.55 + rng() * 0.28,
+      ph: rng() * Math.PI * 2, sp: 0.03 + rng() * 0.04
+    });
+    // each cluster carries a knot of denser motes
+    var c = CLUSTERS[k];
+    for (var m = 0; m < 16; m++) {
+      MOTES.push({
+        x: c.x + (rng() - 0.5) * 0.05, y: c.y + (rng() - 0.5) * 0.06,
+        ph: rng() * Math.PI * 2, sp: c.sp, ax: 0.002, ay: 0.002,
+        r: 0.7 + rng() * 1.0, cl: k
+      });
+    }
+  }
+})();
+function motePos(m, t) {
+  return {
+    x: m.x + Math.sin(t * m.sp + m.ph) * m.ax * 8,
+    y: m.y + Math.cos(t * m.sp * 0.8 + m.ph * 1.7) * m.ay * 8
+  };
+}
+function clusterPos(c, t) {
+  return { x: c.x + Math.sin(t * c.sp + c.ph) * 0.03, y: c.y + Math.cos(t * c.sp * 0.7 + c.ph) * 0.02 };
+}
+
+// ---------- sim state ----------
+var S = null;
+function newSim(seed) {
+  var tl = buildTimeline(seed);
+  var p = timelinePos(tl, 0);
+  return {
+    seed: seed, tl: tl,
+    t: 0, pathT: 0,
+    dx: p.x, dy: p.y, pvx: 0, pvy: 0, // drone pos / prev-frame velocity (normalized / s)
+    theta: 0.10,                      // cone angle from vertical (rad), lagged
+    lean: 0,                          // drone body lean (rad), lagged
+    mode: "auto",                     // auto | hold | drag
+    holdUntil: -1, dragUntil: -1,
+    tapX: 0.5, tapY: 0.8,
+    dragX: 0.4, dragY: 0.3, dragging: false,
+    foundTimer: 0, foundUntil: -1, coolUntil: -1,
+    ripples: [],                      // sim times of ripple spawns
+    lastSeg: p.seg,
+    reseedCount: 0,
+    speedSm: 0
+  };
+}
+function spawnRipple(st) { st.ripples.push(st.t); if (st.ripples.length > 6) st.ripples.shift(); }
+
+function step(st) {
+  st.t += DT;
+  var frozen = st.t < st.foundUntil || st.mode !== "auto";
+  if (!frozen) st.pathT += DT;
+
+  // --- drone position ---
+  var tx, ty, thetaTarget;
+  if (st.mode === "drag" && st.t < st.dragUntil) {
+    tx = st.dragX; ty = st.dragY;
+    // chase the hand with a soft lag
+    st.dx += (tx - st.dx) * Math.min(1, DT * 3.2);
+    st.dy += (ty - st.dy) * Math.min(1, DT * 3.2);
+    thetaTarget = Math.atan2(st.pvx * 0.55, 1) ;
+  } else if (st.mode === "hold" && st.t < st.holdUntil) {
+    // frozen mid-air; cone locked on the tap point
+    thetaTarget = Math.atan2(st.tapX - st.dx, Math.max(0.2, st.tapY - st.dy));
+  } else {
+    if (st.mode !== "auto" && ((st.mode === "hold" && st.t >= st.holdUntil) || (st.mode === "drag" && st.t >= st.dragUntil))) {
+      st.mode = "auto";
+    }
+    var p = timelinePos(st.tl, st.pathT);
+    // arriving into a hold segment = a settle: the light presses
+    if (p.seg !== st.lastSeg) {
+      if (st.tl.segs[p.seg].kind === 1) spawnRipple(st);
+      st.lastSeg = p.seg;
+    }
+    st.dx = p.x; st.dy = p.y;
+    if (p.moving) {
+      thetaTarget = Math.atan2(st.pvx * 0.85, 1);
+    } else {
+      // hover scan: slow curious sweep, biased by segment parity
+      var hs = st.tl.segs[p.seg];
+      var hu = (st.pathT - hs.t0) / hs.dur;
+      var dirBias = (p.seg % 4 === 3) ? 0.35 : 0;
+      thetaTarget = 0.42 * Math.sin(hu * Math.PI * 1.15 + dirBias) + 0.10 * Math.sin(st.pathT * 0.7);
+    }
+  }
+  // velocity estimate (normalized units / s)
+  var vx = 0, vy = 0;
+  if (st.mode === "auto") {
+    var p2 = timelinePos(st.tl, st.pathT + 0.05);
+    vx = (p2.x - st.dx) / 0.05; vy = (p2.y - st.dy) / 0.05;
+  }
+  st.pvx = vx; st.pvy = vy;
+  st.speedSm += ((Math.hypot(vx, vy)) - st.speedSm) * Math.min(1, DT * 4);
+
+  // --- lagged cone aim + body lean (the swing trails the turn) ---
+  var k = Math.min(1, DT * 1.9); // ~0.55 s lag constant
+  st.theta += (thetaTarget - st.theta) * k;
+  var leanT = Math.max(-0.5, Math.min(0.5, vx * 0.55)) + (st.mode === "auto" && !timelinePos(st.tl, st.pathT).moving ? 0.16 * Math.sin(st.pathT * 0.9) : 0);
+  st.lean += (leanT - st.lean) * Math.min(1, DT * 3.0);
+
+  // --- floor pool from the cone ray ---
+  var pool = poolOf(st);
+
+  // --- dust-cluster find ---
+  if (st.t >= st.coolUntil && st.t >= st.foundUntil) {
+    var best = 1e9;
+    for (var i = 0; i < CLUSTERS.length; i++) {
+      var cp = clusterPos(CLUSTERS[i], st.t);
+      var d = Math.abs(cp.x - pool.x) + Math.abs(cp.y - FLOOR_Y) * 0.4;
+      if (d < best) best = d;
+    }
+    if (best < 0.055) {
+      st.foundTimer += DT;
+      if (st.foundTimer >= 1.5) {
+        st.foundUntil = st.t + 4.0;
+        st.coolUntil = st.t + 14.0;
+        st.foundTimer = 0;
+        spawnRipple(st);
+        audioBloom();
+      }
+    } else {
+      st.foundTimer = Math.max(0, st.foundTimer - DT * 2);
+    }
+  }
+}
+function poolOf(st) {
+  var dy = FLOOR_Y - st.dy;
+  var px = st.dx + Math.tan(st.theta) * dy;
+  return { x: px, y: FLOOR_Y + 0.012 };
+}
+
+// ---------- audio (lazy, gesture-only, guarded) ----------
+var AC = null, aRotor = null, aRotorGain = null, aWash = null, aWashGain = null;
+function audioInit() {
+  if (AC) { if (AC.resume) AC.resume(); return; }
+  if (typeof AudioContext === "undefined" && typeof webkitAudioContext === "undefined") return;
+  try {
+    var Ctx = AudioContext || webkitAudioContext;
+    AC = new Ctx();
+    aRotor = AC.createOscillator(); aRotor.type = "sawtooth"; aRotor.frequency.value = 58;
+    var lp = AC.createBiquadFilter(); lp.type = "lowpass"; lp.frequency.value = 320;
+    aRotorGain = AC.createGain(); aRotorGain.gain.value = 0.0;
+    aRotor.connect(lp); lp.connect(aRotorGain); aRotorGain.connect(AC.destination);
+    aRotor.start();
+    var len = AC.sampleRate * 2, buf = AC.createBuffer(1, len, AC.sampleRate), d = buf.getChannelData(0);
+    var r = mulberry32(4242);
+    for (var i = 0; i < len; i++) d[i] = r() * 2 - 1;
+    aWash = AC.createBufferSource(); aWash.buffer = buf; aWash.loop = true;
+    var bp = AC.createBiquadFilter(); bp.type = "bandpass"; bp.frequency.value = 900; bp.Q.value = 0.6;
+    aWashGain = AC.createGain(); aWashGain.gain.value = 0.0;
+    aWash.connect(bp); bp.connect(aWashGain); aWashGain.connect(AC.destination);
+    aWash.start();
+  } catch (e) { AC = null; }
+}
+function audioBloom() {
+  if (!AC) return;
+  try {
+    var o = AC.createOscillator(), g = AC.createGain();
+    o.type = "sine"; o.frequency.value = 96;
+    g.gain.setValueAtTime(0.0001, AC.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.12, AC.currentTime + 0.5);
+    g.gain.exponentialRampToValueAtTime(0.0001, AC.currentTime + 3.2);
+    o.connect(g); g.connect(AC.destination);
+    o.start(); o.stop(AC.currentTime + 3.4);
+  } catch (e) {}
+}
+function audioTick(st) {
+  if (!AC || !aRotorGain) return;
+  try {
+    var sp = st.speedSm;
+    aRotor.frequency.value = 52 + sp * 160;
+    aRotorGain.gain.value = 0.015 + Math.min(0.03, sp * 0.05);
+    aWashGain.gain.value = 0.006 + Math.min(0.02, Math.abs(st.theta) * 0.03);
+  } catch (e) {}
+}
+
+// ---------- view ----------
+var canvas = document.getElementById("c");
+var ctx = canvas.getContext("2d");
+var W = 720, H = 720, DPR = 1, PHONE = false;
+function resize() {
+  var vv = (typeof visualViewport !== "undefined" && visualViewport) ? visualViewport : null;
+  var w = vv ? vv.width : window.innerWidth;
+  var h = vv ? vv.height : window.innerHeight;
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = Math.max(50, Math.floor(w)); H = Math.max(50, Math.floor(h));
+  canvas.width = Math.floor(W * DPR); canvas.height = Math.floor(H * DPR);
+  var sw = 9999, sh = 9999;
+  if (typeof window !== "undefined" && window.screen) { sw = window.screen.width || 9999; sh = window.screen.height || 9999; }
+  PHONE = Math.min(sw, sh) < 700 || H > W * 1.15;
+}
+if (typeof visualViewport !== "undefined" && visualViewport && visualViewport.addEventListener) visualViewport.addEventListener("resize", resize);
+window.addEventListener("resize", resize);
+resize();
+
+// ---------- drawing ----------
+function draw(st) {
+  canvas.style.width = W + "px";
+  canvas.style.height = H + "px";
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  var u = Math.min(W, H) / 720; // unit scale
+  ctx.fillStyle = VOID;
+  ctx.fillRect(0, 0, W, H);
+
+  var dxp = st.dx * W, dyp = st.dy * H;
+  var pool = poolOf(st);
+  var poolX = pool.x * W, poolY = pool.y * H;
+  var headX = dxp, headY = dyp + 10 * u;
+  var found = st.t < st.foundUntil;
+  var warmth = found ? 1 : Math.min(1, st.foundTimer / 1.5) * 0.5;
+
+  // cone spread at the floor grows with throw distance
+  var throwLen = Math.max(0.1, pool.y - st.dy);
+  var spread = (0.050 + throwLen * 0.135) * W;
+  var coreSpread = spread * 0.52;
+  var poolRx = spread * 0.92, poolRy = poolRx * 0.30;
+  var coneBaseY = poolY + poolRy; // wedge fully contains the pool; pool drawn over it
+
+  function conePath(sp) {
+    ctx.beginPath();
+    ctx.moveTo(headX - 3 * u, headY);
+    ctx.lineTo(poolX - sp, coneBaseY);
+    ctx.lineTo(poolX + sp, coneBaseY);
+    ctx.lineTo(headX + 3 * u, headY);
+    ctx.closePath();
+  }
+
+  // --- cone: layered flat-alpha wedges ---
+  conePath(spread);
+  ctx.globalAlpha = 0.25; ctx.fillStyle = CONE; ctx.fill();
+  conePath(coreSpread);
+  ctx.globalAlpha = 0.40; ctx.fillStyle = CORE; ctx.fill();
+  ctx.globalAlpha = 1;
+
+  // --- dust: visible only where the light is ---
+  ctx.save();
+  conePath(spread);
+  ctx.clip();
+  ctx.fillStyle = DUST;
+  for (var i = 0; i < MOTES.length; i++) {
+    var mp = motePos(MOTES[i], st.t);
+    var mx = mp.x * W, my = mp.y * H;
+    if (mx < 0 || mx > W || my < 0 || my > H) continue;
+    ctx.globalAlpha = 0.5;
+    ctx.beginPath();
+    ctx.arc(mx, my, MOTES[i].r * u, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+  ctx.globalAlpha = 1;
+
+  // --- floor pool: bloom + press ---
+  ctx.globalAlpha = 0.30 + warmth * 0.18;
+  ctx.fillStyle = POOL;
+  ctx.beginPath(); ctx.ellipse(poolX, poolY, poolRx, poolRy, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.globalAlpha = 0.30 + warmth * 0.30;
+  ctx.beginPath(); ctx.ellipse(poolX, poolY, poolRx * 0.55, poolRy * 0.55, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.globalAlpha = 1;
+
+  // ripples: expanding ellipse outlines, fading
+  for (var ri = 0; ri < st.ripples.length; ri++) {
+    var age = st.t - st.ripples[ri];
+    if (age < 0 || age > 2.8) continue;
+    var fr = age / 2.8;
+    ctx.globalAlpha = 0.20 * (1 - fr);
+    ctx.strokeStyle = RIPPLE;
+    ctx.lineWidth = Math.max(1, 1.4 * u);
+    ctx.beginPath();
+    ctx.ellipse(poolX, poolY, poolRx * (0.25 + 0.85 * fr), poolRy * (0.25 + 0.85 * fr), 0, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+
+  // --- drone: small dark X with rotor blurs, leaning ---
+  ctx.save();
+  ctx.translate(dxp, dyp);
+  ctx.rotate(st.lean);
+  var R = 15 * u; // arm half-length (~30 px across at u=1)
+  // rotor blurs first (behind arms)
+  ctx.strokeStyle = ROTOR;
+  ctx.lineCap = "round";
+  var fl = 0.5 + 0.5 * Math.sin(st.t * 87);
+  for (var a = 0; a < 4; a++) {
+    var ang = Math.PI / 4 + a * Math.PI / 2;
+    var rx = Math.cos(ang) * R, ry = Math.sin(ang) * R * 0.62;
+    ctx.globalAlpha = 0.35 + 0.30 * ((a % 2 === 0) ? fl : 1 - fl);
+    ctx.lineWidth = 2.4 * u;
+    ctx.beginPath();
+    ctx.moveTo(rx - 7 * u, ry);
+    ctx.lineTo(rx + 7 * u, ry);
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  // X arms
+  ctx.strokeStyle = DRONE;
+  ctx.lineWidth = 5.0 * u;
+  ctx.beginPath();
+  ctx.moveTo(-R, -R * 0.62); ctx.lineTo(R, R * 0.62);
+  ctx.moveTo(R, -R * 0.62); ctx.lineTo(-R, R * 0.62);
+  ctx.stroke();
+  // body + spotlight head
+  ctx.fillStyle = DRONE;
+  ctx.beginPath(); ctx.arc(0, 0, 4.6 * u, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(-4.5 * u, 6 * u); ctx.lineTo(4.5 * u, 6 * u);
+  ctx.lineTo(2.6 * u, 11 * u); ctx.lineTo(-2.6 * u, 11 * u);
+  ctx.closePath(); ctx.fill();
+  // warm glint at the lens
+  ctx.globalAlpha = 0.85;
+  ctx.fillStyle = CORE;
+  ctx.beginPath(); ctx.arc(0, 10.4 * u, 1.6 * u, 0, Math.PI * 2); ctx.fill();
+  ctx.globalAlpha = 1;
+  ctx.restore();
+}
+
+// ---------- interaction ----------
+var lastTapT = -10, downX = 0, downY = 0, downT = 0, isDown = false;
+function toNorm(e) {
+  var r = canvas.getBoundingClientRect();
+  return { x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height };
+}
+canvas.addEventListener("pointerdown", function (e) {
+  audioInit();
+  var p = toNorm(e); downX = p.x; downY = p.y; downT = S.t; isDown = true;
+  if (S.t - lastTapT < 0.35) {
+    // double-tap: a new drone — reseed search + gait
+    S.reseedCount++;
+    var keep = { t: S.t, ripples: S.ripples, reseedCount: S.reseedCount };
+    var ns = newSim(BASE_SEED + S.reseedCount * 7919);
+    ns.t = keep.t; ns.pathT = 0; ns.ripples = keep.ripples; ns.reseedCount = keep.reseedCount;
+    var pp = timelinePos(ns.tl, 0); ns.dx = pp.x; ns.dy = pp.y;
+    S = ns;
+    lastTapT = -10;
+    isDown = false;
+    return;
+  }
+  lastTapT = S.t;
+  S.dragX = p.x; S.dragY = p.y;
+});
+canvas.addEventListener("pointermove", function (e) {
+  if (!isDown) return;
+  var p = toNorm(e);
+  S.dragX = p.x; S.dragY = p.y;
+  if (Math.hypot(p.x - downX, p.y - downY) > 0.02 || S.t - downT > 0.25) {
+    if (S.mode !== "drag") spawnRipple(S);
+    S.mode = "drag";
+    S.dragUntil = S.t + 15;
+  }
+});
+function endPointer(e) {
+  if (!isDown) return;
+  isDown = false;
+  if (S.mode === "drag") { S.dragUntil = Math.min(S.dragUntil, S.t + 15); return; }
+  // a clean tap: hold here for 10 s, cone locked on the tap point
+  var p = toNorm(e);
+  S.mode = "hold";
+  S.holdUntil = S.t + 10;
+  S.tapX = p.x; S.tapY = Math.max(p.y, S.dy + 0.25);
+  spawnRipple(S);
+}
+canvas.addEventListener("pointerup", endPointer);
+canvas.addEventListener("pointercancel", function () { isDown = false; });
+
+// ---------- run ----------
+S = newSim(BASE_SEED);
+var PRE = Math.round(14 / DT);
+for (var i = 0; i < PRE; i++) step(S);
+draw(S); // frame one: synchronous, at the fixed pre-rolled state
+
+if (typeof requestAnimationFrame !== "undefined") {
+  var lastMs = null, acc = 0;
+  var frame = function (ms) {
+    if (lastMs === null) lastMs = ms;
+    var el = (ms - lastMs) / 1000;
+    lastMs = ms;
+    if (el > 0.25) el = 0.25;
+    acc += el;
+    var n = 0;
+    while (acc >= DT && n < 40) { step(S); acc -= DT; n++; }
+    if (n === 40) acc = 0;
+    draw(S);
+    audioTick(S);
+    requestAnimationFrame(frame);
+  };
+  requestAnimationFrame(frame);
+}
+</script>
+</body>
+</html>

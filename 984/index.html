@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Ball Track</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #07080C; overflow: hidden; height: 100%; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  var GALLERY = '#07080C';
+  var RAIL = '#3A3D46';
+  var MINT = '#7DF9C6';
+  var WHITE = '#FFFFFF';
+  var TERM = '#4A5A50';
+  var COLORS = ['#FF4D4D', '#4DFF88', '#4DC9FF', '#FFD93B', '#C64DFF'];
+
+  var BASE_SEED = 984145;
+  var DT = 1 / 120;
+  var PREROLL = 2400;           // exactly 20 s of fixed steps before frame one
+  var NPTS = 17;                // infrared control points
+  var TABLE_N = 2400;           // rail samples
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- rail geometry (unit space, layout independent) ----------
+  // Figure-8 (lemniscate) with a radius modulation so the loops breathe
+  // like a spiral, tilted slightly. Precomputed once, arc-length tabled.
+  var railPts = [];   // {x, y} unit coords
+  var railCum = [];   // cumulative arc length at each sample
+  var railLen = 0;
+  (function buildRail() {
+    var tilt = -0.14, ct = Math.cos(tilt), st = Math.sin(tilt);
+    var raw = [];
+    var minX = 1e9, maxX = -1e9, minY = 1e9, maxY = -1e9;
+    for (var i = 0; i < TABLE_N; i++) {
+      var t = (i / TABLE_N) * Math.PI * 2;
+      var mod = 1 + 0.16 * Math.sin(2 * t + 1.3) + 0.07 * Math.sin(5 * t + 0.4);
+      var x = Math.sin(t) * mod;
+      var y = Math.sin(t) * Math.cos(t) * mod * 1.3;
+      var rx = x * ct - y * st, ry = x * st + y * ct;
+      raw.push({ x: rx, y: ry });
+      if (rx < minX) minX = rx; if (rx > maxX) maxX = rx;
+      if (ry < minY) minY = ry; if (ry > maxY) maxY = ry;
+    }
+    // normalize into a centered box of half-extent 1 on the long axis
+    var cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
+    var span = Math.max(maxX - minX, maxY - minY) / 2;
+    railCum.push(0);
+    for (var j = 0; j < TABLE_N; j++) {
+      var p = { x: (raw[j].x - cx) / span, y: (raw[j].y - cy) / span };
+      railPts.push(p);
+      if (j > 0) {
+        var dx = p.x - railPts[j - 1].x, dy = p.y - railPts[j - 1].y;
+        railLen += Math.sqrt(dx * dx + dy * dy);
+      }
+      railCum.push(railLen);
+    }
+    var lx = railPts[0].x - railPts[TABLE_N - 1].x, ly = railPts[0].y - railPts[TABLE_N - 1].y;
+    railLen += Math.sqrt(lx * lx + ly * ly);
+  })();
+
+  function railPos(s) { // s in [0,1) -> unit coords, constant-speed lookup
+    s = ((s % 1) + 1) % 1;
+    var target = s * railLen;
+    var lo = 0, hi = TABLE_N;
+    while (lo < hi) {
+      var mid = (lo + hi) >> 1;
+      if (railCum[mid] < target) lo = mid + 1; else hi = mid;
+    }
+    var i1 = Math.max(0, lo - 1), i2 = (i1 + 1) % TABLE_N;
+    var segLen = (i2 === 0 ? railLen : railCum[i2]) - railCum[i1];
+    var f = segLen > 0 ? (target - railCum[i1]) / segLen : 0;
+    if (f < 0) f = 0; if (f > 1) f = 1;
+    var a = railPts[i1], b = railPts[i2];
+    return { x: a.x + (b.x - a.x) * f, y: a.y + (b.y - a.y) * f };
+  }
+
+  // ---------- simulation ----------
+  function buildSim(seed) {
+    var rng = mulberry32(seed);
+    var S = {
+      seed: seed, step: 0, rng: rng,
+      balls: [], points: [], terms: [], packets: [], zones: [],
+      nextCmdStep: 2328, // first auto command launches at 19.4 s: packet mid-flight at frame one
+      armCycle: 0, lastClickAt: -1e9
+    };
+    var nb = 24 + Math.floor(rng() * 5); // 24-28 balls
+    for (var i = 0; i < nb; i++) {
+      S.balls.push({
+        s: rng(),
+        speed: 0.020 + rng() * 0.016,       // loops per second
+        color: Math.floor(rng() * 5),
+        trail: []
+      });
+    }
+    for (var k = 0; k < NPTS; k++) {
+      var r = rng();
+      var rule;
+      if (r < 0.62) rule = { type: 'seq' };
+      else if (r < 0.86) rule = { type: 'set', color: Math.floor(rng() * 5) };
+      else rule = { type: 'rand' };
+      S.points.push({ s: k / NPTS, rule: rule, flashStep: -1e9, armed: -1 });
+    }
+    for (var m = 0; m < 10; m++) S.terms.push({ blinkStep: -1e9 });
+    return S;
+  }
+
+  function launchPacket(S, termIdx, pointIdx, color) {
+    S.packets.push({ term: termIdx, point: pointIdx, color: color, startStep: S.step });
+    S.terms[termIdx].blinkStep = S.step;
+    blip();
+  }
+
+  function speedFactorAt(S, s) {
+    var f = 1;
+    for (var i = 0; i < S.zones.length; i++) {
+      var z = S.zones[i];
+      var age = (S.step - z.born) / 120;
+      if (age > 3) continue;
+      var d = Math.min(Math.abs(s - z.s), 1 - Math.abs(s - z.s)); // wrapped distance along the loop
+      var w = Math.exp(-(d * d) / (0.035 * 0.035)) * Math.exp(-age / 1.6);
+      f += (z.factor - 1) * w;
+    }
+    return f < 0.15 ? 0.15 : (f > 2.6 ? 2.6 : f);
+  }
+
+  function stepSim(S, silent) {
+    S.step++;
+    var i, j;
+    // balls advance and cross control points
+    for (i = 0; i < S.balls.length; i++) {
+      var b = S.balls[i];
+      var ds = b.speed * DT * speedFactorAt(S, b.s);
+      var prev = b.s;
+      b.s = prev + ds;
+      if (b.s >= 1) b.s -= 1;
+      for (j = 0; j < NPTS; j++) {
+        var p = S.points[j];
+        var fwd = p.s - prev; if (fwd < 0) fwd += 1;
+        if (fwd < ds) {
+          p.flashStep = S.step;
+          if (p.armed >= 0) { b.color = p.armed; p.armed = -1; }
+          else if (p.rule.type === 'seq') b.color = (b.color + 1) % 5;
+          else if (p.rule.type === 'set') b.color = p.rule.color;
+          else b.color = Math.floor(S.rng() * 5);
+          click(silent);
+        }
+      }
+      if (S.step % 5 === 0) {
+        b.trail.push(b.s);
+        if (b.trail.length > 14) b.trail.shift();
+      }
+    }
+    // packets fly terminal -> control point (0.8 s = 96 steps), then arm it
+    for (i = S.packets.length - 1; i >= 0; i--) {
+      var pk = S.packets[i];
+      if (S.step - pk.startStep >= 96) {
+        S.points[pk.point].armed = pk.color;
+        S.packets.splice(i, 1);
+      }
+    }
+    // automatic visitor commands on a seeded schedule
+    if (S.step >= S.nextCmdStep) {
+      var term = Math.floor(S.rng() * 10);
+      var pt = Math.floor(S.rng() * NPTS);
+      var col = Math.floor(S.rng() * 5);
+      launchPacket(S, term, pt, col);
+      S.nextCmdStep = S.step + Math.round((7 + S.rng() * 7) * 120);
+    }
+    // prune dead retime zones
+    for (i = S.zones.length - 1; i >= 0; i--) {
+      if ((S.step - S.zones[i].born) / 120 > 3.2) S.zones.splice(i, 1);
+    }
+  }
+
+  // ---------- audio (lazy, guarded; silent until a visitor gesture) ----------
+  var AC = null, humOsc = null, humGain = null;
+  function audioInit() {
+    if (AC) return;
+    var Ctor = (typeof AudioContext !== 'undefined') ? AudioContext
+      : (typeof window !== 'undefined' ? (window.AudioContext || window.webkitAudioContext) : undefined);
+    if (!Ctor) return;
+    try {
+      AC = new Ctor();
+      humOsc = AC.createOscillator(); humGain = AC.createGain();
+      humOsc.type = 'sine'; humOsc.frequency.value = 58;
+      humGain.gain.value = 0.0;
+      humOsc.connect(humGain); humGain.connect(AC.destination);
+      humOsc.start();
+      humGain.gain.setTargetAtTime(0.035, AC.currentTime, 0.4);
+    } catch (e) { AC = null; }
+  }
+  function blip() {
+    if (!AC) return;
+    try {
+      var t = AC.currentTime, o = AC.createOscillator(), g = AC.createGain();
+      o.type = 'square';
+      o.frequency.setValueAtTime(880, t);
+      o.frequency.exponentialRampToValueAtTime(1420, t + 0.07);
+      g.gain.setValueAtTime(0.05, t);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.09);
+      o.connect(g); g.connect(AC.destination); o.start(t); o.stop(t + 0.1);
+    } catch (e) {}
+  }
+  function click(silent) {
+    if (silent || !AC || !sim) return;
+    if (performance.now() - sim.lastClickAt < 70) return; // throttle
+    sim.lastClickAt = performance.now();
+    try {
+      var t = AC.currentTime, o = AC.createOscillator(), g = AC.createGain();
+      o.type = 'square'; o.frequency.value = 1900;
+      g.gain.setValueAtTime(0.028, t);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.03);
+      o.connect(g); g.connect(AC.destination); o.start(t); o.stop(t + 0.04);
+    } catch (e) {}
+  }
+
+  // ---------- layout ----------
+  var W = 0, H = 0, DPR = 1, PHONE = false;
+  var railCX = 0, railCY = 0, railScale = 1, termY = 0, U = 1;
+  function computeLayout() {
+    var vv = (typeof window !== 'undefined') ? window.visualViewport : null;
+    W = vv ? vv.width : (window.innerWidth || 720);
+    H = vv ? vv.height : (window.innerHeight || 720);
+    DPR = Math.min((typeof window !== 'undefined' && window.devicePixelRatio) || 1, 2);
+    var sw = 1e9;
+    if (typeof window !== 'undefined' && window.screen) sw = Math.min(window.screen.width, window.screen.height);
+    PHONE = sw < 700 || H > W * 1.15;
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    U = Math.max(0.6, Math.min(W, H) / 720);
+    var railBoxW = W * 0.94, railBoxH = H * (PHONE ? 0.80 : 0.84);
+    railScale = Math.min(railBoxW, railBoxH) / 2; // unit half-extent is 1
+    railCX = W / 2;
+    railCY = H * (PHONE ? 0.44 : 0.46);
+    termY = H - Math.max(16, H * 0.035);
+  }
+  function toPx(u) { return { x: railCX + u.x * railScale, y: railCY + u.y * railScale }; }
+  function termPx(i) { return { x: W * (0.10 + 0.80 * (i / 9)), y: termY }; }
+
+  // ---------- draw ----------
+  function draw() {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = GALLERY;
+    ctx.fillRect(0, 0, W, H);
+    var S = sim, i, j;
+
+    // rail hairline
+    ctx.strokeStyle = RAIL;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (i = 0; i <= TABLE_N; i += 6) {
+      var rp = toPx(railPts[i % TABLE_N]);
+      if (i === 0) ctx.moveTo(rp.x, rp.y); else ctx.lineTo(rp.x, rp.y);
+    }
+    ctx.closePath();
+    ctx.stroke();
+
+    // trails: fading dots in each ball's own color
+    for (i = 0; i < S.balls.length; i++) {
+      var b = S.balls[i];
+      ctx.fillStyle = COLORS[b.color];
+      for (j = 0; j < b.trail.length; j++) {
+        ctx.globalAlpha = 0.15 * (j + 1) / b.trail.length;
+        var tp = toPx(railPos(b.trail[j]));
+        var tr = 1.6 * U * (0.5 + 0.5 * (j + 1) / b.trail.length);
+        ctx.beginPath(); ctx.arc(tp.x, tp.y, tr, 0, Math.PI * 2); ctx.fill();
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    // control points: mint squares, flash on crossing, white tick when armed
+    var half = 3.6 * U;
+    for (i = 0; i < NPTS; i++) {
+      var p = S.points[i];
+      var pp = toPx(railPos(p.s));
+      var age = (S.step - p.flashStep) / 120;
+      ctx.globalAlpha = 0.35 + (age < 2 ? 0.65 * Math.exp(-age / 0.45) : 0);
+      ctx.fillStyle = MINT;
+      ctx.fillRect(pp.x - half, pp.y - half, half * 2, half * 2);
+      if (p.armed >= 0) {
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = WHITE;
+        ctx.fillRect(pp.x - 1.6 * U, pp.y - half - 5.5 * U, 3.2 * U, 3.2 * U);
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    // command packets in flight: tiny white squares, cause before effect
+    for (i = 0; i < S.packets.length; i++) {
+      var pk = S.packets[i];
+      var f = (S.step - pk.startStep) / 96; if (f > 1) f = 1;
+      var a = termPx(pk.term), c = toPx(railPos(S.points[pk.point].s));
+      ctx.fillStyle = WHITE;
+      var ps = 2.4 * U;
+      ctx.fillRect(a.x + (c.x - a.x) * f - ps, a.y + (c.y - a.y) * f - ps, ps * 2, ps * 2);
+    }
+
+    // balls: flat LED dots, hard colors
+    for (i = 0; i < S.balls.length; i++) {
+      var bl = S.balls[i];
+      var bp = toPx(railPos(bl.s));
+      ctx.fillStyle = COLORS[bl.color];
+      ctx.beginPath(); ctx.arc(bp.x, bp.y, 3.1 * U, 0, Math.PI * 2); ctx.fill();
+    }
+
+    // visitor terminals along the bottom edge
+    for (i = 0; i < S.terms.length; i++) {
+      var tpx = termPx(i);
+      var bAge = (S.step - S.terms[i].blinkStep) / 120;
+      ctx.globalAlpha = bAge < 1.2 ? 1 : 0.55;
+      ctx.fillStyle = bAge < 1.2 ? MINT : TERM;
+      ctx.beginPath(); ctx.arc(tpx.x, tpx.y, 2.6 * U, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- interaction ----------
+  var sim = buildSim(BASE_SEED);
+  var reseedCount = 0;
+  for (var q = 0; q < PREROLL; q++) stepSim(sim, true);
+
+  function nearestRailS(px, py) {
+    var best = 0, bd = 1e18;
+    for (var i = 0; i < TABLE_N; i += 4) {
+      var p = toPx(railPts[i]);
+      var dx = p.x - px, dy = p.y - py, d = dx * dx + dy * dy;
+      if (d < bd) { bd = d; best = railCum[i] / railLen; }
+    }
+    return { s: best, dist: Math.sqrt(bd) };
+  }
+  function nearestPoint(px, py) {
+    var best = -1, bd = 1e18;
+    for (var i = 0; i < NPTS; i++) {
+      var p = toPx(railPos(sim.points[i].s));
+      var dx = p.x - px, dy = p.y - py, d = dx * dx + dy * dy;
+      if (d < bd) { bd = d; best = i; }
+    }
+    return { idx: best, dist: Math.sqrt(bd) };
+  }
+
+  var drag = null, pendingTap = null;
+  function evtPos(e) {
+    var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    return { x: (e.clientX || 0) - r.left, y: (e.clientY || 0) - r.top };
+  }
+  function doTap(px, py) {
+    var np = nearestPoint(px, py);
+    if (np.idx >= 0 && np.dist < 46 * U) {
+      // your command also travels: packet from the nearest terminal
+      var ti = 0, td = 1e18;
+      for (var i = 0; i < 10; i++) { var tp = termPx(i); var d = Math.abs(tp.x - px); if (d < td) { td = d; ti = i; } }
+      var col = sim.armCycle % 5; sim.armCycle++;
+      launchPacket(sim, ti, np.idx, col);
+    }
+  }
+  function doDoubleTap() {
+    reseedCount++;
+    sim = buildSim((BASE_SEED + reseedCount * 1013904223) >>> 0);
+    for (var i = 0; i < PREROLL; i++) stepSim(sim, true);
+    draw();
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', function (e) {
+      audioInit();
+      if (AC && AC.resume) AC.resume();
+      var p = evtPos(e);
+      drag = { x: p.x, y: p.y, s: nearestRailS(p.x, p.y).s, moved: false };
+    });
+    canvas.addEventListener('pointermove', function (e) {
+      if (!drag) return;
+      var p = evtPos(e);
+      var nr = nearestRailS(p.x, p.y);
+      var dS = nr.s - drag.s; if (dS > 0.5) dS -= 1; if (dS < -0.5) dS += 1;
+      if (Math.abs(p.x - drag.x) + Math.abs(p.y - drag.y) > 6) drag.moved = true;
+      if (nr.dist < 90 * U && Math.abs(dS) > 0.0006) {
+        sim.zones.push({ s: nr.s, factor: dS > 0 ? 1.7 : 0.4, born: sim.step });
+        if (sim.zones.length > 24) sim.zones.shift();
+      }
+      drag.x = p.x; drag.y = p.y; drag.s = nr.s;
+    });
+    canvas.addEventListener('pointerup', function (e) {
+      if (!drag) return;
+      var wasDrag = drag.moved;
+      drag = null;
+      if (wasDrag) { pendingTap = null; return; }
+      var p = evtPos(e);
+      if (pendingTap) { // second tap close in time: reprogram
+        pendingTap = null;
+        doDoubleTap();
+      } else {
+        pendingTap = { x: p.x, y: p.y, at: performance.now() };
+      }
+    });
+  }
+
+  // ---------- live loop (fixed steps; frame one never comes from a clock) ----------
+  computeLayout();
+  draw();
+  if (typeof window !== 'undefined') {
+    var onResize = function () { computeLayout(); draw(); };
+    if (window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', onResize);
+    window.addEventListener('resize', onResize);
+  }
+  var rafFn = (typeof requestAnimationFrame !== 'undefined') ? requestAnimationFrame : null;
+  if (rafFn) {
+    var lastT = null, acc = 0;
+    var frame = function (now) {
+      if (lastT === null) lastT = now;
+      var el = (now - lastT) / 1000; lastT = now;
+      if (pendingTap && now - pendingTap.at > 280) { doTap(pendingTap.x, pendingTap.y); pendingTap = null; }
+      acc += el; if (acc > 0.25) acc = 0.25;
+      var n = 0;
+      while (acc >= DT && n < 40) { stepSim(sim, false); acc -= DT; n++; }
+      if (humOsc && sim) {
+        var mf = 0, bi;
+        for (bi = 0; bi < sim.balls.length; bi++) mf += speedFactorAt(sim, sim.balls[bi].s);
+        mf /= sim.balls.length;
+        humOsc.frequency.setTargetAtTime(46 + 26 * mf, AC.currentTime, 0.1);
+      }
+      draw();
+      rafFn(frame);
+    };
+    rafFn(frame);
+  }
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Thread the Feed</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #07080C; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* No.988 "Thread the Feed" (PP149 Pa++ern embroidery wire, motoi-ishibashi study)
+   Network input transcoded into embroidery. Abstract word-fragments rise
+   from the bottom of a dark field as a feed; an embroidery hoop mid-frame
+   catches them and stitches them letter by letter at 2.2 chars/s in glowing
+   thread, each character landing with a white stitch dot and a sagging
+   thread trail. Finished lines accumulate as cloth inside the hoop; when a
+   section of eight completes, it slides down out of the hoop on a slow
+   conveyor and folds away at the bottom edge.
+   The whole pipeline (spawn, rise, catch, stitch, fold) is a deterministic
+   seeded timeline generated ahead of time; every frame is a pure function
+   of piece time u and the recorded gesture events. Frame one is the
+   synchronous draw at U0. */
+
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;var t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+
+var SEED = 988149;
+var U0 = 131.75;              // frame-one piece time (seconds into the timeline)
+var STITCH_RATE = 2.2;        // chars per second, specced
+var SECTION_ROWS = 8;
+var SLIDE_SPEED = 0.011;      // fraction of H per second, the slow conveyor
+
+var COL = {
+  bg: '#07080C', feed: '#8A8D84', hoop: '#3A3D46', dot: '#FFFFFF',
+  thread: ['#FF4FD8', '#4FD6FF', '#FFD93B', '#7DF9C6']
+};
+
+var cv = document.getElementById('c');
+var ctx = cv.getContext('2d');
+var W = 0, H = 0;
+
+function resize(){
+  var w = window.innerWidth, h = window.innerHeight;
+  if (window.visualViewport){ w = window.visualViewport.width; h = window.visualViewport.height; }
+  W = w; H = h;
+  cv.width = Math.round(w); cv.height = Math.round(h);
+}
+if (window.visualViewport) window.visualViewport.addEventListener('resize', resize);
+window.addEventListener('resize', resize);
+resize();
+
+function isPhone(){
+  var sw = (window.screen && window.screen.width)  || W;
+  var sh = (window.screen && window.screen.height) || H;
+  if (Math.min(sw, sh) < 700) return true;
+  return H > W * 1.15;
+}
+
+/* ---------------- abstract word pool (seeded, no real language) ---------------- */
+var ON  = ["v","t","k","m","n","r","s","l","th","qu","z","ph","br","sk"];
+var VOW = ["a","e","i","o","u","y"];
+var COD = ["l","m","n","r","s","k","th","","x"];
+
+var BLOCK = { the:1, sam:1, ram:1, ran:1, van:1, tin:1, sin:1, rim:1, sir:1, nam:1, tom:1, tim:1, kim:1, ken:1 };
+function makeToken(rng){
+  var t = "";
+  do {
+    t = ON[Math.floor(rng() * ON.length)] + VOW[Math.floor(rng() * VOW.length)];
+    if (rng() < 0.55) t += COD[Math.floor(rng() * COD.length)];
+    else t += VOW[Math.floor(rng() * VOW.length)] + COD[Math.floor(rng() * COD.length)];
+  } while (BLOCK[t]);
+  return t;
+}
+function makeText(rng){
+  var ntok = 3 + Math.floor(rng() * 4), toks = [];
+  for (var i = 0; i < ntok; i++) toks.push(makeToken(rng));
+  return toks.join(" ");
+}
+
+/* ---------------- deterministic timeline ----------------
+   Messages are generated in stitch order. Each carries its spawn, rise,
+   catch, stitch start/end, section and slot. Timing draws come from the
+   main rng stream in a fixed order (text, spawn gap, rise); all purely
+   visual parameters come from a second stream so timing stays stable. */
+var TL = null;
+
+function newTimeline(seed){
+  return {
+    rng: mulberry32(seed),
+    vrng: mulberry32(seed + 777),
+    msgs: [],
+    spawn: 1.0,
+    stitchFree: 0,
+    prevDur: 8.0,
+    nextIdx: 0,
+    foldStart: {}        // section -> stitch end of its 8th row
+  };
+}
+
+function genNext(){
+  var rng = TL.rng, vrng = TL.vrng;
+  var text = makeText(rng);
+  if (TL.nextIdx > 0) TL.spawn += TL.prevDur * (0.72 + rng() * 0.30);
+  var rise = 9.0 + rng() * 3.5;
+  var catchT = TL.spawn + rise;
+  var dur = text.length / STITCH_RATE;
+  var ss = Math.max(catchT, TL.stitchFree);
+  var se = ss + dur;
+  TL.stitchFree = se; TL.prevDur = dur;
+  var idx = TL.nextIdx++;
+  var m = {
+    idx: idx, text: text, color: COL.thread[idx % 4],
+    spawn: TL.spawn, rise: rise, catchT: catchT, ss: ss, se: se,
+    sec: Math.floor(idx / SECTION_ROWS), slot: idx % SECTION_ROWS,
+    feedX: (vrng() * 2 - 1), sway: vrng() * 6.283,
+    rowJit: (vrng() * 2 - 1) * 0.05, injected: false
+  };
+  TL.msgs.push(m);
+  if (m.slot === SECTION_ROWS - 1) TL.foldStart[m.sec] = se;
+  return m;
+}
+
+function ensure(u){
+  var guard = 0;
+  while (guard++ < 400){
+    var n = TL.msgs.length;
+    if (n && TL.msgs[n - 1].se > u + 30) break;
+    genNext();
+  }
+}
+
+/* tap injection: joins the back of the stitch queue in the next thread color */
+var tapRng = mulberry32(SEED + 31337);
+function inject(u){
+  var text = makeText(tapRng);
+  var dur = text.length / STITCH_RATE;
+  var catchT = u + 4.0;
+  var ss = Math.max(catchT, TL.stitchFree);
+  var se = ss + dur;
+  TL.stitchFree = se;
+  var idx = TL.nextIdx++;
+  var m = {
+    idx: idx, text: text, color: COL.thread[idx % 4],
+    spawn: u, rise: 4.0, catchT: catchT, ss: ss, se: se,
+    sec: Math.floor(idx / SECTION_ROWS), slot: idx % SECTION_ROWS,
+    feedX: 0, sway: 0, rowJit: 0, injected: true
+  };
+  TL.msgs.push(m);
+  if (m.slot === SECTION_ROWS - 1) TL.foldStart[m.sec] = se;
+}
+
+/* ---------------- layout ---------------- */
+function layout(){
+  var S = Math.min(W, H), phone = isPhone();
+  var R = phone ? W * 0.40 : S * 0.31;
+  return {
+    S: S, phone: phone,
+    cx: W / 2,
+    cy: H * (phone ? 0.40 : 0.42),
+    R: R,
+    rowH: R * 0.19,
+    feedFont: Math.max(10, S * 0.016),
+    threadFont: Math.max(12, R * 0.088)
+  };
+}
+function rowCenterY(L, slot){ return L.cy + (slot - (SECTION_ROWS - 1) / 2) * L.rowH; }
+
+/* fit a mono font so text fits the hoop chord at rowY; returns {font, charW, width} */
+function fitFont(text, baseFont, L, rowY){
+  var dy = Math.abs(rowY - L.cy);
+  var chord = Math.sqrt(Math.max(L.R * L.R - dy * dy, 1)) * 0.92;
+  var f = baseFont;
+  ctx.font = f + "px monospace";
+  var w = ctx.measureText(text).width;
+  if (w > chord * 2){ f = Math.max(8, f * (chord * 2) / w); ctx.font = f + "px monospace"; w = ctx.measureText(text).width; }
+  var cw = ctx.measureText("MMMMMMMMMM").width / 10;
+  return { font: f, charW: cw, width: w };
+}
+
+/* ---------------- elastic thread pull (drag) ---------------- */
+var pull = { active: false, x: 0, y: 0, releaseU: -10, sx: 0, sy: 0 };
+function pullAmt(u){
+  if (pull.active) return 1;
+  var dt = u - pull.releaseU;
+  if (dt < 0 || dt > 2.5) return 0;
+  return Math.exp(-2.2 * dt) * Math.cos(5.5 * dt);
+}
+function pullOffset(u, L, x, y, strength){
+  var amt = pullAmt(u);
+  if (!amt) return [0, 0];
+  var tx = pull.active ? pull.x : pull.sx, ty = pull.active ? pull.y : pull.sy;
+  var dx = tx - x, dy = ty - y, d = Math.sqrt(dx * dx + dy * dy);
+  var infl = Math.max(0, 1 - d / (L.R * 1.25));
+  var k = 0.34 * infl * amt * strength;
+  return [dx * k, dy * k];
+}
+
+/* ---------------- audio (lazy, all guarded) ---------------- */
+var AC = null, masterGain = null, noiseBuf = null;
+function ensureAudio(){
+  if (AC) return;
+  var Ctor = (typeof AudioContext !== "undefined") ? AudioContext
+           : (typeof webkitAudioContext !== "undefined") ? webkitAudioContext : null;
+  if (!Ctor) return;
+  try {
+    AC = new Ctor();
+    masterGain = AC.createGain(); masterGain.gain.value = 0.4;
+    masterGain.connect(AC.destination);
+    var len = Math.floor(AC.sampleRate * 0.6);
+    noiseBuf = AC.createBuffer(1, len, AC.sampleRate);
+    var d = noiseBuf.getChannelData(0);
+    for (var i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+  } catch (e) { AC = null; }
+}
+function blip(freq, dur, gain, type){
+  if (!AC) return;
+  try {
+    var o = AC.createOscillator(), g = AC.createGain(), t = AC.currentTime;
+    o.type = type; o.frequency.value = freq;
+    g.gain.setValueAtTime(gain, t);
+    g.gain.exponentialRampToValueAtTime(0.0008, t + dur);
+    o.connect(g); g.connect(masterGain);
+    o.start(t); o.stop(t + dur + 0.02);
+  } catch (e) {}
+}
+function fabricSweep(){
+  if (!AC || !noiseBuf) return;
+  try {
+    var src = AC.createBufferSource(); src.buffer = noiseBuf; src.loop = true;
+    var f = AC.createBiquadFilter(); f.type = "lowpass";
+    var t = AC.currentTime;
+    f.frequency.setValueAtTime(1400, t);
+    f.frequency.exponentialRampToValueAtTime(240, t + 0.8);
+    var g = AC.createGain();
+    g.gain.setValueAtTime(0.0008, t);
+    g.gain.exponentialRampToValueAtTime(0.07, t + 0.12);
+    g.gain.exponentialRampToValueAtTime(0.0008, t + 0.85);
+    src.connect(f); f.connect(g); g.connect(masterGain);
+    src.start(t); src.stop(t + 0.9);
+  } catch (e) {}
+}
+var sndState = { u: -1, chars: 0, spawns: 0, folds: {} };
+function audioEvents(u){
+  if (!AC) { sndState.u = u; return; }
+  var spawns = 0, chars = 0;
+  for (var i = 0; i < TL.msgs.length; i++){
+    var m = TL.msgs[i];
+    if (m.spawn <= u) spawns++;
+    if (u >= m.ss && u < m.se) chars = Math.floor((u - m.ss) * STITCH_RATE);
+  }
+  if (sndState.u >= 0){
+    if (spawns > sndState.spawns) blip(1600, 0.05, 0.035, "square");           // feed typing tick
+    if (chars > sndState.chars) blip(2900, 0.02, 0.05, "triangle");            // needle click
+    for (var sec in TL.foldStart){
+      if (TL.foldStart[sec] > sndState.u && TL.foldStart[sec] <= u && !sndState.folds[sec]){
+        sndState.folds[sec] = true; fabricSweep();                              // cloth folds away
+      }
+    }
+  }
+  sndState.u = u; sndState.spawns = spawns; sndState.chars = chars;
+}
+
+/* ---------------- draw ---------------- */
+function draw(u){
+  cv.style.width = W + "px"; cv.style.height = H + "px";
+  var L = layout();
+  ctx.fillStyle = COL.bg;
+  ctx.fillRect(0, 0, W, H);
+  ctx.textBaseline = "middle";
+
+  var catchY = L.cy + L.R * 1.03;
+  var i, m;
+
+  /* feed lines rising from the bottom */
+  ctx.fillStyle = COL.feed;
+  ctx.font = L.feedFont + "px monospace";
+  ctx.textAlign = "center";
+  for (i = 0; i < TL.msgs.length; i++){
+    m = TL.msgs[i];
+    if (u >= m.spawn && u < m.catchT){
+      var p = (u - m.spawn) / m.rise;
+      var y = (H + 24) + (catchY - (H + 24)) * p;
+      var x = L.cx + m.feedX * W * 0.30 + Math.sin(u * 0.7 + m.sway) * 4;
+      ctx.globalAlpha = 0.55 + 0.35 * p;
+      ctx.fillText(m.text, x, y);
+    }
+  }
+  ctx.globalAlpha = 1;
+
+  /* caught messages waiting at the rim for the stitcher */
+  var queued = [];
+  for (i = 0; i < TL.msgs.length; i++){
+    m = TL.msgs[i];
+    if (u >= m.catchT && u < m.ss) queued.push(m);
+  }
+  ctx.font = (L.feedFont * 0.78) + "px monospace";
+  for (i = 0; i < queued.length && i < 3; i++){
+    var qx = L.cx + queued[i].feedX * W * 0.08;
+    ctx.globalAlpha = 0.55;
+    ctx.fillText(queued[i].text, qx, catchY + L.feedFont * (1.15 + i * 1.3));
+  }
+  ctx.globalAlpha = 1;
+
+  /* finished cloth rows (in the hoop, then sliding down the conveyor) */
+  for (i = 0; i < TL.msgs.length; i++){
+    m = TL.msgs[i];
+    if (u < m.se) continue;
+    var fs = TL.foldStart[m.sec];
+    var slide = (fs !== undefined && u > fs) ? (u - fs) * SLIDE_SPEED * H : 0;
+    var ry = rowCenterY(L, m.slot) + slide;
+    if (ry > H * 1.08) continue;
+    var alpha = 0.5;
+    if (slide > 0) alpha *= Math.max(0, Math.min(1, (H * 1.04 - ry) / (H * 0.16)));
+    if (alpha <= 0.01) continue;
+    var fit = fitFont(m.text, L.threadFont, L, Math.min(ry, L.cy + L.R));
+    var sx = L.cx + m.rowJit * L.R - fit.width / 2;
+    var off = pullOffset(u, L, L.cx, ry, 0.35);
+    ctx.font = fit.font + "px monospace";
+    ctx.textAlign = "left";
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = m.color;
+    ctx.fillText(m.text, sx + off[0], ry + off[1]);
+  }
+  ctx.globalAlpha = 1;
+
+  /* the hoop: double rim and screw nub */
+  ctx.strokeStyle = COL.hoop;
+  ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(L.cx, L.cy, L.R, 0, 6.2832); ctx.stroke();
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.arc(L.cx, L.cy, L.R - 5, 0, 6.2832); ctx.stroke();
+  ctx.fillStyle = COL.hoop;
+  ctx.fillRect(L.cx - 12, L.cy - L.R - 15, 6, 14);
+  ctx.fillRect(L.cx + 6, L.cy - L.R - 15, 6, 14);
+  ctx.beginPath(); ctx.arc(L.cx, L.cy - L.R - 8, 4.5, 0, 6.2832); ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(L.cx - 3, L.cy - L.R - 8); ctx.lineTo(L.cx + 3, L.cy - L.R - 8);
+  ctx.stroke();
+
+  /* the line currently being stitched */
+  for (i = 0; i < TL.msgs.length; i++){
+    m = TL.msgs[i];
+    if (!(u >= m.ss && u < m.se)) continue;
+    var ry2 = rowCenterY(L, m.slot);
+    var fit2 = fitFont(m.text, L.threadFont, L, ry2);
+    var sx2 = L.cx + m.rowJit * L.R - fit2.width / 2;
+    var shown = Math.min(m.text.length, Math.floor((u - m.ss) * STITCH_RATE));
+    var dotR = Math.max(1.2, L.R * 0.006);
+    var pts = [];
+    ctx.font = fit2.font + "px monospace";
+    ctx.textAlign = "left";
+    var j, chx, chy, o2;
+    for (j = 0; j < shown; j++){
+      chx = sx2 + j * fit2.charW;
+      o2 = pullOffset(u, L, chx, ry2, 1.0);
+      pts.push([chx + fit2.charW / 2 + o2[0], ry2 + fit2.font * 0.46 + o2[1]]);
+      ctx.globalAlpha = 0.20;
+      ctx.fillStyle = m.color;
+      ctx.fillText(m.text[j], chx + o2[0] + 1, ry2 + o2[1]);
+      ctx.globalAlpha = 1;
+      ctx.fillText(m.text[j], chx + o2[0], ry2 + o2[1]);
+    }
+    /* thread trail: sagging stitches between the dots, plus the needle tail */
+    if (pts.length){
+      ctx.strokeStyle = m.color;
+      ctx.globalAlpha = 0.8;
+      ctx.lineWidth = Math.max(1, L.R * 0.005);
+      ctx.beginPath();
+      ctx.moveTo(pts[0][0], pts[0][1]);
+      for (j = 1; j < pts.length; j++){
+        var mx = (pts[j - 1][0] + pts[j][0]) / 2, my = (pts[j - 1][1] + pts[j][1]) / 2 + fit2.font * 0.16;
+        ctx.quadraticCurveTo(pts[j - 1][0], pts[j - 1][1], mx, my);
+        ctx.lineTo(pts[j][0], pts[j][1]);
+      }
+      var last = pts[pts.length - 1];
+      ctx.quadraticCurveTo(last[0] + 14, last[1] + 3, last[0] + 26, last[1] + fit2.font * 0.9);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = COL.dot;
+      for (j = 0; j < pts.length; j++){
+        ctx.beginPath(); ctx.arc(pts[j][0], pts[j][1], dotR, 0, 6.2832); ctx.fill();
+      }
+      /* needle at the end of the tail */
+      ctx.fillStyle = COL.feed;
+      ctx.beginPath(); ctx.arc(last[0] + 26, last[1] + fit2.font * 0.9, dotR * 1.1, 0, 6.2832); ctx.fill();
+    }
+    break;
+  }
+}
+
+/* ---------------- interaction ---------------- */
+var startStamp = (typeof performance !== "undefined" && performance.now) ? performance.now() : 0;
+function pieceU(){
+  if (typeof performance === "undefined" || !performance.now) return U0;
+  return U0 + (performance.now() - startStamp) / 1000;
+}
+var downInfo = null, lastTapUp = -1000, pendingTap = null;
+
+function onDown(e){
+  ensureAudio();
+  if (AC && AC.resume) AC.resume();
+  var r = cv.getBoundingClientRect ? cv.getBoundingClientRect() : { left: 0, top: 0 };
+  var x = (e.clientX || 0) - r.left, y = (e.clientY || 0) - r.top;
+  downInfo = { x: x, y: y, t: performance.now(), dragging: false };
+  pull.active = false;
+}
+function onMove(e){
+  if (!downInfo) return;
+  var r = cv.getBoundingClientRect ? cv.getBoundingClientRect() : { left: 0, top: 0 };
+  var x = (e.clientX || 0) - r.left, y = (e.clientY || 0) - r.top;
+  if (!downInfo.dragging && Math.sqrt((x - downInfo.x) * (x - downInfo.x) + (y - downInfo.y) * (y - downInfo.y)) > 8) downInfo.dragging = true;
+  if (downInfo.dragging){ pull.active = true; pull.x = x; pull.y = y; }
+}
+function onUp(e){
+  if (!downInfo) return;
+  var now = performance.now();
+  if (downInfo.dragging){
+    pull.active = false;
+    pull.sx = pull.x; pull.sy = pull.y;
+    pull.releaseU = pieceU();
+  } else if (now - downInfo.t < 400){
+    if (pendingTap && now - pendingTap.t < 350){
+      /* double-tap: a new hoop */
+      pendingTap = null;
+      SEED += 1;
+      TL = newTimeline(SEED);
+      tapRng = mulberry32(SEED + 31337);
+      sndState = { u: -1, chars: 0, spawns: 0, folds: {} };
+      startStamp = now;
+      ensure(U0 + 1);
+      draw(U0);
+    } else {
+      pendingTap = { t: now };
+    }
+    lastTapUp = now;
+  }
+  downInfo = null;
+}
+if (cv.addEventListener){
+  cv.addEventListener('pointerdown', onDown);
+  cv.addEventListener('pointermove', onMove);
+  cv.addEventListener('pointerup', onUp);
+  cv.addEventListener('pointercancel', function(){ downInfo = null; pull.active = false; });
+  cv.addEventListener('touchstart', function(e){ if (e.preventDefault) e.preventDefault(); }, { passive: false });
+}
+
+/* ---------------- main loop ---------------- */
+function frame(){
+  var u = pieceU();
+  if (pendingTap && performance.now() - pendingTap.t >= 350){
+    pendingTap = null;
+    inject(u);
+  }
+  ensure(u);
+  audioEvents(u);
+  draw(u);
+  if (typeof requestAnimationFrame === "function") requestAnimationFrame(frame);
+}
+
+TL = newTimeline(SEED);
+ensure(U0 + 1);
+draw(U0);
+if (typeof requestAnimationFrame === "function") requestAnimationFrame(frame);
+</script>
+</body>
+</html>

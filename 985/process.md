@@ -1,0 +1,33 @@
+# No.985 — Can a Spotlight Fly?
+
+Study #121 motoi-ishibashi, PP146 "shadow" (2015): Ishibashi's own question, "can a spotlight fly and still be beautiful?" One drone, one warm light, a dark void. The light is curious, never a searchlight: wherever the cone lands, the floor blooms and a ripple presses out of the pool.
+
+## Concept
+
+A single small drone (dark X silhouette, four flickering rotor blurs) flies slow searching curves through the upper void: it travels to a waypoint, hovers and tilts as if thinking, and moves on. Bolted under it, a spotlight throws a warm cone whose aim lags behind the drone's turns, so the light swings a beat late, like something being carried. Dust motes drift everywhere but are only drawn inside the cone: the light reveals them. Where the cone meets the invisible floor, a warm ellipse blooms; on every settle a slow ripple ring spreads through the pool (the light has weight, it presses). A few dust clusters drift through the void, and when the pool rests on one for about 1.5 s the drone finds it: it holds, the pool warms to full, and a low bloom tone sounds. Tap holds the drone for 10 s with the cone locked on the tap point; drag flies it by hand for 15 s; double-tap reseeds the search with a new drone. Sound is gesture-started only: rotor hum pitched by drone speed, an airy wash that follows the cone angle, the bloom tone on a find.
+
+## Construction
+
+- Fixed-step simulation at 120 Hz (dt = 1/120), all randomness from a seeded mulberry32 (base seed 985146). Frame one is the synchronous draw after a 1680-step pre-roll to t = 14 s; nothing drawn is derived from the wall clock. The rAF loop (typeof-guarded) only advances the same fixed steps through a capped accumulator.
+- Search: the drone follows a waypoint timeline of alternating eased moves (smoothstep) and holds, stored as segments with chained start times and evaluated closed-form at pathT. pathT freezes while the drone is in a found-hold, a tap-hold, or a drag, so the search resumes exactly where it left off. The opening segments are hand-set so frame one is composed (arrival at pathT 12.8 spawns a settle ripple; at t = 14 the drone is in the following hold, mid-scan); the remaining 240 move/hold pairs are seeded.
+- Cone aim: the cone angle theta is a lagged state, an exponential chase (about 0.55 s constant) toward a target taken from the drone's velocity heading while moving, or a slow scan sweep while hovering. The floor pool is the analytic intersection of the cone ray with the floor line (y = 0.865). The cone is two layered flat-alpha wedge polygons (outer #FFD88A at 0.25, core #FFE9B8 at 0.40) whose base fully contains the pool ellipse; the pool is drawn over the cone so no straight cone edge ever cuts the pool. No gradients, no shadowBlur, no filters, no offscreen canvas.
+- Dust: 200 field motes plus 16 anchored motes per cluster (4 clusters), all positions closed-form sine drifts of sim time. Motes are drawn only inside the outer cone path via canvas clip. Cluster find: when the pool center stays within a threshold of a drifting cluster for a continuous 1.5 s (tracked per step, with decay and a 14 s cooldown), the find triggers: 4 s hold, pool warmth ramps up, a ripple spawns, the bloom tone fires.
+- Ripples: a list of spawn times (waypoint settles, finds, tap-holds, drag starts); each renders as an expanding ellipse outline, #FFFFFF at 0.20 fading over 2.8 s, radius a closed form of its age.
+- Interaction: pointer events recorded against sim time. Tap = hold mode 10 s (drone frozen, theta target aimed at the tap point). Drag = the drone chases the pointer with a soft lag for up to 15 s from drag start. Double-tap = reseed: a fresh timeline from base seed + reseedCount, sim clock and ripples preserved.
+- Audio: lazily created on the first pointerdown, every use typeof-guarded and try-wrapped. Rotor = lowpassed sawtooth whose pitch follows the smoothed drone speed; wash = looped noise through a bandpass, gain following cone angle; bloom = a 96 Hz sine swell on a find. The piece is visually complete in silence.
+- Viewport: canvas sized from the Visual Viewport API with resize listeners on visualViewport and window; canvas style width/height pinned in px on every draw. Phone detection via window.screen physical size (min dimension < 700 px) with aspect fallback (h > w * 1.15). Sizes scale with u = min(W, H) / 720 so drone and pool stay proportionate on phones; page ground is the void tone.
+
+## QA log
+
+- Rendered with the house node-canvas renderer at 1280x900 (qa-desktop.png), 390x844 (qa-mobile.png), and 720x720 (thumb.png). Renders cleanly in silence (no AudioContext in the renderer; all audio paths guarded).
+- Determinism: thumb.png rendered twice and byte-compared with cmp: identical. The duplicate render was deleted.
+- Desktop frame one reads: near-black void; one small dark X drone upper-left of center, tilted, rotor streaks visible; the warm cone swung down-right from it; dust specks visible only inside the cone, including one cluster knot low in the beam; the pool blooming lower-right with its bright core and a ripple ring caught mid-spread.
+- Mobile frame one: the same scene fitted to the tall frame; the cone runs long and narrow, pool whole at the bottom, nothing clipped.
+- Fix rounds: (1) the cone wedge originally ended at the pool center, leaving a hard horizontal edge slicing the ellipse and a dark lower half hanging over the void; the wedge base was moved to the pool's top, which still left a bright band across the pool, so it now extends to the pool's bottom tangent with the pool drawn over it, and the spread factor was reduced slightly. (2) The drone read as a faint speck at desktop size; arm half-length raised 13u to 15u, arm and rotor strokes thickened slightly. All sizes re-rendered and determinism re-verified after each round.
+- Source grep-verified: no gradients, shadowBlur, ctx.filter, offscreen canvas, external references, or date strings; the only text in the piece is the <title>.
+
+## Deviations
+
+- During hover holds the scan sweep's bias is set by segment parity rather than a separate curiosity model; the sweep still reads as the drone looking around while it thinks, and it keeps theta a pure function of the timeline.
+- The find threshold is computed in normalized x against the cluster's floor-projected position (with a fixed allowance for the cluster's height above the floor line), rather than a full 2D pool-overlap test; clusters drift slowly and low, so the trigger reads the same: the pool must rest on the cluster.
+- Drag control lasts 15 s measured from the drag's start (the prompt's wording) rather than 15 s after release; while the pointer is down the drone keeps following the hand regardless.
