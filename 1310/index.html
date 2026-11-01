@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Broadcast Slices</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #F4F2ED; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  /* Seeded PRNG (mulberry32). No Math.random anywhere in this piece. */
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  /* Palette (KH7, verbatim). */
+  var WHITE = '#F4F2ED', CHROME = '#9AA0A6', GREEN = '#2F5D3A',
+      AMBER = '#C8871E', BLACK = '#111111', RED = '#B3271E';
+
+  var W = 0, H = 0, S = 0; /* viewport width/height, unit = min(W,H) */
+  var isPhone = false;
+  var STRIPS = 40, GAP = 2;
+  var LOOP = 40; /* seconds: lock, drift out, re-lock, hold */
+
+  /* Static seeded layout: bottle rows and stamp glyphs. */
+  var bottles = [], stamps = [];
+  function buildLayout() {
+    var r = mulberry32(1310);
+    bottles = [];
+    var cols = [GREEN, AMBER, CHROME, GREEN, CHROME, AMBER];
+    for (var side = 0; side < 2; side++) {
+      for (var i = 0; i < 7; i++) {
+        bottles.push({
+          x: side === 0 ? 0.015 + i * 0.0135 : 0.985 - i * 0.0135,
+          y: 0.30 + r() * 0.42,
+          w: 0.016 + r() * 0.008,
+          h: 0.10 + r() * 0.09,
+          c: cols[(i + side * 3) % cols.length],
+          neck: 0.35 + r() * 0.3
+        });
+      }
+    }
+    stamps = [];
+    var kinds = ['diamond', 'ring', 'star', 'cross', 'bar'];
+    for (var j = 0; j < 9; j++) {
+      stamps.push({
+        x: 0.06 + r() * 0.88, y: 0.05 + r() * 0.16,
+        s: 0.018 + r() * 0.02, k: kinds[Math.floor(r() * kinds.length)],
+        c: j % 3 === 0 ? RED : BLACK, rot: r() * 0.9 - 0.45
+      });
+    }
+  }
+
+  /* Per-strip drift parameters, seeded once. */
+  var stripAmp = [], stripPhase = [], stripSpeed = [];
+  function buildStrips() {
+    var r = mulberry32(131007);
+    for (var i = 0; i < STRIPS; i++) {
+      stripAmp.push(0.030 + r() * 0.035);
+      stripPhase.push(r() * Math.PI * 2);
+      stripSpeed.push(0.35 + r() * 0.45);
+    }
+  }
+
+  /* Mirror-flip schedule for one loop, from a seeded stream. */
+  function flipEvents(loop) {
+    var r = mulberry32(1310 + loop * 7919);
+    var ev = [];
+    for (var k = 0; k < 3; k++) {
+      ev.push({ t: 9 + k * 9 + r() * 5, strip: Math.floor(r() * STRIPS) });
+    }
+    return ev;
+  }
+  function stripMirrored(i, loopT, loop) {
+    var ev = flipEvents(loop), on = false;
+    for (var k = 0; k < ev.length; k++) {
+      if (ev[k].strip === i && loopT >= ev[k].t) on = !on;
+    }
+    return on;
+  }
+
+  /* Sync envelope: 1 = locked, 0 = fully drifted. */
+  function smooth(a, b, x) {
+    if (x <= a) return 0; if (x >= b) return 1;
+    var u = (x - a) / (b - a); return u * u * (3 - 2 * u);
+  }
+  function syncAt(t) {
+    var lt = t % LOOP;
+    if (lt < 6) return 1;
+    if (lt < 24) return 1 - smooth(6, 24, lt);
+    if (lt < 32) return smooth(24, 32, lt);
+    return 1;
+  }
+
+  /* Drag scrub: closed-form over the recorded drag event list. */
+  var dragEvents = []; /* {t, dx} moves and {t, up:true} releases */
+  var dragging = false, lastX = 0;
+  function scrubAt(t) {
+    var acc = 0, lastUp = -1e9;
+    for (var k = 0; k < dragEvents.length; k++) {
+      var e = dragEvents[k];
+      if (e.t > t) break;
+      if (e.up) { lastUp = e.t; }
+      else { acc += e.dx * 0.35; }
+    }
+    if (lastUp > -1e8) {
+      var dt = t - lastUp;
+      if (dt > 0) acc *= Math.exp(-dt / 1.5);
+    }
+    return acc;
+  }
+  function stripOffset(i, t) {
+    var s = 1 - syncAt(t);
+    var drift = stripAmp[i] * s * Math.sin(stripPhase[i] + t * stripSpeed[i]);
+    var scrub = scrubAt(t) * Math.sin(i * 0.9 + 1.3);
+    return (drift * H) + scrub;
+  }
+
+  function size() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    if (typeof visualViewport !== 'undefined' && visualViewport) {
+      vw = visualViewport.width; vh = visualViewport.height;
+    }
+    W = vw; H = vh; S = Math.min(W, H);
+    canvas.width = W; canvas.height = H;
+    canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+    var sw = 1e9, sh = 0;
+    if (typeof window !== 'undefined' && window.screen) {
+      sw = window.screen.width; sh = window.screen.height;
+    }
+    var minDim = Math.min(sw, sh);
+    isPhone = (minDim < 700) || (H > W * 1.15);
+    if (typeof document !== 'undefined' && document.body && document.body.style) {
+      document.body.style.background = WHITE;
+    }
+  }
+
+  function rr(x, y, w, h) { ctx.fillRect(x, y, w, h); }
+
+  /* The full scene, drawn in absolute coordinates. Called once per strip
+     under a clip rect (and, for mirrored strips, a horizontal flip). */
+  function drawScene() {
+    var u = S;
+    /* Counter: chrome bar the figure sits at. */
+    ctx.fillStyle = CHROME;
+    rr(W * 0.10, H * 0.66, W * 0.80, Math.max(3, u * 0.012));
+    ctx.fillStyle = BLACK;
+    rr(W * 0.10, H * 0.66 + Math.max(3, u * 0.012), W * 0.80, Math.max(2, u * 0.006));
+
+    /* Seated figure: abstract silhouette, no likeness. */
+    var cx = W * 0.5, hy = H * 0.40, hr = u * 0.075;
+    ctx.fillStyle = BLACK;
+    ctx.beginPath();
+    ctx.moveTo(cx - hr * 0.9, hy);
+    ctx.ellipse(cx, hy, hr * 0.9, hr, 0, 0, Math.PI * 2);
+    ctx.fill();
+    /* Headphones: band arc + ear cups. */
+    ctx.strokeStyle = CHROME; ctx.lineWidth = Math.max(3, u * 0.014);
+    ctx.beginPath();
+    ctx.moveTo(cx - hr * 0.95, hy - hr * 0.1);
+    ctx.ellipse(cx, hy - hr * 0.1, hr * 1.05, hr * 1.05, 0, Math.PI, Math.PI * 2);
+    ctx.stroke();
+    ctx.fillStyle = CHROME;
+    rr(cx - hr * 1.15, hy - hr * 0.45, hr * 0.28, hr * 0.9);
+    rr(cx + hr * 0.87, hy - hr * 0.45, hr * 0.28, hr * 0.9);
+    /* Torso down to the counter, one arm reaching forward. */
+    ctx.fillStyle = BLACK;
+    ctx.beginPath();
+    ctx.moveTo(cx - hr * 1.5, H * 0.66);
+    ctx.lineTo(cx - hr * 0.7, H * 0.50);
+    ctx.lineTo(cx + hr * 0.7, H * 0.50);
+    ctx.lineTo(cx + hr * 1.5, H * 0.66);
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle = BLACK;
+    rr(cx - hr * 2.1, H * 0.60, hr * 2.4, Math.max(4, u * 0.02));
+    /* Amber accent: a small cup on the counter. */
+    ctx.fillStyle = AMBER;
+    rr(cx + hr * 1.9, H * 0.60, hr * 0.35, hr * 0.6);
+
+    /* Bottle rows at both edges (repeat strips). */
+    for (var b = 0; b < bottles.length; b++) {
+      var bt = bottles[b];
+      var bx = bt.x * W, by = bt.y * H, bw = bt.w * W, bh = bt.h * H;
+      ctx.fillStyle = bt.c;
+      rr(bx - bw / 2, by, bw, bh);
+      rr(bx - bw * 0.22, by - bh * bt.neck, bw * 0.44, bh * bt.neck);
+      ctx.fillStyle = WHITE;
+      rr(bx - bw * 0.30, by + bh * 0.25, bw * 0.60, Math.max(2, u * 0.006));
+    }
+
+    /* Stamp glyphs in the upper third: abstract shapes, no words. */
+    for (var s = 0; s < stamps.length; s++) {
+      var st = stamps[s], sx = st.x * W, sy = st.y * H, ss = st.s * u;
+      ctx.save();
+      ctx.translate(sx, sy); ctx.rotate(st.rot);
+      ctx.fillStyle = st.c;
+      if (st.k === 'diamond') {
+        ctx.beginPath();
+        ctx.moveTo(0, -ss); ctx.lineTo(ss * 0.7, 0);
+        ctx.lineTo(0, ss); ctx.lineTo(-ss * 0.7, 0);
+        ctx.closePath(); ctx.fill();
+      } else if (st.k === 'ring') {
+        ctx.strokeStyle = st.c; ctx.lineWidth = Math.max(2, ss * 0.25);
+        ctx.beginPath(); ctx.arc(0, 0, ss * 0.7, 0, Math.PI * 2); ctx.stroke();
+      } else if (st.k === 'star') {
+        ctx.beginPath();
+        for (var p = 0; p < 10; p++) {
+          var rad = (p % 2 === 0) ? ss : ss * 0.45;
+          var ang = -Math.PI / 2 + p * Math.PI / 5;
+          var px = Math.cos(ang) * rad, py = Math.sin(ang) * rad;
+          if (p === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+        }
+        ctx.closePath(); ctx.fill();
+      } else if (st.k === 'cross') {
+        rr(-ss * 0.2, -ss, ss * 0.4, ss * 2);
+        rr(-ss, -ss * 0.2, ss * 2, ss * 0.4);
+      } else {
+        rr(-ss, -ss * 0.18, ss * 2, ss * 0.36);
+      }
+      ctx.restore();
+    }
+  }
+
+  function draw(t) {
+    size();
+    ctx.fillStyle = WHITE;
+    ctx.fillRect(0, 0, W, H);
+    var loop = Math.floor(t / LOOP), lt = t % LOOP;
+    var sw = W / STRIPS;
+    for (var i = 0; i < STRIPS; i++) {
+      var x0 = i * sw;
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(x0, 0, sw - GAP, H);
+      ctx.clip();
+      ctx.translate(0, stripOffset(i, t));
+      if (stripMirrored(i, lt, loop)) {
+        var cxm = x0 + sw / 2;
+        ctx.translate(cxm, 0); ctx.scale(-1, 1); ctx.translate(-cxm, 0);
+      }
+      drawScene();
+      ctx.restore();
+    }
+  }
+
+  buildLayout();
+  buildStrips();
+
+  /* Boot: frame one at exactly t = 0, before the clock starts. */
+  var booted = false;
+  function boot() {
+    if (booted) return; booted = true;
+    draw(0);
+  }
+  boot();
+
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', function (e) {
+      dragging = true; lastX = e.clientX;
+      if (e.preventDefault) e.preventDefault();
+    });
+    canvas.addEventListener('pointermove', function (e) {
+      if (!dragging) return;
+      var dx = e.clientX - lastX;
+      lastX = e.clientX;
+      dragEvents.push({ t: pieceTime(), dx: dx });
+      if (e.preventDefault) e.preventDefault();
+    });
+    var endDrag = function () {
+      if (!dragging) return;
+      dragging = false;
+      dragEvents.push({ t: pieceTime(), up: true });
+    };
+    canvas.addEventListener('pointerup', endDrag);
+    canvas.addEventListener('pointercancel', endDrag);
+  }
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('resize', function () { draw(pieceTime()); });
+    if (typeof visualViewport !== 'undefined' && visualViewport && visualViewport.addEventListener) {
+      visualViewport.addEventListener('resize', function () { draw(pieceTime()); });
+    }
+  }
+
+  /* Clock: starts only with the rAF loop. */
+  var start = 0, started = false;
+  function pieceTime() {
+    if (!started) return 0;
+    if (typeof performance !== 'undefined' && performance.now) {
+      return (performance.now() - start) / 1000;
+    }
+    return 0;
+  }
+  function loop() {
+    if (!started) { started = true; start = performance.now(); }
+    draw(pieceTime());
+    if (typeof requestAnimationFrame !== 'undefined') {
+      requestAnimationFrame(loop);
+    }
+  }
+  if (typeof requestAnimationFrame !== 'undefined') {
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
