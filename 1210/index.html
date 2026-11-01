@@ -1,0 +1,604 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Interface Absences</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #1E1E24; height: 100%; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  var T0 = 52;          // fixed first-frame phase: mid-arc, two windows open
+  var CYCLE = 180;      // 3-minute arc: busy desktop -> cursor alone -> restore
+
+  var W = 0, H = 0, DPR = 1, phone = false, U = 1;
+
+  function hash(n) {
+    var x = Math.sin(n * 127.1 + 311.7) * 43758.5453;
+    return x - Math.floor(x);
+  }
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function lerp(a, b, p) { return a + (b - a) * p; }
+  function smoother(p) { return p * p * p * (p * (p * 6 - 15) + 10); }
+
+  function fit() {
+    var vv = (typeof window !== 'undefined' && window.visualViewport) ? window.visualViewport : null;
+    var w = vv ? vv.width : window.innerWidth;
+    var h = vv ? vv.height : window.innerHeight;
+    W = w; H = h;
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.round(w * DPR);
+    canvas.height = Math.round(h * DPR);
+    var sw = (window.screen && window.screen.width) || w;
+    var sh = (window.screen && window.screen.height) || h;
+    phone = (Math.min(sw, sh) < 700) || (h > w * 1.15);
+    U = clamp(Math.min(w, h) / 720, 0.55, 1.2);
+  }
+
+  var startStamp = Date.now();
+  function pieceTime() { return T0 + (Date.now() - startStamp) / 1000; }
+
+  /* ---------------- schedule (pure functions of hashes) ---------------- */
+
+  var SLOTS = [
+    { title: 'birch_film.mov', x: 0.345, y: 0.115, w: 0.335, h: 0.395 },
+    { title: 'street_reel',    x: 0.585, y: 0.315, w: 0.355, h: 0.415 },
+    { title: 'crowd_02',       x: 0.295, y: 0.475, w: 0.315, h: 0.385 },
+    { title: 'rooftops',       x: 0.635, y: 0.075, w: 0.295, h: 0.335 }
+  ];
+
+  function slotRect(s) {
+    var r = { x: s.x * W, y: s.y * H, w: s.w * W, h: s.h * H };
+    if (phone) r.h *= 0.58;   // portrait: keep windows from becoming slabs
+    return r;
+  }
+
+  // Window appearances. The first three opens are anchored so that at the
+  // first-frame phase (t = 52) one window is playing a fragment, one has
+  // already emptied into absence, and one has closed into the trash.
+  var APPS = [];
+  (function buildApps() {
+    var opens = [26, 40, 49];
+    var k = 3;
+    while (true) {
+      var nx = opens[k - 1] + 8 + hash(700 + k) * 6;   // gap 8-14 s
+      if (nx > 128) break;                              // windows stop opening after ~130
+      opens.push(nx); k++;
+    }
+    var slotFreeAt = [-1, -1, -1, -1];
+    for (var i = 0; i < opens.length; i++) {
+      var open = opens[i], dur, foot;
+      if (i === 0)      { dur = 8 + hash(710) * 3;        foot = 2 + hash(711) * 2; }
+      else if (i === 1) { dur = 12.5 + hash(712) * 1.5;   foot = 2 + hash(713) * 0.8; }
+      else if (i === 2) { dur = 7 + hash(714) * 4;        foot = 3.2 + hash(715) * 0.8; }
+      else              { dur = 6 + hash(720 + i) * 6;    foot = 2 + hash(730 + i) * 2; }
+      // first free slot, search order rotated by hash
+      var slot = -1, startAt = Math.floor(hash(740 + i) * 4);
+      for (var j = 0; j < 4; j++) {
+        var cand = (startAt + j) % 4;
+        if (slotFreeAt[cand] <= open - 0.3) { slot = cand; break; }
+      }
+      if (slot < 0) slot = startAt;
+      slotFreeAt[slot] = open + dur;
+      var scene = (slot === 1) ? 0 : (slot === 2) ? 1 : (slot === 3) ? 2 : (i % 3);
+      APPS.push({
+        i: i, slot: slot, open: open, close: open + dur, foot: foot,
+        scene: scene, seed: 1000 + i * 37,
+        baseMiss: 0.22 + hash(750 + i) * 0.26
+      });
+    }
+  })();
+
+  var FOLDERS = [
+    { name: 'photos_04', x: 0.045, y: 0.07 }, { name: 'field_rec', x: 0.045, y: 0.295 },
+    { name: 'birch_film', x: 0.045, y: 0.52 }, { name: 'notes', x: 0.045, y: 0.745 },
+    { name: 'scans', x: 0.165, y: 0.07 },     { name: 'drive_bak', x: 0.165, y: 0.295 },
+    { name: 'clips', x: 0.165, y: 0.52 },     { name: 'misc', x: 0.165, y: 0.745 }
+  ];
+  for (var fi = 0; fi < FOLDERS.length; fi++) {
+    FOLDERS[fi].del = 15 + fi * 19 + hash(900 + fi) * 9;   // 2 gone before t=52, last by ~157
+  }
+
+  var TOTAL_ITEMS = FOLDERS.length + APPS.length;
+
+  /* ---------------- visitor state (rescues / drags) ---------------- */
+  var rescueExt = {};    // app index -> true once rescued (+20 s, capped)
+  var dragOff = {};      // app index -> {dx, dy}
+  var dragState = null;  // {app, sx, sy, moved, baseDx, baseDy}
+  var lastTc = -1;
+
+  function closeOf(app) {
+    var c = app.close + (rescueExt[app.i] ? 20 : 0);
+    return Math.min(c, 174);
+  }
+  function appRect(app) {
+    var r = slotRect(SLOTS[app.slot]);
+    var o = dragOff[app.i];
+    if (o) { r.x += o.dx; r.y += o.dy; }
+    return r;
+  }
+
+  /* ---------------- derived desktop state ---------------- */
+
+  function deletedCount(tc) {
+    var n = 0, i;
+    for (i = 0; i < FOLDERS.length; i++) if (tc > FOLDERS[i].del) n++;
+    for (i = 0; i < APPS.length; i++) if (tc > closeOf(APPS[i])) n++;
+    return n;
+  }
+
+  // Cursor waypoints, computed from the schedule.
+  var WAY = [];
+  (function buildWaypoints() {
+    var ev = [], i, r;
+    for (i = 0; i < APPS.length; i++) {
+      r = slotRect(SLOTS[APPS[i].slot]);
+      ev.push({ t: APPS[i].open - 0.8, fx: (SLOTS[APPS[i].slot].x + SLOTS[APPS[i].slot].w / 2), fy: SLOTS[APPS[i].slot].y + 0.012 });
+      ev.push({ t: APPS[i].close + 0.4, fx: 0.905, fy: 0.875 });
+    }
+    for (i = 0; i < FOLDERS.length; i++) {
+      ev.push({ t: FOLDERS[i].del - 0.6, fx: FOLDERS[i].x + 0.035, fy: FOLDERS[i].y + 0.03 });
+    }
+    ev.sort(function (a, b) { return a.t - b.t; });
+    WAY = ev;
+  })();
+
+  function cursorPos(tc) {
+    var home = { x: 0.47 * W, y: 0.44 * H };
+    var prev = null, next = null, i;
+    for (i = 0; i < WAY.length; i++) {
+      if (WAY[i].t <= tc) prev = WAY[i];
+      else { next = WAY[i]; break; }
+    }
+    var px = prev ? prev.fx * W : home.x;
+    var py = prev ? prev.fy * H : home.y;
+    if (!next) return { x: px, y: py };
+    var nx = next.fx * W, ny = next.fy * H;
+    var dist = Math.sqrt((nx - px) * (nx - px) + (ny - py) * (ny - py));
+    var travel = clamp(dist / 650, 0.35, 2.4);
+    var p = clamp((tc - (next.t - travel)) / travel, 0, 1);
+    var e = smoother(p);
+    return { x: lerp(px, nx, e), y: lerp(py, ny, e) };
+  }
+
+  /* ---------------- drawing helpers ---------------- */
+
+  function checkerRect(x, y, w, h, tile) {
+    var cols = Math.ceil(w / tile), rows = Math.ceil(h / tile), cx, cy;
+    for (cy = 0; cy < rows; cy++) {
+      for (cx = 0; cx < cols; cx++) {
+        ctx.fillStyle = ((cx + cy) % 2 === 0) ? '#808080' : '#5C5C64';
+        ctx.fillRect(x + cx * tile, y + cy * tile,
+          Math.min(tile, w - cx * tile), Math.min(tile, h - cy * tile));
+      }
+    }
+  }
+
+  /* ---------------- footage scenes (monochrome, generated) ---------------- */
+
+  function sceneStreet(cx, cy, cw, ch, ft, seed) {
+    ctx.fillStyle = '#B4B4B4'; ctx.fillRect(cx, cy, cw, ch);
+    // far buildings
+    ctx.fillStyle = '#6E6E6E';
+    var b;
+    for (b = 0; b < 5; b++) {
+      var bw = cw * (0.10 + hash(seed + b * 3) * 0.08);
+      var bh = ch * (0.30 + hash(seed + b * 5) * 0.22);
+      ctx.fillRect(cx + cw * (0.06 + b * 0.19), cy + ch * 0.62 - bh, bw, bh);
+    }
+    // street
+    ctx.fillStyle = '#8E8E8E';
+    ctx.beginPath();
+    ctx.moveTo(cx + cw * 0.30, cy + ch); ctx.lineTo(cx + cw * 0.46, cy + ch * 0.62);
+    ctx.lineTo(cx + cw * 0.58, cy + ch * 0.62); ctx.lineTo(cx + cw * 0.76, cy + ch);
+    ctx.closePath(); ctx.fill();
+    // near buildings
+    ctx.fillStyle = '#2C2C2C';
+    ctx.fillRect(cx, cy + ch * 0.18, cw * 0.16, ch * 0.82);
+    ctx.fillRect(cx + cw * 0.86, cy + ch * 0.10, cw * 0.14, ch * 0.90);
+    ctx.fillStyle = '#1E1E1E';
+    ctx.fillRect(cx + cw * 0.03, cy + ch * 0.30, cw * 0.05, ch * 0.14);
+    ctx.fillRect(cx + cw * 0.90, cy + ch * 0.26, cw * 0.05, ch * 0.16);
+    // walking figures
+    ctx.strokeStyle = '#101010'; ctx.fillStyle = '#101010';
+    for (b = 0; b < 3; b++) {
+      var prog = ((ft * (0.045 + b * 0.013) + hash(seed + b * 11) * 0.9) % 1.25) - 0.12;
+      var fx = cx + prog * cw;
+      var fh = ch * (0.30 + b * 0.035);
+      var fy = cy + ch * 0.90;
+      var sw = Math.sin(ft * 6 + b * 2.1) * fh * 0.16;
+      ctx.beginPath(); ctx.arc(fx, fy - fh, fh * 0.13, 0, Math.PI * 2); ctx.fill();
+      ctx.lineWidth = Math.max(1.5, fh * 0.07);
+      ctx.beginPath();
+      ctx.moveTo(fx, fy - fh * 0.86); ctx.lineTo(fx, fy - fh * 0.42);
+      ctx.moveTo(fx, fy - fh * 0.42); ctx.lineTo(fx + sw, fy);
+      ctx.moveTo(fx, fy - fh * 0.42); ctx.lineTo(fx - sw, fy);
+      ctx.moveTo(fx, fy - fh * 0.80); ctx.lineTo(fx + sw * 0.7, fy - fh * 0.48);
+      ctx.stroke();
+    }
+  }
+
+  function sceneCrowd(cx, cy, cw, ch, ft, seed) {
+    ctx.fillStyle = '#A6A6A6'; ctx.fillRect(cx, cy, cw, ch);
+    ctx.fillStyle = '#787878'; ctx.fillRect(cx, cy + ch * 0.80, cw, ch * 0.20);
+    var rows = 4, r, k;
+    for (r = 0; r < rows; r++) {
+      var ry = cy + ch * (0.34 + r * 0.155);
+      var hr = ch * (0.052 + r * 0.012);
+      var n = 6 + r;
+      for (k = 0; k < n; k++) {
+        var hx = cx + cw * ((k + 0.5) / n) + Math.sin(ft * 0.7 + r * 2.0 + k) * cw * 0.006;
+        var bob = Math.sin(ft * 2.2 + k * 1.7 + r * 2.6) * hr * 0.22;
+        ctx.fillStyle = (hash(seed + r * 31 + k * 7) > 0.45) ? '#1B1B1B' : '#3D3D3D';
+        ctx.beginPath(); ctx.arc(hx, ry + bob, hr, 0, Math.PI * 2); ctx.fill();
+        ctx.fillRect(hx - hr * 1.25, ry + bob + hr * 0.75, hr * 2.5, hr * 1.15);
+      }
+    }
+  }
+
+  function sceneRoofs(cx, cy, cw, ch, ft, seed) {
+    ctx.fillStyle = '#C2C2C2'; ctx.fillRect(cx, cy, cw, ch);
+    var pw = cw * 0.85;
+    var off = -((ft * 13) % pw);
+    ctx.fillStyle = '#26262C';
+    var rep, b;
+    for (rep = -1; rep < 3; rep++) {
+      var baseX = cx + off + rep * pw;
+      var x = baseX;
+      b = 0;
+      while (x < baseX + pw) {
+        var bw = pw * (0.13 + hash(seed + b * 13 + rep * 101) * 0.12);
+        var bh = ch * (0.34 + hash(seed + b * 17 + rep * 57) * 0.30);
+        ctx.fillRect(x, cy + ch * 0.88 - bh, bw, bh);
+        if (hash(seed + b * 23) > 0.55) {  // chimney
+          ctx.fillRect(x + bw * 0.55, cy + ch * 0.88 - bh - ch * 0.07, bw * 0.16, ch * 0.07);
+        }
+        if (b === 2 && rep === 0) {        // water tower silhouette
+          var tx = x + bw * 0.2, tw = bw * 0.62;
+          ctx.fillRect(tx, cy + ch * 0.88 - bh - ch * 0.30, tw, ch * 0.20);
+          ctx.beginPath();
+          ctx.moveTo(tx - tw * 0.08, cy + ch * 0.88 - bh - ch * 0.30);
+          ctx.lineTo(tx + tw * 0.5, cy + ch * 0.88 - bh - ch * 0.44);
+          ctx.lineTo(tx + tw * 1.08, cy + ch * 0.88 - bh - ch * 0.30);
+          ctx.closePath(); ctx.fill();
+          ctx.fillRect(tx + tw * 0.12, cy + ch * 0.88 - bh - ch * 0.10, tw * 0.10, ch * 0.10);
+          ctx.fillRect(tx + tw * 0.78, cy + ch * 0.88 - bh - ch * 0.10, tw * 0.10, ch * 0.10);
+        }
+        x += bw + pw * 0.015; b++;
+      }
+    }
+    ctx.fillStyle = '#4C4C4C'; ctx.fillRect(cx, cy + ch * 0.88, cw, ch * 0.12);
+  }
+
+  function drawFootage(app, x, y, w, h, ft, dim) {
+    var step = Math.floor(ft / 0.12);
+    ctx.save();
+    ctx.beginPath(); ctx.rect(x, y, w, h); ctx.clip();
+    ctx.globalAlpha = dim;
+    var jx = (hash(step * 7 + app.seed) - 0.5) * 3;
+    var jy = (hash(step * 13 + app.seed) - 0.5) * 2.4;
+    ctx.save();
+    ctx.translate(jx, jy);
+    if (app.scene === 0) sceneStreet(x - 3, y - 3, w + 6, h + 6, ft, app.seed);
+    else if (app.scene === 1) sceneCrowd(x - 3, y - 3, w + 6, h + 6, ft, app.seed);
+    else sceneRoofs(x - 3, y - 3, w + 6, h + 6, ft, app.seed);
+    ctx.restore();
+    if (dim > 0.5) {
+      // film grain (hash speckle per 0.12 s step)
+      var g;
+      for (g = 0; g < 90; g++) {
+        var gx = x + hash(g * 3 + step * 131 + app.seed) * w;
+        var gy = y + hash(g * 7 + step * 57 + app.seed) * h;
+        ctx.fillStyle = hash(g * 11 + step) > 0.5 ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.08)';
+        ctx.fillRect(gx, gy, 1.6, 1.6);
+      }
+      // scratches
+      ctx.fillStyle = 'rgba(255,255,255,0.16)';
+      ctx.fillRect(x + hash(step * 17 + app.seed) * w, y, 1, h);
+      ctx.fillStyle = 'rgba(0,0,0,0.20)';
+      ctx.fillRect(x + hash(step * 29 + app.seed) * w, y, 1, h);
+      // sepia decay at the frame edges
+      ctx.fillStyle = 'rgba(138,111,77,0.30)';
+      ctx.fillRect(x, y, w, 5); ctx.fillRect(x, y + h - 5, w, 5);
+      ctx.fillRect(x, y, 4, h); ctx.fillRect(x + w - 4, y, 4, h);
+      ctx.fillStyle = 'rgba(138,111,77,0.22)';
+      ctx.fillRect(x, y, w, 11); ctx.fillRect(x, y + h - 11, w, 11);
+    }
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
+  /* ---------------- windows / folders / trash ---------------- */
+
+  function drawWindow(app, tc) {
+    var cl = closeOf(app);
+    if (tc < app.open || tc >= cl) return;
+    var r = appRect(app);
+    var th = Math.max(15, 19 * U);
+    // body
+    ctx.fillStyle = '#3A3A46';
+    ctx.fillRect(r.x, r.y, r.w, r.h);
+    ctx.strokeStyle = '#5A5A68'; ctx.lineWidth = 1;
+    ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1);
+    // title bar
+    ctx.fillStyle = '#55556A';
+    ctx.fillRect(r.x + 1, r.y + 1, r.w - 2, th - 1);
+    ctx.fillStyle = '#DADAE4';
+    ctx.font = Math.round(11 * U + 1) + 'px Menlo, Consolas, monospace';
+    ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+    ctx.fillText(SLOTS[app.slot].title, r.x + 8, r.y + th / 2 + 0.5);
+    // close box (decorative chrome)
+    var bs = th - 7;
+    ctx.strokeStyle = '#C9C9D4';
+    ctx.strokeRect(r.x + r.w - bs - 5.5, r.y + 3.5, bs, bs);
+    ctx.beginPath();
+    ctx.moveTo(r.x + r.w - bs - 2, r.y + 6); ctx.lineTo(r.x + r.w - 8, r.y + bs + 1);
+    ctx.moveTo(r.x + r.w - 8, r.y + 6); ctx.lineTo(r.x + r.w - bs - 2, r.y + bs + 1);
+    ctx.stroke();
+
+    // content
+    var cx = r.x + 3, cy = r.y + th + 2, cw = r.w - 6, ch = r.h - th - 5;
+    ctx.fillStyle = '#101014';
+    ctx.fillRect(cx, cy, cw, ch);
+    var age = tc - app.open;
+    var tile = Math.max(14, Math.round(24 * U));
+    var playing = age < app.foot;
+    if (playing) {
+      drawFootage(app, cx, cy, cw, ch, age + app.seed % 7, 1);
+      var fracA = app.baseMiss + 0.25 * (age / app.foot);
+      overlayMissing(app, cx, cy, cw, ch, tile, fracA, Math.floor(age / 0.5));
+    } else {
+      // absence: the footage is gone, a dim ghost and mostly checkerboard
+      drawFootage(app, cx, cy, cw, ch, app.foot + app.seed % 7, 0.15);
+      var p = clamp((age - app.foot) / Math.max(1, cl - app.open - app.foot), 0, 1);
+      var fracB = 0.55 + 0.35 * p;
+      overlayMissing(app, cx, cy, cw, ch, tile, fracB, 99);
+    }
+    // flicker-out in the last 0.3 s
+    if (cl - tc < 0.3) {
+      ctx.globalAlpha = 1 - (cl - tc) / 0.3;
+      checkerRect(r.x, r.y, r.w, r.h, tile);
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function overlayMissing(app, x, y, w, h, tile, frac, bucket) {
+    var cols = Math.ceil(w / tile), rows = Math.ceil(h / tile), cx, cy;
+    for (cy = 0; cy < rows; cy++) {
+      for (cx = 0; cx < cols; cx++) {
+        var hv = hash(app.seed + cx * 41 + cy * 67 + bucket * 3);
+        var tx = x + cx * tile, ty = y + cy * tile;
+        var tw = Math.min(tile, w - cx * tile), thh = Math.min(tile, h - cy * tile);
+        if (hv < frac) {
+          ctx.fillStyle = ((cx + cy) % 2 === 0) ? '#808080' : '#5C5C64';
+          ctx.fillRect(tx, ty, tw, thh);
+        } else if (hv < frac + 0.07) {
+          ctx.fillStyle = '#2A2A31';
+          ctx.fillRect(tx, ty, tw, thh);
+          ctx.fillStyle = 'rgba(255,255,255,0.10)';
+          ctx.fillRect(tx + tw * hash(hv * 900) * 0.8, ty + thh * hash(hv * 700) * 0.8, 1.6, 1.6);
+        }
+      }
+    }
+  }
+
+  function drawFolder(f, tc) {
+    var fw = clamp(W * 0.068, 44, 92), fh = fw * 0.62;
+    var x = f.x * W, y = f.y * H;
+    if (tc > f.del) {
+      if (tc - f.del < 0.6) {  // checkerboard flicker as it deletes
+        ctx.globalAlpha = 0.9 * (1 - (tc - f.del) / 0.6);
+        checkerRect(x, y, fw, fh + 14 * U, Math.max(8, 12 * U));
+        ctx.globalAlpha = 1;
+      }
+      return;
+    }
+    ctx.fillStyle = '#8F7D46';
+    ctx.fillRect(x, y + 5 * U, fw, fh);
+    ctx.fillRect(x, y, fw * 0.44, 6 * U);
+    ctx.fillStyle = '#A08C50';
+    ctx.fillRect(x, y + 5 * U, fw, 3 * U);
+    ctx.strokeStyle = '#2A2A30'; ctx.lineWidth = 1;
+    ctx.strokeRect(x + 0.5, y + 5 * U + 0.5, fw - 1, fh - 1);
+    ctx.fillStyle = '#B9B9C4';
+    ctx.font = Math.round(10 * U + 1) + 'px Menlo, Consolas, monospace';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+    ctx.fillText(f.name, x + fw / 2, y + fh + 8 * U);
+  }
+
+  function drawTrash(tc) {
+    var n = deletedCount(tc);
+    var fillFrac = TOTAL_ITEMS ? n / TOTAL_ITEMS : 0;
+    var s = 46 * U;
+    var x = W * 0.905, y = H * 0.865;
+    // count beside the can
+    ctx.fillStyle = '#D5D5DE';
+    ctx.font = 'bold ' + Math.round(16 * U + 2) + 'px Menlo, Consolas, monospace';
+    ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+    ctx.fillText(String(n), x - 10 * U, y + s * 0.45);
+    // paper balls above the rim grow with the fill
+    var balls = Math.floor(fillFrac * 3.4), bi;
+    ctx.fillStyle = '#C9C9CE';
+    for (bi = 0; bi < balls; bi++) {
+      ctx.beginPath();
+      ctx.arc(x + s * (0.22 + bi * 0.26), y - s * 0.02 - (bi % 2) * s * 0.10, s * 0.13, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    // lid + handle
+    ctx.fillStyle = '#6A6A76';
+    ctx.fillRect(x - s * 0.06, y + s * 0.06, s * 1.12, s * 0.10);
+    ctx.fillRect(x + s * 0.32, y - s * 0.03, s * 0.36, s * 0.08);
+    // body (trapezoid)
+    ctx.fillStyle = '#4A4A55';
+    ctx.beginPath();
+    ctx.moveTo(x, y + s * 0.18); ctx.lineTo(x + s, y + s * 0.18);
+    ctx.lineTo(x + s * 0.86, y + s); ctx.lineTo(x + s * 0.14, y + s);
+    ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = '#23232A'; ctx.lineWidth = 1; ctx.stroke();
+    // crumple lines increase as it fills
+    var lines = 2 + Math.floor(fillFrac * 4);
+    ctx.strokeStyle = 'rgba(220,220,228,0.35)';
+    for (bi = 0; bi < lines; bi++) {
+      var lx = x + s * (0.24 + bi * 0.13);
+      ctx.beginPath();
+      ctx.moveTo(lx, y + s * 0.30); ctx.lineTo(lx - s * 0.03, y + s * 0.88);
+      ctx.stroke();
+    }
+  }
+
+  function drawCursor(p, tc) {
+    // click pulses
+    var i;
+    for (i = 0; i < APPS.length; i++) {
+      var dt = tc - APPS[i].open;
+      if (dt > 0 && dt < 0.4) {
+        var rr = slotRect(SLOTS[APPS[i].slot]);
+        ctx.strokeStyle = 'rgba(255,255,255,' + (0.65 * (1 - dt / 0.4)) + ')';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.arc(rr.x + rr.w / 2, rr.y + 10, 4 + dt * 34, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    }
+    // arrow
+    var s = 17 * U + 3;
+    ctx.beginPath();
+    ctx.moveTo(p.x, p.y);
+    ctx.lineTo(p.x + s * 0.72, p.y + s * 0.72);
+    ctx.lineTo(p.x + s * 0.46, p.y + s * 0.74);
+    ctx.lineTo(p.x + s * 0.62, p.y + s * 1.12);
+    ctx.lineTo(p.x + s * 0.46, p.y + s * 1.20);
+    ctx.lineTo(p.x + s * 0.30, p.y + s * 0.80);
+    ctx.lineTo(p.x, p.y + s * 1.06);
+    ctx.closePath();
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fill();
+    ctx.strokeStyle = '#000000';
+    ctx.lineWidth = 1.2;
+    ctx.stroke();
+  }
+
+  /* ---------------- main draw ---------------- */
+
+  function draw(t) {
+    var tc = ((t % CYCLE) + CYCLE) % CYCLE;
+    if (lastTc >= 0 && tc < lastTc - 0.01) { rescueExt = {}; dragOff = {}; }
+    lastTc = tc;
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+
+    // wallpaper under desktop; the desktop thins as items vanish
+    ctx.fillStyle = '#0A1A3A';
+    ctx.fillRect(0, 0, W, H);
+    var gone = deletedCount(tc);
+    var frac = TOTAL_ITEMS ? gone / TOTAL_ITEMS : 0;
+    ctx.fillStyle = '#1E1E24';
+    ctx.globalAlpha = 1 - 0.88 * frac;
+    ctx.fillRect(0, 0, W, H);
+    ctx.globalAlpha = 1;
+
+    var i;
+    for (i = 0; i < FOLDERS.length; i++) drawFolder(FOLDERS[i], tc);
+    for (i = 0; i < APPS.length; i++) drawWindow(APPS[i], tc);
+    drawTrash(tc);
+    drawCursor(cursorPos(tc), tc);
+
+    // restore sweep at the cycle seam
+    if (tc < 0.6) {
+      var front = (tc / 0.6) * 1.35 - 0.18;
+      ctx.globalAlpha = 0.9 * (1 - tc / 0.6);
+      var tile = Math.max(16, 26 * U), cx2, cy2;
+      for (cy2 = 0; cy2 < Math.ceil(H / tile); cy2++) {
+        for (cx2 = 0; cx2 < Math.ceil(W / tile); cx2++) {
+          if ((cx2 * tile) / W + (cy2 * tile) / H * 0.35 < front) {
+            ctx.fillStyle = ((cx2 + cy2) % 2 === 0) ? '#808080' : '#5C5C64';
+            ctx.fillRect(cx2 * tile, cy2 * tile, tile, tile);
+          }
+        }
+      }
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  /* ---------------- interaction: drag a window to rescue it ---------------- */
+
+  function evtPos(e) {
+    var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    var src = (e.touches && e.touches[0]) || (e.changedTouches && e.changedTouches[0]) || e;
+    return { x: src.clientX - r.left, y: src.clientY - r.top };
+  }
+  function hitWindow(x, y) {
+    var tc = ((pieceTime() % CYCLE) + CYCLE) % CYCLE;
+    for (var i = APPS.length - 1; i >= 0; i--) {
+      var app = APPS[i];
+      if (tc >= app.open && tc < closeOf(app)) {
+        var r = appRect(app);
+        if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) return app;
+      }
+    }
+    return null;
+  }
+  function onDown(e) {
+    var p = evtPos(e);
+    var app = hitWindow(p.x, p.y);
+    if (app) {
+      var o = dragOff[app.i] || { dx: 0, dy: 0 };
+      dragState = { app: app, sx: p.x, sy: p.y, moved: false, baseDx: o.dx, baseDy: o.dy };
+    }
+  }
+  function onMove(e) {
+    if (!dragState) return;
+    var p = evtPos(e);
+    var dx = p.x - dragState.sx, dy = p.y - dragState.sy;
+    if (Math.abs(dx) + Math.abs(dy) > 4) dragState.moved = true;
+    if (dragState.moved) {
+      dragOff[dragState.app.i] = { dx: dragState.baseDx + dx, dy: dragState.baseDy + dy };
+      draw(pieceTime());
+    }
+    if (e.preventDefault && e.cancelable) e.preventDefault();
+  }
+  function onUp() {
+    if (dragState && dragState.moved) rescueExt[dragState.app.i] = true;  // rescued: +20 s
+    dragState = null;
+    draw(pieceTime());
+  }
+
+  fit();
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { fit(); draw(pieceTime()); });
+  }
+  if (window.addEventListener) {
+    window.addEventListener('resize', function () { fit(); draw(pieceTime()); });
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+    canvas.addEventListener('mousedown', onDown);
+    canvas.addEventListener('mousemove', onMove);
+    canvas.addEventListener('mouseup', onUp);
+    canvas.addEventListener('touchstart', onDown, { passive: true });
+    canvas.addEventListener('touchmove', onMove, { passive: false });
+    canvas.addEventListener('touchend', onUp);
+  }
+
+  draw(T0);   // first frame at the exact fixed phase; rAF continues from T0 + elapsed
+  function frame() {
+    draw(pieceTime());
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+  }
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

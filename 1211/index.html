@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hex Subtraction</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #05070F; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+/* No.1211 "Hex Subtraction" - Amy Szczepanski study block AS4.
+   A quiet blue scene (top 70%) is edited from inside by a hex panel
+   (bottom 30%). Bytes are only ever DELETED - greyed out and struck
+   through in red - and each deletion wounds the image band mapped
+   from its byte run: a permanent horizontal shear, a magenta bloom,
+   a channel split. The damage accumulates and never heals.
+   Subtraction only: nothing is ever written back. */
+
+var T0 = 26;          // fixed first-frame phase (seconds)
+var T_END = 210;      // render time clamps here; the wounded end state holds
+var SEED = 1;         // schedule seed (verified: exactly 3 deletions by t=26)
+var ROWS = 24, COLS = 16, NBYTES = ROWS * COLS, BANDS = 40;
+
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+
+var W = 0, H = 0, imgH = 0, panelY = 0;
+
+/* ---------- seeded hashes only (no Math.random anywhere) ---------- */
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    var t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+function hash2(a, b) {
+  var h = (Math.imul(a, 374761393) + Math.imul(b, 668265263)) ^ 0x5bf03635;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+function byteVal(idx) { return Math.floor(hash2(idx + 1, 0x51ab) * 256); }
+function hex2(v) { var s = v.toString(16).toUpperCase(); return s.length < 2 ? '0' + s : s; }
+function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+function smooth(x) { x = clamp(x, 0, 1); return x * x * (3 - 2 * x); }
+
+/* ---------- the deletion schedule ----------
+   First deletion fires at t=8; later gaps are hashed, 6-12 s, until
+   t~200 (21 events with SEED=1, last at t=196.4). A run is 4-10
+   contiguous bytes in one row. Band mapping (the causal link):
+   band = floor(byteIndex / (NBYTES/BANDS)) = floor(byteIndex / 9.6). */
+function drawEvent(rng, t) {
+  var row = Math.floor(rng() * ROWS);
+  var len = 4 + Math.floor(rng() * 7);
+  var col = Math.floor(rng() * (COLS + 1 - len));
+  var off = (14 + rng() * 38) * (rng() < 0.5 ? -1 : 1);
+  var bloom = rng() < 0.45 ? 0.15 + 0.22 * rng() : 0;
+  var split = rng() < 0.5;
+  return { t: t, row: row, col: col, len: len, off: off, bloom: bloom, split: split,
+           band: Math.floor((row * COLS + col) / (NBYTES / BANDS)) };
+}
+var BASE_EVENTS = (function () {
+  var rng = mulberry32(SEED);
+  var evs = [drawEvent(rng, 8)];
+  var t = 8;
+  while (true) {
+    var gap = 6 + 6 * rng(); t += gap;
+    if (t > 200) break;
+    evs.push(drawEvent(rng, t));
+  }
+  return evs;
+})();
+
+/* ---------- visitor state: recorded events, nothing frame-integrated ---------- */
+var materialized = [];   // deletion events that have fired (runs may be viewer-aimed)
+var matCount = 0;
+var pendingSel = null;   // {row, col, len} - the next deletion lands here
+var smears = [];         // direct wounds from image drags: {band, off, t}
+var drag = null;         // active pointer drag
+
+var startMs = Date.now();
+function pieceT() { return T0 + (Date.now() - startMs) / 1000; }
+
+function materialize(te) {
+  while (matCount < BASE_EVENTS.length && BASE_EVENTS[matCount].t <= te) {
+    var src = BASE_EVENTS[matCount];
+    var ev = { t: src.t, row: src.row, col: src.col, len: src.len,
+               off: src.off, bloom: src.bloom, split: src.split, band: src.band };
+    if (pendingSel) {
+      ev.row = pendingSel.row; ev.col = pendingSel.col; ev.len = pendingSel.len;
+      ev.band = Math.floor((ev.row * COLS + ev.col) / (NBYTES / BANDS));
+      ev.aimed = true;
+      pendingSel = null;
+    }
+    materialized.push(ev);
+    matCount++;
+  }
+}
+
+/* ---------- per-band wound state at time te ---------- */
+function computeBands(te) {
+  var off = new Float64Array(BANDS), bloom = new Float64Array(BANDS);
+  var cnt = new Int32Array(BANDS), split = new Array(BANDS);
+  var i, e, r;
+  for (i = 0; i < BANDS; i++) split[i] = false;
+  for (i = 0; i < materialized.length; i++) {
+    e = materialized[i];
+    if (e.t > te) continue;
+    r = smooth((te - e.t) / 0.35);
+    off[e.band] += e.off * r;
+    bloom[e.band] += e.bloom * r;
+    cnt[e.band]++;
+    if (e.split) split[e.band] = true;
+  }
+  for (i = 0; i < smears.length; i++) {
+    e = smears[i];
+    if (e.t > te) continue;
+    r = clamp((te - e.t) / 0.2, 0, 1);
+    off[e.band] += e.off * r;
+    cnt[e.band]++;
+  }
+  for (i = 0; i < BANDS; i++) off[i] = clamp(off[i], -110, 110);
+  return { off: off, bloom: bloom, cnt: cnt, split: split };
+}
+
+/* ---------- the scene: a figure against a blue field, flat ---------- */
+function lerpC(c1, c2, t) {
+  return 'rgb(' + Math.round(c1[0] + (c2[0] - c1[0]) * t) + ',' +
+                  Math.round(c1[1] + (c2[1] - c1[1]) * t) + ',' +
+                  Math.round(c1[2] + (c2[2] - c1[2]) * t) + ')';
+}
+function poly(pts) {
+  ctx.beginPath();
+  ctx.moveTo(pts[0], pts[1]);
+  for (var i = 2; i < pts.length; i += 2) ctx.lineTo(pts[i], pts[i + 1]);
+  ctx.closePath();
+  ctx.fill();
+}
+function disc(x, y, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arc(x, y, r, 0, 6.283185307);
+  ctx.fill();
+}
+function drawFigure(tint) {
+  var hy = imgH * 0.76;
+  var fx = W * 0.42, fh = imgH * 0.54, feetY = hy + imgH * 0.045;
+  var topY = feetY - fh, u = fh;
+  // arms
+  poly([fx - u * 0.080, topY + u * 0.17, fx - u * 0.028, topY + u * 0.20,
+        fx - u * 0.105, topY + u * 0.47, fx - u * 0.150, topY + u * 0.45]);
+  poly([fx + u * 0.080, topY + u * 0.17, fx + u * 0.028, topY + u * 0.20,
+        fx + u * 0.105, topY + u * 0.47, fx + u * 0.150, topY + u * 0.45]);
+  // legs
+  poly([fx - u * 0.062, topY + u * 0.50, fx - u * 0.012, topY + u * 0.50,
+        fx - u * 0.020, feetY, fx - u * 0.078, feetY]);
+  poly([fx + u * 0.062, topY + u * 0.50, fx + u * 0.012, topY + u * 0.50,
+        fx + u * 0.020, feetY, fx + u * 0.078, feetY]);
+  // torso
+  poly([fx - u * 0.088, topY + u * 0.155, fx + u * 0.088, topY + u * 0.155,
+        fx + u * 0.066, topY + u * 0.52, fx - u * 0.066, topY + u * 0.52]);
+  // head
+  disc(fx, topY + u * 0.072, u * 0.070);
+  if (!tint) {
+    // shoes
+    ctx.fillStyle = '#0D0D10';
+    ctx.fillRect(fx - u * 0.088, feetY, u * 0.085, u * 0.018);
+    ctx.fillRect(fx + u * 0.003, feetY, u * 0.085, u * 0.018);
+  }
+}
+function drawStructure(tint) {
+  var hy = imgH * 0.76;
+  var sx = W * 0.665, sw = W * 0.115, sTop = hy - imgH * 0.185, sBot = hy + imgH * 0.015;
+  ctx.fillRect(sx, sTop, sw, sBot - sTop);
+  poly([sx - sw * 0.09, sTop, sx + sw * 1.09, sTop, sx + sw * 0.5, sTop - imgH * 0.058]);
+  if (!tint) {
+    ctx.fillStyle = '#05070F';
+    ctx.fillRect(sx + sw * 0.40, sBot - imgH * 0.085, sw * 0.20, imgH * 0.085);
+    ctx.fillStyle = 'rgba(245,214,168,0.55)';
+    ctx.fillRect(sx + sw * 0.14, sTop + imgH * 0.045, sw * 0.16, imgH * 0.038);
+  }
+}
+function drawHills() {
+  var hy = imgH * 0.76;
+  poly([0, hy, W * 0.18, hy - imgH * 0.030, W * 0.38, hy - imgH * 0.008,
+        W * 0.62, hy - imgH * 0.036, W * 0.85, hy - imgH * 0.012,
+        W, hy - imgH * 0.020, W, hy, 0, hy]);
+}
+/* tint = null draws the full scene; a color draws silhouettes only
+   (the channel-split fringe passes). */
+function drawScene(tint) {
+  var hy = imgH * 0.76, i;
+  if (tint) {
+    ctx.fillStyle = tint;
+    drawHills();
+    drawStructure(true);
+    drawFigure(true);
+    return;
+  }
+  // sky: flat stepped bands, #1B4FD8 deepening to #0A1E5E at the horizon
+  var strips = 14;
+  for (i = 0; i < strips; i++) {
+    ctx.fillStyle = lerpC([27, 79, 216], [10, 30, 94], i / (strips - 1));
+    ctx.fillRect(-130, (hy * i) / strips, W + 260, hy / strips + 1);
+  }
+  // pale sun disc
+  ctx.fillStyle = 'rgba(220,233,255,0.85)';
+  disc(W * 0.76, imgH * 0.20, imgH * 0.045);
+  // ground
+  ctx.fillStyle = '#0A1E5E';
+  ctx.fillRect(-130, hy, W + 260, imgH - hy);
+  ctx.fillStyle = '#060F33';
+  ctx.fillRect(-130, imgH * 0.935, W + 260, imgH * 0.065);
+  // hills silhouette on the horizon
+  ctx.fillStyle = '#0C1C52';
+  drawHills();
+  // figure ground shadow
+  ctx.fillStyle = 'rgba(0,0,0,0.30)';
+  ctx.fillRect(W * 0.42 - imgH * 0.085, hy + imgH * 0.045, imgH * 0.17, 4);
+  // structure + figure
+  ctx.fillStyle = '#0B1020';
+  drawStructure(false);
+  ctx.fillStyle = '#0D0D10';
+  drawFigure(false);
+}
+
+/* ---------- hex panel layout (shared by draw + pointer) ----------
+   Wide screens: two side-by-side blocks of 12 rows. Narrow: one
+   block of 24 rows. 24 rows x 16 bytes are always all shown. */
+function panelLayout() {
+  var padX = Math.max(10, W * 0.012);
+  var two = W >= 760;
+  var nRows = two ? 12 : 24;
+  var rowH = (H - panelY - 8) / nRows;
+  var blockW = two ? (W - padX * 3) / 2 : W - padX * 2;
+  var fs = Math.min(rowH * 0.74, blockW / (53 * 0.6));
+  ctx.font = '600 ' + fs + 'px monospace';
+  var charW = ctx.measureText('0000000000').width / 10;
+  var blocks = [];
+  var nb = two ? 2 : 1;
+  for (var b = 0; b < nb; b++) {
+    blocks.push({
+      x: padX + b * (blockW + padX),
+      y: panelY + 5,
+      row0: b * nRows,
+      nRows: nRows,
+      bytesX: padX + b * (blockW + padX) + 5.2 * charW
+    });
+  }
+  return { rowH: rowH, fs: fs, charW: charW, blocks: blocks, bytePitch: 3 * charW };
+}
+function rowPos(L, row) {
+  for (var b = 0; b < L.blocks.length; b++) {
+    var bl = L.blocks[b];
+    if (row >= bl.row0 && row < bl.row0 + bl.nRows) {
+      return { block: bl, y: bl.y + (row - bl.row0 + 0.5) * L.rowH };
+    }
+  }
+  return null;
+}
+function hitPanel(L, x, y) {
+  for (var b = 0; b < L.blocks.length; b++) {
+    var bl = L.blocks[b];
+    var lr = Math.floor((y - bl.y) / L.rowH);
+    if (lr >= 0 && lr < bl.nRows && x >= bl.x && x <= bl.x + 53 * L.charW + 10) {
+      var col = Math.floor((x - bl.bytesX) / L.bytePitch);
+      return { row: bl.row0 + lr, col: clamp(col, 0, COLS - 1) };
+    }
+  }
+  return null;
+}
+
+function drawPanel(L, te) {
+  var i, r, c;
+  ctx.fillStyle = '#0A0C10';
+  ctx.fillRect(0, panelY, W, H - panelY);
+  ctx.fillStyle = '#2A2A2E';
+  ctx.fillRect(0, panelY, W, 1);
+  // deleted byte set from fired events
+  var deleted = {};
+  for (i = 0; i < materialized.length; i++) {
+    var e = materialized[i];
+    for (c = e.col; c < e.col + e.len; c++) deleted[e.row * COLS + c] = true;
+  }
+  var sel = (drag && drag.inHex && drag.sel) ? drag.sel : pendingSel;
+  ctx.textBaseline = 'middle';
+  for (var b = 0; b < L.blocks.length; b++) {
+    var bl = L.blocks[b];
+    for (var lr = 0; lr < bl.nRows; lr++) {
+      r = bl.row0 + lr;
+      var y = bl.y + (lr + 0.5) * L.rowH;
+      ctx.font = '600 ' + L.fs + 'px monospace';
+      ctx.fillStyle = '#565D66';
+      ctx.fillText((r * COLS).toString(16).toUpperCase().padStart(4, '0'), bl.x, y);
+      for (c = 0; c < COLS; c++) {
+        var idx = r * COLS + c;
+        var bx = bl.bytesX + c * L.bytePitch;
+        var inSel = sel && sel.row === r && c >= sel.col && c < sel.col + sel.len;
+        if (inSel) {
+          ctx.fillStyle = 'rgba(255,176,0,0.16)';
+          ctx.fillRect(bx - 2, y - L.rowH * 0.42, L.bytePitch - 2, L.rowH * 0.84);
+        }
+        if (deleted[idx]) ctx.fillStyle = '#3A3A40';
+        else if (inSel) ctx.fillStyle = '#FFD98A';
+        else ctx.fillStyle = '#9AA0A6';
+        ctx.fillText(hex2(byteVal(idx)), bx, y);
+      }
+    }
+  }
+  // red strike-throughs: one per fired deletion, across its run
+  ctx.fillStyle = '#FF2B2B';
+  for (i = 0; i < materialized.length; i++) {
+    var ev = materialized[i];
+    var p = rowPos(L, ev.row);
+    if (!p) continue;
+    var x0 = p.block.bytesX + ev.col * L.bytePitch - 2;
+    var x1 = p.block.bytesX + (ev.col + ev.len) * L.bytePitch - L.charW - 2;
+    ctx.fillRect(x0, p.y - 1, x1 - x0, 2);
+  }
+}
+
+/* ---------- frame ---------- */
+function draw() {
+  ctx.save();
+  ctx.fillStyle = '#05070F';
+  ctx.fillRect(0, 0, W, H);
+  var t = pieceT();
+  var te = Math.min(t, T_END);
+  materialize(te);
+  var bands = computeBands(te);
+  var bandH = imgH / BANDS;
+  var b, st;
+  for (b = 0; b < BANDS; b++) {
+    st = bands.off[b];
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(-130, b * bandH, W + 260, bandH + 1);
+    ctx.clip();
+    if (Math.abs(st) > 5) {
+      var sep = bands.split[b] ? 6 : 3;
+      ctx.globalAlpha = 0.45;
+      ctx.save(); ctx.translate(st - sep, 0); drawScene('#FF2B8D'); ctx.restore();
+      ctx.save(); ctx.translate(st + sep, 0); drawScene('#00E5FF'); ctx.restore();
+      ctx.globalAlpha = 1;
+    }
+    ctx.save(); ctx.translate(st, 0); drawScene(null); ctx.restore();
+    if (bands.bloom[b] > 0.01) {
+      ctx.fillStyle = '#FF2B8D';
+      ctx.globalAlpha = bands.bloom[b] * 0.28;
+      disc(W * 0.42 + st, b * bandH + bandH / 2, bandH * 1.5);
+      ctx.globalAlpha = bands.bloom[b] * 0.34;
+      disc(W * 0.42 + st, b * bandH + bandH / 2, bandH * 0.8);
+      ctx.globalAlpha = 1;
+    }
+    if (bands.cnt[b] > 0) {
+      ctx.fillStyle = '#000000';
+      ctx.globalAlpha = 1 - Math.max(0.55, Math.pow(0.94, bands.cnt[b]));
+      ctx.fillRect(0, b * bandH, W, bandH + 1);
+      ctx.globalAlpha = 1;
+    }
+    ctx.restore();
+  }
+  var L = panelLayout();
+  drawPanel(L, te);
+  ctx.restore();
+}
+
+/* ---------- sizing: Visual Viewport API, pinned in draw ---------- */
+function fit() {
+  var vv = window.visualViewport;
+  var w = vv ? vv.width : window.innerWidth;
+  var h = vv ? vv.height : window.innerHeight;
+  W = Math.round(w); H = Math.round(h);
+  imgH = Math.floor(H * 0.70);
+  panelY = imgH;
+  canvas.width = W; canvas.height = H;
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+}
+function isPhone() {
+  var sw = window.screen ? window.screen.width : W;
+  var sh = window.screen ? window.screen.height : H;
+  return Math.min(sw, sh) < 700 || (H > W * 1.15 && Math.min(W, H) < 700);
+}
+if (window.visualViewport && window.visualViewport.addEventListener) {
+  window.visualViewport.addEventListener('resize', function () { fit(); draw(); });
+}
+window.addEventListener('resize', function () { fit(); draw(); });
+
+/* ---------- pointer: aim the scalpel / wound directly ---------- */
+function evtPos(e) {
+  if (e && typeof e.clientX === 'number') return { x: e.clientX, y: e.clientY };
+  return { x: 0, y: 0 };
+}
+function selFromDrag(d) {
+  var L = panelLayout();
+  var a = hitPanel(L, d.x0, d.y0), b = hitPanel(L, d.x1, d.y1);
+  if (!a) return null;
+  var row = a.row;
+  var c0 = a.col, c1 = b && b.row === row ? b.col : a.col;
+  var col = Math.min(c0, c1), len = Math.abs(c1 - c0) + 1;
+  if (len < 2) { len = Math.min(6, COLS - col); }  // a tap picks a standard run
+  return { row: row, col: col, len: len };
+}
+canvas.addEventListener('pointerdown', function (e) {
+  var p = evtPos(e);
+  drag = { x0: p.x, y0: p.y, x1: p.x, y1: p.y, inHex: p.y >= panelY, sel: null, pts: [{ x: p.x, y: p.y }] };
+});
+canvas.addEventListener('pointermove', function (e) {
+  if (!drag) return;
+  var p = evtPos(e);
+  drag.x1 = p.x; drag.y1 = p.y;
+  drag.pts.push({ x: p.x, y: p.y });
+  if (drag.inHex) drag.sel = selFromDrag(drag);
+});
+canvas.addEventListener('pointerup', function (e) {
+  if (!drag) return;
+  var p = evtPos(e);
+  drag.x1 = p.x; drag.y1 = p.y;
+  drag.pts.push({ x: p.x, y: p.y });
+  var t = Math.min(pieceT(), T_END);
+  if (drag.inHex) {
+    var s = selFromDrag(drag);
+    if (s) pendingSel = s;
+  } else {
+    var dx = drag.x1 - drag.x0;
+    if (Math.abs(dx) >= 8 || drag.pts.length > 3) {
+      var bandH = imgH / BANDS;
+      var seen = {};
+      for (var i = 0; i < drag.pts.length; i++) {
+        var bd = Math.floor(drag.pts[i].y / bandH);
+        if (bd >= 0 && bd < BANDS) seen[bd] = true;
+      }
+      var off = clamp(dx * 0.7, -52, 52);
+      if (Math.abs(off) < 6) off = dx >= 0 ? 14 : -14;
+      for (var k in seen) smears.push({ band: +k, off: off, t: t });
+    }
+  }
+  drag = null;
+  draw();
+});
+canvas.addEventListener('pointercancel', function () { drag = null; });
+
+/* ---------- go ---------- */
+fit();
+draw();
+if (typeof requestAnimationFrame === 'function') {
+  var loop = function () { draw(); requestAnimationFrame(loop); };
+  requestAnimationFrame(loop);
+}
+</script>
+</body>
+</html>
