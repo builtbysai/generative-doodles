@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Monglot Machine</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0A0A0A; overflow: hidden; height: 100%; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- Monglot Machine — Rosa Menkman study RM8 (monglot, 2011) ----------
+  // A clean arc-and-spoke geometry runs through a visible 3-stage glitch
+  // pipeline. Everything is computed on a data grid (120 x 30 per stage):
+  // no offscreen canvas, no ImageData — the pipeline is grid math.
+  // Stage 0: source geometry (phosphor green #39FF6A)
+  // Stage 1: datamosh row smear (orange #FF6A00)
+  // Stage 2: block shift (cyan #00D0FF)
+  // Stage 3: channel swap (white #F2F2F2, with cyan channel ghosts)
+
+  var T0 = 11.3;               // fixed phase for the deterministic first frame
+  var GW = 120, GH = 30;       // grid size per stage
+  var STAGE_COLORS = ['#39FF6A', '#FF6A00', '#00D0FF', '#F2F2F2'];
+  var BG = '#0A0A0A', SEP = '#2A2A2A';
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ---------- seeded rng ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- per-seed parameters ----------
+  var seed = 1151008;
+  var P = null;
+  function buildParams(s) {
+    var rng = mulberry32(s);
+    var p = {};
+    // geometry
+    p.cx = (GW - 1) / 2 + (rng() * 8 - 4);
+    p.cy = (GH - 1) / 2 + (rng() * 4 - 2);
+    p.rings = [];
+    var base = [0.22, 0.42, 0.62, 0.82];
+    for (var i = 0; i < base.length; i++) p.rings.push(base[i] + (rng() * 0.1 - 0.05));
+    if (rng() > 0.5) p.rings.push(0.93);
+    p.ringW = 0.035 + rng() * 0.02;
+    p.spokes = 10 + Math.floor(rng() * 5);
+    p.spokePhase = rng() * Math.PI * 2;
+    p.spokeW = 0.022 + rng() * 0.018;
+    // stage 1: per-row shift offsets (cells, at depth = 1) and smear decay
+    p.rowOff = [];
+    for (var r = 0; r < GH; r++) p.rowOff.push(Math.round((rng() * 1.9 - 0.35) * 8));
+    p.trailDecay = 0.52 + rng() * 0.14;
+    p.trailLen = 9;
+    // stage 2: per-block offsets (blocks are 8 wide x 5 tall -> 15 x 6)
+    p.blockOX = []; p.blockOY = [];
+    for (var by = 0; by < 6; by++) {
+      p.blockOX.push([]); p.blockOY.push([]);
+      for (var bx = 0; bx < 15; bx++) {
+        p.blockOX[by].push(Math.round((rng() * 2 - 1) * 10));
+        p.blockOY[by].push(Math.round((rng() * 2 - 1) * 3));
+      }
+    }
+    return p;
+  }
+  P = buildParams(seed);
+
+  // ---------- geometry function: concentric arcs + radial spokes ----------
+  function geo(gx, gy, cellW, cellH, halfStageH) {
+    var dx = (gx - P.cx) * cellW;
+    var dy = (gy - P.cy) * cellH;
+    var r = Math.sqrt(dx * dx + dy * dy);
+    var rn = r / halfStageH;
+    var v = 0;
+    for (var i = 0; i < P.rings.length; i++) {
+      if (Math.abs(rn - P.rings[i]) < P.ringW) v = 1.0;
+    }
+    if (rn > 0.10 && rn < 0.99) {
+      var ang = Math.atan2(dy, dx) + P.spokePhase;
+      var period = (Math.PI * 2) / P.spokes;
+      var m = ang % period; if (m < 0) m += period;
+      var dist = Math.min(m, period - m);
+      if (dist < P.spokeW && v < 0.85) v = 0.85;
+    }
+    if (rn < 0.055) v = Math.max(v, 0.9);
+    return v;
+  }
+
+  function makeGrid() {
+    var g = new Array(GH);
+    for (var y = 0; y < GH; y++) { g[y] = new Array(GW); for (var x = 0; x < GW; x++) g[y][x] = 0; }
+    return g;
+  }
+
+  function computeGrids(cellW, cellH, stageH, depth, active) {
+    var halfStageH = stageH / 2;
+    var g0 = makeGrid(), g1 = makeGrid(), g2 = makeGrid();
+    var x, y, k;
+    for (y = 0; y < GH; y++) for (x = 0; x < GW; x++) g0[y][x] = geo(x, y, cellW, cellH, halfStageH);
+
+    // stage 1 — datamosh: row shift + decaying smear trail to the right
+    var d1 = Math.min(1, depth * (active === 1 ? 1.18 : 1));
+    for (y = 0; y < GH; y++) {
+      var shift = Math.round(d1 * P.rowOff[y]);
+      for (x = 0; x < GW; x++) {
+        var best = 0;
+        for (k = 0; k <= P.trailLen; k++) {
+          var sx = x - shift - k;
+          if (sx < 0) break;
+          var val = g0[y][sx] * Math.pow(P.trailDecay, k);
+          if (val > best) best = val;
+        }
+        g1[y][x] = best;
+      }
+    }
+
+    // stage 2 — block shift: 8x5 blocks copied to depth-scaled offsets
+    var d2 = Math.min(1, depth * (active === 2 ? 1.18 : 1));
+    for (y = 0; y < GH; y++) {
+      for (x = 0; x < GW; x++) {
+        var bx = Math.floor(x / 8), by = Math.floor(y / 5);
+        var ox = Math.round(d2 * P.blockOX[by][bx]);
+        var oy = Math.round(d2 * P.blockOY[by][bx]);
+        var sx2 = x - ox, sy2 = y - oy;
+        g2[y][x] = (sx2 >= 0 && sx2 < GW && sy2 >= 0 && sy2 < GH) ? g1[sy2][sx2] : 0;
+      }
+    }
+    return [g0, g1, g2];
+  }
+
+  // ---------- viewport / sizing ----------
+  var W = 0, H = 0, DPR = 1;
+  function viewSize() {
+    var vv = (typeof window !== 'undefined' && window.visualViewport) ? window.visualViewport : null;
+    var w = vv ? vv.width : (window.innerWidth || 800);
+    var h = vv ? vv.height : (window.innerHeight || 600);
+    return { w: w, h: h };
+  }
+  function isPhone() {
+    var scr = (typeof window !== 'undefined' && window.screen) ? window.screen : null;
+    if (scr && scr.width && scr.height) {
+      if (Math.min(scr.width, scr.height) < 700) return true;
+    }
+    return H > W * 1.15;
+  }
+  function fit() {
+    var s = viewSize();
+    W = s.w; H = s.h;
+    DPR = Math.min((window.devicePixelRatio || 1), 2);
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+  }
+  fit();
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', fit);
+  }
+  window.addEventListener('resize', fit);
+
+  // ---------- depth: idle drift + drag scrub (closed-form, phase re-anchored) ----------
+  var anchorT = T0, anchorPhase = (Math.PI * 2) * T0 / 24;
+  var dragging = false, dragDepth = 0;
+  var stackGeom = { x: 0, y: 0, w: 0, h: 0 };
+
+  function depthAt(t) {
+    if (dragging) return dragDepth;
+    var v = 0.45 + 0.3 * Math.sin(anchorPhase + (t - anchorT) * (Math.PI * 2) / 24);
+    return Math.max(0, Math.min(1, v));
+  }
+
+  // ---------- interaction ----------
+  function pointerY(e) {
+    if (e.clientY != null) return e.clientY;
+    if (e.touches && e.touches[0]) return e.touches[0].clientY;
+    if (e.changedTouches && e.changedTouches[0]) return e.changedTouches[0].clientY;
+    return 0;
+  }
+  var lastDownAt = -10, lastDownStamp = 0;
+  function nowSec() {
+    return (typeof performance !== 'undefined' && performance.now) ? performance.now() / 1000 : Date.now() / 1000;
+  }
+  var startStamp = nowSec();
+  function pieceT() { return T0 + (nowSec() - startStamp); }
+
+  function onDown(e) {
+    var t = pieceT();
+    if (t - lastDownAt < 0.35) {
+      // double-tap: reseed geometry + operation parameters
+      seed = (seed * 1103515245 + 12345) % 2147483648;
+      P = buildParams(seed);
+      dragging = false;
+      lastDownAt = -10;
+      return;
+    }
+    lastDownAt = t;
+    dragging = true;
+    dragDepth = Math.max(0, Math.min(1, (pointerY(e) - stackGeom.y) / stackGeom.h));
+    if (e.preventDefault) e.preventDefault();
+  }
+  function onMove(e) {
+    if (!dragging) return;
+    dragDepth = Math.max(0, Math.min(1, (pointerY(e) - stackGeom.y) / stackGeom.h));
+    if (e.preventDefault) e.preventDefault();
+  }
+  function onUp() {
+    if (!dragging) return;
+    dragging = false;
+    var t = pieceT();
+    var s = Math.max(-1, Math.min(1, (dragDepth - 0.45) / 0.3));
+    anchorPhase = Math.asin(s);
+    anchorT = t;
+  }
+  if (window.PointerEvent) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+  } else {
+    canvas.addEventListener('mousedown', onDown);
+    canvas.addEventListener('mousemove', onMove);
+    canvas.addEventListener('mouseup', onUp);
+    canvas.addEventListener('touchstart', onDown);
+    canvas.addEventListener('touchmove', onMove);
+    canvas.addEventListener('touchend', onUp);
+  }
+
+  // ---------- drawing ----------
+  function drawStageCells(grid, color, sx, sy, cellW, cellH) {
+    // 4 hard shade steps, batched per step
+    for (var step = 1; step <= 4; step++) {
+      var lo = (step - 1) / 4, hi = step / 4;
+      ctx.globalAlpha = hi;
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      var any = false;
+      for (var y = 0; y < GH; y++) {
+        for (var x = 0; x < GW; x++) {
+          var v = grid[y][x];
+          if (v > 0.03 && v > lo && v <= hi + 0.0001) {
+            ctx.rect(sx + x * cellW, sy + y * cellH, cellW + 0.6, cellH + 0.6);
+            any = true;
+          }
+        }
+      }
+      if (any) ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function draw(t) {
+    // pin CSS size every draw (house rule for high-DPR phones)
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+    ctx.fillStyle = BG;
+    ctx.fillRect(0, 0, W, H);
+
+    // portrait stack, centered; phones go near full-bleed
+    var phone = isPhone();
+    var stackW = phone ? W * 0.96 : Math.min(W * 0.94, H * 0.68);
+    var stackH = phone ? H * 0.97 : H * 0.96;
+    var stackX = (W - stackW) / 2;
+    var stackY = (H - stackH) / 2;
+    stackGeom = { x: stackX, y: stackY, w: stackW, h: stackH };
+    var stageH = stackH / 4;
+    var cellW = stackW / GW, cellH = stageH / GH;
+
+    var depth = depthAt(t);
+    var active = Math.floor(t / 2) % 4;
+    var grids = computeGrids(cellW, cellH, stageH, depth, active);
+    var g0 = grids[0], g1 = grids[1], g2 = grids[2];
+
+    drawStageCells(g0, STAGE_COLORS[0], stackX, stackY, cellW, cellH);
+    drawStageCells(g1, STAGE_COLORS[1], stackX, stackY + stageH, cellW, cellH);
+    drawStageCells(g2, STAGE_COLORS[2], stackX, stackY + stageH * 2, cellW, cellH);
+
+    // stage 3 — channel swap rendered on the monochrome grid:
+    // cyan channel ghosts (stage-2 signal offset +-2 cells) under a
+    // two-tone white read of the swapped result: bright cells full white,
+    // dim cells in a gray tone. See process.md for the honesty note.
+    var sy3 = stackY + stageH * 3;
+    ctx.fillStyle = STAGE_COLORS[2];
+    ctx.globalAlpha = 0.15;
+    ctx.beginPath();
+    var anyG = false;
+    for (var gy = 0; gy < GH; gy++) {
+      for (var gx = 0; gx < GW; gx++) {
+        if (g2[gy][gx] > 0.35 && gx + 2 < GW) {
+          ctx.rect(stackX + (gx + 2) * cellW, sy3 + gy * cellH, cellW + 0.6, cellH + 0.6);
+          anyG = true;
+        }
+      }
+    }
+    if (anyG) ctx.fill();
+    ctx.globalAlpha = 1;
+    // dim tone pass (swapped low band)
+    drawStageCellsDim(g2, sy3, stackX, cellW, cellH);
+    // bright pass (swapped high band)
+    for (var step2 = 3; step2 <= 4; step2++) {
+      var lo2 = (step2 - 1) / 4, hi2 = step2 / 4;
+      ctx.globalAlpha = hi2;
+      ctx.fillStyle = STAGE_COLORS[3];
+      ctx.beginPath();
+      var anyB = false;
+      for (var yy = 0; yy < GH; yy++) {
+        for (var xx = 0; xx < GW; xx++) {
+          var vv2 = g2[yy][xx];
+          if (vv2 > 0.5 && vv2 > lo2 && vv2 <= hi2 + 0.0001) {
+            ctx.rect(stackX + xx * cellW, sy3 + yy * cellH, cellW + 0.6, cellH + 0.6);
+            anyB = true;
+          }
+        }
+      }
+      if (anyB) ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // separators (1px)
+    ctx.fillStyle = SEP;
+    for (var s = 1; s <= 3; s++) ctx.fillRect(stackX, stackY + stageH * s - 0.5, stackW, 1);
+
+    // progress line: dim track + bright segment on the active stage
+    ctx.fillStyle = SEP;
+    ctx.fillRect(stackX + 1, stackY, 2, stackH);
+    ctx.fillStyle = '#F2F2F2';
+    ctx.globalAlpha = 0.92;
+    ctx.fillRect(stackX + 1, stackY + stageH * active, 3, stageH);
+    ctx.globalAlpha = 1;
+  }
+
+  function drawStageCellsDim(grid, sy, sx, cellW, cellH) {
+    for (var step = 1; step <= 2; step++) {
+      var lo = (step - 1) / 4, hi = step / 4;
+      ctx.globalAlpha = hi * 0.85;
+      ctx.fillStyle = '#7A7A7A';
+      ctx.beginPath();
+      var any = false;
+      for (var y = 0; y < GH; y++) {
+        for (var x = 0; x < GW; x++) {
+          var v = grid[y][x];
+          if (v > 0.03 && v <= 0.5 && v > lo && v <= hi + 0.0001) {
+            ctx.rect(sx + x * cellW, sy + y * cellH, cellW + 0.6, cellH + 0.6);
+            any = true;
+          }
+        }
+      }
+      if (any) ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- run: synchronous fixed-phase first frame, then guarded rAF ----------
+  draw(T0);
+  if (typeof requestAnimationFrame === 'function') {
+    var loop = function () {
+      draw(pieceT());
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
