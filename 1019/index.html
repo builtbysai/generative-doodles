@@ -1,0 +1,713 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Detect, Segment, Erase, Rebuild</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #050507; height: 100%; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- palette (strict, from the brief) ----------
+  var FIELD = '#050507';        // page ground / stage field
+  var DIV   = '#14161C';        // stage dividers
+  var NIGHT = '#05070D';        // night scene base
+  var CYAN  = '#00E5FF';        // detect boxes / glitch
+  var MAG   = '#FF2EA6';        // segment building class / counterfeit posters
+  var GREEN = '#3DDC84';        // segment street class
+  var WHITE = '#FFFFFF';        // segment human class / wave
+  var AMBER = '#FFD93B';        // inpaint healing edge
+  var RED   = '#FF2E4D';        // glitch macroblocks
+
+  var T0 = 13;                  // frame one: wave mid-stack, stage 3 pulsing
+  var SWEEP = 9;                // seconds per processing-wave sweep
+
+  // ---------- seeded rng / helpers ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function lerp(a, b, u) { return a + (b - a) * u; }
+  // integer hash: pure function of (a, b, c) -> [0, 1)
+  function hash3(a, b, c) {
+    var h = (Math.floor(a) * 374761393 + Math.floor(b) * 668265263 + Math.floor(c) * 2246822519) | 0;
+    h = Math.imul(h ^ (h >>> 13), 1274126177);
+    return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+  }
+  function grayHex(g) {
+    g = clamp(Math.round(g), 0, 255);
+    var s = g.toString(16); if (s.length < 2) s = '0' + s;
+    return '#' + s + s + s;
+  }
+
+  // ---------- tune parameters (drag-mapped, one per stage) ----------
+  var tune = {
+    lag: 0.22,        // stage 1 DETECT: bounding-box lag, seconds (0.04..0.70)
+    flicker: 1.0,     // stage 2 SEGMENT: class-flicker rate multiplier (0.2..3.0)
+    heal: 1.0,        // stage 3 INPAINT: heal speed multiplier (0.4..2.2)
+    contrast: 1.0,    // stage 4 DEPTH: depth contrast exponent (0.5..2.0)
+    glitch: 1.0       // stage 5 COMPOSITE: glitch intensity multiplier (0..2.0)
+  };
+
+  // ---------- THE SCENE: one street, five truths ----------
+  // All geometry/states are closed-form functions of (scene, t).
+  var HORIZON = 0.66;
+  var scene = null;
+  var sceneSeed = 915180;
+
+  function buildScene(seed) {
+    var rng = mulberry32(seed);
+    var layout = [
+      { x: 0.03, w: 0.21, top: 0.18 },
+      { x: 0.27, w: 0.20, top: 0.30 },
+      { x: 0.50, w: 0.16, top: 0.12 },
+      { x: 0.86, w: 0.11, top: 0.24 }
+    ];
+    var buildings = layout.map(function (b, i) {
+      return {
+        x: b.x + (rng() - 0.5) * 0.012,
+        w: b.w,
+        top: b.top + (rng() - 0.5) * 0.03,
+        depth: 0.22 + rng() * 0.38,          // far..mid
+        idx: i
+      };
+    });
+    var slots = [
+      { u: 0.315, v: 0.365, w: 0.135, h: 0.215, depth: 0.58, poster: Math.floor(rng() * 3), seed: Math.floor(rng() * 1e9), board: false },
+      { u: 0.695, v: 0.255, w: 0.165, h: 0.255, depth: 0.70, poster: Math.floor(rng() * 3), seed: Math.floor(rng() * 1e9), board: true }
+    ];
+    var figures = [
+      { x0: 0.06, x1: 0.62, feetV: 0.865, h: 0.36, speed: 0.045, stride: 7.0, phase: 0.675, depth: 0.82 },
+      { x0: 0.38, x1: 0.94, feetV: 0.935, h: 0.40, speed: 0.036, stride: 6.2, phase: 1.052, depth: 0.66 }
+    ];
+    return { seed: seed, buildings: buildings, slots: slots, figures: figures };
+  }
+
+  // figure kinematics: closed-form ping-pong walk
+  function figureState(fig, t) {
+    var span = fig.x1 - fig.x0;
+    var dist = (t * fig.speed + fig.phase) % (2 * span);
+    if (dist < 0) dist += 2 * span;
+    var dir = dist < span ? 1 : -1;
+    var cx = fig.x0 + (dist < span ? dist : 2 * span - dist);
+    return { cx: cx, dir: dir, sp: t * fig.stride + fig.phase * 13.0 };
+  }
+
+  // ---------- canvas ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 720, H = 720, DPR = 1;
+
+  function fit() {
+    var vv = (typeof window !== 'undefined' && window.visualViewport) ? window.visualViewport : null;
+    var w = vv ? vv.width : (window.innerWidth || 720);
+    var h = vv ? vv.height : (window.innerHeight || 720);
+    DPR = (typeof window !== 'undefined' && window.devicePixelRatio) ? window.devicePixelRatio : 1;
+    if (DPR > 2) DPR = 2;
+    W = w; H = h;
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+  }
+  function isPhone() {
+    var scr = (typeof window !== 'undefined' && window.screen) ? window.screen : null;
+    if (scr && Math.min(scr.width, scr.height) < 700) return true;
+    return H > W * 1.15;
+  }
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { fit(); draw(currentT); });
+  }
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('resize', function () { fit(); draw(currentT); });
+  }
+
+  // ---------- geometry helpers (pixel space inside a stage rect) ----------
+  function X(rx, rw, u) { return rx + u * rw; }
+  function Y(ry, rh, v) { return ry + v * rh; }
+
+  function quadPath(p1, p2, w) {
+    var dx = p2.x - p1.x, dy = p2.y - p1.y;
+    var len = Math.sqrt(dx * dx + dy * dy) || 1;
+    var nx = -dy / len * w * 0.5, ny = dx / len * w * 0.5;
+    ctx.moveTo(p1.x + nx, p1.y + ny);
+    ctx.lineTo(p2.x + nx, p2.y + ny);
+    ctx.lineTo(p2.x - nx, p2.y - ny);
+    ctx.lineTo(p1.x - nx, p1.y - ny);
+    ctx.closePath();
+  }
+  function mid(a, b) { return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }; }
+
+  // Trace the figure silhouette (head + torso + limb quads) into the current path.
+  // Returns the bounding box in pixels.
+  function traceFigure(fig, st, rx, ry, rw, rh) {
+    var hPx = fig.h * rh;
+    var cxPx = X(rx, rw, st.cx);
+    var feetY = Y(ry, rh, fig.feetV) + Math.sin(st.sp * 2) * hPx * 0.008;
+    var hip = { x: cxPx, y: feetY - hPx * 0.50 };
+    var sh  = { x: cxPx + st.dir * hPx * 0.02, y: feetY - hPx * 0.78 };
+    var head = { x: sh.x + st.dir * hPx * 0.015, y: feetY - hPx * 0.895 };
+    var footL = { x: cxPx + st.dir * Math.sin(st.sp) * hPx * 0.17, y: feetY };
+    var footR = { x: cxPx + st.dir * Math.sin(st.sp + Math.PI) * hPx * 0.17, y: feetY };
+    var kneeL = mid(hip, footL); kneeL.x += st.dir * hPx * 0.05; kneeL.y -= hPx * 0.01;
+    var kneeR = mid(hip, footR); kneeR.x += st.dir * hPx * 0.05; kneeR.y -= hPx * 0.01;
+    var handL = { x: sh.x + st.dir * Math.sin(st.sp + Math.PI) * hPx * 0.13, y: sh.y + hPx * 0.27 };
+    var handR = { x: sh.x + st.dir * Math.sin(st.sp) * hPx * 0.13, y: sh.y + hPx * 0.27 };
+    var elbL = mid(sh, handL); elbL.x += st.dir * hPx * 0.035; elbL.y += hPx * 0.012;
+    var elbR = mid(sh, handR); elbR.x -= st.dir * hPx * 0.010; elbR.y += hPx * 0.012;
+    ctx.beginPath();
+    ctx.moveTo(head.x + hPx * 0.105, head.y);
+    ctx.arc(head.x, head.y, hPx * 0.105, 0, Math.PI * 2);
+    // torso
+    ctx.moveTo(sh.x - hPx * 0.085, sh.y);
+    ctx.lineTo(sh.x + hPx * 0.085, sh.y);
+    ctx.lineTo(hip.x + hPx * 0.060, hip.y);
+    ctx.lineTo(hip.x - hPx * 0.060, hip.y);
+    ctx.closePath();
+    quadPath(hip, kneeL, hPx * 0.090); quadPath(kneeL, footL, hPx * 0.070);
+    quadPath(hip, kneeR, hPx * 0.090); quadPath(kneeR, footR, hPx * 0.070);
+    quadPath(sh, elbL, hPx * 0.065);  quadPath(elbL, handL, hPx * 0.055);
+    quadPath(sh, elbR, hPx * 0.065);  quadPath(elbR, handR, hPx * 0.055);
+    return { x0: cxPx - hPx * 0.30, x1: cxPx + hPx * 0.30, y0: feetY - hPx * 1.03, y1: feetY + 2, hPx: hPx };
+  }
+
+  function slotRectPx(s, rx, ry, rw, rh) {
+    return { x: X(rx, rw, s.u), y: Y(ry, rh, s.v), w: s.w * rw, h: s.h * rh };
+  }
+
+  // windows: deterministic lit pattern per building
+  function drawWindows(b, rx, ry, rw, rh, t, alphaLit, alphaBlink) {
+    var bx = X(rx, rw, b.x), bw = b.w * rw;
+    var by = Y(ry, rh, b.top), bh = (HORIZON - b.top) * rh;
+    var cols = Math.max(2, Math.floor(bw / (rw * 0.045)));
+    var rows = Math.max(2, Math.floor(bh / (rh * 0.075)));
+    var cw = bw / cols, chh = bh / rows;
+    var bucket = Math.floor(t / 2.7);
+    for (var i = 0; i < cols; i++) {
+      for (var j = 0; j < rows; j++) {
+        var lit = hash3(scene.seed + b.idx * 131, i * 17 + 3, j * 29 + 5);
+        var on = lit < 0.34;
+        if (!on && alphaBlink > 0 && hash3(scene.seed + b.idx * 131, i * 17 + 3, j * 29 + 5 + bucket * 7) < 0.05) on = true;
+        if (!on) continue;
+        ctx.fillStyle = 'rgba(255,255,255,' + (lit < 0.10 ? alphaLit : alphaLit * 0.55) + ')';
+        ctx.fillRect(bx + i * cw + cw * 0.28, by + j * chh + chh * 0.30, cw * 0.44, chh * 0.38);
+      }
+    }
+  }
+
+  // shared "night photograph" of the street (no figures, no posters)
+  function drawNightBase(rx, ry, rw, rh, t, withWindows) {
+    ctx.fillStyle = NIGHT;
+    ctx.fillRect(rx, ry, rw, rh);
+    // street
+    ctx.fillStyle = '#0A0D16';
+    ctx.fillRect(rx, Y(ry, rh, HORIZON), rw, rh * (1 - HORIZON));
+    ctx.fillStyle = DIV;
+    ctx.fillRect(rx, Y(ry, rh, HORIZON), rw, 1);
+    // buildings
+    for (var i = 0; i < scene.buildings.length; i++) {
+      var b = scene.buildings[i];
+      ctx.fillStyle = '#0D1120';
+      ctx.fillRect(X(rx, rw, b.x), Y(ry, rh, b.top), b.w * rw, (HORIZON - b.top) * rh);
+      ctx.fillStyle = '#1A2138';
+      ctx.fillRect(X(rx, rw, b.x), Y(ry, rh, b.top), b.w * rw, 1.5);
+      if (withWindows) drawWindows(b, rx, ry, rw, rh, t, 0.30, 1);
+    }
+    // billboard pole (slot B hardware stays in every stage's base)
+    var sb = scene.slots[1];
+    ctx.fillStyle = '#1A2138';
+    var pcx = X(rx, rw, sb.u + sb.w / 2);
+    ctx.fillRect(pcx - 1, Y(ry, rh, sb.v + sb.h), 2, (0.80 - (sb.v + sb.h)) * rh);
+  }
+
+  function drawSlotFrame(s, rx, ry, rw, rh) {
+    var r = slotRectPx(s, rx, ry, rw, rh);
+    ctx.fillStyle = '#070A12';
+    ctx.fillRect(r.x, r.y, r.w, r.h);
+    ctx.strokeStyle = '#2A3350';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1);
+  }
+
+  // counterfeit poster: pure generative marks, no text, clipped to the slot
+  function drawPoster(s, rx, ry, rw, rh, t) {
+    var r = slotRectPx(s, rx, ry, rw, rh);
+    var rng = mulberry32(s.seed);
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(r.x, r.y, r.w, r.h);
+    ctx.clip();
+    ctx.fillStyle = '#0A0A12';
+    ctx.fillRect(r.x, r.y, r.w, r.h);
+    var flick = hash3(s.seed, Math.floor(t * 3), 7) < 0.06 ? 0.55 : 1.0;
+    ctx.globalAlpha = flick;
+    if (s.poster === 0) {           // ring + bars
+      ctx.strokeStyle = MAG; ctx.lineWidth = Math.max(2, r.w * 0.07);
+      ctx.beginPath();
+      ctx.arc(r.x + r.w * (0.3 + rng() * 0.4), r.y + r.h * 0.42, r.w * 0.20, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.fillStyle = MAG;
+      for (var i = 0; i < 4; i++) ctx.fillRect(r.x + r.w * 0.12, r.y + r.h * (0.68 + i * 0.075), r.w * (0.35 + rng() * 0.4), r.h * 0.038);
+      ctx.fillStyle = WHITE;
+      ctx.fillRect(r.x + r.w * 0.12, r.y + r.h * 0.10, r.w * 0.22, r.h * 0.05);
+    } else if (s.poster === 1) {    // diagonal stripes
+      ctx.strokeStyle = MAG; ctx.lineWidth = Math.max(2, r.w * 0.055);
+      for (var k = -2; k < 8; k++) {
+        ctx.beginPath();
+        ctx.moveTo(r.x + k * r.w * 0.16, r.y + r.h);
+        ctx.lineTo(r.x + k * r.w * 0.16 + r.h * 0.7, r.y);
+        ctx.stroke();
+      }
+      ctx.fillStyle = CYAN;
+      ctx.beginPath();
+      ctx.arc(r.x + r.w * 0.72, r.y + r.h * 0.30, r.w * 0.10, 0, Math.PI * 2);
+      ctx.fill();
+    } else {                        // halftone dot field + slab
+      ctx.fillStyle = MAG;
+      var n = 7;
+      for (var a = 0; a < n; a++) for (var b2 = 0; b2 < n; b2++) {
+        var rad = (0.5 + 0.5 * Math.sin((a + b2) * 0.8 + rng() * 0.4)) * r.w * 0.045;
+        ctx.beginPath();
+        ctx.arc(r.x + (a + 0.5) * r.w / n, r.y + (b2 + 0.5) * r.h / n, Math.max(0.6, rad), 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.fillStyle = WHITE;
+      ctx.fillRect(r.x + r.w * 0.14, r.y + r.h * 0.80, r.w * 0.5, r.h * 0.07);
+    }
+    ctx.globalAlpha = 1;
+    ctx.restore();
+    ctx.strokeStyle = '#2A3350';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1);
+  }
+
+  // ---------- stage 1: DETECT ----------
+  function stageDetect(rx, ry, rw, rh, t) {
+    drawNightBase(rx, ry, rw, rh, t, true);
+    for (var s = 0; s < scene.slots.length; s++) drawSlotFrame(scene.slots[s], rx, ry, rw, rh);
+    // dim figures
+    ctx.fillStyle = '#26304A';
+    for (var f = 0; f < scene.figures.length; f++) {
+      traceFigure(scene.figures[f], figureState(scene.figures[f], t), rx, ry, rw, rh);
+      ctx.fill();
+    }
+    // hunting boxes: honest temporal lag, state evaluated at (t - lag)
+    var bucket = Math.floor(t * 7);
+    var targets = [];
+    for (var i = 0; i < scene.figures.length; i++) targets.push({ fig: scene.figures[i], id: i + 1 });
+    for (var j = 0; j < scene.slots.length; j++) targets.push({ slot: scene.slots[j], id: 11 + j });
+    ctx.strokeStyle = CYAN;
+    for (var k = 0; k < targets.length; k++) {
+      var tg = targets[k];
+      var lagK = tune.lag * (0.85 + 0.3 * hash3(scene.seed, tg.id, 41));
+      var box;
+      if (tg.fig) {
+        box = traceFigure(tg.fig, figureState(tg.fig, t - lagK), rx, ry, rw, rh);
+      } else {
+        box = slotRectPx(tg.slot, rx, ry, rw, rh);
+        box = { x0: box.x - 3, x1: box.x + box.w + 3, y0: box.y - 3, y1: box.y + box.h + 3 };
+      }
+      var jit = (tune.lag / 0.22) * rw * 0.004;
+      var jx = (hash3(scene.seed, tg.id * 3, bucket) - 0.5) * 2 * jit;
+      var jy = (hash3(scene.seed, tg.id * 5, bucket) - 0.5) * 2 * jit * 0.6;
+      var bx = box.x0 + jx, by = box.y0 + jy, bw = box.x1 - box.x0, bh = box.y1 - box.y0;
+      ctx.globalAlpha = 0.55;
+      ctx.lineWidth = 1;
+      ctx.strokeRect(bx + 0.5, by + 0.5, bw - 1, bh - 1);
+      ctx.globalAlpha = 1;
+      ctx.lineWidth = 2;
+      var c = Math.min(bw, bh) * 0.22;
+      ctx.beginPath();
+      ctx.moveTo(bx, by + c); ctx.lineTo(bx, by); ctx.lineTo(bx + c, by);
+      ctx.moveTo(bx + bw - c, by); ctx.lineTo(bx + bw, by); ctx.lineTo(bx + bw, by + c);
+      ctx.moveTo(bx + bw, by + bh - c); ctx.lineTo(bx + bw, by + bh); ctx.lineTo(bx + bw - c, by + bh);
+      ctx.moveTo(bx + c, by + bh); ctx.lineTo(bx, by + bh); ctx.lineTo(bx, by + bh - c);
+      ctx.stroke();
+    }
+  }
+
+  // ---------- stage 2: SEGMENT ----------
+  function stageSegment(rx, ry, rw, rh, t) {
+    // sky: void
+    ctx.fillStyle = '#000000';
+    ctx.fillRect(rx, ry, rw, rh);
+    var bucket = Math.floor(t * 2 * tune.flicker);
+    // buildings: magenta class, with seeded misclassification patches (flicker)
+    for (var i = 0; i < scene.buildings.length; i++) {
+      var b = scene.buildings[i];
+      ctx.fillStyle = MAG;
+      var bx = X(rx, rw, b.x), by = Y(ry, rh, b.top), bw = b.w * rw, bh = (HORIZON - b.top) * rh;
+      ctx.fillRect(bx, by, bw, bh);
+      if (hash3(scene.seed * 7 + 3, b.idx * 19, bucket) < 0.45) {
+        var np = 1 + Math.floor(hash3(scene.seed * 7 + 3, b.idx * 23, bucket) * 3);
+        ctx.fillStyle = WHITE;
+        for (var pi = 0; pi < np; pi++) {
+          var px = bx + hash3(scene.seed, b.idx * 31 + pi, bucket) * bw * 0.75;
+          var py = by + hash3(scene.seed, b.idx * 37 + pi, bucket) * bh * 0.7;
+          ctx.fillRect(px, py, bw * 0.16, bh * 0.18);
+        }
+      }
+    }
+    // billboard pole + slot: building class
+    var sb = scene.slots[1];
+    ctx.fillStyle = MAG;
+    var pcx = X(rx, rw, sb.u + sb.w / 2);
+    ctx.fillRect(pcx - 1, Y(ry, rh, sb.v + sb.h), 2, (0.80 - (sb.v + sb.h)) * rh);
+    for (var s = 0; s < scene.slots.length; s++) {
+      var r = slotRectPx(scene.slots[s], rx, ry, rw, rh);
+      ctx.fillRect(r.x, r.y, r.w, r.h);
+    }
+    // street: green class
+    ctx.fillStyle = GREEN;
+    ctx.fillRect(rx, Y(ry, rh, HORIZON), rw, rh * (1 - HORIZON));
+    // humans: white class (rare flicker to magenta)
+    for (var f = 0; f < scene.figures.length; f++) {
+      var ff = hash3(scene.seed * 7 + 3, 99 + f, bucket) < 0.08;
+      ctx.fillStyle = ff ? MAG : WHITE;
+      traceFigure(scene.figures[f], figureState(scene.figures[f], t), rx, ry, rw, rh);
+      ctx.fill();
+    }
+  }
+
+  // ---------- stage 3: INPAINT ----------
+  function stageInpaint(rx, ry, rw, rh, t) {
+    drawNightBase(rx, ry, rw, rh, t, true);   // the healed background IS the scene
+    // erased regions: figure bboxes + slot rects, each on its own heal cycle
+    var regions = [];
+    for (var f = 0; f < scene.figures.length; f++) {
+      var lig = scene.figures[f];
+      var bb = traceFigure(lig, figureState(lig, t), rx, ry, rw, rh);
+      regions.push({ x0: bb.x0 - 3, y0: bb.y0 - 3, x1: bb.x1 + 3, y1: bb.y1 + 3, id: f + 1 });
+    }
+    for (var s = 0; s < scene.slots.length; s++) {
+      var r = slotRectPx(scene.slots[s], rx, ry, rw, rh);
+      regions.push({ x0: r.x, y0: r.y, x1: r.x + r.w, y1: r.y + r.h, id: 21 + s });
+    }
+    var period = 6 / tune.heal;
+    for (var i = 0; i < regions.length; i++) {
+      var rg = regions[i];
+      var off = hash3(scene.seed, rg.id, 97) * period;
+      var p = ((t + off) % period) / period;
+      if (p > 0.85) continue;                       // fully healed: nothing to show
+      var front = p < 0.15 ? 0 : (p - 0.15) / 0.70; // healed fraction, left to right
+      var fx = lerp(rg.x0, rg.x1, front);
+      // unhealed remainder: smudge + seeded speckle
+      ctx.save();
+      ctx.beginPath(); ctx.rect(fx, rg.y0, rg.x1 - fx, rg.y1 - rg.y0); ctx.clip();
+      ctx.fillStyle = '#171B2C';
+      ctx.fillRect(fx, rg.y0, rg.x1 - fx, rg.y1 - rg.y0);
+      var cell = Math.max(4, rw * 0.012);
+      var bkt = Math.floor(t * 5);
+      for (var gx = Math.floor(fx / cell); gx * cell < rg.x1; gx++) {
+        for (var gy = Math.floor(rg.y0 / cell); gy * cell < rg.y1; gy++) {
+          var hv = hash3(scene.seed + rg.id, gx * 3 + bkt, gy * 5);
+          if (hv < 0.34) {
+            ctx.fillStyle = 'rgba(255,255,255,' + (0.05 + hv * 0.18) + ')';
+            ctx.fillRect(gx * cell, gy * cell, cell, cell);
+          }
+        }
+      }
+      ctx.restore();
+      // healing front: amber edge + ticks
+      if (front > 0 && front < 1) {
+        ctx.strokeStyle = AMBER;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(fx, rg.y0); ctx.lineTo(fx, rg.y1);
+        ctx.stroke();
+        ctx.fillStyle = AMBER;
+        var nTicks = 3;
+        for (var tk = 0; tk <= nTicks; tk++) {
+          ctx.fillRect(fx - 1, rg.y0 + (rg.y1 - rg.y0) * (tk / nTicks) - 1, 2, 2);
+        }
+      }
+      ctx.strokeStyle = 'rgba(20,22,28,0.9)';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(rg.x0 + 0.5, rg.y0 + 0.5, rg.x1 - rg.x0 - 1, rg.y1 - rg.y0 - 1);
+    }
+  }
+
+  // ---------- stage 4: DEPTH ----------
+  function stageDepth(rx, ry, rw, rh, t) {
+    ctx.fillStyle = '#000000';
+    ctx.fillRect(rx, ry, rw, rh);
+    function shade(d) { return grayHex(255 * Math.pow(clamp(d, 0, 1), tune.contrast)); }
+    // street: flat strips, nearer toward the bottom
+    var strips = 6;
+    for (var k = 0; k < strips; k++) {
+      var v0 = HORIZON + (1 - HORIZON) * (k / strips);
+      ctx.fillStyle = shade(0.30 + k * 0.115);
+      ctx.fillRect(rx, Y(ry, rh, v0), rw, rh * (1 - HORIZON) / strips + 1);
+    }
+    // buildings by seeded depth
+    for (var i = 0; i < scene.buildings.length; i++) {
+      var b = scene.buildings[i];
+      ctx.fillStyle = shade(b.depth);
+      ctx.fillRect(X(rx, rw, b.x), Y(ry, rh, b.top), b.w * rw, (HORIZON - b.top) * rh);
+    }
+    // slots by depth
+    for (var s = 0; s < scene.slots.length; s++) {
+      var r = slotRectPx(scene.slots[s], rx, ry, rw, rh);
+      ctx.fillStyle = shade(scene.slots[s].depth);
+      ctx.fillRect(r.x, r.y, r.w, r.h);
+    }
+    var sb = scene.slots[1];
+    ctx.fillStyle = shade(sb.depth - 0.1);
+    var pcx = X(rx, rw, sb.u + sb.w / 2);
+    ctx.fillRect(pcx - 1, Y(ry, rh, sb.v + sb.h), 2, (0.80 - (sb.v + sb.h)) * rh);
+    // figures: near and bright, depth drifting as they walk
+    for (var f = 0; f < scene.figures.length; f++) {
+      var lig = scene.figures[f];
+      var d = lig.depth + 0.05 * Math.sin(t * 0.3 + f * 2.1);
+      ctx.fillStyle = shade(d);
+      traceFigure(lig, figureState(lig, t), rx, ry, rw, rh);
+      ctx.fill();
+    }
+  }
+
+  // ---------- stage 5: COMPOSITE ----------
+  function stageComposite(rx, ry, rw, rh, t) {
+    drawNightBase(rx, ry, rw, rh, t, true);
+    for (var s = 0; s < scene.slots.length; s++) drawPoster(scene.slots[s], rx, ry, rw, rh, t);
+    for (var f = 0; f < scene.figures.length; f++) {
+      var lig = scene.figures[f];
+      var st = figureState(lig, t);
+      // RGB split echoes of the silhouette itself
+      ctx.save();
+      ctx.translate(-2, 0); ctx.fillStyle = 'rgba(255,46,77,0.22)';
+      traceFigure(lig, st, rx, ry, rw, rh); ctx.fill();
+      ctx.restore();
+      ctx.save();
+      ctx.translate(2, 0); ctx.fillStyle = 'rgba(0,229,255,0.22)';
+      traceFigure(lig, st, rx, ry, rw, rh); ctx.fill();
+      ctx.restore();
+      // body
+      ctx.fillStyle = '#2A3350';
+      var bb = traceFigure(lig, st, rx, ry, rw, rh);
+      ctx.fill();
+      // glitch macroblocks: strictly inside the silhouette (clip-enforced)
+      if (tune.glitch > 0.01) {
+        ctx.save();
+        traceFigure(lig, st, rx, ry, rw, rh);
+        ctx.clip();
+        var cell = Math.max(3, bb.hPx * 0.11 / (0.6 + tune.glitch * 0.4));
+        var bkt = Math.floor(t * 9);
+        var density = 0.10 * tune.glitch;
+        for (var gx = Math.floor(bb.x0 / cell); gx * cell < bb.x1; gx++) {
+          for (var gy = Math.floor(bb.y0 / cell); gy * cell < bb.y1; gy++) {
+            var hv = hash3(scene.seed + f * 57, gx * 7 + bkt * 13, gy * 11);
+            if (hv < density) {
+              ctx.fillStyle = hv < density * 0.5 ? RED : CYAN;
+              ctx.fillRect(gx * cell, gy * cell, cell, cell);
+            }
+          }
+        }
+        ctx.restore();
+      }
+    }
+  }
+
+  var STAGES = [stageDetect, stageSegment, stageInpaint, stageDepth, stageComposite];
+
+  // ---------- interaction state ----------
+  var soloStage = -1, soloUntil = -1;
+  var pendingTap = null;               // {stage, frames}
+  var lastTapStage = -2, lastTapFrame = -100, frameCount = 0;
+  var dragInfo = null;                 // {stage, x, y, moved}
+
+  function stageAt(y) { return clamp(Math.floor(y / (H / 5)), 0, 4); }
+
+  function applyTune(stage, dx) {
+    var k = dx * 0.004;
+    if (stage === 0) tune.lag = clamp(tune.lag + dx * 0.0016, 0.04, 0.70);
+    else if (stage === 1) tune.flicker = clamp(tune.flicker + k, 0.2, 3.0);
+    else if (stage === 2) tune.heal = clamp(tune.heal + k, 0.4, 2.2);
+    else if (stage === 3) tune.contrast = clamp(tune.contrast + k * 0.6, 0.5, 2.0);
+    else if (stage === 4) tune.glitch = clamp(tune.glitch + k, 0, 2.0);
+  }
+
+  function onDown(e) {
+    ensureAudio();
+    var x = e.clientX || 0, y = e.clientY || 0;
+    dragInfo = { stage: soloStage >= 0 ? soloStage : stageAt(y), x: x, y: y, moved: false };
+  }
+  function onMove(e) {
+    if (!dragInfo) return;
+    var x = e.clientX || 0, y = e.clientY || 0;
+    var dx = x - dragInfo.x;
+    if (Math.abs(x - dragInfo.x) + Math.abs(y - dragInfo.y) > 8) dragInfo.moved = true;
+    if (dragInfo.moved && dx !== 0) { applyTune(dragInfo.stage, dx); dragInfo.x = x; dragInfo.y = y; }
+  }
+  function onUp(e) {
+    if (!dragInfo) return;
+    var wasDrag = dragInfo.moved;
+    var stg = dragInfo.stage;
+    dragInfo = null;
+    if (wasDrag) return;
+    // a tap
+    if (soloStage >= 0) { soloStage = -1; soloUntil = -1; pendingTap = null; return; }
+    if (pendingTap && frameCount - lastTapFrame < 22 && lastTapStage === stg) {
+      // double-tap: new scene
+      pendingTap = null;
+      sceneSeed = (sceneSeed * 1103515245 + 12345) % 2147483648;
+      scene = buildScene(sceneSeed);
+      soloStage = -1; soloUntil = -1;
+      return;
+    }
+    pendingTap = { stage: stg, frames: 0 };
+    lastTapStage = stg; lastTapFrame = frameCount;
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', function () { dragInfo = null; });
+  }
+
+  // ---------- audio (lazy, guarded; visual is silent without a gesture) ----------
+  var AC = null, voices = null;
+  function ensureAudio() {
+    if (AC) { if (AC.resume) { try { AC.resume(); } catch (err) {} } return; }
+    var Ctor = null;
+    try {
+      if (typeof AudioContext !== 'undefined') Ctor = AudioContext;
+      else if (typeof window !== 'undefined' && window.webkitAudioContext) Ctor = window.webkitAudioContext;
+    } catch (err) { Ctor = null; }
+    if (!Ctor) return;
+    try {
+      AC = new Ctor();
+      var master = AC.createGain(); master.gain.value = 0.6; master.connect(AC.destination);
+      function osc(type, freq) {
+        var o = AC.createOscillator(); o.type = type; o.frequency.value = freq;
+        var g = AC.createGain(); g.gain.value = 0; o.connect(g); g.connect(master); o.start();
+        return g;
+      }
+      function noise(filterType, freq, q) {
+        var len = AC.sampleRate * 2;
+        var buf = AC.createBuffer(1, len, AC.sampleRate);
+        var d = buf.getChannelData(0);
+        var r = mulberry32(4242);
+        for (var i = 0; i < len; i++) d[i] = r() * 2 - 1;
+        var src = AC.createBufferSource(); src.buffer = buf; src.loop = true;
+        var flt = AC.createBiquadFilter(); flt.type = filterType; flt.frequency.value = freq; flt.Q.value = q;
+        var g = AC.createGain(); g.gain.value = 0;
+        src.connect(flt); flt.connect(g); g.connect(master); src.start();
+        return g;
+      }
+      voices = [
+        osc('square', 1240),                                   // detect: targeting blips
+        [osc('sine', 220), osc('sine', 277), osc('sine', 330)],// segment: class chord
+        noise('bandpass', 1800, 1.2),                          // inpaint: filling shimmer
+        osc('sine', 58),                                       // depth: low wash
+        [noise('lowpass', 420, 0.7), osc('sine', 110)]         // composite: the mix
+      ];
+    } catch (err) { AC = null; voices = null; }
+  }
+  function updateAudio(t, pulses) {
+    if (!AC || !voices) return;
+    try {
+      var now = AC.currentTime;
+      function set(g, v) { g.gain.setTargetAtTime(clamp(v, 0, 0.12), now, 0.08); }
+      var bucket = Math.floor(t * 6);
+      var gate = hash3(scene.seed, 77, bucket) < 0.5 ? 1 : 0.12;
+      set(voices[0], pulses[0] * gate * 0.05);                       // blips
+      for (var i = 0; i < 3; i++) set(voices[1][i], pulses[1] * 0.016); // chord
+      set(voices[2], pulses[2] * 0.05 * tune.heal);                  // shimmer
+      set(voices[3], pulses[3] * 0.085);                             // wash
+      set(voices[4][0], pulses[4] * 0.045);                          // mix noise
+      set(voices[4][1], pulses[4] * 0.03);                           // mix tone
+    } catch (err) {}
+  }
+
+  // ---------- draw ----------
+  var currentT = T0;
+  var lastPulses = [0, 0, 0, 0, 0];
+
+  function draw(t) {
+    currentT = t;
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.fillStyle = FIELD;
+    ctx.fillRect(0, 0, W, H);
+    var stageH = H / 5;
+    var sweepY = ((t % SWEEP) / SWEEP) * H;
+    var i, pulse;
+    var pulses = [];
+    for (i = 0; i < 5; i++) {
+      var center = (i + 0.5) * stageH;
+      pulse = clamp(1 - Math.abs(sweepY - center) / (stageH * 0.9), 0, 1);
+      pulses.push(pulse);
+    }
+    lastPulses = pulses;
+
+    if (soloStage >= 0 && t < soloUntil) {
+      STAGES[soloStage](0, 0, W, H, t);
+      ctx.fillStyle = 'rgba(255,255,255,' + (pulses[soloStage] * 0.08) + ')';
+      ctx.fillRect(0, 0, W, H);
+    } else {
+      if (soloStage >= 0 && t >= soloUntil) { soloStage = -1; soloUntil = -1; }
+      for (i = 0; i < 5; i++) {
+        var ry = i * stageH;
+        ctx.save();
+        ctx.beginPath(); ctx.rect(0, ry, W, stageH); ctx.clip();
+        STAGES[i](0, ry, W, stageH, t);
+        ctx.restore();
+        if (pulses[i] > 0.01) {
+          ctx.fillStyle = 'rgba(255,255,255,' + (pulses[i] * 0.10) + ')';
+          ctx.fillRect(0, ry, W, stageH);
+        }
+        if (i < 4) {
+          ctx.fillStyle = DIV;
+          ctx.fillRect(0, ry + stageH - 1, W, 2);
+        }
+      }
+    }
+    // the processing wave: layered flat-alpha band (no gradients)
+    ctx.fillStyle = 'rgba(255,255,255,0.03)';
+    ctx.fillRect(0, sweepY - 27, W, 54);
+    ctx.fillStyle = 'rgba(255,255,255,0.07)';
+    ctx.fillRect(0, sweepY - 13, W, 26);
+    ctx.fillStyle = 'rgba(255,255,255,0.16)';
+    ctx.fillRect(0, sweepY - 5, W, 10);
+  }
+
+  // ---------- run ----------
+  scene = buildScene(sceneSeed);
+  fit();
+  draw(T0);
+
+  if (typeof requestAnimationFrame === 'function') {
+    var startTs = null;
+    var tick = function (ts) {
+      if (startTs === null) startTs = ts;
+      var t = T0 + (ts - startTs) / 1000;
+      frameCount++;
+      if (pendingTap) {
+        pendingTap.frames++;
+        if (pendingTap.frames > 20) {
+          soloStage = pendingTap.stage;
+          soloUntil = t + 10;
+          pendingTap = null;
+        }
+      }
+      draw(t);
+      updateAudio(t, lastPulses);
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }
+})();
+</script>
+</body>
+</html>

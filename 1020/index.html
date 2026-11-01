@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>170,000 Dreams, One Cube</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #050507; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  var T0 = 14;                 // fixed first-frame phase, seconds
+  var BASE_SEED = 1020181;     // piece seed
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ---------- deterministic rng ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function ihash(x, y) {
+    var h = (Math.imul(x | 0, 374761393) + Math.imul(y | 0, 668265263)) | 0;
+    h = Math.imul(h ^ (h >>> 13), 1274126177);
+    return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+  }
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function lerp(a, b, t) { return a + (b - a) * t; }
+
+  // ---------- palette ----------
+  var ROOM = '#050507';
+  var WALL = '#14161C';
+  var TRAIL = [138, 141, 132];        // #8A8D84
+  var BLUE = [74, 107, 138];          // #4A6B8A
+  var ROSE = [138, 74, 107];          // #8A4A6B
+  var GREEN = [74, 138, 107];         // #4A8A6B
+  var CUBE = '#1E2A4A';
+  function rgb(c, a) { return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a + ')'; }
+
+  // ---------- view ----------
+  var W = 0, H = 0, DPR = 1, PHONE = false;
+  function measure() {
+    var w, h;
+    if (typeof window !== 'undefined' && window.visualViewport) {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    } else {
+      w = window.innerWidth; h = window.innerHeight;
+    }
+    W = Math.max(50, Math.round(w)); H = Math.max(50, Math.round(h));
+    DPR = (typeof window !== 'undefined' && window.devicePixelRatio) ? window.devicePixelRatio : 1;
+    var sw = W, sh = H;
+    if (typeof window !== 'undefined' && window.screen) { sw = window.screen.width; sh = window.screen.height; PHONE = Math.min(sw, sh) < 700; }
+    else { PHONE = H > W * 1.15; }
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+  }
+
+  // ---------- model state (seeded parameter sets, rebuilt on reseed) ----------
+  var seedSalt = 0, attSalt = 0;
+  var epoch = 0, attEpoch = 0;        // piece-time of last reseed / attention resample
+  var nodes = [], pairSeed = [];
+  var fieldA = null, fieldB = null;
+  var losses = [];
+
+  function makeField(rng) {
+    var f = { s1: [], blobs: [] };
+    for (var i = 0; i < 6; i++) f.s1.push(rng() * Math.PI * 2);
+    var nb = 4 + Math.floor(rng() * 3);
+    for (var j = 0; j < nb; j++) {
+      f.blobs.push({ x: 0.12 + rng() * 0.76, y: 0.12 + rng() * 0.76, r: 0.14 + rng() * 0.26, a: (rng() - 0.30) * 1.3 });
+    }
+    return f;
+  }
+  function fieldVal(f, x, y) {
+    var v = 0.5
+      + 0.26 * Math.sin(3.1 * x + f.s1[0]) * Math.cos(2.7 * y + f.s1[1])
+      + 0.20 * Math.sin(5.1 * y + f.s1[2] + 1.6 * x)
+      + 0.14 * Math.sin(4.3 * (x + y) + f.s1[3])
+      + 0.10 * Math.cos(6.7 * x - 3.9 * y + f.s1[4]);
+    for (var i = 0; i < f.blobs.length; i++) {
+      var b = f.blobs[i], dx = x - b.x, dy = y - b.y;
+      v += b.a * Math.exp(-(dx * dx + dy * dy) / (b.r * b.r));
+    }
+    return clamp(v, 0, 1);
+  }
+
+  function buildModel() {
+    var rng = mulberry32(BASE_SEED + seedSalt * 7919);
+    fieldA = makeField(rng);
+    fieldB = makeField(rng);
+    losses = [];
+    for (var k = 0; k < 4; k++) {
+      var L = { decay: 2.3 + rng() * 1.4, off: rng() * 46, alpha: 0.4 + rng() * 0.45, steps: [] };
+      var ns = 2 + Math.floor(rng() * 3), prev = 0.15;
+      for (var s = 0; s < ns; s++) { var u = prev + rng() * 0.3; if (u < 0.92) L.steps.push({ u: u, drop: 0.10 + rng() * 0.22 }); prev = u; }
+      losses.push(L);
+    }
+    buildAttention();
+  }
+  function buildAttention() {
+    var rng = mulberry32(BASE_SEED + 31337 + attSalt * 104729 + seedSalt * 7919);
+    nodes = [];
+    var n = PHONE ? 11 : 15;
+    for (var i = 0; i < n; i++) {
+      nodes.push({
+        bx: 0.06 + rng() * 0.88, by: 0.08 + rng() * 0.84,
+        ax: 0.015 + rng() * 0.035, ay: 0.02 + rng() * 0.05,
+        w1: 0.05 + rng() * 0.09, w2: 0.04 + rng() * 0.08,
+        p1: rng() * Math.PI * 2, p2: rng() * Math.PI * 2,
+        r: 1.1 + rng() * 1.1
+      });
+    }
+    pairSeed = [];
+    for (var a = 0; a < n; a++) { pairSeed.push([]); for (var b = 0; b < n; b++) pairSeed[a].push(rng()); }
+  }
+
+  // ---------- interaction state (recorded events; state is a function of them and t) ----------
+  var dragging = false, dragStartX = 0, dragStartY = 0, dragCurX = 0, dragCurY = 0;
+  var dragBaseX = 0, dragBaseY = 0, relX = 0, relY = 0, relT = -1000;
+  var downT = 0, downX = 0, downY = 0, lastTapT = -1000;
+  var nowT = T0;
+
+  function latentOffset(t) {
+    if (dragging) return [dragBaseX + (dragCurX - dragStartX), dragBaseY + (dragCurY - dragStartY)];
+    var d = Math.exp(-(t - relT) / 5);
+    return [relX * d, relY * d];
+  }
+
+  // ---------- audio (lazy, gesture-born, fully guarded) ----------
+  var AC = null, droneOsc = null, droneOsc2 = null, droneGain = null, descOsc = null;
+  function ensureAudio() {
+    if (AC) { if (AC.resume) { try { AC.resume(); } catch (e) {} } return; }
+    var Ctor = null;
+    if (typeof AudioContext !== 'undefined') Ctor = AudioContext;
+    else if (typeof window !== 'undefined' && window.webkitAudioContext) Ctor = window.webkitAudioContext;
+    if (!Ctor) return;
+    try {
+      AC = new Ctor();
+      var master = AC.createGain(); master.gain.value = 0.16; master.connect(AC.destination);
+      droneGain = AC.createGain(); droneGain.gain.value = 0.035;
+      var lp = AC.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 420;
+      droneOsc = AC.createOscillator(); droneOsc.type = 'sine'; droneOsc.frequency.value = 52;
+      droneOsc2 = AC.createOscillator(); droneOsc2.type = 'triangle'; droneOsc2.frequency.value = 78.5;
+      var g2 = AC.createGain(); g2.gain.value = 0.4;
+      droneOsc.connect(lp); droneOsc2.connect(g2); g2.connect(lp);
+      lp.connect(droneGain); droneGain.connect(master);
+      droneOsc.start(); droneOsc2.start();
+      descOsc = AC.createOscillator(); descOsc.type = 'sine'; descOsc.frequency.value = 190;
+      var dg = AC.createGain(); dg.gain.value = 0.012;
+      descOsc.connect(dg); dg.connect(master); descOsc.start();
+      var nb = AC.createBuffer(1, AC.sampleRate, AC.sampleRate);
+      var ch = nb.getChannelData(0);
+      var lr = mulberry32(555);
+      for (var i = 0; i < ch.length; i++) ch[i] = lr() * 2 - 1;
+      var src = AC.createBufferSource(); src.buffer = nb; src.loop = true;
+      var bp = AC.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 5200; bp.Q.value = 0.8;
+      var sg = AC.createGain(); sg.gain.value = 0.008;
+      src.connect(bp); bp.connect(sg); sg.connect(master); src.start();
+    } catch (e) { AC = null; }
+  }
+  var PENTA = [523.25, 587.33, 659.25, 783.99, 880.0, 1046.5];
+  function chime(idx) {
+    if (!AC) return;
+    try {
+      var o = AC.createOscillator(), g = AC.createGain();
+      o.type = 'triangle'; o.frequency.value = PENTA[idx % PENTA.length];
+      var t = AC.currentTime;
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(0.05, t + 0.015);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.7);
+      o.connect(g); g.connect(AC.destination);
+      o.start(t); o.stop(t + 0.75);
+    } catch (e) {}
+  }
+
+  // ---------- pointer ----------
+  function pieceTime() { return nowT; }
+  function onDown(x, y) {
+    ensureAudio();
+    dragging = true; dragStartX = dragCurX = x; dragStartY = dragCurY = y;
+    var o = latentOffset(pieceTime()); dragBaseX = o[0]; dragBaseY = o[1];
+    downT = pieceTime(); downX = x; downY = y;
+  }
+  function onMove(x, y) { if (dragging) { dragCurX = x; dragCurY = y; } }
+  function onUp(x, y) {
+    if (!dragging) return;
+    dragging = false;
+    var o = latentOffset(pieceTime()); relX = o[0]; relY = o[1]; relT = pieceTime();
+    var t = pieceTime();
+    var moved = Math.abs(x - downX) + Math.abs(y - downY);
+    if (moved < 8 && t - downT < 0.6) {
+      if (t - lastTapT < 0.38) {
+        seedSalt++; epoch = t; attEpoch = t; buildModel();
+        relX = 0; relY = 0;
+        lastTapT = -1000;
+      } else {
+        var cx = W / 2, cy = H / 2, cs = Math.min(W, H) * 0.085;
+        if (Math.abs(x - cx) < cs * 2.4 && Math.abs(y - cy) < cs * 2.4) { attSalt++; attEpoch = t; buildAttention(); }
+        lastTapT = t;
+      }
+    }
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', function (e) { onDown(e.clientX, e.clientY); });
+    canvas.addEventListener('pointermove', function (e) { onMove(e.clientX, e.clientY); });
+    canvas.addEventListener('pointerup', function (e) { onUp(e.clientX, e.clientY); });
+    canvas.addEventListener('pointercancel', function () { dragging = false; });
+  }
+
+  // ---------- drawing ----------
+  function drawDataWall(t) {
+    var m = Math.min(W, H);
+    var cs = clamp(m / 44, 8, 16);
+    ctx.fillStyle = WALL;
+    ctx.fillRect(0, 0, W, cs); ctx.fillRect(0, H - cs, W, cs);
+    ctx.fillRect(0, 0, cs, H); ctx.fillRect(W - cs, 0, cs, H);
+    var nx = Math.ceil(W / cs), ny = Math.ceil(H / cs);
+    var i, j, cellT = Math.floor(t * 0.8);
+    for (i = 0; i < nx; i++) {
+      for (j = 0; j < 2; j++) { wallCell(i, j * (ny - 1), cs, cellT); }
+    }
+    for (j = 1; j < ny - 1; j++) {
+      wallCell(0, j, cs, cellT); wallCell(nx - 1, j, cs, cellT);
+    }
+  }
+  function wallCell(i, j, cs, cellT) {
+    var h1 = ihash(i * 3 + 11, j * 7 + 5);
+    if (h1 > 0.55) {
+      var x = i * cs, y = j * cs;
+      ctx.fillStyle = 'rgba(26,29,38,0.9)';
+      ctx.fillRect(x + 1, y + 1, cs - 2, cs - 2);
+    }
+    if (h1 > 0.68) {
+      var shim = 0.5 + 0.5 * Math.sin(cellT * 1.7 + h1 * 43.0);
+      var a = 0.05 + 0.16 * shim * h1;
+      ctx.fillStyle = rgb(TRAIL, a);
+      var mw = 2 + h1 * (cs - 5);
+      ctx.fillRect(i * cs + 2, j * cs + cs * 0.38, mw, 1.4);
+    }
+  }
+
+  function nodePos(nd, lt, rx, ry, rw, rh) {
+    var x = rx + (nd.bx + nd.ax * Math.sin(nd.w1 * lt + nd.p1)) * rw;
+    var y = ry + (nd.by + nd.ay * Math.cos(nd.w2 * lt + nd.p2)) * rh;
+    return [x, y];
+  }
+  var prevEdges = {};
+  function drawAttention(lt, rx, ry, rw, rh, live) {
+    var pos = [], i, j;
+    for (i = 0; i < nodes.length; i++) pos.push(nodePos(nodes[i], lt, rx, ry, rw, rh));
+    var thr = Math.min(rw, rh) * 0.85;
+    var cur = {};
+    for (i = 0; i < nodes.length; i++) {
+      for (j = i + 1; j < nodes.length; j++) {
+        var dx = pos[i][0] - pos[j][0], dy = pos[i][1] - pos[j][1];
+        var d = Math.sqrt(dx * dx + dy * dy);
+        if (d > thr) continue;
+        var sd = pairSeed[i][j];
+        var P = 17 + sd * 18;
+        var ph = ((lt * (0.7 + sd * 0.6) + sd * 37) % P) / P;
+        if (ph > 0.42) continue;
+        var env = Math.sin(Math.PI * ph / 0.42);
+        var a = 0.30 * env * (1 - d / thr);
+        if (a <= 0.004) continue;
+        ctx.strokeStyle = rgb(TRAIL, a);
+        ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(pos[i][0], pos[i][1]); ctx.lineTo(pos[j][0], pos[j][1]); ctx.stroke();
+        if (live) { var key = i + '-' + j; cur[key] = 1; if (!prevEdges[key]) chime(i + j); }
+      }
+    }
+    if (live) prevEdges = cur;
+    for (i = 0; i < nodes.length; i++) {
+      var p = pos[i], r = nodes[i].r;
+      ctx.fillStyle = rgb([255, 255, 255], 0.05); ctx.beginPath(); ctx.arc(p[0], p[1], r * 6.2, 0, 6.2832); ctx.fill();
+      ctx.fillStyle = rgb([255, 255, 255], 0.10); ctx.beginPath(); ctx.arc(p[0], p[1], r * 3.4, 0, 6.2832); ctx.fill();
+      ctx.fillStyle = rgb([255, 255, 255], 0.20); ctx.beginPath(); ctx.arc(p[0], p[1], r * 1.9, 0, 6.2832); ctx.fill();
+      ctx.fillStyle = 'rgba(255,255,255,0.95)'; ctx.beginPath(); ctx.arc(p[0], p[1], r, 0, 6.2832); ctx.fill();
+    }
+  }
+
+  function fieldColor(v) {
+    var c;
+    if (v < 0.5) { var u = v * 2; c = [lerp(BLUE[0], GREEN[0], u), lerp(BLUE[1], GREEN[1], u), lerp(BLUE[2], GREEN[2], u)]; }
+    else { var u2 = (v - 0.5) * 2; c = [lerp(GREEN[0], ROSE[0], u2), lerp(GREEN[1], ROSE[1], u2), lerp(GREEN[2], ROSE[2], u2)]; }
+    var b = 0.6 + 0.5 * v;
+    return 'rgb(' + Math.round(c[0] * b) + ',' + Math.round(c[1] * b) + ',' + Math.round(c[2] * b) + ')';
+  }
+  function drawLatent(te, rx, ry, rw, rh, off) {
+    var cols = PHONE ? 34 : 48;
+    var rows = Math.max(10, Math.round(cols * rh / rw));
+    var cw = rw / cols, ch = rh / rows;
+    var ox = (off[0] / Math.max(1, rw)) * 0.7, oy = (off[1] / Math.max(1, rh)) * 0.7;
+    for (var j = 0; j < rows; j++) {
+      for (var i = 0; i < cols; i++) {
+        var xn = (i + 0.5) / cols, yn = (j + 0.5) / rows;
+        var a = fieldVal(fieldA, xn + ox, yn + oy);
+        var b = fieldVal(fieldB, xn - ox * 0.6, yn - oy * 0.6);
+        var mm = 0.5 + 0.28 * Math.sin(0.11 * te + 2.3 * xn - 1.8 * yn + 0.9 * Math.sin(0.07 * te + 3.1 * yn));
+        mm = clamp(mm, 0.22, 0.78);
+        var v = a * (1 - mm) + b * mm;
+        ctx.fillStyle = fieldColor(v);
+        ctx.fillRect(rx + i * cw + 0.5, ry + j * ch + 0.5, cw - 1, ch - 1);
+      }
+    }
+  }
+
+  function drawLosses(te, rx, ry, rw, rh) {
+    var SEG = 90;
+    for (var k = 0; k < losses.length; k++) {
+      var L = losses[k];
+      var p = ((te + L.off) % 46) / 46;
+      var drawU = p < 0.8 ? p / 0.8 : 1;
+      ctx.strokeStyle = 'rgba(255,255,255,' + L.alpha.toFixed(3) + ')';
+      ctx.lineWidth = 1.1;
+      ctx.beginPath();
+      var upto = Math.floor(SEG * drawU), i, u, v, y;
+      for (i = 0; i <= upto; i++) {
+        u = i / SEG;
+        v = Math.exp(-L.decay * u);
+        for (var s = 0; s < L.steps.length; s++) if (u > L.steps[s].u) v *= (1 - L.steps[s].drop);
+        y = ry + (1 - v) * rh;
+        if (i === 0) ctx.moveTo(rx + u * rw, y); else ctx.lineTo(rx + u * rw, y);
+      }
+      ctx.stroke();
+      if (drawU > 0 && drawU < 1) {
+        u = drawU; v = Math.exp(-L.decay * u);
+        for (var s2 = 0; s2 < L.steps.length; s2++) if (u > L.steps[s2].u) v *= (1 - L.steps[s2].drop);
+        ctx.fillStyle = 'rgba(255,255,255,0.9)';
+        ctx.beginPath(); ctx.arc(rx + u * rw, ry + (1 - v) * rh, 1.6, 0, 6.2832); ctx.fill();
+      }
+    }
+  }
+
+  function drawCube(te, cx, cy) {
+    var s = Math.min(W, H) * 0.085;
+    var ax = 0.6 + te * 0.09, ay = te * 0.13;
+    var ca = Math.cos(ax), sa = Math.sin(ax), cb = Math.cos(ay), sb = Math.sin(ay);
+    var pts = [], i;
+    for (i = 0; i < 8; i++) {
+      var x = (i & 1) ? 1 : -1, y = (i & 2) ? 1 : -1, z = (i & 4) ? 1 : -1;
+      var y1 = y * ca - z * sa, z1 = y * sa + z * ca;
+      var x2 = x * cb + z1 * sb, z2 = -x * sb + z1 * cb;
+      var f = 3.4 / (3.4 + z2);
+      pts.push([cx + x2 * s * f, cy + y1 * s * f]);
+    }
+    var E = [[0,1],[1,3],[3,2],[2,0],[4,5],[5,7],[7,6],[6,4],[0,4],[1,5],[2,6],[3,7]];
+    ctx.strokeStyle = CUBE; ctx.lineWidth = 1.3; ctx.globalAlpha = 0.95;
+    ctx.beginPath();
+    for (i = 0; i < E.length; i++) { ctx.moveTo(pts[E[i][0]][0], pts[E[i][0]][1]); ctx.lineTo(pts[E[i][1]][0], pts[E[i][1]][1]); }
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  function draw(t, live) {
+    nowT = t;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = ROOM;
+    ctx.fillRect(0, 0, W, H);
+
+    var m = Math.min(W, H);
+    var bw = clamp(m / 44, 8, 16);
+    var ix = bw, iy = bw, iw = W - 2 * bw, ih = H - 2 * bw;
+    var te = t - epoch, at = t - attEpoch;
+    var off = latentOffset(t);
+
+    drawLatent(te, ix + iw * 0.02, iy + ih * 0.27, iw * 0.96, ih * 0.48, off);
+    drawAttention(at, ix + iw * 0.03, iy + ih * 0.015, iw * 0.94, ih * 0.27, live);
+    drawLosses(te, ix + iw * 0.03, iy + ih * 0.815, iw * 0.94, ih * 0.155);
+    drawCube(te, W / 2, H / 2);
+    drawDataWall(t);
+
+    if (AC && droneOsc) {
+      try {
+        var mr = 0.5 + 0.5 * Math.sin(te * 0.11);
+        droneOsc.frequency.value = 46 + 20 * mr;
+        droneOsc2.frequency.value = (46 + 20 * mr) * 1.5 + 2;
+        descOsc.frequency.value = 200 - 90 * (((te % 46) / 46));
+      } catch (e) {}
+    }
+  }
+
+  // ---------- boot ----------
+  measure();
+  buildModel();
+  draw(T0, false);
+
+  if (typeof window !== 'undefined') {
+    var onR = function () { measure(); draw(nowT, false); };
+    if (window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', onR);
+    if (window.addEventListener) window.addEventListener('resize', onR);
+  }
+
+  if (typeof requestAnimationFrame === 'function') {
+    var startStamp = null, frames = 0;
+    var loop = function (stamp) {
+      if (startStamp === null) startStamp = (typeof stamp === 'number') ? stamp : 0;
+      frames++;
+      var elapsed;
+      if (typeof stamp === 'number') elapsed = (stamp - startStamp) / 1000;
+      else elapsed = frames / 60;
+      draw(T0 + elapsed, true);
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
