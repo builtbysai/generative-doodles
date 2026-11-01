@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GlitcHorses</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #1A0B2E; overflow: hidden; height: 100%; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- deterministic hashes (seeded only; no Math.random) ----------
+  function h2(a, b) {
+    var x = ((a * 374761393 + b * 668265263) ^ 0x5bf03635) >>> 0;
+    x = Math.imul(x ^ (x >>> 13), 1274126177) >>> 0;
+    return ((x ^ (x >>> 16)) >>> 0) / 4294967296;
+  }
+  function mulberry32(seed) {
+    var s = seed >>> 0;
+    return function () {
+      s = (s + 0x6D2B79F5) >>> 0;
+      var t = s;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+
+  // ---------- constants ----------
+  var T0 = 20.8;               // fixed first frame: mid-burst (burst window [20, 21.6])
+  var BURST_EVERY = 20;        // a glitch burst every 20 s
+  var BURST_LEN = 1.6;         // burst duration (<= 2 s)
+  var RING_SPEED = 260;        // shockwave px/s
+  var RING_LIFE = 1.2;
+
+  var COL = {
+    sky: '#1A0B2E', fireEdge: '#FF7A00', fireMid: '#FFE45C', fireCore: '#FFFFFF',
+    horse: '#0D0D0F', ground: '#0D0D0F',
+    neuRed: '#FF2B4E', neuPink: '#FF7AD9',
+    ghostMag: '#FF2BD1', ghostCyan: '#00E5FF'
+  };
+
+  // ---------- horse glyph (local units: x 0 tail -> 100 nose, y 0 top -> 70 ground) ----------
+  // One bold galloping profile. The body is a single closed polygon so it can
+  // serve as the clip region for the neural pattern.
+  var BODY = [
+    [106, 21.5], [102, 12], [96, 7.5], [93.5, 4], [91, 8], [88, 9.5], // long face, small ear, low poll
+    [80, 13], [73, 15], [65, 14], [52, 12.5], [40, 13], [31, 14.5],   // crest, withers, back, croup
+    [25, 13], [13, 8], [5, 13], [9, 25], [17, 28], [24, 25],          // tail streaming back and down
+    [23, 32], [27, 38], [36, 39.5], [52, 40.5], [66, 38.5],           // rump, belly
+    [75, 34], [81, 29], [86, 25.5], [91, 23], [97, 22.5], [101, 22]   // chest, throat, jaw, muzzle
+  ];
+  var HOOF_Y = 66;             // local y of the ground line
+  // leg pivots: front (shoulder), hind (hip); near + far
+  var PIV = { fn: [76, 33], ff: [73, 32], hn: [31, 34], hf: [33, 33] };
+  var LEG_LEN = [16, 15];      // upper, lower
+  // 4-frame gallop cycle: [frontNear, frontFar, hindNear, hindFar] as [upperDeg, lowerDeg]
+  // 0 deg = straight down, + = swung toward the head.
+  var FRAMES = [
+    { fn: [52, 20],  ff: [44, 12],  hn: [-52, -18], hf: [-44, -26], bob: 0 },    // extension / flying
+    { fn: [18, -30], ff: [26, -48], hn: [-18, 25],  hf: [-8, 40],   bob: 2.5 },  // landing / gather
+    { fn: [-28, -8], ff: [-18, -2], hn: [20, -30],  hf: [28, -18],  bob: 1.2 },  // push
+    { fn: [34, -78], ff: [42, -65], hn: [-28, 62],  hf: [-18, 74],  bob: -2.2 }  // folded / suspension
+  ];
+
+  function legPoints(piv, upperDeg, lowerDeg) {
+    var a1 = upperDeg * Math.PI / 180, a2 = lowerDeg * Math.PI / 180;
+    var d1x = Math.sin(a1), d1y = Math.cos(a1);
+    var d2x = Math.sin(a2), d2y = Math.cos(a2);
+    var kx = piv[0] + d1x * LEG_LEN[0], ky = piv[1] + d1y * LEG_LEN[0];
+    var hx = kx + d2x * LEG_LEN[1], hy = ky + d2y * LEG_LEN[1];
+    var p1x = d1y, p1y = -d1x;             // perpendicular of upper segment
+    var p2x = d2y, p2y = -d2x;             // perpendicular of lower segment
+    var w0 = 3.4, w1 = 2.0, w2 = 1.1;      // half-widths: thigh, cannon, hoof
+    return [
+      [piv[0] + p1x * w0, piv[1] + p1y * w0],
+      [kx + p2x * w1, ky + p2y * w1],
+      [hx + p2x * w2 + d2x * 1.6, hy + p2y * w2 + d2y * 1.6],
+      [hx - p2x * w2 + d2x * 1.6, hy - p2y * w2 + d2y * 1.6],
+      [kx - p2x * w1, ky - p2y * w1],
+      [piv[0] - p1x * w0, piv[1] - p1y * w0]
+    ];
+  }
+
+  function pointInPoly(px, py, poly) {
+    var inside = false;
+    for (var i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+      var xi = poly[i][0], yi = poly[i][1], xj = poly[j][0], yj = poly[j][1];
+      if (((yi > py) !== (yj > py)) && (px < (xj - xi) * (py - yi) / (yj - yi) + xi)) inside = !inside;
+    }
+    return inside;
+  }
+
+  // neural node graph in horse-local coords, rejection-sampled inside BODY
+  function buildGraph(seed) {
+    var rnd = mulberry32(seed);
+    var nodes = [], tries = 0;
+    while (nodes.length < 26 && tries < 600) {
+      tries++;
+      var x = 22 + rnd() * 80, y = 5 + rnd() * 36;
+      if (pointInPoly(x, y, BODY)) nodes.push({ x: x, y: y });
+    }
+    var edges = [];
+    for (var i = 0; i < nodes.length; i++) {
+      for (var k = i + 1; k < nodes.length; k++) {
+        var dx = nodes[i].x - nodes[k].x, dy = nodes[i].y - nodes[k].y;
+        if (dx * dx + dy * dy < 24 * 24) edges.push([i, k]);
+      }
+    }
+    return { nodes: nodes, edges: edges };
+  }
+
+  // ---------- gallop clock: freezes during bursts ----------
+  // burst windows: [20 + 20k, 21.6 + 20k] for k >= 0
+  function burstOverlap(t) {
+    var total = 0;
+    for (var s = BURST_EVERY; s - BURST_LEN < t; s += BURST_EVERY) {
+      var a = Math.max(s, 0), b = Math.min(s + BURST_LEN, t);
+      if (b > a) total += b - a;
+      if (s > t) break;
+    }
+    return total;
+  }
+  function gallopTime(t) { return t - burstOverlap(t); }
+  function burstActive(t) {
+    if (t < BURST_EVERY) return null;
+    var lt = (t - BURST_EVERY) % BURST_EVERY;
+    return lt < BURST_LEN ? { start: t - lt, lt: lt } : null;
+  }
+
+  // ---------- horses ----------
+  var HORSES = [
+    { lenFrac: 0.25, period: 15, phase: 0.154, frameOff: 2, graph: buildGraph(119502) }, // foal, behind
+    { lenFrac: 0.35, period: 12, phase: 0.586, frameOff: 0, graph: buildGraph(119501) }  // mare, front
+  ];
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('cv');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0, DPR = 1;
+
+  var isPhone = false;
+  if (typeof window !== 'undefined' && window.screen) {
+    isPhone = Math.min(window.screen.width || 9999, window.screen.height || 9999) < 700;
+  }
+  function fit() {
+    var vv = (typeof window !== 'undefined') ? window.visualViewport : null;
+    var w = vv ? vv.width : (window.innerWidth || 1280);
+    var h = vv ? vv.height : (window.innerHeight || 800);
+    if (!isPhone && h > w * 1.15) isPhone = true; // aspect fallback
+    DPR = Math.min((typeof window !== 'undefined' && window.devicePixelRatio) || 1, 2);
+    W = w; H = h;
+    canvas.width = Math.round(w * DPR);
+    canvas.height = Math.round(h * DPR);
+    canvas.style.width = w + 'px';
+    canvas.style.height = h + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  }
+  fit();
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', function () { fit(); draw(currentT()); });
+    }
+    window.addEventListener('resize', function () { fit(); draw(currentT()); });
+  }
+
+  function pieceNow() { return T0 + (performance.now() - startStamp) / 1000; }
+  var startStamp = (typeof performance !== 'undefined') ? performance.now() : 0;
+  function currentT() { return pieceNow(); }
+
+  // ---------- shockwave rings (recorded pointer events; closed-form) ----------
+  var rings = []; // {x, y, t}
+  var pointerDown = false, lastRingT = -10;
+  function addRing(x, y) {
+    var t = pieceNow();
+    if (t - lastRingT < 0.12) return;
+    lastRingT = t;
+    rings.push({ x: x, y: y, t: t });
+    if (rings.length > 24) rings.shift();
+  }
+  if (typeof window !== 'undefined' && canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', function (ev) { pointerDown = true; addRing(ev.clientX, ev.clientY); });
+    canvas.addEventListener('pointermove', function (ev) { if (pointerDown) addRing(ev.clientX, ev.clientY); });
+    function endP() { pointerDown = false; }
+    canvas.addEventListener('pointerup', endP);
+    canvas.addEventListener('pointercancel', endP);
+    canvas.addEventListener('pointerleave', endP);
+  }
+  function ringBoost(sx, sy, t) {
+    var boost = 0;
+    for (var i = 0; i < rings.length; i++) {
+      var age = t - rings[i].t;
+      if (age < 0 || age > RING_LIFE) continue;
+      var dx = sx - rings[i].x, dy = sy - rings[i].y;
+      var d = Math.sqrt(dx * dx + dy * dy);
+      var off = Math.abs(d - age * RING_SPEED);
+      if (off < 20) boost += 1.5 * (1 - off / 20) * (1 - age / RING_LIFE);
+    }
+    return boost;
+  }
+
+  // ---------- drawing ----------
+  function bodyPath(ox, oy, sc) {
+    ctx.beginPath();
+    for (var i = 0; i < BODY.length; i++) {
+      var x = ox + BODY[i][0] * sc, y = oy + BODY[i][1] * sc;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+  }
+  function polyPath(pts, ox, oy, sc) {
+    ctx.beginPath();
+    for (var i = 0; i < pts.length; i++) {
+      var x = ox + pts[i][0] * sc, y = oy + pts[i][1] * sc;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+  }
+
+  // horse placement at gallop time gt
+  function horsePose(horse, gt) {
+    var len = horse.lenFrac * W;
+    var sc = len / 100;
+    var frac = ((gt / horse.period) + horse.phase) % 1;
+    if (frac < 0) frac += 1;
+    var x = -len + frac * (W + 2 * len);
+    var frame = Math.floor(gt * 6 + horse.frameOff) % 4;
+    if (frame < 0) frame += 4;
+    var groundY = 0.80 * H;
+    var oy = groundY - HOOF_Y * sc + FRAMES[frame].bob * sc;
+    return { x: x, oy: oy, sc: sc, len: len, frame: frame };
+  }
+
+  function drawSilhouette(horse, pose, fill) {
+    var f = FRAMES[pose.frame];
+    ctx.fillStyle = fill;
+    // far legs, near legs, then body over the leg tops
+    polyPath(legPoints(PIV.ff, f.ff[0], f.ff[1]), pose.x, pose.oy, pose.sc); ctx.fill();
+    polyPath(legPoints(PIV.hf, f.hf[0], f.hf[1]), pose.x, pose.oy, pose.sc); ctx.fill();
+    polyPath(legPoints(PIV.fn, f.fn[0], f.fn[1]), pose.x, pose.oy, pose.sc); ctx.fill();
+    polyPath(legPoints(PIV.hn, f.hn[0], f.hn[1]), pose.x, pose.oy, pose.sc); ctx.fill();
+    bodyPath(pose.x, pose.oy, pose.sc); ctx.fill();
+  }
+
+  function drawNeural(horse, pose, gt, t) {
+    ctx.save();
+    bodyPath(pose.x, pose.oy, pose.sc);
+    ctx.clip();
+    var g = horse.graph, i, a, b;
+    var bright = [];
+    for (i = 0; i < g.nodes.length; i++) {
+      var n = g.nodes[i];
+      var ph = (gt * 0.9 - n.x / 115) % 1; if (ph < 0) ph += 1;
+      var wave = 0.5 + 0.5 * Math.sin(ph * Math.PI * 2);
+      var br = 0.16 + 0.84 * Math.pow(wave, 3);
+      var sx = pose.x + n.x * pose.sc, sy = pose.oy + n.y * pose.sc;
+      br += ringBoost(sx, sy, t);
+      bright.push(Math.min(br, 1.6));
+    }
+    ctx.lineWidth = Math.max(1, 0.55 * pose.sc);
+    for (i = 0; i < g.edges.length; i++) {
+      a = g.nodes[g.edges[i][0]]; b = g.nodes[g.edges[i][1]];
+      var eb = (bright[g.edges[i][0]] + bright[g.edges[i][1]]) / 2;
+      ctx.strokeStyle = COL.neuRed;
+      ctx.globalAlpha = clamp(eb, 0, 1) * 0.75;
+      ctx.beginPath();
+      ctx.moveTo(pose.x + a.x * pose.sc, pose.oy + a.y * pose.sc);
+      ctx.lineTo(pose.x + b.x * pose.sc, pose.oy + b.y * pose.sc);
+      ctx.stroke();
+    }
+    for (i = 0; i < g.nodes.length; i++) {
+      var nd = g.nodes[i];
+      var r = (1.1 + 2.1 * Math.min(bright[i], 1)) * pose.sc * 0.62;
+      ctx.globalAlpha = clamp(0.35 + bright[i] * 0.65, 0, 1);
+      ctx.fillStyle = bright[i] > 0.62 ? COL.neuPink : COL.neuRed;
+      ctx.beginPath();
+      ctx.arc(pose.x + nd.x * pose.sc, pose.oy + nd.y * pose.sc, r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
+  function drawHorse(horse, gt, t, sliced, burst) {
+    var pose = horsePose(horse, gt);
+    if (!sliced) {
+      drawSilhouette(horse, pose, COL.horse);
+      drawNeural(horse, pose, gt, t);
+      return;
+    }
+    // burst: redraw in 12 horizontal slices, each shifted by a hashed offset
+    var step = Math.floor(burst.lt / 0.09);
+    var top = pose.oy - 2, height = 72 * pose.sc + 4;
+    var sliceH = height / 12;
+    for (var s = 0; s < 12; s++) {
+      var off = (h2(s * 7 + 1, step * 13 + 5) - 0.5) * 14;
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(-30, top + s * sliceH, W + 60, sliceH + 0.6);
+      ctx.clip();
+      ctx.translate(off, 0);
+      drawSilhouette(horse, pose, COL.horse);
+      drawNeural(horse, pose, gt, t);
+      ctx.restore();
+    }
+    // sweeping white scan lines over the horse's box
+    ctx.fillStyle = '#FFFFFF';
+    for (var i = 0; i < 6; i++) {
+      var fr = (burst.lt * 0.85 + i * 0.17) % 1.15;
+      if (fr > 1) continue;
+      ctx.globalAlpha = 0.4;
+      ctx.fillRect(pose.x - 8, top + fr * height, pose.len + 16, 1.4);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function draw(t) {
+    canvas.style.width = W + 'px';   // pin CSS size in draw()
+    canvas.style.height = H + 'px';
+    var gt = gallopTime(t);
+    var burst = burstActive(t);
+
+    // ---- explosion field: flat concentric ellipses, slow pulse ----
+    var S = Math.max(W, H);
+    var pulse = 1 + 0.02 * Math.sin(t * 0.5);
+    var cx = 0.42 * W, cy = 0.62 * H;
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = COL.sky;
+    ctx.fillRect(0, 0, W, H);
+    var layers = [
+      [COL.fireEdge, 0.62, 0.52],
+      [COL.fireMid, 0.42, 0.35],
+      [COL.fireCore, 0.22, 0.18]
+    ];
+    for (var i = 0; i < layers.length; i++) {
+      ctx.fillStyle = layers[i][0];
+      ctx.beginPath();
+      ctx.ellipse(cx, cy, layers[i][1] * S * pulse, layers[i][2] * S * pulse, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // ---- ground strip ----
+    var groundY = 0.80 * H;
+    ctx.fillStyle = COL.ground;
+    ctx.fillRect(0, groundY, W, H - groundY);
+    ctx.globalAlpha = 0.18;           // firelight on the ground line
+    ctx.fillStyle = COL.fireEdge;
+    ctx.fillRect(0, groundY, W, 3);
+    ctx.globalAlpha = 1;
+
+    // ---- horses (foal behind, mare front) ----
+    if (burst) {
+      for (var gi = 0; gi < HORSES.length; gi++) {
+        var pose = horsePose(HORSES[gi], gt);
+        ctx.globalAlpha = 0.55;
+        ctx.save(); ctx.translate(-6, 0); drawSilhouette(HORSES[gi], pose, COL.ghostMag); ctx.restore();
+        ctx.save(); ctx.translate(6, 0); drawSilhouette(HORSES[gi], pose, COL.ghostCyan); ctx.restore();
+        ctx.globalAlpha = 1;
+      }
+    }
+    for (var hi = 0; hi < HORSES.length; hi++) {
+      drawHorse(HORSES[hi], gt, t, !!burst, burst);
+    }
+
+    // ---- shockwave rings ----
+    for (var ri = 0; ri < rings.length; ri++) {
+      var age = t - rings[ri].t;
+      if (age < 0 || age > RING_LIFE) continue;
+      ctx.globalAlpha = 0.28 * (1 - age / RING_LIFE);
+      ctx.strokeStyle = '#FFFFFF';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(rings[ri].x + age * RING_SPEED, rings[ri].y);
+      ctx.arc(rings[ri].x, rings[ri].y, age * RING_SPEED, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- run ----------
+  draw(T0); // synchronous fixed-phase first frame
+  if (typeof requestAnimationFrame === 'function') {
+    var loopFn = function () {
+      draw(pieceNow());
+      requestAnimationFrame(loopFn);
+    };
+    requestAnimationFrame(loopFn);
+  }
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Snowrainbow Television</title>
+<style>
+  html, body { margin:0; padding:0; background:#050505; height:100%; overflow:hidden; }
+  canvas { display:block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function(){
+'use strict';
+
+// ---------- Snowrainbow Television — joncates study JC1 ----------
+// A dead channel, after SNOWRAINBOW TELEVISION (2023). The field is
+// full-frame analog snow, but the snow is not white noise: a coarse
+// tile field (no per-pixel buffer, every tile a seeded hash of its
+// coordinates and the current noise step) is tinted by six horizontal
+// rainbow bands that drift vertically through it — one full band cycle
+// per 75 s loop, the drift an integer number of band rows so the seam
+// never shows. Over the bottom third, western-horizon silhouettes (a
+// rider, fence posts, a water tower) sit as dark cutouts, drawn late
+// and then half-buried under a second sparse snow pass: a broadcast
+// leaking through, never resolved. Every 9–14 s (hashed, never
+// regular) a tear-line event splits the field horizontally for 0.45 s
+// and the silhouette layer separates into red/blue ghosts.
+// Dragging is an antenna: the finger leaves decaying samples, and
+// where their resolution field is strong the tiles go flat and the
+// silhouettes draw crisp — the horizon momentarily tunes in, then
+// collapses back into snow as the samples decay. The viewer tunes,
+// never controls. No frame, no digits, no sound.
+
+var LOOP = 75;          // seconds per loop
+var T0 = 12;            // fixed first-frame phase (no tear active, probed)
+var SEED = 1192001;
+
+var CRT = '#050505';
+var SNOW = [232, 232, 232];
+var BANDS = [
+  [255, 0, 60],     // #FF003C
+  [255, 122, 0],    // #FF7A00
+  [255, 230, 0],    // #FFE600
+  [0, 230, 118],    // #00E676
+  [0, 176, 255],    // #00B0FF
+  [124, 77, 255]    // #7C4DFF
+];
+var BANDROWS = 13;      // band rows per field height (drift = 13 rows/loop)
+var GREEN = [51, 255, 102];   // #33FF66 phosphor flecks
+var SKYFLAT = [128, 122, 134];  // resolved-sky tone inside the ghost
+var GNDFLAT = [44, 40, 46];     // resolved-ground tone inside the ghost
+var HORIZON = 0.72;           // ground line, fraction of H
+
+// ---------- seeded hashes / rng ----------
+function hash3(x, y, z){
+  var h = Math.imul(x + 1, 374761393) ^ Math.imul(y + 1, 668265263) ^ Math.imul(z + 1, 1442695041);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+function mulberry32(a){
+  return function(){
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    var t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+function clamp01(v){ return v < 0 ? 0 : (v > 1 ? 1 : v); }
+function smooth(a, b, v){
+  var x = clamp01((v - a) / (b - a));
+  return x * x * (3 - 2 * x);
+}
+function mix3(a, b, k){
+  return [a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k, a[2] + (b[2] - a[2]) * k];
+}
+function css(c){
+  return 'rgb(' + (c[0] | 0) + ',' + (c[1] | 0) + ',' + (c[2] | 0) + ')';
+}
+
+// ---------- tear schedule (per loop, hashed gaps 9–14 s) ----------
+function tearEvents(loopIndex){
+  var rng = mulberry32(SEED + loopIndex * 7919);
+  var evs = [];
+  var start = 9 + 5 * rng();
+  while (start < LOOP - 1){
+    evs.push({ start: start, tear: 0.25 + 0.45 * rng(), dur: 0.45 });
+    start += 9 + 5 * rng();
+  }
+  return evs;
+}
+function tearAt(lt, loopIndex){
+  var evs = tearEvents(loopIndex);
+  for (var i = 0; i < evs.length; i++){
+    var e = evs[i];
+    if (lt >= e.start && lt < e.start + e.dur){
+      var age = (lt - e.start) / e.dur;
+      return { env: Math.sin(Math.PI * age), tear: e.tear };
+    }
+  }
+  return null;
+}
+
+// ---------- antenna ghost (recorded drag samples) ----------
+var samples = [];   // {x, y, t} in piece time, cap 40
+function resolution(x, y, t){
+  var best = 0;
+  for (var i = 0; i < samples.length; i++){
+    var s = samples[i];
+    var dt = t - s.t;
+    if (dt < 0) continue;
+    var dx = x - s.x, dy = y - s.y;
+    var d = Math.sqrt(dx * dx + dy * dy);
+    var v = Math.exp(-d / 90) * Math.exp(-dt / 1.8);
+    if (v > best) best = v;
+  }
+  return best;
+}
+
+// ---------- view / canvas ----------
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var W = 0, H = 0, lastT = T0;
+
+function viewW(){
+  var vv = (typeof window !== 'undefined' && window.visualViewport) ? window.visualViewport : null;
+  if (vv && vv.width) return vv.width;
+  return window.innerWidth || 800;
+}
+function viewH(){
+  var vv = (typeof window !== 'undefined' && window.visualViewport) ? window.visualViewport : null;
+  if (vv && vv.height) return vv.height;
+  return window.innerHeight || 800;
+}
+function isPhone(){
+  var sw = (window.screen && window.screen.width) || 0;
+  var sh = (window.screen && window.screen.height) || 0;
+  var mn = Math.min(sw || 9999, sh || 9999);
+  if (mn < 700) return true;
+  return H > W * 1.15;
+}
+function fit(){
+  W = viewW(); H = viewH();
+  canvas.width = W; canvas.height = H;
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+}
+if (window.visualViewport && window.visualViewport.addEventListener){
+  window.visualViewport.addEventListener('resize', function(){ fit(); draw(lastT); });
+}
+if (window.addEventListener){
+  window.addEventListener('resize', function(){ fit(); draw(lastT); });
+}
+
+// ---------- band field ----------
+function bandColor(yFrac, lt){
+  var v = yFrac + lt / LOOP + 0.02 * Math.sin(2 * Math.PI * lt / LOOP);
+  var idx = Math.floor(v * BANDROWS) % 6;
+  if (idx < 0) idx += 6;
+  return BANDS[idx];
+}
+function bandStrength(yFrac, tAbs){
+  return 0.34 + 0.30 * (0.5 + 0.5 * Math.sin(2 * Math.PI * yFrac * 1.5 - tAbs * 0.13));
+}
+
+// ---------- tile colour (closed form) ----------
+function tileColor(tx, ty, cx, cy, step, lt, tAbs){
+  var h1 = hash3(tx, ty, step);
+  var lum = 0.18 + 0.82 * h1;
+  var base = [SNOW[0] * lum, SNOW[1] * lum, SNOW[2] * lum];
+  var h2 = hash3(tx, ty, 991);
+  var k = bandStrength(cy / H, tAbs) * (0.7 + 0.5 * h2);
+  if (k > 0.85) k = 0.85;
+  var bc = bandColor(cy / H, lt);
+  var banded = [bc[0] * (0.30 + 0.70 * lum), bc[1] * (0.30 + 0.70 * lum), bc[2] * (0.30 + 0.70 * lum)];
+  var col = mix3(base, banded, k);
+  if (hash3(tx, ty, step + 701) < 0.02) col = mix3(col, GREEN, 0.45);
+  // antenna ghost: strong resolution flattens the tile to the tuned image
+  var res = resolution(cx, cy, tAbs);
+  var clearK = smooth(0.35, 0.8, res);
+  if (clearK > 0){
+    var flat = (cy / H > HORIZON) ? GNDFLAT : SKYFLAT;
+    var fc = [flat[0] * (0.9 + 0.1 * lum), flat[1] * (0.9 + 0.1 * lum), flat[2] * (0.9 + 0.1 * lum)];
+    col = mix3(col, fc, clearK);
+  }
+  return col;
+}
+
+// ---------- silhouettes ----------
+function poly(pts){
+  ctx.beginPath();
+  ctx.moveTo(pts[0][0], pts[0][1]);
+  for (var i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+  ctx.closePath();
+  ctx.fill();
+}
+function drawSilhouettes(){
+  var gy = HORIZON * H;
+  // ground
+  ctx.beginPath();
+  ctx.moveTo(0, gy + 0.006 * H);
+  ctx.lineTo(W * 0.3, gy - 0.004 * H);
+  ctx.lineTo(W * 0.62, gy + 0.005 * H);
+  ctx.lineTo(W, gy - 0.003 * H);
+  ctx.lineTo(W, H);
+  ctx.lineTo(0, H);
+  ctx.closePath();
+  ctx.fill();
+
+  // rider + horse, left of centre, baseline on the ground line
+  var hx = 0.10 * W, hw = 0.17 * W, hTop = gy - 0.205 * H;
+  function P(x, y){ return [hx + x * hw, hTop + y * 0.205 * H]; }
+  // horse body: tail base, back, withers, neck, head, jaw, chest,
+  // near front leg, belly, near hind leg, rump
+  poly([P(0.10, 0.34), P(0.32, 0.30), P(0.55, 0.28), P(0.70, 0.16),
+        P(0.76, 0.10), P(0.80, 0.13), P(0.86, 0.24), P(0.83, 0.30),
+        P(0.74, 0.28), P(0.66, 0.38), P(0.64, 0.46), P(0.655, 0.97),
+        P(0.655, 1.0), P(0.615, 1.0), P(0.605, 0.52), P(0.40, 0.54),
+        P(0.30, 0.52), P(0.26, 0.54), P(0.235, 1.0), P(0.195, 1.0),
+        P(0.205, 0.56), P(0.13, 0.46), P(0.08, 0.40)]);
+  // far legs + tail
+  poly([P(0.58, 0.52), P(0.60, 1.0), P(0.565, 1.0), P(0.545, 0.54)]);
+  poly([P(0.17, 0.54), P(0.155, 1.0), P(0.12, 1.0), P(0.135, 0.50)]);
+  poly([P(0.09, 0.36), P(0.05, 0.40), P(0.035, 0.66), P(0.06, 0.68), P(0.085, 0.48)]);
+  // saddle
+  poly([P(0.36, 0.265), P(0.50, 0.26), P(0.50, 0.30), P(0.36, 0.305)]);
+  // rider: torso, arm, leg along the barrel, head, hat
+  poly([P(0.40, 0.28), P(0.415, 0.06), P(0.465, 0.055), P(0.475, 0.27)]);
+  poly([P(0.46, 0.10), P(0.58, 0.24), P(0.565, 0.27), P(0.45, 0.14)]);
+  poly([P(0.42, 0.27), P(0.45, 0.27), P(0.50, 0.43), P(0.49, 0.57), P(0.455, 0.57), P(0.455, 0.44)]);
+  ctx.beginPath();
+  var hr = 0.030 * hw;
+  ctx.moveTo(P(0.445, 0.015)[0] + hr, P(0.445, 0.015)[1]);
+  ctx.arc(P(0.445, 0.015)[0], P(0.445, 0.015)[1], hr, 0, Math.PI * 2);
+  ctx.fill();
+  poly([P(0.415, -0.035), P(0.475, -0.035), P(0.475, -0.008), P(0.415, -0.008)]);
+  poly([P(0.375, -0.008), P(0.515, -0.008), P(0.515, 0.006), P(0.375, 0.006)]);
+
+  // fence posts + rails, centre-left
+  var fw = Math.max(2, 0.006 * W), fh = 0.058 * H;
+  var fx, i;
+  for (i = 0; i < 5; i++){
+    fx = (0.335 + i * 0.062) * W;
+    ctx.fillRect(fx, gy - fh, fw, fh + 2);
+  }
+  ctx.fillRect(0.332 * W, gy - fh * 0.82, 0.318 * W, Math.max(1.5, 0.004 * H));
+  ctx.fillRect(0.332 * W, gy - fh * 0.45, 0.318 * W, Math.max(1.5, 0.004 * H));
+
+  // water tower, right side
+  var tx0 = 0.795 * W, tw = 0.075 * W, tTop = gy - 0.235 * H;
+  poly([[tx0 - tw * 0.55, tTop + 0.045 * H], [tx0 + tw * 0.55, tTop + 0.045 * H],
+        [tx0 + tw * 0.42, tTop + 0.125 * H], [tx0 - tw * 0.42, tTop + 0.125 * H]]);
+  poly([[tx0 - tw * 0.55, tTop + 0.045 * H], [tx0 + tw * 0.55, tTop + 0.045 * H],
+        [tx0, tTop]]);
+  var lw = Math.max(2, 0.005 * W);
+  ctx.fillRect(tx0 - tw * 0.40, tTop + 0.125 * H, lw, gy - tTop - 0.125 * H);
+  ctx.fillRect(tx0 + tw * 0.40 - lw, tTop + 0.125 * H, lw, gy - tTop - 0.125 * H);
+  ctx.fillRect(tx0 - tw * 0.16, tTop + 0.125 * H, lw, gy - tTop - 0.125 * H);
+  ctx.fillRect(tx0 + tw * 0.16 - lw, tTop + 0.125 * H, lw, gy - tTop - 0.125 * H);
+}
+
+// ---------- draw ----------
+function draw(t){
+  lastT = t;
+  var lt = t % LOOP;
+  var loopIndex = Math.floor(t / LOOP);
+  var step = Math.floor(t * 9);
+  var tear = tearAt(lt, loopIndex);
+  var u = Math.min(W, H);
+  var tScale = Math.max(0.6, Math.min(1.4, u / 720));
+
+  ctx.fillStyle = CRT;
+  ctx.fillRect(0, 0, W, H);
+
+  var NX = isPhone() ? 22 : 26;
+  var NY = Math.max(16, Math.min(44, Math.round(NX * H / W)));
+  var tw = W / NX, th = H / NY;
+  var tearY = tear ? tear.tear * H : -1;
+  var tx, ty, cx, cy, off;
+
+  // pass 1: the snow, banded, tear-split, ghost-flattened
+  for (ty = 0; ty < NY; ty++){
+    cy = (ty + 0.5) * th;
+    off = 0;
+    if (tear) off = tear.env * (cy < tearY ? 14 : -10) * tScale;
+    for (tx = 0; tx < NX; tx++){
+      cx = (tx + 0.5) * tw;
+      ctx.fillStyle = css(tileColor(tx, ty, cx, cy, step, lt, t));
+      ctx.fillRect(tx * tw + off, ty * th, tw + 1, th + 1);
+      if (hash3(tx, ty, step + 313) > 0.988){
+        var sx = tx * tw + off + hash3(tx, ty, 77) * tw * 0.7;
+        var sy = ty * th + hash3(tx, ty, 78) * th * 0.7;
+        ctx.fillStyle = 'rgba(255,255,255,0.9)';
+        ctx.fillRect(sx, sy, 2, 2);
+      }
+    }
+  }
+
+  // silhouettes: half-buried cutouts; RGB-split ghosts during a tear
+  if (tear){
+    ctx.globalAlpha = 0.16;
+    ctx.fillStyle = '#FF2040';
+    ctx.save(); ctx.translate(-5 * tear.env * tScale, 0); drawSilhouettes(); ctx.restore();
+    ctx.fillStyle = '#2060FF';
+    ctx.save(); ctx.translate(5 * tear.env * tScale, 0); drawSilhouettes(); ctx.restore();
+    ctx.globalAlpha = 0.30;
+    ctx.fillStyle = '#0A0A0C';
+    drawSilhouettes();
+  } else {
+    ctx.globalAlpha = 0.35;
+    ctx.fillStyle = '#0A0A0C';
+    drawSilhouettes();
+  }
+  ctx.globalAlpha = 1;
+
+  // antenna ghost: inside strong resolution the cutouts draw crisp
+  for (var si = 0; si < samples.length; si++){
+    var s = samples[si];
+    var str = resolution(s.x, s.y, t);
+    if (str < 0.05) continue;
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(s.x + 95 * tScale, s.y);
+    ctx.arc(s.x, s.y, 95 * tScale, 0, Math.PI * 2);
+    ctx.clip();
+    ctx.globalAlpha = 0.55 * str;
+    ctx.fillStyle = '#0A0A0C';
+    drawSilhouettes();
+    ctx.restore();
+  }
+  ctx.globalAlpha = 1;
+
+  // pass 2: bury the bottom third under fresh sparse snow
+  for (ty = 0; ty < NY; ty++){
+    cy = (ty + 0.5) * th;
+    if (cy / H < HORIZON - 0.06) continue;
+    off = 0;
+    if (tear) off = tear.env * (cy < tearY ? 14 : -10) * tScale;
+    for (tx = 0; tx < NX; tx++){
+      if (hash3(tx, ty, step + 555) >= 0.55) continue;
+      cx = (tx + 0.5) * tw;
+      var resHere = resolution(cx, cy, t);
+      var a = 0.25 * (1 - smooth(0.35, 0.8, resHere));
+      if (a <= 0.01) continue;
+      ctx.globalAlpha = a;
+      ctx.fillStyle = css(tileColor(tx, ty, cx, cy, step, lt, t));
+      ctx.fillRect(tx * tw + off, ty * th, tw + 1, th + 1);
+    }
+  }
+  ctx.globalAlpha = 1;
+
+  // rolling CRT bar
+  var barY = ((t * 0.055) % 1.3 - 0.15) * H;
+  ctx.fillStyle = 'rgba(0,0,0,0.10)';
+  ctx.fillRect(0, barY, W, 0.16 * H);
+}
+
+// ---------- interaction: drag = antenna (tunes, never controls) ----------
+var dragging = false;
+function ptrSample(x, y){
+  samples.push({ x: x, y: y, t: lastT });
+  if (samples.length > 40) samples.shift();
+  draw(lastT);
+}
+function ptrDown(x, y){
+  dragging = true;
+  samples.length = 0;
+  ptrSample(x, y);
+}
+function ptrMove(x, y){
+  if (!dragging) return;
+  ptrSample(x, y);
+}
+function ptrUp(){
+  dragging = false;
+  draw(lastT);
+}
+if (canvas.addEventListener){
+  canvas.addEventListener('pointerdown', function(e){ ptrDown(e.clientX || 0, e.clientY || 0); });
+  canvas.addEventListener('pointermove', function(e){ ptrMove(e.clientX || 0, e.clientY || 0); });
+  canvas.addEventListener('pointerup', ptrUp);
+  canvas.addEventListener('mousedown', function(e){ ptrDown(e.clientX || 0, e.clientY || 0); });
+  canvas.addEventListener('mousemove', function(e){ ptrMove(e.clientX || 0, e.clientY || 0); });
+  canvas.addEventListener('mouseup', ptrUp);
+  canvas.addEventListener('touchstart', function(e){
+    if (e.touches && e.touches[0]) ptrDown(e.touches[0].clientX || 0, e.touches[0].clientY || 0);
+  });
+  canvas.addEventListener('touchmove', function(e){
+    if (e.touches && e.touches[0]) ptrMove(e.touches[0].clientX || 0, e.touches[0].clientY || 0);
+  });
+  canvas.addEventListener('touchend', ptrUp);
+}
+
+// ---------- run ----------
+function clockNow(){
+  if (typeof performance !== 'undefined' && performance.now) return performance.now() / 1000;
+  return Date.now() / 1000;
+}
+fit();
+draw(T0);
+var boot = clockNow();
+function frame(){
+  draw(T0 + (clockNow() - boot));
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+}
+if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Yawl</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0A0A0A; overflow: hidden; height: 100%; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- deterministic hashes (seeded only; no Math.random) ----------
+  function h2(a, b) {
+    var x = ((a * 374761393 + b * 668265263) ^ 0x5bf03635) >>> 0;
+    x = Math.imul(x ^ (x >>> 13), 1274126177) >>> 0;
+    return ((x ^ (x >>> 16)) >>> 0) / 4294967296;
+  }
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+
+  // ---------- constants ----------
+  var T0 = 8.2;                  // fixed first-frame phase: slot 0, mid-corruption
+  var LOOP = 90;                 // seamless 90 s cycle
+  var SLOT = 16;                 // 5 phrase slots of 16 s = 80 s, + 10 s tail
+  var PHRASES = [
+    "goodMorn'NN Out West yawl",
+    "the cowgirl gatherer'd her wits err",
+    "glitch◆school",
+    "yawl come back inn the snow",
+    "err on the side of the signal"
+  ];
+  var SWEEPS = [40, 82];         // sweep start times (1.1 s each)
+  var SWEEP_DUR = 1.1;
+
+  var COL = {
+    bg: '#0A0A0A',
+    amber: '#FFB000',
+    cyan: '#00E5FF',
+    magenta: '#FF2BD1',
+    red: '#FF2B2B',
+    sweep: '#33FF66'
+  };
+
+  // ---------- corruption model (precomputed per phrase, hash-picked) ----------
+  // At most 35% of non-space letters ever corrupt. flip order is by hash rank:
+  // rank 0 flips first and is the slot's single red letter.
+  var POOL = ['3', '0', '¡', '◇', '◆', '×', '§', '†', '5', '7'];
+  function subGlyph(ch, r) {
+    switch (ch) {
+      case 'e': return r < 0.6 ? '3' : '¡';
+      case 'o': case 'O': return '0';
+      case 'i': return '¡';
+      case 'a': return r < 0.5 ? '4' : 'æ';
+      case 'u': return 'µ';
+      case 'g': return r < 0.5 ? '9' : '◇';
+      case 'l': return r < 0.5 ? '1' : '┼';
+      case 't': return r < 0.5 ? '7' : '†';
+      case 's': return r < 0.5 ? '5' : '§';
+      case 'c': return r < 0.5 ? '¢' : '(';
+      case 'h': return '#';
+      case 'n': return 'ñ';
+      case 'y': return '¥';
+      case 'w': return '◆';
+      case 'r': return r < 0.5 ? '2' : '®';
+      case 'd': return 'Ð';
+      case 'M': return 'm';
+      case 'N': return 'И';
+      case 'W': return 'w';
+      default: return POOL[Math.floor(r * POOL.length) % POOL.length];
+    }
+  }
+
+  // per-phrase letter interval: one letter per 0.14 s, compressed so typing
+  // always completes inside the 3.5 s type window even for the longest line
+  function typeIv(p) { return Math.min(0.14, 3.5 / PHRASES[p].length); }
+
+  var CORRUPT = PHRASES.map(function (phrase, p) {
+    var idxs = [];
+    // letters only: spaces, the dialect apostrophe and the ◆ sigil never flip
+    for (var i = 0; i < phrase.length; i++) {
+      var ch = phrase[i];
+      if (ch !== ' ' && ch !== "'" && ch !== '◆') idxs.push(i);
+    }
+    var k = Math.floor(0.35 * idxs.length);
+    var ordered = idxs.slice().sort(function (a, b) {
+      return h2(1000 + p * 131, a * 17 + 3) - h2(1000 + p * 131, b * 17 + 3);
+    });
+    var map = {}; // idx -> {flip, unflip, glyph, color, red}
+    for (var rank = 0; rank < k; rank++) {
+      var idx = ordered[rank];
+      map[idx] = {
+        flip: 6 + 2.8 * (rank + 0.5) / k,
+        unflip: 12 + (k > 1 ? 1.8 * (k - 1 - rank) / (k - 1) : 0),
+        glyph: subGlyph(phrase[idx], h2(2000 + p * 57, idx * 13 + 1)),
+        color: h2(3003 + p * 57, idx * 13 + 5) < 0.5 ? COL.cyan : COL.magenta,
+        red: rank === 0
+      };
+    }
+    return map;
+  });
+
+  // ---------- line state machine ----------
+  // Returns {p, visible, flippedAt(st)->bool per letter via flipped(idx, st), cursor}
+  // Modes are resolved to a (phrase, slot-local-time) pair plus flags.
+  function resolveLine(lt) {
+    // returns {p, st, mode} where mode: 'slot' | 'retype' | 'hold' | 'sweep'
+    if (lt < 80) {
+      var s = Math.floor(lt / SLOT), st = lt - s * SLOT;
+      if (s === 2 && lt >= SWEEPS[0] && lt < SWEEPS[0] + SWEEP_DUR) {
+        return { p: 2, st: 8.0, mode: 'sweep', sweepT: lt }; // frozen mid-corrupt, distorted
+      }
+      if (s === 2 && lt >= SWEEPS[0] + SWEEP_DUR) {
+        return { p: 2, st: lt - (SWEEPS[0] + SWEEP_DUR), mode: 'retype' };
+      }
+      return { p: s, st: st, mode: 'slot' };
+    }
+    // tail: phrase 4 holds clean, sweep at 82 washes it, retype from zero
+    if (lt < SWEEPS[1]) return { p: 4, st: 15, mode: 'slot' }; // clean hold state
+    if (lt < SWEEPS[1] + SWEEP_DUR) return { p: 4, st: 15, mode: 'sweep', sweepT: lt };
+    return { p: 4, st: lt - (SWEEPS[1] + SWEEP_DUR), mode: 'retype' };
+  }
+
+  function letterFlipped(p, idx, st, mode) {
+    if (mode !== 'slot' && mode !== 'sweep') return false;
+    var c = CORRUPT[p][idx];
+    if (!c) return false;
+    if (st < 6) return false;
+    if (st < 9) return st >= c.flip;
+    if (st < 12) return true;
+    if (st < 14) return st < c.unflip;
+    return false;
+  }
+
+  function visibleCount(p, st, mode) {
+    var len = PHRASES[p].length;
+    if (mode === 'retype' || (mode === 'slot' && st < 3.5)) {
+      return Math.min(len, Math.floor(st / typeIv(p)) + 1);
+    }
+    return len;
+  }
+
+  function showCursor(p, st, mode, vis) {
+    if (vis >= PHRASES[p].length) return false;
+    if (mode === 'retype') return true;
+    if (mode === 'slot') return st < 3.5;
+    return false;
+  }
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('cv');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0, DPR = 1;
+  var FS = 40, CHARW = 24; // font size / monospace cell width, set by fit()
+
+  var isPhone = false;
+  if (typeof window !== 'undefined' && window.screen) {
+    isPhone = Math.min(window.screen.width || 9999, window.screen.height || 9999) < 700;
+  }
+  function fit() {
+    var vv = (typeof window !== 'undefined') ? window.visualViewport : null;
+    var w = vv ? vv.width : (window.innerWidth || 1280);
+    var h = vv ? vv.height : (window.innerHeight || 800);
+    if (!isPhone && h > w * 1.15) isPhone = true; // aspect fallback
+    DPR = Math.min((typeof window !== 'undefined' && window.devicePixelRatio) || 1, 2);
+    W = w; H = h;
+    canvas.width = Math.round(w * DPR);
+    canvas.height = Math.round(h * DPR);
+    canvas.style.width = w + 'px';   // pin CSS size
+    canvas.style.height = h + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    // font metrics: size ~7% of min dimension, shrunk until the longest
+    // phrase fits 94% of the width
+    FS = Math.max(10, Math.floor(Math.min(W, H) * 0.07));
+    ctx.font = 'bold ' + FS + 'px "DejaVu Sans Mono", monospace';
+    CHARW = ctx.measureText('M').width;
+    var longest = 0;
+    for (var i = 0; i < PHRASES.length; i++) longest = Math.max(longest, PHRASES[i].length);
+    if (longest * CHARW > W * 0.94) {
+      FS = Math.max(10, Math.floor(FS * (W * 0.94) / (longest * CHARW)));
+      ctx.font = 'bold ' + FS + 'px "DejaVu Sans Mono", monospace';
+      CHARW = ctx.measureText('M').width;
+    }
+  }
+  fit();
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', function () { fit(); draw(currentT()); });
+    }
+    window.addEventListener('resize', function () { fit(); draw(currentT()); });
+  }
+
+  // ---------- drag smear (bad tracking head) ----------
+  // segments: {downT, samples:[{x,t}], lastX, upT|null, upMag, upX}
+  var dragSegs = [];
+  function smearAt(t) {
+    // returns {mag, x} : current smear magnitude (px) and hot-spot x
+    for (var i = dragSegs.length - 1; i >= 0; i--) {
+      var s = dragSegs[i];
+      if (t < s.downT) continue;
+      if (s.upT === null || t < s.upT) {
+        var sm = s.samples, vx = 0;
+        if (sm.length >= 2) {
+          var a = sm[Math.max(0, sm.length - 4)], b = sm[sm.length - 1];
+          if (b.t > a.t) vx = (b.x - a.x) / (b.t - a.t);
+        }
+        return { mag: clamp(vx * 0.045, -70, 70), x: s.lastX };
+      }
+      var m = s.upMag * Math.exp(-(t - s.upT) / 0.22); // snap back
+      if (Math.abs(m) < 0.05) return { mag: 0, x: s.upX };
+      return { mag: m, x: s.upX };
+    }
+    return { mag: 0, x: -9999 };
+  }
+
+  function nowMs() {
+    return (typeof performance !== 'undefined') ? performance.now() : Date.now();
+  }
+  var startStamp = nowMs();
+  function pieceNow() { return T0 + (nowMs() - startStamp) / 1000; }
+  function currentT() { return pieceNow(); }
+
+  if (typeof window !== 'undefined' && canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', function (ev) {
+      var t = pieceNow();
+      dragSegs.push({ downT: t, samples: [{ x: ev.clientX, t: t }], lastX: ev.clientX, upT: null, upMag: 0, upX: ev.clientX });
+      if (dragSegs.length > 24) dragSegs.shift();
+    });
+    canvas.addEventListener('pointermove', function (ev) {
+      var s = dragSegs[dragSegs.length - 1];
+      if (s && s.upT === null) {
+        s.samples.push({ x: ev.clientX, t: pieceNow() });
+        if (s.samples.length > 12) s.samples.shift();
+        s.lastX = ev.clientX;
+      }
+    });
+    function endDrag() {
+      var s = dragSegs[dragSegs.length - 1];
+      if (s && s.upT === null) {
+        var t = pieceNow();
+        s.upMag = smearAt(t).mag;
+        s.upX = s.lastX;
+        s.upT = t;
+      }
+    }
+    canvas.addEventListener('pointerup', endDrag);
+    canvas.addEventListener('pointercancel', endDrag);
+  }
+
+  // ---------- draw ----------
+  function draw(t) {
+    var lt = ((t % LOOP) + LOOP) % LOOP;
+    ctx.fillStyle = COL.bg;
+    ctx.fillRect(0, 0, W, H);
+
+    var line = resolveLine(lt);
+    var p = line.p, st = line.st, mode = line.mode;
+    var phrase = PHRASES[p];
+    var vis = visibleCount(p, st, mode);
+    var lineW = phrase.length * CHARW;
+    var x0 = (W - lineW) / 2;
+    var yMid = H / 2;
+
+    // sweep distortion envelope
+    var sweeping = (mode === 'sweep');
+    var swProg = sweeping ? (line.sweepT - (p === 2 ? SWEEPS[0] : SWEEPS[1])) / SWEEP_DUR : 0;
+    var swEnv = sweeping ? Math.sin(Math.PI * clamp(swProg, 0, 1)) : 0;
+
+    var smear = smearAt(t);
+    ctx.font = 'bold ' + FS + 'px "DejaVu Sans Mono", monospace';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+
+    for (var i = 0; i < vis; i++) {
+      var flipped = letterFlipped(p, i, st, mode);
+      var c = flipped ? CORRUPT[p][i] : null;
+      var glyph = flipped ? c.glyph : phrase[i];
+      var color = flipped ? (c.red ? COL.red : c.color) : COL.amber;
+      var lx = x0 + i * CHARW;
+      var ly = yMid;
+
+      // stutter jitter while a letter sits corrupted
+      if (flipped) ly += (h2(i * 31 + 7, Math.floor(t * 8)) - 0.5) * 3;
+
+      // sweep wash distortion
+      if (sweeping) {
+        var step = Math.floor(lt * 14);
+        lx += (h2(i * 17 + 51, step) - 0.5) * 20 * swEnv;
+        ly += (h2(i * 23 + 91, step) - 0.5) * 28 * swEnv;
+      }
+
+      // drag smear: gaussian falloff around the finger, ghost echoes
+      var off = 0;
+      if (smear.mag !== 0) {
+        var dx = (lx + CHARW / 2) - smear.x;
+        off = smear.mag * Math.exp(-(dx * dx) / (2 * 160 * 160));
+      }
+      if (Math.abs(off) > 1.5) {
+        ctx.globalAlpha = 0.35;
+        ctx.fillStyle = color;
+        ctx.fillText(glyph, lx - off * 0.3, ly);
+        ctx.fillText(glyph, lx + off * 1.3, ly);
+        ctx.globalAlpha = 1;
+      }
+      ctx.fillStyle = color;
+      ctx.fillText(glyph, lx + off, ly);
+    }
+
+    // type-in cursor (part of the line; only while typing)
+    if (showCursor(p, st, mode, vis)) {
+      var blink = Math.floor(t * 2.4) % 2 === 0;
+      ctx.globalAlpha = blink ? 0.85 : 0.15;
+      ctx.fillStyle = COL.amber;
+      ctx.fillRect(x0 + vis * CHARW + 2, yMid + FS * 0.42, CHARW * 0.7, 3);
+      ctx.globalAlpha = 1;
+    }
+
+    // green scanline sweep band, descending across the line
+    if (sweeping) {
+      var bandY = yMid - FS * 1.6 + swProg * FS * 3.2;
+      ctx.globalAlpha = 0.35;
+      ctx.fillStyle = COL.sweep;
+      ctx.fillRect(0, bandY - FS * 0.75, W, FS * 1.5);
+      ctx.globalAlpha = 0.6;
+      ctx.fillRect(0, bandY - 1, W, 2);
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  // ---------- run ----------
+  draw(T0); // synchronous fixed-phase first frame
+  if (typeof requestAnimationFrame === 'function') {
+    var loopFn = function () {
+      draw(pieceNow());
+      requestAnimationFrame(loopFn);
+    };
+    requestAnimationFrame(loopFn);
+  }
+})();
+</script>
+</body>
+</html>
