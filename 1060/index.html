@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Omni Chorus</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0B0C0E; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- palette (strict) ----------
+  var STAGE = '#0B0C0E';
+  var LIGHT = '#FFE14D';
+  var TRACE = '#3DDC84';
+  var FLASH = '#FF4D8D';
+  var BODY = '#2A2E35';
+
+  var PREROLL = 2880;         // 24 s at 120 Hz: frame one lives here
+  var T0 = 24;                // frame one phase, seconds (formation 1, SPIRAL)
+  var BASE_SEED = 1063375;
+
+  // ==== CHORUS MATH BEGIN ====
+  // Pure, DOM-free. Twelve omni movers chase formation targets. Each
+  // mover's measured position lags its target and carries an Ornstein-
+  // Uhlenbeck drift, so it is never exactly on path. When the error
+  // passes THRESH the feedback loop bites: a correction event is
+  // recorded, the light flares magenta, and the position snaps partway
+  // to the target. Traces are data buffers, cleared at each formation
+  // boundary: the tire tracks are the proof of control for one
+  // formation only.
+  var STEP = 1 / 120;         // fixed sim step, seconds
+  var TAU = Math.PI * 2;
+  var N_MOVERS = 12;
+  var FORM_DUR = 18;          // seconds per formation
+  var BLEND = 6;              // seconds of crossfade at a formation start
+  var R_FORM = 350;           // formation radius, logical units (world 1000)
+  var CHASE = 5;              // chase rate, 1/s
+  var DRIFT_SIGMA = 68;       // drift diffusion, units/s per sqrt(s)
+  var DRIFT_TAU = 0.8;        // drift mean-reversion time, s
+  var THRESH = 15;            // correction threshold, logical units
+  var SNAP = 0.5;             // fraction of error removed by a correction
+  var COOLDOWN = 45;          // steps before a mover may correct again
+  var FLASH_FULL = 6;         // steps at full magenta (about 3 frames at 60 Hz)
+  var FLASH_TAIL = 42;        // steps of fading magenta halo after the flash
+  var TRACE_EVERY = 3;        // sample the trace every 3 steps (40 Hz)
+  var TRACE_CAP = 900;
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function smooth01(x) {
+    if (x <= 0) return 0;
+    if (x >= 1) return 1;
+    return x * x * (3 - 2 * x);
+  }
+
+  function rotAt(t) { return t * TAU / 110; }
+
+  // Raw position of mover i in formation f (0 rosette, 1 spiral,
+  // 2 grid folding into circle), t absolute seconds, u seconds into
+  // the formation (the grid morph reads u; the others ignore it).
+  function formationRaw(f, i, t, u) {
+    var a, r;
+    if (f === 0) {
+      a = i * TAU / N_MOVERS + rotAt(t);
+      r = R_FORM * (0.60 + 0.40 * Math.cos(5 * a));
+      return [r * Math.cos(a), r * Math.sin(a)];
+    }
+    if (f === 1) {
+      a = rotAt(t) + i * (TAU / N_MOVERS) * 2.5;
+      r = R_FORM * (0.12 + 0.88 * i / (N_MOVERS - 1));
+      return [r * Math.cos(a), r * Math.sin(a)];
+    }
+    var gx = (i % 4 - 1.5) * 0.44 * R_FORM;
+    var gy = (Math.floor(i / 4) - 1) * 0.44 * R_FORM;
+    a = i * TAU / N_MOVERS + rotAt(t);
+    r = 0.92 * R_FORM;
+    var m = smooth01((u - 1) / 14);
+    return [gx + (r * Math.cos(a) - gx) * m, gy + (r * Math.sin(a) - gy) * m];
+  }
+
+  // Formation bookkeeping lives on the state so the step function
+  // stays a pure function of state.
+  function formationAt(st, t) {
+    var rel = t - st.formBase;
+    var idx = st.formStartIdx + Math.floor(rel / FORM_DUR);
+    var u = rel - Math.floor(rel / FORM_DUR) * FORM_DUR;
+    return { idx: idx, u: u };
+  }
+
+  function targetAt(st, i, t) {
+    var fo = formationAt(st, t);
+    var f = ((fo.idx % 3) + 3) % 3;
+    var cur = formationRaw(f, i, t, fo.u);
+    if (fo.u < BLEND) {
+      var pf = ((f + 2) % 3);
+      var prev = formationRaw(pf, i, t, FORM_DUR);
+      var w = smooth01(fo.u / BLEND);
+      return [prev[0] + (cur[0] - prev[0]) * w, prev[1] + (cur[1] - prev[1]) * w];
+    }
+    return cur;
+  }
+
+  function createState(seed) {
+    var st = {
+      step: 0,
+      formBase: 0,
+      formStartIdx: 0,
+      lastFormIdx: 0,
+      corrTotal: 0,
+      movers: []
+    };
+    var i, rng, p;
+    for (i = 0; i < N_MOVERS; i++) {
+      rng = mulberry32(seed + i * 7919);
+      p = targetAt(st, i, 0);
+      st.movers.push({
+        x: p[0] + (rng() * 2 - 1) * 10,
+        y: p[1] + (rng() * 2 - 1) * 10,
+        vx: 0, vy: 0,
+        rng: rng,
+        lastCorr: -100000,
+        corr: 0,
+        maxErr: 0,
+        trace: []
+      });
+    }
+    return st;
+  }
+
+  function clearTraces(st) {
+    for (var i = 0; i < N_MOVERS; i++) st.movers[i].trace.length = 0;
+  }
+
+  // One fixed step. grabIdx >= 0 replaces that mover's target with
+  // (grabX, grabY) and tightens its correction rule.
+  function stepSim(st, grabIdx, grabX, grabY) {
+    st.step++;
+    var t = st.step * STEP;
+    var fo = formationAt(st, t);
+    if (fo.idx !== st.lastFormIdx) {
+      st.lastFormIdx = fo.idx;
+      clearTraces(st);
+    }
+    var chaseF = 1 - Math.exp(-CHASE * STEP);
+    var driftDecay = Math.exp(-STEP / DRIFT_TAU);
+    var i, m, tp, dx, dy, err, thr;
+    for (i = 0; i < N_MOVERS; i++) {
+      m = st.movers[i];
+      if (i === grabIdx) { tp = [grabX, grabY]; }
+      else tp = targetAt(st, i, t);
+      // drift: Ornstein-Uhlenbeck velocity
+      m.vx = m.vx * driftDecay + (m.rng() * 2 - 1) * DRIFT_SIGMA * STEP * 10;
+      m.vy = m.vy * driftDecay + (m.rng() * 2 - 1) * DRIFT_SIGMA * STEP * 10;
+      m.x += (tp[0] - m.x) * chaseF + m.vx * STEP;
+      m.y += (tp[1] - m.y) * chaseF + m.vy * STEP;
+      dx = tp[0] - m.x; dy = tp[1] - m.y;
+      err = Math.sqrt(dx * dx + dy * dy);
+      if (err > m.maxErr) m.maxErr = err;
+      thr = (i === grabIdx) ? 6 : THRESH;
+      if (err > thr && st.step - m.lastCorr > ((i === grabIdx) ? 10 : COOLDOWN)) {
+        m.lastCorr = st.step;
+        m.corr++;
+        st.corrTotal++;
+        m.x += dx * SNAP;
+        m.y += dy * SNAP;
+      }
+      if (st.step % TRACE_EVERY === 0) {
+        m.trace.push(m.x, m.y);
+        if (m.trace.length > TRACE_CAP * 2) m.trace.splice(0, m.trace.length - TRACE_CAP * 2);
+      }
+    }
+  }
+  // ==== CHORUS MATH END ====
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 720, H = 720;
+  var phoneNow = false;
+  var sizeMul = 1;
+
+  function isPhone() {
+    var sw = 0, sh = 0;
+    if (typeof window !== 'undefined' && window.screen) {
+      sw = window.screen.width || 0; sh = window.screen.height || 0;
+    }
+    var mn = Math.min(sw, sh);
+    if (mn > 0 && mn < 700) return true;
+    return H > W * 1.15; // aspect fallback only
+  }
+  function fit() {
+    var vv = (typeof window !== 'undefined') ? window.visualViewport : null;
+    if (vv && vv.width) { W = vv.width; H = vv.height; }
+    else if (typeof window !== 'undefined' && window.innerWidth) { W = window.innerWidth; H = window.innerHeight; }
+    canvas.width = Math.round(W);
+    canvas.height = Math.round(H);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    phoneNow = isPhone();
+    sizeMul = phoneNow ? 1.3 : 1;
+  }
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', function () { fit(); draw(); });
+    }
+    if (window.addEventListener) {
+      window.addEventListener('resize', function () { fit(); draw(); });
+    }
+  }
+
+  // ---------- coordinates: logical 1000x1000 stage, contain-fit ----------
+  function scale() { return Math.min(W, H) / 1000; }
+  function toPx(x, y) { var s = scale(); return [W / 2 + x * s, H / 2 + y * s]; }
+  function toLogical(px, py) { var s = scale(); return [(px - W / 2) / s, (py - H / 2) / s]; }
+
+  // ---------- interaction state ----------
+  var state = createState(BASE_SEED);
+  var grabIdx = -1, grabX = 0, grabY = 0;
+  var lastTapStep = -100000, lastTapX = 0, lastTapY = 0;
+  var reseedCount = 0;
+
+  function simT() { return state.step * STEP; }
+
+  // ---------- drawing ----------
+  function draw() {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.fillStyle = STAGE;
+    ctx.fillRect(0, 0, W, H);
+    var s = scale();
+    var i, j, p;
+
+    // retroreflective grid underlay: the mocap truth, barely visible
+    ctx.fillStyle = BODY;
+    ctx.globalAlpha = 0.35;
+    for (i = -10; i <= 10; i++) {
+      for (j = -10; j <= 10; j++) {
+        p = toPx(i * 50, j * 50);
+        ctx.fillRect(p[0] - 1, p[1] - 1, 2, 2);
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    // tire tracks: this formation's history per mover
+    ctx.strokeStyle = TRACE;
+    ctx.globalAlpha = 0.25;
+    ctx.lineWidth = 2.5 * s;
+    ctx.lineJoin = 'round';
+    for (i = 0; i < N_MOVERS; i++) {
+      var tr = state.movers[i].trace;
+      if (tr.length < 4) continue;
+      ctx.beginPath();
+      p = toPx(tr[0], tr[1]);
+      ctx.moveTo(p[0], p[1]);
+      for (j = 2; j < tr.length; j += 2) {
+        p = toPx(tr[j], tr[j + 1]);
+        ctx.lineTo(p[0], p[1]);
+      }
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+
+    // movers: layered glow, dark puck, light on top
+    for (i = 0; i < N_MOVERS; i++) {
+      var m = state.movers[i];
+      p = toPx(m.x, m.y);
+      var since = state.step - m.lastCorr;
+      var flashing = since < FLASH_FULL;
+      var tail = (!flashing && since < FLASH_TAIL) ? 1 - (since - FLASH_FULL) / (FLASH_TAIL - FLASH_FULL) : 0;
+      var haloCol = flashing || tail > 0 ? FLASH : LIGHT;
+      var haloA = flashing ? 0.30 : (tail > 0 ? 0.22 * tail : 0.10);
+      // glow: layered flat alpha discs, no gradients
+      ctx.fillStyle = haloCol;
+      ctx.globalAlpha = haloA * 0.45;
+      ctx.beginPath(); ctx.arc(p[0], p[1], 52 * s * sizeMul, 0, TAU); ctx.fill();
+      ctx.globalAlpha = haloA;
+      ctx.beginPath(); ctx.arc(p[0], p[1], 30 * s * sizeMul, 0, TAU); ctx.fill();
+      // puck body
+      ctx.fillStyle = BODY;
+      ctx.globalAlpha = 1;
+      ctx.beginPath(); ctx.arc(p[0], p[1], 16 * s * sizeMul, 0, TAU); ctx.fill();
+      // the light it carries
+      ctx.fillStyle = flashing ? FLASH : LIGHT;
+      ctx.globalAlpha = 0.95;
+      ctx.beginPath(); ctx.arc(p[0], p[1], 8 * s * sizeMul, 0, TAU); ctx.fill();
+      if (flashing) {
+        ctx.fillStyle = '#FFFFFF';
+        ctx.globalAlpha = 0.85;
+        ctx.beginPath(); ctx.arc(p[0], p[1], 3.5 * s * sizeMul, 0, TAU); ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  // ---------- pointer interaction ----------
+  function evPos(e) {
+    var rect = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    return toLogical(e.clientX - rect.left, e.clientY - rect.top);
+  }
+  function nearestMover(x, y) {
+    var best = -1, bd = 1e12, i, m, dx, dy, d;
+    for (i = 0; i < N_MOVERS; i++) {
+      m = state.movers[i];
+      dx = m.x - x; dy = m.y - y; d = dx * dx + dy * dy;
+      if (d < bd) { bd = d; best = i; }
+    }
+    return { idx: best, dist: Math.sqrt(bd) };
+  }
+  function onDown(e) {
+    var p = evPos(e);
+    // double-tap: jump to the next formation now, traces restart
+    if (state.step - lastTapStep < 42 && Math.abs(p[0] - lastTapX) < 90 && Math.abs(p[1] - lastTapY) < 90) {
+      var fo = formationAt(state, simT());
+      state.formBase = simT();
+      state.formStartIdx = fo.idx + 1;
+      state.lastFormIdx = fo.idx + 1;
+      clearTraces(state);
+      reseedCount++;
+      var fresh = createState(BASE_SEED + reseedCount * 104729);
+      for (var i = 0; i < N_MOVERS; i++) state.movers[i].rng = fresh.movers[i].rng;
+      lastTapStep = -100000;
+      grabIdx = -1;
+      draw();
+      return;
+    }
+    lastTapStep = state.step;
+    lastTapX = p[0]; lastTapY = p[1];
+    var near = nearestMover(p[0], p[1]);
+    if (near.dist < 80) {
+      grabIdx = near.idx;
+      grabX = p[0]; grabY = p[1];
+    }
+  }
+  function onMove(e) {
+    if (grabIdx < 0) return;
+    var p = evPos(e);
+    grabX = p[0]; grabY = p[1];
+  }
+  function onUp() { grabIdx = -1; }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+  }
+
+  // ---------- boot: pre-roll, frame one, live loop ----------
+  fit();
+  var s0;
+  for (s0 = 0; s0 < PREROLL; s0++) stepSim(state, -1, 0, 0);
+  draw();
+
+  if (typeof requestAnimationFrame !== 'undefined') {
+    var lastMs = null, acc = 0;
+    var loop = function (ms) {
+      if (lastMs === null) lastMs = ms;
+      var elapsed = (ms - lastMs) / 1000;
+      lastMs = ms;
+      if (elapsed > 0.25) elapsed = 0.25;
+      acc += elapsed;
+      var n = Math.floor(acc / STEP);
+      if (n > 30) n = 30;
+      acc -= n * STEP;
+      for (var i = 0; i < n; i++) stepSim(state, grabIdx, grabX, grabY);
+      if (n > 0) draw();
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>

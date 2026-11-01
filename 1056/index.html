@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sync Drift</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #050505; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded rng ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- palette (strict) ----------
+  var VOID = '#050505';
+  var BASE = [42, 46, 53];     // #2A2E35 dim, nearly off
+  var WARM = [255, 215, 94];   // #FFD75E aligned flash
+  var GRAY = [138, 147, 160];  // #8A93A0 lagging
+  var LOST = [30, 33, 38];     // #1E2126 barely lit
+
+  // ---------- sim constants ----------
+  var DT = 1 / 120;            // fixed sim step
+  var PREROLL = 3600;          // 30 s at 120 Hz: frame one lives at t = 30
+  var F0 = 0.25;               // master clock rate, cycles per second
+  var FIRE_PERIOD = 12;        // beacon fires every 12 s
+  var FIRST_FIRE = 4.5;        // fires at 4.5, 16.5, 28.5, ... so t=30 is 1.5 s after a fire
+  var RING_SPEED = 0.30;       // world units per second
+  var RING_BAND = 0.045;       // half-width of the correction band
+  var RING_LIFE = 3.2;         // seconds a ring stays active
+  var BASE_SEED = 1056217;
+
+  // beacon origin: off-center, never the exact middle
+  var ORIGIN = { x: 0.38, y: 0.42 };
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 720, H = 720, DPR = 1;
+  var phoneNow = false;
+
+  function isPhone() {
+    var sw = 0, sh = 0;
+    if (typeof window !== 'undefined' && window.screen) {
+      sw = window.screen.width || 0; sh = window.screen.height || 0;
+    }
+    var mn = Math.min(sw, sh);
+    if (mn > 0 && mn < 700) return true;
+    return H > W * 1.15; // aspect fallback only
+  }
+
+  function fit() {
+    var vv = (typeof window !== 'undefined') ? window.visualViewport : null;
+    if (vv && vv.width) { W = vv.width; H = vv.height; }
+    else if (typeof window !== 'undefined' && window.innerWidth) { W = window.innerWidth; H = window.innerHeight; }
+    DPR = (typeof window !== 'undefined' && window.devicePixelRatio) ? Math.min(window.devicePixelRatio, 2) : 1;
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    var p = isPhone();
+    if (p !== phoneNow) { phoneNow = p; buildField(); resetSim(); }
+  }
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', function () { fit(); draw(); });
+    }
+    if (window.addEventListener) {
+      window.addEventListener('resize', function () { fit(); draw(); });
+    }
+  }
+
+  // world: unit square, contain-fit, centered
+  function view() {
+    var s = Math.min(W, H);
+    return { s: s, ox: (W - s) / 2, oy: (H - s) / 2 };
+  }
+
+  // ---------- field construction (seeded) ----------
+  // node: {x, y (world), dist (to origin), edge (0..1 fade), p (phase, cycles),
+  //        drift (cycles/s), c (correction rate), recvEvery, recvPhase, lost, boost}
+  var nodes = [];
+
+  function buildField() {
+    var rng = mulberry32(BASE_SEED);
+    var spacing = phoneNow ? 0.083 : 0.070;
+    var dy = spacing * 0.8660254;
+    var x0 = 0.045, x1 = 0.955, y0 = 0.045, y1 = 0.955;
+    var list = [];
+    var row = 0;
+    for (var y = y0; y <= y1; y += dy, row++) {
+      var off = (row % 2 === 0) ? 0 : spacing / 2;
+      for (var x = x0 + off; x <= x1; x += spacing) {
+        var jx = x + (rng() - 0.5) * spacing * 0.7;
+        var jy = y + (rng() - 0.5) * dy * 0.7;
+        if (jx < 0.02 || jx > 0.98 || jy < 0.02 || jy > 0.98) continue;
+        var dx = jx - ORIGIN.x, dyy = jy - ORIGIN.y;
+        var dist = Math.sqrt(dx * dx + dyy * dyy);
+        // edge fade: full inside radius 0.52 of center, fading out to the corners
+        var cx = jx - 0.5, cy = jy - 0.5;
+        var cr = Math.sqrt(cx * cx + cy * cy);
+        var edge = 1 - Math.max(0, (cr - 0.46)) * 1.55;
+        if (edge < 0.12) edge = 0.12;
+
+        // drift: real error must accumulate between beacons, or the field locks
+        var u = rng();
+        var drift;
+        if (u < 0.78) {
+          var g = (rng() * 2 - 1);
+          drift = g * g * g * 0.048;              // typical |drift| ~0.012 cycles/s
+        } else if (u < 0.96) {
+          drift = (0.045 + rng() * 0.030) * (rng() < 0.5 ? -1 : 1); // stragglers
+        } else {
+          drift = (0.060 + rng() * 0.030) * (rng() < 0.5 ? -1 : 1); // lost: runs away
+        }
+        var lost = u >= 0.96;
+
+        // reception: packet loss means some nodes only hear some beacons
+        var v = rng();
+        var recvEvery, recvPhase;
+        if (lost) { recvEvery = 1000; recvPhase = 0; }
+        else if (v < 0.80) { recvEvery = 1; recvPhase = 0; }
+        else if (v < 0.94) { recvEvery = 2; recvPhase = Math.floor(rng() * 2); }
+        else { recvEvery = 3; recvPhase = Math.floor(rng() * 3); }
+
+        // correction rate: bounded pull while the ring band passes (a pass fixes
+        // roughly a third to two thirds of the error, never all of it)
+        var c = lost ? 0.12 : 1.2 + rng() * 2.0;
+
+        list.push({
+          x: jx, y: jy, dist: dist, edge: edge,
+          p: rng(),                       // phases start fully scattered
+          drift: drift, c: c,
+          recvEvery: recvEvery, recvPhase: recvPhase,
+          lost: lost, boost: 0
+        });
+      }
+    }
+    nodes = list;
+  }
+
+  // ---------- simulation ----------
+  var simTime = 0;
+  var beaconP = 0;
+  var fireT = -10;
+  var fireIndex = -1;
+  var nextFireT = FIRST_FIRE;
+  var ringActive = false;
+
+  function wrap1(x) { return x - Math.floor(x + 0.5); } // to [-0.5, 0.5)
+
+  function resetSim() {
+    simTime = 0;
+    beaconP = 0;
+    fireT = -10;
+    fireIndex = -1;
+    nextFireT = FIRST_FIRE;
+    ringActive = false;
+    for (var i = 0; i < nodes.length; i++) { nodes[i].boost = 0; }
+    for (var s = 0; s < PREROLL; s++) step();
+  }
+
+  function fireBeacon(now) {
+    fireT = now;
+    fireIndex++;
+    nextFireT = now + FIRE_PERIOD;
+    ringActive = true;
+  }
+
+  function step() {
+    simTime += DT;
+    if (simTime >= nextFireT - 1e-9) fireBeacon(nextFireT);
+    beaconP = (simTime * F0) % 1;
+
+    var ringR = -1;
+    if (ringActive) {
+      var age = simTime - fireT;
+      if (age > RING_LIFE) ringActive = false;
+      else ringR = age * RING_SPEED;
+    }
+
+    // radio interference: while the finger is down, phases scramble near it
+    var scr = pointer.active ? pointer : null;
+
+    for (var i = 0; i < nodes.length; i++) {
+      var n = nodes[i];
+      n.p += (F0 + n.drift) * DT;
+
+      if (ringR >= 0 && (fireIndex % n.recvEvery) === n.recvPhase) {
+        var d = Math.abs(n.dist - ringR);
+        if (d < RING_BAND) {
+          var err = wrap1(beaconP - n.p);
+          var k = 1 - Math.exp(-n.c * DT);
+          n.p += err * k;
+          var b = 1 - d / RING_BAND;
+          if (b > n.boost) n.boost = b;
+        }
+      }
+
+      if (scr) {
+        var pdx = n.x - scr.x, pdy = n.y - scr.y;
+        var pd = Math.sqrt(pdx * pdx + pdy * pdy);
+        if (pd < 0.13) {
+          var fall = 1 - pd / 0.13;
+          n.p += (noiseRng() - 0.5) * 7.0 * fall * DT;
+          n.boost = 0;
+        }
+      }
+
+      n.boost *= 0.9794; // exp(-2.5 * DT): the correction flash decays
+    }
+  }
+
+  var noiseRng = mulberry32(1056999);
+
+  // ---------- drawing ----------
+  function mixColor(e, boost) {
+    // brightness is phase information: sharp warm peak at alignment, gray tail, dim base
+    var cs = 0.5 + 0.5 * Math.cos(2 * Math.PI * e);
+    var sharp = Math.pow(cs, 14);
+    var mid = Math.pow(cs, 2);
+    var wWarm = sharp + boost * 0.55;
+    if (wWarm > 1) wWarm = 1;
+    var wGray = (mid - sharp) * 0.85;
+    if (wGray < 0) wGray = 0;
+    var wBase = 1 - wWarm - wGray;
+    if (wBase < 0) wBase = 0;
+    var r = Math.round(BASE[0] * wBase + GRAY[0] * wGray + WARM[0] * wWarm);
+    var g = Math.round(BASE[1] * wBase + GRAY[1] * wGray + WARM[1] * wWarm);
+    var b = Math.round(BASE[2] * wBase + GRAY[2] * wGray + WARM[2] * wWarm);
+    return 'rgb(' + r + ',' + g + ',' + b + ')';
+  }
+
+  function draw() {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = VOID;
+    ctx.fillRect(0, 0, W, H);
+    var v = view();
+    var i, n;
+
+    // the beacon ring: the mechanism, drawn plainly while it travels
+    if (ringActive) {
+      var age = simTime - fireT;
+      var rr = age * RING_SPEED * v.s;
+      ctx.globalAlpha = 0.16 * Math.max(0, 1 - age / RING_LIFE);
+      ctx.strokeStyle = 'rgb(255,215,94)';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.arc(v.ox + ORIGIN.x * v.s, v.oy + ORIGIN.y * v.s, rr, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+
+    var nodeR = v.s * 0.0088;
+    for (i = 0; i < nodes.length; i++) {
+      n = nodes[i];
+      var X = v.ox + n.x * v.s;
+      var Y = v.oy + n.y * v.s;
+      if (n.lost) {
+        // lost nodes: barely lit, flickering on their own runaway phase only
+        var fl = 0.55 + 0.45 * Math.cos(2 * Math.PI * n.p);
+        ctx.globalAlpha = n.edge * (0.35 + 0.30 * fl);
+        ctx.fillStyle = 'rgb(' + LOST[0] + ',' + LOST[1] + ',' + LOST[2] + ')';
+        ctx.beginPath();
+        ctx.arc(X, Y, nodeR * 0.85, 0, Math.PI * 2);
+        ctx.fill();
+        continue;
+      }
+      var e = wrap1(n.p - beaconP);
+      ctx.globalAlpha = n.edge;
+      ctx.fillStyle = mixColor(e, n.boost);
+      ctx.beginPath();
+      ctx.arc(X, Y, nodeR, 0, Math.PI * 2);
+      ctx.fill();
+      // correction flash: a slightly larger flat disc while the ring is working on the node
+      if (n.boost > 0.25) {
+        ctx.globalAlpha = n.edge * (n.boost - 0.25) * 0.5;
+        ctx.fillStyle = 'rgb(255,215,94)';
+        ctx.beginPath();
+        ctx.arc(X, Y, nodeR * 1.9, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    // the beacon itself: a small warm point at the origin, brightest just after a fire
+    var sinceFire = simTime - fireT;
+    var bp = (fireT > -1 && sinceFire < 1.2) ? 1 - sinceFire / 1.2 : 0;
+    ctx.globalAlpha = 0.55 + 0.45 * bp;
+    ctx.fillStyle = 'rgb(255,215,94)';
+    ctx.beginPath();
+    ctx.arc(v.ox + ORIGIN.x * v.s, v.oy + ORIGIN.y * v.s, nodeR * (0.9 + 0.5 * bp), 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- pointer interaction ----------
+  var pointer = { active: false, x: 0, y: 0 };
+  var downInfo = null;
+  var lastTapT = -10;
+
+  function toWorld(e) {
+    var rect = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    var v = view();
+    return {
+      x: ((e.clientX - rect.left) - v.ox) / v.s,
+      y: ((e.clientY - rect.top) - v.oy) / v.s,
+      px: e.clientX - rect.left,
+      py: e.clientY - rect.top
+    };
+  }
+
+  function onDown(e) {
+    var p = toWorld(e);
+    pointer.active = true;
+    pointer.x = p.x; pointer.y = p.y;
+    downInfo = { px: p.px, py: p.py, moved: false };
+  }
+  function onMove(e) {
+    if (!pointer.active) return;
+    var p = toWorld(e);
+    pointer.x = p.x; pointer.y = p.y;
+    if (downInfo && (Math.abs(p.px - downInfo.px) > 8 || Math.abs(p.py - downInfo.py) > 8)) downInfo.moved = true;
+  }
+  function onUp(e) {
+    pointer.active = false;
+    if (!downInfo) return;
+    var wasDrag = downInfo.moved;
+    downInfo = null;
+    if (wasDrag) return;
+    // a tap: only double-tap acts (fire the beacon now); a lone tap does nothing
+    if (simTime - lastTapT < 0.40) {
+      fireBeacon(simTime);
+      lastTapT = -10;
+      draw();
+    } else {
+      lastTapT = simTime;
+    }
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', function () { pointer.active = false; downInfo = null; });
+  }
+
+  // ---------- boot: build, pre-roll, frame one, live loop ----------
+  fit();
+  phoneNow = isPhone();
+  buildField();
+  resetSim();
+  draw();
+
+  if (typeof requestAnimationFrame !== 'undefined') {
+    var lastMs = null;
+    var loop = function (ms) {
+      if (lastMs === null) lastMs = ms;
+      var elapsed = (ms - lastMs) / 1000;
+      lastMs = ms;
+      if (elapsed > 0.25) elapsed = 0.25;
+      var steps = Math.floor(elapsed / DT);
+      if (steps > 30) steps = 30;
+      for (var i = 0; i < steps; i++) step();
+      draw();
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>

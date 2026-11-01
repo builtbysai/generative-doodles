@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rolling Shutter Parade</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #000000; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded rng ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- palette (strict) ----------
+  var VOID = '#000000';
+  var BAR = '#F5F5F0';
+  var BREAKRED = '#FF2A2A';
+  var RESIDUE = '#4DE3FF';
+
+  // ---------- sim constants ----------
+  var STEP = 1 / 120;          // fixed sim step, seconds
+  var PREROLL = 1440;          // 12 s at 120 Hz: frame one lives here, inside dwell A
+  var CYCLE = 52;              // master schedule length, seconds
+  var SAMPLE_KEEP = 1.7;       // seconds of strobe samples drawn per rotor
+  var GHOST_FADE = 20;         // seconds a captured residue pattern takes to fade
+  var BASE_SEED = 1057218;
+  var TAU = Math.PI * 2;
+
+  // Strobe frequency keyframes over the cycle: [time, Hz].
+  // Flat segments are dwells (about 8 s or more); ramps are sweeps.
+  // Breaks sit at 24-26.5 and 49-51.5: the strobe phase freezes there.
+  var KEYS = [
+    [0, 4.85], [14, 4.85],
+    [17, 6.30], [24, 6.30],
+    [26.5, 6.30], [30, 3.90],
+    [40, 3.90], [43, 5.55],
+    [49, 5.55], [51.5, 5.55],
+    [52, 4.85]
+  ];
+  // Cycle times where the current frozen pattern is captured as cyan residue:
+  // sweep starts and break ends (the pattern that just dissolved).
+  var CAPTURE_AT = [14, 26.5, 40, 51.5];
+
+  function cyc(t) { return ((t % CYCLE) + CYCLE) % CYCLE; }
+
+  function inBreak(t) {
+    var u = cyc(t);
+    return (u >= 24 && u < 26.5) || (u >= 49 && u < 51.5);
+  }
+
+  function strobeFreq(t) {
+    var u = cyc(t), i;
+    for (i = 0; i < KEYS.length - 1; i++) {
+      var a = KEYS[i], b = KEYS[i + 1];
+      if (u >= a[0] && u <= b[0]) {
+        if (b[0] === a[0]) return b[1];
+        var f = (u - a[0]) / (b[0] - a[0]);
+        return a[1] + (b[1] - a[1]) * f;
+      }
+    }
+    return KEYS[KEYS.length - 1][1];
+  }
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 720, H = 720, DPR = 1;
+
+  function isPhone() {
+    var sw = 0, sh = 0;
+    if (typeof window !== 'undefined' && window.screen) {
+      sw = window.screen.width || 0; sh = window.screen.height || 0;
+    }
+    var mn = Math.min(sw, sh);
+    if (mn > 0 && mn < 700) return true;
+    return H > W * 1.15; // aspect fallback only
+  }
+
+  function fit() {
+    var vv = (typeof window !== 'undefined') ? window.visualViewport : null;
+    if (vv && vv.width) { W = vv.width; H = vv.height; }
+    else if (typeof window !== 'undefined' && window.innerWidth) { W = window.innerWidth; H = window.innerHeight; }
+    DPR = (typeof window !== 'undefined' && window.devicePixelRatio) ? Math.min(window.devicePixelRatio, 2) : 1;
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+  }
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', function () { fit(); draw(); });
+    }
+    if (window.addEventListener) {
+      window.addEventListener('resize', function () { fit(); draw(); });
+    }
+  }
+
+  // World: a 1000 x 1000 square, contain-fit and centered. Hubs in unit coords.
+  function worldTransform() {
+    var side = Math.min(W, H);
+    return { side: side, ox: (W - side) / 2, oy: (H - side) / 2 };
+  }
+
+  // ---------- rotors ----------
+  // Hubs: a loose triangle. Speeds in revolutions per second, fixed per seed.
+  var HUBS = [
+    { x: 0.295, y: 0.315 },
+    { x: 0.705, y: 0.295 },
+    { x: 0.500, y: 0.685 }
+  ];
+  var rotors = [];   // {hub, bars, omega (rad/s), angle, samples: [{a, t}]}
+  var simTime = 0;
+  var strobePhase = 0;
+  var captures = []; // {t, angles: [[per-rotor sample angles], ...]}
+  var reseedCount = 0;
+
+  function buildRotors(seed) {
+    var rng = mulberry32(seed);
+    var speeds = [1.20, 1.75, 0.90]; // rev/s: the authored set for seed 0
+    rotors = [];
+    for (var i = 0; i < 3; i++) {
+      var f = speeds[i];
+      var bars = 5;
+      if (reseedCount > 0) {
+        f = 0.8 + rng() * 1.3;
+        bars = 4 + Math.floor(rng() * 3); // 4..6
+      }
+      rotors.push({
+        hub: HUBS[i],
+        bars: bars,
+        omega: f * TAU,
+        revs: f,
+        angle: rng() * TAU,
+        samples: []
+      });
+    }
+  }
+
+  // A residue capture: the recent strobe-sample angles of every rotor,
+  // frozen as one cyan pattern that fades over GHOST_FADE seconds.
+  function pushCapture(t, angleSets) {
+    captures.push({ t: t, angles: angleSets });
+    while (captures.length > 3) captures.shift();
+  }
+
+  function recentAngles(r, n) {
+    var out = [], s = r.samples, i;
+    for (i = Math.max(0, s.length - n); i < s.length; i++) out.push(s[i].a);
+    return out;
+  }
+
+  // Boot capture: the pattern a virtual strobe train at dwell-A frequency
+  // would have sampled in the 3 seconds before t = 0, so frame one already
+  // carries a faint residue of the pattern that came before.
+  function bootCapture() {
+    var sets = [];
+    for (var i = 0; i < rotors.length; i++) {
+      var r = rotors[i], arr = [], j;
+      for (j = 12; j >= 1; j--) arr.push(r.angle - r.omega * (j / 4.85));
+      sets.push(arr);
+    }
+    pushCapture(0, sets);
+  }
+
+  function crossedCapture(prevT, newT) {
+    // Fire when the cycle clock passes a CAPTURE_AT mark (wrap aware).
+    var a = cyc(prevT), b = cyc(newT), i, m;
+    for (i = 0; i < CAPTURE_AT.length; i++) {
+      m = CAPTURE_AT[i];
+      var hit = (a < b) ? (m > a && m <= b) : (m > a || m <= b);
+      if (hit && newT - prevT < 1) return true;
+    }
+    return false;
+  }
+
+  // ---------- fixed-step simulation ----------
+  function stepSim() {
+    var prevT = simTime;
+    simTime += STEP;
+    var i, r;
+    for (i = 0; i < rotors.length; i++) {
+      r = rotors[i];
+      r.angle += r.omega * STEP; // velocity is the instrument: no easing
+    }
+    if (!inBreak(simTime)) {
+      strobePhase += strobeFreq(simTime) * STEP;
+      if (strobePhase >= 1) {
+        strobePhase -= Math.floor(strobePhase);
+        for (i = 0; i < rotors.length; i++) {
+          rotors[i].samples.push({ a: rotors[i].angle, t: simTime });
+        }
+      }
+    }
+    // prune samples beyond the drawn window
+    for (i = 0; i < rotors.length; i++) {
+      var s = rotors[i].samples;
+      while (s.length && simTime - s[0].t > SAMPLE_KEEP) s.shift();
+    }
+    if (crossedCapture(prevT, simTime)) {
+      var sets = [];
+      for (i = 0; i < rotors.length; i++) sets.push(recentAngles(rotors[i], 12));
+      pushCapture(simTime, sets);
+    }
+    while (captures.length && simTime - captures[0].t > GHOST_FADE) captures.shift();
+  }
+
+  function resetSim(seed) {
+    buildRotors(seed);
+    simTime = 0;
+    strobePhase = 0;
+    captures = [];
+    bootCapture();
+    for (var s = 0; s < PREROLL; s++) stepSim();
+  }
+
+  // ---------- drawing ----------
+  function drawBars(cx, cy, len, bars, angle, color, alpha, width) {
+    ctx.strokeStyle = color;
+    ctx.globalAlpha = alpha;
+    ctx.lineWidth = width;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    for (var k = 0; k < bars; k++) {
+      var a = angle + (k * TAU) / bars;
+      ctx.moveTo(cx, cy);
+      ctx.lineTo(cx + Math.cos(a) * len, cy + Math.sin(a) * len);
+    }
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  function draw() {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = VOID;
+    ctx.fillRect(0, 0, W, H);
+    var tr = worldTransform();
+    var u = tr.side / 1000; // world unit to px
+    var barLen = 150 * u;
+    var barW = Math.max(2, 5.2 * u);
+    var brk = inBreak(simTime);
+    var i, j, r, cx, cy;
+
+    // 1) cyan residue: captured frozen patterns, fading
+    for (j = 0; j < captures.length; j++) {
+      var cap = captures[j];
+      var age = simTime - cap.t;
+      if (age < 0 || age > GHOST_FADE) continue;
+      var ca = 0.20 * (1 - age / GHOST_FADE);
+      if (ca <= 0.004) continue;
+      for (i = 0; i < rotors.length; i++) {
+        r = rotors[i];
+        cx = tr.ox + r.hub.x * tr.side;
+        cy = tr.oy + r.hub.y * tr.side;
+        var set = cap.angles[i] || [];
+        for (var q = 0; q < set.length; q++) {
+          drawBars(cx, cy, barLen, r.bars, set[q], RESIDUE, ca * 0.8, barW);
+        }
+      }
+    }
+
+    if (brk) {
+      // 2a) THE BREAK: the true spinning, in motion red, fully continuous
+      for (i = 0; i < rotors.length; i++) {
+        r = rotors[i];
+        cx = tr.ox + r.hub.x * tr.side;
+        cy = tr.oy + r.hub.y * tr.side;
+        drawBars(cx, cy, barLen, r.bars, r.angle - r.omega * 0.09, BREAKRED, 0.18, barW);
+        drawBars(cx, cy, barLen, r.bars, r.angle - r.omega * 0.045, BREAKRED, 0.35, barW);
+        drawBars(cx, cy, barLen, r.bars, r.angle, BREAKRED, 0.95, barW);
+        ctx.fillStyle = BREAKRED;
+        ctx.globalAlpha = 0.95;
+        ctx.beginPath(); ctx.arc(cx, cy, Math.max(2.5, 7 * u), 0, TAU); ctx.fill();
+        ctx.globalAlpha = 1;
+      }
+      return;
+    }
+
+    // 2b) faint true-motion ghosts: where the bars physically are, dim
+    for (i = 0; i < rotors.length; i++) {
+      r = rotors[i];
+      cx = tr.ox + r.hub.x * tr.side;
+      cy = tr.oy + r.hub.y * tr.side;
+      drawBars(cx, cy, barLen, r.bars, r.angle - r.omega * 0.10, BAR, 0.028, barW);
+      drawBars(cx, cy, barLen, r.bars, r.angle - r.omega * 0.05, BAR, 0.045, barW);
+      drawBars(cx, cy, barLen, r.bars, r.angle, BAR, 0.07, barW);
+    }
+
+    // 3) strobe samples: the apparent pattern. Newest sample brightest;
+    //    each sample is held near full for its first instants (the 2-frame
+    //    brightening) then decays. Bars only: the frame itself never flashes.
+    for (i = 0; i < rotors.length; i++) {
+      r = rotors[i];
+      cx = tr.ox + r.hub.x * tr.side;
+      cy = tr.oy + r.hub.y * tr.side;
+      var s = r.samples;
+      for (j = 0; j < s.length; j++) {
+        var ageS = simTime - s[j].t;
+        var al = 0.92 * Math.exp(-ageS / 0.55);
+        if (al < 0.02) continue;
+        drawBars(cx, cy, barLen, r.bars, s[j].a, BAR, al, barW);
+      }
+      // hub
+      ctx.fillStyle = BAR;
+      ctx.globalAlpha = 0.55;
+      ctx.beginPath(); ctx.arc(cx, cy, Math.max(2.5, 7 * u), 0, TAU); ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  // ---------- interaction: double-tap reseeds; everything else is inert
+  // (the prompt's rule: no interaction during the hold, do not break the spell)
+  var lastTapAt = -10;
+  function onTap() {
+    if (simTime - lastTapAt < 0.35) {
+      reseedCount++;
+      resetSim(BASE_SEED + reseedCount * 7919);
+      draw();
+      lastTapAt = -10;
+    } else {
+      lastTapAt = simTime;
+    }
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerup', onTap);
+  }
+
+  // ---------- boot: pre-roll, frame one, live loop ----------
+  fit();
+  resetSim(BASE_SEED);
+  draw();
+
+  if (typeof requestAnimationFrame !== 'undefined') {
+    var lastMs = null;
+    var loop = function (ms) {
+      if (lastMs === null) lastMs = ms;
+      var elapsed = (ms - lastMs) / 1000;
+      lastMs = ms;
+      if (elapsed > 0.25) elapsed = 0.25;
+      var steps = Math.floor(elapsed / STEP);
+      if (steps > 30) steps = 30;
+      for (var i = 0; i < steps; i++) stepSim();
+      draw();
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
