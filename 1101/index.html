@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Meandering River</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0D1418; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded RNG (mulberry32) ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(1101101);
+
+  // ---------- helpers ----------
+  function clamp(x, a, b) { return x < a ? a : (x > b ? b : x); }
+  function sstep(a, b, x) { var f = clamp((x - a) / (b - a), 0, 1); return f * f * (3 - 2 * f); }
+  function lerpC(c1, c2, f) {
+    return [c1[0] + (c2[0] - c1[0]) * f, c1[1] + (c2[1] - c1[1]) * f, c1[2] + (c2[2] - c1[2]) * f];
+  }
+  function rgba(c, a) {
+    return 'rgba(' + (c[0] | 0) + ',' + (c[1] | 0) + ',' + (c[2] | 0) + ',' + a + ')';
+  }
+  var TAU = Math.PI * 2;
+
+  // ---------- palette ----------
+  var TERRAIN = '#0D1418';
+  var BANK = '#16242B';
+  var CYAN = [63, 168, 201];    // #3FA8C9
+  var TEAL = [47, 224, 176];    // #2FE0B0
+  var GOLD = [232, 199, 125];   // #E8C77D
+  var PLUMEC = [245, 166, 107]; // #F5A66B
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var vw = 720, vh = 720, dpr = 1;
+  var stageSide = 720, offX = 0, offY = 0, isPhone = false;
+
+  function resize() {
+    var vv = window.visualViewport;
+    vw = (vv && vv.width) ? vv.width : window.innerWidth;
+    vh = (vv && vv.height) ? vv.height : window.innerHeight;
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.round(vw * dpr);
+    canvas.height = Math.round(vh * dpr);
+    canvas.style.width = vw + 'px';
+    canvas.style.height = vh + 'px';
+    var sw = (window.screen && window.screen.width) || vw;
+    var sh = (window.screen && window.screen.height) || vh;
+    isPhone = (Math.min(sw, sh) < 700) || (vh > vw * 1.15);
+    stageSide = Math.min(vw, vh);
+    offX = (vw - stageSide) / 2;
+    offY = (vh - stageSide) / 2;
+  }
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', resize);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // ---------- river geometry (closed-form in t, 60 s loop) ----------
+  var LOOP = 60;
+
+  function oxEnv(t) {
+    var lt = ((t % LOOP) + LOOP) % LOOP;
+    return sstep(34, 44, lt) * (1 - sstep(52, 59.5, lt));
+  }
+  function axisY(s) { return -0.04 + 1.08 * s; }
+  function meanderX(s, t) {
+    var u = clamp((s - 0.40) / 0.58, 0, 1);
+    var env = Math.pow(Math.sin(Math.PI * u), 0.8);
+    var amp = 0.060 * env * (0.8 + 0.2 * Math.sin(TAU * t / LOOP)) * (1 - 0.30 * oxEnv(t));
+    return amp * Math.sin(TAU * 1.6 * s + 0.8);
+  }
+  function axisX(s, t) { return 0.30 + 0.34 * s + meanderX(s, t); }
+  function braidEnv(s) { return sstep(0.0, 0.08, s) * (1 - sstep(0.42, 0.57, s)); }
+  function strandOff(i, s, t) {
+    return braidEnv(s) * 0.088 * Math.sin(TAU * (2.4 * s + i / 3) - TAU * (t / LOOP));
+  }
+  function center(i, s, t, out) {
+    out[0] = axisX(s, t) + strandOff(i, s, t);
+    out[1] = axisY(s);
+    return out;
+  }
+
+  // curl-noise potential: velocity = (dpsi/dy, -dpsi/dx), analytic
+  var CURL = [
+    { a: 1, b: 2, c: 1, A: 0.0011, ph: 0.7 },
+    { a: 2, b: -1, c: 2, A: 0.0008, ph: 2.9 },
+    { a: -2, b: 3, c: 3, A: 0.0006, ph: 5.1 }
+  ];
+  function curlVel(x, y, t) {
+    var vx = 0, vy = 0, k;
+    for (var j = 0; j < CURL.length; j++) {
+      k = CURL[j];
+      var ph = TAU * (k.a * x + k.b * y + k.c * (t / LOOP)) + k.ph;
+      var co = Math.cos(ph) * k.A * TAU;
+      vx += co * k.b;
+      vy += -co * k.a;
+    }
+    return [vx, vy];
+  }
+
+  // ---------- simulation state ----------
+  var DT = 1 / 30;
+  var simT = 0;
+  var NS = 57;
+  var samples = []; // main-axis samples for nearest-s lookup, rebuilt per step
+  var i;
+  for (i = 0; i < NS; i++) samples.push([0, 0]);
+
+  var pointer = { down: false, x: 0.5, y: 0.5, energy: 0 };
+
+  var NW = 300, NSED = 90, NPL = 30;
+  var particles = [];
+
+  function placeAt(p, s) {
+    var c = center(p.strand, clamp(s, 0, 1), simT, [0, 0]);
+    p.x = c[0] + (rng() * 2 - 1) * 0.008;
+    p.y = c[1] + (rng() * 2 - 1) * 0.008;
+    p.px = p.x; p.py = p.y;
+  }
+  var BENDS = [0.16, 0.30, 0.44, 0.70, 0.85];
+  function spawnWater(p, initial) {
+    p.type = 0; p.active = true;
+    p.strand = (rng() * 3) | 0;
+    p.lo = (rng() * 2 - 1) * 0.020;
+    p.speedF = 0.85 + rng() * 0.30;
+    p.age = 0; p.life = 34 + rng() * 14;
+    var s = (initial && rng() < 0.7) ? rng() * 0.98 : (-0.03 + rng() * 0.06);
+    placeAt(p, s);
+  }
+  function spawnSediment(p, initial) {
+    p.type = 1; p.active = true;
+    p.strand = (rng() * 3) | 0;
+    p.lo = (rng() * 2 - 1) * 0.016;
+    p.speedF = 0.70 + rng() * 0.20;
+    p.age = 0; p.life = 20 + rng() * 15;
+    var s = BENDS[(rng() * BENDS.length) | 0] + (rng() * 2 - 1) * 0.03;
+    if (initial && rng() < 0.5) s = rng() * 0.98;
+    placeAt(p, s);
+  }
+  function makeParticle() {
+    return { type: 0, active: false, strand: 0, lo: 0, speedF: 1, age: 0, life: 10,
+             x: 0, y: 0, px: 0, py: 0, spd: 0, vx: 0, vy: 0 };
+  }
+  for (i = 0; i < NW; i++) { var pw = makeParticle(); spawnWater(pw, true); particles.push(pw); }
+  for (i = 0; i < NSED; i++) { var ps = makeParticle(); spawnSediment(ps, true); particles.push(ps); }
+  var plumePool = [];
+  for (i = 0; i < NPL; i++) { var pp = makeParticle(); pp.type = 2; pp.active = false; plumePool.push(pp); particles.push(pp); }
+
+  // terrain patches (seeded, static)
+  var patches = [];
+  for (i = 0; i < 24; i++) {
+    patches.push({
+      x: -0.15 + rng() * 1.3, y: -0.15 + rng() * 1.3,
+      rx: 0.08 + rng() * 0.22, ry: 0.05 + rng() * 0.14,
+      col: rng() < 0.5 ? '#0B1116' : '#111A20',
+      a: 0.05 + rng() * 0.05
+    });
+  }
+
+  // ---------- flow field ----------
+  var tmpA = [0, 0], tmpB = [0, 0];
+  function fieldVel(p, t, out) {
+    // nearest s on main axis
+    var best = 1e9, bs = 0, j;
+    for (j = 0; j < NS; j++) {
+      var dx = p.x - samples[j][0], dy = p.y - samples[j][1];
+      var d2 = dx * dx + dy * dy;
+      if (d2 < best) { best = d2; bs = j / (NS - 1); }
+    }
+    var s = bs * 1.04 - 0.02;
+    // tangent along assigned strand
+    center(p.strand, clamp(s - 0.008, 0, 1), t, tmpA);
+    center(p.strand, clamp(s + 0.008, 0, 1), t, tmpB);
+    var tx = tmpB[0] - tmpA[0], ty = tmpB[1] - tmpA[1];
+    var tl = Math.sqrt(tx * tx + ty * ty) || 1;
+    tx /= tl; ty /= tl;
+    // target: strand center at s* + per-particle lateral home offset
+    center(p.strand, clamp(s, 0, 1), t, tmpA);
+    var gx = tmpA[0] + (-ty) * p.lo;
+    var gy = tmpA[1] + (tx) * p.lo;
+    var ax = (gx - p.x) * 2.2, ay = (gy - p.y) * 2.2;
+    var al = Math.sqrt(ax * ax + ay * ay);
+    if (al > 0.09) { ax *= 0.09 / al; ay *= 0.09 / al; }
+    var U = 0.060 * p.speedF;
+    var cv = curlVel(p.x, p.y, t);
+    var vx = tx * U + ax + cv[0];
+    var vy = ty * U + ay + cv[1];
+    // drag vortex
+    if (pointer.energy > 0.01) {
+      var vx2 = p.x - pointer.x, vy2 = p.y - pointer.y;
+      var d2 = vx2 * vx2 + vy2 * vy2;
+      var infl = Math.exp(-d2 / (2 * 0.09 * 0.09));
+      var dist = Math.sqrt(d2) || 1e-4;
+      var str = 0.35 * pointer.energy * infl;
+      vx += (-vy2 / dist) * str + (-vx2 / dist) * 0.06 * pointer.energy * infl;
+      vy += (vx2 / dist) * str + (-vy2 / dist) * 0.06 * pointer.energy * infl;
+    }
+    out[0] = vx; out[1] = vy;
+    return out;
+  }
+
+  var nextBurst = 0, burstIdx = 0;
+  function fireBurst(t) {
+    var sStation = (burstIdx % 2 === 0) ? 0.52 : 0.82;
+    burstIdx++;
+    var c = center(0, sStation, t, [0, 0]);
+    var n = 0;
+    for (var j = 0; j < plumePool.length && n < 16; j++) {
+      var p = plumePool[j];
+      if (p.active) continue;
+      p.active = true; p.type = 2;
+      p.x = c[0] + (rng() * 2 - 1) * 0.012;
+      p.y = c[1] + (rng() * 2 - 1) * 0.012;
+      p.px = p.x; p.py = p.y;
+      var ang = rng() * TAU, sp = 0.010 + rng() * 0.025;
+      p.vx = Math.cos(ang) * sp;
+      p.vy = Math.sin(ang) * sp + 0.020;
+      p.age = 0; p.life = 6.5;
+      n++;
+    }
+  }
+
+  var fv = [0, 0];
+  function step(dt) {
+    simT += dt;
+    var t = simT, j, p;
+    for (j = 0; j < NS; j++) {
+      var s = j / (NS - 1) * 1.04 - 0.02;
+      samples[j][0] = axisX(clamp(s, 0, 1), t);
+      samples[j][1] = axisY(clamp(s, 0, 1));
+    }
+    if (t >= nextBurst) { fireBurst(t); nextBurst += 10; }
+    // pointer vortex energy
+    if (pointer.down) pointer.energy += (1 - pointer.energy) * Math.min(1, dt * 6);
+    else pointer.energy *= Math.exp(-dt / 1.1);
+
+    for (j = 0; j < particles.length; j++) {
+      p = particles[j];
+      if (!p.active) continue;
+      p.px = p.x; p.py = p.y;
+      p.age += dt;
+      if (p.type === 2) {
+        fieldVel(p, t, fv);
+        var decay = Math.exp(-p.age * 0.55);
+        p.x += (p.vx * decay + fv[0] * 0.45) * dt;
+        p.y += (p.vy * decay + fv[1] * 0.45) * dt;
+        if (p.age > p.life) p.active = false;
+        continue;
+      }
+      fieldVel(p, t, fv);
+      p.x += fv[0] * dt;
+      p.y += fv[1] * dt;
+      p.spd = Math.sqrt(fv[0] * fv[0] + fv[1] * fv[1]);
+      if (p.y > 1.07 || p.x < -0.18 || p.x > 1.18 || p.age > p.life) {
+        if (p.type === 1) spawnSediment(p, false); else spawnWater(p, false);
+      }
+    }
+  }
+
+  // ---------- drawing ----------
+  function traceCenter(idx, s0, s1, t) {
+    var steps = 50, c = [0, 0];
+    for (var j = 0; j <= steps; j++) {
+      var s = s0 + (s1 - s0) * (j / steps);
+      center(idx, s, t, c);
+      if (j === 0) ctx.moveTo(c[0], c[1]); else ctx.lineTo(c[0], c[1]);
+    }
+  }
+
+  function draw() {
+    canvas.style.width = vw + 'px';
+    canvas.style.height = vh + 'px';
+    var t = simT;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = TERRAIN;
+    ctx.fillRect(0, 0, vw, vh);
+    ctx.translate(offX, offY);
+    ctx.scale(stageSide, stageSide);
+    var unit = 1 / (dpr * stageSide); // one device px in stage units
+    var lwF = isPhone ? 1.3 : 1.0;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+
+    // terrain body + soft patches
+    ctx.fillStyle = TERRAIN;
+    ctx.fillRect(-1, -1, 3, 3);
+    var j;
+    for (j = 0; j < patches.length; j++) {
+      var pa = patches[j];
+      ctx.save();
+      ctx.translate(pa.x, pa.y);
+      ctx.scale(pa.rx, pa.ry);
+      ctx.globalAlpha = pa.a;
+      ctx.fillStyle = pa.col;
+      ctx.beginPath();
+      ctx.arc(0, 0, 1, 0, TAU);
+      ctx.fill();
+      ctx.restore();
+    }
+    ctx.globalAlpha = 1;
+
+    // banks
+    ctx.strokeStyle = BANK;
+    ctx.globalAlpha = 0.95;
+    ctx.lineWidth = 0.080;
+    ctx.beginPath(); traceCenter(0, 0, 1, t); ctx.stroke();
+    ctx.globalAlpha = 0.8;
+    ctx.lineWidth = 0.052;
+    for (j = 0; j < 3; j++) { ctx.beginPath(); traceCenter(j, 0, 0.58, t); ctx.stroke(); }
+    ctx.globalAlpha = 1;
+
+    // river tint underlay (accumulated-density read)
+    ctx.strokeStyle = rgba(CYAN, 0.10);
+    ctx.lineWidth = 0.050;
+    ctx.beginPath(); traceCenter(0, 0, 1, t); ctx.stroke();
+    ctx.strokeStyle = rgba(TEAL, 0.06);
+    ctx.lineWidth = 0.022;
+    ctx.beginPath(); traceCenter(0, 0, 1, t); ctx.stroke();
+    ctx.strokeStyle = rgba(CYAN, 0.09);
+    ctx.lineWidth = 0.030;
+    for (j = 0; j < 3; j++) { ctx.beginPath(); traceCenter(j, 0, 0.58, t); ctx.stroke(); }
+
+    // oxbow crescent lake
+    var ox = oxEnv(t);
+    if (ox > 0.01) {
+      var oc = center(0, 0.70, t, [0, 0]);
+      var oxC = oc[0] + 0.052, oyC = oc[1];
+      for (j = 0; j < 24; j++) {
+        var ang = -1.75 + (j / 23) * 3.5;
+        var dxp = oxC + Math.cos(ang) * 0.034;
+        var dyp = oyC + Math.sin(ang) * 0.034;
+        var cc = (j % 3 === 0) ? GOLD : TEAL;
+        ctx.fillStyle = rgba(cc, ox * (0.30 + 0.30 * Math.abs(Math.sin(j * 2.7))));
+        ctx.beginPath();
+        ctx.arc(dxp, dyp, 0.0042, 0, TAU);
+        ctx.fill();
+      }
+    }
+
+    // particles: water + sediment as short segments prev->pos
+    ctx.lineWidth = 2.1 * unit * lwF;
+    for (j = 0; j < particles.length; j++) {
+      var p = particles[j];
+      if (!p.active || p.type === 2) continue;
+      if (p.type === 1) {
+        ctx.strokeStyle = rgba(GOLD, 0.85);
+      } else {
+        var f = clamp((p.spd - 0.03) / 0.09, 0, 1);
+        ctx.strokeStyle = rgba(lerpC(CYAN, TEAL, f), 0.68);
+      }
+      ctx.beginPath();
+      ctx.moveTo(p.px, p.py);
+      ctx.lineTo(p.x, p.y);
+      ctx.stroke();
+    }
+    // plume particles: soft layered dots
+    for (j = 0; j < plumePool.length; j++) {
+      var q = plumePool[j];
+      if (!q.active) continue;
+      var lf = 1 - q.age / q.life;
+      var al = 0.5 * Math.pow(Math.max(lf, 0), 0.7);
+      ctx.fillStyle = rgba(PLUMEC, al * 0.45);
+      ctx.beginPath(); ctx.arc(q.x, q.y, 0.011, 0, TAU); ctx.fill();
+      ctx.fillStyle = rgba(PLUMEC, al);
+      ctx.beginPath(); ctx.arc(q.x, q.y, 0.0055, 0, TAU); ctx.fill();
+    }
+
+    // functional tick marks along the right edge (marks only)
+    ctx.strokeStyle = rgba(CYAN, 0.30);
+    ctx.lineWidth = 1.2 * unit;
+    ctx.beginPath();
+    for (j = 1; j < 16; j++) {
+      var ty = j / 16;
+      var len = (j % 4 === 0) ? 0.028 : ((j % 2 === 0) ? 0.020 : 0.013);
+      ctx.moveTo(0.985 - len, ty);
+      ctx.lineTo(0.985, ty);
+    }
+    ctx.stroke();
+  }
+
+  // ---------- pointer (drag = stir) ----------
+  function toStage(e) {
+    var rect = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    return [ (e.clientX - rect.left - offX) / stageSide, (e.clientY - rect.top - offY) / stageSide ];
+  }
+  function pDown(e) { var s = toStage(e); pointer.x = s[0]; pointer.y = s[1]; pointer.down = true; }
+  function pMove(e) { if (!pointer.down) return; var s = toStage(e); pointer.x = s[0]; pointer.y = s[1]; }
+  function pUp() { pointer.down = false; }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', pDown);
+    canvas.addEventListener('pointermove', pMove);
+    canvas.addEventListener('pointerup', pUp);
+    canvas.addEventListener('pointercancel', pUp);
+    canvas.addEventListener('mousedown', pDown);
+    canvas.addEventListener('mousemove', pMove);
+    canvas.addEventListener('mouseup', pUp);
+  }
+
+  // ---------- run: fixed pre-roll, synchronous frame one, then rAF ----------
+  var PREROLL = 24; // simulated seconds before frame one
+  var steps = Math.round(PREROLL / DT);
+  for (i = 0; i < steps; i++) step(DT);
+  draw();
+
+  if (typeof requestAnimationFrame === 'function') {
+    var last = null, acc = 0;
+    var frame = function (now) {
+      if (last === null) last = now;
+      var el = Math.min((now - last) / 1000, 0.1);
+      last = now;
+      acc += el;
+      while (acc >= DT) { step(DT); acc -= DT; }
+      draw();
+      requestAnimationFrame(frame);
+    };
+    requestAnimationFrame(frame);
+  }
+})();
+</script>
+</body>
+</html>
