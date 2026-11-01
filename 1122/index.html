@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>RGBCMYKinetic</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #030304; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ---------- viewport (Visual Viewport API, with fallbacks) ----------
+  var W = 0, H = 0, DPR = 1;
+  function measure() {
+    var vv = window.visualViewport;
+    var w = vv ? vv.width : (window.innerWidth || 800);
+    var h = vv ? vv.height : (window.innerHeight || 800);
+    W = Math.max(50, Math.round(w));
+    H = Math.max(50, Math.round(h));
+    DPR = Math.min(2, window.devicePixelRatio || 1);
+  }
+  function fit() {
+    measure();
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+  }
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { fit(); });
+  }
+  window.addEventListener('resize', function () { fit(); });
+  window.addEventListener('orientationchange', function () { fit(); });
+
+  function isPhone() {
+    try {
+      var sw = window.screen ? window.screen.width : 0;
+      var sh = window.screen ? window.screen.height : 0;
+      var mn = Math.min(sw, sh);
+      if (mn > 0 && mn < 700) return true;
+    } catch (e) {}
+    return H > W * 1.15;
+  }
+
+  // ---------- seeded RNG ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- palette ----------
+  var VOID = '#030304';
+  var SILVER = '#D8DCE2';
+  var EDGE = '#1A1D22';
+  // pure beams only — every mixed colour on the floor is an additive overlap
+  var LIGHTS = [
+    { col: '#FF2A2A', fx: 0.18, fy: 1.22 },   // red, below frame left
+    { col: '#2AFF5A', fx: 0.50, fy: 1.34 },   // green, below frame centre
+    { col: '#2A5AFF', fx: 0.82, fy: 1.22 }    // blue, below frame right
+  ];
+
+  // ---------- disks ----------
+  var BASE_SEED = 20261122;
+  var seedSalt = 0;
+  var disks = [];   // normalized-space params, positions derived closed-form in t
+  // hand-placed bases (normalized) so the five always read as one drifting group
+  var BASES = [
+    { x: 0.30, y: 0.36 }, { x: 0.43, y: 0.27 }, { x: 0.56, y: 0.40 },
+    { x: 0.68, y: 0.30 }, { x: 0.50, y: 0.50 }
+  ];
+
+  function buildDisks() {
+    var rng = mulberry32((BASE_SEED + Math.imul(seedSalt + 1, 7919)) | 0);
+    disks = [];
+    for (var i = 0; i < 5; i++) {
+      var b = BASES[i];
+      disks.push({
+        bx: b.x + (rng() - 0.5) * 0.03,
+        by: b.y + (rng() - 0.5) * 0.03,
+        ax: 0.035 + rng() * 0.05,                 // Lissajous amplitudes (normalized)
+        ay: 0.018 + rng() * 0.032,
+        w1: (Math.PI * 2 / 40) * (0.8 + rng() * 0.4),   // ~40 s family
+        w2: (Math.PI * 2 / 40) * (0.55 + rng() * 0.5),
+        p1: rng() * Math.PI * 2,
+        p2: rng() * Math.PI * 2,
+        r: 0.058 + rng() * 0.028,                // radius, fraction of min(W,H)
+        squish: 0.36 + rng() * 0.22,             // base ellipse flatness (the tilt)
+        tiltPh: rng() * Math.PI * 2,
+        tiltSp: 0.05 + rng() * 0.06,             // slow tilt breathing
+        tiltLean: (rng() - 0.5) * 0.5,           // static lean: shifts pools sideways
+        rel: null                                // post-drag release offset {t, dx, dy}
+      });
+    }
+  }
+
+  function driftPos(d, t) {
+    return {
+      x: (d.bx + d.ax * Math.sin(d.w1 * t + d.p1)) * W,
+      y: (d.by + d.ay * Math.sin(d.w2 * t + d.p2)) * H
+    };
+  }
+  function diskPos(d, t) {
+    var p = driftPos(d, t);
+    if (dragDisk === d && dragPos) { return { x: dragPos.x, y: dragPos.y }; }
+    if (d.rel) {
+      var k = Math.exp(-(t - d.rel.t) / 1.15);   // ease back onto the drift path
+      if (k < 0.002) { d.rel = null; }
+      else { p.x += d.rel.dx * k; p.y += d.rel.dy * k; }
+    }
+    return p;
+  }
+  function tiltOf(d, t) {
+    return d.squish * (0.78 + 0.22 * Math.sin(d.tiltPh + d.tiltSp * t));
+  }
+
+  // ---------- interaction ----------
+  var curT = 0;
+  var dragDisk = null, dragPos = null, grabDX = 0, grabDY = 0, dragMoved = 0;
+  var downX = 0, downY = 0;
+  var lastTapT = -1e9, lastTapX = 0, lastTapY = 0;
+
+  function diskAt(x, y, t) {
+    var best = null, bestD = 1e18;
+    for (var i = 0; i < disks.length; i++) {
+      var p = diskPos(disks[i], t);
+      var r = disks[i].r * Math.min(W, H) * 1.5;
+      var dx = x - p.x, dy = y - p.y;
+      var dd = dx * dx + dy * dy;
+      if (dd < r * r && dd < bestD) { bestD = dd; best = disks[i]; }
+    }
+    return best;
+  }
+
+  canvas.addEventListener('pointerdown', function (e) {
+    downX = e.clientX; downY = e.clientY; dragMoved = 0;
+    var d = diskAt(e.clientX, e.clientY, curT);
+    if (d) {
+      var p = diskPos(d, curT);
+      dragDisk = d; dragPos = p;
+      grabDX = e.clientX - p.x; grabDY = e.clientY - p.y;
+      d.rel = null;
+      try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+    }
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (!dragDisk) return;
+    dragMoved += Math.abs(e.clientX - downX) + Math.abs(e.clientY - downY);
+    downX = e.clientX; downY = e.clientY;
+    dragPos = { x: e.clientX - grabDX, y: e.clientY - grabDY };
+  });
+  function endPointer(e) {
+    var now = performance.now() / 1000;
+    if (dragDisk) {
+      var dp = driftPos(dragDisk, curT);
+      dragDisk.rel = { t: curT, dx: dragPos.x - dp.x, dy: dragPos.y - dp.y };
+      dragDisk = null; dragPos = null;
+    }
+    var moved = Math.abs(e.clientX - lastTapX) + Math.abs(e.clientY - lastTapY);
+    if (now - lastTapT < 0.32 && moved < 48 && dragMoved < 24) {
+      seedSalt++;                                 // double-tap: reseed the drift
+      buildDisks();
+      lastTapT = -1e9;
+    } else {
+      lastTapT = now; lastTapX = e.clientX; lastTapY = e.clientY;
+    }
+  }
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', function () { dragDisk = null; dragPos = null; });
+  canvas.addEventListener('dblclick', function () { seedSalt++; buildDisks(); });
+
+  // ---------- draw ----------
+  function ellipse(x, y, rx, ry) {
+    ctx.beginPath();
+    ctx.ellipse(x, y, Math.max(0.1, rx), Math.max(0.1, ry), 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  function draw(t) {
+    curT = t;
+    canvas.style.width = W + 'px';    // pin CSS size (house rule)
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = VOID;
+    ctx.fillRect(0, 0, W, H);
+
+    var minD = Math.min(W, H);
+    var floorY = H * 0.70;            // top edge of the invisible floor plane
+    var poolLineY = H * 0.815;        // representative floor depth pools land on
+    var pos = [], i, j, d, p;
+    for (i = 0; i < disks.length; i++) pos.push(diskPos(disks[i], t));
+
+    ctx.globalCompositeOperation = 'lighter';
+
+    // volumetric beams: stacked translucent triangles, source -> disk edges.
+    // Clipped at the floor line: the shafts live between floor and disks,
+    // never spilling under the invisible plane.
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, 0, W, poolLineY + H * 0.05);
+    ctx.clip();
+    for (j = 0; j < LIGHTS.length; j++) {
+      var L = LIGHTS[j], lx = L.fx * W, ly = L.fy * H;
+      ctx.fillStyle = L.col;
+      for (i = 0; i < disks.length; i++) {
+        d = disks[i]; p = pos[i];
+        var r = d.r * minD;
+        ctx.globalAlpha = 0.020;
+        ctx.beginPath();
+        ctx.moveTo(lx, ly);
+        ctx.lineTo(p.x - r * 1.25, p.y + r * 0.2);
+        ctx.lineTo(p.x + r * 1.25, p.y + r * 0.2);
+        ctx.closePath(); ctx.fill();
+        ctx.globalAlpha = 0.038;
+        ctx.beginPath();
+        ctx.moveTo(lx, ly);
+        ctx.lineTo(p.x - r * 0.8, p.y + r * 0.15);
+        ctx.lineTo(p.x + r * 0.8, p.y + r * 0.15);
+        ctx.closePath(); ctx.fill();
+      }
+    }
+    ctx.restore();
+
+    // floor pools: each disk projects each light onto the floor line.
+    // Layered concentric ellipses fake the soft falloff; 'lighter' makes the
+    // overlaps add honestly (R+G -> yellow, R+G+B -> near white).
+    var LAYERS = [ [1.0, 0.10], [0.74, 0.15], [0.50, 0.20], [0.29, 0.26] ];
+    for (i = 0; i < disks.length; i++) {
+      d = disks[i]; p = pos[i];
+      var dr = d.r * minD;
+      var hgt = Math.max(0, Math.min(1, (floorY - p.y) / (H * 0.55)));  // height above floor
+      var tilt = tiltOf(d, t);
+      for (j = 0; j < LIGHTS.length; j++) {
+        var Lj = LIGHTS[j], sx = Lj.fx * W, sy = Lj.fy * H;
+        var tt = (poolLineY - sy) / (p.y - sy);
+        var px = sx + tt * (p.x - sx) + d.tiltLean * dr * 1.1;
+        var py = poolLineY + (1 - hgt) * H * 0.045;
+        var prx = dr * (1.35 + 1.5 * hgt) * (0.85 + 0.3 * (1 - tilt));
+        var pry = prx * 0.30;
+        ctx.fillStyle = Lj.col;
+        for (var q = 0; q < LAYERS.length; q++) {
+          ctx.globalAlpha = LAYERS[q][1];
+          ellipse(px, py, prx * LAYERS[q][0], pry * LAYERS[q][0]);
+        }
+      }
+    }
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+
+    // shadow cuts: a disk edge slices a hard dark wedge across the pools
+    for (i = 0; i < disks.length; i += 2) {
+      d = disks[i]; p = pos[i];
+      var dr2 = d.r * minD;
+      var lean = d.tiltLean * dr2 * 1.1;
+      ctx.fillStyle = VOID;
+      ctx.globalAlpha = 0.5;
+      ctx.beginPath();
+      ctx.moveTo(p.x + dr2 * 0.55, p.y + dr2 * tiltOf(d, t) * 0.5);
+      ctx.lineTo(p.x + lean + dr2 * 1.5, poolLineY + H * 0.055);
+      ctx.lineTo(p.x + lean + dr2 * 2.35, poolLineY + H * 0.055);
+      ctx.closePath(); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // the disks themselves: silver ellipses, dark rim, one specular tick
+    for (i = 0; i < disks.length; i++) {
+      d = disks[i]; p = pos[i];
+      var rr = d.r * minD, sq = tiltOf(d, t);
+      ctx.fillStyle = EDGE;                       // dark under-rim, a hair low
+      ellipse(p.x, p.y + rr * sq * 0.16 + 1.5, rr, rr * sq);
+      ctx.fillStyle = SILVER;
+      ellipse(p.x, p.y, rr, rr * sq);
+      ctx.strokeStyle = EDGE;
+      ctx.lineWidth = 1.6;
+      ctx.beginPath();
+      ctx.ellipse(p.x, p.y, rr, rr * sq, 0, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.strokeStyle = 'rgba(255,255,255,0.6)';   // specular tick
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.ellipse(p.x, p.y, rr * 0.62, rr * sq * 0.62, 0, Math.PI * 1.15, Math.PI * 1.45);
+      ctx.stroke();
+    }
+  }
+
+  // ---------- run: deterministic first frame, then guarded rAF ----------
+  fit();
+  buildDisks();
+  var T0 = 14.0;                       // fixed phase: disks mid-drift, pools merged
+  draw(T0);
+  var t0 = null;
+  function frame(ts) {
+    if (t0 === null) t0 = ts;
+    draw(T0 + (ts - t0) / 1000);       // anchored: fixed phase + elapsed
+    if (typeof window.requestAnimationFrame === 'function') {
+      window.requestAnimationFrame(frame);
+    }
+  }
+  if (typeof window.requestAnimationFrame === 'function') {
+    window.requestAnimationFrame(frame);
+  }
+})();
+</script>
+</body>
+</html>

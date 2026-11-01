@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kinetic Rain</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #07090E; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded RNG ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  var seed = 1120;
+  try {
+    var m = /[?&]seed=(\d+)/.exec(location.search || '');
+    if (m) seed = parseInt(m[1], 10);
+  } catch (e) {}
+
+  // ---------- palette ----------
+  var VOID = '#07090E';
+  var AMBIENT = 'rgb(22,32,46)';        // #16202E
+  var SHADOW = [90, 63, 34];            // #5A3F22
+  var BRONZE = [192, 138, 62];          // #C08A3E
+  var SPEC = [255, 217, 160];           // #FFD9A0
+  var ECHO = 'rgb(192,138,62)';
+
+  var BUCKETS = 28;
+  var bucketColor = [];
+  (function () {
+    for (var b = 0; b < BUCKETS; b++) {
+      var f = b / (BUCKETS - 1);        // 0 = lowest/darkest, 1 = highest/brightest
+      var c;
+      if (f < 0.5) {
+        var g = f * 2;
+        c = [SHADOW[0] + (BRONZE[0] - SHADOW[0]) * g,
+             SHADOW[1] + (BRONZE[1] - SHADOW[1]) * g,
+             SHADOW[2] + (BRONZE[2] - SHADOW[2]) * g];
+      } else {
+        var g2 = (f - 0.5) * 2;
+        c = [BRONZE[0] + (SPEC[0] - BRONZE[0]) * g2,
+             BRONZE[1] + (SPEC[1] - BRONZE[1]) * g2,
+             BRONZE[2] + (SPEC[2] - BRONZE[2]) * g2];
+      }
+      bucketColor.push('rgb(' + Math.round(c[0]) + ',' + Math.round(c[1]) + ',' + Math.round(c[2]) + ')');
+    }
+  })();
+
+  // ---------- phone detection ----------
+  var sw = (window.screen && window.screen.width) || 0;
+  var sh = (window.screen && window.screen.height) || 0;
+  var minScreen = Math.min(sw || 9999, sh || 9999);
+  var isPhone = minScreen < 700;
+
+  // ---------- the two arrays ----------
+  var COLS = isPhone ? 28 : 40;
+  var ROWS = isPhone ? 18 : 24;
+  var N = COLS * ROWS * 2;
+
+  var dU = new Float32Array(N);   // global x across both arrays, 0..1
+  var du = new Float32Array(N);   // local x within its array, 0..1
+  var dv = new Float32Array(N);   // depth: 0 = back, 1 = front
+  var dR = new Float32Array(N);   // polar radius around its array's centre
+  var dT = new Float32Array(N);   // polar angle around its array's centre
+  (function () {
+    var i = 0;
+    for (var a = 0; a < 2; a++) {
+      for (var r = 0; r < ROWS; r++) {
+        for (var c = 0; c < COLS; c++) {
+          var u = COLS === 1 ? 0.5 : c / (COLS - 1);
+          var v = ROWS === 1 ? 0.5 : r / (ROWS - 1);
+          dU[i] = (a + u) / 2;
+          du[i] = u;
+          dv[i] = v;
+          var dx = u - 0.5, dy = (v - 0.5) * 0.8;
+          dR[i] = Math.sqrt(dx * dx + dy * dy);
+          dT[i] = Math.atan2(dy, dx);
+          i++;
+        }
+      }
+    }
+  })();
+
+  // per-frame scratch
+  var sxA = new Float32Array(N);
+  var syA = new Float32Array(N);
+  var srA = new Float32Array(N);
+  var bucketLists = [];
+  for (var b0 = 0; b0 < BUCKETS; b0++) bucketLists.push([]);
+
+  // ---------- the choreography score (reseedable) ----------
+  var scoreSeed = seed;
+  var P = null;
+  function buildScore(s) {
+    var rnd = mulberry32((s * 7919 + 17) | 0);
+    P = {
+      // swell: two travelling plane waves over the whole double field
+      a1: 1.1 + rnd() * 0.7, b1: 0.6 + rnd() * 0.6, w1: 1.5 + rnd() * 0.5, ph1: rnd() * 6.283,
+      a2: 0.5 + rnd() * 0.5, b2: -(0.8 + rnd() * 0.7), w2: 1.0 + rnd() * 0.5, ph2: rnd() * 6.283,
+      // peak / trough: a gaussian whose centre orbits inside each array
+      orbR: 0.14 + rnd() * 0.12, orbW: 0.55 + rnd() * 0.35, sig: 0.055 + rnd() * 0.035,
+      ripW: 1.8 + rnd() * 0.8,
+      // spiral: arms winding around each array's centre
+      arms: rnd() < 0.5 ? 2 : 3, radF: 3.2 + rnd() * 1.6, spW: 1.6 + rnd() * 0.7
+    };
+  }
+  buildScore(scoreSeed);
+
+  var TAU = Math.PI * 2;
+  function clampH(h) { return h < -1 ? -1 : h > 1 ? 1 : h; }
+
+  function hSwell(i, t) {
+    return clampH(0.88 * (0.72 * Math.sin(TAU * (P.a1 * dU[i] + P.b1 * dv[i]) - P.w1 * t + P.ph1)
+                        + 0.42 * Math.sin(TAU * (P.a2 * dU[i] + P.b2 * dv[i]) - P.w2 * t + P.ph2)));
+  }
+  function gauss(i, t, sign) {
+    // centre orbits per array; arrays are told apart by dU (array 0: U<0.5)
+    var arr = dU[i] < 0.5 ? 0 : 1;
+    var cx = 0.5 + P.orbR * Math.sin(P.orbW * t + arr * Math.PI);
+    var cy = 0.5 + P.orbR * Math.cos(P.orbW * 0.83 * t + arr * 2.1);
+    var dx = du[i] - cx, dy = (dv[i] - cy) * 0.8;
+    var g = Math.exp(-(dx * dx + dy * dy) / P.sig);
+    var rip = 0.16 * Math.sin(TAU * (1.5 * du[i] + 1.2 * dv[i]) - P.ripW * t);
+    return clampH(sign * (1.6 * g - 0.45) + rip);
+  }
+  function hPeak(i, t) { return gauss(i, t, 1); }
+  function hTrough(i, t) { return gauss(i, t, -1); }
+  function hSpiral(i, t) {
+    return clampH(0.9 * Math.sin(P.arms * dT[i] + P.radF * TAU * dR[i] * 0.32 - P.spW * t)
+                      * (1 - 0.55 * Math.min(1, dR[i] / 0.65))
+                  + 0.14 * Math.sin(TAU * 1.2 * dU[i] - 1.1 * t));
+  }
+  var PHRASES = [hSwell, hPeak, hSpiral, hTrough];
+
+  var LOOP = 25, SEG = LOOP / 4, FADE = 1.6;
+  function smooth(x) { return x <= 0 ? 0 : x >= 1 ? 1 : x * x * (3 - 2 * x); }
+  function heightAt(i, t) {
+    var cyc = t % LOOP;
+    var seg = Math.floor(cyc / SEG);
+    var ft = cyc - seg * SEG;
+    var h = PHRASES[seg](i, t);
+    if (ft > SEG - FADE) {
+      var w = smooth((ft - (SEG - FADE)) / FADE);
+      h = h + (PHRASES[(seg + 1) % 4](i, t) - h) * w;
+    }
+    return h;
+  }
+
+  // ---------- drag disturbance: recorded impulses, closed-form spring response ----------
+  var impulses = [];   // {x, y, t, s} in pixels / piece-seconds
+  function impulseResponse(i, t) {
+    if (!impulses.length) return 0;
+    var add = 0;
+    var sig2 = 2 * Math.pow(Math.min(W, H) * 0.15, 2);
+    for (var k = 0; k < impulses.length; k++) {
+      var im = impulses[k];
+      var tau = t - im.t;
+      if (tau < 0 || tau > 3) continue;
+      var dx = sxA[i] - im.x, dy = syA[i] - im.y;
+      var fall = Math.exp(-(dx * dx + dy * dy) / sig2);
+      if (fall < 0.01) continue;
+      add += im.s * fall * Math.exp(-2.3 * tau) * Math.sin(TAU * tau / 0.85);
+    }
+    return add;
+  }
+
+  // ---------- view / canvas ----------
+  var canvas = document.getElementById('stage');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0;
+
+  function viewW() {
+    if (window.visualViewport && window.visualViewport.width) return window.visualViewport.width;
+    return window.innerWidth || 800;
+  }
+  function viewH() {
+    if (window.visualViewport && window.visualViewport.height) return window.visualViewport.height;
+    return window.innerHeight || 800;
+  }
+  function fit() {
+    W = viewW(); H = viewH();
+    canvas.width = W; canvas.height = H;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+  }
+
+  var T0 = 3.0;   // fixed first-frame phase: squarely inside the swell
+
+  function draw(t) {
+    fit();
+    ctx.fillStyle = VOID;
+    ctx.fillRect(0, 0, W, H);
+
+    // faint cool ambient, low in the hall (flat layered ellipses, no gradients)
+    ctx.fillStyle = AMBIENT;
+    ctx.globalAlpha = 0.05;
+    ctx.beginPath(); ctx.arc(W / 2, H * 1.25, W * 0.62, 0, TAU); ctx.fill();
+    ctx.globalAlpha = 0.05;
+    ctx.beginPath(); ctx.arc(W / 2, H * 1.25, W * 0.42, 0, TAU); ctx.fill();
+    ctx.globalAlpha = 1;
+
+    var gap = W * 0.03;
+    var aw = (W - gap) / 2;
+    var px = Math.min(W, H) / 720;
+    if (px < 0.8) px = 0.8; else if (px > 1.6) px = 1.6;
+
+    var b, i;
+    for (b = 0; b < BUCKETS; b++) bucketLists[b].length = 0;
+
+    for (i = 0; i < N; i++) {
+      var a = dU[i] < 0.5 ? 0 : 1;
+      var x0 = a * (aw + gap);
+      var x = x0 + du[i] * aw;
+      var v = dv[i];
+      var baseY = H * (0.16 + 0.64 * Math.pow(v, 1.3));
+      // base (undisturbed) position is needed before the impulse response,
+      // which measures distance from the droplet's resting place
+      sxA[i] = x;
+      syA[i] = baseY;
+      var h = heightAt(i, t) + impulseResponse(i, t);
+      if (h > 1.15) h = 1.15; else if (h < -1.15) h = -1.15;
+      var y = baseY - h * H * (0.085 + 0.05 * v);
+      syA[i] = y;
+      srA[i] = (1.9 + 1.9 * v) * px;
+      var bi = Math.round((0.5 + 0.5 * h) * (BUCKETS - 1));
+      if (bi < 0) bi = 0; else if (bi >= BUCKETS) bi = BUCKETS - 1;
+      bucketLists[bi].push(i);
+    }
+
+    // soft reflections below each droplet
+    ctx.fillStyle = ECHO;
+    ctx.globalAlpha = 0.09;
+    ctx.beginPath();
+    for (i = 0; i < N; i++) {
+      ctx.moveTo(sxA[i] + srA[i] * 0.62, syA[i] + srA[i] * 3.4);
+      ctx.arc(sxA[i], syA[i] + srA[i] * 3.4, srA[i] * 0.62, 0, TAU);
+    }
+    ctx.fill();
+    ctx.globalAlpha = 1;
+
+    // droplets, batched by brightness bucket
+    for (b = 0; b < BUCKETS; b++) {
+      var list = bucketLists[b];
+      if (!list.length) continue;
+      ctx.fillStyle = bucketColor[b];
+      ctx.beginPath();
+      for (var j = 0; j < list.length; j++) {
+        i = list[j];
+        ctx.moveTo(sxA[i] + srA[i] * 0.86, syA[i] - srA[i] * 0.28);
+        ctx.arc(sxA[i], syA[i] - srA[i] * 0.28, srA[i] * 0.86, 0, TAU);
+        ctx.moveTo(sxA[i] + srA[i] * 0.62, syA[i] + srA[i] * 0.55);
+        ctx.arc(sxA[i], syA[i] + srA[i] * 0.55, srA[i] * 0.62, 0, TAU);
+      }
+      ctx.fill();
+    }
+  }
+
+  // ---------- interaction: drag disturbs, double-tap reseeds the score ----------
+  var lastT = T0;
+  var dragging = false, lastX = 0, lastY = 0, lastTap = 0;
+
+  function pushImpulse(x, y, dy) {
+    var s = dy / 26;
+    if (s > 1) s = 1; else if (s < -1) s = -1;
+    if (Math.abs(s) < 0.25) s = dy === 0 ? 0.35 : 0.25 * Math.sign(dy);
+    impulses.push({ x: x, y: y, t: lastT, s: s });
+    if (impulses.length > 24) impulses.splice(0, impulses.length - 24);
+    for (var k = impulses.length - 1; k >= 0; k--) {
+      if (lastT - impulses[k].t > 3.2) impulses.splice(k, 1);
+    }
+  }
+  function reseed() {
+    scoreSeed += 1;
+    buildScore(scoreSeed);
+  }
+  function onDown(e) {
+    if (!e) return;
+    dragging = true;
+    lastX = e.clientX || 0; lastY = e.clientY || 0;
+    var now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+    if (now && now - lastTap < 320) reseed();
+    lastTap = now;
+    pushImpulse(lastX, lastY, 10);
+  }
+  function onMove(e) {
+    if (!dragging || !e) return;
+    var x = e.clientX || 0, y = e.clientY || 0;
+    var dx = x - lastX, dy = y - lastY;
+    if (Math.abs(dx) + Math.abs(dy) > 6) pushImpulse(x, y, dy);
+    lastX = x; lastY = y;
+  }
+  function onUp() { dragging = false; }
+
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+    canvas.addEventListener('dblclick', reseed);
+  }
+  if (window.addEventListener) {
+    window.addEventListener('resize', function () { draw(lastT); });
+  }
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { draw(lastT); });
+  }
+
+  // ---------- run: synchronous fixed-phase first frame, then guarded rAF ----------
+  draw(T0);
+
+  var startStamp = null;
+  function frame(stamp) {
+    if (startStamp === null) startStamp = stamp;
+    var t = T0 + (stamp - startStamp) / 1000;
+    lastT = t;
+    draw(t);
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+  }
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

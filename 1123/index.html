@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Reflective Kinematronic</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #05060A; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+/* No.1123 "Reflective Kinematronic" — Joachim Sauter study block JS4.
+   Sauter's Mobility (Shanghai 2010) abstracted to pure mirrors: a 10 x 10
+   grid of small square mirrors on an unseen wall, each turning on its own
+   axis at its own seeded speed. One light source sits off-frame left;
+   every mirror throws one warm spot into the dark around the grid — the
+   room exists only where the spots land. Every 45 s the mirrors ease
+   together into one common angle and the hundred spots converge into a
+   single blazing field, hold a breath, and scatter again. Dragging across
+   the grid stirs the nearby mirrors faster for a few seconds. Double-tap
+   reseeds speeds and phases. Everything unattended is a closed-form
+   function of piece time t; frame one is a fixed phase mid-scatter. */
+
+var TAU = Math.PI * 2;
+
+/* ---------- seeded rng (determinism: no Math.random, no wall clock) ------- */
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function hash2(a, b) {
+  var h = (a ^ Math.imul(b + 1, 0x9E3779B1)) >>> 0;
+  h = Math.imul(h ^ (h >>> 15), 0x85EBCA6B) >>> 0;
+  return (h ^ (h >>> 13)) >>> 0;
+}
+var SEED = 112317;
+(function () {
+  var m = /[?&]seed=(\d+)/.exec((typeof location !== 'undefined' && location.search) || '');
+  if (m) SEED = parseInt(m[1], 10) >>> 0;
+})();
+
+/* ---------- palette ------------------------------------------------------ */
+var COL = {
+  ground: '#05060A',
+  spot: [255, 246, 222],        // warm white #FFF6DE
+  white: [255, 255, 255],       // merged field #FFFFFF
+  tileLo: [24, 27, 33],         // mirror tile, edge-on
+  tileHi: [46, 50, 60],         // mirror tile, catching light
+  glint: [232, 237, 245]        // edge glint #E8EDF5
+};
+function rgba(c, a) { return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a + ')'; }
+function lerpC(c0, c1, f) {
+  return [Math.round(c0[0] + (c1[0] - c0[0]) * f),
+          Math.round(c0[1] + (c1[1] - c0[1]) * f),
+          Math.round(c0[2] + (c1[2] - c0[2]) * f)];
+}
+function smooth(a, b, x) {
+  var f = Math.max(0, Math.min(1, (x - a) / (b - a)));
+  return f * f * (3 - 2 * f);
+}
+
+/* ---------- the mirrors ----------------------------------------------------
+   Per mirror: base phase, own slow speed (some counter-rotating), a seeded
+   radial fraction for where its spot lands, a seeded spot size, and a
+   seeded jitter used only inside the aligned field. Geometry (grid cell
+   centres) is derived from the stage at draw time, so it is seed-free.   */
+var N = 10;
+var mirrors = [];
+function buildMirrors(seed) {
+  var r = mulberry32(seed);
+  mirrors = [];
+  for (var i = 0; i < N * N; i++) {
+    var sp = 0.05 + r() * 0.22;                    // rad/s, slow
+    if (r() < 0.42) sp = -sp;                      // some turn the other way
+    mirrors.push({
+      row: Math.floor(i / N), col: i % N,
+      phase: r() * TAU,
+      speed: sp,
+      rad: 0.16 + r() * 0.86,                      // scatter radius fraction
+      size: 0.8 + r() * 0.55,
+      jx: (r() - 0.5) * 2, jy: (r() - 0.5) * 2     // aligned-field jitter
+    });
+  }
+}
+buildMirrors(SEED);
+
+/* ---------- sizing -------------------------------------------------------- */
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var vw = 300, vh = 300, dpr = 1, phone = false;
+var PHASE = 12.0;                 // frame one: mid-scatter, well before the
+var T = PHASE;                    // first alignment (37 s into the loop)
+
+function fit() {
+  var vv = (typeof window !== 'undefined' && window.visualViewport) ? window.visualViewport : null;
+  vw = vv ? vv.width : (window.innerWidth || 300);
+  vh = vv ? vv.height : (window.innerHeight || 300);
+  dpr = Math.min(2, (typeof window !== 'undefined' && window.devicePixelRatio) || 1);
+  var sw = (typeof window !== 'undefined' && window.screen) ? window.screen.width : vw;
+  var sh = (typeof window !== 'undefined' && window.screen) ? window.screen.height : vh;
+  phone = (Math.min(sw, sh) < 700) || (vh > vw * 1.15);
+  canvas.width = Math.round(vw * dpr);
+  canvas.height = Math.round(vh * dpr);
+  canvas.style.width = vw + 'px';
+  canvas.style.height = vh + 'px';
+}
+if (typeof window !== 'undefined') {
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { fit(); draw(); });
+  }
+  window.addEventListener('resize', function () { fit(); draw(); });
+}
+fit();
+
+/* stage: centred square; the grid is a centred geometric composition, so it
+   holds on phones too and the page ground is the piece's own black. */
+function stage() {
+  var S = Math.min(vw, vh);
+  return { w: S, h: S, ox: (vw - S) / 2, oy: (vh - S) / 2 };
+}
+/* grid rect in stage fractions: the middle 44 % of the stage */
+var G0 = 0.28, G1 = 0.72;
+function cellCenter(m, st) {
+  var f = (G1 - G0) / N;
+  return {
+    x: st.ox + (G0 + (m.col + 0.5) * f) * st.w,
+    y: st.oy + (G0 + (m.row + 0.5) * f) * st.h,
+    cell: f * st.w
+  };
+}
+
+/* ---------- interaction ----------------------------------------------------
+   Dragging across the grid records stir impulses; each impulse lends the
+   mirrors near it a temporary extra angle — a closed-form bump in time,
+   (dt/tau)*exp(1-dt/tau), which rises for ~1.1 s and relaxes over ~5 s,
+   so a stirred mirror spins faster and then settles back to its own
+   speed. Double-tap reseeds speeds and phases. A single tap does nothing.
+   Never click-to-reload.                                                */
+var impulses = [];                // {x, y, t} in CSS px / piece time
+var downInfo = null;
+var lastTapT = -10;
+var dragging = false, lastImp = null;
+function evPos(e) {
+  var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+  return [e.clientX - r.left, e.clientY - r.top];
+}
+function addImpulse(x, y) {
+  impulses.push({ x: x, y: y, t: T });
+  if (impulses.length > 48) impulses.splice(0, impulses.length - 48);
+  lastImp = { x: x, y: y };
+}
+if (canvas.addEventListener) {
+  canvas.addEventListener('pointerdown', function (e) {
+    var p = evPos(e);
+    downInfo = { x: p[0], y: p[1], t: T };
+    dragging = true;
+    addImpulse(p[0], p[1]);
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (!dragging) return;
+    var p = evPos(e);
+    if (!lastImp || Math.abs(p[0] - lastImp.x) + Math.abs(p[1] - lastImp.y) > 14) {
+      addImpulse(p[0], p[1]);
+    }
+  });
+  var endPress = function (e) {
+    dragging = false;
+    if (downInfo) {
+      var p = evPos(e);
+      var moved = Math.abs(p[0] - downInfo.x) + Math.abs(p[1] - downInfo.y);
+      if (moved < 8 && T - downInfo.t < 0.45) {              // a tap
+        if (T - lastTapT < 0.32) {                           // double-tap
+          SEED = hash2(SEED, Math.floor(T * 10) + 1);
+          buildMirrors(SEED);
+          impulses = [];
+          lastTapT = -10;
+        } else lastTapT = T;
+      }
+      downInfo = null;
+    }
+  };
+  canvas.addEventListener('pointerup', endPress);
+  canvas.addEventListener('pointercancel', function () { dragging = false; downInfo = null; });
+}
+/* extra angle a stir impulse lends mirror at (mx, my), at piece time t */
+function stirAngle(mx, my, t) {
+  var st = stage(), S = st.w, extra = 0;
+  for (var i = 0; i < impulses.length; i++) {
+    var im = impulses[i], dt = t - im.t;
+    if (dt <= 0 || dt > 7) continue;
+    var dx = mx - im.x, dy = my - im.y, d = Math.sqrt(dx * dx + dy * dy);
+    var prox = Math.exp(-Math.pow(d / (0.17 * S), 2));
+    if (prox < 0.02) continue;
+    var u = dt / 1.1;
+    extra += prox * 1.5 * u * Math.exp(1 - u);
+  }
+  return extra;
+}
+
+/* ---------- the light ------------------------------------------------------
+   The source sits off-frame to the left. A mirror at angle theta reflects
+   it to direction phi = PHI0 + 2*theta; the spot lands along that ray from
+   the stage centre at the mirror's seeded radius. Brightness falls with
+   the angle between the reflected ray and the light's main axis.        */
+var PHI0 = 0.9;                   // reflection offset (light from the left)
+var AXIS = -0.55;                 // main axis of the thrown light
+var ALIGN_PHI = -2.5;             // common reflected direction when aligned
+var LOOP = 45;                    // alignment scheduler period, seconds
+function alignWeight(t) {
+  var p = t % LOOP;
+  if (p < 37) return 0;
+  if (p < 39.5) return smooth(37, 39.5, p);        // ease together, ~2.5 s
+  if (p < 40.5) return 1;                          // one held breath
+  if (p < 43) return 1 - smooth(40.5, 43, p);      // release
+  return 0;
+}
+function thetaOf(m, t, mx, my) {
+  return m.phase + m.speed * t + stirAngle(mx, my, t);
+}
+
+/* ---------- draw ----------------------------------------------------------- */
+function draw() {
+  var st = stage();
+  var S = st.w;
+  var cx = st.ox + 0.5 * st.w, cy = st.oy + 0.5 * st.h;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = COL.ground;
+  ctx.fillRect(0, 0, vw, vh);
+
+  var t = T;
+  var w = alignWeight(t);
+  var gx0 = st.ox + G0 * st.w, gx1 = st.ox + G1 * st.w;
+  var gy0 = st.oy + G0 * st.h, gy1 = st.oy + G1 * st.h;
+  var alignX = cx + Math.cos(ALIGN_PHI) * 0.38 * S;
+  var alignY = cy + Math.sin(ALIGN_PHI) * 0.38 * S;
+
+  /* the spots: three layered alpha circles each, 'lighter' so that where
+     spots cross they add toward white. No gradients — softness is alpha. */
+  ctx.globalCompositeOperation = 'lighter';
+  for (var i = 0; i < mirrors.length; i++) {
+    var m = mirrors[i];
+    var cc = cellCenter(m, st);
+    var th = thetaOf(m, t, cc.x, cc.y);
+    var phi = PHI0 + 2 * th;
+    var sx = cx + Math.cos(phi) * 0.48 * vw * m.rad;
+    var sy = cy + Math.sin(phi) * 0.48 * vh * m.rad;
+    /* keep spots off the grid itself: a landing that falls inside the
+       grid rect is pushed out along its own ray from the centre, to just
+       beyond the rect with a seeded extra step */
+    if (sx > gx0 - 4 && sx < gx1 + 4 && sy > gy0 - 4 && sy < gy1 + 4) {
+      var dx = sx - cx, dy = sy - cy;
+      var hw = (gx1 - gx0) / 2 + 8, hh = (gy1 - gy0) / 2 + 8;
+      var kx = Math.abs(dx) > 1 ? hw / Math.abs(dx) : 1e9;
+      var ky = Math.abs(dy) > 1 ? hh / Math.abs(dy) : 1e9;
+      var kk = Math.min(kx, ky) * (1 + 0.12 * m.size);
+      sx = cx + dx * kk;
+      sy = cy + dy * kk;
+    }
+    if (w > 0) {  // converge into the one field
+      var fx = alignX + m.jx * 0.038 * S, fy = alignY + m.jy * 0.038 * S;
+      sx += (fx - sx) * w;
+      sy += (fy - sy) * w;
+    }
+    var b = 0.30 + 0.70 * Math.pow(Math.max(0, Math.cos(phi - AXIS)), 1.5);
+    b = b * (1 - w) + 1.12 * w;
+    var rBase = S * 0.016 * m.size * (1 + 0.18 * w);
+    var col = w > 0.55 ? COL.white : COL.spot;
+    ctx.fillStyle = rgba(col, 0.050 * b);
+    ctx.beginPath(); ctx.arc(sx, sy, rBase * 2.3, 0, TAU); ctx.fill();
+    ctx.fillStyle = rgba(col, 0.095 * b);
+    ctx.beginPath(); ctx.arc(sx, sy, rBase * 1.45, 0, TAU); ctx.fill();
+    ctx.fillStyle = rgba(col, 0.24 * b);
+    ctx.beginPath(); ctx.arc(sx, sy, rBase, 0, TAU); ctx.fill();
+  }
+  ctx.globalCompositeOperation = 'source-over';
+
+  /* the mirrors: small squares whose drawn width narrows with |cos theta|
+     as they turn on their vertical axes; the face brightens and one edge
+     glints as it comes square to the light. */
+  for (var j = 0; j < mirrors.length; j++) {
+    var mm = mirrors[j];
+    var c2 = cellCenter(mm, st);
+    var th2 = thetaOf(mm, t, c2.x, c2.y);
+    var face = Math.abs(Math.cos(th2));
+    var size = c2.cell * 0.74;
+    var wid = size * (0.34 + 0.66 * face);
+    ctx.fillStyle = rgba(lerpC(COL.tileLo, COL.tileHi, face), 1);
+    ctx.fillRect(c2.x - wid / 2, c2.y - size / 2, wid, size);
+    var ga = Math.pow(face, 2) * 0.9;
+    if (ga > 0.03) {
+      ctx.fillStyle = rgba(COL.glint, ga);
+      ctx.fillRect(c2.x - wid / 2, c2.y - size / 2, Math.max(1, S * 0.0016), size);
+      ctx.fillStyle = rgba(COL.glint, ga * 0.45);
+      ctx.fillRect(c2.x - wid / 2, c2.y - size / 2, wid, Math.max(1, S * 0.0012));
+    }
+  }
+
+  /* a whisper of vignette: three inset strokes of black, flat alpha */
+  ctx.strokeStyle = 'rgba(0,0,0,0.20)';
+  ctx.lineWidth = Math.max(2, S * 0.012);
+  ctx.strokeRect(0, 0, vw, vh);
+  ctx.strokeStyle = 'rgba(0,0,0,0.12)';
+  ctx.strokeRect(S * 0.03, S * 0.03, vw - S * 0.06, vh - S * 0.06);
+}
+
+/* Sound: none. The piece ships silent; a room of mirrors makes no noise
+   worth inventing. */
+
+/* ---------- main loop ------------------------------------------------------ */
+draw();
+var lastTs = -1;
+function frame(ts) {
+  if (lastTs < 0) lastTs = ts;
+  T = PHASE + (ts - lastTs) / 1000;
+  draw();
+  requestAnimationFrame(frame);
+}
+if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+</script>
+</body>
+</html>
