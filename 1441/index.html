@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Brush Meets Needle</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #d8d2c8; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // Seeded PRNG (mulberry32), never Math.random, so every loop is reproducible.
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  var rand = mulberry32(1441000);
+
+  // Palette (prompt-specced).
+  var GROUND = '#d8d2c8', VINYL = '#141414', SHEEN = '#3a3a3a',
+      LABEL = '#f2ead8', WOOD = '#8a5a2a', BRISTLE = '#2a1a0a';
+  var COLOURS = ['#1a8a7a', '#7a8a2a', '#6a2a6a', '#b84a1a', '#3a5a8a',
+                 '#c88a2a', '#5a7a3a', '#8a5a7a', '#2a9aaa', '#d89a1a',
+                 '#7a1a2a', '#7aaa6a'];
+
+  // Geometry constants (fractions of record radius R, angles in degrees,
+  // screen coords: x = cos, y = sin, so 90 deg is the bottom of the frame).
+  var RP = 0.80;            // painted arc radius, on the record's outer third
+  var TH_START = 130, TH_END = 60;   // brush sweep, lower-left to lower-right
+  var PIV_X = 1.02, PIV_Y = -0.55;   // tonearm pivot, upper right of record
+  var APPROACH = 8, HOLD = 1.2, RET = 1.0;   // seconds; meeting at ~8 s
+  var OMEGA = Math.PI * 2 / 24;      // slow record rotation, rad per approach-second
+
+  // Hand wobble for the painted arc: one seeded jitter per 2-degree segment,
+  // stable across loops (the error stays visible, never smoothed out).
+  var JIT = [];
+  for (var k = 0; k <= 36; k++) { JIT.push((rand() - 0.5) * 0.012); }
+
+  function round4(x) { return Math.round(x * 10000) / 10000; }
+  function rad(d) { return d * Math.PI / 180; }
+  function smooth(p) { return p * p * (3 - 2 * p); }
+  function clamp(x, lo, hi) { return x < lo ? lo : (x > hi ? hi : x); }
+  function wrapDeg(d) {
+    while (d > 180) { d -= 360; }
+    while (d < -180) { d += 360; }
+    return d;
+  }
+
+  // Layout from the visual viewport; recomputed on resize.
+  var W = 0, H = 0, CX = 0, CY = 0, R = 0, PIV = null, ARM_LEN = 0, PHI0 = 0, PHI1 = 0, MEET = null;
+  function layout() {
+    var vv = (typeof window !== 'undefined') ? window.visualViewport : null;
+    var w = (vv && vv.width) ? vv.width : window.innerWidth;
+    var h = (vv && vv.height) ? vv.height : window.innerHeight;
+    W = w; H = h;
+    CX = w / 2; CY = h / 2;
+    R = Math.min(0.65 * h, 0.92 * w) / 2;
+    PIV = { x: CX + PIV_X * R, y: CY + PIV_Y * R };
+    MEET = { x: CX + RP * R * Math.cos(rad(TH_END)),
+             y: CY + RP * R * Math.sin(rad(TH_END)) };
+    var dx = MEET.x - PIV.x, dy = MEET.y - PIV.y;
+    ARM_LEN = Math.sqrt(dx * dx + dy * dy);
+    PHI1 = Math.atan2(dy, dx);
+    PHI0 = PHI1 - rad(21.6);
+  }
+  function resize() {
+    var vv = (typeof window !== 'undefined') ? window.visualViewport : null;
+    var w = (vv && vv.width) ? vv.width : window.innerWidth;
+    var h = (vv && vv.height) ? vv.height : window.innerHeight;
+    canvas.width = w; canvas.height = h;
+    canvas.style.width = w + 'px'; canvas.style.height = h + 'px';
+    layout();
+    draw(nowT);
+  }
+
+  // Drag events: {t, mult}. The approach rate multiplier changes only here.
+  var dragEvents = [];
+  var curMult = 1;
+
+  // Closed-form state at time t, from the event list only (no frame state).
+  function stateAt(t) {
+    var phase = 'approach', p = 0, col = 0, appSec = 0, retQ = 0;
+    var time = 0, mult = 1, ei = 0, phaseEnd = Infinity, guard = 0;
+    while (time < t && guard++ < 100000) {
+      while (ei < dragEvents.length && dragEvents[ei].t <= time) { mult = dragEvents[ei].mult; ei++; }
+      var nextT = (ei < dragEvents.length) ? dragEvents[ei].t : Infinity;
+      if (phase === 'approach') {
+        var rate = mult / APPROACH;
+        var need = (1 - p) / rate;
+        var segEnd = Math.min(nextT, t, time + need);
+        var dt = segEnd - time;
+        if (dt > 0) { p += rate * dt; appSec += mult * dt; time = segEnd; }
+        if (p >= 1 - 1e-9) {
+          p = 1; phase = 'hold'; phaseEnd = time + HOLD;
+          if (time >= t) { break; }
+          continue;
+        }
+        if (segEnd === nextT && nextT < t) { continue; }
+        break;
+      } else if (phase === 'hold') {
+        var segH = Math.min(nextT, t, phaseEnd);
+        time = segH;
+        if (time >= phaseEnd - 1e-9) {
+          phase = 'return'; phaseEnd = time + RET; retQ = 0;
+          if (time >= t) { break; }
+          continue;
+        }
+        if (segH === nextT && nextT < t) { continue; }
+        break;
+      } else {
+        var segR = Math.min(nextT, t, phaseEnd);
+        retQ = (segR - (phaseEnd - RET)) / RET;
+        time = segR;
+        if (time >= phaseEnd - 1e-9) {
+          phase = 'approach'; p = 0; col += 1; retQ = 0;
+          if (time >= t) { break; }
+          continue;
+        }
+        if (segR === nextT && nextT < t) { continue; }
+        break;
+      }
+    }
+    if (p > 1) { p = 1; }
+    if (p < 0) { p = 0; }
+    return { phase: phase, p: p, col: col, rot: appSec * OMEGA, retQ: retQ };
+  }
+
+  function brushTip(s) {
+    var th = rad(TH_START - s * (TH_START - TH_END));
+    return { x: CX + RP * R * Math.cos(th), y: CY + RP * R * Math.sin(th), th: th };
+  }
+  function armTip(s) {
+    var ph = PHI0 + s * (PHI1 - PHI0);
+    return { x: PIV.x + ARM_LEN * Math.cos(ph), y: PIV.y + ARM_LEN * Math.sin(ph), ph: ph };
+  }
+
+  function draw(t) {
+    var st = stateAt(t);
+    var s;
+    if (st.phase === 'approach') { s = smooth(st.p); }
+    else if (st.phase === 'hold') { s = 1; }
+    else { s = 1 - smooth(st.retQ); }
+    var colour = COLOURS[((st.col % 12) + 12) % 12];
+    var arcAlpha = (st.phase === 'return') ? 1 - smooth(st.retQ) : 1;
+    var tip = brushTip(s);
+    var arm = armTip(s);
+
+    // Ground.
+    ctx.fillStyle = GROUND;
+    ctx.fillRect(0, 0, W, H);
+
+    // Vinyl disc.
+    ctx.beginPath();
+    ctx.arc(CX, CY, R, 0, Math.PI * 2);
+    ctx.fillStyle = VINYL;
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(CX, CY, R, 0, Math.PI * 2);
+    ctx.strokeStyle = SHEEN;
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    // Groove circles.
+    ctx.strokeStyle = SHEEN;
+    ctx.lineWidth = 1;
+    for (var gi = 0; gi < 14; gi++) {
+      var gr = R * (0.36 + gi * 0.045);
+      ctx.beginPath();
+      ctx.arc(CX, CY, gr, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    // Rotating sheen arcs and label marker: the rotation made visible.
+    var rot = st.rot;
+    ctx.lineWidth = 2;
+    var sheenR = [0.50, 0.68, 0.90];
+    for (var si = 0; si < sheenR.length; si++) {
+      ctx.beginPath();
+      ctx.arc(CX, CY, R * sheenR[si], rot + si * 2.1, rot + si * 2.1 + 0.45);
+      ctx.stroke();
+    }
+    // Label.
+    ctx.beginPath();
+    ctx.arc(CX, CY, R * 0.32, 0, Math.PI * 2);
+    ctx.fillStyle = LABEL;
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(CX + R * 0.20 * Math.cos(rot), CY + R * 0.20 * Math.sin(rot), Math.max(2, R * 0.03), 0, Math.PI * 2);
+    ctx.fillStyle = VINYL;
+    ctx.fill();
+
+    // Tone indicator: a faint ring pulsing at 2 Hz while apart, gone on contact.
+    if (st.phase === 'approach') {
+      var pulse = 0.10 + 0.08 * (0.5 + 0.5 * Math.sin(t * Math.PI * 4));
+      ctx.beginPath();
+      ctx.arc(CX, CY, R * 0.36, 0, Math.PI * 2);
+      ctx.strokeStyle = 'rgba(242,234,216,' + round4(pulse) + ')';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+
+    // Painted arc: from the brush start angle down to the current tip angle,
+    // drawn as short wobbling segments (hand-drawn, never a perfect arc).
+    if (arcAlpha > 0.001) {
+      var thCur = TH_START - s * (TH_START - TH_END);
+      ctx.beginPath();
+      var first = true;
+      for (var a = TH_START; a >= thCur - 0.01; a -= 2) {
+        var aa = Math.max(a, thCur);
+        var idx = Math.round((TH_START - aa) / 2);
+        var rr = RP * R + JIT[Math.min(idx, JIT.length - 1)] * R;
+        var px = CX + rr * Math.cos(rad(aa));
+        var py = CY + rr * Math.sin(rad(aa));
+        if (first) { ctx.moveTo(px, py); first = false; }
+        else { ctx.lineTo(px, py); }
+      }
+      ctx.strokeStyle = colour;
+      ctx.globalAlpha = round4(arcAlpha);
+      ctx.lineWidth = Math.max(3, R * 0.035);
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+      // Paint blob at the tip.
+      ctx.beginPath();
+      ctx.arc(tip.x, tip.y, Math.max(3, R * 0.03), 0, Math.PI * 2);
+      ctx.fillStyle = colour;
+      ctx.fill();
+    }
+
+    // Brush: handle from the tip outward, bristle wedge at the tip.
+    var hx = Math.cos(tip.th), hy = Math.sin(tip.th);
+    ctx.beginPath();
+    ctx.moveTo(tip.x, tip.y);
+    ctx.lineTo(tip.x + hx * R * 0.42, tip.y + hy * R * 0.42);
+    ctx.strokeStyle = WOOD;
+    ctx.lineWidth = Math.max(4, R * 0.045);
+    ctx.lineCap = 'round';
+    ctx.stroke();
+    var tx = Math.sin(tip.th), ty = -Math.cos(tip.th); // travel direction (decreasing angle)
+    ctx.beginPath();
+    ctx.moveTo(tip.x, tip.y);
+    ctx.lineTo(tip.x + tx * R * 0.06 + hy * R * 0.02, tip.y + ty * R * 0.06 - hx * R * 0.02);
+    ctx.lineTo(tip.x + tx * R * 0.06 - hy * R * 0.02, tip.y + ty * R * 0.06 + hx * R * 0.02);
+    ctx.closePath();
+    ctx.fillStyle = BRISTLE;
+    ctx.fill();
+
+    // Tonearm: pivot upper right, arm to the needle tip, headshell at the tip.
+    ctx.beginPath();
+    ctx.moveTo(PIV.x, PIV.y);
+    ctx.lineTo(arm.x, arm.y);
+    ctx.strokeStyle = VINYL;
+    ctx.lineWidth = Math.max(3, R * 0.022);
+    ctx.lineCap = 'round';
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(PIV.x, PIV.y, Math.max(4, R * 0.05), 0, Math.PI * 2);
+    ctx.fillStyle = VINYL;
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(PIV.x, PIV.y, Math.max(4, R * 0.05), 0, Math.PI * 2);
+    ctx.strokeStyle = LABEL;
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.save();
+    ctx.translate(arm.x, arm.y);
+    ctx.rotate(arm.ph);
+    ctx.fillStyle = VINYL;
+    ctx.fillRect(-R * 0.055, -R * 0.018, R * 0.11, R * 0.036);
+    ctx.restore();
+    ctx.beginPath();
+    ctx.arc(arm.x, arm.y, Math.max(2, R * 0.018), 0, Math.PI * 2);
+    ctx.fillStyle = VINYL;
+    ctx.fill();
+  }
+
+  // Interaction: drag the brush. Moving the pointer along the sweep direction
+  // (decreasing angle, toward the needle) hurries the meeting; moving it back
+  // prolongs the music. The loop never restarts mid-approach on release.
+  var nowT = 0;
+  var dragging = false, prevAng = 0, pointerSeen = false;
+  function pointerPos(e) {
+    var x = (e.clientX !== undefined) ? e.clientX : (e.pageX || 0);
+    var y = (e.clientY !== undefined) ? e.clientY : (e.pageY || 0);
+    return { x: x, y: y };
+  }
+  function brushGeometryAt(t) {
+    var st = stateAt(t);
+    var s = (st.phase === 'approach') ? smooth(st.p) : (st.phase === 'hold' ? 1 : 1 - smooth(st.retQ));
+    var tip = brushTip(s);
+    var mid = { x: tip.x + Math.cos(tip.th) * R * 0.21, y: tip.y + Math.sin(tip.th) * R * 0.21 };
+    return { tip: tip, mid: mid };
+  }
+  function onDown(e) {
+    if (e.type && e.type.indexOf('pointer') === 0) { pointerSeen = true; }
+    if (e.type && e.type.indexOf('mouse') === 0 && pointerSeen) { return; }
+    var pos = pointerPos(e);
+    var g = brushGeometryAt(nowT);
+    var dTip = Math.sqrt((pos.x - g.tip.x) * (pos.x - g.tip.x) + (pos.y - g.tip.y) * (pos.y - g.tip.y));
+    var dMid = Math.sqrt((pos.x - g.mid.x) * (pos.x - g.mid.x) + (pos.y - g.mid.y) * (pos.y - g.mid.y));
+    if (Math.min(dTip, dMid) < Math.max(48, R * 0.18)) {
+      dragging = true;
+      prevAng = Math.atan2(pos.y - CY, pos.x - CX) * 180 / Math.PI;
+    }
+  }
+  function onMove(e) {
+    if (e.type && e.type.indexOf('mouse') === 0 && pointerSeen) { return; }
+    if (!dragging) { return; }
+    var pos = pointerPos(e);
+    var a = Math.atan2(pos.y - CY, pos.x - CX) * 180 / Math.PI;
+    var d = wrapDeg(a - prevAng);
+    prevAng = a;
+    var mult;
+    if (d < -0.5) { mult = 2.5; }       // toward the needle: hurry the meeting
+    else if (d > 0.5) { mult = 0.25; }  // away from the needle: prolong the music
+    else { mult = 1; }
+    if (mult !== curMult) {
+      curMult = mult;
+      dragEvents.push({ t: nowT, mult: mult });
+    }
+  }
+  function onUp(e) {
+    if (e.type && e.type.indexOf('mouse') === 0 && pointerSeen) { return; }
+    if (dragging) {
+      dragging = false;
+      if (curMult !== 1) {
+        curMult = 1;
+        dragEvents.push({ t: nowT, mult: 1 });
+      }
+    }
+  }
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('pointerdown', onDown);
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    if (typeof PointerEvent === 'undefined') {
+      window.addEventListener('mousedown', onDown);
+      window.addEventListener('mousemove', onMove);
+      window.addEventListener('mouseup', onUp);
+    }
+    window.addEventListener('resize', resize);
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', resize);
+    }
+  }
+  if (canvas.style) { canvas.style.touchAction = 'none'; }
+
+  // Boot: frame one is draw(0) synchronously; the clock starts with the rAF loop.
+  var started = false, startTime = 0;
+  function loop(ts) {
+    if (!started) { started = true; startTime = ts; }
+    nowT = (ts - startTime) / 1000;
+    draw(nowT);
+    if (typeof requestAnimationFrame === 'function') { requestAnimationFrame(loop); }
+  }
+  resize();
+  draw(0);
+  if (typeof requestAnimationFrame === 'function') { requestAnimationFrame(loop); }
+})();
+</script>
+</body>
+</html>

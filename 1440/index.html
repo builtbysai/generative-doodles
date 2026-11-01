@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Forty-Eight Rows, Sewn</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #d8d0c0; overflow: hidden; height: 100%; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // Seeded PRNG (mulberry32), never Math.random.
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  // Stable per-(row, stitch) hash value in [0,1).
+  function hash2(r, i, salt) {
+    var h = (1440000 + r * 7919 + i * 104729 + salt * 1299709) | 0;
+    h = Math.imul(h ^ (h >>> 16), 2246822507);
+    h = Math.imul(h ^ (h >>> 13), 3266489909);
+    h = (h ^ (h >>> 16)) >>> 0;
+    return h / 4294967296;
+  }
+
+  // Yarn ramp: 18 named colours, interpolated to 48 rows.
+  var RAMP = [
+    [0xc8, 0x10, 0x2e], [0xe8, 0x3a, 0x1a], [0xf0, 0x7a, 0x1a], [0xe8, 0xa8, 0x1a],
+    [0xf2, 0xd8, 0x1a], [0x4a, 0x8a, 0x2a], [0x1a, 0x7a, 0x6a], [0x2a, 0x7a, 0xd8],
+    [0x1a, 0x2a, 0x6a], [0x6a, 0x2a, 0x8a], [0xc8, 0x1a, 0x6a], [0xe8, 0x5a, 0x8a],
+    [0xa8, 0x3a, 0x1a], [0xc8, 0x8a, 0x2a], [0x8a, 0xaa, 0x6a], [0x5a, 0x6a, 0x7a],
+    [0x2a, 0x2a, 0x2a], [0xff, 0xf8, 0xe8]
+  ];
+  function hex(n) { var s = n.toString(16); return s.length === 1 ? '0' + s : s; }
+  function yarnColour(row) {
+    var pos = row / 47 * (RAMP.length - 1);
+    var lo = Math.floor(pos), hi = Math.min(RAMP.length - 1, lo + 1);
+    var f = pos - lo;
+    var r = Math.round(RAMP[lo][0] + (RAMP[hi][0] - RAMP[lo][0]) * f);
+    var g = Math.round(RAMP[lo][1] + (RAMP[hi][1] - RAMP[lo][1]) * f);
+    var b = Math.round(RAMP[lo][2] + (RAMP[hi][2] - RAMP[lo][2]) * f);
+    return '#' + hex(r) + hex(g) + hex(b);
+  }
+  var COLOURS = [];
+  for (var r = 0; r < 48; r++) COLOURS.push(yarnColour(r));
+
+  var ROWS = 48;
+  var STITCH_DUR = 0.28; // seconds per stitch at base speed
+  var W = 0, H = 0, phone = false;
+  var margin = 16, paperX = 0, paperY = 0, paperW = 0, paperH = 0;
+  var rowGap = 0, pitch = 16, perRow = 40, totalStitches = ROWS * 40;
+  var rowDrift = [], rowPhase = [], offRow = -1, longStitch = [];
+
+  function isPhone() {
+    if (typeof window.screen !== 'undefined' && window.screen.width && window.screen.height) {
+      return Math.min(window.screen.width, window.screen.height) < 700;
+    }
+    return H > W * 1.15;
+  }
+
+  function size() {
+    var vw = W, vh = H;
+    if (typeof window.visualViewport !== 'undefined' && window.visualViewport) {
+      vw = window.visualViewport.width; vh = window.visualViewport.height;
+    } else if (typeof window.innerWidth !== 'undefined') {
+      vw = window.innerWidth; vh = window.innerHeight;
+    }
+    W = Math.max(1, Math.floor(vw)); H = Math.max(1, Math.floor(vh));
+    canvas.width = W; canvas.height = H;
+    phone = isPhone();
+    margin = phone ? 8 : 18;
+    paperX = margin; paperY = margin;
+    paperW = W - margin * 2; paperH = H - margin * 2;
+    rowGap = paperH / ROWS;
+    pitch = Math.max(14, paperW / 44);
+    perRow = Math.max(8, Math.floor((paperW - 8) / pitch));
+    totalStitches = ROWS * perRow;
+    // Seeded per-row constants (stable across loops and resizes).
+    rowDrift = []; rowPhase = []; longStitch = [];
+    for (var i = 0; i < ROWS; i++) {
+      rowDrift.push((hash2(i, 0, 7) - 0.5) * 6);
+      rowPhase.push(hash2(i, 0, 11) * Math.PI * 2);
+      longStitch.push(Math.floor(hash2(i, 0, 13) * perRow));
+    }
+    offRow = Math.floor(hash2(0, 0, 17) * ROWS);
+  }
+
+  // Drag state: closed-form segments over piece time, never frame-integrated.
+  var dragSegs = []; // {t0, t1|null, mult}
+  var dragActive = false, dragX = 0, dragY = 0, dragDy = 0, dragStartY = 0;
+  var lastX = 0, lastY = 0;
+
+  function rateMultAt(t) {
+    var m = 1;
+    for (var i = 0; i < dragSegs.length; i++) {
+      var s = dragSegs[i];
+      if (t <= s.t0) continue;
+      var end = (s.t1 === null) ? t : Math.min(t, s.t1);
+      if (end > s.t0) m = s.mult; // latest overlapping segment wins for display
+    }
+    return m;
+  }
+  // Needle stitch index (float) at piece time t, closed-form over recorded events.
+  function needleIndex(t) {
+    var base = t / STITCH_DUR;
+    var extra = 0;
+    for (var i = 0; i < dragSegs.length; i++) {
+      var s = dragSegs[i];
+      if (t <= s.t0) continue;
+      var end = (s.t1 === null) ? t : Math.min(t, s.t1);
+      if (end > s.t0) extra += (s.mult - 1) * (end - s.t0) / STITCH_DUR;
+    }
+    return base + extra;
+  }
+  // Frame one sits mid-stitch on the last row (bottom rows still being sewn).
+  var PHASE0 = 0;
+  function needleAt(t) {
+    var idx = (PHASE0 + needleIndex(t)) % totalStitches;
+    if (idx < 0) idx += totalStitches;
+    var row = Math.floor(idx / perRow);
+    var st = Math.floor(idx - row * perRow);
+    return { row: row, stitch: st, frac: idx - Math.floor(idx) };
+  }
+
+  function stitchGeom(row, i, t) {
+    var x0 = paperX + 4 + i * pitch;
+    var long = (i === longStitch[row]) ? 1.6 : 1;
+    var len = (pitch * 0.55) * long;
+    var yBase = paperY + (row + 0.5) * rowGap + rowDrift[row];
+    var breathe = Math.sin(t * Math.PI * 2 / 60 + rowPhase[row]) * 0.5;
+    var jy = (hash2(row, i, 1) - 0.5) * 2.0;
+    var jx = (hash2(row, i, 2) - 0.5) * 2.5;
+    var off = (row === offRow) ? 2 : 0;
+    var y = yBase + breathe + jy;
+    // Drag pull: rows near the finger bend off-parallel while dragging.
+    if (dragActive) {
+      var d = Math.abs(yBase - dragY);
+      var fall = Math.max(0, 1 - d / (3 * rowGap));
+      y += Math.max(-6, Math.min(6, dragDy * 0.1)) * fall;
+    }
+    return { x: x0 + jx + off, y: y, len: len };
+  }
+
+  function draw(t) {
+    size();
+    // Recompute phase offset once per size (depends on perRow).
+    PHASE0 = totalStitches - Math.floor(perRow * 0.4);
+    ctx.fillStyle = '#d8d0c0';
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#f2ede2';
+    ctx.fillRect(paperX, paperY, paperW, paperH);
+
+    var n = needleAt(t);
+    ctx.lineCap = 'round';
+    ctx.lineWidth = Math.max(2, rowGap * 0.22);
+    for (var row = 0; row < ROWS; row++) {
+      ctx.strokeStyle = COLOURS[row];
+      var upto = (row < n.row) ? perRow : (row === n.row ? n.stitch : perRow);
+      // Rows after the needle's row are already sewn in earlier cycles;
+      // only the needle's own row is partial (it is being re-sewn).
+      if (row > n.row) upto = perRow;
+      ctx.beginPath();
+      for (var i = 0; i < upto; i++) {
+        var g = stitchGeom(row, i, t);
+        ctx.moveTo(g.x, g.y);
+        ctx.lineTo(g.x + g.len, g.y);
+      }
+      ctx.stroke();
+    }
+
+    // Needle: steel point at the stitch being laid, thread trailing from last stitch.
+    var ng = stitchGeom(n.row, Math.min(n.stitch, perRow - 1), t);
+    var nx = ng.x + ng.len, ny = ng.y;
+    var pg = stitchGeom(n.row, Math.max(0, n.stitch - 1), t);
+    ctx.strokeStyle = COLOURS[n.row];
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(pg.x + pg.len, pg.y);
+    ctx.lineTo(nx - 14, ny);
+    ctx.stroke();
+    // Needle point: small steel dot + short shaft.
+    ctx.strokeStyle = '#3a3a3a';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(nx - 14, ny);
+    ctx.lineTo(nx, ny);
+    ctx.stroke();
+    ctx.fillStyle = '#3a3a3a';
+    ctx.beginPath();
+    ctx.moveTo(nx + 3, ny);
+    ctx.arc(nx, ny, 3, 0, Math.PI * 2);
+    ctx.fill();
+
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+  }
+
+  // Pointer interaction: drag down sews faster, drag up slows to a crawl.
+  function pos(e) {
+    var rect = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+  }
+  // Piece clock: anchored on the first rAF callback, shared by draw() and drag times.
+  var t0ms = null;
+  function nowT() {
+    if (t0ms === null) return 0;
+    if (typeof performance !== 'undefined' && performance.now) {
+      return (performance.now() - t0ms) / 1000;
+    }
+    return 0;
+  }
+
+  canvas.addEventListener('pointerdown', function (e) {
+    var p = pos(e);
+    dragActive = true; dragX = p.x; dragY = p.y; dragStartY = p.y; dragDy = 0;
+    lastX = p.x; lastY = p.y;
+    dragSegs.push({ t0: nowT(), t1: null, mult: 1 });
+    if (e.preventDefault) e.preventDefault();
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (!dragActive) return;
+    var p = pos(e);
+    dragY = p.y; dragX = p.x;
+    dragDy += (p.y - lastY);
+    lastX = p.x; lastY = p.y;
+    var mult = 1 + dragDy / 100;
+    if (mult < 0.25) mult = 0.25;
+    if (mult > 3) mult = 3;
+    dragSegs[dragSegs.length - 1].mult = mult;
+    if (e.preventDefault) e.preventDefault();
+  });
+  function endDrag(e) {
+    if (!dragActive) return;
+    dragActive = false;
+    dragSegs[dragSegs.length - 1].t1 = nowT();
+    dragDy = 0;
+  }
+  canvas.addEventListener('pointerup', endDrag);
+  canvas.addEventListener('pointercancel', endDrag);
+
+  // Probe hook (not visible): lets the QA harness read closed-form state.
+  if (typeof window !== 'undefined') {
+    window.__probe = {
+      colours: COLOURS, rows: ROWS,
+      needleAt: needleAt,
+      perRow: function () { return perRow; },
+      totalStitches: function () { return totalStitches; },
+      stitchDur: STITCH_DUR
+    };
+  }
+
+  // Boot: frame one at constant phase; clock starts only with the rAF loop.
+  draw(0);
+  var start = null;
+  function loop(ts) {
+    if (start === null) { start = ts; t0ms = ts; }
+    var t = (ts - start) / 1000;
+    draw(t);
+    if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(loop);
+  }
+  if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(loop);
+
+  if (typeof window.visualViewport !== 'undefined' && window.visualViewport) {
+    window.visualViewport.addEventListener('resize', function () { draw(0); });
+  }
+  if (typeof window.addEventListener !== 'undefined') {
+    window.addEventListener('resize', function () { draw(0); });
+  }
+})();
+</script>
+</body>
+</html>
