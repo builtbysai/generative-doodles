@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Deep Time Archive</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #07080A; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded RNG (mulberry32) ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function hash1(n) { // deterministic 0..1 from an integer
+    var x = Math.imul(n ^ 0x9E3779B9, 2654435761);
+    x ^= x >>> 15; x = Math.imul(x, 2246822519); x ^= x >>> 13;
+    return ((x >>> 0) % 100000) / 100000;
+  }
+
+  // ---------- helpers ----------
+  function clamp(x, a, b) { return x < a ? a : (x > b ? b : x); }
+  var TAU = Math.PI * 2;
+  var MINUS = '\u2212';
+  function fmtYears(y) {
+    return String(Math.round(y)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  }
+
+  // ---------- palette ----------
+  var BG = '#07080A';
+  var GLITCH = '#E8A020';
+  var READ = '#8A93A0';
+  var TONES = [
+    { base: '#8A4A2E', dark: '#6E3A24', light: '#A05C39' },  // rust
+    { base: '#6E7278', dark: '#54585E', light: '#8A9096' },  // ash
+    { base: '#2E7A6E', dark: '#215C52', light: '#3D9081' },  // mineral teal
+    { base: '#D8D2C4', dark: '#B3AC9C', light: '#EAE5D8' }   // bone
+  ];
+
+  // ---------- band sequence: thicknesses repeat with period P, textures never do ----------
+  var P = 64;
+  var cum = [0];
+  (function () {
+    var r = mulberry32(11106464);
+    for (var i = 0; i < P; i++) cum.push(cum[i] + 0.095 + r() * 0.06);
+  })();
+  var PH = cum[P]; // period height in material units (~0.125 per band)
+  function bandStart(k) {
+    var q = Math.floor(k / P), r = k - q * P;
+    return q * PH + cum[r];
+  }
+  function bandThick(k) {
+    var r = ((k % P) + P) % P;
+    return cum[r + 1] - cum[r];
+  }
+  function bandAt(m) { // band index whose span contains material m
+    var q = Math.floor(m / PH), local = m - q * PH, r = 0;
+    while (r < P - 1 && cum[r + 1] <= local) r++;
+    return q * P + r;
+  }
+
+  // corruption density: densest at the archive top (recent = technological), gone deep down
+  function corrOf(k) { return clamp(1.12 - k * 0.052, 0, 1); }
+
+  // ---------- per-band texture descriptor (seeded by absolute band index, cached) ----------
+  var descCache = {};
+  function bandDesc(k) {
+    var d = descCache[k];
+    if (d) return d;
+    var r = mulberry32((Math.imul(k + 1, 1000003) ^ 0x51ED) | 0);
+    var tw = r();
+    var tone = tw < 0.26 ? 0 : (tw < 0.52 ? 1 : (tw < 0.76 ? 2 : 3));
+    // deeper = stranger: past band ~14 the mix tips toward teal and ash
+    if (k > 14 && r() < clamp((k - 14) / 46, 0, 0.5)) tone = r() < 0.6 ? 2 : 1;
+    var strips = [], ns = 3 + Math.floor(r() * 3), i;
+    for (i = 0; i < ns; i++) {
+      strips.push({ fy: 0.12 + r() * 0.76, amp: 0.02 + r() * 0.06, fr: 1 + Math.floor(r() * 3),
+                    ph: r() * TAU, kind: r() < 0.55 ? 0 : 1, wdt: 0.05 + r() * 0.10 });
+    }
+    var spk = [], nsp = 46 + Math.floor(r() * 46);
+    for (i = 0; i < nsp; i++) {
+      spk.push({ u: -0.08 + r() * 1.16, v: r(), s: 0.6 + r() * 1.9,
+                 a: 0.10 + r() * 0.26, kind: r() < 0.6 ? 0 : 1 });
+    }
+    var veins = [], nv = 1 + Math.floor(r() * 2) + (k > 20 ? 1 : 0);
+    for (i = 0; i < nv; i++) {
+      var pts = [], u = r() * 0.7, v = r();
+      for (var j = 0; j < 5; j++) { pts.push([u, v]); u += 0.05 + r() * 0.09; v += (r() - 0.5) * 0.34; v = clamp(v, 0.03, 0.97); }
+      veins.push(pts);
+    }
+    var blines = [], nb = 2 + Math.floor(r() * 3);
+    for (i = 0; i < nb; i++) blines.push(r());
+    d = { tone: tone, strips: strips, spk: spk, veins: veins, blines: blines,
+          post: [r(), r(), r()] };
+    var keys = Object.keys(descCache);
+    if (keys.length > 260) descCache = {};
+    descCache[k] = d;
+    return d;
+  }
+
+  // ---------- depth state: closed form in t + recorded drag events ----------
+  var YEARS_PER_UNIT = 10800;
+  var U_BASE = 1.28, SINK = 0.0010, U_MIN = 0.30, U_MAX = 40;
+  var dragBase = 0;        // fully-ramped drag offset (material units)
+  var dragEvents = [];     // recent {t, d} step deltas, response 1-exp(-(t-ti)/tau)
+  var corruptGen = 0;      // bumped by double-tap: re-corrupt
+  var sample = null;       // {k, years, t0}
+  var lastTapT = -10;
+  var downInfo = null;
+
+  function dragOffset(t) {
+    var s = dragBase;
+    for (var i = 0; i < dragEvents.length; i++) {
+      var e = dragEvents[i];
+      if (t >= e.t) s += e.d * (1 - Math.exp(-(t - e.t) / 0.15));
+    }
+    return s;
+  }
+  function depthU(t) {
+    return clamp(Math.max(U_MIN, U_BASE - SINK * t) + dragOffset(t), 0.05, 60);
+  }
+  function addDragDelta(d, t) {
+    // fold fully-ramped events into the base so the list stays short
+    var keep = [];
+    for (var i = 0; i < dragEvents.length; i++) {
+      var e = dragEvents[i];
+      if (t - e.t > 1.2) dragBase += e.d; else keep.push(e);
+    }
+    dragEvents = keep;
+    dragEvents.push({ t: t, d: d });
+  }
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var vw = 720, vh = 720, dpr = 1;
+  var stageSide = 720, offX = 0, offY = 0, isPhone = false;
+
+  function resize() {
+    var vv = window.visualViewport;
+    vw = (vv && vv.width) ? vv.width : window.innerWidth;
+    vh = (vv && vv.height) ? vv.height : window.innerHeight;
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.round(vw * dpr);
+    canvas.height = Math.round(vh * dpr);
+    canvas.style.width = vw + 'px';
+    canvas.style.height = vh + 'px';
+    var sw = (window.screen && window.screen.width) || vw;
+    var sh = (window.screen && window.screen.height) || vh;
+    isPhone = (Math.min(sw, sh) < 700) || (vh > vw * 1.15);
+    stageSide = Math.min(vw, vh);
+    offX = (vw - stageSide) / 2;
+    offY = (vh - stageSide) / 2;
+  }
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', resize);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  function perfNow() {
+    if (typeof performance !== 'undefined' && performance.now) return performance.now();
+    return Date.now();
+  }
+
+  // ---------- audio: lazy low drone, pitch deepens with depth; visuals never depend on it ----------
+  var AC = (typeof window !== 'undefined') ? (window.AudioContext || window.webkitAudioContext) : null;
+  var audio = null;
+  function startAudio() {
+    if (audio || !AC) return;
+    try {
+      var ac = new AC();
+      var g = ac.createGain(); g.gain.value = 0.0;
+      var fl = ac.createBiquadFilter(); fl.type = 'lowpass'; fl.frequency.value = 240;
+      var o1 = ac.createOscillator(); o1.type = 'sine'; o1.frequency.value = 62;
+      var o2 = ac.createOscillator(); o2.type = 'sine'; o2.frequency.value = 125;
+      var g2 = ac.createGain(); g2.gain.value = 0.3;
+      o1.connect(fl); o2.connect(g2); g2.connect(fl); fl.connect(g); g.connect(ac.destination);
+      o1.start(); o2.start();
+      g.gain.linearRampToValueAtTime(0.05, ac.currentTime + 2.0);
+      audio = { ac: ac, o1: o1, o2: o2 };
+    } catch (e) { audio = null; }
+  }
+  function audioUpdate(U) {
+    if (!audio) return;
+    try {
+      var f = 30 + 38 * Math.exp(-U / 9);
+      audio.o1.frequency.value = f;
+      audio.o2.frequency.value = f * 2.02;
+    } catch (e) { /* silent */ }
+  }
+
+  // ---------- band texture: pure function of (band, rect, warp) ----------
+  // rect is in stage units; texture u spans a little past the edges so slice shifts never gap.
+  function drawBandTexture(k, rx, ry, rw, rh, warp, alpha) {
+    var d = bandDesc(k);
+    var T = TONES[d.tone];
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.beginPath(); ctx.rect(rx, ry, rw, rh); ctx.clip();
+    ctx.fillStyle = T.base;
+    ctx.fillRect(rx, ry, rw, rh);
+    // posterized tone steps: three horizontal sub-strips, quantized overlays
+    for (var j = 0; j < 3; j++) {
+      var pv = d.post[j];
+      if (pv < 0.38) { ctx.fillStyle = T.dark; ctx.globalAlpha = alpha * 0.30; }
+      else if (pv > 0.66) { ctx.fillStyle = T.light; ctx.globalAlpha = alpha * 0.26; }
+      else continue;
+      ctx.fillRect(rx, ry + rh * j / 3, rw, rh / 3 + 0.001);
+    }
+    ctx.globalAlpha = alpha;
+    var unit = 1 / (dpr * stageSide);
+    // warped horizontal strips
+    for (var i = 0; i < d.strips.length; i++) {
+      var s = d.strips[i];
+      ctx.strokeStyle = s.kind ? T.light : T.dark;
+      ctx.globalAlpha = alpha * 0.30;
+      ctx.lineWidth = Math.max(rh * s.wdt, 1.1 * unit);
+      ctx.beginPath();
+      var steps = 26;
+      for (var q = 0; q <= steps; q++) {
+        var u = -0.08 + 1.16 * q / steps;
+        var y = ry + rh * (s.fy + s.amp * Math.sin(TAU * (s.fr * u) + s.ph + warp));
+        var x = rx + rw * u;
+        if (q === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    }
+    // speckle field
+    for (var n = 0; n < d.spk.length; n++) {
+      var p = d.spk[n];
+      ctx.fillStyle = p.kind ? T.light : T.dark;
+      ctx.globalAlpha = alpha * p.a;
+      var sx = rx + rw * p.u, sy = ry + rh * p.v, ss = p.s * Math.max(unit, rh * 0.012);
+      ctx.fillRect(sx, sy, ss, ss);
+    }
+    // vein lines
+    ctx.globalAlpha = alpha * 0.38;
+    ctx.strokeStyle = T.dark;
+    ctx.lineWidth = Math.max(1 * unit, rh * 0.012);
+    for (var v = 0; v < d.veins.length; v++) {
+      var pts = d.veins[v];
+      ctx.beginPath();
+      for (var w = 0; w < pts.length; w++) {
+        var vx = rx + rw * pts[w][0], vy = ry + rh * pts[w][1];
+        if (w === 0) ctx.moveTo(vx, vy); else ctx.lineTo(vx, vy);
+      }
+      ctx.stroke();
+    }
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
+  // corruption overlays drawn in stage space for the visible band rect
+  function drawCorruption(k, ry, rh, corr) {
+    var unit = 1 / (dpr * stageSide);
+    var d = bandDesc(k);
+    // banding artifacts: thin full-width dark lines
+    ctx.fillStyle = 'rgba(7,8,10,0.28)';
+    for (var i = 0; i < d.blines.length; i++) {
+      if (hash1(k * 31 + i * 7 + corruptGen) < corr) {
+        ctx.fillRect(0, ry + rh * d.blines[i], 1, Math.max(1 * unit, rh * 0.016));
+      }
+    }
+    // gold glitch ticks — the honest glitch
+    var nTicks = Math.round(corr * (3 + hash1(k * 17 + corruptGen * 3) * 5));
+    ctx.fillStyle = GLITCH;
+    for (var g = 0; g < nTicks; g++) {
+      var gx = hash1(k * 101 + g * 37 + corruptGen * 13);
+      var gy = hash1(k * 57 + g * 91 + corruptGen * 7);
+      var gw = 0.008 + hash1(k * 71 + g * 13) * 0.026;
+      ctx.globalAlpha = 0.45 + 0.5 * hash1(k * 13 + g * 29 + corruptGen);
+      ctx.fillRect(gx, ry + rh * gy, gw, Math.max(1.4 * unit, rh * 0.02));
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // one visible band: sliced/shifted when corrupted, plain when clean
+  function drawBand(k, ry, rh, warp) {
+    var corr = corrOf(k);
+    var unit = 1 / (dpr * stageSide);
+    if (corr >= 0.05) {
+      var nSlices = 3 + Math.floor(corr * 3);
+      for (var i = 0; i < nSlices; i++) {
+        var sy0 = ry + rh * i / nSlices, sh = rh / nSlices + 0.0015;
+        var off = (hash1(k * 211 + i * 43 + corruptGen * 101) - 0.5) * 0.17 * corr;
+        ctx.save();
+        ctx.beginPath(); ctx.rect(0, sy0, 1, sh); ctx.clip();
+        ctx.translate(off, 0);
+        if (corr > 0.42 && i === (k + corruptGen) % nSlices) ctx.scale(1.25, 1); // smeared latent
+        drawBandTexture(k, -0.14, ry, 1.28, rh, warp, 1);
+        ctx.restore();
+        // posterized step per slice: each slice sits at its own tone level, so the cuts read
+        var step = hash1(k * 67 + i * 19 + corruptGen * 5);
+        if (step < 0.42) { ctx.fillStyle = 'rgba(7,8,10,0.13)'; ctx.fillRect(0, sy0, 1, sh); }
+        else if (step > 0.62) { ctx.fillStyle = 'rgba(234,229,216,0.10)'; ctx.fillRect(0, sy0, 1, sh); }
+        // hairline seam at the slice boundary
+        ctx.fillStyle = 'rgba(7,8,10,0.30)';
+        ctx.fillRect(0, sy0, 1, Math.max(1 * unit, 0.0012));
+      }
+      // ghost repetition: one strip doubled, faint, offset
+      var gi = (k * 7 + corruptGen) % nSlices;
+      var gy0 = ry + rh * gi / nSlices;
+      ctx.save();
+      ctx.beginPath(); ctx.rect(0, gy0, 1, rh / nSlices + 0.0015); ctx.clip();
+      ctx.translate(0.02 * corr, 0.007);
+      drawBandTexture(k, -0.14, ry, 1.28, rh, warp, 0.28);
+      ctx.restore();
+      drawCorruption(k, ry, rh, corr);
+    } else {
+      drawBandTexture(k, -0.02, ry, 1.04, rh, warp, 1);
+    }
+    // band boundary: a dark hairline so every stratum edge reads, even between like tones
+    ctx.fillStyle = 'rgba(7,8,10,0.5)';
+    ctx.fillRect(0, ry, 1, Math.max(1.3 * unit, 0.002));
+  }
+
+  function roundedRectPath(x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.lineTo(x + w - r, y); ctx.arcTo(x + w, y, x + w, y + r, r);
+    ctx.lineTo(x + w, y + h - r); ctx.arcTo(x + w, y + h, x + w - r, y + h, r);
+    ctx.lineTo(x + r, y + h); ctx.arcTo(x, y + h, x, y + h - r, r);
+    ctx.lineTo(x, y + r); ctx.arcTo(x, y, x + r, y, r);
+    ctx.closePath();
+  }
+
+  // ---------- drawing ----------
+  function draw(t) {
+    canvas.style.width = vw + 'px';
+    canvas.style.height = vh + 'px';
+    var U = depthU(t);
+    var warp = U * 0.9;
+    var unit = 1 / (dpr * stageSide);
+
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = BG;
+    ctx.fillRect(0, 0, vw, vh);
+    ctx.translate(offX, offY);
+    ctx.scale(stageSide, stageSide);
+
+    // visible bands: material window [U, U+1]
+    var k = bandAt(U);
+    var guard = 0;
+    while (guard < 40) {
+      var s0 = bandStart(k), th = bandThick(k);
+      var y0 = s0 - U, y1 = y0 + th;
+      if (y0 >= 1) break;
+      if (y1 > 0) drawBand(k, y0, th, warp);
+      k++; guard++;
+    }
+    // hairline at the very top edge of the archive window (the present, cut off)
+    ctx.fillStyle = 'rgba(216,210,196,0.20)';
+    ctx.fillRect(0, 0, 1, Math.max(1 * unit, 0.0012));
+
+    // ---------- core sample tile ----------
+    if (sample) {
+      var age = t - sample.t0;
+      var fade = clamp(age / 0.5, 0, 1) * (age > 20 ? clamp((24 - age) / 4, 0, 1) : 1);
+      if (fade <= 0) sample = null;
+      else {
+        var tw = 0.30, thh = 0.30;
+        var cx = 0.70, cy = 0.46 + 0.010 * Math.sin(age * 0.3);
+        var ang = 0.28 * Math.sin(age * 0.45);
+        ctx.save();
+        ctx.globalAlpha = fade;
+        ctx.translate(cx, cy);
+        ctx.rotate(ang);
+        roundedRectPath(-tw / 2, -thh / 2, tw, thh, 0.018);
+        ctx.save(); ctx.clip();
+        drawBandTexture(sample.k, -tw / 2, -thh / 2, tw, thh, warp, 1);
+        ctx.restore();
+        roundedRectPath(-tw / 2, -thh / 2, tw, thh, 0.018);
+        ctx.strokeStyle = 'rgba(216,210,196,0.55)';
+        ctx.lineWidth = 1.2 * unit;
+        ctx.stroke();
+        ctx.restore();
+        // sample label (pixel space, unrotated)
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.globalAlpha = fade * 0.9;
+        ctx.fillStyle = READ;
+        ctx.font = (isPhone ? 9.5 : 10.5) + 'px "Courier New", monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('SAMPLE ' + MINUS + fmtYears(sample.years) + ' yr',
+                     offX + cx * stageSide, offY + (cy + thh / 2 + 0.035) * stageSide);
+        ctx.globalAlpha = 1;
+        ctx.textAlign = 'left';
+        ctx.translate(offX, offY);
+        ctx.scale(stageSide, stageSide);
+      }
+    }
+
+    // ---------- depth readout (pixel space) ----------
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = READ;
+    ctx.globalAlpha = 0.88;
+    ctx.font = (isPhone ? 10 : 11.5) + 'px "Courier New", monospace';
+    ctx.textAlign = 'left';
+    var midYears = (U + 0.5) * YEARS_PER_UNIT;
+    ctx.fillText(MINUS + fmtYears(midYears) + ' yr', offX + 10, offY + stageSide - 10);
+    ctx.globalAlpha = 1;
+
+    audioUpdate(U);
+  }
+
+  // ---------- pointer: drag = scrub depth, tap = core sample, double-tap = re-corrupt ----------
+  function toStage(e) {
+    var rect = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    return [ (e.clientX - rect.left - offX) / stageSide, (e.clientY - rect.top - offY) / stageSide ];
+  }
+  function pieceT() { return PHASE + (perfNow() - startMs) / 1000; }
+
+  function doTap(sx, sy, now) {
+    if (now - lastTapT < 0.35) {          // double-tap: mess the dataset
+      corruptGen++;
+      sample = null;
+      lastTapT = -10;
+      return;
+    }
+    lastTapT = now;
+    var U = depthU(now);
+    var m = U + clamp(sy, 0, 1);
+    sample = { k: bandAt(m), years: m * YEARS_PER_UNIT, t0: now };
+  }
+  function pDown(e) {
+    startAudio();
+    if (audio && audio.ac && audio.ac.resume) audio.ac.resume();
+    var s = toStage(e);
+    downInfo = { y: s[1], t: pieceT(), moved: 0, lastY: s[1] };
+  }
+  function pMove(e) {
+    if (!downInfo) return;
+    var s = toStage(e);
+    var dy = s[1] - downInfo.lastY;
+    downInfo.lastY = s[1];
+    downInfo.moved += Math.abs(s[1] - downInfo.y);
+    if (Math.abs(dy) > 0.0005) {
+      addDragDelta(clamp(-dy, -0.5, 0.5), pieceT());  // drag up (dy<0) goes deeper
+    }
+  }
+  function pUp(e) {
+    if (!downInfo) return;
+    var s = toStage(e);
+    var now = pieceT();
+    if (downInfo.moved < 0.012 && now - downInfo.t < 0.4) doTap(s[0], s[1], now);
+    downInfo = null;
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', pDown);
+    canvas.addEventListener('pointermove', pMove);
+    canvas.addEventListener('pointerup', pUp);
+    canvas.addEventListener('pointercancel', function () { downInfo = null; });
+    canvas.addEventListener('mousedown', pDown);
+    canvas.addEventListener('mousemove', pMove);
+    canvas.addEventListener('mouseup', pUp);
+  }
+
+  // ---------- run: synchronous fixed-phase frame one, then guarded rAF ----------
+  var PHASE = 60;
+  var startMs = perfNow();
+  draw(PHASE);
+
+  if (typeof requestAnimationFrame === 'function') {
+    var frame = function () {
+      draw(pieceT());
+      requestAnimationFrame(frame);
+    };
+    requestAnimationFrame(frame);
+  }
+})();
+</script>
+</body>
+</html>

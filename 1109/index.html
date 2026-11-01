@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Gedankenscherz</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #050607; overflow: hidden; height: 100%; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c" width="720" height="720"></canvas>
+<script>
+(function () {
+  'use strict';
+  var cv = document.getElementById('c');
+  var ctx = cv.getContext('2d');
+
+  // ---------- deterministic helpers ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function mix32(a, b) {
+    var x = (a | 0) ^ Math.imul(b | 0, 0x9E3779B1);
+    x = Math.imul(x ^ (x >>> 13), 0x85EBCA6B);
+    x = Math.imul(x ^ (x >>> 16), 0xC2B2AE35);
+    return (x ^ (x >>> 13)) >>> 0;
+  }
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+  function smooth(u) { return u <= 0 ? 0 : (u >= 1 ? 1 : u * u * (3 - 2 * u)); }
+
+  // ---------- cabinet layout ----------
+  var PANEL = 880;              // panel width in unit space
+  var NWORLD = 5;
+  var WORLDW = PANEL * NWORLD;  // 4400
+  var PHASE = 27.5;             // fixed first-frame phase: idle drift centred on world 3
+  var cabinetSeed = 1109;
+
+  function panelCenter(i) { return i * PANEL + PANEL / 2; }
+
+  // ---------- state (all interaction is recorded events; draws are closed-form in t) ----------
+  var drag = { on: false, downX: 0, downT: 0, lastX: 0, moved: false, off: 0 };
+  var releaseRec = null;   // {t, off}
+  var energyState = 0, energyT = -100;
+  var dwell = null;        // {t, world}
+  var lastTapT = -100;
+
+  function camIdle(t) { return 2200 - 800 * Math.cos((Math.PI * 2 * t) / 110); }
+  function dragOffsetAt(t) {
+    if (drag.on) return drag.off;
+    if (releaseRec) {
+      var w = Math.exp(-(t - releaseRec.t) / 6);
+      if (w < 0.002) { releaseRec = null; return 0; }
+      return releaseRec.off * w;
+    }
+    return 0;
+  }
+  function camCenterAt(t) { return clamp(camIdle(t) + dragOffsetAt(t), 500, WORLDW - 500); }
+  function energyAt(t) {
+    if (drag.on) return energyState;
+    return energyState * Math.exp(-(t - energyT) / 0.9);
+  }
+  function dwellBoost(t, world) {
+    if (!dwell || dwell.world !== world) return 0;
+    var u = (t - dwell.t) / 8;
+    if (u < 0 || u >= 1) return 0;
+    return u < 0.15 ? smooth(u / 0.15) : 1 - smooth((u - 0.15) / 0.85);
+  }
+  function currentWorld(t) {
+    var c = camCenterAt(t);
+    return clamp(Math.floor(c / PANEL), 0, NWORLD - 1);
+  }
+
+  // ---------- viewport ----------
+  var W = 720, H = 720, S = 720, OX = 0, OY = 0, UNIT = 0.72, IS_PHONE = false;
+  function resize() {
+    var vv = window.visualViewport;
+    W = vv ? vv.width : (window.innerWidth || 720);
+    H = vv ? vv.height : (window.innerHeight || 720);
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    cv.width = Math.round(W * dpr);
+    cv.height = Math.round(H * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    S = Math.min(W, H);
+    OX = (W - S) / 2; OY = (H - S) / 2;
+    UNIT = S / 1000;
+    var sw = (window.screen && window.screen.width) || W;
+    var sh = (window.screen && window.screen.height) || H;
+    IS_PHONE = Math.min(sw, sh) < 700 || H > W * 1.15;
+  }
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', resize);
+  }
+  window.addEventListener('resize', resize);
+
+  // =====================================================================
+  // World generators (seeded data, rebuilt on cabinet reseed)
+  // =====================================================================
+  var stars = [], solids = [], blobs = [], glyphs = [], vortices = [], creatures = [];
+
+  var SOLID_DEFS = [
+    { // cube
+      v: [[-1,-1,-1],[1,-1,-1],[1,1,-1],[-1,1,-1],[-1,-1,1],[1,-1,1],[1,1,1],[-1,1,1]],
+      f: [[0,1,2,3],[4,5,6,7],[0,3,7,4],[1,5,6,2],[0,1,5,4],[3,2,6,7]]
+    },
+    { // octahedron
+      v: [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]],
+      f: [[0,2,4],[2,1,4],[1,3,4],[3,0,4],[2,0,5],[1,2,5],[3,1,5],[0,3,5]]
+    },
+    { // tetrahedron
+      v: [[1,1,1],[1,-1,-1],[-1,1,-1],[-1,-1,1]],
+      f: [[0,1,2],[0,3,1],[0,2,3],[1,3,2]]
+    },
+    { // triangular prism
+      v: [[-1,-1,-0.6],[1,-1,-0.6],[0,1,-0.6],[-1,-1,0.6],[1,-1,0.6],[0,1,0.6]],
+      f: [[0,1,2],[3,4,5],[0,1,4,3],[1,2,5,4],[2,0,3,5]]
+    }
+  ];
+
+  function buildCabinet(seed) {
+    var i, j, rnd;
+    // --- world 1: star map ---
+    stars = [];
+    rnd = mulberry32(mix32(seed, 101));
+    for (i = 0; i < 200; i++) {
+      var layer = i % 3;
+      stars.push({
+        x: rnd() * PANEL, y: 40 + rnd() * 920,
+        depth: [0.35, 0.65, 1][layer],
+        spd: [2.2, 4.5, 8][layer] * (0.7 + rnd() * 0.6),
+        r: [1.3, 1.9, 2.7][layer] * (0.75 + rnd() * 0.5),
+        tw: 0.5 + rnd() * 1.6, ph: rnd() * Math.PI * 2
+      });
+    }
+    // --- world 2: solids (first solid anchored to peek at frame one) ---
+    solids = [];
+    rnd = mulberry32(mix32(seed, 202));
+    var spots = [
+      { x: 792, y: 430, s: 96 },
+      { x: 200, y: 250, s: 74 }, { x: 430, y: 640, s: 110 },
+      { x: 640, y: 210, s: 62 }, { x: 250, y: 800, s: 84 }, { x: 700, y: 760, s: 70 }
+    ];
+    for (i = 0; i < spots.length; i++) {
+      solids.push({
+        def: SOLID_DEFS[i % SOLID_DEFS.length],
+        x: spots[i].x, y: spots[i].y, s: spots[i].s,
+        wa: (0.14 + rnd() * 0.22) * (rnd() < 0.5 ? -1 : 1),
+        wb: (0.10 + rnd() * 0.20) * (rnd() < 0.5 ? -1 : 1),
+        pa: rnd() * Math.PI * 2, pb: rnd() * Math.PI * 2
+      });
+    }
+    // --- world 3: ink blobs ---
+    blobs = [];
+    rnd = mulberry32(mix32(seed, 303));
+    for (i = 0; i < 14; i++) {
+      blobs.push({
+        x: 90 + rnd() * 700, y: 110 + rnd() * 780,
+        R: 52 + rnd() * 105,
+        ax: 14 + rnd() * 30, ay: 12 + rnd() * 26,
+        fx: 0.05 + rnd() * 0.05, fy: 0.04 + rnd() * 0.05,
+        px: rnd() * Math.PI * 2, py: rnd() * Math.PI * 2,
+        a1: 0.10 + rnd() * 0.12, a2: 0.06 + rnd() * 0.10,
+        w1: (0.10 + rnd() * 0.16) * (rnd() < 0.5 ? -1 : 1),
+        w2: (0.08 + rnd() * 0.14) * (rnd() < 0.5 ? -1 : 1),
+        deep: 0.55 + rnd() * 0.45
+      });
+    }
+    // --- world 4: letterform storm ---
+    vortices = [
+      { x: 38, y: 480 }, { x: 440, y: 360 }, { x: 660, y: 660 }
+    ];
+    glyphs = [];
+    rnd = mulberry32(mix32(seed, 404));
+    var chars = 'AaBbCcDdEeFfGgKkMmNnRrSsTtXxZz&¶';
+    for (i = 0; i < 60; i++) {
+      var vi = i < 14 ? 0 : (i % 3); // first vortex feeds the frame-one peek
+      glyphs.push({
+        v: vi,
+        ch: chars.charAt(Math.floor(rnd() * chars.length)),
+        ang: rnd() * Math.PI * 2,
+        rad: 26 + rnd() * 120,
+        om: (0.25 + rnd() * 0.55) * (rnd() < 0.5 ? -1 : 1),
+        size: 20 + rnd() * 30,
+        ph: rnd() * Math.PI * 2,
+        al: 0.3 + rnd() * 0.6
+      });
+    }
+    // --- world 5: point-cloud menagerie ---
+    creatures = [];
+    var defs = [buildBird, buildQuadruped, buildFish];
+    var homes = [{ x: 300, y: 300 }, { x: 470, y: 620 }, { x: 330, y: 830 }];
+    for (i = 0; i < 3; i++) {
+      var crnd = mulberry32(mix32(seed, 505 + i * 17));
+      creatures.push({
+        pts: defs[i](crnd), x: homes[i].x, y: homes[i].y,
+        ph: crnd() * Math.PI * 2, drift: 26 + crnd() * 30
+      });
+    }
+  }
+
+  function outlineEllipse(rnd, pts, a, b, n, cx, cy) {
+    for (var k = 0; k < n; k++) {
+      var th = (k / n) * Math.PI * 2;
+      pts.push([cx + Math.cos(th) * a + (rnd() - 0.5) * 6, cy + Math.sin(th) * b + (rnd() - 0.5) * 6, 0.55 + rnd() * 0.45]);
+    }
+  }
+  function outlineLine(rnd, pts, x1, y1, x2, y2, n) {
+    for (var k = 0; k <= n; k++) {
+      var u = k / n;
+      pts.push([x1 + (x2 - x1) * u + (rnd() - 0.5) * 6, y1 + (y2 - y1) * u + (rnd() - 0.5) * 6, 0.55 + rnd() * 0.45]);
+    }
+  }
+  function buildBird(rnd) {
+    var pts = [];
+    outlineEllipse(rnd, pts, 95, 34, 26, 0, 0);                    // body
+    outlineEllipse(rnd, pts, 20, 20, 12, 100, -20);                // head
+    for (var k = 0; k <= 12; k++) {                               // wing arc
+      var u = k / 12, th = Math.PI * (0.15 + 0.75 * u);
+      pts.push([-20 + Math.cos(th) * 105 + (rnd() - 0.5) * 6, -14 - Math.sin(th) * 78 + (rnd() - 0.5) * 6, 0.55 + rnd() * 0.45]);
+    }
+    outlineLine(rnd, pts, -88, -4, -138, -26, 5);                 // tail
+    outlineLine(rnd, pts, -88, 4, -138, 14, 5);
+    outlineLine(rnd, pts, 116, -22, 138, -16, 3);                 // beak
+    return pts;
+  }
+  function buildQuadruped(rnd) {
+    var pts = [];
+    outlineEllipse(rnd, pts, 110, 42, 28, 0, 0);                  // body
+    outlineEllipse(rnd, pts, 30, 20, 12, 138, -52);               // head
+    outlineLine(rnd, pts, 104, -18, 128, -40, 5);                 // neck
+    var legs = [-72, -46, 54, 80];
+    for (var i = 0; i < 4; i++) outlineLine(rnd, pts, legs[i], 30, legs[i] + (i % 2 ? 5 : -4), 112, 6);
+    for (var k = 0; k <= 8; k++) {                                // tail curve
+      var u = k / 8;
+      pts.push([-108 - 26 * u + (rnd() - 0.5) * 6, -20 + 44 * u * u + (rnd() - 0.5) * 6, 0.55 + rnd() * 0.45]);
+    }
+    return pts;
+  }
+  function buildFish(rnd) {
+    var pts = [], k, u, x, y;
+    for (k = 0; k <= 22; k++) {                                   // upper arc
+      u = k / 22; x = -80 + 200 * u;
+      y = -40 * Math.pow(Math.sin(Math.PI * u), 0.8);
+      pts.push([x + (rnd() - 0.5) * 6, y + (rnd() - 0.5) * 6, 0.55 + rnd() * 0.45]);
+    }
+    for (k = 0; k <= 22; k++) {                                   // lower arc
+      u = k / 22; x = 120 - 200 * u;
+      y = 40 * Math.pow(Math.sin(Math.PI * u), 0.8);
+      pts.push([x + (rnd() - 0.5) * 6, y + (rnd() - 0.5) * 6, 0.55 + rnd() * 0.45]);
+    }
+    outlineLine(rnd, pts, -78, -2, -122, -30, 5);                 // tail
+    outlineLine(rnd, pts, -78, 2, -122, 30, 5);
+    outlineLine(rnd, pts, -122, -30, -122, 30, 6);
+    pts.push([92, -6, 1]);                                        // eye
+    return pts;
+  }
+
+  // =====================================================================
+  // World painters. (ox, oy) is the panel origin in screen-unit coords.
+  // =====================================================================
+  function drawStars(ox, t, boost) {
+    var n = Math.floor(stars.length * (1 + 0.0 * boost));
+    ctx.fillStyle = '#DFF2FF';
+    for (var i = 0; i < n; i++) {
+      var p = stars[i];
+      var x = (((p.x + t * p.spd) % PANEL) + PANEL) % PANEL;
+      var a = (0.14 + 0.86 * (0.5 + 0.5 * Math.sin(t * p.tw + p.ph))) * (0.45 + 0.55 * p.depth);
+      ctx.globalAlpha = a * (1 + 0.25 * boost);
+      ctx.beginPath();
+      ctx.arc(ox + x, p.y, p.r, 0, Math.PI * 2);
+      ctx.fill();
+      if (p.depth === 1 && i % 5 === 0) { // sparse cross glints on the nearest layer
+        ctx.globalAlpha = a * 0.5;
+        ctx.fillRect(ox + x - p.r * 3.2, p.y - 0.8, p.r * 6.4, 1.6);
+        ctx.fillRect(ox + x - 0.8, p.y - p.r * 3.2, 1.6, p.r * 6.4);
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function rot3(v, a, b) {
+    var ca = Math.cos(a), sa = Math.sin(a), cb = Math.cos(b), sb = Math.sin(b);
+    var x = v[0] * ca + v[2] * sa, z = -v[0] * sa + v[2] * ca, y = v[1];
+    return [x, y * cb - z * sb, y * sb + z * cb];
+  }
+  function drawSolids(ox, t, boost, energy) {
+    var spin = 1 + energy * 1.6 + boost * 0.4;
+    for (var i = 0; i < solids.length; i++) {
+      var sd = solids[i];
+      var a = sd.pa + t * sd.wa * spin, b = sd.pb + t * sd.wb * spin;
+      var vs = [], k;
+      for (k = 0; k < sd.def.v.length; k++) vs.push(rot3(sd.def.v[k], a, b));
+      var faces = [];
+      for (k = 0; k < sd.def.f.length; k++) {
+        var f = sd.def.f[k], z = 0, m;
+        for (m = 0; m < f.length; m++) z += vs[f[m]][2];
+        faces.push({ f: f, z: z / f.length });
+      }
+      faces.sort(function (p, q) { return p.z - q.z; });
+      for (k = 0; k < faces.length; k++) {
+        var fc = faces[k].f;
+        var p0 = vs[fc[0]], p1 = vs[fc[1]], p2 = vs[fc[2]];
+        var nz = (p1[0] - p0[0]) * (p2[1] - p0[1]) - (p1[1] - p0[1]) * (p2[0] - p0[0]);
+        var shade = clamp(0.5 + nz * 0.55, 0, 1);
+        ctx.beginPath();
+        for (m = 0; m < fc.length; m++) {
+          var sx = ox + sd.x + vs[fc[m]][0] * sd.s, sy = sd.y + vs[fc[m]][1] * sd.s;
+          if (m === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
+        }
+        ctx.closePath();
+        ctx.fillStyle = 'rgba(201,150,46,' + (0.07 + 0.30 * shade + 0.06 * boost) + ')';
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(201,150,46,' + (0.45 + 0.45 * shade) + ')';
+        ctx.lineWidth = 1.6;
+        ctx.stroke();
+      }
+    }
+  }
+
+  function blobPath(cx, cy, bl, ring, t) {
+    var N = 42, R = bl.R * ring;
+    ctx.beginPath();
+    for (var k = 0; k <= N; k++) {
+      var th = (k / N) * Math.PI * 2;
+      var w = 1 + bl.a1 * Math.sin(3 * th + bl.px + t * bl.w1) + bl.a2 * Math.sin(5 * th - bl.py + t * bl.w2) + 0.05 * Math.sin(2 * th + t * 0.21);
+      var x = cx + Math.cos(th) * R * w, y = cy + Math.sin(th) * R * w * 0.84;
+      if (k === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+  }
+  function drawInk(ox, t, boost, energy) {
+    var drift = 1 + energy * 0.9;
+    for (var i = 0; i < blobs.length; i++) {
+      var bl = blobs[i];
+      var cx = ox + bl.x + bl.ax * Math.sin(t * bl.fx * drift + bl.px);
+      var cy = bl.y + bl.ay * Math.sin(t * bl.fy * drift + bl.py);
+      blobPath(cx, cy, bl, 1.0, t);
+      ctx.fillStyle = 'rgba(62,110,142,' + (0.07 + 0.05 * boost) * bl.deep + ')';
+      ctx.fill();
+      var rings = [1.0, 0.78, 0.55, 0.34];
+      for (var r = 0; r < rings.length; r++) {
+        blobPath(cx, cy, bl, rings[r], t);
+        ctx.strokeStyle = 'rgba(62,110,142,' + (0.24 + 0.42 * (1 - rings[r]) + 0.18 * boost) * bl.deep + ')';
+        ctx.lineWidth = r === 0 ? 2.0 : 1.4;
+        ctx.stroke();
+      }
+      ctx.beginPath();
+      ctx.arc(cx, cy, 2.6, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(120,175,205,' + 0.5 * bl.deep + ')';
+      ctx.fill();
+    }
+  }
+
+  function drawType(ox, t, boost, energy) {
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    var om = 1 + energy * 1.8 + boost * 0.5;
+    for (var i = 0; i < glyphs.length; i++) {
+      var g = glyphs[i], v = vortices[g.v];
+      var ang = g.ang + t * g.om * om;
+      var rad = g.rad + 13 * Math.sin(t * 0.6 + g.ph);
+      var x = ox + v.x + Math.cos(ang) * rad;
+      var y = v.y + Math.sin(ang) * rad * 0.82;
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.rotate(ang + Math.PI / 2 + 0.3 * Math.sin(t * 0.9 + g.ph));
+      ctx.font = g.size + 'px Georgia, "Times New Roman", serif';
+      ctx.fillStyle = 'rgba(237,232,218,' + g.al * (1 + 0.3 * boost) + ')';
+      ctx.fillText(g.ch, 0, 0);
+      ctx.restore();
+    }
+  }
+
+  function drawMenagerie(ox, t, boost, energy) {
+    ctx.fillStyle = '#4DD8C8';
+    var jig = 1 + energy * 2.2;
+    for (var i = 0; i < creatures.length; i++) {
+      var cr = creatures[i];
+      var cx = ox + cr.x + cr.drift * Math.sin(t * 0.07 + cr.ph);
+      var cy = cr.y + 9 * Math.sin(t * 0.8 + cr.ph) * jig;
+      for (var k = 0; k < cr.pts.length; k++) {
+        var p = cr.pts[k];
+        var tw = 0.75 + 0.25 * Math.sin(t * 2.1 + k * 1.7 + cr.ph);
+        ctx.globalAlpha = p[2] * tw * (1 + 0.2 * boost);
+        ctx.beginPath();
+        ctx.arc(cx + p[0], cy + p[1], 2.3, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  var painters = [drawStars, drawSolids, drawInk, drawType, drawMenagerie];
+
+  // ---------- main draw ----------
+  function draw(t) {
+    cv.style.width = W + 'px';
+    cv.style.height = H + 'px';
+    ctx.fillStyle = '#050607';
+    ctx.fillRect(0, 0, W, H);
+    ctx.save();
+    ctx.translate(OX, OY);
+    ctx.scale(UNIT, UNIT);
+    var cam = camCenterAt(t);
+    var energy = clamp(energyAt(t), 0, 1.6);
+    var i, ox;
+    for (i = 0; i < NWORLD; i++) {
+      ox = i * PANEL - cam + 500;
+      if (ox + PANEL < -90 || ox > 1090) continue;
+      painters[i](ox, t, dwellBoost(t, i), energy);
+    }
+    // seam glow bands + hairlines where worlds meet
+    for (i = 1; i < NWORLD; i++) {
+      var sx = i * PANEL - cam + 500;
+      if (sx < -40 || sx > 1040) continue;
+      ctx.fillStyle = 'rgba(255,255,255,0.045)';
+      ctx.fillRect(sx - 15, 0, 30, 1000);
+      ctx.fillStyle = 'rgba(255,255,255,0.30)';
+      ctx.fillRect(sx - 0.8, 0, 1.6, 1000);
+    }
+    ctx.restore();
+  }
+
+  // ---------- audio: five lazy beds, gains follow camera proximity ----------
+  var audioCtx = null, bedGains = [];
+  function ensureAudio() {
+    if (audioCtx) { if (audioCtx.resume) audioCtx.resume(); return; }
+    try {
+      var AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      audioCtx = new AC();
+      var master = audioCtx.createGain();
+      master.gain.value = 0.9;
+      master.connect(audioCtx.destination);
+      var spec = [
+        { f: 740, type: 'sine', g: 0.05 }, { f: 196, type: 'triangle', g: 0.07 },
+        { f: 98, type: 'sine', g: 0.09 }, { f: 330, type: 'sine', g: 0.045 },
+        { f: 523, type: 'triangle', g: 0.05 }
+      ];
+      bedGains = [];
+      for (var i = 0; i < spec.length; i++) {
+        var o = audioCtx.createOscillator();
+        o.type = spec[i].type;
+        o.frequency.value = spec[i].f;
+        var gn = audioCtx.createGain();
+        gn.gain.value = 0;
+        o.connect(gn); gn.connect(master);
+        o.start();
+        bedGains.push({ node: gn, base: spec[i].g });
+      }
+    } catch (e) { audioCtx = null; bedGains = []; }
+  }
+  function updateAudio(t) {
+    if (!audioCtx || !bedGains.length) return;
+    var cam = camCenterAt(t), en = clamp(energyAt(t), 0, 1.6);
+    for (var i = 0; i < NWORLD; i++) {
+      var prox = clamp(1 - Math.abs(cam - panelCenter(i)) / PANEL, 0, 1);
+      var target = bedGains[i].base * prox * prox * (0.6 + 0.4 * en);
+      try { bedGains[i].node.gain.setTargetAtTime(target, audioCtx.currentTime, 0.15); } catch (e) {}
+    }
+  }
+
+  // ---------- interaction ----------
+  function nowMs() {
+    if (window.performance && window.performance.now) return window.performance.now();
+    return Date.now();
+  }
+  var startStamp = nowMs();
+  function pieceT() { return PHASE + (nowMs() - startStamp) / 1000; }
+  function toUnitX(e) {
+    var rect = cv.getBoundingClientRect ? cv.getBoundingClientRect() : { left: 0, top: 0 };
+    return (e.clientX - rect.left - OX) / UNIT;
+  }
+  cv.addEventListener('pointerdown', function (e) {
+    ensureAudio();
+    var t = pieceT();
+    drag.on = true; drag.moved = false;
+    drag.downX = toUnitX(e); drag.lastX = drag.downX; drag.downT = t;
+    drag.off = dragOffsetAt(t);
+    releaseRec = null;
+    if (cv.setPointerCapture && e.pointerId != null) { try { cv.setPointerCapture(e.pointerId); } catch (err) {} }
+  });
+  cv.addEventListener('pointermove', function (e) {
+    if (!drag.on) return;
+    var t = pieceT();
+    var x = toUnitX(e);
+    var dx = x - drag.lastX;
+    drag.lastX = x;
+    if (Math.abs(x - drag.downX) > 8) drag.moved = true;
+    if (drag.moved) {
+      drag.off -= dx; // grab the panorama: content follows the pointer
+      var inst = clamp(Math.abs(dx) * 60 / 900, 0, 1.6);
+      energyState = Math.max(energyState * 0.6, inst);
+      energyT = t;
+    }
+  });
+  function endPointer() {
+    if (!drag.on) return;
+    var t = pieceT();
+    var wasDrag = drag.moved;
+    drag.on = false;
+    if (wasDrag) { releaseRec = { t: t, off: drag.off }; return; }
+    if (t - drag.downT > 0.4) return; // long press: not a tap
+    if (t - lastTapT < 0.4) {
+      // double-tap: new cabinet
+      cabinetSeed = mix32(cabinetSeed, (t * 1000) | 0) & 0x7fffffff;
+      buildCabinet(cabinetSeed);
+      dwell = null;
+      lastTapT = -100;
+    } else {
+      dwell = { t: t, world: currentWorld(t) };
+      lastTapT = t;
+    }
+  }
+  cv.addEventListener('pointerup', endPointer);
+  cv.addEventListener('pointercancel', endPointer);
+
+  // ---------- boot ----------
+  buildCabinet(cabinetSeed);
+  resize();
+  draw(PHASE);
+  function frame() {
+    var t = pieceT();
+    draw(t);
+    updateAudio(t);
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+  }
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
