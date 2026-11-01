@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>№1115 — Sweet Spot</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #F7F5F0; overflow: hidden; height: 100%; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded RNG (deterministic; no Math.random anywhere) ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  var PAPER = '#F7F5F0';
+  var PAPER_LIGHT = '#FDFCF9';
+  var PAPER_SHADE = '#E7E3D9';
+  var PAPER_EDGE = '#C9C4B8';
+  var INK = '#17181C';
+  var ACCENT = '#2B5CE6';
+  var TRACK = '#D8D3C8';
+
+  var COLS = 5, ROWS = 4;
+  var SMEAR_K = 0.45;        // slice displacement per unit of viewpoint error
+  var PROX_RANGE = 0.78;     // distance at which proximity reads 0
+  var HIT_DIST = (1 - 0.985) * PROX_RANGE; // proximity 0.985 -> this distance
+  var SUSTAIN = 0.35;        // seconds above threshold before success fires
+  var FLASH_LEN = 0.6;       // white pulse length
+  var HOLD_LEN = 2.0;        // aligned hold after the pulse
+
+  // ---------- seed ----------
+  var seed = 1115;
+  try {
+    var m = /[?&]seed=(\d+)/.exec(window.location && window.location.search || '');
+    if (m) seed = parseInt(m[1], 10) >>> 0;
+  } catch (e) { /* location unavailable: keep default */ }
+
+  // ---------- deal: motif + hidden sweet spot + start viewpoint ----------
+  var motifKind = 0;         // 0 ring, 1 cross, 2 triangle, 3 steps
+  var spot = { x: 0.5, y: 0.5 };
+  var baseCur = { x: 0.5, y: 0.5 }; // viewpoint anchor before wander / hunting
+  var wanderDir = 0;
+
+  function deal(s) {
+    var rnd = mulberry32(s);
+    motifKind = Math.floor(rnd() * 4);
+    // sweet spot kept off the dead centre so the hunt has somewhere to go
+    var ang = rnd() * Math.PI * 2;
+    var rad = 0.16 + rnd() * 0.14;
+    spot.x = 0.5 + Math.cos(ang) * rad;
+    spot.y = 0.5 + Math.sin(ang) * rad * 0.8;
+    // start viewpoint offset on a diagonal, ~half-way proximity (arc about
+    // half) with the error present on both axes so frame one smears in x and y
+    var ex = (rnd() < 0.5 ? -1 : 1) * (0.21 + rnd() * 0.07);
+    var ey = (rnd() < 0.5 ? -1 : 1) * (0.21 + rnd() * 0.07);
+    baseCur.x = spot.x + ex;
+    baseCur.y = spot.y + ey;
+    baseCur.x = Math.max(0.04, Math.min(0.96, baseCur.x));
+    baseCur.y = Math.max(0.04, Math.min(0.96, baseCur.y));
+    wanderDir = rnd() * Math.PI * 2;
+  }
+  deal(seed);
+
+  // ---------- motif field: 0 none, 1 ink, 2 accent; coords in grid units ----------
+  function motifAt(x, y) {
+    // x in [0,5], y in [0,4]; outside -> 0
+    if (x < 0 || x > 5 || y < 0 || y > 4) return 0;
+    if (motifKind === 0) { // ring with an accent wedge
+      var dx = x - 2.5, dy = (y - 2) * 1.25;
+      var d = Math.sqrt(dx * dx + dy * dy);
+      if (d > 0.78 && d < 1.42) {
+        var a = Math.atan2(dy, dx);
+        if (a > -0.5 && a < 0.65) return 2;
+        return 1;
+      }
+      return 0;
+    }
+    if (motifKind === 1) { // bar-cross, accent heart
+      var inV = Math.abs(x - 2.5) < 0.36 && y > 0.55 && y < 3.45;
+      var inH = Math.abs(y - 2) < 0.36 && x > 0.55 && x < 4.45;
+      if (inV && inH) return 2;
+      if (inV || inH) return 1;
+      return 0;
+    }
+    if (motifKind === 2) { // triangle, accent core
+      if (y < 0.55 || y > 3.45) return 0;
+      var half = 0.25 + (y - 0.55) * 0.62;
+      if (Math.abs(x - 2.5) < half) {
+        var halfIn = 0.05 + (y - 1.15) * 0.5;
+        if (y > 1.15 && Math.abs(x - 2.5) < halfIn) return 2;
+        return 1;
+      }
+      return 0;
+    }
+    // steps: four ascending bands, accent nosing on each tread edge
+    var band = Math.floor(y);
+    if (band < 0) band = 0; if (band > 3) band = 3;
+    var tread = 4.35 - band * 1.02;
+    if (x > tread) {
+      if (x - tread < 0.34) return 2;
+      return 1;
+    }
+    return 0;
+  }
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('stage');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0, DPR = 1;
+  var isPhone = false;
+
+  function computeSize() {
+    var vv = window.visualViewport;
+    var w, h;
+    if (vv && vv.width) { w = vv.width; h = vv.height; }
+    else { w = window.innerWidth; h = window.innerHeight; }
+    W = Math.max(1, Math.floor(w));
+    H = Math.max(1, Math.floor(h));
+    DPR = 1;
+    try { DPR = Math.min(window.devicePixelRatio || 1, 2); } catch (e) { DPR = 1; }
+    var sw = 9999;
+    try {
+      if (window.screen) sw = Math.min(window.screen.width, window.screen.height);
+    } catch (e) { /* keep default */ }
+    isPhone = sw < 700 || (H > W * 1.15 && Math.min(W, H) < 700);
+  }
+
+  function applySize() {
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+  }
+
+  // ---------- state ----------
+  var PHASE0 = 0;            // fixed first-frame phase (determinism)
+  var cur = { x: baseCur.x, y: baseCur.y };   // eased viewpoint
+  var target = null;         // drag target in viewpoint space; null = idle wander
+  var phase = 'hunt';        // 'hunt' | 'flash' | 'hold'
+  var phaseT = 0;            // seconds inside flash/hold
+  var hotT = 0;              // sustained time above the proximity threshold
+  var lastT = PHASE0;
+
+  function wander(t) {
+    // slow drift around baseCur; amplitude kept well short of the spot
+    return {
+      x: baseCur.x + Math.sin(t * 0.37 + wanderDir) * 0.055 + Math.sin(t * 0.13 + 1.7) * 0.03,
+      y: baseCur.y + Math.cos(t * 0.29 + wanderDir * 1.3) * 0.05 + Math.sin(t * 0.11 + 0.4) * 0.028
+    };
+  }
+
+  function proximity(cx, cy) {
+    var dx = spot.x - cx, dy = spot.y - cy;
+    var d = Math.sqrt(dx * dx + dy * dy);
+    var p = 1 - d / PROX_RANGE;
+    return p < 0 ? 0 : (p > 1 ? 1 : p);
+  }
+
+  // ---------- audio: lazy hum, starts only inside the first gesture ----------
+  var actx = null, humOsc = null, humGain = null;
+  function ensureAudio() {
+    try {
+      if (actx || typeof window === 'undefined') return;
+      var AC = window.AudioContext || window.webkitAudioContext;
+      if (typeof AC !== 'function') return;
+      actx = new AC();
+      humOsc = actx.createOscillator();
+      humGain = actx.createGain();
+      humOsc.type = 'sine';
+      humOsc.frequency.value = 150;
+      humGain.gain.value = 0.0;
+      humOsc.connect(humGain);
+      humGain.connect(actx.destination);
+      humOsc.start();
+    } catch (e) { actx = null; humOsc = null; humGain = null; }
+  }
+  function updateAudio(prox) {
+    if (!actx || !humOsc || !humGain) return;
+    try {
+      var f = 110 + prox * prox * 420;
+      humOsc.frequency.setTargetAtTime(f, actx.currentTime, 0.08);
+      humGain.gain.setTargetAtTime(0.012 + prox * 0.03, actx.currentTime, 0.1);
+    } catch (e) { /* audio is decoration; visuals stand alone */ }
+  }
+
+  // ---------- drawing ----------
+  function draw(t) {
+    computeSize();
+    applySize();
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+    // paper ground everywhere (phones: page ground takes the paper colour)
+    ctx.fillStyle = PAPER;
+    ctx.fillRect(0, 0, W, H);
+
+    // centred square stage; the prism field lives inside it
+    var side = Math.min(W, H);
+    var ox = (W - side) / 2, oy = (H - side) / 2;
+    var margin = side * 0.09;
+    var gx = ox + margin, gy = oy + margin;
+    var gw = side - margin * 2, gh = side - margin * 2;
+    var cellW = gw / COLS, cellH = gh / ROWS;
+
+    // viewpoint for this frame
+    var vx, vy;
+    if (phase !== 'hunt') { vx = spot.x; vy = spot.y; }
+    else if (target) { vx = cur.x; vy = cur.y; }
+    else { var wpos = wander(t); vx = wpos.x; vy = wpos.y; cur.x = vx; cur.y = vy; }
+
+    var aligned = (phase !== 'hunt');
+    var errX = aligned ? 0 : (spot.x - vx);
+    var errY = aligned ? 0 : (spot.y - vy);
+
+    var block = Math.max(4, Math.round(cellW / 16));
+
+    for (var r = 0; r < ROWS; r++) {
+      for (var c = 0; c < COLS; c++) {
+        var cx = gx + c * cellW, cy = gy + r * cellH;
+        var inset = Math.max(1.5, side * 0.004);
+        var px = cx + inset, py = cy + inset;
+        var pw = cellW - inset * 2, ph = cellH - inset * 2;
+
+        // prism body: two flat-shaded faces split by a vertical ridge
+        var ridge = px + pw * (0.5 + (c - 2) * 0.03);
+        ctx.fillStyle = PAPER_LIGHT;
+        ctx.beginPath();
+        ctx.moveTo(px, py); ctx.lineTo(ridge, py + ph * 0.08);
+        ctx.lineTo(ridge, py + ph * 0.92); ctx.lineTo(px, py + ph);
+        ctx.closePath(); ctx.fill();
+        ctx.fillStyle = PAPER_SHADE;
+        ctx.beginPath();
+        ctx.moveTo(ridge, py + ph * 0.08); ctx.lineTo(px + pw, py);
+        ctx.lineTo(px + pw, py + ph); ctx.lineTo(ridge, py + ph * 0.92);
+        ctx.closePath(); ctx.fill();
+
+        // the slice: motif sampled through this prism's anamorphic offset
+        var dirX = (c - (COLS - 1) / 2) / ((COLS - 1) / 2);
+        var dirY = (r - (ROWS - 1) / 2) / ((ROWS - 1) / 2);
+        var shX = errX * SMEAR_K * dirX * COLS;
+        var shY = errY * SMEAR_K * dirY * ROWS;
+
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(px, py, pw, ph);
+        ctx.clip();
+        for (var by = py; by < py + ph; by += block) {
+          for (var bx = px; bx < px + pw; bx += block) {
+            var bcx = bx + block / 2, bcy = by + block / 2;
+            var u = (bcx - gx) / gw * COLS + shX;
+            var v = (bcy - gy) / gh * ROWS + shY;
+            var val = motifAt(u, v);
+            if (val === 0) continue;
+            ctx.fillStyle = val === 2 ? ACCENT : INK;
+            ctx.fillRect(bx, by, block + 0.5, block + 0.5);
+          }
+        }
+        ctx.restore();
+
+        // ridge glint + prism outline
+        ctx.strokeStyle = 'rgba(23,24,28,0.18)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(ridge, py + ph * 0.08);
+        ctx.lineTo(ridge, py + ph * 0.92);
+        ctx.stroke();
+        ctx.strokeStyle = PAPER_EDGE;
+        ctx.strokeRect(px + 0.5, py + 0.5, pw - 1, ph - 1);
+      }
+    }
+
+    // the flash: one smooth white pulse across the whole field
+    if (phase === 'flash') {
+      var k = phaseT / FLASH_LEN;
+      var a = Math.sin(Math.PI * (k < 0 ? 0 : k > 1 ? 1 : k));
+      ctx.fillStyle = 'rgba(255,255,255,' + (a * 0.88).toFixed(3) + ')';
+      ctx.fillRect(gx, gy, gw, gh);
+    }
+
+    // proximity arc, top-right of the stage; no numbers, feedback only
+    var prox = aligned ? 1 : proximity(vx, vy);
+    var arcR = Math.min(side * 0.045, margin * 0.42);
+    var ax = ox + side - margin / 2;
+    var ay = oy + margin / 2;
+    ctx.lineWidth = Math.max(2, side * 0.005);
+    ctx.strokeStyle = TRACK;
+    ctx.beginPath();
+    ctx.arc(ax, ay, arcR, 0, Math.PI * 2);
+    ctx.stroke();
+    if (prox > 0.003) {
+      ctx.strokeStyle = INK;
+      ctx.beginPath();
+      ctx.arc(ax, ay, arcR, -Math.PI / 2, -Math.PI / 2 + prox * Math.PI * 2);
+      ctx.stroke();
+    }
+
+    return prox;
+  }
+
+  // ---------- frame step: easing + success state machine ----------
+  function step(t) {
+    var dt = t - lastT;
+    if (dt < 0) dt = 0;
+    if (dt > 0.1) dt = 0.1;
+    lastT = t;
+
+    if (phase === 'flash' || phase === 'hold') {
+      phaseT += dt;
+      if (phase === 'flash' && phaseT >= FLASH_LEN) { phase = 'hold'; phaseT = 0; }
+      else if (phase === 'hold' && phaseT >= HOLD_LEN) {
+        seed = (seed * 1664525 + 1013904223) >>> 0;
+        deal(seed);
+        cur.x = baseCur.x; cur.y = baseCur.y;
+        target = null; hotT = 0;
+        phase = 'hunt'; phaseT = 0;
+      }
+    } else {
+      if (target) {
+        var k = 1 - Math.exp(-dt / 0.12);
+        cur.x += (target.x - cur.x) * k;
+        cur.y += (target.y - cur.y) * k;
+      }
+      var dx = spot.x - cur.x, dy = spot.y - cur.y;
+      var dist = Math.sqrt(dx * dx + dy * dy);
+      // while idle-wandering cur is set inside draw(); measure from the
+      // wander position too so a lucky drift can never fire the success
+      if (dist < HIT_DIST && target) {
+        hotT += dt;
+        if (hotT >= SUSTAIN) { phase = 'flash'; phaseT = 0; hotT = 0; }
+      } else {
+        hotT = 0;
+      }
+    }
+
+    var prox = draw(t);
+    updateAudio(phase === 'hunt' ? prox : 1);
+  }
+
+  // ---------- pointer: drag hunts, double-tap reseeds ----------
+  var downAt = 0, downPos = null, lastTapAt = -1e9, lastTapPos = null, dragging = false;
+
+  function toViewpoint(clientX, clientY) {
+    var rect = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0, width: W, height: H };
+    var x = (clientX - rect.left) / (rect.width || W);
+    var y = (clientY - rect.top) / (rect.height || H);
+    var side = Math.min(W, H);
+    var ox = (W - side) / 2, oy = (H - side) / 2;
+    var margin = side * 0.09;
+    // map stage position into viewpoint space over the grid extent
+    var vx = (x * W - ox - margin) / (side - margin * 2);
+    var vy = (y * H - oy - margin) / (side - margin * 2);
+    return {
+      x: Math.max(0, Math.min(1, vx)),
+      y: Math.max(0, Math.min(1, vy))
+    };
+  }
+
+  function nowSec() {
+    try { return performance.now() / 1000; } catch (e) { return 0; }
+  }
+
+  function onDown(e) {
+    ensureAudio();
+    if (actx && actx.state === 'suspended') { try { actx.resume(); } catch (err) { /* ignore */ } }
+    var p = toViewpoint(e.clientX, e.clientY);
+    downAt = nowSec();
+    downPos = p;
+    dragging = false;
+    if (phase === 'hunt') target = p;
+  }
+  function onMove(e) {
+    if (!downPos) return;
+    var p = toViewpoint(e.clientX, e.clientY);
+    if (Math.abs(p.x - downPos.x) + Math.abs(p.y - downPos.y) > 0.01) dragging = true;
+    if (phase === 'hunt') target = p;
+  }
+  function onUp(e) {
+    if (!downPos) return;
+    var p = toViewpoint(e.clientX, e.clientY);
+    var quick = (nowSec() - downAt) < 0.35;
+    if (phase === 'hunt') target = p;
+    if (quick && !dragging) {
+      var tnow = nowSec();
+      if (lastTapPos && (tnow - lastTapAt) < 0.32 &&
+          Math.abs(p.x - lastTapPos.x) + Math.abs(p.y - lastTapPos.y) < 0.08) {
+        // double-tap: deal a fresh motif and a fresh hidden viewpoint
+        seed = (seed * 1664525 + 1013904223) >>> 0;
+        deal(seed);
+        cur.x = baseCur.x; cur.y = baseCur.y;
+        target = null; hotT = 0;
+        lastTapAt = -1e9; lastTapPos = null;
+      } else {
+        lastTapAt = tnow; lastTapPos = p;
+      }
+    }
+    downPos = null;
+    dragging = false;
+  }
+
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', function () { downPos = null; dragging = false; });
+  }
+
+  // ---------- resize ----------
+  function onResize() { draw(lastT); }
+  if (window.addEventListener) window.addEventListener('resize', onResize);
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', onResize);
+  }
+
+  // ---------- go: synchronous fixed-phase first frame, then the loop ----------
+  computeSize();
+  applySize();
+  draw(PHASE0);
+
+  if (typeof requestAnimationFrame === 'function') {
+    var startStamp = null;
+    var loop = function (stamp) {
+      if (startStamp === null) startStamp = stamp;
+      step(PHASE0 + (stamp - startStamp) / 1000);
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>

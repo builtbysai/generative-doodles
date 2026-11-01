@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Point Cloud Country</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #07090a; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ---------- viewport (Visual Viewport API, with fallbacks) ----------
+  var W = 0, H = 0, DPR = 1;
+  function measure() {
+    var vv = window.visualViewport;
+    var w = vv ? vv.width : (window.innerWidth || 800);
+    var h = vv ? vv.height : (window.innerHeight || 800);
+    W = Math.max(50, Math.round(w));
+    H = Math.max(50, Math.round(h));
+    DPR = Math.min(2, window.devicePixelRatio || 1);
+  }
+  function fit() {
+    measure();
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+  }
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { fit(); });
+  }
+  window.addEventListener('resize', function () { fit(); });
+  window.addEventListener('orientationchange', function () { fit(); });
+
+  function isPhone() {
+    try {
+      var sw = window.screen ? window.screen.width : 0;
+      var sh = window.screen ? window.screen.height : 0;
+      var mn = Math.min(sw, sh);
+      if (mn > 0 && mn < 700) return true;
+    } catch (e) {}
+    return H > W * 1.15;
+  }
+
+  // ---------- seeded RNG + integer-hash value noise ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function hash2(ix, iz, seed) {
+    var n = (Math.imul(ix, 374761393) + Math.imul(iz, 668265263) + Math.imul(seed, 974711)) | 0;
+    n = Math.imul(n ^ (n >>> 13), 1274126177);
+    return ((n ^ (n >>> 16)) >>> 0) / 4294967296;
+  }
+  function smoother(t) { return t * t * t * (t * (t * 6 - 15) + 10); }
+  function vnoise(x, z, seed) {
+    var ix = Math.floor(x), iz = Math.floor(z);
+    var fx = x - ix, fz = z - iz;
+    var a = hash2(ix, iz, seed), b = hash2(ix + 1, iz, seed);
+    var c = hash2(ix, iz + 1, seed), d = hash2(ix + 1, iz + 1, seed);
+    var ux = smoother(fx), uz = smoother(fz);
+    return a + (b - a) * ux + (c - a) * uz + (a - b - c + d) * ux * uz;
+  }
+  function fbm(x, z, seed) {
+    var v = 0, amp = 0.55, f = 1, norm = 0;
+    for (var o = 0; o < 5; o++) {
+      v += amp * vnoise(x * f, z * f, seed + o * 131);
+      norm += amp; amp *= 0.5; f *= 2.03;
+    }
+    return v / norm;
+  }
+
+  // ---------- terrain ----------
+  // Palette indices: 0 deep green, 1 valley green, 2 ochre, 3 rock, 4 snow, 5 river
+  var COLORS = ['#2E5E2A', '#3E7A3A', '#C9962E', '#B8B0A0', '#F2F2EE', '#57D8E8'];
+  var BASE_SEED = 20261116;
+  var seedSalt = 0;
+
+  var pts = [];      // {x, z, y, col, jit}
+  var snowline = 0.8;
+  var built = false;
+
+  function buildTerrain() {
+    var seed = (BASE_SEED + Math.imul(seedSalt + 1, 7919)) | 0;
+    var rng = mulberry32(seed);
+    var phone = isPhone();
+    var N = phone ? 92 : 124;              // 92^2=8464 phone, 124^2=15376 desktop
+    var heights = new Float32Array(N * N);
+    var i, j, x, z;
+
+    // two seeded mountain masses so a snow peak always exists
+    var p1x = -0.45 + rng() * 0.5, p1z = -0.4 + rng() * 0.45, p1a = 0.40 + rng() * 0.20;
+    var p2x = 0.25 + rng() * 0.5, p2z = 0.3 + rng() * 0.45, p2a = 0.28 + rng() * 0.16;
+    snowline = 0.79 + rng() * 0.06;
+
+    var hmin = 1e9, hmax = -1e9;
+    for (j = 0; j < N; j++) {
+      for (i = 0; i < N; i++) {
+        x = (i / (N - 1)) * 2 - 1;
+        z = (j / (N - 1)) * 2 - 1;
+        var base = fbm(x * 2.6 + 10, z * 2.6 + 10, seed);
+        var detail = fbm(x * 6.5 + 40, z * 6.5 + 40, seed + 777);
+        var d1 = (x - p1x) * (x - p1x) + (z - p1z) * (z - p1z);
+        var d2 = (x - p2x) * (x - p2x) + (z - p2z) * (z - p2z);
+        // falloff toward the coasts so the country reads as one landmass
+        var edge = Math.max(Math.abs(x), Math.abs(z));
+        var coast = 1 - 0.35 * Math.max(0, edge - 0.72) / 0.28;
+        var h = (base * 0.70 + detail * 0.13 + p1a * Math.exp(-d1 * 3.4) + p2a * Math.exp(-d2 * 4.2)) * coast;
+        heights[j * N + i] = h;
+        if (h < hmin) hmin = h;
+        if (h > hmax) hmax = h;
+      }
+    }
+    var span = (hmax - hmin) || 1;
+    function hn(idx) { return (heights[idx] - hmin) / span; }
+
+    // river: a seeded meander walk born on the main peak's flank. It keeps a
+    // heading (momentum), and at each step picks the forward cell that runs
+    // lowest — so it winds downhill through the valleys to the far coast
+    // instead of dying in the first noise hollow like a pure descent would.
+    var riverSet = {};
+    (function () {
+      var ci = Math.round((p1x * 0.72 + 1) / 2 * (N - 1));
+      var cj = Math.round((p1z * 0.72 + 1) / 2 * (N - 1));
+      var hx = -p1x + (rng() - 0.5) * 0.6, hz = -p1z + (rng() - 0.5) * 0.6;
+      var hl = Math.sqrt(hx * hx + hz * hz) || 1; hx /= hl; hz /= hl;
+      var seen = {}, steps = 0, maxSteps = Math.floor(N * 1.5);
+      while (steps++ < maxSteps) {
+        if (ci < 1 || cj < 1 || ci > N - 2 || cj > N - 2) break;
+        riverSet[cj * N + ci] = 1;
+        seen[cj * N + ci] = 1;
+        var bestScore = 1e18, bdi = 0, bdj = 0, found = false;
+        for (var dj = -1; dj <= 1; dj++) for (var di = -1; di <= 1; di++) {
+          if (!di && !dj) continue;
+          var dot = di * hx + dj * hz;
+          if (dot < 0.15) continue;                       // forward cone only
+          var ni = ci + di, nj = cj + dj;
+          if (seen[nj * N + ni]) continue;
+          var score = hn(nj * N + ni) + (1 - dot) * 0.16 + rng() * 0.012;
+          if (score < bestScore) { bestScore = score; bdi = di; bdj = dj; found = true; }
+        }
+        if (!found) break;
+        hx = hx * 0.55 + bdi * 0.45; hz = hz * 0.55 + bdj * 0.45;
+        var nl = Math.sqrt(hx * hx + hz * hz) || 1; hx /= nl; hz /= nl;
+        ci += bdi; cj += bdj;
+      }
+    })();
+
+    pts = [];
+    var cell = 2 / (N - 1);
+    for (j = 0; j < N; j++) {
+      for (i = 0; i < N; i++) {
+        var idx = j * N + i;
+        var jx = (rng() - 0.5) * cell * 0.85;
+        var jz = (rng() - 0.5) * cell * 0.85;
+        var hh = hn(idx);
+        var col;
+        if (riverSet[idx]) col = 5;
+        else {
+          var hb = hh + (rng() - 0.5) * 0.045;
+          if (hb >= snowline) col = 4;
+          else if (hb >= 0.60) col = 3;
+          else if (hb >= 0.44) col = 2;
+          else if (hb >= 0.27) col = 1;
+          else col = 0;
+        }
+        pts.push({
+          x: ((i / (N - 1)) * 2 - 1) + jx,
+          z: ((j / (N - 1)) * 2 - 1) + jz,
+          y: hh + (riverSet[idx] ? 0.006 : 0),   // river sits a hair proud of the land
+          col: col,
+          big: riverSet[idx] ? 1 : 0
+        });
+      }
+    }
+    built = true;
+  }
+
+  // ---------- camera / interaction state ----------
+  var AZ0 = 0.85;                 // fixed first-frame azimuth (river + peak read here)
+  var TILT0 = 35 * Math.PI / 180; // fixed ~35 degree tilt
+  var ROT_PERIOD = 60;            // seconds per idle revolution
+  var azOff = 0, tiltOff = 0;     // drag offsets, ease back to idle path
+  var dragging = false, lastPX = 0, lastPY = 0;
+  var lastTapT = -1e9, lastTapX = 0, lastTapY = 0;
+
+  canvas.addEventListener('pointerdown', function (e) {
+    dragging = true; lastPX = e.clientX; lastPY = e.clientY;
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+    startWind();
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (!dragging) return;
+    var dx = e.clientX - lastPX, dy = e.clientY - lastPY;
+    lastPX = e.clientX; lastPY = e.clientY;
+    azOff += dx * 0.008;
+    tiltOff += dy * 0.004;
+    if (tiltOff > 0.30) tiltOff = 0.30;
+    if (tiltOff < -0.30) tiltOff = -0.30;
+  });
+  function endPointer(e) {
+    if (!dragging) return;
+    dragging = false;
+    var now = performance.now() / 1000;
+    var moved = Math.abs(e.clientX - lastTapX) + Math.abs(e.clientY - lastTapY);
+    if (now - lastTapT < 0.32 && moved < 48) {
+      seedSalt++;
+      buildTerrain();
+      lastTapT = -1e9;
+    } else {
+      lastTapT = now; lastTapX = e.clientX; lastTapY = e.clientY;
+    }
+  }
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', function () { dragging = false; });
+  canvas.addEventListener('dblclick', function () { seedSalt++; buildTerrain(); });
+
+  // ---------- optional lazy wind tone (first gesture only, fully guarded) ----------
+  var windStarted = false;
+  function startWind() {
+    if (windStarted) return;
+    windStarted = true;
+    try {
+      var AC = window.AudioContext || window.webkitAudioContext;
+      if (typeof AC !== 'function') return;
+      var ac = new AC();
+      var len = ac.sampleRate * 2;
+      var buf = ac.createBuffer(1, len, ac.sampleRate);
+      var data = buf.getChannelData(0);
+      var r = mulberry32(4242), last = 0;
+      for (var i = 0; i < len; i++) {           // pinkish noise, no Math.random
+        var white = r() * 2 - 1;
+        last = last * 0.94 + white * 0.06;
+        data[i] = last * 2.4;
+      }
+      var src = ac.createBufferSource();
+      src.buffer = buf; src.loop = true;
+      var filt = ac.createBiquadFilter();
+      filt.type = 'lowpass'; filt.frequency.value = 320; filt.Q.value = 0.4;
+      var gain = ac.createGain(); gain.gain.value = 0.035;
+      src.connect(filt); filt.connect(gain); gain.connect(ac.destination);
+      src.start();
+    } catch (e) { /* silent ship is fine */ }
+  }
+
+  // ---------- draw ----------
+  var NB = 26; // depth buckets
+  var buckets = [];
+  for (var b = 0; b < NB; b++) buckets.push([]);
+
+  function draw(t) {
+    canvas.style.width = W + 'px';    // pin CSS size (house rule)
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = '#07090a';
+    ctx.fillRect(0, 0, W, H);
+    if (!built) buildTerrain();
+
+    var az = AZ0 + (t / ROT_PERIOD) * Math.PI * 2 + azOff;
+    var tilt = TILT0 + tiltOff;
+    var cosA = Math.cos(az), sinA = Math.sin(az);
+    var cosT = Math.cos(tilt), sinT = Math.sin(tilt);
+    var unit = Math.min(W, H) * 0.44;
+    var cx = W / 2, cy = H / 2 + unit * 0.10;
+    var focal = 3.1, amp = 0.62;
+
+    for (var b2 = 0; b2 < NB; b2++) buckets[b2].length = 0;
+
+    var i, p, x1, z1, y2, z2, depth, sc, sx, sy, bi;
+    for (i = 0; i < pts.length; i++) {
+      p = pts[i];
+      x1 = p.x * cosA - p.z * sinA;
+      z1 = p.x * sinA + p.z * cosA;
+      y2 = p.y * amp * cosT - z1 * sinT;
+      z2 = p.y * amp * sinT + z1 * cosT;
+      depth = z2 + 2.35;                        // > 0 always (|z2| < ~1.5)
+      sc = focal / depth;
+      sx = cx + x1 * sc * unit;
+      sy = cy - y2 * sc * unit;
+      if (sx < -4 || sx > W + 4 || sy < -4 || sy > H + 4) continue;
+      bi = (depth * 6) | 0;                     // depth ~0.85..3.85 -> 5..23
+      if (bi < 0) bi = 0; else if (bi >= NB) bi = NB - 1;
+      buckets[bi].push(sx, sy, sc, p.col, p.big);
+    }
+
+    // far buckets first (large depth index = far), points batched by colour
+    for (var bb = NB - 1; bb >= 0; bb--) {
+      var arr = buckets[bb];
+      if (!arr.length) continue;
+      var alpha = 0.45 + 0.55 * (1 - bb / (NB - 1));
+      ctx.globalAlpha = alpha;
+      for (var cc = 0; cc < COLORS.length; cc++) {
+        ctx.fillStyle = COLORS[cc];
+        ctx.beginPath();
+        for (var k = 0; k < arr.length; k += 5) {
+          if (arr[k + 3] !== cc) continue;
+          var s = arr[k + 2] * (arr[k + 4] ? 3.4 : 2.5);
+          if (s < 1) s = 1; else if (s > 4.2) s = 4.2;
+          var hx = arr[k] - s / 2, hy = arr[k + 1] - s / 2;
+          ctx.rect(hx, hy, s, s);
+        }
+        ctx.fill();
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- run: deterministic first frame, then guarded rAF ----------
+  fit();
+  buildTerrain();
+  draw(0);                                     // fixed phase: t = 0, azimuth AZ0
+  var t0 = null;
+  function frame(ts) {
+    if (t0 === null) t0 = ts;
+    var t = (ts - t0) / 1000;
+    if (!dragging) {                           // ease drag offsets back to the idle path
+      var decay = Math.pow(0.5, 1 / 150);      // ~2.5 s half-life at 60 fps
+      azOff *= decay;
+      tiltOff *= decay;
+      if (Math.abs(azOff) < 1e-4) azOff = 0;
+      if (Math.abs(tiltOff) < 1e-4) tiltOff = 0;
+    }
+    draw(t);
+    if (typeof window.requestAnimationFrame === 'function') {
+      window.requestAnimationFrame(frame);
+    }
+  }
+  if (typeof window.requestAnimationFrame === 'function') {
+    window.requestAnimationFrame(frame);
+  }
+})();
+</script>
+</body>
+</html>

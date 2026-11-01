@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Durchsehen Cube — №1113</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: #BFC9C4;
+    overflow: hidden;
+  }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded RNG (mulberry32) ----------
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // deterministic integer hash -> [0,1)
+  function hash01(a, b, s) {
+    var h = (Math.imul(a | 0, 374761393) + Math.imul(b | 0, 668265263) + Math.imul(s | 0, 974711)) | 0;
+    h = Math.imul(h ^ (h >>> 13), 1274126177);
+    return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+  }
+
+  // ---------- palette ----------
+  var SKY       = '#BFC9C4';  // pale haze above the horizon
+  var FAR_GROUND = '#77875A'; // base tone under the patchwork
+  var FIELDS = ['#5A7A3C', '#6E8A44', '#7A9A4E', '#67913F', '#C9A44E', '#B98A3E', '#CBB98A', '#87A355'];
+  var PLOW      = '#6B5A3E';  // freshly turned earth
+  var RIVER     = '#2AA8BE';  // the winding band
+  var RIVER_HI  = '#5FCEDD';  // water glint line
+  var BANK      = '#C9BC93';  // sandy bank
+  var ROAD      = 'rgba(224,216,190,0.85)';
+  var SHADOW    = 'rgba(20,26,18,0.24)';
+  var CONC_TOP  = '#7A7E84';  // cube top slab
+  var EDGE_DARK = '#4A4E54';  // concrete edge frame
+  var EDGE_LITE = '#9BA0A5';
+  var SEAM_HI   = 'rgba(255,255,255,0.10)';
+
+  function clamp(x, a, b) { return x < a ? a : (x > b ? b : x); }
+  function lerp(a, b, t) { return a + (b - a) * t; }
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('stage');
+  var ctx = canvas.getContext('2d');
+  var viewW = 720, viewH = 720, dpr = 1;
+
+  function measure() {
+    var w, h;
+    if (window.visualViewport) { w = window.visualViewport.width; h = window.visualViewport.height; }
+    else { w = window.innerWidth; h = window.innerHeight; }
+    viewW = w; viewH = h;
+    dpr = Math.min(2, window.devicePixelRatio || 1);
+    var bw = Math.round(w * dpr), bh = Math.round(h * dpr);
+    if (canvas.width !== bw) canvas.width = bw;
+    if (canvas.height !== bh) canvas.height = bh;
+  }
+  function onResize() { measure(); }
+  if (window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', onResize);
+  if (window.addEventListener) window.addEventListener('resize', onResize);
+  measure();
+
+  function isPhone() {
+    var sw = 1024, sh = 768;
+    if (typeof screen !== 'undefined' && screen) { sw = screen.width; sh = screen.height; }
+    return Math.min(sw, sh) < 700 || viewH > viewW * 1.15;
+  }
+
+  // ---------- the landscape: ONE parameterized scene function ----------
+  // Land coords (lx, lz): the world drifts through them, so the ground
+  // scrolls slowly under the orbiting camera. Fields are hashed cells of
+  // land coords; the river is a winding band in land coords; roads are
+  // land-coord lines. drawLandscape() is called once for the real view
+  // and once per cube face with that face's own viewpoint offset — the
+  // transparency is re-rendering, never alpha.
+  var worldSeed = 1113;
+  var riverPh = null;
+  function buildWorld() {
+    var rng = mulberry32(worldSeed);
+    riverPh = { a: rng() * Math.PI * 2, b: rng() * Math.PI * 2, amp: 60 + rng() * 30 };
+  }
+  buildWorld();
+
+  function riverZ(lx) {
+    return riverPh.amp * Math.sin(lx * 0.009 + riverPh.a) + 34 * Math.sin(lx * 0.023 + riverPh.b);
+  }
+
+  function fieldColor(li, lj) {
+    var r = hash01(li, lj, worldSeed);
+    if (r < 0.10) return PLOW;
+    var c = FIELDS[Math.floor(hash01(li, lj, worldSeed + 55) * FIELDS.length) % FIELDS.length];
+    return c;
+  }
+
+  // camera state for the current frame (set by render)
+  var CAM = { th: 0, cos: 1, sin: 0, D: 310, eyeH: 132, f: 700, cx: 0, cy: 0, horizon: 0, drift: 0 };
+
+  function project(wx, wy, wz) {
+    // camera orbits the origin at radius D, height eyeH, looking at origin
+    var qx = wx - CAM.sin * CAM.D, qy = wy - CAM.eyeH, qz = wz - CAM.cos * CAM.D;
+    var x = qx * CAM.cos - qz * CAM.sin;
+    var z = qx * CAM.sin + qz * CAM.cos;      // z < 0 in front of camera
+    var depth = -z;
+    if (depth < 30) depth = 30;              // clamp: extreme foreground stays in frame
+    return { x: CAM.cx + x * CAM.f / depth, y: CAM.horizon - qy * CAM.f / depth, d: -z };
+  }
+
+  function landCell(wx, wz, step) {
+    var lx = wx + CAM.drift, lz = wz;
+    return { li: Math.floor(lx / step), lj: Math.floor(lz / step) };
+  }
+
+  // bbox: optional {x0,y0,x1,y1} in the caller's (possibly translated) space;
+  // cells fully outside are skipped (keeps the cube-face passes cheap).
+  function drawLandscape(bbox) {
+    var w = viewW, h = viewH, S = Math.min(w, h);
+    // base far-ground tone (covers the band between patch edge and horizon)
+    ctx.fillStyle = FAR_GROUND;
+    ctx.fillRect(-2 * S, CAM.horizon - 2, w + 4 * S, h + 2 * S);
+
+    var step = isPhone() ? 26 : 20;
+    var EXT = 310;
+    var cells = [];
+    function pushCell(wx, wz, st) {
+      var p00 = project(wx, 0, wz), p10 = project(wx + st, 0, wz);
+      var p11 = project(wx + st, 0, wz + st), p01 = project(wx, 0, wz + st);
+      if (bbox) {
+        var mnx = Math.min(p00.x, p10.x, p11.x, p01.x), mxx = Math.max(p00.x, p10.x, p11.x, p01.x);
+        var mny = Math.min(p00.y, p10.y, p11.y, p01.y), mxy = Math.max(p00.y, p10.y, p11.y, p01.y);
+        if (mxx < bbox.x0 || mnx > bbox.x1 || mxy < bbox.y0 || mny > bbox.y1) return;
+      }
+      var cc = landCell(wx + st / 2, wz + st / 2, st);
+      cells.push({ p: [p00, p10, p11, p01], d: (p00.d + p11.d) / 2, li: cc.li, lj: cc.lj });
+    }
+    for (var wx = -EXT; wx < EXT; wx += step) {
+      for (var wz = -EXT; wz < EXT; wz += step) pushCell(wx, wz, step);
+    }
+    // far rings: coarser cells out to the haze line, so the patchwork runs
+    // to the horizon instead of stopping at a hard table edge
+    var RST = 55, REXT = 660;
+    for (var rx = -REXT; rx < REXT; rx += RST) {
+      for (var rz = -REXT; rz < REXT; rz += RST) {
+        if (rx >= -EXT && rx + RST <= EXT && rz >= -EXT && rz + RST <= EXT) continue;
+        pushCell(rx, rz, RST);
+      }
+    }
+    var RST2 = 140, REXT2 = 1500;
+    for (var qx = -REXT2; qx < REXT2; qx += RST2) {
+      for (var qz = -REXT2; qz < REXT2; qz += RST2) {
+        if (qx >= -REXT && qx + RST2 <= REXT && qz >= -REXT && qz + RST2 <= REXT) continue;
+        pushCell(qx, qz, RST2);
+      }
+    }
+    cells.sort(function (a, b) { return a.d - b.d; }); // farthest (most negative d) first
+    for (var i = 0; i < cells.length; i++) {
+      var c = cells[i];
+      ctx.fillStyle = fieldColor(c.li, c.lj);
+      ctx.beginPath();
+      ctx.moveTo(c.p[0].x, c.p[0].y);
+      ctx.lineTo(c.p[1].x, c.p[1].y);
+      ctx.lineTo(c.p[2].x, c.p[2].y);
+      ctx.lineTo(c.p[3].x, c.p[3].y);
+      ctx.closePath(); ctx.fill();
+    }
+
+    // roads: land-coord lines, projected as sampled polylines
+    ctx.strokeStyle = ROAD;
+    ctx.lineWidth = Math.max(1.2, S * 0.0028);
+    ctx.lineCap = 'round';
+    var road;
+    for (road = -1; road <= 1; road++) {
+      drawLandLine(true, road * 130 - CAM.drift, bbox);   // lines of constant lx
+      drawLandLine(false, road * 130 + 40, bbox);         // lines of constant lz
+    }
+
+    // river: bank strip, then water, then a glint line — sampled in land coords
+    drawRiverStrip(19, BANK, bbox);
+    drawRiverStrip(12.5, RIVER, bbox);
+    drawRiverGlint(bbox);
+  }
+
+  function landPoint(lx, lz) { return project(lx - CAM.drift, 0, lz); }
+
+  function drawLandLine(constLx, lv, bbox) {
+    ctx.beginPath();
+    var started = false;
+    for (var s = -330; s <= 330; s += 22) {
+      var p = constLx ? landPoint(lv + CAM.drift, s) : landPoint(s, lv);
+      if (!started) { ctx.moveTo(p.x, p.y); started = true; } else ctx.lineTo(p.x, p.y);
+    }
+    ctx.stroke();
+  }
+
+  function riverPoint(lx, off) { return landPoint(lx, riverZ(lx) + off); }
+
+  function drawRiverStrip(halfW, color, bbox) {
+    ctx.fillStyle = color;
+    var prevL = null, prevR = null, prevLx = 0;
+    for (var lx = -340; lx <= 340; lx += 13) {
+      var L = riverPoint(lx, -halfW), R = riverPoint(lx, halfW);
+      if (prevL) {
+        if (!bbox || segNear(L.x, L.y, R.x, R.y, prevL.x, prevL.y, prevR.x, prevR.y, bbox)) {
+          ctx.beginPath();
+          ctx.moveTo(prevL.x, prevL.y); ctx.lineTo(L.x, L.y);
+          ctx.lineTo(R.x, R.y); ctx.lineTo(prevR.x, prevR.y);
+          ctx.closePath(); ctx.fill();
+        }
+      }
+      prevL = L; prevR = R; prevLx = lx;
+    }
+  }
+
+  function drawRiverGlint(bbox) {
+    ctx.strokeStyle = RIVER_HI;
+    ctx.lineWidth = Math.max(1, Math.min(viewW, viewH) * 0.002);
+    ctx.globalAlpha = 0.55;
+    ctx.beginPath();
+    var started = false;
+    for (var lx = -340; lx <= 340; lx += 13) {
+      var p = riverPoint(lx, Math.sin(lx * 0.05 + riverPh.a) * 3);
+      if (!started) { ctx.moveTo(p.x, p.y); started = true; } else ctx.lineTo(p.x, p.y);
+    }
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  function segNear(x1, y1, x2, y2, x3, y3, x4, y4, bbox) {
+    var mnx = Math.min(x1, x2, x3, x4), mxx = Math.max(x1, x2, x3, x4);
+    var mny = Math.min(y1, y2, y3, y4), mxy = Math.max(y1, y2, y3, y4);
+    return !(mxx < bbox.x0 || mnx > bbox.x1 || mxy < bbox.y0 || mny > bbox.y1);
+  }
+
+  // ---------- the cube ----------
+  var CUBE = 92; // world size
+  function cubeCenter(t) {
+    return { x: 0, y: 76 + 5 * Math.sin(2 * Math.PI * t / 26), z: 0 };
+  }
+
+  // concrete speckle for the top slab (seeded, static)
+  var speckles = [];
+  (function () {
+    var rng = mulberry32(31337);
+    for (var i = 0; i < 90; i++) {
+      speckles.push({ u: rng(), v: rng(), r: 0.6 + rng() * 1.6, light: rng() < 0.45, a: 0.05 + rng() * 0.08 });
+    }
+  })();
+
+  function drawCube(t) {
+    var S = Math.min(viewW, viewH);
+    var c = cubeCenter(t), hs = CUBE / 2;
+    // 8 corners, world space
+    var corners = [];
+    for (var i = 0; i < 8; i++) {
+      corners.push({
+        x: c.x + ((i & 1) ? hs : -hs),
+        y: c.y + ((i & 2) ? hs : -hs),
+        z: c.z + ((i & 4) ? hs : -hs)
+      });
+    }
+    var P = corners.map(function (p) { return project(p.x, p.y, p.z); });
+    var cc = project(c.x, c.y, c.z);
+
+    // faces: corner indices + outward normal (world)
+    var FACES = [
+      { idx: [1, 3, 7, 5], n: { x: 1, y: 0, z: 0 } },
+      { idx: [0, 4, 6, 2], n: { x: -1, y: 0, z: 0 } },
+      { idx: [4, 5, 7, 6], n: { x: 0, y: 0, z: 1 } },
+      { idx: [0, 2, 3, 1], n: { x: 0, y: 0, z: -1 } },
+      { idx: [2, 6, 7, 3], n: { x: 0, y: 1, z: 0 } },   // top
+      { idx: [0, 1, 5, 4], n: { x: 0, y: -1, z: 0 } }    // bottom
+    ];
+    // Visibility: in camera space the cube sits at z' < 0 and the camera at
+    // the origin, so a vertical face is visible when its rotated outward
+    // normal has nz > 0 (pointing back toward the camera). The top face is
+    // always visible (camera above); the bottom never is.
+    var drawList = [];
+    for (var fi = 0; fi < FACES.length; fi++) {
+      var F = FACES[fi];
+      var isTop = F.n.y === 1, isBottom = F.n.y === -1;
+      var nz = F.n.x * CAM.sin + F.n.z * CAM.cos;
+      var visible;
+      if (isTop) visible = true;
+      else if (isBottom) visible = false;
+      else visible = nz > 0.001;
+      if (!visible) continue;
+      var fc = { x: c.x + F.n.x * hs, y: c.y + F.n.y * hs, z: c.z + F.n.z * hs };
+      var qx = fc.x - CAM.sin * CAM.D, qz = fc.z - CAM.cos * CAM.D;
+      var cz = qx * CAM.sin + qz * CAM.cos;
+      var ctr = { x: 0, y: 0 };
+      for (var k = 0; k < 4; k++) { ctr.x += P[F.idx[k]].x / 4; ctr.y += P[F.idx[k]].y / 4; }
+      drawList.push({ F: F, fi: fi, top: isTop, ctr: ctr, depth: -cz });
+    }
+    drawList.sort(function (a, b) { return b.depth - a.depth; }); // farthest first
+
+    for (var di = 0; di < drawList.length; di++) {
+      var D = drawList[di];
+      var poly = D.F.idx.map(function (ix) { return P[ix]; });
+      if (D.top) {
+        // concrete slab, speckled, mapped bilinearly over the face
+        ctx.fillStyle = CONC_TOP;
+        pathPoly(poly); ctx.fill();
+        var c0 = poly[0], c1 = poly[1], c2 = poly[2], c3 = poly[3];
+        for (var si = 0; si < speckles.length; si++) {
+          var sp = speckles[si];
+          var ax = lerp(c0.x, c1.x, sp.u), ay = lerp(c0.y, c1.y, sp.u);
+          var bx = lerp(c3.x, c2.x, sp.u), by = lerp(c3.y, c2.y, sp.u);
+          ctx.fillStyle = sp.light ? 'rgba(255,255,255,' + sp.a.toFixed(3) + ')' : 'rgba(0,0,0,' + sp.a.toFixed(3) + ')';
+          ctx.beginPath();
+          ctx.arc(lerp(ax, bx, sp.v), lerp(ay, by, sp.v), sp.r * (S / 720 + 0.4), 0, Math.PI * 2);
+          ctx.fill();
+        }
+      } else {
+        // the Durchsehen pass: the SAME landscape, re-rendered through this
+        // face with the face's own viewpoint transform. Offset = (cube centre
+        // - face centre) x 0.5 + a deliberate 1-2px mis-registration.
+        var offX = (cc.x - D.ctr.x) * 0.5 + (D.fi % 2 ? 1.5 : -1.0);
+        var offY = (cc.y - D.ctr.y) * 0.5 + (D.fi < 2 ? -1.0 : 1.5);
+        var bx0 = Math.min(poly[0].x, poly[1].x, poly[2].x, poly[3].x) - offX;
+        var bx1 = Math.max(poly[0].x, poly[1].x, poly[2].x, poly[3].x) - offX;
+        var by0 = Math.min(poly[0].y, poly[1].y, poly[2].y, poly[3].y) - offY;
+        var by1 = Math.max(poly[0].y, poly[1].y, poly[2].y, poly[3].y) - offY;
+        ctx.save();
+        pathPoly(poly); ctx.clip();
+        ctx.translate(offX, offY);
+        drawLandscape({ x0: bx0 - 4, y0: by0 - 4, x1: bx1 + 4, y1: by1 + 4 });
+        ctx.restore();
+        // hairline inner seam: the mechanism stays visible
+        ctx.strokeStyle = SEAM_HI;
+        ctx.lineWidth = 1;
+        var inset = insetPoly(poly, cc, 3.5);
+        pathPoly(inset); ctx.stroke();
+      }
+    }
+
+    // concrete edge frame over everything: the seams of the trick
+    ctx.strokeStyle = EDGE_DARK;
+    ctx.lineWidth = Math.max(3, S * 0.006);
+    ctx.lineJoin = 'round';
+    var drawn = {};
+    for (var ei = 0; ei < drawList.length; ei++) {
+      var idx = drawList[ei].F.idx;
+      for (var e = 0; e < 4; e++) {
+        var a = idx[e], b = idx[(e + 1) % 4];
+        var key = Math.min(a, b) + '_' + Math.max(a, b);
+        if (drawn[key]) continue;
+        drawn[key] = 1;
+        ctx.beginPath();
+        ctx.moveTo(P[a].x, P[a].y); ctx.lineTo(P[b].x, P[b].y);
+        ctx.stroke();
+      }
+    }
+    ctx.strokeStyle = EDGE_LITE;
+    ctx.lineWidth = 1.2;
+    for (var key2 in drawn) {
+      var parts = key2.split('_');
+      var A = P[+parts[0]], B = P[+parts[1]];
+      ctx.beginPath(); ctx.moveTo(A.x, A.y); ctx.lineTo(B.x, B.y); ctx.stroke();
+    }
+  }
+
+  function pathPoly(poly) {
+    ctx.beginPath();
+    ctx.moveTo(poly[0].x, poly[0].y);
+    for (var i = 1; i < poly.length; i++) ctx.lineTo(poly[i].x, poly[i].y);
+    ctx.closePath();
+  }
+
+  function insetPoly(poly, toward, px) {
+    return poly.map(function (p) {
+      var dx = toward.x - p.x, dy = toward.y - p.y;
+      var len = Math.sqrt(dx * dx + dy * dy) || 1;
+      return { x: p.x + dx / len * px, y: p.y + dy / len * px };
+    });
+  }
+
+  function drawShadow(t) {
+    var c = cubeCenter(t);
+    var pc = project(0, 0, 0);
+    var px1 = project(46, 0, 0), px2 = project(0, 0, 46);
+    var rx = Math.max(6, Math.sqrt(Math.pow(px1.x - pc.x, 2) + Math.pow(px1.y - pc.y, 2)));
+    var ry = Math.max(3, Math.sqrt(Math.pow(px2.x - pc.x, 2) + Math.pow(px2.y - pc.y, 2)));
+    ctx.fillStyle = SHADOW;
+    ctx.beginPath();
+    ctx.ellipse(pc.x, pc.y, rx, Math.max(ry, rx * 0.32), 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // ---------- time: fixed phase + elapsed (deterministic first frame) ----------
+  var PHASE = 20; // seconds into the piece at frame one: mid-drift, cube centred
+  var startStamp = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+  function tNow() {
+    var n = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+    return PHASE + (n - startStamp) / 1000;
+  }
+
+  // ---------- drag orbit: event-driven azimuth, easing back to idle ----------
+  var drag = { active: false, startAz: 0, acc: 0, lastX: 0, relT: -100, relAz: 0 };
+  function dragAzAt(t) {
+    if (drag.active) return drag.startAz + drag.acc;
+    if (drag.relT < 0) return 0;
+    return drag.relAz * Math.exp(-(t - drag.relT) / 3);
+  }
+
+  // ---------- optional lazy audio: soft wind, first gesture only ----------
+  var AC = null;
+  function ensureAudio() {
+    if (AC) { if (AC.resume) AC.resume(); return; }
+    try {
+      var Ctor = window.AudioContext || window.webkitAudioContext;
+      if (!Ctor) return;
+      AC = new Ctor();
+      var len = 2 * AC.sampleRate;
+      var buf = AC.createBuffer(1, len, AC.sampleRate);
+      var data = buf.getChannelData(0);
+      var rng = mulberry32(9182);
+      var lp1 = 0;
+      for (var i = 0; i < len; i++) { // pinkish noise: soft wind body
+        lp1 = lp1 * 0.94 + (rng() * 2 - 1) * 0.06;
+        data[i] = lp1 * 3;
+      }
+      var src = AC.createBufferSource();
+      src.buffer = buf; src.loop = true;
+      var lp = AC.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 420;
+      var g = AC.createGain(); g.gain.value = 0.018;
+      var lfo = AC.createOscillator(); lfo.frequency.value = 0.11;
+      var lfoG = AC.createGain(); lfoG.gain.value = 0.007;
+      lfo.connect(lfoG); lfoG.connect(g.gain);
+      src.connect(lp); lp.connect(g); g.connect(AC.destination);
+      src.start(); lfo.start();
+    } catch (e) { AC = null; }
+  }
+
+  // ---------- pointer events: drag orbits, double-tap reseeds ----------
+  var downInfo = null;
+  var lastTapT = -100;
+  function evtPos(e) {
+    var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  }
+  function onDown(e) {
+    ensureAudio();
+    var p = evtPos(e);
+    downInfo = { x: p.x, y: p.y, t: tNow() };
+    drag.active = true;
+    drag.startAz = dragAzAt(tNow());
+    drag.acc = 0;
+    drag.lastX = p.x;
+  }
+  function onMove(e) {
+    if (!drag.active) return;
+    var p = evtPos(e);
+    drag.acc += (p.x - drag.lastX) * 0.0055;
+    drag.lastX = p.x;
+  }
+  function onUp(e) {
+    var p = evtPos(e);
+    if (drag.active) {
+      drag.relAz = drag.startAz + drag.acc;
+      drag.relT = tNow();
+      drag.active = false;
+    }
+    if (!downInfo) return;
+    var dx = p.x - downInfo.x, dy = p.y - downInfo.y;
+    var dt = tNow() - downInfo.t;
+    var wasTap = (dx * dx + dy * dy) <= 64 && dt <= 0.35;
+    downInfo = null;
+    if (!wasTap) return;
+    var now = tNow();
+    if (now - lastTapT < 0.4) {          // double-tap: a new landscape
+      worldSeed = (Math.imul(worldSeed, 1664525) + 1013904223) >>> 0;
+      buildWorld();
+      lastTapT = -100;
+    } else {
+      lastTapT = now;
+    }
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointerleave', function () {
+      if (drag.active) { drag.relAz = drag.startAz + drag.acc; drag.relT = tNow(); drag.active = false; }
+      downInfo = null;
+    });
+  }
+
+  // ---------- render ----------
+  function render(t) {
+    measure();
+    var w = viewW, h = viewH, S = Math.min(w, h);
+    canvas.style.width = w + 'px';
+    canvas.style.height = h + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    CAM.th = 2 * Math.PI * t / 240 + dragAzAt(t);   // one slow orbit per 240s + drag
+    CAM.cos = Math.cos(CAM.th); CAM.sin = Math.sin(CAM.th);
+    CAM.f = 1.08 * S;
+    CAM.cx = w / 2; CAM.cy = h / 2;
+    CAM.horizon = CAM.cy - 0.14 * S;
+    CAM.drift = t * 2.5;                            // the land scrolls beneath
+
+    ctx.fillStyle = SKY;
+    ctx.fillRect(0, 0, w, h);
+
+    drawLandscape(null);
+    drawShadow(t);
+    drawCube(t);
+  }
+
+  // synchronous fixed-phase first frame
+  render(PHASE);
+
+  if (typeof requestAnimationFrame === 'function') {
+    var loop = function () {
+      render(tNow());
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
