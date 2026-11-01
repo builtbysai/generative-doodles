@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Palm Reader</title>
+<style>
+html, body { margin: 0; padding: 0; background: #e8e2d4; overflow: hidden; }
+canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+'use strict';
+
+// ---------- seeded PRNG (mulberry32), never Math.random ----------
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    var t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+function round4(x) { return Math.round(x * 10000) / 10000; }
+
+// ---------- canvas / viewport ----------
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var W = 720, H = 720, phone = false;
+function isPhone() {
+  try {
+    var s = window.screen;
+    if (s && s.width && s.height) return Math.min(s.width, s.height) < 700;
+  } catch (e) {}
+  return H > W * 1.15;
+}
+function sizeCanvas() {
+  var vw = 720, vh = 720;
+  try {
+    if (typeof visualViewport !== 'undefined' && visualViewport) {
+      vw = visualViewport.width; vh = visualViewport.height;
+    } else if (window.innerWidth && window.innerHeight) {
+      vw = window.innerWidth; vh = window.innerHeight;
+    }
+  } catch (e) {}
+  W = vw; H = vh;
+  canvas.width = W; canvas.height = H;
+  canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+  phone = isPhone();
+}
+sizeCanvas();
+if (typeof window !== 'undefined' && window.addEventListener) {
+  window.addEventListener('resize', sizeCanvas);
+  try {
+    if (typeof visualViewport !== 'undefined' && visualViewport && visualViewport.addEventListener) {
+      visualViewport.addEventListener('resize', sizeCanvas);
+    }
+  } catch (e) {}
+}
+
+// ---------- piece data ----------
+var WORDS = ['STATE', 'LAW', 'CONSTITUTION'];
+var LETTER_DUR = 1.2;               // seconds per letter: beat 0 = pad, beat 1 = palm
+var LETTERS_PER_CYCLE = 20;          // 5 + 3 + 12
+var CYCLE = LETTER_DUR * LETTERS_PER_CYCLE; // 24 s
+// per-word seeded pressure (hard/dark vs light/skittering)
+var pressure = [];
+(function () {
+  var r = mulberry32(1420000 + 77);
+  for (var i = 0; i < WORDS.length; i++) pressure.push(0.6 + 0.4 * r());
+})();
+// deterministic per-stamp jitter from (cycle, letterIndex)
+function stampJitter(cycle, li) {
+  var r = mulberry32(1420000 + cycle * 1000 + li * 7919);
+  return { dx: (r() - 0.5) * 8, dy: (r() - 0.5) * 8, rot: (r() - 0.5) * 0.24, smear: r() };
+}
+function smooth(t) { return t * t * (3 - 2 * t); }
+function clamp(x, a, b) { return x < a ? a : (x > b ? b : x); }
+
+// ---------- recorded drag events (closed-form over event list) ----------
+var drags = [];          // {t0, t1, samples: [{t,x,y}], vecX, vecY}
+var grabbing = null;     // {samples, startX, startY}
+var pointerDown = false, pointerX = 0, pointerY = 0;
+
+function layout() {
+  var s = Math.min(W, H);
+  var palmW = phone ? Math.min(W * 0.78, H * 0.44) : Math.min(W * 0.52, H * 0.42);
+  var palmH = palmW * 1.32;
+  var cx = W / 2;
+  var palmTop = H * 0.5 - palmH * 0.52;
+  var fingerLen = palmH * 0.30;
+  var bodyTop = palmTop + fingerLen;
+  var bodyH = palmH - fingerLen;
+  var colX = [cx - palmW * 0.27, cx, cx + palmW * 0.27];
+  var yTop = bodyTop + bodyH * 0.10;
+  var yBot = bodyTop + bodyH * 0.94;
+  var pad = { x: W * 0.84, y: H * 0.075, w: Math.max(44, W * 0.10), h: Math.max(26, H * 0.05) };
+  return { s: s, palmW: palmW, palmH: palmH, cx: cx, palmTop: palmTop,
+    fingerLen: fingerLen, bodyTop: bodyTop, bodyH: bodyH,
+    colX: colX, yTop: yTop, yBot: yBot, pad: pad };
+}
+function wordLetterPos(L, wi, li) {
+  var word = WORDS[wi];
+  var x = L.colX[wi];
+  var n = word.length;
+  var y = n === 1 ? (L.yTop + L.yBot) / 2 : L.yTop + (L.yBot - L.yTop) * (li / (n - 1));
+  return { x: x, y: y };
+}
+// letter index -> (word, letter) and its land time within a cycle
+function letterInfo(li) {
+  var acc = 0;
+  for (var wi = 0; wi < WORDS.length; wi++) {
+    if (li < acc + WORDS[wi].length) return { wi: wi, li: li - acc, ch: WORDS[wi].charAt(li - acc) };
+    acc += WORDS[wi].length;
+  }
+  return { wi: 0, li: 0, ch: 'S' };
+}
+// stamp position at its land time, honouring drags recorded around that time
+function stampPos(L, cycle, li, landTime) {
+  var info = letterInfo(li);
+  var base = wordLetterPos(L, info.wi, info.li);
+  var j = stampJitter(cycle, li);
+  var x = base.x + j.dx, y = base.y + j.dy, smear = j.smear * 0.35;
+  for (var d = 0; d < drags.length; d++) {
+    var dr = drags[d];
+    if (landTime >= dr.t0 && landTime <= dr.t1 && dr.samples.length) {
+      // interpolate recorded pointer samples
+      var s0 = dr.samples[0], s1 = dr.samples[dr.samples.length - 1];
+      var f = dr.samples.length > 1 ? clamp((landTime - dr.t0) / Math.max(0.001, dr.t1 - dr.t0), 0, 1) : 0;
+      var px = s0.x + (s1.x - s0.x) * f, py = s0.y + (s1.y - s0.y) * f;
+      x = clamp(px, L.cx - L.palmW * 0.5, L.cx + L.palmW * 0.5);
+      y = clamp(py, L.bodyTop, L.bodyTop + L.bodyH);
+      var dist = Math.sqrt((x - base.x) * (x - base.x) + (y - base.y) * (y - base.y));
+      smear = clamp(dist / (L.palmW * 0.3), 0.3, 1);
+      return { x: x, y: y, rot: j.rot, smear: smear, misaimed: true };
+    }
+    if (landTime > dr.t1) {
+      var dec = Math.exp(-(landTime - dr.t1) / 1.0);
+      x = base.x + j.dx + dr.vecX * dec;
+      y = base.y + j.dy + dr.vecY * dec;
+    }
+  }
+  // a stamp landing while a drag is still in progress lands where the
+  // hand actually is, not where the schedule says it should be
+  if (grabbing && grabbing.samples.length && landTime >= grabbing.samples[0].t) {
+    var gs = grabbing.samples;
+    var gl = gs[gs.length - 1];
+    var gf = gs.length > 1 ? clamp((landTime - gs[0].t) / Math.max(0.001, gl.t - gs[0].t), 0, 1) : 0;
+    var gx = gs[0].x + (gl.x - gs[0].x) * gf, gy = gs[0].y + (gl.y - gs[0].y) * gf;
+    x = clamp(gx, L.cx - L.palmW * 0.5, L.cx + L.palmW * 0.5);
+    y = clamp(gy, L.bodyTop, L.bodyTop + L.bodyH);
+    var gdist = Math.sqrt((x - base.x) * (x - base.x) + (y - base.y) * (y - base.y));
+    smear = clamp(gdist / (L.palmW * 0.3), 0.3, 1);
+    return { x: x, y: y, rot: j.rot, smear: smear, misaimed: true };
+  }
+  return { x: x, y: y, rot: j.rot, smear: smear, misaimed: false };
+}
+// scheduled hand position at time t (before drag override)
+function scheduledHand(L, t) {
+  var ct = ((t % CYCLE) + CYCLE) % CYCLE;
+  var li = Math.floor(ct / LETTER_DUR);
+  var p = (ct % LETTER_DUR) / LETTER_DUR;
+  var info = letterInfo(li);
+  var target = wordLetterPos(L, info.wi, info.li);
+  var padC = { x: L.pad.x + L.pad.w / 2, y: L.pad.y + L.pad.h / 2 + 26 };
+  var hx, hy;
+  if (p < 0.5) { hx = padC.x; hy = padC.y + Math.sin(p * Math.PI * 2) * 2; }
+  else if (p < 0.75) { var f = smooth((p - 0.5) / 0.25); hx = padC.x + (target.x - padC.x) * f; hy = padC.y + (target.y - 46 - padC.y) * f; }
+  else if (p < 0.9) { hx = target.x; hy = target.y - 46 + 4; }
+  else { var g = smooth((p - 0.9) / 0.1); hx = target.x + (padC.x - target.x) * g; hy = target.y - 46 + (padC.y - (target.y - 46)) * g; }
+  return { x: hx, y: hy, target: target, letter: info };
+}
+function handPos(L, t) {
+  if (grabbing) return { x: pointerX, y: pointerY - 20 };
+  var s = scheduledHand(L, t);
+  var x = s.x, y = s.y;
+  if (drags.length) {
+    var dr = drags[drags.length - 1];
+    if (t > dr.t1) {
+      var dec = Math.exp(-(t - dr.t1) / 1.0);
+      x += dr.vecX * dec; y += dr.vecY * dec;
+    }
+  }
+  return { x: x, y: y };
+}
+
+// ---------- drawing helpers ----------
+function rr(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.arc(x + w - r, y + r, r, -Math.PI / 2, 0);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.arc(x + w - r, y + h - r, r, 0, Math.PI / 2);
+  ctx.lineTo(x + r, y + h);
+  ctx.arc(x + r, y + h - r, r, Math.PI / 2, Math.PI);
+  ctx.lineTo(x, y + r);
+  ctx.arc(x + r, y + r, r, Math.PI, Math.PI * 1.5);
+  ctx.closePath();
+}
+function dot(x, y, r, color, alpha) {
+  ctx.fillStyle = 'rgba(' + color + ',' + round4(alpha) + ')';
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arc(x, y, r, 0, Math.PI * 2);
+  ctx.fill();
+}
+function hexRgb(hex) {
+  var n = parseInt(hex.slice(1), 16);
+  return ((n >> 16) & 255) + ',' + ((n >> 8) & 255) + ',' + (n & 255);
+}
+var SKIN = hexRgb('#d9b48f'), INK = hexRgb('#1a1a18'), PADB = hexRgb('#2e4a6e'),
+    BLOOM = hexRgb('#b01e24'), SMUDGE = hexRgb('#8a8f94'), PAPER = hexRgb('#e8e2d4');
+
+function drawHand(x, y, L) {
+  var bw = L.palmW * 0.17, bh = L.palmH * 0.075;
+  // stamp block below the hand
+  ctx.fillStyle = 'rgba(' + PADB + ',1)';
+  ctx.fillRect(x - bw / 2, y + bh * 0.4, bw, bh * 0.55);
+  // hand: palm + four finger bars, skin tone
+  ctx.fillStyle = 'rgba(' + SKIN + ',1)';
+  rr(x - bw * 0.42, y - bh * 1.15, bw * 0.84, bh * 1.15, bw * 0.2); ctx.fill();
+  for (var i = 0; i < 4; i++) {
+    var fx = x - bw * 0.38 + i * bw * 0.20;
+    ctx.fillRect(fx, y - bh * 1.75 - (i === 1 || i === 2 ? bh * 0.18 : 0), bw * 0.15, bh * 0.7);
+  }
+}
+
+function draw(t) {
+  var L = layout();
+  // paper ground
+  ctx.fillStyle = 'rgba(' + PAPER + ',1)';
+  ctx.fillRect(0, 0, W, H);
+
+  // inkpad: small dark rectangle at the frame's edge
+  ctx.fillStyle = 'rgba(' + PADB + ',1)';
+  ctx.fillRect(L.pad.x, L.pad.y, L.pad.w, L.pad.h);
+  ctx.fillStyle = 'rgba(' + PAPER + ',0.25)';
+  ctx.fillRect(L.pad.x + 4, L.pad.y + 4, L.pad.w - 8, 3);
+
+  // palm: fingers spread, seen from above
+  var fingerLens = [0.88, 1.0, 0.95, 0.78];
+  ctx.fillStyle = 'rgba(' + SKIN + ',1)';
+  for (var f = 0; f < 4; f++) {
+    var fw = L.palmW * 0.19;
+    var fx = L.cx - L.palmW * 0.38 + f * L.palmW * 0.255;
+    var fl = L.fingerLen * fingerLens[f];
+    rr(fx, L.palmTop + (L.fingerLen - fl), fw, fl + L.palmH * 0.06, fw / 2);
+    ctx.fill();
+  }
+  // thumb, left side, angled
+  ctx.save();
+  ctx.translate(L.cx - L.palmW * 0.5, L.bodyTop + L.bodyH * 0.42);
+  ctx.rotate(-0.7);
+  rr(-L.palmW * 0.09, -L.palmH * 0.10, L.palmW * 0.18, L.palmH * 0.20, L.palmW * 0.09);
+  ctx.fill();
+  ctx.restore();
+  // palm body
+  ctx.fillStyle = 'rgba(' + SKIN + ',1)';
+  rr(L.cx - L.palmW / 2, L.bodyTop, L.palmW, L.bodyH, L.palmW * 0.20);
+  ctx.fill();
+  // palm creases
+  ctx.strokeStyle = 'rgba(' + SMUDGE + ',0.5)';
+  ctx.lineWidth = Math.max(1, L.palmW * 0.006);
+  var creases = [
+    [0.15, 0.30, 0.85, 0.22], [0.12, 0.52, 0.88, 0.44], [0.20, 0.72, 0.80, 0.66]
+  ];
+  for (var ci = 0; ci < creases.length; ci++) {
+    var c = creases[ci];
+    ctx.beginPath();
+    ctx.moveTo(L.cx - L.palmW / 2 + L.palmW * c[0], L.bodyTop + L.bodyH * c[1]);
+    ctx.quadraticCurveTo(L.cx, L.bodyTop + L.bodyH * (c[1] + c[3]) / 2 + L.bodyH * 0.06,
+      L.cx - L.palmW / 2 + L.palmW * c[2], L.bodyTop + L.bodyH * c[3]);
+    ctx.stroke();
+  }
+
+  // stamps: pre-seeded previous cycle + last cycles, oldest fade under newer ones
+  var curCycle = Math.floor(t / CYCLE);
+  var fontPx = Math.max(14, L.palmW * 0.062);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  for (var cyc = Math.max(-1, curCycle - 5); cyc <= curCycle; cyc++) {
+    for (var li = 0; li < LETTERS_PER_CYCLE; li++) {
+      var landTime = cyc * CYCLE + li * LETTER_DUR + LETTER_DUR * 0.5;
+      if (landTime > t) continue;
+      var info = letterInfo(li);
+      var pos = stampPos(L, cyc, li, landTime);
+      var age = t - landTime;
+      var pr = pressure[info.wi];
+      var ageF = age < 60 ? 1 : Math.max(0.35, 1 - (age - 60) / 120);
+      var a = round4((0.55 + 0.45 * pr) * ageF);
+      var fs = fontPx * (0.9 + 0.2 * pr);
+      ctx.save();
+      ctx.translate(pos.x, pos.y);
+      ctx.rotate(pos.rot);
+      ctx.font = '700 ' + fs.toFixed(1) + 'px sans-serif';
+      ctx.fillStyle = 'rgba(' + INK + ',' + a + ')';
+      ctx.fillText(info.ch, 0, 0);
+      if (pos.smear > 0.3) {
+        // smear across the palm's lines
+        ctx.fillStyle = 'rgba(' + INK + ',' + round4(a * 0.35) + ')';
+        ctx.fillText(info.ch, pos.smear * 7, pos.smear * 2);
+      }
+      ctx.restore();
+      if (pr > 0.95 && info.li % 4 === 0) {
+        // hardest stamps get a small red bloom, sparingly: only the
+        // hardest word's every-fourth letter carries one
+        dot(pos.x + fs * 0.42, pos.y + fs * 0.42, Math.max(2, fs * 0.09), BLOOM, round4(a * 0.9));
+      }
+    }
+  }
+
+  // stamping hand
+  var hp = handPos(L, t);
+  drawHand(hp.x, hp.y, L);
+}
+
+// ---------- pointer: drag the stamping hand to re-aim ----------
+function onDown(x, y, t) {
+  pointerDown = true; pointerX = x; pointerY = y;
+  var L = layout();
+  var hp = handPos(L, t);
+  var d = Math.sqrt((x - hp.x) * (x - hp.x) + (y - hp.y) * (y - hp.y));
+  if (d < 80) grabbing = { samples: [{ t: t, x: x, y: y }], startX: hp.x, startY: hp.y };
+}
+function onMove(x, y, t) {
+  pointerX = x; pointerY = y;
+  if (grabbing) grabbing.samples.push({ t: t, x: x, y: y });
+}
+function onUp(t) {
+  pointerDown = false;
+  if (grabbing) {
+    var g = grabbing;
+    var last = g.samples[g.samples.length - 1];
+    drags.push({ t0: g.samples[0].t, t1: t, samples: g.samples,
+      vecX: last.x - g.startX, vecY: last.y - g.startY });
+    grabbing = null;
+  }
+}
+if (canvas.addEventListener) {
+  var now = function () { return (typeof performance !== 'undefined' && performance.now) ? performance.now() / 1000 : 0; };
+  var t0 = now();
+  canvas.addEventListener('pointerdown', function (e) { onDown(e.clientX || 0, e.clientY || 0, now() - t0); });
+  canvas.addEventListener('pointermove', function (e) { onMove(e.clientX || 0, e.clientY || 0, now() - t0); });
+  canvas.addEventListener('pointerup', function (e) { onUp(now() - t0); });
+  canvas.addEventListener('pointercancel', function (e) { onUp(now() - t0); });
+}
+
+// ---------- boot: frame one is draw(0); clock starts with the rAF loop ----------
+draw(0);
+var startTime = null;
+function loop(ts) {
+  if (startTime === null) startTime = ts;
+  var t = (ts - startTime) / 1000;
+  draw(t);
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+}
+if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Find Face</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #ece8dc; overflow: hidden; }
+  canvas { display: block; background: #ece8dc; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  var canvas = null;
+  try { canvas = document.getElementById('c'); } catch (e) { canvas = null; }
+  if (!canvas) return;
+  var ctx = canvas.getContext('2d');
+
+  // ---- seeded PRNG (mulberry32), never Math.random ----
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  var rnd = mulberry32(1419000);
+  var SEED = [];
+  var si;
+  for (si = 0; si < 64; si++) SEED.push(rnd());
+
+  // ---- viewport / phone ----
+  var W = 0, H = 0, phone = false;
+  function sizeCanvas() {
+    var vw = W, vh = H;
+    try {
+      if (typeof visualViewport !== 'undefined' && visualViewport) {
+        vw = visualViewport.width; vh = visualViewport.height;
+      } else if (typeof window !== 'undefined' && window) {
+        vw = window.innerWidth; vh = window.innerHeight;
+      }
+    } catch (e) {}
+    if (!vw || !vh) { vw = 1280; vh = 900; }
+    W = vw; H = vh;
+    canvas.width = W; canvas.height = H;
+    canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+    try {
+      var sw = 0, sh = 0;
+      if (typeof window !== 'undefined' && window.screen) { sw = window.screen.width; sh = window.screen.height; }
+      var mn = Math.min(sw || W, sh || H);
+      phone = mn < 700 || (H > W * 1.15 && mn < 900);
+    } catch (e) { phone = false; }
+  }
+  sizeCanvas();
+  try {
+    if (typeof visualViewport !== 'undefined' && visualViewport && visualViewport.addEventListener) {
+      visualViewport.addEventListener('resize', sizeCanvas);
+    }
+  } catch (e) {}
+  try {
+    if (typeof window !== 'undefined' && window.addEventListener) window.addEventListener('resize', sizeCanvas);
+  } catch (e) {}
+
+  // ---- helpers ----
+  function a4(x) { // round fading alpha to 4 decimals (node-canvas quirk)
+    if (x < 0) x = 0; if (x > 1) x = 1;
+    return Math.round(x * 10000) / 10000;
+  }
+  function rgba(hex, al) {
+    var r = parseInt(hex.slice(1, 3), 16), g = parseInt(hex.slice(3, 5), 16), b = parseInt(hex.slice(5, 7), 16);
+    return 'rgba(' + r + ',' + g + ',' + b + ',' + a4(al) + ')';
+  }
+  function clamp(x, lo, hi) { return x < lo ? lo : (x > hi ? hi : x); }
+  function smooth(x) { x = clamp(x, 0, 1); return x * x * (3 - 2 * x); }
+  function rect(x, y, w, h, color) { ctx.fillStyle = color; ctx.fillRect(x, y, w, h); }
+  function dot(x, y, r, color) { // filled circle, own beginPath
+    ctx.fillStyle = color; ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+  }
+  function line(x1, y1, x2, y2, color, w) {
+    ctx.strokeStyle = color; ctx.lineWidth = w; ctx.beginPath();
+    ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+  }
+
+  // ---- interaction state (recorded events, closed-form over t) ----
+  var drags = []; // {x0,y0,x1,y1,t0,t1,mode} mode: 'face' | 'swipe'
+  var active = null;
+  function canvasPos(ev) {
+    var x = ev.clientX, y = ev.clientY;
+    if (x === undefined) x = ev.offsetX || 0;
+    if (y === undefined) y = ev.offsetY || 0;
+    try {
+      if (canvas.getBoundingClientRect) {
+        var r = canvas.getBoundingClientRect();
+        x -= (r.left || 0); y -= (r.top || 0);
+      }
+    } catch (e) {}
+    return { x: x, y: y };
+  }
+  function onDown(ev) {
+    var p = canvasPos(ev);
+    var cx = W / 2, cy = H / 2, fr = Math.min(W, H) * 0.30;
+    var mode = 'swipe';
+    if (Math.abs(p.x - cx) < fr * 1.1 && Math.abs(p.y - cy) < fr * 1.3) mode = 'face';
+    active = { x0: p.x, y0: p.y, x1: p.x, y1: p.y, t0: nowT, t1: nowT, mode: mode };
+    if (typeof ev.preventDefault === 'function') { try { ev.preventDefault(); } catch (e) {} }
+  }
+  function onMove(ev) {
+    if (!active) return;
+    var p = canvasPos(ev);
+    active.x1 = p.x; active.y1 = p.y; active.t1 = nowT;
+  }
+  function onUp(ev) {
+    if (!active) return;
+    var p = canvasPos(ev);
+    active.x1 = p.x; active.y1 = p.y; active.t1 = nowT;
+    drags.push(active);
+    if (drags.length > 8) drags.shift();
+    active = null;
+  }
+  try {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+  } catch (e) {}
+
+  // ---- loop schedule: 60 s cycle, failures grow more frequent ----
+  // lock windows (cycle seconds): filter locked; failures fill the gaps.
+  var LOCKS = [[-3, 9], [13, 20], [24, 29], [33, 36], [40, 42], [46, 47], [51, 52], [56, 57]];
+  var HANDS = [ // hand-pass windows: [start, end, side] side: -1 left, 1 right
+    [20, 24, -1], [31, 34, 1], [42, 44, -1], [48, 50, 1], [54, 56, -1], [58, 60, 1]
+  ];
+  function inWin(wins, c) {
+    for (var i = 0; i < wins.length; i++) {
+      if (c >= wins[i][0] && c < wins[i][1]) return wins[i];
+    }
+    return null;
+  }
+  function lockQuality(c) { // 1 locked, 0 failed; smooth edges
+    var w = inWin(LOCKS, c);
+    if (w) {
+      var d0 = Math.min(c - w[0], 1.2) / 1.2, d1 = Math.min(w[1] - c, 1.2) / 1.2;
+      return 0.25 + 0.75 * Math.min(smooth(d0), smooth(d1));
+    }
+    return 0.12;
+  }
+  function bannerAlpha(c) { // FIND FACE banner during failures
+    if (inWin(LOCKS, c)) return 0;
+    // find current failure gap
+    var prev = 0, next = 60;
+    for (var i = 0; i < LOCKS.length; i++) {
+      if (LOCKS[i][1] <= c) prev = LOCKS[i][1];
+      if (LOCKS[i][0] > c && LOCKS[i][0] < next) next = LOCKS[i][0];
+    }
+    var fIn = smooth((c - prev) / 0.6), fOut = smooth((next - c) / 0.6);
+    return Math.min(fIn, fOut);
+  }
+
+  var nowT = 0;
+
+  function faceState(t) {
+    var c = t % 60;
+    // face turn: swings during turn windows
+    var turn = 0;
+    var tw = [[8, 13], [28, 33], [44, 48]];
+    for (var i = 0; i < tw.length; i++) {
+      if (c >= tw[i][0] && c < tw[i][1]) {
+        var ph = (c - tw[i][0]) / (tw[i][1] - tw[i][0]);
+        turn = Math.sin(ph * Math.PI) * (i % 2 === 0 ? 1 : -1) * 0.22;
+      }
+    }
+    // light change: shading sweep during light windows
+    var light = 0;
+    var lw = [[14, 19], [36, 40]];
+    for (var j = 0; j < lw.length; j++) {
+      if (c >= lw[j][0] && c < lw[j][1]) {
+        var lp = (c - lw[j][0]) / (lw[j][1] - lw[j][0]);
+        light = Math.sin(lp * Math.PI) * 0.35;
+      }
+    }
+    // drag offset: live while dragging, decays tau 2 s after release
+    var dx = 0, dy = 0, draggingFace = false;
+    for (var k = 0; k < drags.length; k++) {
+      var d = drags[k];
+      if (d.mode !== 'face') continue;
+      var ox = d.x1 - d.x0, oy = d.y1 - d.y0;
+      var dt = t - d.t1;
+      var decay = dt <= 0 ? 1 : Math.exp(-dt / 2);
+      dx += ox * decay; dy += oy * decay;
+    }
+    if (active && active.mode === 'face') {
+      dx += active.x1 - active.x0; dy += active.y1 - active.y0;
+      draggingFace = true;
+    }
+    dx = clamp(dx, -W * 0.25, W * 0.25); dy = clamp(dy, -H * 0.25, H * 0.25);
+    return { c: c, turn: turn, light: light, dx: dx, dy: dy, draggingFace: draggingFace };
+  }
+
+  function lockWithDrag(t, baseQ) {
+    // face drag drops lock quality; reattach struggles (slow recovery tau 4 s)
+    var q = baseQ, latest = null;
+    for (var k = 0; k < drags.length; k++) {
+      if (drags[k].mode === 'face') latest = drags[k];
+    }
+    if (active && active.mode === 'face') return 0.25;
+    if (latest) {
+      var dt = t - latest.t1;
+      if (dt < 8) q = Math.min(q, 0.25 + 0.75 * (1 - Math.exp(-dt / 4)));
+    }
+    // swipe drag breaks the lock instantly, banner for 2.5 s after release
+    for (var j = 0; j < drags.length; j++) {
+      if (drags[j].mode === 'swipe' && t - drags[j].t1 < 2.5) return 0.05;
+    }
+    if (active && active.mode === 'swipe') return 0.05;
+    return q;
+  }
+
+  function drawHand(x, y, s, flip, wave) {
+    // parametric hand silhouette: palm + 4 fingers + thumb, ink, no text
+    ctx.fillStyle = '#26241f';
+    ctx.beginPath();
+    ctx.ellipse(x, y, 16 * s, 20 * s, 0, 0, Math.PI * 2);
+    ctx.fill();
+    var f;
+    for (f = 0; f < 4; f++) {
+      var fx = x + (f - 1.5) * 11 * s * flip;
+      var fy = y - 20 * s - (6 + SEED[f] * 6) * s + Math.sin(wave + f * 1.3) * 4 * s;
+      ctx.beginPath();
+      ctx.ellipse(fx, fy, 4.5 * s, (14 + SEED[10 + f] * 6) * s, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.beginPath();
+    ctx.ellipse(x + 18 * s * flip, y + 4 * s, 10 * s, 5 * s, 0.5 * flip, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  function draw(t) {
+    nowT = t;
+    if (!W || !H) sizeCanvas();
+    var fs = faceState(t);
+    var c = fs.c;
+    var q = lockWithDrag(t, lockQuality(c));
+    var cx = W / 2 + fs.dx, cy = H / 2 + fs.dy;
+    var fr = Math.min(W, H) * 0.30; // face radius
+    var fw = fr * 0.78, fh = fr * 1.05;
+
+    // background
+    rect(0, 0, W, H, '#ece8dc');
+
+    // face: parametric oval, skin fill, turn as horizontal squash
+    var squash = 1 - Math.abs(fs.turn) * 0.9;
+    ctx.fillStyle = '#d9b48f';
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, fw * squash, fh, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // light-change shading: flat-alpha side wash, never a gradient
+    if (fs.light > 0.01) {
+      ctx.fillStyle = rgba('#ffffff', fs.light * 0.35);
+      ctx.beginPath();
+      ctx.ellipse(cx - fw * 0.35 * squash, cy, fw * 0.45 * squash, fh * 0.9, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    // ears
+    dot(cx - fw * squash, cy, fr * 0.09, '#d9b48f');
+    dot(cx + fw * squash, cy, fr * 0.09, '#d9b48f');
+    // brows, eyes, nose, mouth (gold morpheme dot)
+    var eyeY = cy - fh * 0.28, eyeDX = fw * 0.38 * squash;
+    line(cx - eyeDX - 14, eyeY - 18, cx - eyeDX + 14, eyeY - 18 - fs.turn * 30, '#1a1a18', 3);
+    line(cx + eyeDX - 14, eyeY - 18 + fs.turn * 30, cx + eyeDX + 14, eyeY - 18, '#1a1a18', 3);
+    dot(cx - eyeDX, eyeY, 6, '#1a1a18');
+    dot(cx + eyeDX, eyeY, 6, '#1a1a18');
+    line(cx, eyeY + 8, cx + fs.turn * 40, eyeY + 42, '#1a1a18', 3);
+    ctx.strokeStyle = '#1a1a18'; ctx.lineWidth = 3; ctx.beginPath();
+    ctx.moveTo(cx - 18, cy + fh * 0.42);
+    ctx.quadraticCurveTo(cx + fs.turn * 30, cy + fh * 0.55, cx + 18, cy + fh * 0.42);
+    ctx.stroke();
+    dot(cx, cy + fh * 0.52, 5, '#d4a24e');
+
+    // wireframe mesh: landmarks + web, tracking quality q
+    var lm = [
+      [cx - fw * 0.83 * squash, cy - fh * 0.55], [cx, cy - fh], [cx + fw * 0.83 * squash, cy - fh * 0.55],
+      [cx - eyeDX, eyeY], [cx + eyeDX, eyeY],
+      [cx - fw * 0.99 * squash, cy + fh * 0.1], [cx + fw * 0.99 * squash, cy + fh * 0.1],
+      [cx, cy + fh * 0.55], [cx - fw * 0.436 * squash, cy + fh * 0.9], [cx + fw * 0.436 * squash, cy + fh * 0.9]
+    ];
+    var edges = [[0, 1], [1, 2], [0, 3], [2, 4], [3, 5], [4, 6], [5, 7], [6, 7], [5, 8], [6, 9], [3, 4], [0, 5], [2, 6], [1, 7]];
+    // mesh jitter grows as lock slips; lag offset grows too
+    var jit = (1 - q) * 14, lag = (1 - q) * 26;
+    var pts = [];
+    for (var i = 0; i < lm.length; i++) {
+      var jx = Math.sin(t * 2.1 + i * 2.7 + SEED[i] * 6) * jit;
+      var jy = Math.cos(t * 1.7 + i * 1.9 + SEED[20 + i] * 6) * jit;
+      pts.push([lm[i][0] + jx + Math.sin(t * 0.9 + i) * lag * 0.4, lm[i][1] + jy]);
+    }
+    for (var e = 0; e < edges.length; e++) {
+      var p1 = pts[edges[e][0]], p2 = pts[edges[e][1]];
+      // slipping lines break: skip some segments when lock is poor
+      if (q < 0.5 && SEED[40 + e] < (0.5 - q)) continue;
+      line(p1[0], p1[1], p2[0], p2[1], rgba('#2e86c8', 0.35 + 0.65 * q), 1 + 1.5 * q);
+    }
+    for (var m = 0; m < pts.length; m++) dot(pts[m][0], pts[m][1], 3, rgba('#2e86c8', 0.4 + 0.6 * q));
+
+    // interrupting hands: scheduled passes + swipe drags
+    var hw = inWin(HANDS, c);
+    if (hw) {
+      var hp = (c - hw[0]) / (hw[1] - hw[0]);
+      var hx = hw[2] < 0 ? -60 + hp * (W + 120) : W + 60 - hp * (W + 120);
+      drawHand(hx, cy + Math.sin(hp * Math.PI) * -30, 1.4, hw[2], t * 6);
+    }
+    // swipe drag hand: travels across frame over 1.2 s from release point
+    for (var s2 = 0; s2 < drags.length; s2++) {
+      var sd = drags[s2];
+      if (sd.mode !== 'swipe') continue;
+      var st = t - sd.t1;
+      if (st >= 0 && st < 1.2) {
+        var sx = sd.x1 + (st / 1.2) * (W * 0.6) * (sd.x1 > W / 2 ? -1 : 1);
+        drawHand(sx, sd.y1, 1.2, sd.x1 > W / 2 ? -1 : 1, t * 8);
+      }
+    }
+    if (active && active.mode === 'swipe') {
+      drawHand(active.x1, active.y1, 1.2, 1, t * 8);
+    }
+
+    // failure banner: FIND FACE, large, full-width, timed
+    var ba = bannerAlpha(c);
+    var swipeBanner = false;
+    for (var b = 0; b < drags.length; b++) {
+      if (drags[b].mode === 'swipe' && t - drags[b].t1 < 2.5) swipeBanner = true;
+    }
+    if (active && active.mode === 'swipe') swipeBanner = true;
+    if (swipeBanner) ba = Math.max(ba, 0.95);
+    if (ba > 0.01) {
+      var bh = Math.min(W, H) * 0.14;
+      rect(0, cy - bh * 0.9, W, bh * 1.8, rgba('#c8352a', 0.12 * ba));
+      ctx.fillStyle = rgba('#c8352a', ba);
+      ctx.font = 'bold ' + Math.round(bh) + 'px sans-serif';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      try { ctx.fillText('FIND FACE', W / 2, cy); } catch (e) {}
+    }
+  }
+
+  // boot: frame one is draw(0); clock starts only with the rAF loop
+  draw(0);
+  var start = null;
+  function loop(ts) {
+    if (start === null) start = ts;
+    draw((ts - start) / 1000);
+    if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(loop);
+  }
+  if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
