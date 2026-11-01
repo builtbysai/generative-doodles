@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Margin Talks Back</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #e8e0d0; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // Palette (prompt only).
+  var GREY = '#b8bcc0', SUIT = '#2a2a30', TEAL = '#2e6f6a';
+  var SCARLET = '#c1272d', GOLD = '#d9a441', CREAM = '#e8e0d0';
+
+  // Seeded PRNG (mulberry32), never Math.random.
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  var rnd = mulberry32(1483000);
+
+  // Broadcast figures: 2 rows x 5, each with a seeded mouth period/phase.
+  var FIGS = [];
+  var r, c, i;
+  for (r = 0; r < 2; r++) {
+    for (c = 0; c < 5; c++) {
+      FIGS.push({
+        row: r, col: c,
+        // Period divides the 30 s card cycle exactly (30/k), so the whole
+        // frame, mouths included, closes exactly at t = 30.
+        period: 30 / [10, 12, 15, 18, 20][Math.floor(rnd() * 5)],
+        phase: rnd() * Math.PI * 2,
+        lean: (rnd() - 0.5) * 0.06
+      });
+    }
+  }
+
+  // Cards, bound to scene indices (not screen positions): scarlet/disc -> scene 0,
+  // gold/bar -> scene 1, teal/triangle -> scene 2. The margin stack order is a
+  // render order only; a card's scene binding never changes when reordered.
+  var CARDS = [
+    { id: 0, color: SCARLET, shape: 'disc', scene: 0 },
+    { id: 1, color: GOLD, shape: 'bar', scene: 1 },
+    { id: 2, color: TEAL, shape: 'triangle', scene: 2 }
+  ];
+  var order = [0, 1, 2]; // card ids top -> bottom in the margin stack
+  var SCENE_ORDER = [0, 1, 2]; // broadcast scene order; fixed here (no scene drag in IW4)
+
+  var CYCLE = 30; // card arrival cycle, seconds
+  var PHASE = 20; // frame one opens at cycle time 20: all cards arrived and settled
+  var ARRIVE = [4, 10, 16]; // cycle times each card slides in
+  var DEPART0 = 28, DEPART1 = 30; // cycle window in which all cards slide back out
+
+  // Drag / settle state, all closed-form over piece time + recorded events.
+  var drag = null; // {card, startY, y, moved}
+  var settle = null; // {card, t0, fromY, toY}
+  var pulse = null; // {card, t0}
+
+  function vw() {
+    if (typeof window !== 'undefined' && window.visualViewport &&
+        typeof window.visualViewport.width === 'number') {
+      return { w: window.visualViewport.width, h: window.visualViewport.height };
+    }
+    return { w: 1280, h: 900 };
+  }
+
+  function layout(W, H) {
+    var split = W * 2 / 3;
+    var marginW = W - split;
+    var fs = Math.min(W * 0.085, H * 0.06); // figure unit (width-capped so phones stay legible)
+    var cardW = marginW * 0.78;
+    var cardH = Math.min(H * 0.17, 150);
+    var slots = [H * 0.26, H * 0.50, H * 0.74];
+    return { split: split, marginW: marginW, fs: fs, cardW: cardW, cardH: cardH, slots: slots };
+  }
+
+  function easeOut(p) { return 1 - (1 - p) * (1 - p); }
+
+  // Card slide offset (0 = fully in place, 1 = fully off-screen right) at cycle time ct.
+  function slideOff(id, ct) {
+    var a = ARRIVE[id];
+    if (ct < a) return 1;
+    if (ct < a + 1) return 1 - easeOut((ct - a) / 1);
+    if (ct < DEPART0) return 0;
+    if (ct < DEPART1) return easeOut((ct - DEPART0) / (DEPART1 - DEPART0));
+    return 1;
+  }
+
+  // Y of a card at piece time t, given drag/settle events.
+  function cardY(id, L, t) {
+    var pos = order.indexOf(id);
+    var slotY = L.slots[pos];
+    if (drag && drag.card === id) return drag.y;
+    if (settle && settle.card === id) {
+      var p = (t - settle.t0) / 0.4;
+      if (p >= 1) return slotY;
+      if (p < 0) return settle.fromY;
+      return settle.fromY + (slotY - settle.fromY) * easeOut(p);
+    }
+    return slotY;
+  }
+
+  // Pulse scale of a card's shape at piece time t (one pulse after settling).
+  function pulseScale(id, t) {
+    if (!pulse || pulse.card !== id) return 1;
+    var p = (t - pulse.t0) / 0.6;
+    if (p < 0 || p > 1) return 1;
+    return 1 + 0.35 * Math.sin(Math.PI * p);
+  }
+
+  function drawFigure(x, y, fs, f, t) {
+    var headR = fs * 0.42;
+    var torsoW = fs * 0.86, torsoH = fs * 1.25;
+    ctx.fillStyle = SUIT;
+    // torso
+    ctx.fillRect(x - torsoW / 2, y, torsoW, torsoH);
+    // head
+    ctx.beginPath();
+    ctx.moveTo(x + headR, y - headR * 0.15);
+    ctx.arc(x, y - headR * 0.15, headR, 0, Math.PI * 2);
+    ctx.fill();
+    // mouth line, opening and closing on the figure's own beat
+    var m = 0.5 + 0.5 * Math.sin(2 * Math.PI * t / f.period + f.phase);
+    // Quantized so float noise at the cycle boundary cannot flip a pixel.
+    var mw = Math.max(2, Math.round(fs * (0.18 + 0.30 * m)));
+    ctx.fillStyle = GREY;
+    ctx.fillRect(x - mw / 2, y - headR * 0.15 + headR * 0.18, mw, Math.max(2, fs * 0.05));
+  }
+
+  function drawShape(shape, cx, cy, s, scale) {
+    var r = s * 0.5 * scale;
+    ctx.fillStyle = CREAM;
+    if (shape === 'disc') {
+      ctx.beginPath();
+      ctx.moveTo(cx + r, cy);
+      ctx.arc(cx, cy, r, 0, Math.PI * 2);
+      ctx.fill();
+    } else if (shape === 'bar') {
+      ctx.fillRect(cx - r, cy - r * 0.28, r * 2, r * 0.56);
+    } else { // triangle
+      ctx.beginPath();
+      ctx.moveTo(cx, cy - r);
+      ctx.lineTo(cx + r, cy + r * 0.8);
+      ctx.lineTo(cx - r, cy + r * 0.8);
+      ctx.closePath();
+      ctx.fill();
+    }
+  }
+
+  function draw(t) {
+    var size = vw();
+    var W = size.w, H = size.h;
+    canvas.width = W;
+    canvas.height = H;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    var L = layout(W, H);
+    var ct = (t + PHASE) % CYCLE;
+
+    // Broadcast panel, left two-thirds: teal backdrop, grey floor band.
+    ctx.fillStyle = TEAL;
+    ctx.fillRect(0, 0, L.split, H);
+    ctx.fillStyle = GREY;
+    ctx.fillRect(0, H * 0.86, L.split, H * 0.14);
+
+    // Rows of suited figures.
+    var fs = L.fs;
+    var rowY = [H * 0.16, H * 0.48];
+    var k;
+    for (k = 0; k < FIGS.length; k++) {
+      var f = FIGS[k];
+      var fx = L.split * (0.14 + 0.72 * (f.col / 4));
+      drawFigure(fx, rowY[f.row], fs, f, t);
+    }
+
+    // Margin strip, right one-third.
+    ctx.fillStyle = CREAM;
+    ctx.fillRect(L.split, 0, L.marginW, H);
+
+    // Cards, in stack order; each overlaps the broadcast edge slightly.
+    var overlap = L.marginW * 0.14;
+    var baseX = L.split - overlap;
+    var j, id, card, off, x, y;
+    for (j = 0; j < order.length; j++) {
+      id = order[j];
+      card = CARDS[id];
+      off = slideOff(id, ct);
+      x = baseX + off * (L.marginW + L.cardW);
+      y = cardY(id, L, t);
+      ctx.fillStyle = card.color;
+      ctx.fillRect(x, y - L.cardH / 2, L.cardW, L.cardH);
+      drawShape(card.shape, x + L.cardW / 2, y, Math.min(L.cardW, L.cardH) * 0.52, pulseScale(id, t));
+    }
+  }
+
+  function cardAt(x, y, t) {
+    var size = vw();
+    var L = layout(size.w, size.h);
+    var ct = (t + PHASE) % CYCLE;
+    var overlap = L.marginW * 0.14;
+    var baseX = L.split - overlap;
+    var j, id, off, cx, cy;
+    for (j = 0; j < order.length; j++) {
+      id = order[j];
+      off = slideOff(id, ct);
+      if (off > 0.05) continue; // not yet arrived / already departed
+      cx = baseX + off * (L.marginW + L.cardW);
+      cy = cardY(id, L, t);
+      if (x >= cx && x <= cx + L.cardW && y >= cy - L.cardH / 2 && y <= cy + L.cardH / 2) {
+        return id;
+      }
+    }
+    return null;
+  }
+
+  var lastT = 0;
+  function pointerDown(x, y, t) {
+    lastT = t;
+    var id = cardAt(x, y, t);
+    if (id === null) return;
+    drag = { card: id, startY: y, y: y, moved: false };
+    settle = null;
+    pulse = null;
+  }
+  function pointerMove(x, y, t) {
+    lastT = t;
+    if (!drag) return;
+    drag.y = y;
+    if (Math.abs(y - drag.startY) > 4) drag.moved = true;
+    if (!drag.moved) return;
+    // Reorder: swap with the neighbour whose slot the pointer has crossed.
+    var size = vw();
+    var L = layout(size.w, size.h);
+    var pos = order.indexOf(drag.card);
+    var slots = L.slots;
+    var target = pos;
+    var s;
+    for (s = 0; s < slots.length; s++) {
+      if (Math.abs(y - slots[s]) < Math.abs(y - slots[target])) target = s;
+    }
+    if (target !== pos) {
+      order.splice(pos, 1);
+      order.splice(target, 0, drag.card);
+    }
+  }
+  function pointerUp(x, y, t) {
+    lastT = t;
+    if (!drag) return;
+    var id = drag.card;
+    var fromY = drag.y;
+    drag = null;
+    settle = { card: id, t0: t, fromY: fromY, toY: 0 };
+    pulse = { card: id, t0: t + 0.4 };
+  }
+
+  // Boot flag: frame one is draw(0); the clock starts only with the rAF loop.
+  var booted = false;
+  function loop(ts) {
+    var t = (ts - loop.start) / 1000;
+    lastT = t;
+    draw(t);
+    if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(loop);
+  }
+  function start() {
+    if (booted) return;
+    booted = true;
+    draw(0);
+    if (typeof requestAnimationFrame !== 'undefined') {
+      loop.start = 0;
+      requestAnimationFrame(function (ts) {
+        loop.start = ts;
+        requestAnimationFrame(loop);
+      });
+    }
+  }
+
+  if (typeof window !== 'undefined') {
+    window.__piece = {
+      draw: draw,
+      down: pointerDown, move: pointerMove, up: pointerUp,
+      order: function () { return order.slice(); },
+      sceneOf: function (id) { return CARDS[id].scene; }
+    };
+    if (canvas.addEventListener) {
+      canvas.addEventListener('pointerdown', function (e) {
+        pointerDown(e.clientX, e.clientY, lastT);
+      });
+      canvas.addEventListener('pointermove', function (e) {
+        pointerMove(e.clientX, e.clientY, lastT);
+      });
+      canvas.addEventListener('pointerup', function (e) {
+        pointerUp(e.clientX, e.clientY, lastT);
+      });
+    }
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', function () { draw(lastT); });
+    }
+    if (window.addEventListener) {
+      window.addEventListener('resize', function () { draw(lastT); });
+    }
+  }
+  start();
+})();
+</script>
+</body>
+</html>
