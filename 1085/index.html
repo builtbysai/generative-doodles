@@ -1,0 +1,475 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Post-Choreography</title>
+<style>
+  html, body {
+    margin: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #101014;
+  }
+  canvas {
+    display: block;
+    touch-action: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="piece"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  var canvas = document.getElementById('piece');
+  var ctx = canvas.getContext('2d');
+
+  var BG = '#101014';          // split-view background
+  var TINT_L = '#16202E';      // left channel tint
+  var TINT_R = '#1E1A28';      // right channel tint
+  var FRAME = '#1A1A1E';       // drone frames
+  var ORB = '#BFE3FF';         // orb glow
+  var STRIP = '#0A0A0E';       // timeline strip
+  var REAL_C = '#35E0FF';      // REAL take marker
+  var DEL_C = '#FF4FD8';       // DELUSION take marker
+  var CUT = '#E8E8E6';         // cut lines / playhead
+
+  var LOOP = 30;               // one edit loop, seconds of media time
+  var PHASE0 = 17;             // fixed first frame: inside the morph band (16-18)
+
+  var CUT_AT = 10;             // edit 1: hard cut, DELUSION takes the lead
+  var MORPH_A = 16;            // edit 2: morph band, 2 s crossfade back to REAL
+  var MORPH_B = 18;
+  var PUSH_AT = 24;            // edit 3: slow push to the end of the loop
+
+  var W = 0;
+  var H = 0;
+  var DPR = 1;
+  var isPhone = false;
+
+  var startStamp = 0;
+  if (typeof performance !== 'undefined' && performance && typeof performance.now === 'function') {
+    startStamp = performance.now();
+  }
+
+  function clamp(v, a, b) {
+    return v < a ? a : (v > b ? b : v);
+  }
+
+  function mod(v, n) {
+    return ((v % n) + n) % n;
+  }
+
+  function smooth(x) {
+    x = clamp(x, 0, 1);
+    return x * x * (3 - 2 * x);
+  }
+
+  // deterministic seed stream
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- the flock: 12 drones, seeded formation slots ----------
+
+  var SLOTS = [
+    [-0.30, -0.13], [-0.10, -0.16], [0.10, -0.16], [0.30, -0.13],
+    [-0.20, -0.02], [0.00, -0.05], [0.20, -0.02],
+    [-0.30, 0.09], [-0.10, 0.12], [0.10, 0.12], [0.30, 0.09],
+    [0.00, 0.20]
+  ];
+
+  var drones = [];
+  (function buildFlock() {
+    var rnd = mulberry32(1085);
+    for (var i = 0; i < SLOTS.length; i++) {
+      drones.push({
+        sx: SLOTS[i][0],
+        sy: SLOTS[i][1],
+        size: 0.82 + rnd() * 0.38,          // glyph scale
+        depth: rnd() * 2 - 1,               // -1 far .. 1 near, for parallax
+        ph1: rnd() * Math.PI * 2,           // station-keeping phases
+        ph2: rnd() * Math.PI * 2,
+        j1: rnd() * Math.PI * 2,            // delusion jitter phases
+        j2: rnd() * Math.PI * 2,
+        j3: rnd() * Math.PI * 2
+      });
+    }
+  })();
+
+  // ---------- the edit: pure functions of media time ----------
+
+  // which take leads: 1 = REAL sharp, 0 = DELUSION shimmer
+  function leadMix(m) {
+    if (m < CUT_AT) return 1;
+    if (m < MORPH_A) return 0;
+    if (m < MORPH_B) return smooth((m - MORPH_A) / (MORPH_B - MORPH_A));
+    return 1;
+  }
+
+  // edit 3: the slow push, formation scales up over the last 6 s
+  function pushScale(m) {
+    if (m < PUSH_AT) return 1;
+    return 1 + 0.12 * smooth((m - PUSH_AT) / (LOOP - PUSH_AT));
+  }
+
+  // ---------- media clock: closed form in elapsed time + scrub events ----------
+
+  var anchor = { elapsed: 0, media: PHASE0 };
+  var scrubbing = false;
+  var scrubMedia = PHASE0;
+
+  function mediaAt(elapsed) {
+    if (scrubbing) return scrubMedia;
+    return mod(anchor.media + (elapsed - anchor.elapsed), LOOP);
+  }
+
+  function elapsedNow() {
+    if (typeof performance !== 'undefined' && performance && typeof performance.now === 'function') {
+      return (performance.now() - startStamp) / 1000;
+    }
+    return 0;
+  }
+
+  // ---------- geometry ----------
+
+  function stage() {
+    var s = Math.min(W, H);
+    return { s: s, ox: (W - s) / 2, oy: (H - s) / 2 };
+  }
+
+  var VIEW_H = 0.65;           // viewport takes the upper 65% of the square
+  var TRK_X0 = 0.165, TRK_X1 = 0.975;
+  var REAL_Y0 = 0.705, REAL_Y1 = 0.775;
+  var DEL_Y0 = 0.815, DEL_Y1 = 0.885;
+
+  function mediaToX(m, st) {
+    return st.ox + (TRK_X0 + (m / LOOP) * (TRK_X1 - TRK_X0)) * st.s;
+  }
+
+  function xToMedia(px, st) {
+    var u = (px - st.ox) / st.s;
+    return clamp((u - TRK_X0) / (TRK_X1 - TRK_X0), 0, 1) * LOOP;
+  }
+
+  // ---------- drawing ----------
+
+  function drawDrone(x, y, hs, layerAlpha, jittered) {
+    // orb on its mast, flat-alpha glow discs (no gradients)
+    var oy = y - hs * 1.3;
+    ctx.fillStyle = ORB;
+    ctx.globalAlpha = 0.05 * layerAlpha;
+    ctx.beginPath(); ctx.arc(x, oy, hs * (jittered ? 2.3 : 1.9), 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = 0.10 * layerAlpha;
+    ctx.beginPath(); ctx.arc(x, oy, hs * (jittered ? 1.5 : 1.2), 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = 0.85 * layerAlpha;
+    ctx.beginPath(); ctx.arc(x, oy, hs * 0.55, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#FFFFFF';
+    ctx.globalAlpha = 0.9 * layerAlpha;
+    ctx.beginPath(); ctx.arc(x, oy, hs * 0.2, 0, Math.PI * 2); ctx.fill();
+
+    // mast
+    ctx.strokeStyle = FRAME;
+    ctx.globalAlpha = 0.9 * layerAlpha;
+    ctx.lineWidth = Math.max(1, hs * 0.16);
+    ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x, oy + hs * 0.4); ctx.stroke();
+
+    // skeletal X frame with rotor ticks at the four arm ends
+    ctx.lineWidth = Math.max(1, hs * 0.22);
+    ctx.beginPath();
+    ctx.moveTo(x - hs, y - hs * 0.55); ctx.lineTo(x + hs, y + hs * 0.55);
+    ctx.moveTo(x + hs, y - hs * 0.55); ctx.lineTo(x - hs, y + hs * 0.55);
+    ctx.stroke();
+    ctx.lineWidth = Math.max(1, hs * 0.14);
+    var ends = [[-1, -0.55], [1, -0.55], [-1, 0.55], [1, 0.55]];
+    for (var i = 0; i < 4; i++) {
+      var ex = x + ends[i][0] * hs, ey = y + ends[i][1] * hs;
+      ctx.beginPath(); ctx.arc(ex, ey, hs * 0.3, 0, Math.PI * 2); ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawFlockLayer(st, chan, m, mixLayer, jittered) {
+    // one render of the formation: mixLayer is this layer's crossfade weight
+    if (mixLayer <= 0.02) return;
+    var s = st.s;
+    var sign = chan === 0 ? -1 : 1;
+    var cx = st.ox + (chan === 0 ? 0.25 : 0.75) * s + sign * 0.0075 * s;
+    var cy = st.oy + 0.325 * s;
+    var ps = pushScale(m);
+    for (var i = 0; i < drones.length; i++) {
+      var d = drones[i];
+      var dx = 0.004 * Math.sin(2 * Math.PI * (m / 23) + d.ph1);
+      var dy = 0.003 * Math.sin(2 * Math.PI * (m / 17) + d.ph2);
+      var jx = 0, jy = 0;
+      if (jittered) {
+        jx = 0.005 * Math.sin(2 * Math.PI * (m * 1.7) + d.j1) +
+             0.003 * Math.sin(2 * Math.PI * (m * 4.3) + d.j2);
+        jy = 0.004 * Math.sin(2 * Math.PI * (m * 2.3) + d.j3) +
+             0.0025 * Math.sin(2 * Math.PI * (m * 5.1) + d.j1);
+      }
+      var px = cx + (d.sx * 0.62 * ps + dx + jx) * s + sign * d.depth * 0.006 * s;
+      var py = cy + (d.sy * ps + dy + jy) * s;
+      drawDrone(px, py, 0.0165 * s * d.size * ps, mixLayer, jittered);
+    }
+  }
+
+  function drawChannel(st, chan, m, mix) {
+    var s = st.s;
+    var x0 = st.ox + (chan === 0 ? 0 : 0.5) * s;
+    var y0 = st.oy;
+    var w = 0.5 * s, h = VIEW_H * s;
+    ctx.save();
+    ctx.beginPath(); ctx.rect(x0, y0, w, h); ctx.clip();
+    ctx.fillStyle = chan === 0 ? TINT_L : TINT_R;
+    ctx.fillRect(x0, y0, w, h);
+    // DELUSION underneath (jittered), REAL on top (sharp); weights crossfade
+    drawFlockLayer(st, chan, m, 1 - mix, true);
+    drawFlockLayer(st, chan, m, mix, false);
+    ctx.restore();
+  }
+
+  function trackBase(st, y0, y1) {
+    var x0 = st.ox + TRK_X0 * st.s, x1 = st.ox + TRK_X1 * st.s;
+    var yA = st.oy + y0 * st.s, yB = st.oy + y1 * st.s;
+    ctx.fillStyle = 'rgba(232,232,230,0.05)';
+    ctx.fillRect(x0, yA, x1 - x0, yB - yA);
+    ctx.strokeStyle = 'rgba(232,232,230,0.14)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(x0, yA, x1 - x0, yB - yA);
+  }
+
+  function block(st, m0, m1, y0, y1, color, alpha) {
+    var x0 = mediaToX(m0, st), x1 = mediaToX(m1, st);
+    var yA = st.oy + y0 * st.s + 2, yB = st.oy + y1 * st.s - 2;
+    ctx.fillStyle = color;
+    ctx.globalAlpha = alpha;
+    ctx.fillRect(x0 + 1, yA, Math.max(1, x1 - x0 - 2), yB - yA);
+    ctx.globalAlpha = 1;
+  }
+
+  function morphBand(st, y0, y1) {
+    // the crossfade drawn as what it is: alternating slivers of the two takes
+    var x0 = mediaToX(MORPH_A, st), x1 = mediaToX(MORPH_B, st);
+    var yA = st.oy + y0 * st.s + 2, yB = st.oy + y1 * st.s - 2;
+    var step = Math.max(2, st.s * 0.006);
+    ctx.save();
+    ctx.beginPath(); ctx.rect(x0, yA, x1 - x0, yB - yA); ctx.clip();
+    for (var x = x0, k = 0; x < x1; x += step, k++) {
+      ctx.fillStyle = k % 2 === 0 ? REAL_C : DEL_C;
+      ctx.globalAlpha = 0.55;
+      ctx.fillRect(x, yA, step, yB - yA);
+    }
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
+  function drawTimeline(st, m) {
+    var s = st.s;
+    // strip ground + hairline
+    ctx.fillStyle = STRIP;
+    ctx.fillRect(st.ox, st.oy + VIEW_H * s, s, (1 - VIEW_H) * s);
+    ctx.strokeStyle = 'rgba(232,232,230,0.16)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(st.ox, st.oy + VIEW_H * s);
+    ctx.lineTo(st.ox + s, st.oy + VIEW_H * s);
+    ctx.stroke();
+
+    trackBase(st, REAL_Y0, REAL_Y1);
+    trackBase(st, DEL_Y0, DEL_Y1);
+
+    // take blocks: which footage each track carries, segment by segment
+    block(st, 0, CUT_AT, REAL_Y0, REAL_Y1, REAL_C, 0.8);            // REAL leads
+    block(st, CUT_AT, MORPH_A, DEL_Y0, DEL_Y1, DEL_C, 0.8);         // DELUSION leads
+    block(st, MORPH_B, LOOP, REAL_Y0, REAL_Y1, REAL_C, 0.8);        // REAL again, push
+    morphBand(st, REAL_Y0, REAL_Y1);
+    morphBand(st, DEL_Y0, DEL_Y1);
+
+    // cut markers: edit 1 hard, band edges soft, edit 3 medium
+    var marks = [[CUT_AT, 0.85, 1.6], [MORPH_A, 0.35, 1], [MORPH_B, 0.35, 1], [PUSH_AT, 0.5, 1]];
+    for (var i = 0; i < marks.length; i++) {
+      var mx = mediaToX(marks[i][0], st);
+      ctx.strokeStyle = CUT;
+      ctx.globalAlpha = marks[i][1];
+      ctx.lineWidth = marks[i][2];
+      ctx.beginPath();
+      ctx.moveTo(mx, st.oy + 0.688 * s);
+      ctx.lineTo(mx, st.oy + 0.902 * s);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+
+    // marker diamonds above the tracks
+    var dia = [[CUT_AT, CUT, 1], [PUSH_AT, CUT, 0.6]];
+    for (var j = 0; j < dia.length; j++) {
+      var dx = mediaToX(dia[j][0], st), dy = st.oy + 0.672 * s, r = 0.006 * s;
+      ctx.fillStyle = dia[j][1];
+      ctx.globalAlpha = dia[j][2];
+      ctx.beginPath();
+      ctx.moveTo(dx, dy - r); ctx.lineTo(dx + r, dy); ctx.lineTo(dx, dy + r); ctx.lineTo(dx - r, dy);
+      ctx.closePath(); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // track labels (the only text besides the title)
+    ctx.fillStyle = 'rgba(232,232,230,0.6)';
+    ctx.font = '600 ' + Math.max(9, s * (isPhone ? 0.02 : 0.017)) + 'px ui-monospace, Menlo, Consolas, monospace';
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('REAL', st.ox + 0.15 * s, st.oy + (REAL_Y0 + REAL_Y1) / 2 * s);
+    ctx.fillText('DELUSION', st.ox + 0.15 * s, st.oy + (DEL_Y0 + DEL_Y1) / 2 * s);
+    ctx.textAlign = 'left';
+
+    // playhead
+    var px = mediaToX(m, st);
+    ctx.strokeStyle = CUT;
+    ctx.globalAlpha = 0.95;
+    ctx.lineWidth = Math.max(1.2, s * 0.002);
+    ctx.beginPath();
+    ctx.moveTo(px, st.oy + 0.66 * s);
+    ctx.lineTo(px, st.oy + 0.905 * s);
+    ctx.stroke();
+    ctx.fillStyle = CUT;
+    ctx.beginPath();
+    ctx.moveTo(px - 0.007 * s, st.oy + 0.655 * s);
+    ctx.lineTo(px + 0.007 * s, st.oy + 0.655 * s);
+    ctx.lineTo(px, st.oy + 0.668 * s);
+    ctx.closePath(); ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  function drawAt(elapsed) {
+    var m = mediaAt(elapsed);
+    var st = stage();
+    var s = st.s;
+
+    ctx.fillStyle = BG;
+    ctx.fillRect(0, 0, W, H);
+
+    var mix = leadMix(m);
+    drawChannel(st, 0, m, mix);
+    drawChannel(st, 1, m, mix);
+
+    // thin divider between the eyes + a hairline frame on the view
+    ctx.strokeStyle = 'rgba(232,232,230,0.45)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(st.ox + 0.5 * s, st.oy);
+    ctx.lineTo(st.ox + 0.5 * s, st.oy + VIEW_H * s);
+    ctx.stroke();
+    ctx.strokeStyle = 'rgba(232,232,230,0.10)';
+    ctx.strokeRect(st.ox, st.oy, s, VIEW_H * s);
+
+    drawTimeline(st, m);
+
+    // keep the CSS size pinned (high-DPR phones render doubled otherwise)
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+  }
+
+  // ---------- sizing ----------
+
+  function resize() {
+    var vv = window.visualViewport;
+    var w = (vv && vv.width) ? vv.width : window.innerWidth;
+    var h = (vv && vv.height) ? vv.height : window.innerHeight;
+    var sw = (window.screen && window.screen.width) ? window.screen.width : w;
+    var sh = (window.screen && window.screen.height) ? window.screen.height : h;
+    W = Math.max(1, Math.round(w));
+    H = Math.max(1, Math.round(h));
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    isPhone = Math.min(sw, sh) < 700 || (Math.min(sw, sh) >= 700 && H > W * 1.15);
+  }
+
+  // ---------- scrub: drag on the timeline moves the playhead ----------
+
+  function pointerPos(e) {
+    var x = 0, y = 0;
+    if (typeof canvas.getBoundingClientRect === 'function') {
+      var r = canvas.getBoundingClientRect();
+      x = e.clientX - r.left;
+      y = e.clientY - r.top;
+    } else {
+      x = e.clientX || 0;
+      y = e.clientY || 0;
+    }
+    return [x, y];
+  }
+
+  function inTimeline(y) {
+    var st = stage();
+    var u = (y - st.oy) / st.s;
+    return u >= 0.64 && u <= 0.93;
+  }
+
+  function onPointerDown(e) {
+    var p = pointerPos(e);
+    if (!inTimeline(p[1])) return;
+    scrubbing = true;
+    scrubMedia = xToMedia(p[0], stage());
+    if (canvas.setPointerCapture && e.pointerId !== undefined) {
+      try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+    }
+    drawAt(elapsedNow());
+  }
+
+  function onPointerMove(e) {
+    if (!scrubbing) return;
+    var p = pointerPos(e);
+    scrubMedia = xToMedia(p[0], stage());
+    drawAt(elapsedNow());
+  }
+
+  function endScrub() {
+    if (!scrubbing) return;
+    scrubbing = false;
+    anchor = { elapsed: elapsedNow(), media: scrubMedia };
+  }
+
+  if (window.visualViewport && typeof window.visualViewport.addEventListener === 'function') {
+    window.visualViewport.addEventListener('resize', resize);
+  }
+  if (typeof window.addEventListener === 'function') {
+    window.addEventListener('resize', resize);
+  }
+  if (typeof canvas.addEventListener === 'function') {
+    canvas.addEventListener('pointerdown', onPointerDown);
+    canvas.addEventListener('pointermove', onPointerMove);
+    canvas.addEventListener('pointerup', endScrub);
+    canvas.addEventListener('pointercancel', endScrub);
+  }
+
+  resize();
+  if (typeof performance !== 'undefined' && performance && typeof performance.now === 'function') {
+    startStamp = performance.now();
+  }
+  drawAt(0);
+
+  var raf = null;
+  if (typeof window.requestAnimationFrame === 'function') raf = window.requestAnimationFrame;
+  else if (typeof requestAnimationFrame === 'function') raf = requestAnimationFrame;
+
+  function loop() {
+    drawAt(elapsedNow());
+    if (raf) raf(loop);
+  }
+  if (raf) raf(loop);
+})();
+</script>
+</body>
+</html>
