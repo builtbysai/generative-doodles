@@ -1,0 +1,254 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>The Same River</title>
+<style>html,body{margin:0;padding:0;background:#07141c;overflow:hidden;height:100%}canvas{display:block;width:100vw;height:100vh;touch-action:none;cursor:crosshair}</style>
+</head><body><canvas id="c"></canvas>
+<!-- SAME-RIVER-9114 -->
+<script>
+/* №9114 "The Same River" — driver core.
+ * A meandering river channel whose course migrates over time (the river is never
+ * the same), advecting silt particles whose trails fade (every step is new).
+ * Drag injects a vortex that bends the current, then dissolves (the stepper
+ * changes the river). Tap reseeds the drift (the river turns over).
+ * Pure logic, no DOM: shared by the piece, the Node acceptance harness, and the
+ * thumbnail renderer. Deterministic given seed.
+ */
+var RiverCore = (function () {
+  'use strict';
+
+  var TAU = Math.PI * 2;
+
+  var DEFAULTS = {
+    fadeAlpha: 0.045,   // per-frame trail fade at 60fps
+    dragStr: 2.5,       // vortex strength injected per drag sample
+    vortexRad: 110,     // px
+    vortexTau: 6,       // seconds until a vortex has ~decayed
+    baseSpeed: 46       // px/s particle base speed
+  };
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function makeRiver(seed, W, H) {
+    var rnd = mulberry32(seed >>> 0);
+    var drift = {
+      p1: rnd() * TAU, p2: rnd() * TAU, p3: rnd() * TAU,
+      mp: rnd() * TAU,
+      w1: 0.050 + rnd() * 0.030,
+      w2: 0.040 + rnd() * 0.030,
+      w3: 0.030 + rnd() * 0.020,
+      wmp: 0.050 + rnd() * 0.030
+    };
+    return {
+      W: W, H: H, drift: drift, vortices: [], rnd: rnd,
+      channelAmp1: 0.18, channelAmp2: 0.07, channelWidth: 0.27
+    };
+  }
+
+  function smoothstep(a, b, x) {
+    var t = Math.min(1, Math.max(0, (x - a) / (b - a)));
+    return t * t * (3 - 2 * t);
+  }
+
+  // Layered trig "noise", returns an angle-ish value in roughly [-2.85, 2.85].
+  function noiseAngle(S, x, y, t) {
+    var d = S.drift;
+    var n = Math.sin(x * 0.006 + d.p1 + t * d.w1) * Math.cos(y * 0.005 - d.p2 + t * d.w2)
+          + 0.5 * Math.sin(x * 0.013 - y * 0.011 + d.p3 + t * d.w3);
+    return n * 1.9;
+  }
+
+  // The river's course: a migrating meander. This is what makes it never the same.
+  function channelCenter(S, x, t) {
+    var d = S.drift;
+    var mp = d.mp + t * d.wmp;
+    return S.H * (0.5
+      + S.channelAmp1 * Math.sin(x * 0.004 + mp)
+      + S.channelAmp2 * Math.sin(x * 0.011 + mp * 1.7));
+  }
+
+  // Field sample. Returns {angle, speed, bright}.
+  // speed/bright in [0..~2.3] / [0..1]: fast+bright inside the channel, slow+dim out.
+  function fieldAt(S, x, y, t) {
+    var n = noiseAngle(S, x, y, t);
+    var cc = channelCenter(S, x, t);
+    var hw = S.H * S.channelWidth;
+    var b = 1 - smoothstep(hw * 0.55, hw * 1.15, Math.abs(y - cc));
+    var ang = n + (0.35 * n - n) * b; // calm: full swirl; channel: mostly downstream
+    var vx = Math.cos(ang), vy = Math.sin(ang);
+    var vs = S.vortices;
+    for (var i = 0; i < vs.length; i++) {
+      var o = vs[i], age = t - o.t0;
+      if (age < 0) continue;
+      var dec = Math.exp(-age / DEFAULTS.vortexTau);
+      if (dec < 0.01) continue;
+      var dx = x - o.x, dy = y - o.y;
+      var w = o.str * Math.exp(-(dx * dx + dy * dy) / (o.rad * o.rad)) * dec;
+      if (w < 0.001) continue;
+      var dl = Math.sqrt(dx * dx + dy * dy) + 1e-6;
+      vx += w * (-dy / dl); vy += w * (dx / dl); // tangential push
+    }
+    return { angle: Math.atan2(vy, vx), speed: 0.35 + 1.9 * b, bright: 0.10 + 0.90 * b };
+  }
+
+  function pruneVortices(S, t) {
+    var vs = S.vortices, out = [];
+    for (var i = 0; i < vs.length; i++) {
+      if (Math.exp(-(t - vs[i].t0) / DEFAULTS.vortexTau) >= 0.01) out.push(vs[i]);
+    }
+    S.vortices = out;
+  }
+
+  // A step in the river: inject a vortex at (x,y). Strength ~ drag velocity.
+  function disturb(S, x, y, str, t) {
+    S.vortices.push({ x: x, y: y, t0: t, str: str, rad: DEFAULTS.vortexRad });
+    if (S.vortices.length > 24) S.vortices.shift();
+  }
+
+  // The river turns over: jump the drift phases (discontinuous field change).
+  function reseed(S) {
+    var r = S.rnd, d = S.drift;
+    d.p1 = r() * TAU; d.p2 = r() * TAU; d.p3 = r() * TAU; d.mp = r() * TAU;
+  }
+
+  // Coarse, deterministic fingerprint of field state on a 16x9 grid.
+  function fieldHash(S, t) {
+    var h = 0;
+    for (var gy = 0; gy < 9; gy++) {
+      for (var gx = 0; gx < 16; gx++) {
+        var f = fieldAt(S, (gx + 0.5) / 16 * S.W, (gy + 0.5) / 9 * S.H, t);
+        h = (h * 31 + Math.round(f.angle * 1000)) | 0;
+      }
+    }
+    return h >>> 0;
+  }
+
+  function spawn(S) {
+    var r = S.rnd;
+    return { x: r() * S.W, y: r() * S.H, px: 0, py: 0, age: r() * 40, maxAge: 25 + r() * 35, bright: 0.5 };
+  }
+
+  function makeParticles(S, count) {
+    var ps = [];
+    for (var i = 0; i < count; i++) { var p = spawn(S); p.px = p.x; p.py = p.y; ps.push(p); }
+    return ps;
+  }
+
+  function stepParticles(S, ps, dt, t) {
+    for (var i = 0; i < ps.length; i++) {
+      var p = ps[i];
+      var f = fieldAt(S, p.x, p.y, t);
+      var sp = f.speed * DEFAULTS.baseSpeed * dt;
+      p.px = p.x; p.py = p.y;
+      p.x += Math.cos(f.angle) * sp;
+      p.y += Math.sin(f.angle) * sp;
+      p.age += dt; p.bright = f.bright;
+      if (p.x < -20 || p.x > S.W + 20 || p.y < -20 || p.y > S.H + 20 ||
+          p.age > p.maxAge || !isFinite(p.x + p.y)) {
+        var np = spawn(S);
+        p.x = np.x; p.y = np.y; p.px = p.x; p.py = p.y;
+        p.age = 0; p.maxAge = np.maxAge;
+      }
+    }
+  }
+
+  return {
+    DEFAULTS: DEFAULTS, TAU: TAU,
+    makeRiver: makeRiver, fieldAt: fieldAt, disturb: disturb,
+    reseed: reseed, fieldHash: fieldHash, makeParticles: makeParticles,
+    stepParticles: stepParticles, pruneVortices: pruneVortices,
+    channelCenter: channelCenter
+  };
+})();
+if (typeof module !== 'undefined' && module.exports) module.exports = RiverCore;
+
+</script>
+<script>
+(function(){
+  'use strict';
+  var cv = document.getElementById('c'), ctx = cv.getContext('2d');
+  var W = 0, H = 0, DPR = 1;
+  var river = null, parts = [];
+  var BG = '7,20,28'; // deep water
+
+  function resize() {
+    DPR = Math.min(2, (window.devicePixelRatio || 1));
+    W = window.innerWidth; H = window.innerHeight;
+    cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    river = RiverCore.makeRiver(9114, W, H);
+    var n = Math.max(500, Math.min(1600, Math.round(W * H / 900)));
+    parts = RiverCore.makeParticles(river, n);
+    ctx.fillStyle = 'rgb(' + BG + ')';
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  var lastT = -1;
+  function frame(now) {
+    var t = now / 1000, dt;
+    if (lastT < 0) { lastT = t; requestAnimationFrame(frame); return; }
+    dt = Math.min(0.05, t - lastT); lastT = t;
+    RiverCore.pruneVortices(river, t);
+    ctx.fillStyle = 'rgba(' + BG + ',' + RiverCore.DEFAULTS.fadeAlpha + ')';
+    ctx.fillRect(0, 0, W, H);
+    RiverCore.stepParticles(river, parts, dt, t);
+    ctx.lineWidth = Math.max(1, DPR * 0.9);
+    ctx.lineCap = 'round';
+    var i, p, a;
+    for (i = 0; i < parts.length; i++) {
+      p = parts[i];
+      a = 0.55 * p.bright * Math.min(1, p.age / 1.5);
+      // group strokes in one path would lose per-particle alpha; stroke individually
+      ctx.strokeStyle = 'rgba(186,214,220,' + a.toFixed(3) + ')';
+      ctx.beginPath();
+      ctx.moveTo(p.px, p.py);
+      ctx.lineTo(p.x, p.y);
+      ctx.stroke();
+    }
+    requestAnimationFrame(frame);
+  }
+
+  // Interaction: drag steps in the river (vortex); tap turns the river over.
+  var downX = 0, downY = 0, downT = 0, lastX = 0, lastY = 0, lastMoveT = 0, isDown = false;
+  function pos(e) {
+    var r = cv.getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  }
+  cv.addEventListener('pointerdown', function (e) {
+    var p = pos(e);
+    isDown = true; downX = lastX = p.x; downY = lastY = p.y;
+    downT = lastMoveT = performance.now();
+    if (cv.setPointerCapture) { try { cv.setPointerCapture(e.pointerId); } catch (err) {} }
+  });
+  cv.addEventListener('pointermove', function (e) {
+    if (!isDown) return;
+    var p = pos(e), now = performance.now();
+    var dt = Math.max(1, now - lastMoveT) / 1000;
+    var v = Math.hypot(p.x - lastX, p.y - lastY) / dt;
+    var str = Math.min(3, Math.max(0.6, v / 700));
+    RiverCore.disturb(river, p.x, p.y, str, now / 1000);
+    lastX = p.x; lastY = p.y; lastMoveT = now;
+  });
+  function up(e) {
+    if (!isDown) return;
+    isDown = false;
+    var p = pos(e), now = performance.now();
+    if (now - downT < 300 && Math.hypot(p.x - downX, p.y - downY) < 14) {
+      RiverCore.reseed(river); // tap: the river turns over
+    }
+  }
+  cv.addEventListener('pointerup', up);
+  cv.addEventListener('pointercancel', function () { isDown = false; });
+
+  if (window.addEventListener) window.addEventListener('resize', resize);
+  resize();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body></html>
