@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A Memory, Plotted</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #060608; height: 100%; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<script>
+"use strict";
+
+/* ------------------------------------------------------------------ */
+/* A Memory, Plotted - study #116 refikanadol, PP106 "Data Is Memory" */
+/* 600 seeded memories in four families, spring-embedded on black.    */
+/* Points carry records (year, intensity, family, name). Migration    */
+/* travels; nothing teleports. Fixed-timestep sim, 120 Hz, with a     */
+/* synchronous 2400-step pre-roll so frame one is mid-breath.         */
+/* ------------------------------------------------------------------ */
+
+/* ---------------- seeded RNG ---------------- */
+function mulberry32(seed) {
+  var a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function gauss(rng) {
+  var u = 0, v = 0;
+  while (u === 0) u = rng();
+  while (v === 0) v = rng();
+  return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+}
+function clamp(x, a, b) { return x < a ? a : (x > b ? b : x); }
+function lerp(a, b, u) { return a + (b - a) * u; }
+function smooth(u) { return u * u * (3 - 2 * u); }
+
+/* ---------------- families ---------------- */
+var FAMS = [
+  { key: "ember",  label: "EMBER",  color: [255, 92, 57],   band: [1962, 1975],
+    names: ["the summer of the storm", "grandmother\u2019s kitchen", "the first bicycle",
+            "a wedding in june", "the long blackout", "the river in august",
+            "the harvest dance", "the letter never sent", "the orchard wall",
+            "the winter the river froze"] },
+  { key: "gold",   label: "GOLD",   color: [255, 179, 0],   band: [1976, 1989],
+    names: ["the first train", "the scholarship letter", "the city lights",
+            "the band\u2019s first gig", "the rooftop garden", "the second language",
+            "the borrowed camera", "the marathon finish", "the small business",
+            "the reunion"] },
+  { key: "ice",    label: "ICE",    color: [39, 230, 255],  band: [1990, 2003],
+    names: ["the frozen lake", "the northern lights", "the quiet apartment",
+            "the first snow", "the video call home", "the mountain cabin",
+            "the glacier hike", "the blue hour", "the ice rink evenings",
+            "the letter from abroad"] },
+  { key: "violet", label: "VIOLET", color: [122, 92, 255],  band: [2004, 2017],
+    names: ["the rooftop concert", "the purple hour", "the last train home",
+            "the neon street", "the dream journal", "the midnight garden",
+            "the observatory night", "the ultraviolet poster", "the slow morning",
+            "the farewell party"] }
+];
+var BASE_ANCHORS = [ [0.30, 0.36], [0.69, 0.31], [0.34, 0.69], [0.71, 0.67] ];
+var SIGMAS = [0.075, 0.065, 0.080, 0.070];
+var N_POINTS = 600;
+var CYCLE = 90;        /* breath cycle, seconds */
+var MIG_DUR = 20;      /* migration travel time, seconds */
+
+/* ---------------- archive generation ---------------- */
+var archiveSeed = 945106;
+var anchors = [];      /* per family, jittered blob anchors */
+var points = [];       /* live point states */
+var famShadow = [];    /* family each point will hold, for event planning */
+
+function buildArchive(seed) {
+  var rng = mulberry32(seed);
+  var anch = [];
+  for (var f = 0; f < 4; f++) {
+    anch.push([
+      BASE_ANCHORS[f][0] + (rng() - 0.5) * 0.06,
+      BASE_ANCHORS[f][1] + (rng() - 0.5) * 0.06
+    ]);
+  }
+  var recs = [];
+  for (var i = 0; i < N_POINTS; i++) {
+    var fam = i % 4;
+    var band = FAMS[fam].band;
+    var year = band[0] + Math.floor(rng() * (band[1] - band[0] + 1));
+    var inten = 0.15 + 0.85 * Math.pow(rng(), 1.4);
+    var name = FAMS[fam].names[Math.floor(rng() * FAMS[fam].names.length)];
+    var off = [gauss(rng) * SIGMAS[fam], gauss(rng) * SIGMAS[fam]];
+    recs.push({ fam: fam, year: year, inten: inten, name: name, off: off,
+                phase: rng() * Math.PI * 2 });
+  }
+  return { anchors: anch, recs: recs };
+}
+
+function initPoints(arch) {
+  anchors = arch.anchors;
+  points = [];
+  famShadow = [];
+  for (var i = 0; i < N_POINTS; i++) {
+    var r = arch.recs[i];
+    var hx = anchors[r.fam][0] + r.off[0];
+    var hy = anchors[r.fam][1] + r.off[1];
+    points.push({
+      x: hx, y: hy, vx: 0, vy: 0,
+      fam: r.fam, off: [r.off[0], r.off[1]],
+      year: r.year, inten: r.inten, name: r.name, phase: r.phase,
+      mig: null
+    });
+    famShadow.push(r.fam);
+  }
+}
+
+/* ---------------- migration event schedule ---------------- */
+/* Events are planned per breath cycle from a per-cycle seeded RNG,  */
+/* so the schedule is deterministic for any sim time. Cycle 0 fires  */
+/* three early migrations so frame one (t = 20 s) is mid-travel.     */
+var migEvents = [];    /* {t, idx, toFam, toOff, done} sorted by t */
+var cyclesPlanned = -1;
+
+function planCycle(k) {
+  var rng = mulberry32((archiveSeed ^ (0x9E3779B9 * (k + 1))) >>> 0);
+  var starts, count, j;
+  if (k === 0) { starts = [3, 9, 15]; count = 3; }
+  else {
+    count = 2 + Math.floor(rng() * 2); /* 2 or 3 */
+    starts = [];
+    for (j = 0; j < count; j++) starts.push(k * CYCLE + 4 + rng() * 55);
+    starts.sort(function (a, b) { return a - b; });
+  }
+  for (j = 0; j < count; j++) {
+    var idx = Math.floor(rng() * N_POINTS);
+    var guard = 0;
+    while (points[idx].mig && guard < 20) { idx = (idx + 37) % N_POINTS; guard++; }
+    var from = famShadow[idx];
+    var to = Math.floor(rng() * 4);
+    if (to === from) to = (to + 1 + Math.floor(rng() * 3)) % 4;
+    var toOff = [gauss(rng) * SIGMAS[to], gauss(rng) * SIGMAS[to]];
+    migEvents.push({ t: starts[j], idx: idx, toFam: to, toOff: toOff, fired: false });
+    famShadow[idx] = to;
+  }
+  migEvents.sort(function (a, b) { return a.t - b.t; });
+}
+function ensureEvents(upTo) {
+  var need = Math.floor(upTo / CYCLE);
+  while (cyclesPlanned < need) { cyclesPlanned++; planCycle(cyclesPlanned); }
+}
+
+/* ---------------- geometry of homes ---------------- */
+function blobCenter(fam, t) {
+  var a = anchors[fam];
+  var ph = fam * 1.7 + 0.6;
+  var r = 0.020;
+  return [
+    a[0] + Math.cos(t * 2 * Math.PI / CYCLE + ph) * r,
+    a[1] + Math.sin(t * 2 * Math.PI / CYCLE + ph * 1.3) * r
+  ];
+}
+function rotAngle(t) { return (t / CYCLE) * 2 * Math.PI / 180; } /* 2 deg per cycle */
+function blobHome(fam, off, t) {
+  var c = blobCenter(fam, t);
+  var x = c[0] + off[0], y = c[1] + off[1];
+  var ang = rotAngle(t), ca = Math.cos(ang), sa = Math.sin(ang);
+  var dx = x - 0.5, dy = y - 0.5;
+  return [0.5 + dx * ca - dy * sa, 0.5 + dx * sa + dy * ca];
+}
+function pointHome(p, t) {
+  if (p.mig) {
+    var u = clamp((t - p.mig.t0) / MIG_DUR, 0, 1);
+    var e = smooth(u);
+    var hA = blobHome(p.mig.fromFam, p.mig.fromOff, t);
+    var hB = blobHome(p.mig.toFam, p.mig.toOff, t);
+    return [lerp(hA[0], hB[0], e), lerp(hA[1], hB[1], e)];
+  }
+  return blobHome(p.fam, p.off, t);
+}
+function pointColor(p, t) {
+  if (p.mig) {
+    var u = smooth(clamp((t - p.mig.t0) / MIG_DUR, 0, 1));
+    var cA = FAMS[p.mig.fromFam].color, cB = FAMS[p.mig.toFam].color;
+    return [lerp(cA[0], cB[0], u), lerp(cA[1], cB[1], u), lerp(cA[2], cB[2], u)];
+  }
+  return FAMS[p.fam].color;
+}
+
+/* ---------------- interaction state ---------------- */
+var pendingEvents = [];  /* {type:'tap'|'dbl', t, x, y} in unit coords */
+var dragState = { active: false, x: 0, y: 0 };
+var flare = { idx: -1, until: -1 };
+
+/* ---------------- audio (lazy, guarded) ---------------- */
+var AC = null, droneGains = [], audioOn = false;
+function initAudio() {
+  if (audioOn) return;
+  if (typeof AudioContext === "undefined" && typeof webkitAudioContext === "undefined") return;
+  try {
+    var Ctx = typeof AudioContext !== "undefined" ? AudioContext : webkitAudioContext;
+    AC = new Ctx();
+    var freqs = [110, 138.59, 164.81, 196.0];
+    var counts = [0, 0, 0, 0], i;
+    for (i = 0; i < N_POINTS; i++) counts[points[i].fam]++;
+    for (i = 0; i < 4; i++) {
+      var o = AC.createOscillator(), o2 = AC.createOscillator(), g = AC.createGain();
+      o.type = "sine"; o.frequency.value = freqs[i];
+      o2.type = "triangle"; o2.frequency.value = freqs[i] * 1.005;
+      g.gain.value = 0.012 + 0.03 * (counts[i] / N_POINTS);
+      o.connect(g); o2.connect(g); g.connect(AC.destination);
+      o.start(); o2.start();
+      droneGains.push(g);
+    }
+    audioOn = true;
+  } catch (e) { AC = null; }
+}
+function chime(inten) {
+  if (!audioOn || !AC) return;
+  try {
+    var o = AC.createOscillator(), g = AC.createGain();
+    o.type = "sine";
+    o.frequency.value = 520 + inten * 660;
+    var t = AC.currentTime;
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.05, t + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 1.1);
+    o.connect(g); g.connect(AC.destination);
+    o.start(t); o.stop(t + 1.2);
+  } catch (e) { /* silent */ }
+}
+
+/* ---------------- sim ---------------- */
+var STEP = 1 / 120;
+var simTime = 0;
+
+function startMigration(idx, toFam, toOff, t, newRecord) {
+  var p = points[idx];
+  if (p.mig) { /* finish the current one instantly so state stays clean */
+    p.fam = p.mig.toFam; p.off = p.mig.toOff;
+    if (p.mig.newRecord) { p.year = p.mig.newRecord.year; p.inten = p.mig.newRecord.inten; p.name = p.mig.newRecord.name; }
+    p.mig = null;
+  }
+  p.mig = { fromFam: p.fam, fromOff: [p.off[0], p.off[1]],
+            toFam: toFam, toOff: [toOff[0], toOff[1]], t0: t,
+            newRecord: newRecord || null };
+  famShadow[idx] = toFam;
+}
+
+function newArchive(t) {
+  archiveSeed = (archiveSeed + 7919) >>> 0;
+  var arch = buildArchive(archiveSeed);
+  anchors = arch.anchors;
+  migEvents = [];
+  cyclesPlanned = -1;
+  for (var i = 0; i < N_POINTS; i++) {
+    var r = arch.recs[i];
+    startMigration(i, r.fam, r.off, t, { year: r.year, inten: r.inten, name: r.name });
+    points[i].phase = r.phase;
+  }
+  ensureEvents(t + CYCLE);
+}
+
+function applyEvent(ev) {
+  if (ev.type === "tap") {
+    var best = -1, bd = 1e9;
+    for (var i = 0; i < N_POINTS; i++) {
+      var dx = points[i].x - ev.x, dy = points[i].y - ev.y;
+      var d = dx * dx + dy * dy;
+      if (d < bd) { bd = d; best = i; }
+    }
+    flare.idx = best; flare.until = ev.t + 4;
+  } else if (ev.type === "dbl") {
+    newArchive(ev.t);
+  }
+}
+
+function simStep(dt) {
+  var t = simTime;
+  ensureEvents(t + MIG_DUR);
+  var i, p;
+  /* fire scheduled migrations whose time has come */
+  for (i = 0; i < migEvents.length; i++) {
+    var ev = migEvents[i];
+    if (!ev.fired && ev.t <= t) {
+      ev.fired = true;
+      startMigration(ev.idx, ev.toFam, ev.toOff, ev.t, null);
+      chime(points[ev.idx].inten);
+    }
+  }
+  /* consume interaction events */
+  while (pendingEvents.length && pendingEvents[0].t <= t) {
+    applyEvent(pendingEvents.shift());
+  }
+  /* springs toward homes, drag disturbance, migration completion */
+  var K = 6.0, C = 2.4;
+  for (i = 0; i < N_POINTS; i++) {
+    p = points[i];
+    if (p.mig && t >= p.mig.t0 + MIG_DUR) {
+      p.fam = p.mig.toFam; p.off = p.mig.toOff;
+      if (p.mig.newRecord) {
+        p.year = p.mig.newRecord.year; p.inten = p.mig.newRecord.inten;
+        p.name = p.mig.newRecord.name;
+      }
+      p.mig = null;
+    }
+    var h = pointHome(p, t);
+    var ax = (h[0] - p.x) * K - p.vx * C;
+    var ay = (h[1] - p.y) * K - p.vy * C;
+    if (dragState.active) {
+      var dx = dragState.x - p.x, dy = dragState.y - p.y;
+      var d2 = dx * dx + dy * dy, R = 0.17;
+      if (d2 < R * R) {
+        var w = 1 - Math.sqrt(d2) / R;
+        ax += dx * 42 * w; ay += dy * 42 * w;
+      }
+    }
+    p.vx += ax * dt; p.vy += ay * dt;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+  }
+  simTime = t + dt;
+}
+
+/* ---------------- view ---------------- */
+var canvas = document.getElementById("cv");
+var ctx = canvas.getContext("2d");
+var viewW = 0, viewH = 0, isPhone = false;
+
+function computeSize() {
+  var w, h;
+  if (typeof visualViewport !== "undefined" && visualViewport && visualViewport.width) {
+    w = visualViewport.width; h = visualViewport.height;
+  } else if (typeof window !== "undefined" && window.innerWidth) {
+    w = window.innerWidth; h = window.innerHeight;
+  } else { w = 720; h = 720; }
+  viewW = Math.max(50, Math.floor(w));
+  viewH = Math.max(50, Math.floor(h));
+  var scrMin = -1;
+  if (typeof screen !== "undefined" && screen && screen.width && screen.height) {
+    scrMin = Math.min(screen.width, screen.height);
+  }
+  if (scrMin > 0) isPhone = scrMin < 700;
+  else isPhone = viewH > viewW * 1.15;
+  canvas.width = viewW; canvas.height = viewH;
+}
+if (typeof visualViewport !== "undefined" && visualViewport && visualViewport.addEventListener) {
+  visualViewport.addEventListener("resize", function () { computeSize(); draw(); });
+}
+if (typeof window !== "undefined" && window.addEventListener) {
+  window.addEventListener("resize", function () { computeSize(); draw(); });
+}
+
+var HAND_FONT = "\"Segoe Print\", \"Bradley Hand\", \"Comic Sans MS\", cursive";
+function legendHeight() { return isPhone ? 64 : 44; }
+function fieldRect() {
+  var lh = legendHeight();
+  var fh = viewH - lh;
+  var s = Math.min(viewW, fh) * 0.92;
+  return { cx: viewW / 2, cy: fh / 2, s: s };
+}
+function toPx(x, y, fr) { return [fr.cx + (x - 0.5) * fr.s, fr.cy + (y - 0.5) * fr.s]; }
+
+/* convex hull (Andrew monotone chain) over pixel points */
+function hull(pts) {
+  if (pts.length < 3) return pts.slice();
+  var P = pts.slice().sort(function (a, b) { return a[0] - b[0] || a[1] - b[1]; });
+  function cross(o, a, b) { return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]); }
+  var lower = [], upper = [], i;
+  for (i = 0; i < P.length; i++) {
+    while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], P[i]) <= 0) lower.pop();
+    lower.push(P[i]);
+  }
+  for (i = P.length - 1; i >= 0; i--) {
+    while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], P[i]) <= 0) upper.pop();
+    upper.push(P[i]);
+  }
+  lower.pop(); upper.pop();
+  return lower.concat(upper);
+}
+function chaikin(poly, iters) {
+  var P = poly, k, i;
+  for (k = 0; k < iters; k++) {
+    var out = [];
+    for (i = 0; i < P.length; i++) {
+      var a = P[i], b = P[(i + 1) % P.length];
+      out.push([a[0] * 0.75 + b[0] * 0.25, a[1] * 0.75 + b[1] * 0.25]);
+      out.push([a[0] * 0.25 + b[0] * 0.75, a[1] * 0.25 + b[1] * 0.75]);
+    }
+    P = out;
+  }
+  return P;
+}
+function expandPoly(poly, cx, cy, f) {
+  return poly.map(function (p) { return [cx + (p[0] - cx) * f, cy + (p[1] - cy) * f]; });
+}
+function rgba(c, a) {
+  return "rgba(" + Math.round(c[0]) + "," + Math.round(c[1]) + "," + Math.round(c[2]) + "," + a + ")";
+}
+
+/* ---------------- draw ---------------- */
+function draw() {
+  canvas.style.width = viewW + "px";
+  canvas.style.height = viewH + "px";
+  var t = simTime;
+  ctx.fillStyle = "#060608";
+  ctx.fillRect(0, 0, viewW, viewH);
+  var fr = fieldRect();
+  var lh = legendHeight();
+  var i, f;
+
+  /* contour ribbons, one per family */
+  for (f = 0; f < 4; f++) {
+    var members = [];
+    var sx = 0, sy = 0;
+    for (i = 0; i < N_POINTS; i++) {
+      var p = points[i];
+      var belongs = p.mig
+        ? (smooth(clamp((t - p.mig.t0) / MIG_DUR, 0, 1)) > 0.5 ? p.mig.toFam === f : p.mig.fromFam === f)
+        : p.fam === f;
+      if (belongs) { var px = toPx(p.x, p.y, fr); members.push(px); sx += px[0]; sy += px[1]; }
+    }
+    if (members.length >= 3) {
+      var h = hull(members);
+      if (h.length >= 3) {
+        var cxm = sx / members.length, cym = sy / members.length;
+        var sm = chaikin(expandPoly(h, cxm, cym, 1.10), 2);
+        ctx.beginPath();
+        ctx.moveTo(sm[0][0], sm[0][1]);
+        for (i = 1; i < sm.length; i++) ctx.lineTo(sm[i][0], sm[i][1]);
+        ctx.closePath();
+        ctx.fillStyle = rgba(FAMS[f].color, 0.05);
+        ctx.fill();
+        ctx.strokeStyle = rgba(FAMS[f].color, 0.35);
+        ctx.lineWidth = Math.max(3, fr.s * 0.008);
+        ctx.stroke();
+      }
+    }
+  }
+
+  /* points: layered glow + white core */
+  var baseR = Math.max(1.1, fr.s * 0.0022);
+  for (i = 0; i < N_POINTS; i++) {
+    var pt = points[i];
+    var pp = toPx(pt.x, pt.y, fr);
+    var col = pointColor(pt, t);
+    var pulse = 0.82 + 0.30 * Math.sin(t * 1.7 + pt.phase) * (0.4 + 0.6 * pt.inten);
+    var r = baseR * (0.7 + pt.inten * 1.5) * pulse;
+    var fl = (flare.idx === i && t < flare.until) ? 1 : 0;
+    if (fl) r *= 2.1;
+    ctx.beginPath(); ctx.arc(pp[0], pp[1], r * 3.4, 0, 6.2832);
+    ctx.fillStyle = rgba(col, fl ? 0.14 : 0.055); ctx.fill();
+    ctx.beginPath(); ctx.arc(pp[0], pp[1], r * 2.0, 0, 6.2832);
+    ctx.fillStyle = rgba(col, fl ? 0.30 : 0.12); ctx.fill();
+    ctx.beginPath(); ctx.arc(pp[0], pp[1], r * 1.15, 0, 6.2832);
+    ctx.fillStyle = rgba(col, fl ? 0.75 : 0.38); ctx.fill();
+    ctx.beginPath(); ctx.arc(pp[0], pp[1], Math.max(0.6, r * 0.55), 0, 6.2832);
+    ctx.fillStyle = "rgba(255,255,255," + (fl ? 1.0 : 0.88) + ")"; ctx.fill();
+    if (fl) {
+      ctx.beginPath(); ctx.arc(pp[0], pp[1], r * 5.2, 0, 6.2832);
+      ctx.strokeStyle = rgba(col, 0.6); ctx.lineWidth = 1.4; ctx.stroke();
+    }
+  }
+
+  /* divider above the legend */
+  ctx.fillStyle = "rgba(255,255,255,0.08)";
+  ctx.fillRect(viewW * 0.06, viewH - lh + 2, viewW * 0.88, 1);
+
+  /* tap record line */
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  if (flare.idx >= 0 && t < flare.until) {
+    var rp = points[flare.idx];
+    var rec = rp.year + " \u00B7 " + rp.name + " \u00B7 intensity " + rp.inten.toFixed(2);
+    ctx.font = Math.round(isPhone ? 13 : 15) + "px " + HAND_FONT;
+    ctx.fillStyle = "rgba(244,247,255,0.92)";
+    ctx.fillText(rec, viewW / 2, viewH - lh + (isPhone ? 16 : 15));
+  }
+
+  /* legend strip: families with the real year bands from the data */
+  var seg = [];
+  for (f = 0; f < 4; f++) {
+    seg.push({ txt: FAMS[f].label + " " + FAMS[f].band[0] + "-" + FAMS[f].band[1], col: FAMS[f].color });
+  }
+  var sep = " \u00B7 ";
+  var lsize = isPhone ? 13 : 15;
+  ctx.font = lsize + "px " + HAND_FONT;
+  function lineWidthOf(items) {
+    var w = 0;
+    for (var j = 0; j < items.length; j++) {
+      w += ctx.measureText(seg[items[j]].txt).width;
+      if (j < items.length - 1) w += ctx.measureText(sep).width;
+    }
+    return w;
+  }
+  function drawLegendLine(items, y) {
+    var w = lineWidthOf(items), x = (viewW - w) / 2;
+    ctx.textAlign = "left";
+    for (var j = 0; j < items.length; j++) {
+      ctx.fillStyle = rgba(seg[items[j]].col, 0.92);
+      ctx.fillText(seg[items[j]].txt, x, y);
+      x += ctx.measureText(seg[items[j]].txt).width;
+      if (j < items.length - 1) {
+        ctx.fillStyle = "rgba(255,255,255,0.4)";
+        ctx.fillText(sep, x, y);
+        x += ctx.measureText(sep).width;
+      }
+    }
+    ctx.textAlign = "center";
+  }
+  var allIdx = [0, 1, 2, 3];
+  if (lineWidthOf(allIdx) <= viewW - 20) {
+    drawLegendLine(allIdx, viewH - lh / 2 + (flare.idx >= 0 && t < flare.until ? 10 : 2));
+  } else {
+    drawLegendLine([0, 1], viewH - lh + 22);
+    drawLegendLine([2, 3], viewH - lh + 46);
+  }
+}
+
+/* ---------------- pointer ---------------- */
+function unitFromEvent(e) {
+  var r = canvas.getBoundingClientRect();
+  var fr = fieldRect();
+  var cx = (e.clientX - r.left), cyy = (e.clientY - r.top);
+  return [ (cx - fr.cx) / fr.s + 0.5, (cyy - fr.cy) / fr.s + 0.5 ];
+}
+var downInfo = null, lastTap = null;
+function onDown(e) {
+  initAudio();
+  if (AC && AC.resume) AC.resume();
+  var u = unitFromEvent(e);
+  downInfo = { t: simTime, x: u[0], y: u[1], moved: false };
+  dragState.active = false; dragState.x = u[0]; dragState.y = u[1];
+}
+function onMove(e) {
+  if (!downInfo) return;
+  var u = unitFromEvent(e);
+  var dx = u[0] - downInfo.x, dy = u[1] - downInfo.y;
+  if (dx * dx + dy * dy > 0.0006) { downInfo.moved = true; dragState.active = true; }
+  dragState.x = u[0]; dragState.y = u[1];
+}
+function onUp(e) {
+  if (!downInfo) return;
+  var wasDrag = downInfo.moved;
+  var u = unitFromEvent(e);
+  dragState.active = false;
+  downInfo = null;
+  if (wasDrag) return;
+  var now = simTime;
+  if (lastTap !== null && now - lastTap < 0.35) {
+    pendingEvents.push({ type: "dbl", t: now, x: u[0], y: u[1] });
+    lastTap = null;
+  } else {
+    pendingEvents.push({ type: "tap", t: now, x: u[0], y: u[1] });
+    lastTap = now;
+  }
+  pendingEvents.sort(function (a, b) { return a.t - b.t; });
+}
+if (canvas.addEventListener) {
+  canvas.addEventListener("pointerdown", onDown);
+  canvas.addEventListener("pointermove", onMove);
+  canvas.addEventListener("pointerup", onUp);
+  canvas.addEventListener("pointercancel", function () { dragState.active = false; downInfo = null; });
+}
+
+/* ---------------- boot: seed, pre-roll, frame one, loop ---------------- */
+computeSize();
+initPoints(buildArchive(archiveSeed));
+ensureEvents(40);
+var pre;
+for (pre = 0; pre < 2400; pre++) simStep(STEP);   /* 20 s at 120 Hz */
+draw();
+
+var lastNow = -1;
+function loop(nowMs) {
+  if (lastNow < 0) lastNow = nowMs;
+  var elapsed = (nowMs - lastNow) / 1000;
+  lastNow = nowMs;
+  if (elapsed > 0.25) elapsed = 0.25;
+  if (elapsed < 0) elapsed = 0;
+  var steps = Math.floor(elapsed / STEP);
+  if (steps > 30) steps = 30;
+  for (var i = 0; i < steps; i++) simStep(STEP);
+  draw();
+  requestAnimationFrame(loop);
+}
+if (typeof requestAnimationFrame !== "undefined") {
+  requestAnimationFrame(loop);
+}
+</script>
+</body>
+</html>

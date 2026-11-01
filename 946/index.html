@@ -1,0 +1,591 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A Thousand Dimensions, Flattened</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #08070B; height: 100%; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- constants ----------
+  var FIELD = '#08070B';
+  var CCOL = [
+    [138, 75, 255],   // violet
+    [56, 225, 255],   // cyan
+    [45, 225, 194],   // teal
+    [255, 62, 165]    // magenta
+  ];
+  var NC = 4;              // four clusters: the palette holds exactly four cluster colors
+  var N = 2500;            // points
+  var PER = N / NC;        // 625 per cluster
+  var DIM = 12;            // the thousand dimensions, sampled at twelve
+  var THETA0 = 0.610865;   // frame one starts mid-turn, 35 degrees in
+  var ROT_PERIOD = 120;    // seconds per full turn
+  var CAM = 3.2;           // perspective distance
+  var STORM_SEQ = [2, 0, 3, 1, 3, 0, 1, 2];
+  var STORM_T0 = 14, STORM_GAP = 35, STORM_LEN = 8;
+  var LAM = 0.25;          // spin momentum decay
+
+  // ---------- rng ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function smooth(u) { u = clamp(u, 0, 1); return u * u * (3 - 2 * u); }
+  function rgba(c, a) { return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a + ')'; }
+
+  // ---------- point identity (stable across datasets) ----------
+  var psz = new Float32Array(N);    // size factor
+  var pphase = new Float32Array(N); // breathing phase
+  (function () {
+    var r = mulberry32(4242);
+    for (var i = 0; i < N; i++) { psz[i] = 0.8 + r() * 1.1; pphase[i] = r() * 6.2831853; }
+  })();
+
+  // ---------- dataset: 12-D clusters, random projection, force layout ----------
+  function buildDataset(seed) {
+    var rng = mulberry32(seed);
+    var g = function () { return (rng() + rng() + rng() + rng() - 2) * 1.15; }; // approx gaussian
+
+    // fixed random projection 12 -> 3, Gram-Schmidt orthogonalized so cluster shapes survive
+    var P = [], d, k, c, i, s;
+    for (d = 0; d < DIM; d++) P.push([g(), g(), g()]);
+    for (k = 0; k < 3; k++) {
+      for (var k2 = 0; k2 < k; k2++) {
+        var dot = 0;
+        for (d = 0; d < DIM; d++) dot += P[d][k] * P[d][k2];
+        for (d = 0; d < DIM; d++) P[d][k] -= dot * P[d][k2];
+      }
+      var nrm = 0;
+      for (d = 0; d < DIM; d++) nrm += P[d][k] * P[d][k];
+      nrm = Math.sqrt(nrm) || 1;
+      for (d = 0; d < DIM; d++) P[d][k] /= nrm;
+    }
+
+    // cluster centers and three sub-centers each, in 12-D
+    var subs = [];
+    for (c = 0; c < NC; c++) {
+      var cen = [];
+      for (d = 0; d < DIM; d++) cen.push(g() * 1.15);
+      var sc = [];
+      for (s = 0; s < 3; s++) {
+        var v = [];
+        for (d = 0; d < DIM; d++) v.push(cen[d] + g() * 0.5);
+        sc.push(v);
+      }
+      subs.push(sc);
+    }
+
+    var ex = new Float32Array(N), ey = new Float32Array(N), ez = new Float32Array(N);
+    var cl = new Uint8Array(N), sb = new Uint8Array(N);
+    var idx = 0;
+    for (c = 0; c < NC; c++) {
+      for (i = 0; i < PER; i++, idx++) {
+        var si = (rng() * 3) | 0;
+        var cx0 = 0, cy0 = 0, cz0 = 0;
+        for (d = 0; d < DIM; d++) {
+          var val = subs[c][si][d] + g() * 0.55;
+          cx0 += val * P[d][0]; cy0 += val * P[d][1]; cz0 += val * P[d][2];
+        }
+        ex[idx] = cx0; ey[idx] = cy0; ez[idx] = cz0;
+        cl[idx] = c; sb[idx] = si;
+      }
+    }
+
+    // force layout in 3-D: springs to sub-centroids + weak global pull + local repulsion.
+    // (A 2-D layout inflates ex/ey while ez stays thin, and the sculpture collapses into coins.)
+    var ITER = 30, CELL = 0.06, RAD = 0.06;
+    var scx = new Float32Array(NC * 3), scy = new Float32Array(NC * 3), scz = new Float32Array(NC * 3), scn = new Int32Array(NC * 3);
+    var grid = {};
+    for (var it = 0; it < ITER; it++) {
+      scx.fill(0); scy.fill(0); scz.fill(0); scn.fill(0);
+      for (i = 0; i < N; i++) { var q = cl[i] * 3 + sb[i]; scx[q] += ex[i]; scy[q] += ey[i]; scz[q] += ez[i]; scn[q]++; }
+      for (q = 0; q < NC * 3; q++) { if (scn[q]) { scx[q] /= scn[q]; scy[q] /= scn[q]; scz[q] /= scn[q]; } }
+      for (i = 0; i < N; i++) {
+        q = cl[i] * 3 + sb[i];
+        ex[i] += (scx[q] - ex[i]) * 0.015 + (0 - ex[i]) * 0.002;
+        ey[i] += (scy[q] - ey[i]) * 0.015 + (0 - ey[i]) * 0.002;
+        ez[i] += (scz[q] - ez[i]) * 0.015 + (0 - ez[i]) * 0.002;
+      }
+      grid = {};
+      for (i = 0; i < N; i++) {
+        var gx = Math.floor(ex[i] / CELL) + 128, gy = Math.floor(ey[i] / CELL) + 128, gz = Math.floor(ez[i] / CELL) + 128;
+        var key = (gx * 512 + gy) * 512 + gz;
+        if (!grid[key]) grid[key] = [];
+        grid[key].push(i);
+      }
+      for (i = 0; i < N; i++) {
+        var bx = Math.floor(ex[i] / CELL), by = Math.floor(ey[i] / CELL), bz = Math.floor(ez[i] / CELL), checks = 0;
+        for (var ox = -1; ox <= 1 && checks < 32; ox++) {
+          for (var oy = -1; oy <= 1 && checks < 32; oy++) {
+            for (var oz = -1; oz <= 1 && checks < 32; oz++) {
+              var cellArr = grid[((bx + ox + 128) * 512 + (by + oy + 128)) * 512 + (bz + oz + 128)];
+              if (!cellArr) continue;
+              for (var j = 0; j < cellArr.length && checks < 32; j++) {
+                var jj = cellArr[j];
+                if (jj === i) continue;
+                checks++;
+                var dx = ex[i] - ex[jj], dy = ey[i] - ey[jj], dz = ez[i] - ez[jj];
+                var d2 = dx * dx + dy * dy + dz * dz;
+                if (d2 < RAD * RAD && d2 > 1e-9) {
+                  var dd = Math.sqrt(d2), f = (RAD - dd) * 0.18;
+                  ex[i] += (dx / dd) * f; ey[i] += (dy / dd) * f; ez[i] += (dz / dd) * f;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // recenter and normalize
+    var mx = 0, my = 0, mz = 0;
+    for (i = 0; i < N; i++) { mx += ex[i]; my += ey[i]; mz += ez[i]; }
+    mx /= N; my /= N; mz /= N;
+    var radii = [];
+    for (i = 0; i < N; i++) {
+      ex[i] -= mx; ey[i] -= my; ez[i] -= mz;
+      radii.push(Math.sqrt(ex[i] * ex[i] + ey[i] * ey[i] + ez[i] * ez[i]));
+    }
+    radii.sort(function (a, b) { return a - b; });
+    var pr = radii[Math.floor(0.995 * (N - 1))] || 1; // percentile radius: outliers do not shrink the mass
+    var ks = 0.98 / pr;
+    for (i = 0; i < N; i++) { ex[i] *= ks; ey[i] *= ks; ez[i] *= ks; } // one shared scale: the cloud keeps its true proportions
+
+    // cluster centroids + convex hulls (monotone chain) in embedding space
+    var ccx = new Float32Array(NC), ccy = new Float32Array(NC), ccz = new Float32Array(NC);
+    for (i = 0; i < N; i++) { ccx[cl[i]] += ex[i]; ccy[cl[i]] += ey[i]; ccz[cl[i]] += ez[i]; }
+    for (c = 0; c < NC; c++) { ccx[c] /= PER; ccy[c] /= PER; ccz[c] /= PER; }
+    var hulls = [];
+    for (c = 0; c < NC; c++) {
+      var crad = [];
+      for (i = 0; i < N; i++) if (cl[i] === c) crad.push(Math.sqrt((ex[i] - ccx[c]) * (ex[i] - ccx[c]) + (ey[i] - ccy[c]) * (ey[i] - ccy[c])));
+      crad.sort(function (a, b) { return a - b; });
+      var med = crad[Math.floor(crad.length / 2)] || 1;
+      var pts = [];
+      for (i = 0; i < N; i++) if (cl[i] === c) {
+        var rd = Math.sqrt((ex[i] - ccx[c]) * (ex[i] - ccx[c]) + (ey[i] - ccy[c]) * (ey[i] - ccy[c]));
+        if (rd <= 1.6 * med) pts.push(i); // far outliers render as points but never join the ribbon
+      }
+      pts.sort(function (a, b) { return (ex[a] - ex[b]) || (ey[a] - ey[b]); });
+      var cross = function (o, a, b) { return (ex[a] - ex[o]) * (ey[b] - ey[o]) - (ey[a] - ey[o]) * (ex[b] - ex[o]); };
+      var lower = [], upper = [], t2;
+      for (i = 0; i < pts.length; i++) {
+        t2 = pts[i];
+        while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], t2) <= 0) lower.pop();
+        lower.push(t2);
+      }
+      for (i = pts.length - 1; i >= 0; i--) {
+        t2 = pts[i];
+        while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], t2) <= 0) upper.pop();
+        upper.push(t2);
+      }
+      lower.pop(); upper.pop();
+      var hind = lower.concat(upper), hpts = [];
+      for (i = 0; i < hind.length; i++) {
+        var a2 = hind[i], b2 = hind[(i + 1) % hind.length];
+        hpts.push({ x: ex[a2], y: ey[a2], z: ez[a2], c: c, ph: pphase[a2] });
+        hpts.push({ x: (ex[a2] + ex[b2]) / 2, y: (ey[a2] + ey[b2]) / 2, z: (ez[a2] + ez[b2]) / 2, c: c, ph: pphase[a2] });
+      }
+      hulls.push(hpts);
+    }
+
+    var delays = new Float32Array(N);
+    for (i = 0; i < N; i++) delays[i] = rng() * 6;
+
+    return { ex: ex, ey: ey, ez: ez, cl: cl, ccx: ccx, ccy: ccy, ccz: ccz, hulls: hulls, delays: delays };
+  }
+
+  // ---------- state ----------
+  var BASE_SEED = 946001;
+  var gen = 0;
+  var cur = buildDataset(BASE_SEED);
+  var prev = null, travelStart = -1e9;
+  var pulses = [];        // {tc, c, fired}
+  var pendingTap = null;  // {t, x, y}
+  var spinEvents = [];    // {tr, off, v0}
+  var tiltEvents = [];    // {tr, a0}
+  var drag = null;        // {sx, sy, dx, dy, lx, ly, lt, vx, moved}
+  var clockT = 0;
+  var facing = [0, 0, 0, 0];
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('stage');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0, PHONE = false;
+  function resize() {
+    var vv = window.visualViewport;
+    var w = vv ? vv.width : window.innerWidth;
+    var h = vv ? vv.height : window.innerHeight;
+    W = w; H = h;
+    canvas.width = w; canvas.height = h;
+    var sw = window.screen ? window.screen.width : w;
+    var sh = window.screen ? window.screen.height : h;
+    PHONE = (Math.min(sw, sh) < 700) || (h > w * 1.15);
+  }
+  if (window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', resize);
+  window.addEventListener('resize', resize);
+  resize();
+
+  // ---------- interaction math (closed form over recorded events) ----------
+  function spinExtra(t) {
+    var s = 0, i, e;
+    for (i = 0; i < spinEvents.length; i++) {
+      e = spinEvents[i];
+      if (t > e.tr) s += e.off + (e.v0 / LAM) * (1 - Math.exp(-LAM * (t - e.tr)));
+    }
+    if (drag) s += drag.dx * 0.005;
+    return s;
+  }
+  function tiltAngle(t) {
+    var s = 0, i, e;
+    for (i = 0; i < tiltEvents.length; i++) {
+      e = tiltEvents[i];
+      if (t > e.tr) { var dt = t - e.tr; s += e.a0 * Math.exp(-2.0 * dt) * Math.cos(5 * dt); }
+    }
+    if (drag) s += clamp(drag.dy * 0.004, -0.5, 0.5);
+    return clamp(s, -0.6, 0.6);
+  }
+  function pulseEnv(c, t) {
+    var m = 0;
+    for (var i = 0; i < pulses.length; i++) {
+      var p = pulses[i];
+      if (p.c !== c) continue;
+      var tau = t - p.tc;
+      if (tau < 0 || tau >= 2.7) continue;
+      for (var b = 0; b < 3; b++) {
+        var lt = tau - b * 0.9;
+        if (lt >= 0 && lt < 0.9) m = Math.max(m, Math.exp(-lt * 3.2));
+      }
+    }
+    return m;
+  }
+  function stormState(t) {
+    if (t < STORM_T0) return null;
+    var k = Math.floor((t - STORM_T0) / STORM_GAP);
+    var tau = (t - STORM_T0) - k * STORM_GAP;
+    if (tau >= STORM_LEN) return null;
+    var env = smooth(tau / 1.5) * smooth((STORM_LEN - tau) / 1.5);
+    return { c: STORM_SEQ[k % STORM_SEQ.length], env: env };
+  }
+
+  // ---------- projection ----------
+  var px = new Float32Array(N), py = new Float32Array(N), pz = new Float32Array(N), pp = new Float32Array(N);
+  var order = new Int32Array(N);
+  for (var oi = 0; oi < N; oi++) order[oi] = oi;
+
+  function projectAll(t, theta, tilt, storm) {
+    var S = 0.37 * Math.min(W, H);
+    var cxS = W / 2, cyS = H / 2;
+    var ct = Math.cos(theta), st = Math.sin(theta);
+    var ci = Math.cos(tilt), si = Math.sin(tilt);
+    var traveling = prev && (t - travelStart) < 22;
+    var sumX = [0, 0, 0, 0], sumY = [0, 0, 0, 0], sumP = [0, 0, 0, 0];
+    for (var i = 0; i < N; i++) {
+      var c = cur.cl[i];
+      var X = cur.ex[i], Y = cur.ey[i], Z = cur.ez[i];
+      if (traveling) {
+        var u = smooth((t - travelStart - cur.delays[i]) / 15);
+        if (u < 1) { X = prev.ex[i] + (X - prev.ex[i]) * u; Y = prev.ey[i] + (Y - prev.ey[i]) * u; Z = prev.ez[i] + (Z - prev.ez[i]) * u; }
+      }
+      // breathing: depth oscillation + gentle squeeze, out of phase per cluster
+      var b = Math.sin(t * 0.45 + c * 1.7);
+      var sq = 1 - 0.045 * b;
+      X = cur.ccx[c] + (X - cur.ccx[c]) * sq;
+      Y = cur.ccy[c] + (Y - cur.ccy[c]) * sq;
+      Z += b * 0.07 + Math.sin(t * 0.9 + pphase[i]) * 0.015;
+      // storm: densify toward the cluster centroid
+      if (storm && c === storm.c) {
+        var f = 0.5 * storm.env;
+        X += (cur.ccx[c] - X) * f; Y += (cur.ccy[c] - Y) * f; Z += (cur.ccz[c] - Z) * 0.3 * storm.env;
+      }
+      // tilt (x axis) then yaw (y axis)
+      var y1 = Y * ci - Z * si, z1 = Y * si + Z * ci;
+      var xr = X * ct + z1 * st, zr = -X * st + z1 * ct;
+      var persp = CAM / (CAM + zr);
+      px[i] = cxS + xr * S * persp;
+      py[i] = cyS + y1 * S * persp;
+      pz[i] = zr; pp[i] = persp;
+      sumX[c] += px[i]; sumY[c] += py[i]; sumP[c] += persp;
+    }
+    var cent = [];
+    for (var c2 = 0; c2 < NC; c2++) { cent.push([sumX[c2] / PER, sumY[c2] / PER]); facing[c2] = sumP[c2] / PER; }
+    return cent;
+  }
+
+  function projectCoords(X0, Y0, Z0, c, ph, t, theta, tilt, storm) {
+    // project one embedding-space coordinate (used for hull ribbons); mirrors projectAll without travel
+    var S = 0.37 * Math.min(W, H);
+    var X = X0, Y = Y0, Z = Z0;
+    var b = Math.sin(t * 0.45 + c * 1.7);
+    var sq = 1 - 0.045 * b;
+    X = cur.ccx[c] + (X - cur.ccx[c]) * sq;
+    Y = cur.ccy[c] + (Y - cur.ccy[c]) * sq;
+    Z += b * 0.07 + Math.sin(t * 0.9 + ph) * 0.015;
+    if (storm && c === storm.c) {
+      var f = 0.5 * storm.env;
+      X += (cur.ccx[c] - X) * f; Y += (cur.ccy[c] - Y) * f; Z += (cur.ccz[c] - Z) * 0.3 * storm.env;
+    }
+    var ct = Math.cos(theta), st = Math.sin(theta), ci = Math.cos(tilt), si = Math.sin(tilt);
+    var y1 = Y * ci - Z * si, z1 = Y * si + Z * ci;
+    var xr = X * ct + z1 * st, zr = -X * st + z1 * ct;
+    var persp = CAM / (CAM + zr);
+    return [W / 2 + xr * S * persp, H / 2 + y1 * S * persp];
+  }
+
+  // ---------- draw ----------
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.fillStyle = FIELD;
+    ctx.fillRect(0, 0, W, H);
+    var theta = THETA0 + t * (2 * Math.PI / ROT_PERIOD) + spinExtra(t);
+    var tilt = tiltAngle(t);
+    var storm = stormState(t);
+    var cent = projectAll(t, theta, tilt, storm);
+    var S = 0.37 * Math.min(W, H);
+    var ss = clamp(Math.min(W, H) / 720, 0.6, 1.6);
+    var c, i;
+
+    // contour ribbons (they fade out while points travel after a re-embed, then fade back)
+    var ribF = 1;
+    if (prev) {
+      var el = t - travelStart;
+      if (el < 22) ribF = el < 2 ? 1 - el / 2 : (el > 14 ? smooth((el - 14) / 6) : 0);
+    }
+    for (c = 0; c < NC; c++) {
+      var hull = cur.hulls[c];
+      if (!hull || hull.length < 3 || ribF <= 0) continue;
+      var boost = pulseEnv(c, t);
+      var pts = [];
+      for (i = 0; i < hull.length; i++) { var hp = hull[i]; pts.push(projectCoords(hp.x, hp.y, hp.z, hp.c, hp.ph, t, theta, tilt, storm)); }
+      ctx.beginPath();
+      var n = pts.length;
+      var mxp = (pts[n - 1][0] + pts[0][0]) / 2, myp = (pts[n - 1][1] + pts[0][1]) / 2;
+      ctx.moveTo(mxp, myp);
+      for (i = 0; i < n; i++) {
+        var nx = pts[(i + 1) % n];
+        ctx.quadraticCurveTo(pts[i][0], pts[i][1], (pts[i][0] + nx[0]) / 2, (pts[i][1] + nx[1]) / 2);
+      }
+      ctx.closePath();
+      ctx.fillStyle = rgba(CCOL[c], (0.055 + 0.10 * boost) * ribF);
+      ctx.fill();
+      ctx.strokeStyle = rgba(CCOL[c], (0.30 + 0.45 * boost) * ribF);
+      ctx.lineWidth = 1.4 * ss;
+      ctx.stroke();
+    }
+
+    // points, far to near
+    var ord = Array.prototype.slice.call(order);
+    ord.sort(function (a, b) { return pz[b] - pz[a]; });
+    for (var k = 0; k < N; k++) {
+      i = ord[k];
+      c = cur.cl[i];
+      var persp = pp[i];
+      var bright = 0.4 + 0.6 * clamp((persp - 0.72) / 0.9, 0, 1);
+      var r = psz[i] * persp * ss * 1.45;
+      if (!PHONE && persp > 0.9) {
+        ctx.beginPath();
+        ctx.arc(px[i], py[i], r * 2.2, 0, 6.2831853);
+        ctx.fillStyle = rgba(CCOL[c], 0.10 * bright);
+        ctx.fill();
+      }
+      ctx.beginPath();
+      ctx.arc(px[i], py[i], r * 0.55, 0, 6.2831853);
+      ctx.fillStyle = rgba(CCOL[c], 0.28 + 0.45 * bright);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(px[i], py[i], Math.max(0.45, r * 0.30), 0, 6.2831853);
+      ctx.fillStyle = 'rgba(255,255,255,' + (0.30 + 0.55 * bright).toFixed(3) + ')';
+      ctx.fill();
+    }
+
+    // pulse rings at an answering cluster centroid
+    for (i = 0; i < pulses.length; i++) {
+      var p = pulses[i], tau = t - p.tc;
+      if (tau < 0 || tau >= 2.7) continue;
+      for (var bIdx = 0; bIdx < 3; bIdx++) {
+        var lt = tau - bIdx * 0.9;
+        if (lt < 0 || lt >= 0.9) continue;
+        var e = Math.exp(-lt * 3.2);
+        ctx.beginPath();
+        ctx.arc(cent[p.c][0], cent[p.c][1], (0.10 + lt * 0.55) * S, 0, 6.2831853);
+        ctx.strokeStyle = rgba(CCOL[p.c], 0.55 * e);
+        ctx.lineWidth = 2 * ss;
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(cent[p.c][0], cent[p.c][1], 4 * ss * (1 + 0.4 * e), 0, 6.2831853);
+        ctx.fillStyle = 'rgba(245,245,245,' + (0.5 * e).toFixed(3) + ')';
+        ctx.fill();
+      }
+    }
+
+    // storm sparkles
+    if (storm && storm.env > 0.02) {
+      var sc2 = storm.c;
+      for (i = 0; i < 12; i++) {
+        var ang = i * 2.399 + t * 0.7;
+        var rad = (12 + 30 * (0.5 + 0.5 * Math.sin(i * 3.7 + t * 2))) * ss;
+        var a = storm.env * (0.35 + 0.6 * Math.abs(Math.sin(t * 6 + i * 1.3)));
+        ctx.beginPath();
+        ctx.arc(cent[sc2][0] + Math.cos(ang) * rad, cent[sc2][1] + Math.sin(ang) * rad, 1.6 * ss, 0, 6.2831853);
+        ctx.fillStyle = 'rgba(245,245,245,' + a.toFixed(3) + ')';
+        ctx.fill();
+      }
+    }
+  }
+
+  // ---------- pointer interaction ----------
+  function piecePos(ev) {
+    var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    return [ev.clientX - r.left, ev.clientY - r.top];
+  }
+  canvas.addEventListener('pointerdown', function (ev) {
+    ensureAudio();
+    var p = piecePos(ev);
+    drag = { sx: p[0], sy: p[1], dx: 0, dy: 0, lx: p[0], lt: clockT, vx: 0, moved: 0, t0: clockT };
+  });
+  canvas.addEventListener('pointermove', function (ev) {
+    if (!drag) return;
+    var p = piecePos(ev);
+    var ddx = p[0] - drag.lx;
+    var dt = Math.max(clockT - drag.lt, 0.001);
+    drag.vx = ddx / dt;
+    drag.dx += p[0] - drag.lx;
+    drag.dy = p[1] - drag.sy; // tilt is measured from the drag start
+    drag.moved = Math.max(drag.moved, Math.abs(p[0] - drag.sx) + Math.abs(p[1] - drag.sy));
+    drag.lx = p[0]; drag.lt = clockT;
+  });
+  function endDrag() {
+    if (!drag) return;
+    var d = drag; drag = null;
+    var quick = (clockT - d.t0) < 0.4;
+    if (d.moved < 8 && quick) {
+      // a tap
+      if (pendingTap && (clockT - pendingTap.t) < 0.35) {
+        pendingTap = null;
+        regen(clockT);
+      } else {
+        pendingTap = { t: clockT, x: d.sx, y: d.sy };
+      }
+    } else {
+      spinEvents.push({ tr: clockT, off: d.dx * 0.005, v0: clamp(d.vx * 0.005, -1.5, 1.5) });
+      tiltEvents.push({ tr: clockT, a0: clamp(d.dy * 0.004, -0.5, 0.5) });
+    }
+  }
+  canvas.addEventListener('pointerup', endDrag);
+  canvas.addEventListener('pointercancel', endDrag);
+
+  function regen(t) {
+    prev = cur;
+    gen++;
+    cur = buildDataset(BASE_SEED + gen * 7919);
+    travelStart = t;
+    pulses = [];
+  }
+
+  // settle a lone tap into a cluster pulse once the double-tap window passes
+  function settleTap(t) {
+    if (!pendingTap) return;
+    if (t - pendingTap.t < 0.35) return;
+    var theta = THETA0 + t * (2 * Math.PI / ROT_PERIOD) + spinExtra(t);
+    var tilt = tiltAngle(t);
+    var cent = projectAll(t, theta, tilt, stormState(t));
+    var best = 0, bd = 1e18;
+    for (var c = 0; c < NC; c++) {
+      var dx = cent[c][0] - pendingTap.x, dy = cent[c][1] - pendingTap.y;
+      var d2 = dx * dx + dy * dy;
+      if (d2 < bd) { bd = d2; best = c; }
+    }
+    pulses.push({ tc: t, c: best, fired: 0 });
+    pendingTap = null;
+  }
+
+  // ---------- audio (lazy, guarded; never required for the visual) ----------
+  var AC = null, aFilter = null, aVoices = [];
+  function ensureAudio() {
+    if (AC) { if (AC.resume) AC.resume(); return; }
+    var Ctx = (typeof AudioContext !== 'undefined') ? AudioContext :
+      ((typeof window !== 'undefined' && window.webkitAudioContext) ? window.webkitAudioContext : null);
+    if (!Ctx) return;
+    try {
+      AC = new Ctx();
+      var master = AC.createGain(); master.gain.value = 0.9; master.connect(AC.destination);
+      aFilter = AC.createBiquadFilter(); aFilter.type = 'lowpass'; aFilter.frequency.value = 220;
+      var dg = AC.createGain(); dg.gain.value = 0.05;
+      var o1 = AC.createOscillator(); o1.type = 'sine'; o1.frequency.value = 54;
+      var o2 = AC.createOscillator(); o2.type = 'sine'; o2.frequency.value = 54.4;
+      o1.connect(dg); o2.connect(dg); dg.connect(aFilter); aFilter.connect(master);
+      o1.start(); o2.start();
+      var freqs = [110, 146.8, 174.6, 220];
+      for (var c = 0; c < NC; c++) {
+        var o = AC.createOscillator(); o.type = 'triangle'; o.frequency.value = freqs[c];
+        var bp = AC.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = freqs[c] * 2; bp.Q.value = 2;
+        var gn = AC.createGain(); gn.gain.value = 0;
+        o.connect(bp); bp.connect(gn); gn.connect(master);
+        o.start();
+        aVoices.push(gn);
+      }
+      AC._master = master;
+    } catch (e) { AC = null; }
+  }
+  function thump() {
+    if (!AC) return;
+    try {
+      var t0 = AC.currentTime;
+      var o = AC.createOscillator(); o.type = 'sine';
+      o.frequency.setValueAtTime(68, t0);
+      o.frequency.exponentialRampToValueAtTime(38, t0 + 0.3);
+      var gn = AC.createGain();
+      gn.gain.setValueAtTime(0.22, t0);
+      gn.gain.exponentialRampToValueAtTime(0.001, t0 + 0.35);
+      o.connect(gn); gn.connect(AC._master);
+      o.start(t0); o.stop(t0 + 0.4);
+    } catch (e) { /* audio is garnish */ }
+  }
+  function audioTick(t, theta) {
+    if (!AC) return;
+    try {
+      aFilter.frequency.value = 200 + 120 * Math.sin(theta);
+      for (var c = 0; c < NC; c++) {
+        var f = clamp((facing[c] - 0.85) / 0.6, 0, 1);
+        aVoices[c].gain.value = 0.014 * f;
+      }
+      for (var i = 0; i < pulses.length; i++) {
+        var p = pulses[i];
+        while (p.fired < 3 && t >= p.tc + p.fired * 0.9) { thump(); p.fired++; }
+      }
+    } catch (e) { /* ignore */ }
+  }
+
+  // ---------- main ----------
+  draw(0);
+  if (typeof requestAnimationFrame === 'function') {
+    var startTs = null;
+    var frame = function (ts) {
+      if (startTs === null) startTs = ts;
+      clockT = (ts - startTs) / 1000;
+      settleTap(clockT);
+      draw(clockT);
+      audioTick(clockT, THETA0 + clockT * (2 * Math.PI / ROT_PERIOD) + spinExtra(clockT));
+      requestAnimationFrame(frame);
+    };
+    requestAnimationFrame(frame);
+  }
+})();
+</script>
+</body>
+</html>

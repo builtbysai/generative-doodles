@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Weather Inside the Machine</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #06070C; overflow: hidden; height: 100%; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+/* No.947 "Weather Inside the Machine" - refikanadol PP108 "The Room Responds".
+   A latent-walk particle dreamscape whose palette, turbulence, brightness and
+   drift are driven by the real environment: the local clock owns the hue
+   temperature, the day of the year owns the base turbulence, and a seeded
+   "room weather" (seeded by the day, so the same day gives the same room)
+   modulates both. No microphone: the room is read from the clock and the
+   calendar only. Env drivers are quantized to the minute (minuteOfDay integer,
+   room seeded by day + hour block) so frame one is a minute-stamped snapshot.
+   Sim: fixed timestep 120 Hz, seeded, synchronous 3000-step pre-roll at load. */
+
+// ---------- seeded RNG ----------
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function hash01(a, b, c) {
+  let h = (a * 374761393 + b * 668265263 + c * 2246822519) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+
+// ---------- canvas / viewport ----------
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let W = 0, H = 0, DPR = 1;
+
+function viewportSize() {
+  const vv = (typeof window !== 'undefined') ? window.visualViewport : null;
+  if (vv && vv.width) return { w: vv.width, h: vv.height };
+  return { w: window.innerWidth || 800, h: window.innerHeight || 600 };
+}
+function isPhone() {
+  let phone = false;
+  try {
+    const sw = window.screen ? window.screen.width : 0;
+    const sh = window.screen ? window.screen.height : 0;
+    if (sw && sh && Math.min(sw, sh) < 700) phone = true;
+  } catch (e) { /* ignore */ }
+  if (!phone && H > W * 1.15) phone = true;
+  return phone;
+}
+
+// ---------- environment ----------
+const FIELD = '#06070C';
+const HEAD = [244, 247, 255]; // #F4F7FF
+// hue-temperature keyframes: [minuteOfDay, [r,g,b]]
+const TEMP_KEYS = [
+  [0,    [26, 42, 140]],   // night  #1A2A8C
+  [360,  [255, 209, 102]], // dawn   #FFD166 (06:00)
+  [780,  [39, 230, 255]],  // noon   #27E6FF (13:00)
+  [1140, [255, 42, 157]],  // dusk   #FF2A9D (19:00)
+  [1440, [26, 42, 140]]    // night again
+];
+function tempColor(minute) {
+  const m = ((minute % 1440) + 1440) % 1440;
+  for (let i = 0; i < TEMP_KEYS.length - 1; i++) {
+    const a = TEMP_KEYS[i], b = TEMP_KEYS[i + 1];
+    if (m >= a[0] && m <= b[0]) {
+      const f = (m - a[0]) / Math.max(1, b[0] - a[0]);
+      const s = f * f * (3 - 2 * f);
+      return [
+        Math.round(a[1][0] + (b[1][0] - a[1][0]) * s),
+        Math.round(a[1][1] + (b[1][1] - a[1][1]) * s),
+        Math.round(a[1][2] + (b[1][2] - a[1][2]) * s)
+      ];
+    }
+  }
+  return TEMP_KEYS[0][1].slice();
+}
+function phaseWord(hour) {
+  if (hour < 5) return 'night drift';
+  if (hour < 9) return 'dawn drift';
+  if (hour < 12) return 'morning drift';
+  if (hour < 16) return 'noon drift';
+  if (hour < 19) return 'evening drift';
+  if (hour < 22) return 'dusk drift';
+  return 'night drift';
+}
+function roomWord(v) {
+  if (v < 0.34) return 'room calm';
+  if (v < 0.67) return 'room restless';
+  return 'room electric';
+}
+
+let roomGen = 0; // advanced by double-tap ("a new day" for the room only)
+const env = {
+  minute: 0, hour: 0, dayOfYear: 1,
+  roomVal: 0.5, turbTarget: 1, turb: 1,
+  bright: 1, driftAng: 0, temp: TEMP_KEYS[0][1].slice()
+};
+function readEnv(now) {
+  const d = now || new Date();
+  env.minute = d.getHours() * 60 + d.getMinutes(); // quantized to the minute
+  env.hour = d.getHours();
+  const start = Date.UTC(d.getFullYear(), 0, 0);
+  const here = Date.UTC(d.getFullYear(), d.getMonth(), d.getDate());
+  env.dayOfYear = Math.round((here - start) / 86400000);
+  const hourBlock = d.getHours();
+  // room weather: seeded by day + hour block + room generation
+  env.roomVal = hash01(env.dayOfYear, hourBlock, 9470 + roomGen * 131);
+  const slow = 0.5 + 0.5 * Math.sin((env.minute / 1440) * Math.PI * 2 + env.roomVal * 6.283);
+  const room = 0.7 + 0.6 * (0.65 * env.roomVal + 0.35 * slow); // 0.7 .. 1.3 band
+  const annual = 0.78 + 0.42 * Math.sin(((env.dayOfYear - 80) / 365) * Math.PI * 2);
+  env.turbTarget = Math.max(0.25, Math.min(1.6, annual * room));
+  env.bright = 0.72 + 0.5 * env.roomVal;
+  env.driftAng = env.roomVal * Math.PI * 2 + env.dayOfYear * 0.11;
+  env.temp = tempColor(env.minute);
+}
+readEnv(new Date());
+env.turb = env.turbTarget * 0.55; // pre-roll warms the turbulence up to target
+
+// ---------- value-noise curl field (analytic derivatives) ----------
+const PERM = new Uint8Array(512);
+{
+  const r = mulberry32(947108);
+  const p = [];
+  for (let i = 0; i < 256; i++) p.push(i);
+  for (let i = 255; i > 0; i--) {
+    const j = (r() * (i + 1)) | 0;
+    const t = p[i]; p[i] = p[j]; p[j] = t;
+  }
+  for (let i = 0; i < 512; i++) PERM[i] = p[i & 255];
+}
+function lat(ix, iy) { return PERM[(PERM[ix & 255] + iy) & 255] * (1 / 255); }
+// returns [dn/dx, dn/dy] of 2-octave value noise at (x, y), drifting with t
+function noiseDeriv(x, y, t) {
+  let gx = 0, gy = 0;
+  let amp = 1, freq = 1;
+  for (let o = 0; o < 2; o++) {
+    const sx = x * freq + t * (0.011 + o * 0.004);
+    const sy = y * freq - t * (0.008 + o * 0.003);
+    const x0 = Math.floor(sx), y0 = Math.floor(sy);
+    const fx = sx - x0, fy = sy - y0;
+    const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+    const dux = 6 * fx * (1 - fx), duy = 6 * fy * (1 - fy);
+    const v00 = lat(x0, y0), v10 = lat(x0 + 1, y0);
+    const v01 = lat(x0, y0 + 1), v11 = lat(x0 + 1, y0 + 1);
+    gx += amp * freq * (v10 - v00 + (v11 - v10 - v01 + v00) * uy) * dux;
+    gy += amp * freq * (v01 - v00 + (v11 - v10 - v01 + v00) * ux) * duy;
+    amp *= 0.5; freq *= 2.17;
+  }
+  return [gx, gy];
+}
+
+// ---------- particles / sim ----------
+const DT = 1 / 120;
+const TRAIL = 18;
+let NP = 2200;
+let particles = [];
+let simStep = 0;
+let gusts = []; // {step, x, y, dx, dy, mag}
+const simRng = mulberry32(947001);
+
+function spawn(p, anywhere) {
+  p.x = simRng() * W;
+  p.y = anywhere ? simRng() * H : simRng() * H;
+  p.hist = new Float32Array(TRAIL * 2);
+  for (let i = 0; i < TRAIL; i++) { p.hist[i * 2] = p.x; p.hist[i * 2 + 1] = p.y; }
+  p.hi = 0;
+  p.sz = 1.4 + simRng() * 1.2;
+  p.jit = 0.82 + simRng() * 0.36; // per-particle blend toward head white
+}
+function buildParticles() {
+  particles = [];
+  for (let i = 0; i < NP; i++) {
+    const p = {};
+    spawn(p, true);
+    particles.push(p);
+  }
+}
+function stepSim() {
+  simStep++;
+  const t = simStep * DT;
+  // turbulence relaxes toward the environment target
+  env.turb += (env.turbTarget - env.turb) * 0.0012;
+  const turb = env.turb;
+  const scale = 0.0038; // noise space per pixel
+  const curlAmp = 260 * turb;
+  const driftX = Math.cos(env.driftAng + t * 0.01) * 6.5 * turb;
+  const driftY = Math.sin(env.driftAng + t * 0.01) * 6.5 * turb;
+  // prune dead gusts
+  if (gusts.length) gusts = gusts.filter(g => (simStep - g.step) < 1800);
+  for (let i = 0; i < particles.length; i++) {
+    const p = particles[i];
+    const d = noiseDeriv(p.x * scale, p.y * scale, t);
+    let vx = d[1] * curlAmp + driftX;   // curl: (dpsi/dy, -dpsi/dx)
+    let vy = -d[0] * curlAmp + driftY;
+    for (let gi = 0; gi < gusts.length; gi++) {
+      const g = gusts[gi];
+      const age = (simStep - g.step) * DT;
+      if (age < 0 || age > 15) continue;
+      const front = age * (210 + 170 * g.mag);
+      const rx = p.x - g.x, ry = p.y - g.y;
+      const s = rx * g.dx + ry * g.dy;
+      const perp = Math.abs(rx * -g.dy + ry * g.dx);
+      const band = Math.exp(-((s - front) * (s - front)) / (2 * 95 * 95));
+      const lat2 = Math.exp(-((perp / 340) * (perp / 340)));
+      const f = band * lat2 * Math.exp(-age / 5) * 165 * g.mag;
+      vx += g.dx * f; vy += g.dy * f;
+    }
+    p.x += vx * DT;
+    p.y += vy * DT;
+    if (p.x < -24 || p.x > W + 24 || p.y < -24 || p.y > H + 24) {
+      spawn(p, false);
+    } else {
+      p.hi = (p.hi + 1) % TRAIL;
+      p.hist[p.hi * 2] = p.x;
+      p.hist[p.hi * 2 + 1] = p.y;
+    }
+  }
+}
+
+// ---------- drawing ----------
+function rgba(c, a) { return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a + ')'; }
+function blend(c, w, f) { // blend color c toward white HEAD by f
+  return [
+    Math.round(c[0] + (w[0] - c[0]) * f),
+    Math.round(c[1] + (w[1] - c[1]) * f),
+    Math.round(c[2] + (w[2] - c[2]) * f)
+  ];
+}
+let stripMode = 0; // 0 = room reading, 1 = turbulence reading
+function stripText() {
+  const hh = String(Math.floor(env.minute / 60)).padStart(2, '0');
+  const mm = String(env.minute % 60).padStart(2, '0');
+  const head = hh + ':' + mm + ' · ' + phaseWord(env.hour);
+  if (stripMode === 0) return head + ' · ' + roomWord(env.roomVal);
+  return head + ' · turbulence ' + env.turbTarget.toFixed(2) + ' · day ' + env.dayOfYear + ' of the year';
+}
+function drawStrip() {
+  const text = stripText();
+  const fs = Math.max(12, Math.min(16, W * 0.016));
+  ctx.font = '600 ' + fs + 'px "Segoe Print", "Bradley Hand", "Comic Sans MS", cursive';
+  // measure with per-char jitter widths
+  const jr = mulberry32(9477);
+  const chars = [];
+  let tw = 0;
+  for (let i = 0; i < text.length; i++) {
+    const w = ctx.measureText(text[i]).width;
+    chars.push({ ch: text[i], w: w, jx: (jr() - 0.5) * 1.1, jy: (jr() - 0.5) * 1.6 });
+    tw += w;
+  }
+  const y = H - Math.max(14, H * 0.028);
+  // soft dark plate for legibility (flat fill, no gradient/shadow)
+  ctx.fillStyle = 'rgba(6,7,12,0.45)';
+  const padX = 12, padY = 7;
+  ctx.fillRect((W - tw) / 2 - padX, y - fs - padY + 2, tw + padX * 2, fs + padY * 2);
+  ctx.fillStyle = rgba(HEAD, 0.85);
+  ctx.textBaseline = 'alphabetic';
+  let x = (W - tw) / 2;
+  for (let i = 0; i < chars.length; i++) {
+    ctx.fillText(chars[i].ch, x + chars[i].jx, y + chars[i].jy);
+    x += chars[i].w;
+  }
+}
+function draw() {
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  ctx.fillStyle = FIELD;
+  ctx.fillRect(0, 0, W, H);
+  const temp = env.temp;
+  const old = blend(temp, HEAD, 0.18);
+  const mid = blend(temp, HEAD, 0.42);
+  const bright = env.bright;
+  ctx.lineWidth = 1.1;
+  ctx.lineCap = 'round';
+  // older trail half
+  ctx.strokeStyle = rgba(old, 0.14 * bright);
+  ctx.beginPath();
+  for (let i = 0; i < particles.length; i++) {
+    const p = particles[i], h = p.hist;
+    for (let a = TRAIL - 1; a >= 9; a--) {
+      const idx = ((p.hi - a) % TRAIL + TRAIL) % TRAIL;
+      const x = h[idx * 2], y = h[idx * 2 + 1];
+      if (a === TRAIL - 1) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+  }
+  ctx.stroke();
+  // newer trail half
+  ctx.strokeStyle = rgba(mid, 0.27 * bright);
+  ctx.beginPath();
+  for (let i = 0; i < particles.length; i++) {
+    const p = particles[i], h = p.hist;
+    for (let a = 9; a >= 0; a--) {
+      const idx = ((p.hi - a) % TRAIL + TRAIL) % TRAIL;
+      const x = h[idx * 2], y = h[idx * 2 + 1];
+      if (a === 9) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+  }
+  ctx.stroke();
+  // heads
+  for (let i = 0; i < particles.length; i++) {
+    const p = particles[i];
+    ctx.fillStyle = rgba(blend(temp, HEAD, 0.55 + 0.3 * (p.jit - 0.82)), 0.85 * bright);
+    ctx.fillRect(p.x - p.sz / 2, p.y - p.sz / 2, p.sz, p.sz);
+  }
+  drawStrip();
+}
+
+// ---------- sizing / init ----------
+function fit() {
+  const s = viewportSize();
+  DPR = (typeof window !== 'undefined' && window.devicePixelRatio) ? Math.min(window.devicePixelRatio, 2) : 1;
+  W = Math.max(50, Math.round(s.w));
+  H = Math.max(50, Math.round(s.h));
+  canvas.width = Math.round(W * DPR);
+  canvas.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  NP = isPhone() ? 1500 : 2200;
+}
+fit();
+buildParticles();
+for (let i = 0; i < 3000; i++) stepSim(); // 25 s pre-roll at 120 Hz
+draw(); // frame one: synchronous, at the load minute
+
+// ---------- live loop ----------
+let lastMs = -1, acc = 0, frameNo = 0;
+function nowMs() {
+  if (typeof performance !== 'undefined' && performance.now) return performance.now();
+  return Date.now();
+}
+function loop() {
+  const t = nowMs();
+  if (lastMs < 0) lastMs = t;
+  let el = (t - lastMs) / 1000;
+  lastMs = t;
+  if (el > 0.25) el = 0.25;
+  acc += el;
+  let n = 0;
+  while (acc >= DT && n < 14) { stepSim(); acc -= DT; n++; }
+  if (n === 14) acc = 0;
+  frameNo++;
+  if (frameNo % 30 === 0) readEnv(new Date()); // env refresh; minute-quantized
+  draw();
+  updateAudio();
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+}
+if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+
+if (typeof window !== 'undefined') {
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { fit(); buildParticles(); draw(); });
+  }
+  window.addEventListener('resize', function () { fit(); buildParticles(); draw(); });
+}
+
+// ---------- audio (lazy, gesture-only, no microphone) ----------
+let AC = null, droneFilter = null;
+function initAudio() {
+  if (AC) return;
+  try {
+    const Ctor = (typeof AudioContext !== 'undefined') ? AudioContext :
+      ((typeof window !== 'undefined' && window.webkitAudioContext) ? window.webkitAudioContext : null);
+    if (!Ctor) return;
+    AC = new Ctor();
+    const g = AC.createGain();
+    g.gain.value = 0.045;
+    droneFilter = AC.createBiquadFilter();
+    droneFilter.type = 'lowpass';
+    droneFilter.frequency.value = 600;
+    droneFilter.Q.value = 0.6;
+    const o1 = AC.createOscillator(); o1.type = 'sine'; o1.frequency.value = 48;
+    const o2 = AC.createOscillator(); o2.type = 'sine'; o2.frequency.value = 48.7;
+    const og = AC.createGain(); og.gain.value = 0.5;
+    o1.connect(og); o2.connect(og); og.connect(droneFilter);
+    droneFilter.connect(g); g.connect(AC.destination);
+    o1.start(); o2.start();
+  } catch (e) { AC = null; }
+}
+function updateAudio() {
+  if (!AC || !droneFilter || frameNo % 30 !== 0) return;
+  try {
+    const warm = Math.max(0, Math.min(1, ((env.temp[0] - env.temp[2]) + 220) / 440));
+    const cut = 160 + Math.pow(warm, 1.5) * 2200; // warm = open, cold = closed
+    droneFilter.frequency.setTargetAtTime(cut, AC.currentTime, 0.4);
+  } catch (e) { /* ignore */ }
+}
+
+// ---------- interaction ----------
+let pDown = null, lastTapMs = -10000, tapTimer = null;
+function evPos(e) {
+  const r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+  const cx = (e.clientX !== undefined) ? e.clientX : (e.touches && e.touches[0] ? e.touches[0].clientX : 0);
+  const cy = (e.clientY !== undefined) ? e.clientY : (e.touches && e.touches[0] ? e.touches[0].clientY : 0);
+  return { x: cx - r.left, y: cy - r.top };
+}
+canvas.addEventListener('pointerdown', function (e) {
+  initAudio();
+  if (AC && AC.resume) { try { AC.resume(); } catch (err) { /* ignore */ } }
+  const p = evPos(e);
+  pDown = { x: p.x, y: p.y, lx: p.x, ly: p.y, dragging: false, gustAt: 0 };
+});
+canvas.addEventListener('pointermove', function (e) {
+  if (!pDown) return;
+  const p = evPos(e);
+  const dx = p.x - pDown.lx, dy = p.y - pDown.ly;
+  const dist = Math.hypot(p.x - pDown.x, p.y - pDown.y);
+  if (dist > 8) pDown.dragging = true;
+  if (pDown.dragging && Math.hypot(dx, dy) > 40) {
+    const m = Math.hypot(dx, dy);
+    gusts.push({ step: simStep, x: pDown.lx, y: pDown.ly, dx: dx / m, dy: dy / m, mag: Math.min(1.4, m / 120) });
+    pDown.lx = p.x; pDown.ly = p.y;
+  }
+});
+canvas.addEventListener('pointerup', function (e) {
+  if (!pDown) return;
+  const wasDrag = pDown.dragging;
+  const p = evPos(e);
+  if (wasDrag) {
+    const dx = p.x - pDown.lx, dy = p.y - pDown.ly;
+    const m = Math.hypot(dx, dy);
+    if (m > 6) gusts.push({ step: simStep, x: pDown.lx, y: pDown.ly, dx: dx / m, dy: dy / m, mag: Math.min(1.4, m / 90) });
+  } else {
+    const t = nowMs();
+    if (t - lastTapMs < 350) {
+      // double-tap: a new day for the room only; the clock keeps running
+      if (tapTimer !== null && typeof clearTimeout === 'function') clearTimeout(tapTimer);
+      tapTimer = null;
+      roomGen++;
+      readEnv(new Date());
+      lastTapMs = -10000;
+    } else {
+      lastTapMs = t;
+      if (typeof setTimeout === 'function') {
+        tapTimer = setTimeout(function () { stripMode = 1 - stripMode; tapTimer = null; }, 350);
+      } else {
+        stripMode = 1 - stripMode;
+      }
+    }
+  }
+  pDown = null;
+});
+canvas.addEventListener('pointercancel', function () { pDown = null; });
+</script>
+</body>
+</html>

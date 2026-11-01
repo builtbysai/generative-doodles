@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A Reef That Never Stops Growing</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0B0E17; height: 100%; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="reef"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  var SEA = '#0B0E17';
+  var HUES = ['#FF6B6B', '#FF9FF3', '#48DBFB', '#B8FF5C', '#8A4BFF'];
+  var BLEACH = '#F5F0E6';
+  var WHITE = '#FFFFFF';
+  var SEED = 948109;
+  var STEP = 1 / 120;          // fixed timestep, 120 Hz
+  var PREROLL = 4200;          // 35 s of growth before frame one
+  var MAXSEG = 14000;          // segment cap; oldest fade faster past it
+  var MAXTIP = 150;            // live walker cap
+  var SEG_LEN = 12;            // px of travel per recorded segment
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function hash2(ix, iy, s) {
+    var h = Math.imul(ix, 374761393) ^ Math.imul(iy, 668265263) ^ Math.imul(s, 974634211);
+    h = Math.imul(h ^ (h >>> 13), 1274126177);
+    return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+  }
+  function vnoise(x, y, s) {
+    var ix = Math.floor(x), iy = Math.floor(y);
+    var fx = x - ix, fy = y - iy;
+    var sx = fx * fx * (3 - 2 * fx), sy = fy * fy * (3 - 2 * fy);
+    var a = hash2(ix, iy, s), b = hash2(ix + 1, iy, s);
+    var c = hash2(ix, iy + 1, s), d = hash2(ix + 1, iy + 1, s);
+    return a + (b - a) * sx + (c - a) * sy + (a - b - c + d) * sx * sy;
+  }
+  function wrapA(a) {
+    while (a > Math.PI) a -= Math.PI * 2;
+    while (a < -Math.PI) a += Math.PI * 2;
+    return a;
+  }
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+  var canvas = document.getElementById('reef');
+  var ctx = canvas.getContext('2d');
+
+  var W = 720, H = 720, PHONE = false;
+  var sim = null;
+
+  function viewSize() {
+    var w = 720, h = 720;
+    try {
+      if (window.visualViewport && window.visualViewport.width) {
+        w = window.visualViewport.width; h = window.visualViewport.height;
+      } else if (window.innerWidth) { w = window.innerWidth; h = window.innerHeight; }
+    } catch (e) {}
+    return [Math.max(60, Math.floor(w)), Math.max(60, Math.floor(h))];
+  }
+  function detectPhone(w, h) {
+    var m = 0;
+    try { if (window.screen) m = Math.min(window.screen.width || 0, window.screen.height || 0); } catch (e) {}
+    if (m > 0) return m < 700;
+    return h > w * 1.15;
+  }
+
+  function makeSim() {
+    var rng = mulberry32(SEED);
+    var ncol = PHONE ? 5 : 6;
+    var colonies = [];
+    for (var i = 0; i < ncol; i++) {
+      colonies.push({
+        x: W * (i + 0.5) / ncol + (rng() - 0.5) * (W / ncol) * 0.6,
+        y: H * (0.80 + rng() * 0.16),
+        hue: Math.floor(rng() * HUES.length),
+        phase: rng() * 100,
+        ceiling: H * (0.30 + rng() * 0.18),
+        halfW: (W / ncol) * 0.85,
+        nextRoot: Math.floor(rng() * 40),
+        bleach: null
+      });
+    }
+    return {
+      rng: rng, step: 0, tips: [], segs: [], blooms: [], events: [],
+      colonies: colonies,
+      bias: { angle: 0, strength: 0, released: true },
+      nextBleach: Math.floor((55 + rng() * 15) * 120),
+      sfx: []
+    };
+  }
+
+  function spawnRootTip(s, c, count) {
+    for (var k = 0; k < count; k++) {
+      if (s.tips.length >= MAXTIP) return;
+      var life = Math.floor((2.2 + s.rng() * 2) * 120);
+      var x = c.x + (s.rng() - 0.5) * 32;
+      s.tips.push({
+        x: x, y: c.y, sx: x, sy: c.y,
+        angle: -Math.PI / 2 + (s.rng() - 0.5) * 1.4,
+        np: s.rng() * 100,
+        depth: 0, colony: c, hue: c.hue,
+        born: s.step, die: s.step + life,
+        speed: 0.13 + s.rng() * 0.06
+      });
+    }
+  }
+
+  function emitSeg(s, t, nx, ny, force) {
+    var dx = nx - t.sx, dy = ny - t.sy;
+    var d2 = dx * dx + dy * dy;
+    if (force ? d2 > 9 : d2 >= SEG_LEN * SEG_LEN) {
+      s.segs.push({
+        x1: t.sx, y1: t.sy, x2: nx, y2: ny, hue: t.hue, born: s.step,
+        fade: 60 + s.rng() * 30, colony: t.colony, depth: t.depth,
+        bleached: false, bleachStep: 0
+      });
+      t.sx = nx; t.sy = ny;
+    }
+  }
+
+  function segAlpha(s, sg) {
+    if (sg.bleached) {
+      var ba = (s.step - sg.bleachStep) / 120;
+      return 0.5 * clamp(1 - ba / 150, 0, 1);
+    }
+    var age = (s.step - sg.born) / 120;
+    return clamp(1 - age / sg.fade, 0, 1);
+  }
+
+  function stepBleach(s, col) {
+    var b = col.bleach;
+    var pr = (s.step - b.start) / (6 * 120);
+    if (pr >= 1) {
+      col.bleach = null;
+      col.hue = (col.hue + 1) % HUES.length;
+      spawnRootTip(s, col, 3);
+      return;
+    }
+    var yTop = col.ceiling - 12, yBot = col.y;
+    var frontY = yTop + (yBot - yTop) * pr;
+    b.frontY = frontY;
+    var segs = s.segs;
+    for (var i = 0; i < segs.length; i++) {
+      var sg = segs[i];
+      if (sg.colony === col && !sg.bleached) {
+        var my = (sg.y1 + sg.y2) / 2;
+        if (my <= frontY && sg.x1 > col.x - col.halfW - 30 && sg.x1 < col.x + col.halfW + 30) {
+          sg.bleached = true; sg.bleachStep = s.step;
+        }
+      }
+    }
+    for (var j = 0; j < s.tips.length; j++) {
+      var t = s.tips[j];
+      if (t.colony === col && t.y <= frontY && t.die > s.step) t.die = s.step;
+    }
+  }
+
+  function applyEvent(s, ev) {
+    var i, t;
+    if (ev.type === 'tap') {
+      var best = null, bd = Infinity;
+      for (i = 0; i < s.tips.length; i++) {
+        t = s.tips[i];
+        var dx = t.x - ev.x, dy = t.y - ev.y;
+        var d2 = dx * dx + dy * dy;
+        if (d2 < bd) { bd = d2; best = t; }
+      }
+      if (best) {
+        s.blooms.push({
+          x: best.x, y: best.y, hue: best.hue, born: s.step,
+          petals: 6 + Math.floor(s.rng() * 3), phase: s.rng() * Math.PI * 2
+        });
+        s.sfx.push({ kind: 'ping' });
+      }
+    } else if (ev.type === 'newreef') {
+      for (i = 0; i < s.colonies.length; i++) spawnRootTip(s, s.colonies[i], 3);
+    } else if (ev.type === 'current') {
+      s.bias.angle = ev.angle;
+      s.bias.strength = Math.min(1, ev.mag / 70);
+      s.bias.released = false;
+    } else if (ev.type === 'currentEnd') {
+      s.bias.released = true;
+    }
+  }
+
+  function stepSim(s) {
+    var i, t;
+    while (s.events.length && s.events[0].step <= s.step) applyEvent(s, s.events.shift());
+
+    if (s.step >= s.nextBleach) {
+      var cand = [];
+      for (i = 0; i < s.colonies.length; i++) if (!s.colonies[i].bleach) cand.push(s.colonies[i]);
+      if (cand.length) {
+        var bc = cand[Math.floor(s.rng() * cand.length)];
+        bc.bleach = { start: s.step, frontY: bc.ceiling - 12 };
+        s.sfx.push({ kind: 'sweep' });
+      }
+      s.nextBleach = s.step + Math.floor((50 + s.rng() * 20) * 120);
+    }
+
+    for (i = 0; i < s.colonies.length; i++) {
+      var col = s.colonies[i];
+      if (s.step >= col.nextRoot) {
+        spawnRootTip(s, col, 2);
+        col.nextRoot = s.step + Math.floor((2.2 + s.rng() * 2.3) * 120);
+      }
+      if (col.bleach) stepBleach(s, col);
+    }
+
+    if (s.bias.released && s.bias.strength > 0) {
+      s.bias.strength *= 0.99855;
+      if (s.bias.strength < 0.005) s.bias.strength = 0;
+    }
+
+    var nt = [];
+    for (i = 0; i < s.tips.length; i++) {
+      t = s.tips[i];
+      if (s.step >= t.die) { emitSeg(s, t, t.x, t.y, true); continue; }
+      var c = t.colony;
+      var n = vnoise(t.x * 0.011 + t.np, t.y * 0.011 + t.np * 0.7, 7);
+      t.angle += (n - 0.5) * 0.04;
+      t.angle += wrapA(-Math.PI / 2 - t.angle) * 0.028;
+      if (s.bias.strength > 0.01) t.angle += wrapA(s.bias.angle - t.angle) * 0.03 * s.bias.strength;
+      if (t.x < W * 0.05) t.angle += wrapA(0 - t.angle) * 0.03;
+      else if (t.x > W * 0.95) t.angle += wrapA(Math.PI - t.angle) * 0.03;
+      var nx = t.x + Math.cos(t.angle) * t.speed;
+      var ny = t.y + Math.sin(t.angle) * t.speed;
+      emitSeg(s, t, nx, ny, false);
+      t.x = nx; t.y = ny;
+      if (t.y < c.ceiling || t.y > H - 2 || t.x < -10 || t.x > W + 10) {
+        emitSeg(s, t, t.x, t.y, true);
+        continue;
+      }
+      nt.push(t);
+      var age = (s.step - t.born) / 120;
+      if (t.depth < 9 && age > 0.5 && nt.length < MAXTIP) {
+        var p = 0.0042 * (1 - t.depth / 12);
+        if (s.rng() < p) {
+          nt.pop();
+          emitSeg(s, t, t.x, t.y, true);
+          var px = -Math.sin(t.angle), py = Math.cos(t.angle);
+          for (var k = 0; k < 2; k++) {
+            var life = Math.floor((2.2 + s.rng() * 2) * 120);
+            var off = (k === 0 ? -1 : 1) * (1.5 + s.rng() * 2.5);
+            var cx2 = t.x + px * off, cy2 = t.y + py * off;
+            nt.push({
+              x: cx2, y: cy2, sx: cx2, sy: cy2,
+              angle: t.angle + (k === 0 ? -1 : 1) * (0.45 + s.rng() * 0.5),
+              np: t.np + (s.rng() - 0.5) * 6,
+              depth: t.depth + 1, colony: t.colony, hue: t.hue,
+              born: s.step, die: s.step + life,
+              speed: 0.13 + s.rng() * 0.06
+            });
+          }
+        }
+      }
+    }
+    s.tips = nt;
+
+    if (s.segs.length > MAXSEG) {
+      var excess = s.segs.length - MAXSEG;
+      for (i = 0; i < excess; i++) {
+        var sg = s.segs[i];
+        if (!sg.bleached) {
+          var ageS = (s.step - sg.born) / 120;
+          if (sg.fade > ageS + 5) sg.fade = ageS + 5;
+        }
+      }
+    }
+    if (s.step % 240 === 0) {
+      s.segs = s.segs.filter(function (sg) { return segAlpha(s, sg) > 0.012; });
+      s.blooms = s.blooms.filter(function (bl) { return (s.step - bl.born) / 120 <= 6.2; });
+    }
+    s.step++;
+  }
+
+  function draw() {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.fillStyle = SEA;
+    ctx.fillRect(0, 0, W, H);
+    var s = sim;
+    var i, sg, key;
+    var buckets = {};
+    for (i = 0; i < s.segs.length; i++) {
+      sg = s.segs[i];
+      var a = segAlpha(s, sg);
+      if (a <= 0.012) continue;
+      var bi = Math.floor(a * 7.999);
+      key = (sg.bleached ? 'B' : 'H' + sg.hue) + '|' + bi + '|' + (sg.depth >= 6 ? 1 : 0);
+      if (!buckets[key]) buckets[key] = [];
+      buckets[key].push(sg);
+    }
+    ctx.lineCap = 'round';
+    for (key in buckets) {
+      if (!Object.prototype.hasOwnProperty.call(buckets, key)) continue;
+      var parts = key.split('|');
+      var list = buckets[key];
+      ctx.globalAlpha = (parseInt(parts[1], 10) + 0.5) / 8;
+      ctx.strokeStyle = parts[0] === 'B' ? BLEACH : HUES[parseInt(parts[0].substring(1), 10)];
+      ctx.lineWidth = parts[2] === '1' ? 1.8 : 2.6;
+      ctx.beginPath();
+      for (i = 0; i < list.length; i++) {
+        sg = list[i];
+        ctx.moveTo(sg.x1, sg.y1);
+        ctx.lineTo(sg.x2, sg.y2);
+      }
+      ctx.stroke();
+    }
+    for (i = 0; i < s.colonies.length; i++) {
+      var col = s.colonies[i];
+      if (col.bleach && typeof col.bleach.frontY === 'number') {
+        var fy = col.bleach.frontY;
+        ctx.globalAlpha = 0.08;
+        ctx.fillStyle = BLEACH;
+        ctx.fillRect(col.x - col.halfW, fy - 20, col.halfW * 2, 40);
+        ctx.globalAlpha = 0.16;
+        ctx.fillRect(col.x - col.halfW, fy - 1.5, col.halfW * 2, 3);
+      }
+    }
+    for (i = 0; i < s.blooms.length; i++) {
+      var bl = s.blooms[i];
+      var bage = (s.step - bl.born) / 120;
+      if (bage > 6) continue;
+      var grow = clamp(bage / 0.4, 0, 1);
+      var bfade = bage > 5 ? clamp(1 - (bage - 5), 0, 1) : 1;
+      var R = 26 * (0.4 + 0.6 * grow);
+      ctx.globalAlpha = 0.9 * bfade;
+      ctx.strokeStyle = HUES[bl.hue];
+      ctx.lineWidth = 2;
+      for (var k = 0; k < bl.petals; k++) {
+        var ang = bl.phase + (k / bl.petals) * Math.PI * 2;
+        ctx.beginPath();
+        ctx.arc(bl.x + Math.cos(ang) * R * 0.72, bl.y + Math.sin(ang) * R * 0.72, R * 0.42, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+      ctx.globalAlpha = bfade;
+      ctx.fillStyle = WHITE;
+      ctx.beginPath();
+      ctx.arc(bl.x, bl.y, 2.4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    for (i = 0; i < s.tips.length; i++) {
+      var t = s.tips[i];
+      ctx.globalAlpha = 0.30;
+      ctx.fillStyle = HUES[t.hue];
+      ctx.beginPath();
+      ctx.arc(t.x, t.y, 5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 0.95;
+      ctx.fillStyle = WHITE;
+      ctx.beginPath();
+      ctx.arc(t.x, t.y, 2, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ------- audio: lazy, guarded, gesture-only -------
+  var AC = null, audioTried = false;
+  function ensureAudio() {
+    if (audioTried) return;
+    audioTried = true;
+    try {
+      var Ctor = window.AudioContext || window.webkitAudioContext;
+      if (!Ctor) return;
+      AC = new Ctor();
+      var len = 2 * AC.sampleRate;
+      var buf = AC.createBuffer(1, len, AC.sampleRate);
+      var d = buf.getChannelData(0);
+      var r = mulberry32(4242);
+      var lp = 0;
+      for (var i = 0; i < len; i++) { lp = lp * 0.98 + (r() * 2 - 1) * 0.02; d[i] = lp * 8; }
+      var src = AC.createBufferSource();
+      src.buffer = buf; src.loop = true;
+      var filt = AC.createBiquadFilter();
+      filt.type = 'lowpass'; filt.frequency.value = 320; filt.Q.value = 0.4;
+      var g = AC.createGain(); g.gain.value = 0.05;
+      src.connect(filt); filt.connect(g); g.connect(AC.destination);
+      src.start();
+      var lfo = AC.createOscillator(); lfo.frequency.value = 0.08;
+      var lg = AC.createGain(); lg.gain.value = 130;
+      lfo.connect(lg); lg.connect(filt.frequency);
+      lfo.start();
+    } catch (e) { AC = null; }
+  }
+  function ping(step) {
+    if (!AC) return;
+    try {
+      var o = AC.createOscillator(), g = AC.createGain();
+      o.type = 'sine';
+      o.frequency.value = 720 + (step * 37) % 560;
+      var t0 = AC.currentTime;
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.exponentialRampToValueAtTime(0.10, t0 + 0.015);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.6);
+      o.connect(g); g.connect(AC.destination);
+      o.start(t0); o.stop(t0 + 0.65);
+    } catch (e) {}
+  }
+  function sweep() {
+    if (!AC) return;
+    try {
+      var o = AC.createOscillator(), g = AC.createGain();
+      o.type = 'sine';
+      var t0 = AC.currentTime;
+      o.frequency.setValueAtTime(210, t0);
+      o.frequency.exponentialRampToValueAtTime(58, t0 + 4.5);
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.exponentialRampToValueAtTime(0.055, t0 + 0.4);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + 4.8);
+      o.connect(g); g.connect(AC.destination);
+      o.start(t0); o.stop(t0 + 4.9);
+    } catch (e) {}
+  }
+  function drainSfx() {
+    if (!sim) return;
+    if (!AC) { sim.sfx.length = 0; return; }
+    var pings = 0;
+    for (var i = 0; i < sim.sfx.length; i++) {
+      if (sim.sfx[i].kind === 'ping') { if (pings < 3) { ping(sim.step); pings++; } }
+      else if (sim.sfx[i].kind === 'sweep') sweep();
+    }
+    sim.sfx.length = 0;
+  }
+
+  // ------- interaction: events are recorded, the sim consumes them by step -------
+  function pushEvent(ev) { if (sim) sim.events.push(ev); }
+  function evtPos(e) {
+    var x = e.clientX || 0, y = e.clientY || 0;
+    try {
+      var r = canvas.getBoundingClientRect();
+      if (r) { x -= r.left; y -= r.top; }
+    } catch (err) {}
+    return [x, y];
+  }
+  var down = null;
+  var pendingTap = null;
+  function queueTap(x, y) {
+    if (pendingTap && typeof clearTimeout === 'function') {
+      clearTimeout(pendingTap.timer);
+      pendingTap = null;
+      pushEvent({ type: 'newreef', step: sim.step, x: x, y: y });
+      return;
+    }
+    if (typeof setTimeout !== 'function') {
+      pushEvent({ type: 'tap', step: sim.step, x: x, y: y });
+      return;
+    }
+    var rec = { x: x, y: y, timer: 0 };
+    rec.timer = setTimeout(function () {
+      if (pendingTap === rec) {
+        pendingTap = null;
+        pushEvent({ type: 'tap', step: sim.step, x: rec.x, y: rec.y });
+      }
+    }, 320);
+    pendingTap = rec;
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', function (e) {
+      ensureAudio();
+      if (AC && AC.resume) { try { AC.resume(); } catch (err) {} }
+      var p = evtPos(e);
+      down = { x: p[0], y: p[1], moved: false, lastPush: -99 };
+    });
+    canvas.addEventListener('pointermove', function (e) {
+      if (!down || !sim) return;
+      var p = evtPos(e);
+      var dx = p[0] - down.x, dy = p[1] - down.y;
+      var dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist > 9) down.moved = true;
+      if (down.moved && sim.step - down.lastPush >= 6) {
+        down.lastPush = sim.step;
+        pushEvent({ type: 'current', step: sim.step, angle: Math.atan2(dy, dx), mag: dist });
+      }
+    });
+    function endPointer(e) {
+      if (!down) return;
+      var p = evtPos(e);
+      if (down.moved) pushEvent({ type: 'currentEnd', step: sim.step });
+      else queueTap(p[0], p[1]);
+      down = null;
+    }
+    canvas.addEventListener('pointerup', endPointer);
+    canvas.addEventListener('pointercancel', function () {
+      if (down && down.moved && sim) pushEvent({ type: 'currentEnd', step: sim.step });
+      down = null;
+    });
+  }
+
+  // ------- lifecycle -------
+  function init(w, h) {
+    W = w; H = h;
+    PHONE = detectPhone(w, h);
+    canvas.width = w;
+    canvas.height = h;
+    sim = makeSim();
+    for (var i = 0; i < PREROLL; i++) stepSim(sim);
+    sim.sfx.length = 0;
+    draw();
+  }
+  function relayout() {
+    var sz = viewSize();
+    if (Math.abs(sz[0] - W) > 2 || Math.abs(sz[1] - H) > 2) init(sz[0], sz[1]);
+  }
+  try { window.addEventListener('resize', relayout); } catch (e) {}
+  try {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', relayout);
+    }
+  } catch (e) {}
+
+  var sz0 = viewSize();
+  init(sz0[0], sz0[1]);
+
+  var raf = (typeof requestAnimationFrame === 'function') ? requestAnimationFrame : null;
+  if (raf) {
+    var acc = 0, lastTs = null;
+    var frame = function (ts) {
+      if (lastTs === null) lastTs = ts;
+      var dt = (ts - lastTs) / 1000;
+      lastTs = ts;
+      if (dt > 0.25) dt = 0.25;
+      if (dt < 0) dt = 0;
+      acc += dt;
+      var n = Math.floor(acc / STEP);
+      acc -= n * STEP;
+      if (n > 30) { n = 30; acc = 0; }
+      for (var i = 0; i < n; i++) stepSim(sim);
+      drainSfx();
+      draw();
+      raf(frame);
+    };
+    raf(frame);
+  }
+})();
+</script>
+</body>
+</html>

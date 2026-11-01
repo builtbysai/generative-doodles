@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dreams Without Cuts</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #05060A; height: 100%; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // No.944 "Dreams Without Cuts" - study #116 refikanadol, PP105 "The Latent Walk".
+  // A particle field advected through four pole states that only ever
+  // interpolate into one another. No hard cuts, ever: pole crossfades,
+  // tap leans and double-tap reseeds are all blends from the current state.
+
+  var FIELD = '#05060A';
+  var POLE_RGB = [
+    [255, 42, 157],   // A magenta - tight vortex
+    [39, 230, 255],   // B cyan - laminar rivers
+    [255, 179, 0],    // C amber - radial bloom
+    [26, 42, 140]     // D deep blue - churned storm
+  ];
+  var HEAD_RGB = [244, 247, 255];
+  var SEED = 944105;
+  var DT = 1 / 120;            // fixed timestep, 120 Hz
+  var PREROLL = 3600;          // exactly 3600 steps = 30 s of walk before frame one
+  var TRAIL_N = 22;            // trail buffer points per particle
+  var TRAIL_EVERY = 6;         // record a trail point every 6 steps (20 Hz)
+  var SEG_S = 60;              // seconds per pole segment in the walk schedule
+  var HOLD_S = 15;             // full-weight hold at the start of each segment
+  var FADE_S = 45;             // crossfade to the next pole
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  var W = 0, H = 0, MIN_DIM = 0, PHONE = false;
+  var GX = 64, GY = 64, GN = 0;
+
+  // ---- deterministic RNG (mulberry32) ----
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function sstep(x) { x = x < 0 ? 0 : (x > 1 ? 1 : x); return x * x * (3 - 2 * x); }
+  function fade(t) { return t * t * t * (t * (t * 6 - 15) + 10); }
+
+  // ---- seeded value noise over a shuffled permutation grid ----
+  function makeNoise(rng) {
+    var p = new Uint8Array(256), perm = new Uint8Array(512), i, j, tmp;
+    for (i = 0; i < 256; i++) p[i] = i;
+    for (i = 255; i > 0; i--) { j = (rng() * (i + 1)) | 0; tmp = p[i]; p[i] = p[j]; p[j] = tmp; }
+    for (i = 0; i < 512; i++) perm[i] = p[i & 255];
+    return function (x, y) {
+      var xi = Math.floor(x), yi = Math.floor(y);
+      var xf = x - xi, yf = y - yi;
+      var X = xi & 255, Y = yi & 255;
+      var u = fade(xf), v = fade(yf);
+      var aa = perm[perm[X] + Y] / 255, ba = perm[perm[X + 1] + Y] / 255;
+      var ab = perm[perm[X] + Y + 1] / 255, bb = perm[perm[X + 1] + Y + 1] / 255;
+      return aa + (ba - aa) * u + (ab - aa) * v + (aa - ba - ab + bb) * u * v;
+    };
+  }
+
+  // ---- pole field grids ----
+  // Each pole is a curl-noise potential plus a structural flow, baked onto a
+  // grid over the frame, then RMS-normalised to its target speed.
+  var POLE_SPEC = [
+    { freq: 3.1, noiseK: 0.55, target: 100 },  // A vortex
+    { freq: 2.3, noiseK: 0.50, target: 92 },   // B laminar
+    { freq: 2.7, noiseK: 0.60, target: 78 },   // C bloom
+    { freq: 6.8, noiseK: 1.25, target: 128 }   // D storm
+  ];
+
+  function buildPoles(rng) {
+    var noise = makeNoise(rng);
+    var VX = [], VY = [], pole, i, j, idx;
+    var cx = W / 2, cy = H / 2, scale = MIN_DIM / 900;
+    for (pole = 0; pole < 4; pole++) {
+      var spec = POLE_SPEC[pole];
+      var ox = rng() * 211 + pole * 57.3, oy = rng() * 197 + pole * 31.7;
+      var ox2 = rng() * 173 + 91.2, oy2 = rng() * 149 + 47.9;
+      var phase = rng() * Math.PI * 2;
+      var vx = new Float32Array(GN), vy = new Float32Array(GN);
+      var pot = function (nx, ny) {
+        return noise(nx, ny) + 0.5 * noise(nx * 2.17 + ox2, ny * 2.17 + oy2);
+      };
+      var e = 0.09;
+      for (j = 0; j < GY; j++) {
+        for (i = 0; i < GX; i++) {
+          idx = j * GX + i;
+          var x = (i / (GX - 1)) * W, y = (j / (GY - 1)) * H;
+          var nx = (x / MIN_DIM) * spec.freq + ox, ny = (y / MIN_DIM) * spec.freq + oy;
+          var cvx = (pot(nx, ny + e) - pot(nx, ny - e)) * spec.noiseK;
+          var cvy = -(pot(nx + e, ny) - pot(nx - e, ny)) * spec.noiseK;
+          var dx = (x - cx) / MIN_DIM, dy = (y - cy) / MIN_DIM;
+          var r = Math.sqrt(dx * dx + dy * dy) + 1e-5;
+          if (pole === 0) {          // tight vortex: strong rotation about centre
+            var mag = 1.15 * (r / (r + 0.16)) / (1 + (r / 0.85) * (r / 0.85));
+            cvx += (-dy / r) * mag; cvy += (dx / r) * mag;
+          } else if (pole === 1) {   // laminar rivers: horizontal flow, sine meander
+            cvx += 0.95; cvy += 0.38 * Math.sin(2 * Math.PI * dy * 1.6 + phase);
+          } else if (pole === 2) {   // radial bloom: outward from centre
+            var out = 0.85 / (1 + r * 1.1);
+            cvx += (dx / r) * out; cvy += (dy / r) * out;
+          }
+          // pole 3 (storm) is pure high-frequency curl, boosted by noiseK.
+          vx[idx] = cvx; vy[idx] = cvy;
+        }
+      }
+      var ms = 0;
+      for (idx = 0; idx < GN; idx++) ms += vx[idx] * vx[idx] + vy[idx] * vy[idx];
+      var k = (spec.target * scale) / Math.sqrt(ms / GN + 1e-9);
+      for (idx = 0; idx < GN; idx++) { vx[idx] *= k; vy[idx] *= k; }
+      VX.push(vx); VY.push(vy);
+    }
+    return { vx: VX, vy: VY };
+  }
+
+  // Per-region blend offset: a static low-frequency noise field, in seconds.
+  function buildOffsetGrid(rng) {
+    var noise = makeNoise(rng);
+    var off = new Float32Array(GN), i, j, idx;
+    for (j = 0; j < GY; j++) {
+      for (i = 0; i < GX; i++) {
+        idx = j * GX + i;
+        var x = (i / (GX - 1)) * W, y = (j / (GY - 1)) * H;
+        off[idx] = (noise((x / MIN_DIM) * 1.35 + 40.7, (y / MIN_DIM) * 1.35 + 9.1) - 0.5) * 48;
+      }
+    }
+    return off;
+  }
+
+  // ---- simulation state ----
+  var N = 0;
+  var PX, PY, WA, WB, WC, WD, TRX, TRY;
+  var poles = null, offGrid = null;
+  var baseCols = POLE_RGB.map(function (c) { return c.slice(); });
+  var stepCount = 0;
+  var dreamIndex = 0;
+  var reseed = null;   // { start, fromVX, fromVY, toVX, toVY, fromCols, toCols }
+  var lean = null;     // { pole, start }
+  var stir = null;     // { x, y, strength, active, releaseStep }
+
+  function scheduleWeights(tSec, out) {
+    var seg = Math.floor(tSec / SEG_S);
+    var loc = tSec - seg * SEG_S;
+    var cur = ((seg % 4) + 4) % 4, nxt = (cur + 1) % 4;
+    out[0] = 0; out[1] = 0; out[2] = 0; out[3] = 0;
+    if (loc < HOLD_S) { out[cur] = 1; return; }
+    var f = sstep((loc - HOLD_S) / FADE_S);
+    out[cur] = 1 - f; out[nxt] = f;
+  }
+
+  var tmpW = [0, 0, 0, 0];
+  function refreshWeights() {
+    var tSec = stepCount * DT, i;
+    // lean bias (tap): envelope over 30 s, peak 0.55 toward the target pole
+    var leanPole = -1, leanBias = 0;
+    if (lean) {
+      var d = stepCount - lean.start;
+      if (d >= 0 && d < 3600) {
+        leanPole = lean.pole;
+        leanBias = 0.55 * sstep(d / 600) * (1 - sstep((d - 2400) / 1200));
+      } else if (d >= 3600) lean = null;
+    }
+    for (i = 0; i < N; i++) {
+      var gx = (PX[i] / W) * (GX - 1); if (gx < 0) gx = 0; else if (gx > GX - 1.001) gx = GX - 1.001;
+      var gy = (PY[i] / H) * (GY - 1); if (gy < 0) gy = 0; else if (gy > GY - 1.001) gy = GY - 1.001;
+      var ix = gx | 0, iy = gy | 0, fx = gx - ix, fy = gy - iy, idx = iy * GX + ix;
+      var a = offGrid[idx], b = offGrid[idx + 1], c = offGrid[idx + GX], dd = offGrid[idx + GX + 1];
+      var off = a + (b - a) * fx + (c - a) * fy + (a - b - c + dd) * fx * fy;
+      scheduleWeights(tSec + off, tmpW);
+      if (leanPole >= 0) {
+        tmpW[leanPole] += leanBias;
+        var s = tmpW[0] + tmpW[1] + tmpW[2] + tmpW[3];
+        tmpW[0] /= s; tmpW[1] /= s; tmpW[2] /= s; tmpW[3] /= s;
+      }
+      WA[i] = tmpW[0]; WB[i] = tmpW[1]; WC[i] = tmpW[2]; WD[i] = tmpW[3];
+    }
+  }
+
+  function recordTrails() {
+    var i, off;
+    for (i = 0; i < N; i++) {
+      off = i * TRAIL_N;
+      TRX.copyWithin(off, off + 1, off + TRAIL_N);
+      TRY.copyWithin(off, off + 1, off + TRAIL_N);
+      TRX[off + TRAIL_N - 1] = PX[i];
+      TRY[off + TRAIL_N - 1] = PY[i];
+    }
+  }
+
+  function respawn(i, rng) {
+    PX[i] = rng() * W; PY[i] = rng() * H;
+    var off = i * TRAIL_N, k;
+    for (k = 0; k < TRAIL_N; k++) { TRX[off + k] = PX[i]; TRY[off + k] = PY[i]; }
+  }
+  var stepRng = mulberry32(SEED ^ 0x77c1);
+
+  function stepSim() {
+    stepCount++;
+    // reseed crossfade factor (double-tap new dream): grids and colors blend
+    var rf = -1;
+    if (reseed) {
+      var rd = stepCount - reseed.start;
+      if (rd >= 2400) {
+        poles = { vx: reseed.toVX, vy: reseed.toVY };
+        baseCols = reseed.toCols;
+        reseed = null;
+      } else rf = sstep(rd / 2400);
+    }
+    // stir decay bookkeeping
+    var stirK = 0, sx = 0, sy = 0;
+    if (stir) {
+      if (stir.active) stirK = stir.strength;
+      else {
+        var age = stepCount - stir.releaseStep;
+        var infl = Math.exp(-age / 800);
+        if (infl < 0.01) stir = null; else stirK = stir.strength * infl;
+      }
+      if (stir) { sx = stir.x; sy = stir.y; }
+    }
+    var VX = poles.vx, VY = poles.vy;
+    var i, x, y, gx, gy, ix, iy, fx, fy, idx, w00, w10, w01, w11;
+    var vx, vy, p;
+    for (i = 0; i < N; i++) {
+      x = PX[i]; y = PY[i];
+      gx = (x / W) * (GX - 1); if (gx < 0) gx = 0; else if (gx > GX - 1.001) gx = GX - 1.001;
+      gy = (y / H) * (GY - 1); if (gy < 0) gy = 0; else if (gy > GY - 1.001) gy = GY - 1.001;
+      ix = gx | 0; iy = gy | 0; fx = gx - ix; fy = gy - iy; idx = iy * GX + ix;
+      w00 = (1 - fx) * (1 - fy); w10 = fx * (1 - fy); w01 = (1 - fx) * fy; w11 = fx * fy;
+      vx = 0; vy = 0;
+      for (p = 0; p < 4; p++) {
+        var wgt = p === 0 ? WA[i] : (p === 1 ? WB[i] : (p === 2 ? WC[i] : WD[i]));
+        if (wgt === 0) continue;
+        var ax = VX[p], ay = VY[p];
+        var svx = ax[idx] * w00 + ax[idx + 1] * w10 + ax[idx + GX] * w01 + ax[idx + GX + 1] * w11;
+        var svy = ay[idx] * w00 + ay[idx + 1] * w10 + ay[idx + GX] * w01 + ay[idx + GX + 1] * w11;
+        if (rf >= 0) {
+          var bx = reseed.toVX[p], by = reseed.toVY[p];
+          var tvx = bx[idx] * w00 + bx[idx + 1] * w10 + bx[idx + GX] * w01 + bx[idx + GX + 1] * w11;
+          var tvy = by[idx] * w00 + by[idx + 1] * w10 + by[idx + GX] * w01 + by[idx + GX + 1] * w11;
+          var fxv = reseed.fromVX[p], fyv = reseed.fromVY[p];
+          var fvx = fxv[idx] * w00 + fxv[idx + 1] * w10 + fxv[idx + GX] * w01 + fxv[idx + GX + 1] * w11;
+          var fvy = fyv[idx] * w00 + fyv[idx + 1] * w10 + fyv[idx + GX] * w01 + fyv[idx + GX + 1] * w11;
+          svx = fvx + (tvx - fvx) * rf; svy = fvy + (tvy - fvy) * rf;
+        }
+        vx += wgt * svx; vy += wgt * svy;
+      }
+      if (stirK > 0) {
+        var ddx = x - sx, ddy = y - sy;
+        var d2 = ddx * ddx + ddy * ddy, sig = 130;
+        var fall = Math.exp(-d2 / (2 * sig * sig));
+        var dd = Math.sqrt(d2) + 1e-4;
+        vx += (-ddy / dd) * stirK * fall * 260;
+        vy += (ddx / dd) * stirK * fall * 260;
+      }
+      x += vx * DT; y += vy * DT;
+      if (x < -24 || x > W + 24 || y < -24 || y > H + 24) { respawn(i, stepRng); }
+      else { PX[i] = x; PY[i] = y; }
+    }
+    if (stepCount % TRAIL_EVERY === 0) { refreshWeights(); recordTrails(); }
+  }
+
+  // ---- drawing ----
+  var BANDS = [[0, 6, 0.05], [6, 12, 0.09], [12, 17, 0.15], [17, 22, 0.23]];
+  function currentCols() {
+    if (!reseed) return baseCols;
+    var f = sstep((stepCount - reseed.start) / 2400), out = [], p, k;
+    for (p = 0; p < 4; p++) {
+      var c = [];
+      for (k = 0; k < 3; k++) c.push(reseed.fromCols[p][k] + (reseed.toCols[p][k] - reseed.fromCols[p][k]) * f);
+      out.push(c);
+    }
+    return out;
+  }
+
+  function draw() {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.fillStyle = FIELD;
+    ctx.fillRect(0, 0, W, H);
+    var cols = currentCols();
+    var lw = Math.max(0.7, Math.min(1.3, MIN_DIM / 900)) * 1.5;
+    var hs = 3 * Math.max(0.7, Math.min(1.2, MIN_DIM / 900));
+    ctx.lineWidth = lw;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    var i, b, k, off;
+    for (i = 0; i < N; i++) {
+      var r = WA[i] * cols[0][0] + WB[i] * cols[1][0] + WC[i] * cols[2][0] + WD[i] * cols[3][0];
+      var g = WA[i] * cols[0][1] + WB[i] * cols[1][1] + WC[i] * cols[2][1] + WD[i] * cols[3][1];
+      var bl = WA[i] * cols[0][2] + WB[i] * cols[1][2] + WC[i] * cols[2][2] + WD[i] * cols[3][2];
+      off = i * TRAIL_N;
+      for (b = 0; b < 4; b++) {
+        ctx.strokeStyle = 'rgba(' + (r | 0) + ',' + (g | 0) + ',' + (bl | 0) + ',' + BANDS[b][2] + ')';
+        ctx.beginPath();
+        ctx.moveTo(TRX[off + BANDS[b][0]], TRY[off + BANDS[b][0]]);
+        for (k = BANDS[b][0] + 1; k < BANDS[b][1]; k++) ctx.lineTo(TRX[off + k], TRY[off + k]);
+        ctx.stroke();
+      }
+      var hr = (r + (HEAD_RGB[0] - r) * 0.55) | 0;
+      var hg = (g + (HEAD_RGB[1] - g) * 0.55) | 0;
+      var hb = (bl + (HEAD_RGB[2] - bl) * 0.55) | 0;
+      ctx.fillStyle = 'rgb(' + hr + ',' + hg + ',' + hb + ')';
+      ctx.fillRect(PX[i] - hs / 2, PY[i] - hs / 2, hs, hs);
+    }
+  }
+
+  // ---- audio: lazy drone, typeof-guarded, first gesture only ----
+  var AC = (typeof AudioContext !== 'undefined') ? AudioContext
+         : ((typeof webkitAudioContext !== 'undefined') ? webkitAudioContext : null);
+  var audioCtx = null, poleGains = [], droneFilter = null;
+  function ensureAudio() {
+    if (!AC || audioCtx) return;
+    try {
+      audioCtx = new AC();
+      var master = audioCtx.createGain(); master.gain.value = 0.9;
+      master.connect(audioCtx.destination);
+      droneFilter = audioCtx.createBiquadFilter();
+      droneFilter.type = 'lowpass'; droneFilter.frequency.value = 240; droneFilter.Q.value = 0.4;
+      var droneGain = audioCtx.createGain(); droneGain.gain.value = 0.14;
+      droneFilter.connect(droneGain); droneGain.connect(master);
+      [54, 54.35].forEach(function (f) {
+        var o = audioCtx.createOscillator(); o.type = 'sine'; o.frequency.value = f;
+        o.connect(droneFilter); o.start();
+      });
+      var nb = audioCtx.createBuffer(1, audioCtx.sampleRate * 2, audioCtx.sampleRate);
+      var data = nb.getChannelData(0), rng = mulberry32(99);
+      for (var i = 0; i < data.length; i++) data[i] = rng() * 2 - 1;
+      var src = audioCtx.createBufferSource(); src.buffer = nb; src.loop = true;
+      var bp = audioCtx.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 480; bp.Q.value = 0.6;
+      var ng = audioCtx.createGain(); ng.gain.value = 0.03;
+      src.connect(bp); bp.connect(ng); ng.connect(master); src.start();
+      var freqs = [110, 138.59, 164.81, 196.0];
+      poleGains = freqs.map(function (f) {
+        var o = audioCtx.createOscillator(); o.type = 'sine'; o.frequency.value = f;
+        var gn = audioCtx.createGain(); gn.gain.value = 0;
+        o.connect(gn); gn.connect(master); o.start();
+        return gn;
+      });
+    } catch (err) { audioCtx = null; }
+  }
+  var audioTickN = 0;
+  function audioTick() {
+    if (!audioCtx || !poleGains.length) return;
+    if ((audioTickN++ % 6) !== 0) return;
+    scheduleWeights(stepCount * DT, tmpW);
+    var t = audioCtx.currentTime, p;
+    for (p = 0; p < 4; p++) poleGains[p].gain.setTargetAtTime(tmpW[p] * 0.05, t, 0.4);
+    if (droneFilter) droneFilter.frequency.setTargetAtTime(160 + 320 * (tmpW[0] * 0.4 + tmpW[2] * 0.6), t, 0.5);
+  }
+
+  // ---- interaction: events recorded against the sim step clock ----
+  var downInfo = null, lastTapStep = -1000, lastTapX = 0, lastTapY = 0;
+  function evtPos(e) {
+    var rect = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    return { x: (e.clientX || 0) - rect.left, y: (e.clientY || 0) - rect.top };
+  }
+  function onDown(e) {
+    ensureAudio();
+    var pos = evtPos(e);
+    var isDouble = (stepCount - lastTapStep) < 42 && Math.abs(pos.x - lastTapX) < 44 && Math.abs(pos.y - lastTapY) < 44;
+    lastTapStep = stepCount; lastTapX = pos.x; lastTapY = pos.y;
+    if (isDouble) { startNewDream(); downInfo = null; return; }
+    downInfo = { x: pos.x, y: pos.y, step: stepCount, moved: false };
+    stir = { x: pos.x, y: pos.y, strength: 0, active: true, releaseStep: -1 };
+    if (canvas.setPointerCapture && e.pointerId !== undefined) {
+      try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+    }
+  }
+  function onMove(e) {
+    if (!downInfo || !stir) return;
+    var pos = evtPos(e);
+    var dx = pos.x - stir.x, dy = pos.y - stir.y;
+    var dist = Math.sqrt(dx * dx + dy * dy);
+    if (Math.sqrt((pos.x - downInfo.x) * (pos.x - downInfo.x) + (pos.y - downInfo.y) * (pos.y - downInfo.y)) > 8) downInfo.moved = true;
+    stir.strength = Math.max(0.15, Math.min(1.6, dist / 14));
+    stir.x = pos.x; stir.y = pos.y;
+  }
+  function onUp(e) {
+    if (stir) { stir.active = false; stir.releaseStep = stepCount; }
+    if (downInfo && !downInfo.moved && (stepCount - downInfo.step) < 48) {
+      // tap: lean toward the nearest pole (the currently dominant one)
+      scheduleWeights(stepCount * DT, tmpW);
+      var best = 0, p;
+      for (p = 1; p < 4; p++) if (tmpW[p] > tmpW[best]) best = p;
+      lean = { pole: best, start: stepCount };
+    }
+    downInfo = null;
+  }
+  function startNewDream() {
+    dreamIndex++;
+    var rng = mulberry32((SEED ^ Math.imul(dreamIndex, 0x9E3779B9)) >>> 0);
+    var built = buildPoles(rng);
+    var toCols = [], p;
+    for (p = 0; p < 4; p++) toCols.push(POLE_RGB[(p + dreamIndex) % 4].slice());
+    reseed = {
+      start: stepCount,
+      fromVX: poles.vx, fromVY: poles.vy,
+      toVX: built.vx, toVY: built.vy,
+      fromCols: currentCols(), toCols: toCols
+    };
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+  }
+
+  // ---- layout / init ----
+  function readSize() {
+    var w, h;
+    if (window.visualViewport && window.visualViewport.width) {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    } else { w = window.innerWidth; h = window.innerHeight; }
+    return [Math.max(50, Math.floor(w)), Math.max(50, Math.floor(h))];
+  }
+  function detectPhone() {
+    if (window.screen && window.screen.width) {
+      return Math.min(window.screen.width, window.screen.height) < 700;
+    }
+    return H > W * 1.15;
+  }
+  function init() {
+    var sz = readSize();
+    W = sz[0]; H = sz[1]; MIN_DIM = Math.min(W, H);
+    canvas.width = W; canvas.height = H;
+    PHONE = detectPhone();
+    N = PHONE ? 1800 : 3000;
+    GX = 64;
+    GY = Math.max(24, Math.min(64, Math.round(64 * H / W)));
+    GN = GX * GY;
+    poles = buildPoles(mulberry32(SEED * 7 + 1));
+    offGrid = buildOffsetGrid(mulberry32(SEED * 13 + 5));
+    baseCols = POLE_RGB.map(function (c) { return c.slice(); });
+    reseed = null; lean = null; stir = null; dreamIndex = 0;
+    stepCount = 0;
+    PX = new Float32Array(N); PY = new Float32Array(N);
+    WA = new Float32Array(N); WB = new Float32Array(N);
+    WC = new Float32Array(N); WD = new Float32Array(N);
+    TRX = new Float32Array(N * TRAIL_N); TRY = new Float32Array(N * TRAIL_N);
+    var rng = mulberry32(SEED ^ 0x51ab), i;
+    for (i = 0; i < N; i++) respawn(i, rng);
+    refreshWeights();
+    recordTrails();
+    for (i = 0; i < PREROLL; i++) stepSim();
+    draw();
+  }
+  var resizeTimer = null;
+  function onResize() {
+    if (resizeTimer) clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(function () {
+      var sz = readSize();
+      if (sz[0] !== W || sz[1] !== H) init();
+    }, 120);
+  }
+  if (window.addEventListener) window.addEventListener('resize', onResize);
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', onResize);
+  }
+
+  init();
+
+  // ---- live loop: rAF typeof-guarded; frame one above is synchronous ----
+  var lastTs = -1, acc = 0;
+  function frame(ts) {
+    if (lastTs < 0) lastTs = ts;
+    var el = ts - lastTs; lastTs = ts;
+    if (el > 250) el = 250;
+    acc += el;
+    var steps = Math.floor(acc / (1000 / 120));
+    acc -= steps * (1000 / 120);
+    if (steps > 480) steps = 480;
+    for (var s = 0; s < steps; s++) stepSim();
+    if (steps > 0) draw();
+    audioTick();
+    requestAnimationFrame(frame);
+  }
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
