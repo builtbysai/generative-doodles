@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Optical Rail</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0B0C0D; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // №1141 "Optical Rail" — kimchi and chips study block KC6.
+  // "Motion without a moving-image display": a completely static back-lit
+  // print, and a train of cylinder lenses travelling over it. The print
+  // never moves; only the seeing moves. Under each lens the print is
+  // re-sampled column by column with a cylinder displacement profile.
+
+  var TAU = Math.PI * 2;
+  function clamp(x, a, b) { return x < a ? a : x > b ? b : x; }
+
+  var PAPER = '#F2EDE3';
+  var INK = '#1A1C1E';
+  var RED = '#C8463C';
+  var SURROUND = '#0B0C0D';
+
+  var T0 = 1.2;               // fixed first-frame phase (seconds)
+  var NL = 6;                 // lens count
+  var CROSS = 20;             // seconds for the train to cross the panel
+
+  // ---------- phone detection ----------
+  var sw = (window.screen && window.screen.width) || 0;
+  var sh = (window.screen && window.screen.height) || 0;
+  var minScreen = Math.min(sw || 9999, sh || 9999);
+  var isPhone = minScreen < 700 || (sh > sw * 1.15 && minScreen < 900);
+
+  // ---------- view / canvas ----------
+  var canvas = document.getElementById('stage');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0, GEO = null;
+
+  function viewW() {
+    if (window.visualViewport && window.visualViewport.width) return window.visualViewport.width;
+    return window.innerWidth || 800;
+  }
+  function viewH() {
+    if (window.visualViewport && window.visualViewport.height) return window.visualViewport.height;
+    return window.innerHeight || 800;
+  }
+  function fit() {
+    W = viewW(); H = viewH();
+    canvas.width = W; canvas.height = H;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    var panelFrac = isPhone ? 0.86 : 0.75;
+    var panelW = W * panelFrac;
+    var panelX0 = (W - panelW) / 2;
+    var lensW = clamp(W * 0.042, 30, 50);
+    var track = panelW + 2 * lensW;
+    GEO = {
+      panelW: panelW, panelX0: panelX0, panelX1: panelX0 + panelW,
+      lensW: lensW, track: track, spacing: track / NL,
+      speed: panelW / CROSS,
+      maxDisp: Math.min(16, lensW * 0.32),
+      inset: Math.max(8, H * 0.012),
+      ring: { x: panelX0 + 0.30 * panelW, y: 0.210 * H, r: 0.155 * H, lw: Math.max(6, 0.016 * H) },
+      disc: { x: panelX0 + 0.70 * panelW, y: 0.455 * H, r: 0.085 * H },
+      pair: { x: panelX0 + 0.44 * panelW, y: 0.685 * H, r1: 0.105 * H, r2: 0.068 * H,
+              lw1: Math.max(4, 0.010 * H), lw2: Math.max(3, 0.008 * H) }
+    };
+  }
+
+  // ---------- the train: closed-form distance over direction segments ----------
+  var dirSegs = [{ t: 0, dir: 1, D: 0 }];
+  function trainD(t) {
+    var seg = dirSegs[0];
+    for (var i = 0; i < dirSegs.length; i++) {
+      if (dirSegs[i].t <= t) seg = dirSegs[i]; else break;
+    }
+    return seg.D + seg.dir * GEO.speed * (t - seg.t);
+  }
+  function modTrack(x) {
+    var t = GEO.track;
+    x = x % t;
+    return x < 0 ? x + t : x;
+  }
+  function wrapDelta(d) {
+    var t = GEO.track;
+    d = d % t;
+    if (d > t / 2) d -= t;
+    if (d < -t / 2) d += t;
+    return d;
+  }
+  function lensBaseLeft(i, t) {
+    return GEO.panelX0 - GEO.lensW + modTrack(i * GEO.spacing + trainD(t));
+  }
+
+  // ---------- per-lens interaction episodes (recorded events) ----------
+  // episode: {kind:'release', t, off}        offset decays exponentially
+  //          {kind:'hold', t, pos, prev}     frozen 4 s, then decays
+  var episodes = [];
+  for (var ei = 0; ei < NL; ei++) episodes.push(null);
+  var dragLens = -1, dragStartX = 0, dragStartLeft = 0, dragCurLeft = 0;
+
+  function lensPos(i, t) {
+    if (dragLens === i) return dragCurLeft;
+    var base = lensBaseLeft(i, t);
+    var ep = episodes[i];
+    if (!ep) return base;
+    if (ep.kind === 'release') {
+      var dt = t - ep.t;
+      if (dt < 0) return base;
+      return base + ep.off * Math.exp(-dt / 0.85);
+    }
+    if (ep.kind === 'hold') {
+      if (t < ep.t + 4) return ep.pos;
+      var offE = wrapDelta(ep.pos - lensBaseLeft(i, ep.t + 4));
+      return base + offE * Math.exp(-(t - ep.t - 4) / 0.85);
+    }
+    return base;
+  }
+
+  // ---------- the print: one draw function, sampled at any x-shift ----------
+  // Draws every print element offset by `shift`, culling to the canvas-x
+  // window [x0, x1]. The caller clips (panel rect, or one lens column).
+  function hatchBand(yA, yB, ang, spacing, lw, shift, x0, x1) {
+    var g = GEO, xa = g.panelX0, xb = g.panelX1;
+    var dx = Math.cos(ang), dy = Math.sin(ang), nx = -dy, ny = dx;
+    var cs = [nx * xa + ny * yA, nx * xb + ny * yA, nx * xa + ny * yB, nx * xb + ny * yB];
+    var cmin = Math.min(cs[0], cs[1], cs[2], cs[3]);
+    var cmax = Math.max(cs[0], cs[1], cs[2], cs[3]);
+    ctx.strokeStyle = INK;
+    ctx.lineWidth = lw;
+    ctx.beginPath();
+    for (var c = Math.ceil(cmin / spacing) * spacing; c <= cmax; c += spacing) {
+      var ox = nx * c, oy = ny * c;
+      var smin = -Infinity, smax = Infinity, ok = true;
+      if (Math.abs(dx) < 1e-9) { if (ox < xa || ox > xb) ok = false; }
+      else {
+        var s1 = (xa - ox) / dx, s2 = (xb - ox) / dx;
+        smin = Math.max(smin, Math.min(s1, s2)); smax = Math.min(smax, Math.max(s1, s2));
+      }
+      if (Math.abs(dy) < 1e-9) { if (oy < yA || oy > yB) ok = false; }
+      else {
+        var s3 = (yA - oy) / dy, s4 = (yB - oy) / dy;
+        smin = Math.max(smin, Math.min(s3, s4)); smax = Math.min(smax, Math.max(s3, s4));
+      }
+      if (!ok || smax < smin) continue;
+      var ax = ox + dx * smin, ay = oy + dy * smin;
+      var bx = ox + dx * smax, by = oy + dy * smax;
+      var lo = Math.min(ax, bx) + shift, hi = Math.max(ax, bx) + shift;
+      if (hi < x0 || lo > x1) continue;
+      ctx.moveTo(ax + shift, ay);
+      ctx.lineTo(bx + shift, by);
+    }
+    ctx.stroke();
+  }
+
+  function halftone(shift, x0, x1) {
+    var g = GEO;
+    var s = Math.max(10, H * 0.021);
+    var yA = 0.385 * H, yB = 0.53 * H;
+    ctx.fillStyle = INK;
+    var row = 0;
+    for (var y = yA + s * 0.5; y < yB; y += s, row++) {
+      var xoff = (row % 2) ? s * 0.5 : 0;
+      for (var x = g.panelX0 + s * 0.5 + xoff; x < g.panelX1; x += s) {
+        var xs = x + shift;
+        if (xs < x0 - s || xs > x1 + s) continue;
+        var pxn = (x - g.panelX0) / g.panelW, pyn = y / H;
+        var f = 0.5 + 0.5 * Math.sin(pxn * 7.0 + 2.0 * Math.sin(pyn * 5.3 + 0.6));
+        var r = s * 0.44 * (0.25 + 0.75 * f);
+        if (r < 0.5) continue;
+        ctx.beginPath();
+        ctx.arc(xs, y, r, 0, TAU);
+        ctx.fill();
+      }
+    }
+  }
+
+  function drawPrint(shift, x0, x1) {
+    var g = GEO;
+    // the one faded signal-red band (spans the panel; the caller's clip
+    // restricts it to the visible window)
+    ctx.fillStyle = RED;
+    ctx.fillRect(g.panelX0 + shift, 0.845 * H, g.panelW, 0.05 * H);
+    // two diagonal hatch bands, at two angles
+    hatchBand(0.060 * H, 0.360 * H, 0.558, Math.max(6, H * 0.011), Math.max(1.2, H * 0.002), shift, x0, x1);
+    hatchBand(0.560 * H, 0.820 * H, -0.838, Math.max(5, H * 0.009), Math.max(1, H * 0.0016), shift, x0, x1);
+    // halftone dot field
+    halftone(shift, x0, x1);
+    // bold circular forms
+    var ring = g.ring, disc = g.disc, pair = g.pair;
+    if (ring.x + ring.r + shift >= x0 && ring.x - ring.r + shift <= x1) {
+      ctx.strokeStyle = INK;
+      ctx.lineWidth = ring.lw;
+      ctx.beginPath(); ctx.arc(ring.x + shift, ring.y, ring.r, 0, TAU); ctx.stroke();
+    }
+    if (disc.x + disc.r + shift >= x0 && disc.x - disc.r + shift <= x1) {
+      ctx.fillStyle = INK;
+      ctx.beginPath(); ctx.arc(disc.x + shift, disc.y, disc.r, 0, TAU); ctx.fill();
+    }
+    if (pair.x + pair.r1 + shift >= x0 && pair.x - pair.r1 + shift <= x1) {
+      ctx.strokeStyle = INK;
+      ctx.lineWidth = pair.lw1;
+      ctx.beginPath(); ctx.arc(pair.x + shift, pair.y, pair.r1, 0, TAU); ctx.stroke();
+      ctx.lineWidth = pair.lw2;
+      ctx.beginPath(); ctx.arc(pair.x + shift, pair.y, pair.r2, 0, TAU); ctx.stroke();
+    }
+    // plate border: verticals culled to the window; horizontals span the
+    // panel and are cut by the caller's clip, so they refract with the
+    // rest of the print under a lens instead of being erased by it
+    ctx.strokeStyle = INK;
+    ctx.globalAlpha = 0.55;
+    ctx.lineWidth = 1.5;
+    var bx1 = g.panelX0 + g.inset, bx2 = g.panelX1 - g.inset;
+    ctx.beginPath();
+    if (bx1 + shift >= x0 && bx1 + shift <= x1) {
+      ctx.moveTo(bx1 + shift, g.inset); ctx.lineTo(bx1 + shift, H - g.inset);
+    }
+    if (bx2 + shift >= x0 && bx2 + shift <= x1) {
+      ctx.moveTo(bx2 + shift, g.inset); ctx.lineTo(bx2 + shift, H - g.inset);
+    }
+    ctx.moveTo(bx1 + shift, g.inset); ctx.lineTo(bx2 + shift, g.inset);
+    ctx.moveTo(bx1 + shift, H - g.inset); ctx.lineTo(bx2 + shift, H - g.inset);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  function fillPaper(x0, x1) {
+    ctx.fillStyle = PAPER;
+    ctx.fillRect(x0, 0, x1 - x0, H);
+  }
+
+  // ---------- draw ----------
+  function draw(t) {
+    fit();
+    var g = GEO;
+
+    ctx.fillStyle = SURROUND;
+    ctx.fillRect(0, 0, W, H);
+
+    // back-light bloom: flat warm washes behind the panel
+    ctx.fillStyle = 'rgba(242,237,227,0.045)';
+    ctx.fillRect(g.panelX0 - 26, -26, g.panelW + 52, H + 52);
+    ctx.fillStyle = 'rgba(242,237,227,0.05)';
+    ctx.fillRect(g.panelX0 - 13, -13, g.panelW + 26, H + 26);
+
+    // base pass: the print, unshifted, clipped to the panel
+    ctx.save();
+    ctx.beginPath(); ctx.rect(g.panelX0, 0, g.panelW, H); ctx.clip();
+    fillPaper(g.panelX0, g.panelX1);
+    drawPrint(0, g.panelX0, g.panelX1);
+    ctx.restore();
+
+    // lens passes: per-column re-sampling under each strip, then the glass
+    var colW = 4;
+    for (var i = 0; i < NL; i++) {
+      var pos = lensPos(i, t);
+      if (pos + g.lensW < g.panelX0 || pos > g.panelX1) continue;
+      var half = g.lensW / 2;
+      var colStart = Math.round(pos), colEnd = Math.round(pos + g.lensW);
+      for (var cx = colStart; cx < colEnd; cx += colW) {
+        var cx1 = Math.min(cx + colW, colEnd);
+        var center = (cx + cx1) / 2;
+        var u = clamp((center - (pos + half)) / half, -1, 1);
+        var disp = g.maxDisp * Math.cos(u * Math.PI / 2);
+        var vx0 = Math.max(cx, g.panelX0), vx1 = Math.min(cx1 + 0.6, g.panelX1);
+        if (vx1 <= vx0) continue;
+        ctx.save();
+        ctx.beginPath(); ctx.rect(vx0, 0, vx1 - vx0, H); ctx.clip();
+        fillPaper(vx0, vx1);
+        drawPrint(-disp, vx0, vx1);
+        ctx.restore();
+      }
+      // the glass itself: near-invisible body, a sheen, bright edges
+      ctx.save();
+      ctx.beginPath(); ctx.rect(g.panelX0, 0, g.panelW, H); ctx.clip();
+      ctx.fillStyle = 'rgba(255,255,255,0.03)';
+      ctx.fillRect(pos, 0, g.lensW, H);
+      ctx.fillStyle = 'rgba(255,255,255,0.05)';
+      ctx.fillRect(pos + g.lensW * 0.36, 0, g.lensW * 0.28, H);
+      ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(pos + 0.75, 0); ctx.lineTo(pos + 0.75, H);
+      ctx.moveTo(pos + g.lensW - 0.75, 0); ctx.lineTo(pos + g.lensW - 0.75, H);
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+
+  // ---------- sound: lazy, gesture-gated, very quiet (Franke rule) ----------
+  var AC = null;
+  function initAudio() {
+    if (AC) { try { if (AC.resume) AC.resume(); } catch (e) {} return; }
+    try {
+      var Ctor = (typeof AudioContext !== 'undefined') ? AudioContext
+               : (typeof webkitAudioContext !== 'undefined' ? webkitAudioContext : null);
+      if (!Ctor) return;
+      AC = new Ctor();
+      // the rail hum: a low saw through a lowpass, barely there
+      var o1 = AC.createOscillator(); o1.type = 'sawtooth'; o1.frequency.value = 46;
+      var lp = AC.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 140;
+      var g1 = AC.createGain(); g1.gain.value = 0.010;
+      o1.connect(lp); lp.connect(g1); g1.connect(AC.destination); o1.start();
+      var o2 = AC.createOscillator(); o2.type = 'sine'; o2.frequency.value = 92;
+      var g2 = AC.createGain(); g2.gain.value = 0.005;
+      o2.connect(g2); g2.connect(AC.destination); o2.start();
+    } catch (e) { AC = null; }
+  }
+  function tick() {
+    if (!AC) return;
+    try {
+      var o = AC.createOscillator(); o.type = 'sine';
+      var g = AC.createGain();
+      var now = AC.currentTime;
+      o.frequency.setValueAtTime(2300, now);
+      o.frequency.exponentialRampToValueAtTime(1500, now + 0.06);
+      g.gain.setValueAtTime(0.014, now);
+      g.gain.exponentialRampToValueAtTime(0.0004, now + 0.07);
+      o.connect(g); g.connect(AC.destination);
+      o.start(now); o.stop(now + 0.08);
+    } catch (e) {}
+  }
+
+  // ---------- interaction ----------
+  var lastT = T0;
+  var pDown = null;        // {x, y, ms, lens}
+  var lastTap = null;      // {ms, lens, ep} — for double-tap disambiguation
+  var prevCenters = null;
+
+  function nowMs() {
+    return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+  }
+  function lensAt(x, t) {
+    if (!GEO || x < 0 || x > W) return -1;
+    for (var i = 0; i < NL; i++) {
+      var p = lensPos(i, t);
+      if (x >= p && x <= p + GEO.lensW) return i;
+    }
+    return -1;
+  }
+  function reverseRail(t) {
+    var seg = dirSegs[dirSegs.length - 1];
+    dirSegs.push({ t: t, dir: -seg.dir, D: trainD(t) });
+    if (dirSegs.length > 40) dirSegs.splice(1, dirSegs.length - 40);
+  }
+
+  function onDown(e) {
+    if (!e) return;
+    initAudio();
+    var x = e.clientX || 0, y = e.clientY || 0;
+    var lens = lensAt(x, lastT);
+    pDown = { x: x, y: y, ms: nowMs(), lens: lens };
+    if (lens >= 0) {
+      dragLens = lens;
+      dragStartX = x;
+      dragStartLeft = lensPos(lens, lastT);
+      dragCurLeft = dragStartLeft;
+    }
+  }
+  function onMove(e) {
+    if (!pDown || dragLens < 0 || !e) return;
+    dragCurLeft = dragStartLeft + ((e.clientX || 0) - dragStartX);
+  }
+  function onUp(e) {
+    if (!pDown) return;
+    var x = (e && e.clientX) || pDown.x;
+    var y = (e && e.clientY) || pDown.y;
+    var ms = nowMs();
+    var moved = Math.sqrt((x - pDown.x) * (x - pDown.x) + (y - pDown.y) * (y - pDown.y));
+    var lens = pDown.lens;
+    if (dragLens >= 0 && moved >= 6) {
+      // a scrubbed lens rejoins the train on a spring (exponential offset)
+      episodes[dragLens] = {
+        kind: 'release', t: lastT,
+        off: wrapDelta(dragCurLeft - lensBaseLeft(dragLens, lastT))
+      };
+      lastTap = null;
+    } else if (moved < 6 && ms - pDown.ms < 300) {
+      // a tap: either the second half of a double-tap, or a hold
+      if (lastTap && ms - lastTap.ms < 350) {
+        if (lastTap.ep && lastTap.lens >= 0) {
+          episodes[lastTap.lens] = lastTap.ep.prev;   // undo the first tap's hold
+        }
+        reverseRail(lastT);
+        lastTap = null;
+      } else {
+        var ep = null;
+        if (lens >= 0) {
+          ep = { kind: 'hold', t: lastT, pos: lensPos(lens, lastT), prev: episodes[lens] };
+          episodes[lens] = ep;
+        }
+        lastTap = { ms: ms, lens: lens, ep: ep };
+      }
+    } else {
+      lastTap = null;
+    }
+    dragLens = -1;
+    pDown = null;
+  }
+
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+  }
+  if (window.addEventListener) {
+    window.addEventListener('resize', function () { draw(lastT); });
+  }
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { draw(lastT); });
+  }
+
+  // ---------- run: synchronous fixed-phase first frame, then guarded rAF ----------
+  draw(T0);
+
+  var startStamp = null;
+  function frame(stamp) {
+    if (startStamp === null) startStamp = stamp;
+    var t = T0 + (stamp - startStamp) / 1000;
+    lastT = t;
+    draw(t);
+    // a soft glassy tick when a lens passes a bold circle
+    if (AC && GEO) {
+      var centers = [];
+      for (var i = 0; i < NL; i++) centers.push(lensPos(i, t) + GEO.lensW / 2);
+      if (prevCenters) {
+        var cxs = [GEO.ring.x, GEO.disc.x, GEO.pair.x];
+        var done = false;
+        for (var a = 0; a < NL && !done; a++) {
+          for (var b = 0; b < cxs.length; b++) {
+            if ((prevCenters[a] - cxs[b]) * (centers[a] - cxs[b]) < 0) { tick(); done = true; break; }
+          }
+        }
+      }
+      prevCenters = centers;
+    }
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+  }
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
