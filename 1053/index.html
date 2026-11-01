@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Whatever Moves, Light Rides</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #050506; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded rng ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- palette (strict) ----------
+  var FIELD = '#050506';
+  var MOVER = '#15171A';
+  var ORB = '#DCE9FF';    // drone cargo
+  var LAMP = '#FFE9B8';   // cart cargo
+  var SCREEN = '#E8EAEE'; // platform cargo
+
+  var LOOP = 60;          // seconds; every period below divides it
+  var T0 = 20;            // frame one phase
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 720, H = 720, DPR = 1;
+
+  function isPhone() {
+    var sw = 0, sh = 0;
+    if (typeof window !== 'undefined' && window.screen) {
+      sw = window.screen.width || 0; sh = window.screen.height || 0;
+    }
+    var mn = Math.min(sw, sh);
+    if (mn > 0 && mn < 700) return true;
+    return H > W * 1.15; // aspect fallback only
+  }
+
+  function fit() {
+    var vv = (typeof window !== 'undefined') ? window.visualViewport : null;
+    if (vv && vv.width) { W = vv.width; H = vv.height; }
+    else if (typeof window !== 'undefined' && window.innerWidth) { W = window.innerWidth; H = window.innerHeight; }
+    DPR = (typeof window !== 'undefined' && window.devicePixelRatio) ? Math.min(window.devicePixelRatio, 2) : 1;
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+  }
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', function () { fit(); draw(currentT); });
+    }
+    if (window.addEventListener) {
+      window.addEventListener('resize', function () { fit(); draw(currentT); });
+    }
+  }
+
+  // world: unit square, contain-fit, centered
+  function view() {
+    var s = Math.min(W, H);
+    return { s: s, ox: (W - s) / 2, oy: (H - s) / 2 };
+  }
+  function px(v, x) { return v.ox + x * v.s; }
+  function py(v, y) { return v.oy + y * v.s; }
+
+  // ---------- fleet construction (seeded) ----------
+  var BASE_SEED = 1053214;
+  var seed = BASE_SEED;
+  var movers = [];
+
+  function buildFleet(s) {
+    var rng = mulberry32(s);
+    var list = [];
+    var i;
+
+    // drones: elliptical closed paths, upper field; orb rides on top
+    var dronePeriods = [60, 30, 20];
+    for (i = 0; i < 3; i++) {
+      var d = {
+        type: 'drone', color: ORB,
+        cx: 0.22 + i * 0.26 + (rng() - 0.5) * 0.05,
+        cy: 0.16 + (rng() - 0.5) * 0.06 + i * 0.045,
+        rx: 0.10 + rng() * 0.05,
+        ry: 0.045 + rng() * 0.02,
+        period: dronePeriods[i],
+        phase: rng() * Math.PI * 2,
+        dir: i % 2 === 0 ? 1 : -1,
+        lightOff: -0.028, // orb sits above the body
+        lightR: 0.013
+      };
+      list.push(d);
+    }
+
+    // carts: axis-aligned rectangular waypoint circuits, floor; lamp dome on top
+    var cartPeriods = [30, 60, 20, 15];
+    for (i = 0; i < 4; i++) {
+      var x0 = 0.08 + rng() * 0.10;
+      var x1 = 0.68 + rng() * 0.22;
+      var y0 = 0.60 + i * 0.085 + rng() * 0.02;
+      var y1 = y0 + 0.045 + rng() * 0.02;
+      var per = 2 * ((x1 - x0) + (y1 - y0));
+      var c = {
+        type: 'cart', color: LAMP,
+        x0: x0, x1: x1, y0: y0, y1: y1, per: per,
+        period: cartPeriods[i],
+        phase: rng(), // fraction of perimeter
+        lightOff: -0.020,
+        lightR: 0.011
+      };
+      list.push(c);
+    }
+
+    // platforms: slow horizontal glides, mid-field; pale screen stands on the slab
+    var platPeriods = [60, 30];
+    for (i = 0; i < 2; i++) {
+      var p = {
+        type: 'platform', color: SCREEN,
+        cx: 0.32 + i * 0.34,
+        cy: 0.47 + i * 0.075,
+        amp: 0.13 + rng() * 0.05,
+        period: platPeriods[i],
+        phase: rng() * Math.PI * 2,
+        lightOff: -0.052, // screen center above the slab
+        lightR: 0.030
+      };
+      list.push(p);
+    }
+    return list;
+  }
+
+  function tri(u) { // triangle wave, u in [0,1) -> [-1,1]
+    return u < 0.5 ? (u * 4 - 1) : (3 - u * 4);
+  }
+
+  // mover body position at time t (closed form)
+  function posAt(m, t) {
+    var u, x, y;
+    if (m.type === 'drone') {
+      var a = m.phase + m.dir * (t / m.period) * Math.PI * 2;
+      x = m.cx + Math.cos(a) * m.rx;
+      y = m.cy + Math.sin(a) * m.ry;
+      return { x: x, y: y };
+    }
+    if (m.type === 'cart') {
+      var d = (((t / m.period) + m.phase) % 1) * m.per;
+      var wdt = m.x1 - m.x0, hgt = m.y1 - m.y0;
+      if (d < wdt) { x = m.x0 + d; y = m.y0; }
+      else if (d < wdt + hgt) { x = m.x1; y = m.y0 + (d - wdt); }
+      else if (d < 2 * wdt + hgt) { x = m.x1 - (d - wdt - hgt); y = m.y1; }
+      else { x = m.x0; y = m.y1 - (d - 2 * wdt - hgt); }
+      return { x: x, y: y };
+    }
+    // platform
+    u = ((t / m.period) + m.phase / (Math.PI * 2)) % 1;
+    x = m.cx + tri(u) * m.amp;
+    y = m.cy + Math.sin((t / m.period) * Math.PI * 2 + m.phase) * 0.006;
+    return { x: x, y: y };
+  }
+
+  function lightAt(m, t) {
+    var p = posAt(m, t);
+    return { x: p.x, y: p.y + m.lightOff };
+  }
+
+  // ---------- interaction state (recorded events only) ----------
+  var dragSamples = []; // {x, y, t} in world coords / piece time
+  var flares = [];      // {idx, t}
+  var downInfo = null;
+  var lastTapT = -10, lastTapIdx = -1;
+
+  function dimFactor(idx, t) {
+    // shadow of a recent drag: dim by proximity to samples younger than 1.6 s
+    var m = movers[idx];
+    var lp = lightAt(m, t);
+    var dim = 0;
+    for (var i = 0; i < dragSamples.length; i++) {
+      var sm = dragSamples[i];
+      var age = t - sm.t;
+      if (age < 0 || age > 1.6) continue;
+      var dx = lp.x - sm.x, dy = lp.y - sm.y;
+      var dist = Math.sqrt(dx * dx + dy * dy);
+      var prox = Math.max(0, 1 - dist / 0.16);
+      var f = prox * (1 - age / 1.6) * 0.55;
+      if (f > dim) dim = f;
+    }
+    return 1 - dim;
+  }
+
+  function flareFactor(idx, t) {
+    var f = 0;
+    for (var i = 0; i < flares.length; i++) {
+      if (flares[i].idx !== idx) continue;
+      var age = t - flares[i].t;
+      if (age >= 0 && age < 3) {
+        var g = age < 0.25 ? age / 0.25 : 1 - (age - 0.25) / 2.75;
+        if (g > f) f = g;
+      }
+    }
+    return f;
+  }
+
+  // ---------- audio (lazy, guarded: first gesture only) ----------
+  var AC = null, voices = null, lastShimmerAt = 0;
+  function audio() {
+    if (AC) return AC;
+    var Ctor = null;
+    if (typeof AudioContext !== 'undefined') Ctor = AudioContext;
+    else if (typeof window !== 'undefined' && window.webkitAudioContext) Ctor = window.webkitAudioContext;
+    if (!Ctor) return null;
+    try { AC = new Ctor(); } catch (e) { AC = null; return null; }
+    var master = AC.createGain(); master.gain.value = 0.05; master.connect(AC.destination);
+    function voice(freq, type, gain) {
+      var o = AC.createOscillator(), g = AC.createGain();
+      o.type = type; o.frequency.value = freq; g.gain.value = gain;
+      o.connect(g); g.connect(master); o.start();
+      return { o: o, g: g };
+    }
+    voices = {
+      mechDrone: voice(196, 'sawtooth', 0.010),
+      mechCart: voice(84, 'triangle', 0.014),
+      mechPlat: voice(122, 'sine', 0.010),
+      cargoOrb: voice(1320, 'sine', 0.006),
+      cargoLamp: voice(880, 'sine', 0.006),
+      cargoScreen: voice(660, 'sine', 0.005)
+    };
+    return AC;
+  }
+  function shimmer() {
+    if (!AC || !voices) return;
+    var now = AC.currentTime;
+    if (now - lastShimmerAt < 0.7) return;
+    lastShimmerAt = now;
+    var t = now;
+    var o = AC.createOscillator(), g = AC.createGain();
+    o.type = 'sine'; o.frequency.setValueAtTime(1760, t);
+    o.frequency.exponentialRampToValueAtTime(1180, t + 0.4);
+    g.gain.setValueAtTime(0.018, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.45);
+    o.connect(g); g.connect(AC.destination);
+    o.start(t); o.stop(t + 0.5);
+  }
+  function checkCrossings(t) {
+    if (!AC) return;
+    var pts = [];
+    for (var i = 0; i < movers.length; i++) pts.push(lightAt(movers[i], t));
+    for (var a = 0; a < pts.length; a++) {
+      for (var b = a + 1; b < pts.length; b++) {
+        var dx = pts[a].x - pts[b].x, dy = pts[a].y - pts[b].y;
+        if (dx * dx + dy * dy < 0.0036) { shimmer(); return; }
+      }
+    }
+  }
+
+  // ---------- drawing ----------
+  function glowDot(v, x, y, r, color, alpha) {
+    ctx.fillStyle = color;
+    ctx.globalAlpha = alpha * 0.07;
+    ctx.beginPath(); ctx.arc(x, y, r * 3.4, 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = alpha * 0.16;
+    ctx.beginPath(); ctx.arc(x, y, r * 2.1, 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = alpha * 0.9;
+    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = alpha;
+    ctx.beginPath(); ctx.arc(x, y, r * 0.45, 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = FIELD;
+    ctx.fillRect(0, 0, W, H);
+    var v = view();
+    var i, k, m, lp;
+
+    // trails: analytic samples of each light's past, base alpha 0.35
+    var TRAIL_N = 16, TRAIL_DT = 0.32;
+    for (i = 0; i < movers.length; i++) {
+      m = movers[i];
+      var dim0 = dimFactor(i, t);
+      for (k = TRAIL_N; k >= 1; k--) {
+        var tp = lightAt(m, t - k * TRAIL_DT);
+        var a = 0.35 * (1 - k / (TRAIL_N + 1)) * dim0 * (m.type === 'platform' ? 0.55 : 1);
+        ctx.fillStyle = m.color;
+        ctx.globalAlpha = a;
+        var tr = (m.type === 'platform' ? 0.013 : 0.008) * v.s * (1 - k / (TRAIL_N + 2));
+        if (m.type === 'platform') {
+          ctx.fillRect(px(v, tp.x) - tr, py(v, tp.y) - tr * 0.8, tr * 2, tr * 1.6);
+        } else {
+          ctx.beginPath(); ctx.arc(px(v, tp.x), py(v, tp.y), Math.max(0.6, tr), 0, Math.PI * 2); ctx.fill();
+        }
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    // movers (dark, plain) then their cargo (bright)
+    for (i = 0; i < movers.length; i++) {
+      m = movers[i];
+      var p = posAt(m, t);
+      var X = px(v, p.x), Y = py(v, p.y);
+      var dim = dimFactor(i, t);
+      var fl = flareFactor(i, t);
+      ctx.fillStyle = MOVER;
+      ctx.strokeStyle = MOVER;
+      if (m.type === 'drone') {
+        var bw = 0.020 * v.s, bh = 0.011 * v.s;
+        ctx.globalAlpha = 1;
+        ctx.lineWidth = Math.max(1, 0.0022 * v.s);
+        // quad outline: body bar + four rotor nubs
+        ctx.strokeRect(X - bw / 2, Y - bh / 2, bw, bh);
+        var rn = 0.0045 * v.s;
+        var offs = [[-bw / 2, -bh / 2], [bw / 2, -bh / 2], [-bw / 2, bh / 2], [bw / 2, bh / 2]];
+        for (k = 0; k < 4; k++) { ctx.beginPath(); ctx.arc(X + offs[k][0], Y + offs[k][1], rn, 0, Math.PI * 2); ctx.stroke(); }
+        ctx.fillRect(X - bw * 0.18, Y - bh * 0.25, bw * 0.36, bh * 0.5);
+      } else if (m.type === 'cart') {
+        var cw = 0.036 * v.s, ch = 0.020 * v.s;
+        ctx.fillRect(X - cw / 2, Y - ch / 2, cw, ch);
+        ctx.fillRect(X - cw * 0.32, Y + ch * 0.28, cw * 0.14, ch * 0.30);
+        ctx.fillRect(X + cw * 0.18, Y + ch * 0.28, cw * 0.14, ch * 0.30);
+      } else {
+        var sw = 0.078 * v.s, sh = 0.013 * v.s;
+        ctx.fillRect(X - sw / 2, Y - sh / 2, sw, sh);
+        ctx.fillRect(X - sw * 0.30, Y + sh * 0.30, sw * 0.10, sh * 0.45);
+        ctx.fillRect(X + sw * 0.20, Y + sh * 0.30, sw * 0.10, sh * 0.45);
+      }
+      ctx.globalAlpha = 1;
+
+      // cargo
+      lp = lightAt(m, t);
+      var LX = px(v, lp.x), LY = py(v, lp.y);
+      var boost = 1 + fl * 0.9;
+      var bright = dim * (0.82 + 0.18 * dim) + fl * 0.35;
+      if (bright > 1) bright = 1;
+      if (m.type === 'platform') {
+        var pw = 0.058 * v.s * boost, ph = 0.052 * v.s * boost;
+        ctx.fillStyle = m.color;
+        ctx.globalAlpha = 0.10 * bright;
+        ctx.fillRect(LX - pw * 0.85, LY - ph * 0.85, pw * 1.7, ph * 1.7);
+        ctx.globalAlpha = 0.28 * bright;
+        ctx.fillRect(LX - pw * 0.62, LY - ph * 0.62, pw * 1.24, ph * 1.24);
+        ctx.globalAlpha = 0.55 * bright;
+        ctx.fillRect(LX - pw / 2, LY - ph / 2, pw, ph);
+        ctx.globalAlpha = 0.85 * bright;
+        ctx.fillRect(LX - pw * 0.30, LY - ph * 0.30, pw * 0.60, ph * 0.60);
+        ctx.globalAlpha = 1;
+      } else {
+        glowDot(v, LX, LY, m.lightR * v.s * boost, m.color, bright);
+      }
+    }
+  }
+
+  // ---------- pointer interaction ----------
+  var currentT = T0;
+  function toWorld(e) {
+    var rect = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    var v = view();
+    var cxp = (e.clientX - rect.left), cyp = (e.clientY - rect.top);
+    return { x: (cxp - v.ox) / v.s, y: (cyp - v.oy) / v.s };
+  }
+  function nearestMover(wx, wy, t) {
+    var best = -1, bd = 1e9;
+    for (var i = 0; i < movers.length; i++) {
+      var lp = lightAt(movers[i], t);
+      var dx = lp.x - wx, dy = lp.y - wy;
+      var d = dx * dx + dy * dy;
+      if (d < bd) { bd = d; best = i; }
+    }
+    return best;
+  }
+  function onDown(e) {
+    audio();
+    var wpt = toWorld(e);
+    downInfo = { x: wpt.x, y: wpt.y, t: currentT, moved: false };
+    dragSamples.push({ x: wpt.x, y: wpt.y, t: currentT });
+  }
+  function onMove(e) {
+    if (!downInfo) return;
+    var wpt = toWorld(e);
+    if (Math.abs(wpt.x - downInfo.x) > 0.015 || Math.abs(wpt.y - downInfo.y) > 0.015) downInfo.moved = true;
+    if (downInfo.moved) {
+      dragSamples.push({ x: wpt.x, y: wpt.y, t: currentT });
+      if (dragSamples.length > 240) dragSamples.splice(0, dragSamples.length - 240);
+    }
+  }
+  function onUp(e) {
+    if (!downInfo) return;
+    var wasDrag = downInfo.moved;
+    var wpt = toWorld(e);
+    downInfo = null;
+    if (wasDrag) return;
+    var idx = nearestMover(wpt.x, wpt.y, currentT);
+    if (idx < 0) return;
+    if (currentT - lastTapT < 0.35 && idx === lastTapIdx) {
+      // double tap: new fleet
+      seed = (seed * 1664525 + 1013904223) >>> 0;
+      movers = buildFleet(seed);
+      flares = [];
+      dragSamples = [];
+      lastTapT = -10; lastTapIdx = -1;
+      draw(currentT);
+      return;
+    }
+    lastTapT = currentT; lastTapIdx = idx;
+    flares.push({ idx: idx, t: currentT });
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', function () { downInfo = null; });
+  }
+
+  // ---------- boot: frame one, then live loop ----------
+  fit();
+  movers = buildFleet(seed);
+  draw(T0);
+  currentT = T0;
+
+  if (typeof requestAnimationFrame !== 'undefined') {
+    var startMs = null;
+    var loop = function (ms) {
+      if (startMs === null) startMs = ms;
+      currentT = T0 + (ms - startMs) / 1000;
+      draw(currentT);
+      checkCrossings(currentT);
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>

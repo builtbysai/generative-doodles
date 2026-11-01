@@ -1,0 +1,597 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>One Centimetre</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #07080A; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded rng ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- palette (strict) ----------
+  var STAGE = '#07080A';
+  var GRID_MIN = '#2A2E35';
+  var GRID_MAJ = '#3A4048';
+  var MACHINE = '#E8EAEE';
+  var TOLCOL = '#7FD4FF';
+  var PATHCOL = '#FFFFFF';
+  var AMBER = '#FFE9B8'; // house amber, used where the prompt says amber (flash + readout)
+
+  // ---------- stage geometry ----------
+  // The stage is 150 x 90 units and represents 15 m across its width,
+  // so 1 unit = 10 cm and ONE CENTIMETRE = 0.1 units exactly.
+  var SW = 150, SH = 90;
+  var TOL = 0.1;               // the tolerance radius, in units = 1 cm (enforced, proven, read out)
+  var TOL_DRAW = 1.1;          // the ring as drawn: 11x magnification. At true scale 1 cm is
+                               // 0.85 px on desktop and 0.26 px on a phone, smaller than any
+                               // stroke, so the true ring cannot be seen at all. The promise
+                               // is enforced and measured at TOL; the ring is its portrait.
+  var CM_PER_UNIT = 10;
+  var LOOP = 55;               // seconds, seamless
+  var DT = 1 / 120;            // fixed step for the live clock
+  var T0_STEP = 1920;          // frame one: step 1920 = t 16 s exactly
+  var BASE_SEED = 1054215;
+  var TAU = Math.PI * 2;
+  var RECOVERY_RATE = 2.5;     // units per second: the machine works back at a steady rate
+  var PUSH_MAX = 9;            // units: the furthest the hand can push a machine
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 720, H = 720, DPR = 1;
+
+  function isPhone() {
+    var sw = 0, sh = 0;
+    if (typeof window !== 'undefined' && window.screen) {
+      sw = window.screen.width || 0; sh = window.screen.height || 0;
+    }
+    var mn = Math.min(sw, sh);
+    if (mn > 0 && mn < 700) return true;
+    return H > W * 1.15; // aspect fallback only
+  }
+
+  function fit() {
+    var vv = (typeof window !== 'undefined') ? window.visualViewport : null;
+    if (vv && vv.width) { W = vv.width; H = vv.height; }
+    else if (typeof window !== 'undefined' && window.innerWidth) { W = window.innerWidth; H = window.innerHeight; }
+    DPR = (typeof window !== 'undefined' && window.devicePixelRatio) ? Math.min(window.devicePixelRatio, 2) : 1;
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+  }
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', function () { fit(); draw(); });
+    }
+    if (window.addEventListener) {
+      window.addEventListener('resize', function () { fit(); draw(); });
+    }
+  }
+
+  // stage rect inside the viewport (contain fit, centred); page ground is the stage tone
+  function layout() {
+    var scale = Math.min(W / SW, H / SH);
+    return { scale: scale, ox: (W - SW * scale) / 2, oy: (H - SH * scale) / 2 };
+  }
+
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+
+  // ---------- spline helpers ----------
+  // Closed Catmull-Rom through waypoints, densely sampled, arc-length table.
+  function buildSpline(wps, per) {
+    var n = wps.length, pts = [], i, k;
+    for (i = 0; i < n; i++) {
+      var p0 = wps[(i + n - 1) % n], p1 = wps[i], p2 = wps[(i + 1) % n], p3 = wps[(i + 2) % n];
+      for (k = 0; k < per; k++) {
+        var u = k / per, u2 = u * u, u3 = u2 * u;
+        pts.push({
+          x: 0.5 * ((2 * p1.x) + (-p0.x + p2.x) * u + (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * u2 + (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * u3),
+          y: 0.5 * ((2 * p1.y) + (-p0.y + p2.y) * u + (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * u2 + (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * u3)
+        });
+      }
+    }
+    var cum = [0], total = 0, j;
+    for (j = 1; j <= pts.length; j++) {
+      var a = pts[j - 1], b = pts[j % pts.length];
+      total += Math.sqrt((b.x - a.x) * (b.x - a.x) + (b.y - a.y) * (b.y - a.y));
+      cum.push(total);
+    }
+    return { pts: pts, cum: cum, total: total };
+  }
+
+  function splineAt(sp, s) {
+    var L = sp.total;
+    s = ((s % L) + L) % L;
+    var cum = sp.cum, lo = 0, hi = cum.length - 1;
+    while (lo < hi - 1) { var mid = (lo + hi) >> 1; if (cum[mid] <= s) lo = mid; else hi = mid; }
+    var seg = cum[hi] - cum[lo];
+    var u = seg > 0 ? (s - cum[lo]) / seg : 0;
+    var a = sp.pts[lo % sp.pts.length], b = sp.pts[hi % sp.pts.length];
+    return { x: a.x + (b.x - a.x) * u, y: a.y + (b.y - a.y) * u };
+  }
+
+  // arc length nearest to each waypoint (for waypoint tick sounds)
+  function waypointArcs(sp, wps) {
+    var out = [], i, j;
+    for (i = 0; i < wps.length; i++) {
+      var best = 0, bd = Infinity;
+      for (j = 0; j < sp.pts.length; j++) {
+        var dx = sp.pts[j].x - wps[i].x, dy = sp.pts[j].y - wps[i].y;
+        var d = dx * dx + dy * dy;
+        if (d < bd) { bd = d; best = j; }
+      }
+      out.push(sp.cum[best]);
+    }
+    return out;
+  }
+
+  // ---------- the world ----------
+  // Hand-placed waypoint sets (the composition), with seeded jitter per build.
+  var BASE_WPS = [
+    // machine 0: cube, rounded rectangle, north-west
+    [{x:16,y:12},{x:36,y:10},{x:56,y:12},{x:58,y:24},{x:56,y:36},{x:36,y:38},{x:16,y:36},{x:14,y:24}],
+    // machine 1: cart, broad ellipse, centre
+    null, // ellipse generated below
+    // machine 2: cube, rounded rectangle, south-east
+    [{x:98,y:58},{x:118,y:56},{x:138,y:58},{x:140,y:68},{x:138,y:79},{x:118,y:81},{x:98,y:79},{x:96,y:68}],
+    // machine 3: cart, tilted ellipse, north-east
+    null
+  ];
+  var LAPS = [55, 27.5, 55, 27.5];
+  var KINDS = ['cube', 'cart', 'cube', 'cart'];
+
+  function ellipseWps(cx, cy, rx, ry, rot, n) {
+    var out = [], i;
+    for (i = 0; i < n; i++) {
+      var a = (i / n) * TAU;
+      var ex = Math.cos(a) * rx, ey = Math.sin(a) * ry;
+      out.push({
+        x: cx + ex * Math.cos(rot) - ey * Math.sin(rot),
+        y: cy + ex * Math.sin(rot) + ey * Math.cos(rot)
+      });
+    }
+    return out;
+  }
+  BASE_WPS[1] = ellipseWps(76, 47, 36, 21, 0, 10);
+  BASE_WPS[3] = ellipseWps(110, 27, 27, 12, -0.35, 10);
+
+  var world = null;
+
+  // Deviation wobble parameters come from a dedicated RNG stream per machine
+  // (fixed call order: ax, ay, kx, ky, px, py) so the bound can be probed exactly.
+  function devParams(seed, idx) {
+    var rng = mulberry32(((seed ^ 0x51ED) + idx * 7919) >>> 0);
+    return {
+      ax: 0.028 + rng() * 0.017,          // 0.028 .. 0.045 units
+      ay: 0.028 + rng() * 0.017,          // 0.028 .. 0.045 units
+      kx: 3 + Math.floor(rng() * 7),      // whole cycles per loop: seamless
+      ky: 3 + Math.floor(rng() * 7),
+      px: rng() * TAU,
+      py: rng() * TAU
+    };
+  }
+  function devAt(dv, t) {
+    return {
+      x: dv.ax * Math.sin(TAU * dv.kx * t / LOOP + dv.px),
+      y: dv.ay * Math.sin(TAU * dv.ky * t / LOOP + dv.py)
+    };
+  }
+
+  function buildWorld(seed) {
+    var rng = mulberry32(seed);
+    var machines = [], i, j;
+    for (i = 0; i < 4; i++) {
+      var base = BASE_WPS[i];
+      var wps = [];
+      for (j = 0; j < base.length; j++) {
+        wps.push({
+          x: clamp(base[j].x + (rng() - 0.5) * 5, 4, SW - 4),
+          y: clamp(base[j].y + (rng() - 0.5) * 5, 4, SH - 4)
+        });
+      }
+      var sp = buildSpline(wps, 30);
+      machines.push({
+        kind: KINDS[i],
+        wps: wps,
+        sp: sp,
+        speed: sp.total / LAPS[i],
+        phase0: rng() * sp.total,
+        dv: devParams(seed, i),
+        arcs: waypointArcs(sp, wps),
+        prevArcIdx: -1
+      });
+    }
+    world = { seed: seed, machines: machines };
+  }
+
+  function intendedAt(m, t) {
+    return splineAt(m.sp, m.phase0 + m.speed * t);
+  }
+  function headingAt(m, t) {
+    var a = splineAt(m.sp, m.phase0 + m.speed * t - 0.6);
+    var b = splineAt(m.sp, m.phase0 + m.speed * t + 0.6);
+    return Math.atan2(b.y - a.y, b.x - a.x);
+  }
+
+  // ---------- interaction state (recorded events; frame one is pre-input) ----------
+  var sim = { step: T0_STEP, lastTapStep: -100000 };
+  var pushes = [null, null, null, null];  // per machine: {t0, ox, oy} release events
+  var grab = null;                        // {idx, ox, oy} while the hand holds a machine
+  var readout = null;                     // {idx, t0} tap-to-measure window
+  var downInfo = null;
+
+  function nowT() { return sim.step * DT; }
+
+  function offsetAt(idx, t) {
+    if (grab && grab.idx === idx) return { x: grab.ox, y: grab.oy };
+    var p = pushes[idx];
+    if (!p) return { x: 0, y: 0 };
+    var mag = Math.sqrt(p.ox * p.ox + p.oy * p.oy);
+    if (mag <= 0) return { x: 0, y: 0 };
+    var remain = Math.max(0, mag - RECOVERY_RATE * (t - p.t0));
+    var f = remain / mag;
+    return { x: p.ox * f, y: p.oy * f };
+  }
+
+  function actualAt(m, idx, t) {
+    var P = intendedAt(m, t);
+    var dv = devAt(m.dv, t);
+    var off = offsetAt(idx, t);
+    return { x: P.x + dv.x + off.x, y: P.y + dv.y + off.y, px: P.x, py: P.y, ex: dv.x + off.x, ey: dv.y + off.y };
+  }
+
+  function nearestMachine(sx, sy, t, maxDist) {
+    var best = -1, bd = maxDist, i;
+    for (i = 0; i < 4; i++) {
+      var A = actualAt(world.machines[i], i, t);
+      var dx = A.x - sx, dy = A.y - sy;
+      var d = Math.sqrt(dx * dx + dy * dy);
+      if (d < bd) { bd = d; best = i; }
+    }
+    return best;
+  }
+
+  // ---------- audio (lazy, guarded) ----------
+  var AC = null, devGain = null, lastTickAt = 0;
+  function ensureAudio() {
+    if (AC) return AC;
+    var Ctor = null;
+    if (typeof AudioContext !== 'undefined') Ctor = AudioContext;
+    else if (typeof window !== 'undefined' && window.webkitAudioContext) Ctor = window.webkitAudioContext;
+    if (!Ctor) return null;
+    try {
+      AC = new Ctor();
+      // the grid: a faint high shimmer, the measure humming
+      var o1 = AC.createOscillator(), g1 = AC.createGain();
+      o1.type = 'sine'; o1.frequency.value = 3900;
+      g1.gain.value = 0.0032;
+      o1.connect(g1); g1.connect(AC.destination);
+      o1.start();
+      var o2 = AC.createOscillator(), g2 = AC.createGain();
+      o2.type = 'sine'; o2.frequency.value = 5240;
+      g2.gain.value = 0.0014;
+      o2.connect(g2); g2.connect(AC.destination);
+      o2.start();
+      // the deviation tone: quiet and warm while any machine is outside tolerance
+      var o3 = AC.createOscillator();
+      devGain = AC.createGain();
+      o3.type = 'sine'; o3.frequency.value = 183;
+      devGain.gain.value = 0;
+      o3.connect(devGain); devGain.connect(AC.destination);
+      o3.start();
+    } catch (e) { AC = null; devGain = null; }
+    return AC;
+  }
+  function tickSound() {
+    if (!AC) return;
+    var now = AC.currentTime;
+    if (now - lastTickAt < 0.05) return;
+    lastTickAt = now;
+    try {
+      var o = AC.createOscillator(), g = AC.createGain();
+      o.type = 'sine'; o.frequency.value = 1760;
+      g.gain.setValueAtTime(0.02, now);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + 0.045);
+      o.connect(g); g.connect(AC.destination);
+      o.start(now); o.stop(now + 0.06);
+    } catch (e) { /* silent */ }
+  }
+  function updateAudio(anyOut) {
+    if (!AC || !devGain) return;
+    try {
+      devGain.gain.setTargetAtTime(anyOut ? 0.03 : 0.0, AC.currentTime, 0.12);
+    } catch (e) { /* silent */ }
+  }
+
+  // waypoint crossings (audio only; never affects the drawing)
+  function audioStep(t) {
+    var i, k, m;
+    for (i = 0; i < 4; i++) {
+      m = world.machines[i];
+      var s = (m.phase0 + m.speed * t) % m.sp.total;
+      for (k = 0; k < m.arcs.length; k++) {
+        var a = m.arcs[k];
+        var prev = (m.phase0 + m.speed * (t - DT)) % m.sp.total;
+        var crossed = (prev <= a && s >= a) || (s < prev && (a >= prev || a <= s));
+        if (crossed) { tickSound(); break; }
+      }
+    }
+  }
+
+  // ---------- drawing ----------
+  function draw() {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = STAGE;
+    ctx.fillRect(0, 0, W, H);
+    var L = layout(), sc = L.scale;
+    var phone = isPhone();
+    var t = nowT();
+    var X = function (u) { return L.ox + u * sc; };
+    var Y = function (v) { return L.oy + v * sc; };
+    var i, j, m;
+
+    // ---- the grid: the subject. minor every unit, major every ten ----
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = GRID_MIN;
+    ctx.globalAlpha = 0.35;
+    ctx.beginPath();
+    for (i = 0; i <= SW; i++) {
+      if (i % 10 === 0) continue;
+      ctx.moveTo(X(i), Y(0)); ctx.lineTo(X(i), Y(SH));
+    }
+    for (j = 0; j <= SH; j++) {
+      if (j % 10 === 0) continue;
+      ctx.moveTo(X(0), Y(j)); ctx.lineTo(X(SW), Y(j));
+    }
+    ctx.stroke();
+    ctx.strokeStyle = GRID_MAJ;
+    ctx.globalAlpha = 0.5;
+    ctx.beginPath();
+    for (i = 0; i <= SW; i += 10) { ctx.moveTo(X(i), Y(0)); ctx.lineTo(X(i), Y(SH)); }
+    for (j = 0; j <= SH; j += 10) { ctx.moveTo(X(0), Y(j)); ctx.lineTo(X(SW), Y(j)); }
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    // ---- intended paths: the plan, faint ----
+    ctx.strokeStyle = PATHCOL;
+    ctx.globalAlpha = 0.25;
+    ctx.lineWidth = Math.max(1, sc * 0.07);
+    ctx.lineJoin = 'round';
+    for (i = 0; i < 4; i++) {
+      var pts = world.machines[i].sp.pts;
+      ctx.beginPath();
+      for (j = 0; j <= pts.length; j++) {
+        var p = pts[j % pts.length];
+        if (j === 0) ctx.moveTo(X(p.x), Y(p.y)); else ctx.lineTo(X(p.x), Y(p.y));
+      }
+      ctx.stroke();
+    }
+    // waypoint marks on the plan
+    ctx.fillStyle = PATHCOL;
+    ctx.globalAlpha = 0.35;
+    var wr = Math.max(1.1, sc * 0.16);
+    for (i = 0; i < 4; i++) {
+      var wps = world.machines[i].wps;
+      for (j = 0; j < wps.length; j++) {
+        ctx.beginPath();
+        ctx.arc(X(wps[j].x), Y(wps[j].y), wr, 0, TAU);
+        ctx.fill();
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    // machine states for this frame (shared by bodies, rings and readout logic)
+    var anyOut = false;
+    var states = [];
+    for (i = 0; i < 4; i++) {
+      var A0 = actualAt(world.machines[i], i, t);
+      states.push(A0);
+      var e0 = Math.sqrt(A0.ex * A0.ex + A0.ey * A0.ey);
+      if (e0 > TOL) anyOut = true;
+    }
+
+    // machine bodies: small, precise instruments, drawn before the rings
+    // so the tolerance circle stays visible on top (see process.md)
+    for (i = 0; i < 4; i++) {
+      m = world.machines[i];
+      var A2 = states[i];
+      var bx = X(A2.x), by = Y(A2.y);
+      var ang = headingAt(m, t);
+      var big = phone ? 1.3 : 1.0;
+      ctx.save();
+      ctx.translate(bx, by);
+      ctx.rotate(ang);
+      ctx.fillStyle = MACHINE;
+      ctx.globalAlpha = 0.94;
+      if (m.kind === 'cube') {
+        var s2 = 0.85 * big * sc;
+        ctx.fillRect(-s2 / 2, -s2 / 2, s2, s2);
+      } else {
+        var bw = 1.3 * big * sc, bh = 0.85 * big * sc;
+        ctx.fillRect(-bw / 2, -bh / 2, bw, bh);
+        // wheel cuts: the stage showing through, fore and aft
+        ctx.fillStyle = STAGE;
+        var ww = 0.34 * big * sc, wh = 0.2 * big * sc;
+        ctx.fillRect(bw * 0.26 - ww / 2, -bh / 2 - wh * 0.4, ww, wh);
+        ctx.fillRect(bw * 0.26 - ww / 2, bh / 2 - wh * 0.6, ww, wh);
+        ctx.fillRect(-bw * 0.26 - ww / 2, -bh / 2 - wh * 0.4, ww, wh);
+        ctx.fillRect(-bw * 0.26 - ww / 2, bh / 2 - wh * 0.6, ww, wh);
+      }
+      ctx.restore();
+      // the exact centre of the machine: a dark point, so position can be judged against the ring
+      ctx.fillStyle = STAGE;
+      ctx.globalAlpha = 0.85;
+      ctx.beginPath();
+      ctx.arc(bx, by, Math.max(0.9, sc * 0.15), 0, TAU);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    // ---- tolerance circles and intended points, drawn over the bodies ----
+    for (i = 0; i < 4; i++) {
+      m = world.machines[i];
+      var A = states[i];
+      var err = Math.sqrt(A.ex * A.ex + A.ey * A.ey);
+
+      // the tolerance circle, centred on the intended point (drawn magnified, see TOL_DRAW)
+      var cx = X(A.px), cy = Y(A.py);
+      var rr = TOL_DRAW * sc;
+      if (err > TOL) {
+        // outside tolerance: the circle flashes amber (house amber for the prompt's amber)
+        ctx.strokeStyle = AMBER;
+        ctx.globalAlpha = 0.6 + 0.32 * Math.sin(t * 9);
+        ctx.lineWidth = Math.max(1.8, sc * 0.07);
+      } else {
+        ctx.strokeStyle = TOLCOL;
+        ctx.globalAlpha = 0.4;
+        ctx.lineWidth = Math.max(1.6, sc * 0.05);
+      }
+      ctx.beginPath();
+      ctx.arc(cx, cy, rr, 0, TAU);
+      ctx.stroke();
+      // the intended point itself
+      ctx.fillStyle = TOLCOL;
+      ctx.globalAlpha = err > TOL ? 0.85 : 0.55;
+      ctx.beginPath();
+      ctx.arc(cx, cy, Math.max(0.9, sc * 0.13), 0, TAU);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    // ---- the measure readout: the only text, tap-summoned, fading ----
+    if (readout && t - readout.t0 < 4) {
+      var rm = world.machines[readout.idx];
+      var RA = actualAt(rm, readout.idx, t);
+      var rerr = Math.sqrt(RA.ex * RA.ex + RA.ey * RA.ey) * CM_PER_UNIT;
+      var fade = clamp((readout.t0 + 4 - t) / 1.2, 0, 1);
+      var fs = clamp(Math.min(W, H) * 0.019, 10, 15);
+      ctx.font = fs + 'px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillStyle = AMBER;
+      ctx.globalAlpha = 0.95 * fade;
+      ctx.fillText(rerr.toFixed(1) + ' cm', X(RA.x), Y(RA.y) - 3.2 * sc);
+      ctx.globalAlpha = 1;
+    }
+
+    updateAudio(anyOut);
+  }
+
+  // ---------- interaction ----------
+  function toStage(e) {
+    var r = { left: 0, top: 0, width: W, height: H };
+    if (canvas.getBoundingClientRect) r = canvas.getBoundingClientRect();
+    var L = layout();
+    return {
+      x: ((e.clientX - r.left) / (r.width || W) * W - L.ox) / L.scale,
+      y: ((e.clientY - r.top) / (r.height || H) * H - L.oy) / L.scale
+    };
+  }
+
+  function onDown(e) {
+    ensureAudio();
+    var p = toStage(e);
+    var t = nowT();
+    downInfo = { x: p.x, y: p.y, moved: false };
+    var idx = nearestMachine(p.x, p.y, t, 16);
+    if (idx >= 0) {
+      var m = world.machines[idx];
+      var P = intendedAt(m, t);
+      var A = actualAt(m, idx, t);
+      grab = { idx: idx, ox: A.x - P.x, oy: A.y - P.y };
+    }
+  }
+  function onMove(e) {
+    if (!downInfo) return;
+    var p = toStage(e);
+    if (Math.abs(p.x - downInfo.x) > 0.8 || Math.abs(p.y - downInfo.y) > 0.8) downInfo.moved = true;
+    if (grab) {
+      var t = nowT();
+      var m = world.machines[grab.idx];
+      var P = intendedAt(m, t);
+      var ox = p.x - P.x, oy = p.y - P.y;
+      var mag = Math.sqrt(ox * ox + oy * oy);
+      if (mag > PUSH_MAX) { ox *= PUSH_MAX / mag; oy *= PUSH_MAX / mag; }
+      grab.ox = ox; grab.oy = oy;
+      draw();
+    }
+  }
+  function onUp(e) {
+    if (!downInfo) return;
+    var wasDrag = downInfo.moved;
+    var t = nowT();
+    if (grab) {
+      // release: the recovery event. The machine now works back at a steady rate.
+      pushes[grab.idx] = { t0: t, ox: grab.ox, oy: grab.oy };
+      grab = null;
+    }
+    downInfo = null;
+    if (wasDrag) { draw(); return; }
+    // tap
+    if (sim.step - sim.lastTapStep < 42) { // double-tap (about 0.35 s): new measure
+      buildWorld((world.seed * 1664525 + 1013904223) >>> 0);
+      pushes = [null, null, null, null];
+      readout = null;
+      sim.lastTapStep = -100000;
+      draw();
+      return;
+    }
+    sim.lastTapStep = sim.step;
+    var p = toStage(e);
+    var idx = nearestMachine(p.x, p.y, t, 18);
+    if (idx >= 0) readout = { idx: idx, t0: t };
+    draw();
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', function () {
+      if (grab) { pushes[grab.idx] = { t0: nowT(), ox: grab.ox, oy: grab.oy }; grab = null; }
+      downInfo = null;
+    });
+  }
+
+  // ---------- boot: frame one at t = 16 s, then the live clock ----------
+  fit();
+  buildWorld(BASE_SEED);
+  draw();
+
+  if (typeof requestAnimationFrame !== 'undefined') {
+    var lastMs = null;
+    var loopFn = function (ms) {
+      if (lastMs === null) lastMs = ms;
+      var elapsed = (ms - lastMs) / 1000;
+      lastMs = ms;
+      if (elapsed > 0.25) elapsed = 0.25;
+      var steps = Math.round(elapsed / DT);
+      if (steps > 30) steps = 30;
+      for (var q = 0; q < steps; q++) { sim.step++; audioStep(nowT()); }
+      draw();
+      requestAnimationFrame(loopFn);
+    };
+    requestAnimationFrame(loopFn);
+  }
+})();
+</script>
+</body>
+</html>

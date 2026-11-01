@@ -1,0 +1,842 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Carts Drive Themselves</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #070809; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- palette (strict) ----------
+  var COURTYARD = '#070809';
+  var TEMPLE = '#1C1E24';
+  var CART = '#FFFFFF';
+  var POOL = '#FFE9B8';
+  var CROWD = '#7FD4FF';
+  var TRAIL = '#FFE9B8';
+
+  var LOOP = 75;              // seconds: every cart schedule sums to exactly this
+  var T0 = 24;                // frame one phase
+  var BASE_SEED = 1055216;
+
+  // ==== NIGHT MATH BEGIN ====
+  // Pure, DOM-free. Four carts on crossing rectangular loops around the
+  // temple. Each cart schedule is a list of pieces in local time:
+  //   go   : constant velocity along the route
+  //   dec  : linear deceleration to a stop (the approach to a yield)
+  //   wait : dwell (waypoint pause, yield wait, or home slack)
+  //   acc  : linear acceleration back to cruise (leaving a yield)
+  // Position is a closed-form function of local time: piece -> route
+  // distance -> point on the polyline. Yields are not scripted by hand:
+  // after routes and phases are seeded, the builder scans all cart pairs
+  // over the whole loop, finds the earliest conflict (two carts closer
+  // than SAFE), and inserts a yield dwell for the lower-priority cart,
+  // stopping it short of the crossing. It repeats until the loop is
+  // conflict-free or the iteration budget runs out. Priority is fixed:
+  // the lower index never yields to the higher.
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  var SAFE = 42;              // conflict distance, logical units
+  var STOP_SHORT = 82;        // yield stop point sits this far before the conflict
+  var DEC_T = 0.7;            // yield deceleration / acceleration time
+  var WP_WAIT = 0.55;         // waypoint dwell
+  var TRAVEL_T = 62;          // target cruise time per loop before dwells
+
+  // rectangles [x0, y0, x1, y1], interleaved so every pair of routes
+  // crosses several times; parallel edges of different rects stay at
+  // least 50 units apart so side-by-side running never reads as conflict
+  var RECTS = [
+    [-430, -200, 445, 200],
+    [-190, -430, 190, 430],
+    [-300, -300, 320, 260],
+    [-110, -380, 385, 150]
+  ];
+
+  function buildRoute(rng, rect, dir) {
+    var j = function () { return (rng() * 2 - 1) * 3; };
+    var x0 = rect[0] + j(), y0 = rect[1] + j(), x1 = rect[2] + j(), y1 = rect[3] + j();
+    var mx = (x0 + x1) / 2, my = (y0 + y1) / 2;
+    var pts = [
+      [x0, y0], [mx, y0], [x1, y0], [x1, my],
+      [x1, y1], [mx, y1], [x0, y1], [x0, my]
+    ];
+    if (dir < 0) pts = [pts[0]].concat(pts.slice(1).reverse());
+    var cum = [0], total = 0, i;
+    for (i = 0; i < 8; i++) {
+      var a = pts[i], b = pts[(i + 1) % 8];
+      total += Math.abs(b[0] - a[0]) + Math.abs(b[1] - a[1]);
+      cum.push(total);
+    }
+    return { pts: pts, cum: cum, total: total };
+  }
+
+  function pointAt(route, s) {
+    var L = route.total;
+    s = s % L; if (s < 0) s += L;
+    var lo = 0, hi = 8;
+    while (lo < hi - 1) { var mid = (lo + hi) >> 1; if (route.cum[mid] <= s) lo = mid; else hi = mid; }
+    var a = route.pts[lo], b = route.pts[(lo + 1) % 8];
+    var segLen = route.cum[lo + 1] - route.cum[lo];
+    var u = segLen > 0 ? (s - route.cum[lo]) / segLen : 0;
+    return {
+      x: a[0] + (b[0] - a[0]) * u,
+      y: a[1] + (b[1] - a[1]) * u,
+      dx: Math.sign(b[0] - a[0]), dy: Math.sign(b[1] - a[1])
+    };
+  }
+
+  // Build one cart's piece list from its yield stops.
+  // yields: [{dist, wait}] sorted by dist. Waypoint waits are hard stops;
+  // yield stops get a dec/acc ramp pair. A final home wait fills the loop.
+  function buildSchedule(route, speed, yields) {
+    var stops = [], i;
+    for (i = 1; i < 8; i++) stops.push({ dist: route.cum[i], wait: WP_WAIT, ramp: false });
+    for (i = 0; i < yields.length; i++) stops.push({ dist: yields[i].dist, wait: yields[i].wait, ramp: true });
+    stops.sort(function (a, b) { return a.dist - b.dist; });
+    // merge stops that land too close together (waits add, ramp wins)
+    var merged = [];
+    for (i = 0; i < stops.length; i++) {
+      var st = stops[i];
+      var prev = merged[merged.length - 1];
+      if (prev && st.dist - prev.dist < 60) {
+        prev.wait += st.wait;
+        prev.ramp = prev.ramp || st.ramp;
+      } else merged.push({ dist: st.dist, wait: st.wait, ramp: st.ramp });
+    }
+    var pieces = [], ct = 0, cd = 0;
+    var decLen = speed * DEC_T / 2;
+    function go(toDist) {
+      if (toDist - cd < 0.01) return;
+      var dur = (toDist - cd) / speed;
+      pieces.push({ t0: ct, dur: dur, kind: 'go', s0: cd, v: speed });
+      ct += dur; cd = toDist;
+    }
+    for (i = 0; i < merged.length; i++) {
+      var ev = merged[i];
+      if (ev.ramp) {
+        go(Math.max(cd, ev.dist - decLen));
+        pieces.push({ t0: ct, dur: DEC_T, kind: 'dec', s0: cd, v: speed });
+        ct += DEC_T; cd += decLen;
+        pieces.push({ t0: ct, dur: ev.wait, kind: 'wait', s0: cd, v: 0 });
+        ct += ev.wait;
+        pieces.push({ t0: ct, dur: DEC_T, kind: 'acc', s0: cd, v: speed });
+        ct += DEC_T; cd += decLen;
+      } else {
+        go(ev.dist);
+        pieces.push({ t0: ct, dur: ev.wait, kind: 'wait', s0: cd, v: 0 });
+        ct += ev.wait;
+      }
+    }
+    go(route.total);
+    var home = LOOP - ct;
+    if (home > 0) pieces.push({ t0: ct, dur: home, kind: 'wait', s0: 0, v: 0 });
+    return { pieces: pieces, total: ct, overflow: home < 0, stops: merged };
+  }
+
+  function schedDistAt(sched, lt) {
+    var pieces = sched.pieces;
+    for (var i = 0; i < pieces.length; i++) {
+      var p = pieces[i];
+      if (lt >= p.t0 && lt < p.t0 + p.dur) {
+        var dt = lt - p.t0;
+        if (p.kind === 'go') return { s: p.s0 + p.v * dt, kind: 'go' };
+        if (p.kind === 'dec') return { s: p.s0 + p.v * dt - (p.v / (2 * DEC_T)) * dt * dt, kind: 'dec' };
+        if (p.kind === 'acc') return { s: p.s0 + (p.v / (2 * DEC_T)) * dt * dt, kind: 'acc' };
+        return { s: p.s0, kind: 'wait' };
+      }
+    }
+    return { s: 0, kind: 'wait' };
+  }
+
+  function buildNight(seed) {
+    var rng = mulberry32(seed);
+    var routes = [], speeds = [], i;
+    for (i = 0; i < 4; i++) {
+      var route = buildRoute(rng, RECTS[i], i % 2 === 0 ? 1 : -1);
+      routes.push(route);
+      speeds.push(route.total / TRAVEL_T);
+    }
+    var carts = null;
+    function stateAt(cart, t) {
+      var lt = (t + cart.offset) % LOOP;
+      if (lt < 0) lt += LOOP;
+      var sd = schedDistAt(cart.sched, lt);
+      var pt = pointAt(cart.route, sd.s);
+      return { x: pt.x, y: pt.y, dx: pt.dx, dy: pt.dy, s: sd.s, kind: sd.kind, lt: lt };
+    }
+    function rebuild() {
+      for (var k = 0; k < 4; k++) carts[k].sched = buildSchedule(carts[k].route, carts[k].speed, carts[k].yields);
+    }
+    function scanEarliest(step) {
+      for (var tt = 0; tt < LOOP; tt += step) {
+        var pos = [];
+        for (var i2 = 0; i2 < 4; i2++) pos.push(stateAt(carts[i2], tt));
+        for (var a = 0; a < 4; a++) {
+          for (var b = a + 1; b < 4; b++) {
+            var dx = pos[a].x - pos[b].x, dy = pos[a].y - pos[b].y;
+            if (dx * dx + dy * dy < SAFE * SAFE) return { t: tt, a: a, b: b };
+          }
+        }
+      }
+      return null;
+    }
+    function countEvents() {
+      var events = 0, inside = false;
+      for (var tt = 0; tt < LOOP; tt += 0.1) {
+        var pos = [], any = false;
+        for (var i2 = 0; i2 < 4; i2++) pos.push(stateAt(carts[i2], tt));
+        for (var a = 0; a < 4 && !any; a++) {
+          for (var b = a + 1; b < 4; b++) {
+            var dx = pos[a].x - pos[b].x, dy = pos[a].y - pos[b].y;
+            if (dx * dx + dy * dy < SAFE * SAFE) { any = true; break; }
+          }
+        }
+        if (any && !inside) events++;
+        inside = any;
+      }
+      return events;
+    }
+    // Meetings are engineered, not hoped for. Seeded offsets alone space
+    // the fleet so politely that nothing ever meets, so the builder picks
+    // real crossing points of the route geometry and sets each cart's
+    // phase so pairs arrive at a shared crossing together: cart 1 meets
+    // cart 0, cart 2 meets cart 1, cart 3 meets cart 2. Those arrivals
+    // are genuine conflicts; the resolver below turns them into yields.
+    function crossingsBetween(ra, rb) {
+      var out = [];
+      for (var i2 = 0; i2 < 8; i2++) {
+        var a1 = ra.pts[i2], a2 = ra.pts[(i2 + 1) % 8];
+        for (var j2 = 0; j2 < 8; j2++) {
+          var b1 = rb.pts[j2], b2 = rb.pts[(j2 + 1) % 8];
+          var aVert = a1[0] === a2[0], bVert = b1[0] === b2[0];
+          if (aVert === bVert) continue;
+          var vx = aVert ? a1[0] : b1[0];
+          var hy = aVert ? b1[1] : a1[1];
+          var aLo = Math.min(aVert ? a1[1] : a1[0], aVert ? a2[1] : a2[0]);
+          var aHi = Math.max(aVert ? a1[1] : a1[0], aVert ? a2[1] : a2[0]);
+          var bLo = Math.min(aVert ? b1[0] : b1[1], aVert ? b2[0] : b2[1]);
+          var bHi = Math.max(aVert ? b1[0] : b1[1], aVert ? b2[0] : b2[1]);
+          var along1 = aVert ? hy : vx, along2 = aVert ? vx : hy;
+          if (along1 <= aLo || along1 >= aHi || along2 <= bLo || along2 >= bHi) continue;
+          var sa = ra.cum[i2] + Math.abs(along1 - (aVert ? a1[1] : a1[0]));
+          var sb = rb.cum[j2] + Math.abs(along2 - (aVert ? b1[0] : b1[1]));
+          out.push({ sa: sa, sb: sb, x: vx, y: hy });
+        }
+      }
+      return out;
+    }
+    function timeAtDist(sched, s) {
+      var pieces = sched.pieces;
+      for (var i2 = 0; i2 < pieces.length; i2++) {
+        var p = pieces[i2];
+        var sEnd = p.kind === 'wait' ? p.s0 :
+          p.kind === 'go' ? p.s0 + p.v * p.dur :
+          p.s0 + p.v * p.dur / 2;
+        if (s <= sEnd + 1e-9) {
+          if (p.kind === 'wait') return p.t0;
+          if (p.kind === 'go') return p.t0 + (s - p.s0) / p.v;
+          // dec/acc: invert the quadratic, take the root inside the piece
+          var A = p.kind === 'dec' ? -p.v / (2 * DEC_T) : p.v / (2 * DEC_T);
+          var B = p.kind === 'dec' ? p.v : 0;
+          var disc = B * B + 4 * A * (s - p.s0);
+          if (disc < 0) return p.t0;
+          var r1 = (-B + Math.sqrt(disc)) / (2 * A), r2 = (-B - Math.sqrt(disc)) / (2 * A);
+          var dt = (r1 >= 0 && r1 <= p.dur) ? r1 : r2;
+          return p.t0 + dt;
+        }
+      }
+      return LOOP;
+    }
+    function resolveYields() {
+      var iter = 0, resolved = false;
+      while (iter < 90) {
+        iter++;
+        var found = scanEarliest(0.05);
+        if (!found) { resolved = true; break; }
+        var yielder = carts[Math.max(found.a, found.b)];
+        var stY = stateAt(yielder, found.t);
+        var dStop = stY.s - STOP_SHORT;
+        if (dStop < 0) dStop += yielder.route.total;
+        var ex = null;
+        for (var i2 = 0; i2 < yielder.yields.length; i2++) {
+          var dd = Math.abs(yielder.yields[i2].dist - dStop);
+          if (dd < 130 || dd > yielder.route.total - 130) { ex = yielder.yields[i2]; break; }
+        }
+        if (ex) ex.wait += 1.6;
+        else yielder.yields.push({ dist: dStop, wait: 2.2 });
+        yielder.yields.sort(function (p, q) { return p.dist - q.dist; });
+        rebuild();
+      }
+      return { resolved: resolved, iter: iter };
+    }
+    function yieldStopCount() {
+      var n = 0;
+      for (var i2 = 0; i2 < 4; i2++) n += carts[i2].yields.length;
+      return n;
+    }
+    var chosen = null, totalIter = 0, bestScore = -1, fallback = null;
+    for (var attempt = 0; attempt < 12 && !chosen; attempt++) {
+      var offsets;
+      if (attempt === 0) {
+        // engineered phases: base schedules first, then chain the meetings
+        carts = [];
+        for (i = 0; i < 4; i++) {
+          carts.push({ idx: i, route: routes[i], speed: speeds[i], offset: 0, yields: [], sched: null });
+        }
+        rebuild();
+        offsets = [rng() * LOOP, 0, 0, 0];
+        var chain = [[0, 1], [1, 2], [2, 3]];
+        var usedOn = [[], [], [], []];
+        for (var ci = 0; ci < chain.length; ci++) {
+          var ca = chain[ci][0], cb = chain[ci][1];
+          var xs = crossingsBetween(routes[ca], routes[cb]);
+          if (!xs.length) continue;
+          var pick = xs[0], pickScore = -1;
+          for (var xi = 0; xi < xs.length; xi++) {
+            var sc = 1e9;
+            for (var u = 0; u < usedOn[ca].length; u++) sc = Math.min(sc, Math.abs(xs[xi].sa - usedOn[ca][u]));
+            for (var v = 0; v < usedOn[cb].length; v++) sc = Math.min(sc, Math.abs(xs[xi].sb - usedOn[cb][v]));
+            if (sc > pickScore) { pickScore = sc; pick = xs[xi]; }
+          }
+          usedOn[ca].push(pick.sa); usedOn[cb].push(pick.sb);
+          var ta = timeAtDist(carts[ca].sched, pick.sa);
+          var tb = timeAtDist(carts[cb].sched, pick.sb);
+          offsets[cb] = offsets[ca] + ta - tb;
+        }
+        for (i = 0; i < 4; i++) {
+          offsets[i] = offsets[i] % LOOP;
+          if (offsets[i] < 0) offsets[i] += LOOP;
+        }
+      } else {
+        offsets = [rng() * LOOP, rng() * LOOP, rng() * LOOP, rng() * LOOP];
+      }
+      carts = [];
+      for (i = 0; i < 4; i++) {
+        carts.push({ idx: i, route: routes[i], speed: speeds[i], offset: offsets[i], yields: [], sched: null });
+      }
+      rebuild();
+      var events = countEvents();
+      var res = resolveYields();
+      totalIter += res.iter;
+      var overflow = false;
+      for (i = 0; i < 4; i++) if (carts[i].sched.overflow) overflow = true;
+      var stops = yieldStopCount();
+      var score = stops * 10 - (overflow ? 100 : 0) - (res.resolved ? 0 : 50);
+      if (res.resolved && !overflow && stops >= 2) {
+        chosen = { eventsBefore: events };
+      } else if (score > bestScore) {
+        bestScore = score;
+        fallback = { cartsData: carts, events: events };
+      }
+    }
+    if (!chosen && fallback) {
+      carts = fallback.cartsData;
+      chosen = { eventsBefore: fallback.events };
+    }
+    if (!chosen) chosen = { eventsBefore: -1 };
+    // Rotate every offset by one common shift so a real yield wait opens
+    // at about t = 23.5: frame one catches a cart stopped at a crossing.
+    // A common rotation preserves all relative timing, so the resolved
+    // schedules stay conflict-free.
+    var yieldStarts = [];
+    for (i = 0; i < 4; i++) {
+      var pieces = carts[i].sched.pieces;
+      for (var pi = 0; pi < pieces.length; pi++) {
+        if (pieces[pi].kind === 'dec' && pi + 1 < pieces.length) {
+          var g = (pieces[pi + 1].t0 - carts[i].offset) % LOOP;
+          if (g < 0) g += LOOP;
+          yieldStarts.push(g);
+        }
+      }
+    }
+    if (yieldStarts.length) {
+      var delta = yieldStarts[0] - 23.5;
+      for (i = 0; i < 4; i++) {
+        carts[i].offset = (carts[i].offset + delta) % LOOP;
+        if (carts[i].offset < 0) carts[i].offset += LOOP;
+      }
+    }
+    return {
+      carts: carts, iterations: totalIter,
+      resolved: chosen.eventsBefore >= 0,
+      eventsBefore: chosen.eventsBefore,
+      yieldCount: yieldStarts.length,
+      stateAt: stateAt
+    };
+  }
+  // ==== NIGHT MATH END ====
+
+  var seed = BASE_SEED;
+  var night = buildNight(seed);
+  var pieceT = T0;
+
+  // ---------- crowd: seeded fixed-step drift sim (lights, not people) ----------
+  var CROWD_N = 120;
+  var crowd = [];
+  var crowdT = 0;
+  function crowdInit(sd) {
+    var rng = mulberry32(sd ^ 0x9E3779B9);
+    crowd = [];
+    for (var i = 0; i < CROWD_N; i++) {
+      crowd.push({
+        x: (rng() * 2 - 1) * 490,
+        y: (rng() * 2 - 1) * 490,
+        ph: rng() * Math.PI * 2,
+        sp: 0.55 + rng() * 0.8
+      });
+    }
+    crowdT = pieceT;
+  }
+  function crowdStep(dt) {
+    crowdT += dt;
+    var drag = dragNow();
+    for (var i = 0; i < crowd.length; i++) {
+      var d = crowd[i];
+      var vx = (Math.sin(d.y * 0.006 + crowdT * 0.11 + d.ph) * 14 +
+                Math.cos(d.x * 0.0035 - crowdT * 0.07) * 8) * d.sp;
+      var vy = (Math.cos(d.x * 0.006 - crowdT * 0.09 + d.ph * 1.7) * 14 +
+                Math.sin(d.y * 0.0035 + crowdT * 0.06) * 8) * d.sp;
+      if (drag) {
+        var dx = drag[0] - d.x, dy = drag[1] - d.y;
+        var dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist < 150 && dist > 1) {
+          var pull = (1 - dist / 150) * 26;
+          vx += dx / dist * pull; vy += dy / dist * pull;
+        }
+      }
+      d.x += vx * dt; d.y += vy * dt;
+      // the temple is solid: drift around it, never through it
+      if (Math.abs(d.x) < 92 && Math.abs(d.y) < 74) {
+        if (92 - Math.abs(d.x) < 74 - Math.abs(d.y)) d.x = d.x < 0 ? -92 : 92;
+        else d.y = d.y < 0 ? -74 : 74;
+      }
+      if (d.x > 498) d.x -= 996; if (d.x < -498) d.x += 996;
+      if (d.y > 498) d.y -= 996; if (d.y < -498) d.y += 996;
+    }
+  }
+
+  // ---------- per-cart live state: holds, detours, trails ----------
+  var cartsLive = [];
+  function liveInit() {
+    cartsLive = [];
+    for (var i = 0; i < 4; i++) {
+      cartsLive.push({ holdShift: 0, held: false, detX: 0, detY: 0, trail: [] });
+    }
+  }
+  var reveal = { cart: -1, t: -10 };   // tap: route revealed bright
+  var pointer = { down: false, x: 0, y: 0 };
+  var dragPath = [];                    // recent drag points {x, y, t}
+  function dragNow() {
+    if (!pointer.down) return null;
+    return [pointer.x, pointer.y];
+  }
+  function cartDrawn(i, t) {
+    var cart = night.carts[i];
+    var lv = cartsLive[i];
+    var st = night.stateAt(cart, t - lv.holdShift);
+    var x = st.x + lv.detX, y = st.y + lv.detY;
+    return { x: x, y: y, dx: st.dx, dy: st.dy, kind: st.kind, baseX: st.x, baseY: st.y };
+  }
+  var TRAIL_SPAN = 6.5, TRAIL_STEP = 0.32, lastSample = -1;
+  function sampleTrails() {
+    for (var i = 0; i < 4; i++) {
+      var d = cartDrawn(i, pieceT);
+      var tr = cartsLive[i].trail;
+      tr.push({ x: d.x, y: d.y, t: pieceT });
+      while (tr.length && pieceT - tr[0].t > TRAIL_SPAN) tr.shift();
+    }
+    lastSample = pieceT;
+  }
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 720, H = 720;
+  var phoneNow = false;
+  var sizeMul = 1;
+
+  function isPhone() {
+    var sw = 0, sh = 0;
+    if (typeof window !== 'undefined' && window.screen) {
+      sw = window.screen.width || 0; sh = window.screen.height || 0;
+    }
+    var mn = Math.min(sw, sh);
+    if (mn > 0 && mn < 700) return true;
+    return H > W * 1.15; // aspect fallback only
+  }
+  function fit() {
+    var vv = (typeof window !== 'undefined') ? window.visualViewport : null;
+    if (vv && vv.width) { W = vv.width; H = vv.height; }
+    else if (typeof window !== 'undefined' && window.innerWidth) { W = window.innerWidth; H = window.innerHeight; }
+    canvas.width = Math.round(W);
+    canvas.height = Math.round(H);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    phoneNow = isPhone();
+    sizeMul = phoneNow ? 1.35 : 1;
+  }
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', function () { fit(); draw(); });
+    }
+    if (window.addEventListener) {
+      window.addEventListener('resize', function () { fit(); draw(); });
+    }
+  }
+
+  // ---------- coordinates: logical 1000x1000 courtyard, contain-fit ----------
+  function scale() { return Math.min(W, H) / 1000; }
+  function toPx(x, y) { var s = scale(); return [W / 2 + x * s, H / 2 + y * s]; }
+  function toLogical(px, py) { var s = scale(); return [(px - W / 2) / s, (py - H / 2) / s]; }
+
+  // ---------- audio (lazy, guarded; first gesture only) ----------
+  var AC = null, cartOsc = [], cartGain = [], airGain = null;
+  var lastTickAt = -10;
+  function ensureAudio() {
+    if (AC) { if (AC.resume) { try { AC.resume(); } catch (e) {} } return; }
+    var Ctor = null;
+    if (typeof AudioContext !== 'undefined') Ctor = AudioContext;
+    else if (typeof window !== 'undefined' && window.webkitAudioContext) Ctor = window.webkitAudioContext;
+    if (!Ctor) return;
+    try {
+      AC = new Ctor();
+      var len = 2 * AC.sampleRate;
+      var buf = AC.createBuffer(1, len, AC.sampleRate);
+      var ch = buf.getChannelData(0);
+      for (var i = 0; i < len; i++) ch[i] = Math.random() * 2 - 1;
+      var src = AC.createBufferSource();
+      src.buffer = buf; src.loop = true;
+      var lp = AC.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 240;
+      airGain = AC.createGain(); airGain.gain.value = 0.010;
+      src.connect(lp); lp.connect(airGain); airGain.connect(AC.destination);
+      src.start();
+      var baseF = [96, 128, 108, 144];
+      for (i = 0; i < 4; i++) {
+        var o = AC.createOscillator(); o.type = 'sine'; o.frequency.value = baseF[i];
+        var g = AC.createGain(); g.gain.value = 0;
+        o.connect(g); g.connect(AC.destination); o.start();
+        cartOsc.push(o); cartGain.push(g);
+      }
+    } catch (e) { AC = null; }
+  }
+  function tick(freq, gain) {
+    if (!AC) return;
+    try {
+      var t = AC.currentTime;
+      var o = AC.createOscillator(), g = AC.createGain();
+      o.type = 'sine'; o.frequency.value = freq;
+      g.gain.setValueAtTime(gain, t);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.5);
+      o.connect(g); g.connect(AC.destination);
+      o.start(t); o.stop(t + 0.55);
+    } catch (e) {}
+  }
+  function updateAudio() {
+    if (!AC) return;
+    try {
+      var t = AC.currentTime;
+      var baseF = [96, 128, 108, 144];
+      for (var i = 0; i < 4; i++) {
+        var cart = night.carts[i];
+        var lv = cartsLive[i];
+        var st = night.stateAt(cart, pieceT - lv.holdShift);
+        var moving = st.kind === 'go' || st.kind === 'acc';
+        var yielding = st.kind === 'wait' || st.kind === 'dec' || lv.held;
+        var dip = yielding ? 0.45 : 1;             // the tone dips while it yields
+        cartOsc[i].frequency.setTargetAtTime(baseF[i] * (moving ? 1.12 : 0.94) * dip + (yielding ? 0 : 6), t, 0.12);
+        cartGain[i].gain.setTargetAtTime(yielding ? 0.006 : 0.013, t, 0.15);
+      }
+      // faint individual crowd tones: a sparse tick voiced from the field
+      if (pieceT - lastTickAt > 0.8 && crowd.length) {
+        lastTickAt = pieceT;
+        var d = crowd[Math.floor(pieceT * 7) % crowd.length];
+        tick(420 + (d.x + 500) * 0.5, 0.008);
+      }
+    } catch (e) {}
+  }
+
+  // ---------- drawing ----------
+  function drawTempleAndRoofs() {
+    var s = scale();
+    ctx.strokeStyle = TEMPLE;
+    ctx.lineWidth = Math.max(1.5, 2.2 * s);
+    // the temple, small at the center: nested rectangles and a cross
+    var tw = 70 * s, th = 52 * s, cx = W / 2, cy = H / 2;
+    ctx.strokeRect(cx - tw, cy - th, tw * 2, th * 2);
+    ctx.strokeRect(cx - tw * 0.62, cy - th * 0.62, tw * 1.24, th * 1.24);
+    ctx.beginPath();
+    ctx.moveTo(cx - tw, cy); ctx.lineTo(cx + tw, cy);
+    ctx.moveTo(cx, cy - th); ctx.lineTo(cx, cy + th);
+    ctx.stroke();
+    // rooflines at the edges: simple gables, the venue held
+    ctx.lineWidth = Math.max(1.2, 1.8 * s);
+    var roofs = [
+      [-470, -452, -330, -452, -400, -486],
+      [250, -458, 420, -458, 335, -490],
+      [-462, 300, -462, 430, -428, 365],
+      [300, 458, 460, 458, 380, 424],
+      [452, -120, 452, 40, 484, -40]
+    ];
+    for (var i = 0; i < roofs.length; i++) {
+      var r = roofs[i];
+      var p1 = toPx(r[0], r[1]), p2 = toPx(r[2], r[3]), p3 = toPx(r[4], r[5]);
+      ctx.beginPath();
+      ctx.moveTo(p1[0], p1[1]); ctx.lineTo(p3[0], p3[1]); ctx.lineTo(p2[0], p2[1]);
+      ctx.stroke();
+    }
+  }
+
+  function draw() {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    var s = scale();
+    ctx.fillStyle = COURTYARD;
+    ctx.fillRect(0, 0, W, H);
+    var i, j, p;
+
+    drawTempleAndRoofs();
+
+    // crowd: small cool lights wandering, drawn under everything that moves
+    ctx.fillStyle = CROWD;
+    for (i = 0; i < crowd.length; i++) {
+      var d = crowd[i];
+      p = toPx(d.x, d.y);
+      var tw2 = 0.42 + 0.30 * Math.sin(crowdT * 1.7 + d.ph * 3.1);
+      ctx.globalAlpha = 0.5 * Math.max(0.25, tw2);
+      ctx.beginPath();
+      ctx.arc(p[0], p[1], Math.max(0.8, 2.0 * s * sizeMul), 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // revealed route (tap): the plan, bright for five seconds
+    var revAge = pieceT - reveal.t;
+    if (reveal.cart >= 0 && revAge >= 0 && revAge < 5) {
+      var rc = night.carts[reveal.cart];
+      ctx.strokeStyle = TRAIL;
+      ctx.globalAlpha = 0.55 * (1 - revAge / 5) + 0.1;
+      ctx.lineWidth = Math.max(1.2, 2.0 * s);
+      ctx.beginPath();
+      for (i = 0; i <= 8; i++) {
+        var rp = rc.route.pts[i % 8];
+        p = toPx(rp[0], rp[1]);
+        if (i === 0) ctx.moveTo(p[0], p[1]); else ctx.lineTo(p[0], p[1]);
+      }
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+
+    // cart trails: recorded position buffers, never a canvas fade
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = TRAIL;
+    ctx.lineWidth = Math.max(1.1, 2.8 * s * sizeMul);
+    for (i = 0; i < 4; i++) {
+      var tr = cartsLive[i].trail;
+      for (j = 1; j < tr.length; j++) {
+        var age = pieceT - tr[j].t;
+        ctx.globalAlpha = 0.25 * Math.max(0, 1 - age / TRAIL_SPAN);
+        var pa = toPx(tr[j - 1].x, tr[j - 1].y), pb = toPx(tr[j].x, tr[j].y);
+        ctx.beginPath();
+        ctx.moveTo(pa[0], pa[1]); ctx.lineTo(pb[0], pb[1]);
+        ctx.stroke();
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    // carts: white domes riding on warm pools, self-driven
+    for (i = 0; i < 4; i++) {
+      var cd = cartDrawn(i, pieceT);
+      p = toPx(cd.x, cd.y);
+      var lv = cartsLive[i];
+      var yielding = cd.kind === 'wait' || cd.kind === 'dec' || lv.held;
+      // light pool beneath: layered flat ellipses, wider than the dome
+      ctx.fillStyle = POOL;
+      var poolLayers = [[30, 0.10], [21, 0.20], [14, 0.32]];
+      for (j = 0; j < poolLayers.length; j++) {
+        ctx.globalAlpha = Math.min(0.5, poolLayers[j][1] * (yielding ? 0.8 : 1));
+        ctx.save();
+        ctx.translate(p[0], p[1]);
+        ctx.scale(1, 0.62);
+        ctx.beginPath();
+        ctx.arc(0, 0, Math.max(1, poolLayers[j][0] * s * sizeMul), 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      }
+      // dome: white, full strength, with a soft layered halo
+      ctx.fillStyle = CART;
+      var domeLayers = [[13, 0.14], [8.5, 0.35], [5.2, 1.0]];
+      for (j = 0; j < domeLayers.length; j++) {
+        ctx.globalAlpha = domeLayers[j][1];
+        ctx.beginPath();
+        ctx.arc(p[0], p[1], Math.max(1, domeLayers[j][0] * s * sizeMul), 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  // ---------- world stepping (fixed steps; frame one built by pre-roll) ----------
+  var STEP = 1 / 30;
+  function stepWorld(dt) {
+    pieceT += dt;
+    crowdStep(dt);
+    // pedestrian logic: the nearest cart yields to a dragging finger
+    var i;
+    var best = -1;
+    for (i = 0; i < 4; i++) cartsLive[i].held = false;
+    if (pointer.down) {
+      var bestD = 1e9;
+      for (i = 0; i < 4; i++) {
+        var st = night.stateAt(night.carts[i], pieceT - cartsLive[i].holdShift);
+        var dx = pointer.x - st.x, dy = pointer.y - st.y;
+        var dd = Math.sqrt(dx * dx + dy * dy);
+        if (dd < bestD) { bestD = dd; best = i; }
+      }
+      if (best >= 0 && bestD < 120) {
+        var lv = cartsLive[best];
+        var bst = night.stateAt(night.carts[best], pieceT - lv.holdShift);
+        var ahead = (pointer.x - bst.x) * bst.dx + (pointer.y - bst.y) * bst.dy;
+        var nearBlock = bestD < 42 || (bestD < 120 && ahead > 10 && bst.kind === 'go');
+        if (nearBlock) {
+          // it stops for you: its own clock waits while you block the path
+          lv.held = true;
+          lv.holdShift += dt;
+        }
+        // and it reroutes around you: a lateral detour, away from the finger
+        var px = bst.x - pointer.x, py = bst.y - pointer.y;
+        var plen = Math.sqrt(px * px + py * py) || 1;
+        var want = Math.max(0, 1 - bestD / 120) * 46;
+        lv.detX += (px / plen * want - lv.detX) * Math.min(1, dt * 5);
+        lv.detY += (py / plen * want - lv.detY) * Math.min(1, dt * 5);
+      }
+    }
+    for (i = 0; i < 4; i++) {
+      if (i !== best) {
+        cartsLive[i].detX += (0 - cartsLive[i].detX) * Math.min(1, dt * 3);
+        cartsLive[i].detY += (0 - cartsLive[i].detY) * Math.min(1, dt * 3);
+      }
+    }
+    if (pieceT - lastSample >= TRAIL_STEP) sampleTrails();
+  }
+
+  function buildWorld(sd) {
+    seed = sd;
+    night = buildNight(seed);
+    liveInit();
+    reveal = { cart: -1, t: -10 };
+    var target = Math.max(pieceT, T0);
+    pieceT = target - (TRAIL_SPAN + 0.3);
+    crowdInit(seed);
+    crowdT = pieceT;
+    lastSample = pieceT - TRAIL_STEP;
+    while (pieceT < target - 1e-9) stepWorld(Math.min(STEP, target - pieceT));
+    pieceT = target;
+  }
+
+  // ---------- pointer interaction ----------
+  function evtLogical(e) {
+    var rx = 0, ry = 0;
+    if (canvas.getBoundingClientRect) {
+      var rect = canvas.getBoundingClientRect();
+      rx = rect.left; ry = rect.top;
+    }
+    return toLogical((e.clientX || 0) - rx, (e.clientY || 0) - ry);
+  }
+  var downInfo = null;
+  var lastTapT = -10, lastTapX = 0, lastTapY = 0;
+  function nearestCart(x, y) {
+    var bi = -1, bd = 1e9;
+    for (var i = 0; i < 4; i++) {
+      var d = cartDrawn(i, pieceT);
+      var dx = d.x - x, dy = d.y - y;
+      var dd = dx * dx + dy * dy;
+      if (dd < bd) { bd = dd; bi = i; }
+    }
+    return { idx: bi, dist: Math.sqrt(bd) };
+  }
+  function onDown(e) {
+    ensureAudio();
+    var p = evtLogical(e);
+    pointer.down = true; pointer.x = p[0]; pointer.y = p[1];
+    downInfo = { x: p[0], y: p[1], moved: false };
+    dragPath.push({ x: p[0], y: p[1], t: pieceT });
+  }
+  function onMove(e) {
+    if (!pointer.down) return;
+    var p = evtLogical(e);
+    pointer.x = p[0]; pointer.y = p[1];
+    if (downInfo && (Math.abs(p[0] - downInfo.x) > 6 || Math.abs(p[1] - downInfo.y) > 6)) downInfo.moved = true;
+    if (downInfo && downInfo.moved) dragPath.push({ x: p[0], y: p[1], t: pieceT });
+    if (dragPath.length > 60) dragPath = dragPath.slice(dragPath.length - 60);
+  }
+  function onUp(e) {
+    var wasDown = pointer.down;
+    pointer.down = false;
+    if (!wasDown || !downInfo) { downInfo = null; return; }
+    var p = evtLogical(e);
+    var wasDrag = downInfo.moved;
+    downInfo = null;
+    if (wasDrag) return;
+    // a tap: double-tap reseeds, single tap on a cart reveals its route
+    var dtap = pieceT - lastTapT;
+    var dpos = Math.sqrt((p[0] - lastTapX) * (p[0] - lastTapX) + (p[1] - lastTapY) * (p[1] - lastTapY));
+    if (dtap < 0.35 && dpos < 60) {
+      lastTapT = -10;
+      buildWorld((seed * 1664525 + 1013904223) >>> 0);
+      draw();
+      return;
+    }
+    lastTapT = pieceT; lastTapX = p[0]; lastTapY = p[1];
+    var nc = nearestCart(p[0], p[1]);
+    if (nc.dist < 90) reveal = { cart: nc.idx, t: pieceT };
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', function () { pointer.down = false; downInfo = null; });
+  }
+
+  // ---------- boot: pre-roll to the fixed phase, frame one, live loop ----------
+  fit();
+  pieceT = T0;
+  buildWorld(BASE_SEED);
+  draw();
+
+  if (typeof requestAnimationFrame !== 'undefined') {
+    var lastMs = null, acc = 0;
+    var loop = function (ms) {
+      if (lastMs === null) lastMs = ms;
+      var elapsed = (ms - lastMs) / 1000;
+      lastMs = ms;
+      if (elapsed > 0.25) elapsed = 0.25;
+      acc += elapsed;
+      var n = 0;
+      while (acc >= STEP && n < 8) { stepWorld(STEP); acc -= STEP; n++; }
+      if (n === 8) acc = 0;
+      draw();
+      updateAudio();
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
