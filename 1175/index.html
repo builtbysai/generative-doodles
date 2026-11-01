@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Net Art Battle — №1175</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0A0A0C; height: 100%; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded RNG (mulberry32 only) ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function clamp(x, a, b) { return x < a ? a : x > b ? b : x; }
+  function clamp01(x) { return x < 0 ? 0 : x > 1 ? 1 : x; }
+
+  // ---------- palette ----------
+  var PAGE = '#0A0A0C';
+  var CYAN = '#00FFC2', MAGENTA = '#FF2B6E';
+  var CYAN_BG = '#06110E', MAG_BG = '#11060C';
+  var PAPER = '#E8E8E8', DIM = '#888888';
+  var BOARD_BG = '#0A0A0C';
+
+  // ---------- bout constants ----------
+  var BOUT = 44;              // 40s bout + 4s draw card
+  var VOLLEYS = 10;           // one every 4s
+  var T0 = 21;                // fixed first frame: bout 0, five volleys landed
+  var TICKER_H = 26;
+
+  var ROUTE_TEAR = 0, ROUTE_CHAN = 1, ROUTE_SORT = 2;
+
+  // ---------- shared source landscape (in unit space) ----------
+  var SKY = [11, 16, 38];        // #0B1026
+  var SUN = [240, 236, 220];
+  var HILL_FAR = [140, 109, 31];
+  var HILL_NEAR = [255, 225, 77]; // #FFE14D
+  var STAR = [200, 205, 220];
+
+  var STARS = [];
+  (function () {
+    var rng = mulberry32(11750777);
+    for (var i = 0; i < 42; i++) STARS.push([rng(), rng() * 0.46]);
+  })();
+
+  var ASPECT = 1; // cols/rows of the grid currently being sampled
+  function tri(u, c, w) { var d = Math.abs(u - c) / w; return d >= 1 ? 0 : 1 - d; }
+  function baseRGB(u, v) {
+    var far = 0.66 - 0.16 * tri(u, 0.25, 0.45) - 0.10 * tri(u, 0.80, 0.35);
+    var near = 0.82 - 0.12 * tri(u, 0.60, 0.50) - 0.07 * tri(u, 0.10, 0.30);
+    if (v > near) return HILL_NEAR;
+    if (v > far) return HILL_FAR;
+    var sdx = (u - 0.68) * ASPECT, sdy = v - 0.32;
+    if (sdx * sdx + sdy * sdy < 0.115 * 0.115) return SUN;
+    for (var i = 0; i < STARS.length; i++) {
+      var dx = (u - STARS[i][0]) * ASPECT, dy = v - STARS[i][1];
+      if (dx * dx + dy * dy < 0.000045) return STAR;
+    }
+    return SKY;
+  }
+  function sampleRGB(fx, fy, ch, cols, rows) {
+    var cx = clamp(fx, 0, cols - 1), cy = clamp(fy, 0, rows - 1);
+    var u = (cx + 0.5) / cols, v = (cy + 0.5) / rows;
+    var off = ch / cols;
+    var cR = baseRGB(clamp01(u - off), v);
+    var cG = baseRGB(u, v);
+    var cB = baseRGB(clamp01(u + off), v);
+    return 'rgb(' + cR[0] + ',' + cG[1] + ',' + cB[2] + ')';
+  }
+  function lumOf(rgbStr) {
+    var m = rgbStr.match(/\d+/g);
+    return 0.2126 * (+m[0]) + 0.7152 * (+m[1]) + 0.0722 * (+m[2]);
+  }
+
+  // ---------- volleys: deterministic per bout ----------
+  var volleyCache = { key: '', list: null };
+  function volleysFor(bout, coachSide) {
+    var key = bout + '|' + coachSide;
+    if (volleyCache.key === key) return volleyCache.list;
+    var rng = mulberry32(1175000 + bout * 7919);
+    var list = [];
+    for (var i = 1; i <= VOLLEYS; i++) {
+      list.push({
+        i: i,
+        attacker: (i % 2 === 1) ? 0 : 1,      // odd volleys: LEFT attacks
+        routine: Math.floor(rng() * 3),
+        strength: 7 + Math.floor(rng() * 7),  // 7..13
+        seed: Math.floor(rng() * 1000000000)
+      });
+    }
+    if (coachSide === 0) list[0].strength *= 1.5; // LEFT's first attack
+    if (coachSide === 1) list[1].strength *= 1.5; // RIGHT's first attack
+    volleyCache = { key: key, list: list };
+    return list;
+  }
+  function dealtBy(bout, coachSide, side, landed) {
+    var list = volleysFor(bout, coachSide), sum = 0;
+    for (var k = 0; k < list.length; k++) {
+      if (list[k].i <= landed && list[k].attacker === side) sum += list[k].strength;
+    }
+    return Math.min(99, Math.round(sum));
+  }
+
+  // ---------- corruption mapping per half ----------
+  // mapX/mapY: source cell each display cell samples; chan: channel offset (cells)
+  function applyTear(h, volley) {
+    var cols = h.cols, rows = h.rows;
+    var rng = mulberry32(volley.seed);
+    var bandH = 3 + Math.floor(rng() * 3);
+    var amp = 1.5 + volley.strength * 0.55;
+    var ox = h.mapX.slice(), oy = h.mapY.slice(), oc = h.chan.slice();
+    for (var r0 = 0; r0 < rows; r0 += bandH) {
+      var dx = Math.round((rng() * 2 - 1) * amp);
+      if (dx === 0) continue;
+      for (var r = r0; r < Math.min(rows, r0 + bandH); r++) {
+        for (var c = 0; c < cols; c++) {
+          var sc = clamp(c - dx, 0, cols - 1);
+          var d = r * cols + c, s = r * cols + sc;
+          h.mapX[d] = ox[s]; h.mapY[d] = oy[s]; h.chan[d] = oc[s];
+        }
+      }
+    }
+  }
+  function applyChan(h, volley) {
+    var d = 1 + Math.round(volley.strength / 5);
+    for (var i = 0; i < h.chan.length; i++) h.chan[i] += d;
+  }
+  function applySort(h, volley) {
+    var cols = h.cols, rows = h.rows;
+    var rng = mulberry32(volley.seed ^ 0x5eed);
+    var f = Math.min(0.6, volley.strength * 0.028);
+    var runLen = 10 + Math.floor(rng() * 7);
+    for (var r = 0; r < rows; r++) {
+      if (rng() >= f) continue;
+      for (var c0 = 0; c0 < cols; c0 += runLen) {
+        var n = Math.min(runLen, cols - c0);
+        if (n < 3) continue;
+        var idx = [], lums = [];
+        for (var j = 0; j < n; j++) {
+          var cell = r * cols + c0 + j;
+          idx.push(cell);
+          lums.push(lumOf(sampleRGB(h.mapX[cell], h.mapY[cell], h.chan[cell], cols, rows)));
+        }
+        var order = idx.map(function (_, k) { return k; });
+        order.sort(function (a, b) { return lums[a] - lums[b]; });
+        var sx = [], sy = [], sc = [];
+        for (var a = 0; a < n; a++) {
+          var srcCell = idx[order[a]];
+          sx.push(h.mapX[srcCell]); sy.push(h.mapY[srcCell]); sc.push(h.chan[srcCell]);
+        }
+        for (var b = 0; b < n; b++) {
+          var dst = idx[b];
+          h.mapX[dst] = sx[b]; h.mapY[dst] = sy[b]; h.chan[dst] = sc[b];
+        }
+      }
+    }
+  }
+  function buildMapping(h, bout, landed, coachSide) {
+    var key = bout + '|' + landed + '|' + coachSide + '|' + h.cols + 'x' + h.rows;
+    if (h.mapKey === key) return;
+    var n = h.cols * h.rows;
+    h.mapX = new Float32Array(n); h.mapY = new Float32Array(n); h.chan = new Float32Array(n);
+    for (var r = 0; r < h.rows; r++) {
+      for (var c = 0; c < h.cols; c++) {
+        var i = r * h.cols + c;
+        h.mapX[i] = c; h.mapY[i] = r; h.chan[i] = 0;
+      }
+    }
+    var list = volleysFor(bout, coachSide);
+    for (var k = 0; k < list.length; k++) {
+      var v = list[k];
+      if (v.i > landed || v.attacker === h.side) continue; // only received volleys
+      if (v.routine === ROUTE_TEAR) applyTear(h, v);
+      else if (v.routine === ROUTE_CHAN) applyChan(h, v);
+      else applySort(h, v);
+    }
+    h.mapKey = key;
+  }
+
+  // ---------- chat ticker bank (30 fake crowd lines) ----------
+  var CHAT = [
+    'LETS GOOO', 'that tear was personal', 'mod pls', 'cyan corner best corner',
+    'magenta hive rise up', 'CLIP IT', 'the hills never stood a chance',
+    'row 12 just left the server', 'channel split my beloved',
+    'pixel sort? more like pixel COURT', 'ref do something',
+    'vandalism with extra steps', 'DRAW AGAIN', 'nobody wins a net art battle',
+    'my browser is crying', 'volley volley volley', 'the sun is sideways now',
+    'tactical corruption', 'imagine losing to a landscape', 'GG go next (rematch)',
+    'not in the patch notes', 'certified bruh moment', 'the ticker is the real winner',
+    'more tears per second', 'sorted. absolutely sorted', 'he is heating up',
+    'she is heating up', 'the crowd demands a rematch', 'zero ping pure chaos',
+    'frame perfect vandalism'
+  ];
+  var chatSeq = '';
+  (function () {
+    var order = CHAT.map(function (_, i) { return i; });
+    var rng = mulberry32(11754242);
+    for (var i = order.length - 1; i > 0; i--) {
+      var j = Math.floor(rng() * (i + 1));
+      var tmp = order[i]; order[i] = order[j]; order[j] = tmp;
+    }
+    chatSeq = order.map(function (i) { return CHAT[i]; }).join('   +++   ') + '   +++   ';
+  })();
+
+  // ---------- phone detection ----------
+  var sw = 0, sh = 0;
+  if (typeof window !== 'undefined' && window.screen) {
+    sw = window.screen.width || 0;
+    sh = window.screen.height || 0;
+  }
+  var minScreen = Math.min(sw || 9999, sh || 9999);
+
+  // ---------- canvas ----------
+  var canvas = document.getElementById('stage');
+  var ctx = canvas.getContext('2d');
+
+  function viewW() {
+    if (window.visualViewport && window.visualViewport.width) return window.visualViewport.width;
+    return window.innerWidth || 800;
+  }
+  function viewH() {
+    if (window.visualViewport && window.visualViewport.height) return window.visualViewport.height;
+    return window.innerHeight || 800;
+  }
+
+  var W = 0, H = 0, isPhone = false, stacked = false;
+  var layoutKey = '';
+
+  function makeHalf(side) {
+    return {
+      side: side, x: 0, y: 0, w: 0, h: 0,
+      ax: 0, ay: 0, aw: 0, ah: 0,       // arena rect
+      cell: 6, cols: 0, rows: 0, gx: 0, gy: 0,
+      mapX: null, mapY: null, chan: null, mapKey: ''
+    };
+  }
+  var halves = [makeHalf(0), makeHalf(1)];
+  var board = { x: 0, y: 0, w: 0, h: 0 };
+
+  function fitHalf(h, x, y, w, hh, headerH) {
+    h.x = x; h.y = y; h.w = w; h.h = hh;
+    h.ax = x + 10; h.ay = y + headerH; h.aw = w - 20; h.ah = hh - headerH - 10;
+    h.cell = Math.max(4, Math.floor(Math.min(h.aw / 100, h.ah / 100)));
+    h.cols = Math.max(8, Math.floor(h.aw / h.cell));
+    h.rows = Math.max(8, Math.floor(h.ah / h.cell));
+    h.gx = h.ax + Math.floor((h.aw - h.cols * h.cell) / 2);
+    h.gy = h.ay + Math.floor((h.ah - h.rows * h.cell) / 2);
+  }
+
+  function fit() {
+    var w = viewW(), hgt = viewH();
+    var key = w + 'x' + hgt;
+    if (key === layoutKey) return;
+    layoutKey = key;
+    W = w; H = hgt;
+    var aspectPhone = H > W * 1.15;
+    isPhone = minScreen < 700 || (minScreen === 9999 && aspectPhone);
+    stacked = isPhone || aspectPhone;
+    canvas.width = W;
+    canvas.height = H;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+
+    var arenaH = H - TICKER_H;
+    if (!stacked) {
+      var hw = Math.floor(W / 2);
+      fitHalf(halves[0], 0, 0, hw, arenaH, 40);
+      fitHalf(halves[1], hw, 0, W - hw, arenaH, 40);
+      board.w = Math.min(320, W * 0.42); board.h = 58;
+      board.x = Math.floor((W - board.w) / 2); board.y = 6;
+    } else {
+      board.w = W; board.h = 54; board.x = 0; board.y = 0;
+      var halfH = Math.floor((arenaH - board.h) / 2);
+      fitHalf(halves[0], 0, board.h, W, halfH, 32);
+      fitHalf(halves[1], 0, board.h + halfH, W, arenaH - board.h - halfH, 32);
+    }
+    halves[0].mapKey = ''; halves[1].mapKey = '';
+  }
+
+  // ---------- coach state ----------
+  var coachFor = { bout: -1, side: -1 };
+  function coachSideFor(bout) { return coachFor.bout === bout ? coachFor.side : -1; }
+
+  // ---------- drawing ----------
+  function drawHalfCells(h) {
+    ASPECT = h.cols / h.rows;
+    var cols = h.cols, rows = h.rows, cell = h.cell;
+    for (var r = 0; r < rows; r++) {
+      var y = h.gy + r * cell;
+      var runStart = 0, runCol = null;
+      for (var c = 0; c <= cols; c++) {
+        var col = null;
+        if (c < cols) {
+          var i = r * cols + c;
+          col = sampleRGB(h.mapX[i], h.mapY[i], h.chan[i], cols, rows);
+        }
+        if (col !== runCol) {
+          if (runCol !== null) {
+            ctx.fillStyle = runCol;
+            ctx.fillRect(h.gx + runStart * cell, y, (c - runStart) * cell, cell);
+          }
+          runStart = c; runCol = col;
+        }
+      }
+    }
+  }
+
+  function glitchText(boutT) {
+    var target = 'DRAW (REMATCH?)';
+    var step = Math.floor((boutT - 40) / 0.5); // 0..7
+    var rng = mulberry32(9000 + step);
+    var glyphs = '#%&@$?!/\\=';
+    var out = '';
+    var reveal = clamp01((step - 2) / 4);
+    for (var i = 0; i < target.length; i++) {
+      var ch = target[i];
+      if (ch === ' ' || rng() < reveal) out += ch;
+      else out += glyphs[Math.floor(rng() * glyphs.length)];
+    }
+    return out;
+  }
+
+  function draw(t) {
+    fit();
+    var bout = Math.floor(t / BOUT);
+    var boutT = t - bout * BOUT;
+    var inDraw = boutT >= 40;
+    var landed = inDraw ? VOLLEYS : Math.min(VOLLEYS, Math.floor(boutT / 4));
+    var coachSide = coachSideFor(bout);
+
+    ctx.fillStyle = PAGE;
+    ctx.fillRect(0, 0, W, H);
+
+    // volley flash state
+    var flash = null;
+    if (!inDraw && landed >= 1) {
+      var lastV = volleysFor(bout, coachSide)[landed - 1];
+      var ph = boutT - lastV.i * 4;
+      if (ph >= 0 && ph < 0.5) {
+        flash = { v: lastV, p: ph / 0.5, defender: halves[1 - lastV.attacker] };
+      }
+    }
+
+    for (var s = 0; s < 2; s++) {
+      var h = halves[s];
+      buildMapping(h, bout, landed, coachSide);
+      ctx.fillStyle = s === 0 ? CYAN_BG : MAG_BG;
+      ctx.fillRect(h.x, h.y, h.w, h.h);
+
+      var jolting = flash && flash.defender === h;
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(h.ax, h.ay, h.aw, h.ah);
+      ctx.clip();
+      if (jolting) {
+        var sc = flash.p < 0.5 ? 1.025 : 0.99;
+        var ccx = h.ax + h.aw / 2, ccy = h.ay + h.ah / 2;
+        ctx.translate(ccx, ccy); ctx.scale(sc, sc); ctx.translate(-ccx, -ccy);
+      }
+      ctx.fillStyle = '#0B1026';
+      ctx.fillRect(h.ax - 4, h.ay - 4, h.aw + 8, h.ah + 8);
+      drawHalfCells(h);
+      ctx.restore();
+
+      // arena frame + header
+      ctx.strokeStyle = s === 0 ? CYAN : MAGENTA;
+      ctx.globalAlpha = 0.55;
+      ctx.lineWidth = 1;
+      ctx.strokeRect(h.ax + 0.5, h.ay + 0.5, h.aw - 1, h.ah - 1);
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = s === 0 ? CYAN : MAGENTA;
+      ctx.font = 'bold 15px monospace';
+      ctx.textBaseline = 'middle';
+      var label = s === 0 ? 'CYAN CORNER' : 'MAGENTA CORNER';
+      var relevantBout = inDraw ? bout + 1 : bout;
+      if (coachFor.bout === relevantBout && coachFor.side === s) label += '  + COACHED';
+      if (!stacked && s === 1) {
+        ctx.textAlign = 'right';
+        ctx.fillText(label, h.x + h.w - 12, h.y + 20);
+        ctx.textAlign = 'left';
+      } else {
+        ctx.fillText(label, h.x + 12, h.y + (stacked ? 16 : 20));
+      }
+    }
+
+    // divider
+    ctx.fillStyle = '#2A2A30';
+    if (!stacked) ctx.fillRect(Math.floor(W / 2) - 1, 0, 2, H - TICKER_H);
+    else ctx.fillRect(0, halves[1].y - 1, W, 2);
+
+    // volley flash bar + tag
+    if (flash) {
+      var dh = flash.defender;
+      var atkCol = flash.v.attacker === 0 ? CYAN : MAGENTA;
+      var bx = dh.ax + flash.p * dh.aw;
+      ctx.globalAlpha = 0.85 - flash.p * 0.4;
+      ctx.fillStyle = atkCol;
+      if (!stacked) ctx.fillRect(bx - 11, dh.ay, 22, dh.ah);
+      else ctx.fillRect(dh.ax, dh.ay + flash.p * dh.ah - 11, dh.aw, 22);
+      ctx.globalAlpha = 1;
+      ctx.font = 'bold 16px monospace';
+      ctx.fillText('VOLLEY', dh.ax + 10, dh.ay + 18);
+    }
+
+    // intermission dim + coach hint
+    var showHint = (inDraw || boutT < 4) && coachSideFor(inDraw ? bout + 1 : bout) === -1;
+    if (inDraw) {
+      ctx.fillStyle = 'rgba(5,6,10,0.30)';
+      if (!stacked) ctx.fillRect(0, 0, W, H - TICKER_H);
+      else ctx.fillRect(0, board.h, W, H - TICKER_H - board.h);
+    }
+    if (showHint) {
+      ctx.fillStyle = PAPER;
+      ctx.font = '12px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('TAP A SIDE TO COACH ITS NEXT BOUT', W / 2, (stacked ? board.h + 14 : 78));
+      ctx.textAlign = 'left';
+    }
+
+    // scoreboard
+    ctx.fillStyle = BOARD_BG;
+    ctx.fillRect(board.x, board.y, board.w, board.h);
+    ctx.strokeStyle = '#3A3A40';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(board.x + 0.5, board.y + 0.5, board.w - 1, board.h - 1);
+    ctx.textAlign = 'center';
+    if (!inDraw) {
+      ctx.fillStyle = DIM;
+      ctx.font = '10px monospace';
+      ctx.fillText('CORRUPTION DEALT', W / 2, board.y + 13);
+      ctx.font = 'bold 20px monospace';
+      ctx.fillStyle = CYAN;
+      ctx.fillText('CYAN ' + dealtBy(bout, coachSide, 0, landed) + '%', board.x + board.w * 0.26, board.y + 38);
+      ctx.fillStyle = MAGENTA;
+      ctx.fillText('MAGENTA ' + dealtBy(bout, coachSide, 1, landed) + '%', board.x + board.w * 0.74, board.y + 38);
+    } else {
+      var step = Math.floor((boutT - 40) / 0.5);
+      ctx.fillStyle = DIM;
+      ctx.font = '10px monospace';
+      ctx.fillText('CORRUPTION DEALT', W / 2, board.y + 13);
+      ctx.font = 'bold 20px monospace';
+      if (step < 4) {
+        var rngD = mulberry32(500 + step);
+        var dl = Math.floor(rngD() * 100), dr = Math.floor(rngD() * 100);
+        ctx.fillStyle = CYAN;
+        ctx.fillText('CYAN ' + dl + '%', board.x + board.w * 0.26, board.y + 38);
+        ctx.fillStyle = MAGENTA;
+        ctx.fillText('MAGENTA ' + dr + '%', board.x + board.w * 0.74, board.y + 38);
+      } else {
+        ctx.fillStyle = PAPER;
+        ctx.fillText(glitchText(boutT), W / 2, board.y + 38);
+      }
+    }
+    ctx.textAlign = 'left';
+
+    // chat ticker
+    var ty = H - TICKER_H;
+    ctx.fillStyle = BOARD_BG;
+    ctx.fillRect(0, ty, W, TICKER_H);
+    ctx.fillStyle = '#2A2A30';
+    ctx.fillRect(0, ty, W, 1);
+    ctx.font = '12px monospace';
+    ctx.textBaseline = 'middle';
+    var seqW = Math.max(1, ctx.measureText(chatSeq).width);
+    var off = (t * 55) % seqW;
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(64, ty, W - 64, TICKER_H);
+    ctx.clip();
+    ctx.fillStyle = DIM;
+    ctx.fillText(chatSeq, 64 - off, ty + TICKER_H / 2 + 1);
+    ctx.fillText(chatSeq, 64 - off + seqW, ty + TICKER_H / 2 + 1);
+    ctx.restore();
+    ctx.fillStyle = BOARD_BG;
+    ctx.fillRect(0, ty, 62, TICKER_H);
+    ctx.fillStyle = PAPER;
+    ctx.fillText('CHAT', 10, ty + TICKER_H / 2 + 1);
+  }
+
+  // ---------- clock: anchored phase + elapsed ----------
+  var anchorT = T0;
+  var anchorStamp = null;
+  var lastT = T0;
+
+  function frame(stamp) {
+    if (anchorStamp === null && typeof stamp === 'number') anchorStamp = stamp;
+    var t = anchorT + (typeof stamp === 'number' ? (stamp - anchorStamp) / 1000 : 0);
+    lastT = t;
+    draw(t);
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+  }
+
+  // ---------- interaction: coach taps ----------
+  function ptr(e) {
+    if (e.clientX !== undefined) return { x: e.clientX, y: e.clientY || 0 };
+    if (e.touches && e.touches[0]) return { x: e.touches[0].clientX, y: e.touches[0].clientY };
+    return { x: 0, y: 0 };
+  }
+  function onDown(e) {
+    var p = ptr(e);
+    if (p.y > H - TICKER_H) return;
+    var side;
+    if (!stacked) side = p.x < W / 2 ? 0 : 1;
+    else side = p.y < halves[1].y ? 0 : 1;
+    var bout = Math.floor(lastT / BOUT);
+    var boutT = lastT - bout * BOUT;
+    var target = -1;
+    if (boutT >= 40) target = bout + 1;
+    else if (boutT < 4) target = bout;
+    if (target >= 0 && coachFor.bout !== target) {
+      coachFor = { bout: target, side: side };
+      halves[0].mapKey = ''; halves[1].mapKey = '';
+      draw(lastT);
+    }
+    if (e.preventDefault) e.preventDefault();
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('touchstart', onDown, { passive: false });
+  }
+  if (window.addEventListener) {
+    window.addEventListener('resize', function () { layoutKey = ''; draw(lastT); });
+  }
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { layoutKey = ''; draw(lastT); });
+  }
+
+  // synchronous fixed-phase first frame
+  draw(T0);
+
+  if (typeof requestAnimationFrame === 'function') {
+    requestAnimationFrame(function (stamp) {
+      anchorStamp = stamp;
+      frame(stamp);
+    });
+  }
+})();
+</script>
+</body>
+</html>
