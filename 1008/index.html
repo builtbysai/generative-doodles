@@ -1,0 +1,602 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Bout, Drawn</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0B0D12; height: 100%; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- constants / palette ----------
+  var FEED = '#0B0D12';
+  var BODY = [58, 65, 80];        // #3A4150 figure bodies (derived dim slate)
+  var EDGE = [89, 99, 122];       // #59637A figure edges / blade (derived dim slate)
+  var FLOOR = [43, 48, 56];       // #2B3038 floor line and piste
+  var RIB = [[255, 43, 43], [43, 216, 255]];  // red, cyan ribbon bodies
+  var CORE = [255, 255, 255];     // ribbon cores, reticles, braid glow
+
+  var DT = 1 / 120;               // fixed timestep
+  var PREROLL = 1440;             // steps before frame one (12 s)
+  var RING = 480;                 // samples kept per mover (8 s at 60 Hz)
+  var SAMPLE_EVERY = 2;           // tip sampled every 2nd step (60 Hz)
+  var RIBBON_SECONDS = 8;
+  var FLOORY = 0.815;             // where the feet stand, in world units
+
+  // ---------- seeded rng ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  // deterministic 3-int hash for the sensor grain
+  function hash3(x, y, z) {
+    var h = (Math.imul(x, 374761393) + Math.imul(y, 668265263) + Math.imul(z, 974634211)) | 0;
+    h = Math.imul(h ^ (h >>> 13), 1274126177);
+    return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+  }
+
+  // ---------- sim ----------
+  // World units: 1 unit = arena height; x spans [0, AX], y grows downward.
+  // Each fencer IS a mover: its blade tip is the tracked point, and the
+  // ribbon is the tip's true recorded history. Nothing decorative.
+  // The engagement point (bout centre) drifts up and down the piste, so
+  // the tips, and therefore the ribbons, travel the length of the strip.
+  var AX = 1;
+  var seedBase = 1008169;
+  var sim = null;
+
+  function figScale() { return Math.min(1, Math.max(0.55, AX)); }
+  function boutGap() { return Math.min(0.34, AX * 0.60); }
+
+  function makeFencer(rng, side) {
+    return {
+      side: side, f: side === 0 ? 1 : -1,
+      x: 0, vx: 0, tx: 0,
+      mode: 'free', modeT: 0, modeDur: 1,
+      e: 0.15,                       // blade extension 0..1
+      phase: rng() * Math.PI * 2,    // bounce / circle phase
+      targetTimer: 0.5 + rng() * 1.2,
+      parryOff: 0,
+      tipX: 0, tipY: 0, tipVX: 0, tipVY: 0, tipSpeed: 0,
+      bx: new Float32Array(RING), by: new Float32Array(RING),
+      head: 0, count: 0
+    };
+  }
+
+  function buildSim(seed) {
+    var rng = mulberry32(seed);
+    var gap = boutGap();
+    var a = makeFencer(rng, 0), b = makeFencer(rng, 1);
+    a.x = a.tx = AX / 2 - gap / 2;
+    b.x = b.tx = AX / 2 + gap / 2;
+    return {
+      rng: rng, fencers: [a, b], step: 0,
+      bc: AX / 2, bcTx: AX / 2, bcTimer: 1.5,   // bout centre and its wander
+      directorT: 1.1 + rng() * 0.8,             // time to the next exchange
+      flashes: [],                              // {x, y, step}
+      flashCool: 0,
+      iso: -1, isoUntil: -1,
+      pendingTicks: 0,                          // clash ticks (audio, live only)
+      pendingClicks: 0                          // reticle snap clicks (audio, live only)
+    };
+  }
+
+  function pushSample(m) {
+    m.bx[m.head] = m.tipX; m.by[m.head] = m.tipY;
+    m.head = (m.head + 1) % RING;
+    if (m.count < RING) m.count++;
+  }
+  // sample k steps back from the newest (0 = newest)
+  function sampleAt(m, back) {
+    var idx = (m.head - 1 - back + RING * 2) % RING;
+    return [m.bx[idx], m.by[idx]];
+  }
+
+  function addFlash(s, x, y, live, isClash) {
+    s.flashes.push({ x: x, y: y, step: s.step });
+    if (s.flashes.length > 40) s.flashes.splice(0, s.flashes.length - 40);
+    if (live) { if (isClash) s.pendingTicks++; else s.pendingClicks++; }
+  }
+
+  function stepSim(live) {
+    var s = sim, rng = s.rng, fs = s.fencers, i;
+    s.step++;
+    var t = s.step * DT;
+    var A = fs[0], B = fs[1];
+    var FIG = figScale(), gap = boutGap();
+
+    // ----- the bout centre drifts along the piste -----
+    s.bcTimer -= DT;
+    if (s.bcTimer <= 0) {
+      var margin = gap / 2 + 0.075 * FIG + 0.02;
+      var lo = Math.min(margin, AX / 2), hi = Math.max(AX - margin, AX / 2);
+      s.bcTx = lo + rng() * (hi - lo);
+      s.bcTimer = 2.4 + rng() * 2.2;
+    }
+    s.bc += (s.bcTx - s.bc) * Math.min(1, 0.55 * DT);
+
+    // ----- exchange director: picks an attacker, the other answers -----
+    s.directorT -= DT;
+    if (s.directorT <= 0) {
+      var atk = rng() < 0.5 ? A : B;
+      var def = atk === A ? B : A;
+      atk.mode = 'lunge'; atk.modeT = 0; atk.modeDur = 0.52 + rng() * 0.14;
+      if (rng() < 0.55) { def.mode = 'retreat'; def.modeDur = 0.62; }
+      else { def.mode = 'parry'; def.modeDur = 0.58; }
+      def.modeT = 0;
+      s.directorT = 1.15 + rng() * 1.5;
+    }
+
+    for (i = 0; i < 2; i++) {
+      var m = fs[i];
+      m.modeT += DT;
+      var p = m.modeDur > 0 ? Math.min(1, m.modeT / m.modeDur) : 1;
+      if (m.modeT >= m.modeDur && m.mode !== 'free') {
+        m.mode = m.mode === 'lunge' ? 'recover' : 'free';
+        m.modeT = 0; m.modeDur = m.mode === 'recover' ? 0.45 : 1;
+        p = 0;
+      }
+      // ----- extension and parry deflection from the mode -----
+      if (m.mode === 'lunge') {
+        if (p < 0.24) { var u = p / 0.24; m.e = 0.15 + 0.85 * (1 - (1 - u) * (1 - u)); }
+        else if (p < 0.46) m.e = 1;
+        else { var v = (p - 0.46) / 0.54; m.e = 1 - 0.85 * v * v; }
+        m.parryOff = 0;
+      } else if (m.mode === 'parry') {
+        m.e = 0.42;
+        m.parryOff = Math.sin(p * Math.PI) * 0.030 * FIG;
+      } else if (m.mode === 'retreat') {
+        m.e = 0.12; m.parryOff = 0;
+      } else if (m.mode === 'recover') {
+        m.e = 1 - 0.85 * Math.min(1, p); if (m.e < 0.15) m.e = 0.15;
+        m.parryOff = 0;
+      } else {
+        m.e = 0.16 + 0.04 * Math.sin(t * 1.7 + m.phase);
+        m.parryOff = 0;
+      }
+      // ----- footwork: spring toward a target along the piste -----
+      m.targetTimer -= DT;
+      if (m.mode === 'lunge') {
+        m.tx = m.x + m.f * 0.09;
+      } else if (m.mode === 'retreat') {
+        m.tx = m.x - m.f * 0.13;
+      } else if (m.targetTimer <= 0 || (m.mode === 'free' && Math.abs(m.tx - m.x) < 0.008)) {
+        var home = s.bc + (m.side === 0 ? -gap / 2 : gap / 2);
+        m.tx = home + (rng() - 0.5) * 0.10 * Math.min(1, AX);
+        m.targetTimer = 0.8 + rng() * 1.0;
+      }
+      var axx = (m.tx - m.x) * 16 - m.vx * 5.2;
+      m.vx += axx * DT;
+      var vmax = m.mode === 'lunge' ? 0.55 : 0.34;
+      if (m.vx > vmax) m.vx = vmax; else if (m.vx < -vmax) m.vx = -vmax;
+      m.x += m.vx * DT;
+      if (m.x < 0.045) { m.x = 0.045; m.vx = Math.abs(m.vx) * 0.6; }
+      if (m.x > AX - 0.045) { m.x = AX - 0.045; m.vx = -Math.abs(m.vx) * 0.6; }
+      // ----- blade tip: reach, en-garde circle, bounce, travelling wave -----
+      var circ = 1 - m.e * 0.72;
+      var cx = Math.cos(t * 6.9 + m.phase) * 0.016 * FIG * circ;
+      var cy = Math.sin(t * 6.9 + m.phase) * 0.012 * FIG * circ;
+      var bob = Math.sin(t * 6.3 + m.phase) * 0.0035 * FIG;
+      var wave = m.mode === 'free' ? Math.sin(t * 2.3 + m.phase * 2.0) * 0.011 * FIG : 0;
+      var nx = m.x + m.f * (0.105 + 0.115 * m.e) * FIG + cx;
+      var ny = FLOORY - 0.172 * FIG + bob + cy + wave + m.parryOff;
+      m.tipVX = (nx - m.tipX) / DT; m.tipVY = (ny - m.tipY) / DT;
+      m.tipSpeed = Math.sqrt(m.tipVX * m.tipVX + m.tipVY * m.tipVY);
+      m.tipX = nx; m.tipY = ny;
+      if (s.step % SAMPLE_EVERY === 0) pushSample(m);
+    }
+
+    // ----- braid glow: blade clash, or a head crossing the other's trail -----
+    if (s.flashCool > 0) s.flashCool -= DT;
+    if (s.flashCool <= 0) {
+      var ddx = A.tipX - B.tipX, ddy = A.tipY - B.tipY;
+      if (ddx * ddx + ddy * ddy < 0.0021) {           // tips within ~0.046: a clash
+        addFlash(s, (A.tipX + B.tipX) / 2, (A.tipY + B.tipY) / 2, live, true);
+        s.flashCool = 0.5;
+      } else {
+        var done = false;
+        for (i = 0; i < 2 && !done; i++) {
+          var h = fs[i], tr = fs[1 - i];
+          for (var b = 8; b < tr.count; b += 6) {
+            var pt = sampleAt(tr, b);
+            var ex = pt[0] - h.tipX, ey = pt[1] - h.tipY;
+            if (ex * ex + ey * ey < 0.00042) {
+              addFlash(s, h.tipX, h.tipY, live, false);
+              s.flashCool = 0.5; done = true; break;
+            }
+          }
+        }
+      }
+    }
+    while (s.flashes.length && (s.step - s.flashes[0].step) > 96) s.flashes.shift();
+  }
+
+  // ---------- pointer state ----------
+  var pointer = { active: false, x: 0, y: 0 };
+  var downInfo = null, lastTapStep = -10000;
+  var scrubBack = 0;                  // samples behind live while scrub-dragging
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 720, H = 720;
+
+  function viewportSize() {
+    var w, h;
+    if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.width) {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    } else if (typeof window !== 'undefined' && window.innerWidth) {
+      w = window.innerWidth; h = window.innerHeight;
+    } else { w = W; h = H; }
+    return [Math.round(w), Math.round(h)];
+  }
+  function isPhone() {
+    if (typeof window !== 'undefined' && window.screen && window.screen.width) {
+      return Math.min(window.screen.width, window.screen.height) < 700;
+    }
+    return H > W * 1.15;
+  }
+  function resize() {
+    var s = viewportSize();
+    var newAX = s[0] / s[1];
+    W = s[0]; H = s[1];
+    canvas.width = W; canvas.height = H;
+    canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+    if (Math.abs(newAX - AX) > 0.02) { AX = newAX; rebuild(); }
+    draw();
+  }
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', resize);
+    }
+    if (window.addEventListener) window.addEventListener('resize', resize);
+  }
+  function rebuild() {
+    sim = buildSim(seedBase);
+    for (var k = 0; k < PREROLL; k++) stepSim(false);
+  }
+
+  // ---------- draw ----------
+  function rgba(c, a) { return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a + ')'; }
+
+  function drawFigure(m, S) {
+    var FIG = figScale();
+    var f = m.f, t = sim.step * DT;
+    var bob = Math.sin(t * 6.3 + m.phase) * 0.0035 * FIG;
+    var e = m.e;
+    var hipX = m.x - f * 0.011 * FIG, hipY = FLOORY - 0.105 * FIG + bob * 0.4;
+    var shX = hipX + f * (0.020 + 0.038 * e) * FIG, shY = hipY - 0.082 * FIG + e * 0.008 * FIG + bob;
+    var headX = shX + f * 0.010 * FIG, headY = shY - 0.036 * FIG;
+    // front arm: shoulder, drooped elbow, grip at 60 percent toward the tip
+    var gripX = shX + (m.tipX - shX) * 0.60, gripY = shY + (m.tipY - shY) * 0.60;
+    var elX = (shX + gripX) / 2 - f * 0.006 * FIG, elY = (shY + gripY) / 2 + 0.014 * FIG;
+    // back arm trailing
+    var bhX = hipX - f * 0.064 * FIG, bhY = hipY + 0.024 * FIG + Math.sin(t * 1.7 + m.phase) * 0.004 * FIG;
+    var beX = (shX + bhX) / 2 - f * 0.009 * FIG, beY = (shY + bhY) / 2 + 0.011 * FIG;
+    // legs: front foot planted forward, back leg extended behind
+    var ffX = m.x + f * (0.040 + 0.055 * e) * FIG, ffY = FLOORY;
+    var fkX = (hipX + ffX) / 2 + f * 0.014 * FIG, fkY = (hipY + ffY) / 2 - 0.024 * FIG;
+    var bfX = m.x - f * (0.064 + 0.022 * e) * FIG, bfY = FLOORY;
+    var bkX = (hipX + bfX) / 2 - f * 0.003 * FIG, bkY = (hipY + bfY) / 2 - 0.018 * FIG;
+
+    function seg(x1, y1, x2, y2) {
+      ctx.strokeStyle = rgba(EDGE, 0.85);
+      ctx.lineWidth = Math.max(2.2, 0.012 * S * FIG + 1.2);
+      ctx.beginPath(); ctx.moveTo(x1 * S, y1 * S); ctx.lineTo(x2 * S, y2 * S); ctx.stroke();
+      ctx.strokeStyle = rgba(BODY, 0.96);
+      ctx.lineWidth = Math.max(1.4, 0.0084 * S * FIG + 0.8);
+      ctx.beginPath(); ctx.moveTo(x1 * S, y1 * S); ctx.lineTo(x2 * S, y2 * S); ctx.stroke();
+    }
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    seg(hipX, hipY, fkX, fkY); seg(fkX, fkY, ffX, ffY);       // front leg
+    seg(hipX, hipY, bkX, bkY); seg(bkX, bkY, bfX, bfY);       // back leg
+    seg(hipX, hipY, shX, shY);                                // torso
+    seg(shX, shY, beX, beY); seg(beX, beY, bhX, bhY);         // back arm
+    seg(shX, shY, elX, elY); seg(elX, elY, gripX, gripY);     // front arm
+    // head
+    ctx.fillStyle = rgba(BODY, 0.96);
+    ctx.strokeStyle = rgba(EDGE, 0.85);
+    ctx.lineWidth = Math.max(1, 0.0016 * S);
+    ctx.beginPath(); ctx.arc(headX * S, headY * S, Math.max(2.6, 0.018 * S * FIG), 0, 6.2832);
+    ctx.fill(); ctx.stroke();
+    // blade: grip to the tracked tip
+    ctx.strokeStyle = rgba(EDGE, 0.95);
+    ctx.lineWidth = Math.max(1.2, 0.0022 * S);
+    ctx.beginPath(); ctx.moveTo(gripX * S, gripY * S); ctx.lineTo(m.tipX * S, m.tipY * S); ctx.stroke();
+  }
+
+  function draw() {
+    var S = H;                                   // px per world unit
+    canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+    var stepNow = sim.step;
+    var vStep = stepNow - scrubBack * SAMPLE_EVERY;   // virtual step while scrubbing
+    var isolating = sim.iso >= 0 && stepNow < sim.isoUntil;
+    // camera breath: the whole feed drifts a few px on slow seeded sines
+    var brX = Math.sin(stepNow * DT * 0.23) * 4;
+    var brY = Math.cos(stepNow * DT * 0.171) * 3;
+
+    ctx.fillStyle = FEED;
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.save();
+    ctx.translate(brX, brY);
+    // ----- arena: back wall dressing, floor band, piste -----
+    ctx.fillStyle = rgba(FLOOR, 0.16);
+    ctx.fillRect(-8, FLOORY * S, W + 16, H - FLOORY * S + 8);
+    ctx.fillStyle = rgba(EDGE, 0.06);            // two dim light panels on the far wall
+    var pw = 0.05 * S;
+    ctx.fillRect(0.16 * AX * S - pw / 2, 0.10 * S, pw, 0.52 * S);
+    ctx.fillRect(0.84 * AX * S - pw / 2, 0.10 * S, pw, 0.52 * S);
+    // piste strip: a trapezoid on the floor, far edge at the floor line
+    ctx.fillStyle = rgba(FLOOR, 0.20);
+    ctx.beginPath();
+    ctx.moveTo(0.03 * AX * S, FLOORY * S); ctx.lineTo(0.97 * AX * S, FLOORY * S);
+    ctx.lineTo(1.03 * AX * S, 0.985 * S); ctx.lineTo(-0.03 * AX * S, 0.985 * S);
+    ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = rgba(FLOOR, 0.75);
+    ctx.lineWidth = 1;
+    ctx.beginPath();                             // the floor line, full width
+    ctx.moveTo(-8, FLOORY * S + 0.5); ctx.lineTo(W + 8, FLOORY * S + 0.5); ctx.stroke();
+    ctx.strokeStyle = rgba(FLOOR, 0.5);
+    ctx.beginPath();
+    ctx.moveTo(0.03 * AX * S, FLOORY * S); ctx.lineTo(-0.03 * AX * S, 0.985 * S);
+    ctx.moveTo(0.97 * AX * S, FLOORY * S); ctx.lineTo(1.03 * AX * S, 0.985 * S);
+    ctx.stroke();
+
+    // ----- figures (dimmed while scrubbing: the present goes ghost) -----
+    if (scrubBack > 0) ctx.globalAlpha = 0.35;
+    drawFigure(sim.fencers[0], S);
+    drawFigure(sim.fencers[1], S);
+    ctx.globalAlpha = 1;
+
+    // ----- isolate: dim the feed, spotlight one ribbon -----
+    if (isolating) {
+      ctx.fillStyle = 'rgba(4,5,9,0.55)';
+      ctx.fillRect(-8, -8, W + 16, H + 16);
+    }
+
+    // ----- ribbons: true tip histories, tapered strips, white cores -----
+    var scale = Math.max(0.55, Math.min(1.15, Math.min(W, H) / 720));
+    for (var i = 0; i < 2; i++) {
+      var m = sim.fencers[i];
+      var col = RIB[i];
+      var dim = (isolating && sim.iso !== i) ? 0.22 : 1;
+      var n = m.count - scrubBack;
+      if (n <= 1) continue;
+      var RUN = 8;
+      for (var start = n - 1; start >= 1; start -= RUN) {
+        var end = Math.max(0, start - RUN);      // share one sample: no gaps
+        var age = ((start + end) / 2) * (SAMPLE_EVERY * DT);
+        var fr = 1 - age / RIBBON_SECONDS;
+        if (fr <= 0) continue;
+        var back0 = start + scrubBack, back1 = end + scrubBack, k, p;
+        // colored body
+        ctx.strokeStyle = rgba(col, Math.pow(fr, 1.5) * 0.55 * dim);
+        ctx.lineWidth = Math.max(0.5, (0.0012 + fr * 0.0088) * S);
+        ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+        ctx.beginPath();
+        for (k = back0; k >= back1; k--) {
+          p = sampleAt(m, k);
+          if (k === back0) ctx.moveTo(p[0] * S, p[1] * S); else ctx.lineTo(p[0] * S, p[1] * S);
+        }
+        ctx.stroke();
+        // white core
+        ctx.strokeStyle = rgba(CORE, Math.pow(fr, 1.15) * 0.9 * dim);
+        ctx.lineWidth = Math.max(0.4, (0.0012 + fr * 0.0088) * S * 0.36);
+        ctx.beginPath();
+        for (k = back0; k >= back1; k--) {
+          p = sampleAt(m, k);
+          if (k === back0) ctx.moveTo(p[0] * S, p[1] * S); else ctx.lineTo(p[0] * S, p[1] * S);
+        }
+        ctx.stroke();
+      }
+    }
+
+    // ----- braid glow: brief white nodes where the ribbons cross -----
+    for (i = 0; i < sim.flashes.length; i++) {
+      var fl = sim.flashes[i];
+      var fa = 1 - (vStep - fl.step) * DT / 0.4;
+      if (fa <= 0 || fa > 1) continue;
+      ctx.fillStyle = rgba(CORE, 0.16 * fa);
+      ctx.beginPath(); ctx.arc(fl.x * S, fl.y * S, Math.max(3, 0.016 * S), 0, 6.2832); ctx.fill();
+      ctx.fillStyle = rgba(CORE, 0.85 * fa);
+      ctx.beginPath(); ctx.arc(fl.x * S, fl.y * S, Math.max(1.4, 0.005 * S), 0, 6.2832); ctx.fill();
+    }
+
+    // ----- reticles: the only UI, riding each ribbon head -----
+    for (i = 0; i < 2; i++) {
+      var hm = sim.fencers[i];
+      var hp = scrubBack > 0 ? sampleAt(hm, scrubBack) : [hm.tipX, hm.tipY];
+      var HX = hp[0] * S, HY = hp[1] * S;
+      var rr = (Math.max(6, 0.0155 * S) * scale + 3) * figScale();
+      var tick = rr * 0.55;
+      ctx.strokeStyle = rgba(CORE, (isolating && sim.iso !== i) ? 0.35 : 0.92);
+      ctx.lineWidth = Math.max(1, 0.0016 * S);
+      ctx.beginPath(); ctx.arc(HX, HY, rr, 0, 6.2832); ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(HX - rr - tick, HY); ctx.lineTo(HX - rr, HY);
+      ctx.moveTo(HX + rr, HY); ctx.lineTo(HX + rr + tick, HY);
+      ctx.moveTo(HX, HY - rr - tick); ctx.lineTo(HX, HY - rr);
+      ctx.moveTo(HX, HY + rr); ctx.lineTo(HX, HY + rr + tick);
+      ctx.stroke();
+    }
+    ctx.restore();
+
+    // ----- sensor grain over everything (screen-fixed, hash-seeded) -----
+    var bucket = Math.floor(stepNow / 5);
+    var cell = 6;
+    var cols = Math.ceil(W / cell), rows = Math.ceil(H / cell);
+    for (var gy = 0; gy < rows; gy++) {
+      for (var gx = 0; gx < cols; gx++) {
+        var hv = hash3(gx, gy, bucket);
+        if (hv < 0.14) {
+          ctx.fillStyle = 'rgba(255,255,255,' + (0.025 + hv * 0.22).toFixed(3) + ')';
+          ctx.fillRect(gx * cell + (hv * 977) % 5, gy * cell + (hv * 613) % 5, 1.6, 1.6);
+        }
+      }
+    }
+  }
+
+  // ---------- audio (lazy, guarded; visual is complete in silence) ----------
+  var AC = null, whistles = [], washGain = null;
+  function ensureAudio() {
+    if (AC) { try { if (AC.resume) AC.resume(); } catch (e) {} return; }
+    var Ctor = null;
+    if (typeof AudioContext !== 'undefined') Ctor = AudioContext;
+    else if (typeof window !== 'undefined' && window.webkitAudioContext) Ctor = window.webkitAudioContext;
+    if (!Ctor) return;
+    try {
+      AC = new Ctor();
+      // crowd wash: looped noise through a lowpass, kept low
+      var len = AC.sampleRate * 2;
+      var buf = AC.createBuffer(1, len, AC.sampleRate);
+      var data = buf.getChannelData(0);
+      var ls = 1234567;
+      for (var i = 0; i < len; i++) {
+        ls = (Math.imul(ls, 1103515245) + 12345) | 0;
+        data[i] = ((ls >>> 8) / 16777216 - 0.5) * 0.6;
+      }
+      var src = AC.createBufferSource(); src.buffer = buf; src.loop = true;
+      var lp = AC.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 380;
+      washGain = AC.createGain(); washGain.gain.value = 0.0;
+      src.connect(lp); lp.connect(washGain); washGain.connect(AC.destination);
+      src.start();
+      washGain.gain.setTargetAtTime(0.016, AC.currentTime, 0.8);
+      // one thin whistle per mover, pitch follows tip speed
+      for (i = 0; i < 2; i++) {
+        var o = AC.createOscillator(), g = AC.createGain();
+        o.type = 'sine'; o.frequency.value = 620 + i * 150;
+        g.gain.value = 0;
+        o.connect(g); g.connect(AC.destination); o.start();
+        whistles.push({ o: o, g: g });
+      }
+    } catch (e) { AC = null; whistles = []; }
+  }
+  function blip(freq, vol, dur) {
+    if (!AC) return;
+    try {
+      var o = AC.createOscillator(), g = AC.createGain();
+      o.type = 'triangle'; o.frequency.value = freq;
+      var t = AC.currentTime;
+      g.gain.setValueAtTime(vol, t);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      o.connect(g); g.connect(AC.destination);
+      o.start(t); o.stop(t + dur + 0.02);
+    } catch (e) {}
+  }
+  function updateAudio() {
+    if (!AC || !whistles.length) return;
+    try {
+      var t = AC.currentTime;
+      for (var i = 0; i < 2; i++) {
+        var m = sim.fencers[i];
+        whistles[i].o.frequency.setTargetAtTime(430 + m.tipSpeed * 520, t, 0.05);
+        whistles[i].g.gain.setTargetAtTime(0.0075, t, 0.1);
+      }
+      while (sim.pendingTicks > 0) { blip(1650, 0.055, 0.07); sim.pendingTicks--; }
+      while (sim.pendingClicks > 0) { blip(2950, 0.03, 0.04); sim.pendingClicks--; }
+    } catch (e) {}
+  }
+
+  // ---------- interaction ----------
+  function nearestRibbon(wx, wy) {
+    var best = -1, bestD = 0.038;
+    for (var i = 0; i < 2; i++) {
+      var m = sim.fencers[i];
+      for (var b = 0; b < m.count; b += 4) {
+        var p = sampleAt(m, b);
+        var dx = p[0] - wx, dy = p[1] - wy;
+        var d = Math.sqrt(dx * dx + dy * dy);
+        if (d < bestD) { bestD = d; best = i; }
+      }
+    }
+    return best;
+  }
+  function reseed() {
+    seedBase = (Math.imul(seedBase, 1103515245) + 12345) & 0x7fffffff;
+    scrubBack = 0;
+    rebuild();
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', function (e) {
+      ensureAudio();
+      var px = (typeof e.clientX === 'number') ? e.clientX : e.offsetX;
+      var py = (typeof e.clientY === 'number') ? e.clientY : e.offsetY;
+      pointer.active = true; pointer.x = px; pointer.y = py;
+      downInfo = { x: px, y: py, moved: false };
+      scrubBack = 0;
+    });
+    canvas.addEventListener('pointermove', function (e) {
+      if (!pointer.active || !downInfo) return;
+      var px = (typeof e.clientX === 'number') ? e.clientX : e.offsetX;
+      var py = (typeof e.clientY === 'number') ? e.clientY : e.offsetY;
+      pointer.x = px; pointer.y = py;
+      var dx = px - downInfo.x;
+      if (Math.abs(dx) > 6 || Math.abs(py - downInfo.y) > 10) downInfo.moved = true;
+      if (downInfo.moved) {
+        // drag left to scrub back through the ribbon history, right to return
+        scrubBack = Math.max(0, Math.min(RING - 12, Math.round(-dx / 2.5)));
+        draw();
+      }
+    });
+    canvas.addEventListener('pointerup', function (e) {
+      pointer.active = false;
+      if (!downInfo) return;
+      var wasDrag = downInfo.moved;
+      var wx = downInfo.x / H, wy = downInfo.y / H;
+      downInfo = null;
+      if (wasDrag) { scrubBack = 0; draw(); return; }   // release returns to live
+      // a tap
+      if (sim.step - lastTapStep < 42) {                // double-tap: a new bout
+        reseed();
+        lastTapStep = -10000;
+        draw();
+        return;
+      }
+      lastTapStep = sim.step;
+      var hit = nearestRibbon(wx, wy);
+      if (hit >= 0) { sim.iso = hit; sim.isoUntil = sim.step + 1200; }  // 10 s spotlight
+      draw();
+    });
+  }
+
+  // ---------- run ----------
+  var s0 = viewportSize(); W = s0[0]; H = s0[1];
+  canvas.width = W; canvas.height = H;
+  canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+  AX = W / H;
+  rebuild();                                     // build + fixed pre-roll
+  draw();                                        // frame one: synchronous
+
+  if (typeof requestAnimationFrame === 'function') {
+    var lastTs = null, acc = 0;
+    var loop = function (ts) {
+      if (lastTs === null) lastTs = ts;
+      var elapsed = (ts - lastTs) / 1000;
+      lastTs = ts;
+      if (elapsed > 0.25) elapsed = 0.25;
+      acc += elapsed;
+      var steps = 0;
+      while (acc >= DT && steps < 12) { stepSim(true); acc -= DT; steps++; }
+      if (steps === 12) acc = 0;                 // cap: never spiral
+      if (scrubBack === 0) draw();
+      updateAudio();
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>

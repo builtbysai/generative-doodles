@@ -1,0 +1,31 @@
+# No.1011 "The Wall Hums"
+
+Study #124 futa-kera, PP172 "Scanline Field" (Squarepusher Japan Tour 2022 LED wall).
+
+## Concept
+
+The wall is the subject: a deep blue-black field covered edge to edge in dense white diagonal scanline hatching that breathes. A single small black figure stands at the bottom, backlit into silhouette, swaying a couple of pixels. Occasionally a starburst flare blooms somewhere in the field, magenta or green, and decays. There is nothing to play: the only interaction is a drag that gently bends the lines around the finger, then lets go. The piece is a performer standing in front of an instrument made of light.
+
+## Construction
+
+- **Field tone derivation.** The prompt specifies "deep blue-black" without a hex. Taken as a near-black with the blue channel lifted just clear of zero: R 5, G 7, B 15 = #05070F. Blue dominant, the rest near black, so white lines read as light and the figure tone #010204 still sits darker than the wall behind it.
+- **Scanlines.** Lines run at -45 degrees in (u, v) coordinates, where u = (x + y)/sqrt(2) is the across-line coordinate and v = (x - y)/sqrt(2) the along-line one. Each line k sits at u = k * spacing plus a fixed seeded jitter (offset up to +/-0.85 px, angle wobble up to +/-0.011 rad, from mulberry32 tables of 1024 entries), giving the hand-drawn irregularity. Lines are drawn as 30 px segments stepped along v; the ~13,000 segments per desktop frame are bucketed into 14 alpha bands and stroked as 14 batched paths.
+- **Wave-field model.** Three closed-form fields of (x, y, t), all seeded constants, no state:
+  - Brightness: waveB = 0.55 sin(0.0105x + 0.0042y - 0.16t) + 0.35 sin(0.0038(x - y) + 0.11t + 1.7) + 0.18 sin(0.021y - 0.07t + 0.6), mapped through alpha = 0.05 + 0.50 * n^1.6. Periods run 39 to 90 s, so brightness bands drift across the hatching like slow weather.
+  - Spacing: each line's u is displaced by waveDisp = 3.0 sin(0.006v - 0.13t) + 1.8 sin(0.016u + 0.09t + 2.0), so the hatching visibly spreads and gathers.
+  - Angle: tilt = 0.055 sin(0.005v + 0.10t) + 0.030 sin(0.013u - 0.06t) radians, a few degrees of lean travelling through the field.
+- **Figure.** A filled glyph (head disc, one tapered torso-and-legs path, two arm slivers) in #010204, height 17% of the frame, feet at 96.8% of height. Sway is 2.2 sin(0.32t) px with a slight lean; it occludes the lines behind it, which is what makes it a silhouette rather than a drawing.
+- **Flares.** Seeded schedule from mulberry32: the first is pinned at t0 = 10.2 s, position (0.22, 0.24) of frame, magenta, so frame one (T0 = 11 s) catches it 0.8 s into its 1.5 s life, near full bloom. Later flares follow every 14-26 s, colors alternating magenta #FF4FD8 / green #3DDC84, positions kept out of the lower band, and a position near center is nudged sideways if the previous flare was also near center (never center twice in a row). Each flare: three layered flat-alpha core discs, a bright core dot, 16 seeded radial rays, and 4 long diagonal sparkle rays, all scaled by a sin^1.4 envelope.
+- **Drag bend.** Pointer events are recorded as events (drag start time, strength at start, release time, strength at release); strength at any t is closed-form: exponential approach to 1 while dragging (tau 0.25 s), exponential decay after release (tau 1.0 s, effectively gone by ~3 s). While strength is up, segments near the pointer are pushed along the line normal by up to 11 px with a Gaussian falloff (radius 30% of the smaller dimension), gain up to +0.22 alpha, and lean up to +0.12 rad. No tap or double-tap mechanics exist. Frame one has no events, so it is bend-free.
+- **Determinism.** Frame one is drawn synchronously at fixed T0 = 11 s; the rAF loop, when present, draws T0 + elapsed-since-load. No Date.now, no Math.random in drawn state: jitter and the flare schedule come from mulberry32 tables built once at load. No gradients, shadowBlur, ctx.filter, or offscreen canvas anywhere; glow is layered flat-alpha shapes.
+- **Sizing and phones.** Canvas size comes from the Visual Viewport API with resize listeners on both visualViewport and window; draw() pins canvas.style.width/height in px every frame. Phone detection uses window.screen's smaller dimension (< 700 px), with the h > w * 1.15 aspect rule as fallback only. Page ground is the field tone. On phones the line spacing steps from 6.0 to 7.5 px and segments from 30 to 34 px (about 45% fewer segments), keeping the wall dense but the frame cheap; recorded here per the brief's allowance.
+- **Audio.** Lazy AudioContext created only inside the first pointerdown, typeof-guarded and try/caught; the piece is complete and silent without it. A 54 Hz sine plus 108.5 Hz triangle through a lowpass: oscillator pitch tracks the global spacing wave (the -0.13t term of waveDisp, +/-5 Hz), filter cutoff sweeps 130-320 Hz with the brightness waves, and each flare onset fires a short triangle ping (1567 Hz magenta, 1318 Hz green). No microphone, no audio input of any kind.
+
+## QA log
+
+- Rendered with node ~/workspace/tools/render-piece.js at 1280x900 (qa-desktop.png), 390x844 (qa-mobile.png), 720x720 (thumb.png). All render cleanly in silence (no AudioContext, no rAF in the harness).
+- thumb.png rendered twice and cmp compared: byte-identical. The duplicate was deleted.
+- Desktop read-back: deep blue-black field fully covered in dense diagonal white hatching; slow brightness waves read as broad lighter and darker bands (bright lower-left and top-right at t = 11); magenta starburst bloomed upper-left; tiny black figure standing whole at bottom center. Nothing clipped.
+- Thumb read-back: same composition at square aspect; flare, waves, and figure all legible.
+- Mobile read-back: phone path engaged (screen 390 px), density stepped down as specced; wall fills the tall frame edge to edge, flare upper-left, figure whole at the bottom, nothing clipped.
+- Deviations: (1) the field hex #05070F is derived from the prompt's "deep blue-black" wording, as recorded above; (2) phone line density stepped down (6.0 to 7.5 px spacing), as the brief allows; (3) the audio drone's pitch tracks the spacing wave's global temporal term rather than a measured mean spacing, since spacing is a field, not a scalar; the correlation the prompt asks for (pitch follows the wall's breathing) is preserved.

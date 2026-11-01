@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>A Face, In Dashes</title>
+<style>
+  html, body { margin:0; padding:0; background:#000000; height:100%; overflow:hidden; }
+  canvas { display:block; touch-action:none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // No.1010 "A Face, In Dashes" - study #124 futa-kera, PP171 "Halftone Face"
+  // (Squarepusher Japan Tour 2022). A giant face assembles from thousands of
+  // short white dashes on black. There is no photograph and no image data:
+  // each portrait is an analytic luminance field built from smooth bump
+  // functions (oval head, eye wells, brow arcs, a bright nose ridge, a dark
+  // mouth band, hair shading), and every dash derives from that field - its
+  // LENGTH from the local luminance, its ANGLE from the local gradient
+  // direction turned 90 degrees so dashes flow along the contours. From far
+  // away it reads as a face; from close it is only marks. The cycle is
+  // assemble (about 4 s, per-dash stagger), hold (about 4 s), dissolve into
+  // gray scatter, then a new seeded portrait (frontal, three-quarter, or
+  // profile - never the same variant twice in a row). Thin green data-scroll
+  // columns run at the thirds behind the face. Drag scatters the dashes
+  // under your finger and they reform behind you; tap freezes the current
+  // face for 10 s; double-tap forces a dissolve into a new face. Everything
+  // is a closed-form function of piece time plus recorded visitor events.
+  // Frame one is the synchronous draw at T0 = 9 s, mid-hold of portrait 0.
+
+  var T0 = 9;
+  var BASE_SEED = 1010177;
+  var CYCLE = 14;          // 0-5 assemble, 5-10 hold, 10-14 dissolve
+  var HOLD_FREEZE = 10;    // seconds a tap freezes the cycle
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  var INK = '#FFFFFF';
+  var FADE = '#8A8D84';
+  var COLUMN = '#3DDC84';
+
+  // ---------- deterministic helpers ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  function ihash(n) {
+    var x = Math.imul((n | 0) ^ 0x9E3779B9, 0x85EBCA6B);
+    x ^= x >>> 13; x = Math.imul(x, 0xC2B2AE35); x ^= x >>> 16;
+    return (x >>> 0) / 4294967296;
+  }
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function lerp(a, b, f) { return a + (b - a) * f; }
+  function sstep(a, b, x) {
+    var t = clamp((x - a) / (b - a), 0, 1);
+    return t * t * (3 - 2 * t);
+  }
+  function sstep01(x) { return sstep(0, 1, x); }
+  var TAU = Math.PI * 2;
+
+  // ---------- viewport / phone ----------
+  var viewW = 0, viewH = 0, isPhone = false;
+  function measure() {
+    var w, h;
+    if (typeof window !== 'undefined' && window.visualViewport) {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    } else if (typeof window !== 'undefined' && window.innerWidth) {
+      w = window.innerWidth; h = window.innerHeight;
+    } else { w = 960; h = 960; }
+    viewW = Math.max(50, Math.round(w));
+    viewH = Math.max(50, Math.round(h));
+    var sw = 1e9, sh = 1e9;
+    if (typeof window !== 'undefined' && window.screen) {
+      sw = window.screen.width || 1e9; sh = window.screen.height || 1e9;
+    }
+    isPhone = (Math.min(sw, sh) < 700) || (viewH > viewW * 1.15 && Math.min(viewW, viewH) < 700);
+    canvas.width = viewW;
+    canvas.height = viewH;
+  }
+
+  // ---------- portrait fields (analytic, no image data) ----------
+  // Face space: u right, v up, head roughly inside |u|<0.65, |v|<0.85.
+  var YAWS = [-0.95, -0.5, 0, 0.5, 0.95];
+  var portraitParams = [];   // index -> params, built sequentially
+  function paramsFor(idx) {
+    while (portraitParams.length <= idx) {
+      var k = portraitParams.length;
+      var rnd = mulberry32((BASE_SEED ^ Math.imul(k + 1, 0x85EBCA6B)) | 0);
+      var prevYawIdx = k > 0 ? portraitParams[k - 1].yawIdx : -1;
+      var yawIdx = Math.floor(rnd() * YAWS.length);
+      if (yawIdx === prevYawIdx) yawIdx = (yawIdx + 1 + Math.floor(rnd() * (YAWS.length - 1))) % YAWS.length;
+      portraitParams.push({
+        yawIdx: yawIdx,
+        yaw: YAWS[yawIdx],
+        rx: 0.60 + (rnd() - 0.5) * 0.05,
+        ry: 0.79 + (rnd() - 0.5) * 0.05,
+        eyeGap: 0.235 + (rnd() - 0.5) * 0.03,
+        eyeY: 0.13 + (rnd() - 0.5) * 0.03,
+        mouthY: -0.42 + (rnd() - 0.5) * 0.03,
+        hairPhase: rnd() * TAU,
+        hairLine: 0.40 + (rnd() - 0.5) * 0.06,
+        seed: rnd() * 1000
+      });
+    }
+    return portraitParams[idx];
+  }
+
+  function gauss(dx, dy, sx, sy) {
+    var q = (dx * dx) / (sx * sx) + (dy * dy) / (sy * sy);
+    return Math.exp(-q * 1.6);
+  }
+
+  function makeLum(P) {
+    var yaw = P.yaw, ay = Math.abs(yaw), sgn = yaw < 0 ? -1 : 1;
+    var prof = sstep(0.62, 0.95, ay);            // profile amount
+    function eyeX(bx) {
+      var far = (bx * yaw) > 0;
+      var comp = far ? (1 - 0.52 * ay) : (1 - 0.10 * ay);
+      return bx * comp + yaw * 0.13;
+    }
+    function eyeAmp(bx) {
+      var far = (bx * yaw) > 0;
+      return far ? 1 - 0.92 * sstep(0.55, 0.95, ay) : 1;
+    }
+    var nx = yaw * 0.30;                          // nose ridge x
+    var mx = yaw * 0.17;                          // mouth x
+    return function (u, v) {
+      // head mask: ellipse plus a profile nose bump on the facing side
+      var eu = u / P.rx, ev = (v - 0.02) / P.ry;
+      var er = Math.sqrt(eu * eu + ev * ev);
+      var mask = 1 - sstep(0.88, 1.0, er);
+      if (prof > 0) mask = clamp(mask + prof * 0.7 * gauss(u - sgn * 0.57, v + 0.03, 0.15, 0.12), 0, 1);
+      if (mask <= 0.001) return 0;
+      var L = 0.50 * mask;
+      // hair: darker cap with a wavy seeded hairline
+      var hl = P.hairLine + 0.045 * Math.sin(u * 6.5 + P.hairPhase) + 0.02 * Math.sin(u * 15 + P.hairPhase * 2);
+      L -= 0.30 * sstep(hl - 0.05, hl + 0.10, v) * mask;
+      // broad light, offset against the turn (the lit cheek)
+      L += 0.10 * gauss(u + yaw * 0.22, v - 0.05, 0.46, 0.58) * mask;
+      // forehead sheen
+      L += 0.07 * gauss(u - yaw * 0.05, v - 0.33, 0.30, 0.15) * mask;
+      // eye wells and brow arcs
+      var sides = [-1, 1];
+      for (var s = 0; s < 2; s++) {
+        var bx = sides[s] * P.eyeGap;
+        var amp = eyeAmp(bx);
+        if (amp < 0.03) continue;
+        var ex = eyeX(bx);
+        L -= 0.78 * amp * gauss(u - ex, v - P.eyeY, 0.092, 0.052);
+        L -= 0.50 * amp * gauss(u - ex * 1.02, v - (P.eyeY + 0.135), 0.125, 0.030);
+      }
+      // nose: bright ridge, base shadow, nostril dots
+      L += 0.40 * gauss(u - nx, v - 0.0, 0.045, 0.175) * (0.35 + 0.65 * mask);
+      L -= 0.26 * gauss(u - nx, v + 0.235, 0.080, 0.045);
+      L -= 0.30 * gauss(u - (nx - 0.052), v + 0.252, 0.020, 0.014);
+      if (prof < 0.6) L -= 0.30 * gauss(u - (nx + 0.052), v + 0.252, 0.020, 0.014);
+      // mouth band and lower-lip light
+      var mw = 0.155 * (1 - 0.28 * ay);
+      L -= 0.72 * gauss(u - mx, v - P.mouthY, mw, 0.040);
+      L += 0.13 * gauss(u - mx, v - (P.mouthY - 0.058), mw * 0.7, 0.020);
+      // chin and jaw shading
+      L -= 0.13 * gauss(u - mx * 0.5, v + 0.60, 0.30, 0.11) * mask;
+      L -= 0.08 * gauss(u, v + 0.30, 0.52, 0.20) * mask;
+      return clamp(L, 0, 1) * (0.25 + 0.75 * mask);
+    };
+  }
+
+  // ---------- dash field per portrait (cached) ----------
+  var dashCache = {};   // portraitIdx -> dash data
+  function dashesFor(idx) {
+    if (dashCache[idx]) return dashCache[idx];
+    var P = paramsFor(idx);
+    var lum = makeLum(P);
+    var N = isPhone ? 64 : 90;
+    var span = 1.10;
+    var cell = (2 * span) / N;
+    var h = 0.007;
+    var rnd = mulberry32((BASE_SEED ^ Math.imul(idx + 7, 0x27D4EB2F)) | 0);
+    var list = [];
+    for (var j = 0; j < N; j++) {
+      for (var i = 0; i < N; i++) {
+        var u = -span + (i + 0.5) * cell;
+        var v = span - (j + 0.5) * cell;
+        var L = lum(u, v);
+        var gx = (lum(u + h, v) - lum(u - h, v)) / (2 * h);
+        var gy = (lum(u, v + h) - lum(u, v - h)) / (2 * h);
+        var gm = Math.sqrt(gx * gx + gy * gy);
+        var ang;
+        if (gm > 0.05) ang = Math.atan2(gy, gx) + Math.PI / 2;
+        else ang = (rnd() - 0.5) * 0.9 + (v > 0 ? 0.25 : -0.25);
+        var sa = rnd() * TAU;
+        var sd = 0.22 + rnd() * 0.85;
+        list.push({
+          u: u, v: v, L: L,
+          len: Math.pow(clamp(L, 0, 1), 1.7),
+          ang: ang,
+          sx: Math.cos(sa) * sd, sy: Math.sin(sa) * sd,
+          rot: (rnd() - 0.5) * 1.6,
+          stag: rnd() * 1.7,
+          stagD: rnd() * 1.0
+        });
+      }
+    }
+    var data = { list: list, cell: cell };
+    dashCache = {}; dashCache[idx] = data;   // keep only the current portrait
+    return data;
+  }
+
+  // ---------- visitor events (recorded, closed-form) ----------
+  var holds = [];        // raw piece times where a tap froze the cycle 10 s
+  var skips = [];        // { eff, jump } double-tap: jump to next portrait
+  var dragSamples = [];  // { u, v, t } interference samples, face coords
+  var pendingHoldAt = -1;
+  var lastTapRaw = -10;
+
+  function holdOverlap(rawT) {
+    var total = 0;
+    for (var i = 0; i < holds.length; i++) {
+      var hh = holds[i];
+      if (rawT > hh) total += clamp(Math.min(rawT, hh + HOLD_FREEZE) - hh, 0, HOLD_FREEZE);
+    }
+    return total;
+  }
+  function effectiveTime(rawT) { return rawT - holdOverlap(rawT); }
+
+  function cycleState(rawT) {
+    var eff = effectiveTime(rawT);
+    var phase = eff, i;
+    for (i = 0; i < skips.length; i++) {
+      if (eff > skips[i].eff) phase += skips[i].jump; else break;
+    }
+    var idx = Math.floor(phase / CYCLE);
+    var tau = phase - idx * CYCLE;
+    return { idx: idx, tau: tau, eff: eff };
+  }
+
+  function addSkip(rawT) {
+    var st = cycleState(rawT);
+    var phaseNow = st.eff;
+    for (var i = 0; i < skips.length; i++) if (st.eff > skips[i].eff) phaseNow += skips[i].jump;
+    var jump = CYCLE - (phaseNow % CYCLE);
+    if (jump < 0.001) jump = CYCLE;
+    skips.push({ eff: st.eff, jump: jump });
+  }
+
+  // per-dash assembly amount at cycle tau
+  function assembleAmt(d, tau) {
+    if (tau < 5) return sstep01((tau - d.stag) / 3.0);
+    if (tau < 10) return 1;
+    return 1 - sstep01((tau - 10 - d.stagD * 0.55) / 2.6);
+  }
+
+  // ---------- audio (lazy, gesture-gated, guarded) ----------
+  var AC = null, aMaster = null, aShimmer = null, aHum = null, aNextTick = 0;
+  function ensureAudio() {
+    if (AC) { if (AC.resume) AC.resume(); return; }
+    var Ctor = null;
+    if (typeof AudioContext !== 'undefined') Ctor = AudioContext;
+    else if (typeof webkitAudioContext !== 'undefined') Ctor = webkitAudioContext;
+    if (!Ctor) return;
+    try {
+      AC = new Ctor();
+      aMaster = AC.createGain(); aMaster.gain.value = 0.0;
+      aMaster.connect(AC.destination);
+      var len = AC.sampleRate * 1.5;
+      var buf = AC.createBuffer(1, len, AC.sampleRate);
+      var ch = buf.getChannelData(0);
+      var r = mulberry32(BASE_SEED);
+      for (var i = 0; i < len; i++) ch[i] = r() * 2 - 1;
+      var src = AC.createBufferSource(); src.buffer = buf; src.loop = true;
+      var bp = AC.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 3400; bp.Q.value = 0.7;
+      aShimmer = AC.createGain(); aShimmer.gain.value = 0;
+      src.connect(bp); bp.connect(aShimmer); aShimmer.connect(aMaster); src.start();
+      var osc = AC.createOscillator(); osc.type = 'sine'; osc.frequency.value = 96;
+      aHum = AC.createGain(); aHum.gain.value = 0;
+      osc.connect(aHum); aHum.connect(aMaster); osc.start();
+      aMaster.gain.setTargetAtTime(0.5, AC.currentTime, 0.4);
+    } catch (e) { AC = null; }
+  }
+  function audioTick(rawT, tau, globalAmt) {
+    if (!AC || !aShimmer) return;
+    try {
+      var t = AC.currentTime;
+      var shim, hum;
+      if (tau < 5) { shim = 0.05 + 0.11 * globalAmt; hum = 0.0; }
+      else if (tau < 10) { shim = 0.012; hum = 0.045; }
+      else { shim = 0.03 + 0.06 * (1 - globalAmt); hum = 0.0; }
+      aShimmer.gain.setTargetAtTime(shim, t, 0.15);
+      aHum.gain.setTargetAtTime(hum, t, 0.25);
+      if (rawT >= aNextTick) {
+        aNextTick = rawT + 0.16;
+        var o = AC.createOscillator(); o.type = 'square';
+        o.frequency.value = 1500 + ihash(Math.floor(rawT * 6)) * 700;
+        var g = AC.createGain(); g.gain.value = 0.0;
+        g.gain.setValueAtTime(0.018, t);
+        g.gain.exponentialRampToValueAtTime(0.0004, t + 0.03);
+        o.connect(g); g.connect(aMaster); o.start(t); o.stop(t + 0.04);
+      }
+    } catch (e) { /* audio is garnish; stay silent */ }
+  }
+
+  // ---------- drawing ----------
+  function drawColumns(rawT) {
+    ctx.strokeStyle = COLUMN;
+    ctx.globalAlpha = 0.5;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    var cols = [viewW / 3, (2 * viewW) / 3];
+    for (var c = 0; c < 2; c++) {
+      for (var k = 0; k < 52; k++) {
+        var seedK = k * 2 + c * 131;
+        var spd = 0.018 + ihash(seedK) * 0.02;
+        var yf = (ihash(seedK + 7) + rawT * spd) % 1;
+        var y = yf * viewH;
+        var x = cols[c] + (ihash(seedK + 13) - 0.5) * 7;
+        var tl = 3 + ihash(seedK + 29) * 7;
+        var flick = 0.55 + 0.45 * Math.sin(rawT * (1 + ihash(seedK + 3) * 2) + k);
+        if (flick < 0.25) continue;
+        ctx.moveTo(x, y);
+        ctx.lineTo(x, y + tl);
+      }
+    }
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  function draw(rawT) {
+    ctx.fillStyle = '#000000';
+    ctx.fillRect(0, 0, viewW, viewH);
+    canvas.style.width = viewW + 'px';
+    canvas.style.height = viewH + 'px';
+
+    drawColumns(rawT);
+
+    var st = cycleState(rawT);
+    var data = dashesFor(st.idx);
+    var list = data.list;
+    var unit = 0.56 * Math.min(viewW, viewH);
+    var cx = viewW / 2, cy = viewH / 2;
+    var maxLen = data.cell * 1.5 * unit;
+    var lw = Math.max(1, unit * 0.010);
+    ctx.lineWidth = lw;
+    ctx.lineCap = 'round';
+
+    // recent drag samples only
+    var recent = [];
+    for (var s = dragSamples.length - 1; s >= 0 && recent.length < 48; s--) {
+      var age = rawT - dragSamples[s].t;
+      if (age > 3.4) break;
+      if (age >= 0) recent.push(dragSamples[s]);
+    }
+
+    var amtSum = 0;
+    var buckets = [[], [], [], [], []];
+    for (var i = 0; i < list.length; i++) {
+      var d = list[i];
+      var a = assembleAmt(d, st.tau);
+      var pu = d.u, pv = d.v, tint = 1 - a, lenF = d.len * (0.3 + 0.7 * a);
+      var ang = d.ang + (1 - a) * d.rot;
+      pu += d.sx * (1 - a);
+      pv += d.sy * (1 - a);
+      if (recent.length) {
+        for (var q = 0; q < recent.length; q++) {
+          var sm = recent[q];
+          var du = d.u - sm.u, dv = d.v - sm.v;
+          var dist2 = du * du + dv * dv;
+          if (dist2 > 0.09) continue;
+          var sage = rawT - sm.t;
+          var env = sage < 0.15 ? sage / 0.15 : Math.exp(-(sage - 0.15) / 1.05);
+          var w = Math.exp(-dist2 / 0.026) * env;
+          if (w > 0.02) {
+            pu += d.sx * w * 0.85;
+            pv += d.sy * w * 0.85;
+            tint = Math.min(1, tint + w * 0.6);
+            lenF *= (1 - 0.4 * w);
+          }
+        }
+      }
+      if (d.L < 0.03 && a > 0.92) continue;
+      amtSum += a;
+      var Lpx = maxLen * lenF;
+      if (Lpx < 0.8) Lpx = 0.8;
+      var x = cx + pu * unit, y = cy - pv * unit;
+      var hx = Math.cos(ang) * Lpx * 0.5, hy = -Math.sin(ang) * Lpx * 0.5;
+      var b = Math.round(clamp(tint, 0, 1) * 4);
+      buckets[b].push(x - hx, y - hy, x + hx, y + hy);
+    }
+    var shades = ['#FFFFFF', '#E4E6E1', '#C9CCC4', '#A9ACA2', '#8A8D84'];
+    for (var b2 = 0; b2 < 5; b2++) {
+      var arr = buckets[b2];
+      if (!arr.length) continue;
+      ctx.strokeStyle = shades[b2];
+      ctx.beginPath();
+      for (var m = 0; m < arr.length; m += 4) {
+        ctx.moveTo(arr[m], arr[m + 1]);
+        ctx.lineTo(arr[m + 2], arr[m + 3]);
+      }
+      ctx.stroke();
+    }
+    return amtSum / Math.max(1, list.length);
+  }
+
+  // ---------- clock ----------
+  var startStamp = null;
+  function nowMs() {
+    if (typeof performance !== 'undefined' && performance.now) return performance.now();
+    return 0;
+  }
+  function pieceTime() {
+    if (startStamp === null) return T0;
+    return T0 + (nowMs() - startStamp) / 1000;
+  }
+
+  // frame one: the synchronous draw at T0
+  measure();
+  draw(T0);
+
+  var rafFn = (typeof requestAnimationFrame !== 'undefined') ? requestAnimationFrame : null;
+  if (rafFn) {
+    var loop = function () {
+      if (startStamp === null) startStamp = nowMs();
+      var rawT = pieceTime();
+      var amt = draw(rawT);
+      var st = cycleState(rawT);
+      audioTick(rawT, st.tau, amt);
+      rafFn(loop);
+    };
+    rafFn(loop);
+  }
+
+  function onResize() {
+    var ow = viewW, oh = viewH;
+    measure();
+    if (viewW !== ow || viewH !== oh) { dashCache = {}; draw(pieceTime()); }
+  }
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('resize', onResize);
+  }
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', onResize);
+  }
+
+  // ---------- pointer ----------
+  var pDown = null;
+  function toFace(ev) {
+    var rect = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    var px = (ev.clientX || 0) - rect.left, py = (ev.clientY || 0) - rect.top;
+    var unit = 0.56 * Math.min(viewW, viewH);
+    return { u: (px - viewW / 2) / unit, v: (viewH / 2 - py) / unit, px: px, py: py };
+  }
+  function onDown(ev) {
+    ensureAudio();
+    var f = toFace(ev);
+    pDown = { t: pieceTime(), px: f.px, py: f.py, moved: 0, lastSample: 0 };
+    if (ev.preventDefault) ev.preventDefault();
+  }
+  function onMove(ev) {
+    if (!pDown) return;
+    var f = toFace(ev);
+    var dx = f.px - pDown.px, dy = f.py - pDown.py;
+    pDown.moved = Math.max(pDown.moved, Math.sqrt(dx * dx + dy * dy));
+    var rawT = pieceTime();
+    if (rawT - pDown.lastSample > 0.03) {
+      pDown.lastSample = rawT;
+      dragSamples.push({ u: f.u, v: f.v, t: rawT });
+      if (dragSamples.length > 400) dragSamples.splice(0, dragSamples.length - 400);
+    }
+  }
+  function onUp(ev) {
+    if (!pDown) return;
+    var rawT = pieceTime();
+    var dur = rawT - pDown.t;
+    var wasTap = dur < 0.35 && pDown.moved < 9;
+    if (wasTap) {
+      if (rawT - lastTapRaw < 0.38) {
+        // double-tap: cancel the pending hold, jump to a new face
+        if (pendingHoldAt >= 0) {
+          var ix = holds.indexOf(pendingHoldAt);
+          if (ix >= 0) holds.splice(ix, 1);
+          pendingHoldAt = -1;
+        }
+        addSkip(rawT);
+        lastTapRaw = -10;
+      } else {
+        holds.push(rawT);
+        pendingHoldAt = rawT;
+        lastTapRaw = rawT;
+      }
+    }
+    pDown = null;
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', function () { pDown = null; });
+  }
+})();
+</script>
+</body>
+</html>

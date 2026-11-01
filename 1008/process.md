@@ -1,0 +1,36 @@
+# No.1008 "The Bout, Drawn"
+
+Study #124 futa-kera, PP169 "Broadcast Ribbons": the fencing broadcast AR composite. A real arena feed below, the drawing above. Sibling to No.1000 (which drew fencing ribbons on black): here a visible scene sits under the ribbons and thin reticles ride the ribbon heads.
+
+## Concept
+
+Two fencers duel on a dark piste inside a grainy broadcast feed. The system tracks only one point per fencer, the blade tip, and draws its true recorded path as a tapered ribbon: red for the left fencer, cyan for the right, each with a white core, fading over eight seconds. A thin white reticle (circle plus crosshair ticks) rides each ribbon head; it and the ribbons are the only graphics, no score bugs, no commentary boxes. Where the blades clash or a head crosses the other's trail, a brief white braid-glow node flares and dies in 0.4 s. The camera breathes a few pixels on slow sines; the sensor grain sits on top of everything, screen-fixed, because it belongs to the camera, not the arena.
+
+## Construction
+
+- Sim: fixed timestep 120 Hz, mulberry32 seeded (seedBase 1008169). Frame one is the synchronous draw after exactly 1440 pre-roll steps (12 s). No Date.now, no Math.random anywhere; grain is a 3-int hash of (cell, cell, time bucket).
+- Movers: each fencer is a spring-steered agent on the piste line. A shared bout centre drifts up and down the strip (seeded wander targets every 2.4 to 4.6 s), so the engagement, and therefore the ribbons, travel the length of the arena instead of knotting in one spot. An exchange director fires every 1.15 to 2.65 s: it picks an attacker, who lunges (extension curve 0.15 to 1 and back over about 0.55 s, with a forward step), and a defender, who retreats or parries (tip deflects sideways on a sine bump). Between exchanges both fencers spring toward footwork targets around the bout centre.
+- Blade tip: tip = fencer x + facing * (0.105 + 0.115 * extension) * FIG, at shoulder height, plus an en-garde circle (radius shrinks as the blade extends), a small bounce, and a slow travelling wave while in free play. The tip is sampled every 2nd step (60 Hz) into a 480-sample ring buffer: exactly 8 s of history, matching the ribbon fade.
+- Ribbons: drawn oldest first in shared-endpoint runs of 8 samples (no gaps), as two passes per run: colored body (alpha decays as (1 - age/8)^1.5, width tapers 0.0012 to 0.010 world units) and a white core at 36 percent of the body width. Every segment is a recorded tip position; nothing is decorative.
+- Braid glow: triggered in-sim when the two tips come within about 0.046 units (a clash, midpoint node) or when a head passes within about 0.02 units of the other ribbon's recorded trail (node at the head), with a 0.5 s per-pair cooldown. Nodes are two layered white discs fading linearly over 0.4 s.
+- Figures: articulated silhouettes posed from the same state that drives the tip (hip, shoulder, head, front arm with drooped elbow and grip at 60 percent of shoulder-to-tip, trailing back arm, front and back legs), so the blade line from grip to tip is the tracked segment itself. Figure geometry scales by FIG = clamp(AX, 0.55, 1), which keeps bodies and reach inside narrow phone frames.
+- Feed: floor band and piste trapezoid in the floor tone at low alpha, two dim far-wall light panels, full-width floor line, hash grain (6 px cells, about 14 percent coverage, alpha 0.025 to 0.056), camera breath of plus/minus 4 px applied to the scene only.
+- Palette: feed #0B0D12; floor line #2B3038; ribbons #FF2B2B and #2BD8FF with #FFFFFF cores; reticles and braid glow #FFFFFF. Figure tones are derived dim slates, recorded here as specified in the brief: bodies #3A4150, edges and blade #59637A (drawn as an edge pass under a body pass per limb).
+- Interaction: tap a ribbon to isolate it (feed dims under a 0.55 black wash, the other ribbon drops to 0.22, 10 s). Drag horizontally to scrub: dragging left walks a replay offset back through the ring buffers (ribbons redraw truncated at the scrub point, the reticle rides the historical head, figures ghost to 0.35, flashes age against the virtual step); release returns to live. Double-tap reseeds a new bout (seed advances by LCG, sim rebuilt and pre-rolled). Never click-to-reload.
+- Audio (lazy, typeof-guarded, created only inside the first pointerdown; the visual is complete in silence): a looped seeded-noise crowd wash through a 380 Hz lowpass at low gain; one thin sine whistle per mover with pitch mapped to tip speed; a bright 1650 Hz tick per clash and a softer 2950 Hz click per trail-crossing snap, both counted in-sim and drained by the audio updater.
+- Viewport: canvas sized from the Visual Viewport API with resize listeners on visualViewport and window; canvas.style.width/height pinned in px in draw(); phone detection via window.screen min dimension under 700 px with the aspect fallback. Page ground is the feed tone. If the aspect changes materially, the sim rebuilds at the new AX with the same seed and pre-roll, so geometry stays sane.
+
+## QA log
+
+- Rendered with node ~/workspace/tools/render-piece.js at 1280x900 (qa-desktop.png), 390x844 (qa-mobile.png), 720x720 (thumb.png). All render cleanly in silence; registered listeners: vv:resize, win:resize, canvas pointerdown/pointermove/pointerup.
+- Determinism: thumb.png rendered twice and cmp byte-compared identical; the duplicate render was deleted.
+- Braid-glow presence at frame one verified by a probe build (throwaway copy with flash discs recolored magenta, scanned by pixel count): 367 magenta px at 720x720 and 608 px at 1280x900, so a flash is mid-fade in frame one at both aspects. Probe files deleted.
+- Read-backs: desktop shows a dark grainy arena, floor line and piste trapezoid, two dim slate fencers mid-bout left of centre, red and cyan ribbons with white cores braiding between them with loop handwriting trailing right (history from an earlier passage of the bout), white reticles at both heads. Thumb shows the same composition square, reticles visible at the braid centre. Mobile (390x844) keeps both fencers and the full ribbon band inside the frame; nothing is badly clipped.
+- Fix rounds: (1) first build knotted the ribbons at the tips because the fencers hovered at fixed homes and the figures were oversized; fixed by adding the drifting bout centre, wider footwork, and scaling figure geometry by FIG (about 0.7 of the first build's height). (2) A dropped parenthesis in the RNG return was caught by the first render attempt and fixed before any QA render.
+- Restraint checks: grep confirms no Date.now, Math.random, gradients, shadowBlur, ctx.filter, offscreen canvas, external URLs, or em dashes in index.html. Zero visible text besides the title.
+
+## Deviations
+
+- The wall light panels are drawn in the figure-edge tone at 0.06 alpha rather than a new color, keeping the file inside the brief's palette.
+- During scrub the figures ghost at live pose instead of replaying historical poses: the brief's scrub contract is about the ribbon history, and only the tips' histories are recorded; storing full pose history was judged out of scope. The ribbons, reticles, and flashes all replay honestly.
+- Audio timbres are approximate (sine whistles, triangle blips, filtered noise wash) per house practice; all triggers are the real sim events.

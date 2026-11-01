@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Wall Hums</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #05070F; height: 100%; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- palette ----------
+  // Field tone derivation: the prompt's "deep blue-black" is taken as a
+  // near-black with the blue channel lifted just clear of zero:
+  // R 5, G 7, B 15 (#05070F). Blue dominant, everything else near black,
+  // so the white hatching reads as light and the figure (#010204) still
+  // sits darker than the wall behind it.
+  var FIELD = '#05070F', FIG = '#010204';
+  var MAG = [255, 79, 216], GRN = [61, 220, 132];
+  var T0 = 11;                  // frame one: wall mid-breath, first flare just bloomed
+
+  // ---------- seeded rng ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  var SQ = Math.SQRT1_2;
+
+  // ---------- per-line jitter (fixed tables, seeded once) ----------
+  var NJ = 1024, jOff = new Float32Array(NJ), jTilt = new Float32Array(NJ);
+  (function () {
+    var r = mulberry32(1011172);
+    for (var i = 0; i < NJ; i++) {
+      jOff[i] = (r() - 0.5) * 1.7;        // hand-drawn irregularity, px
+      jTilt[i] = (r() - 0.5) * 0.022;     // per-line angle wobble, rad
+    }
+  })();
+
+  // ---------- wave field ----------
+  // Brightness driver: three slow traveling sines over position and time.
+  function waveB(x, y, t) {
+    var v = 0.55 * Math.sin(0.0105 * x + 0.0042 * y - 0.16 * t)
+          + 0.35 * Math.sin(0.0038 * (x - y) + 0.11 * t + 1.7)
+          + 0.18 * Math.sin(0.0210 * y - 0.07 * t + 0.6);
+    return clamp(v, -1, 1);
+  }
+  // Spacing displacement: the perpendicular coordinate of each line is
+  // pushed by two slower waves, so the hatching spreads and gathers.
+  function waveDisp(u, v, t) {
+    return 3.0 * Math.sin(0.006 * v - 0.13 * t)
+         + 1.8 * Math.sin(0.016 * u + 0.09 * t + 2.0);
+  }
+  // Angle modulation: the whole field leans a few degrees, slowly.
+  function waveTilt(u, v, t) {
+    return 0.055 * Math.sin(0.005 * v + 0.10 * t)
+         + 0.030 * Math.sin(0.013 * u - 0.06 * t);
+  }
+
+  // ---------- flares (seeded schedule) ----------
+  // First flare is fixed by the brief: t0 = 10.2, upper-left, magenta,
+  // so frame one (t = 11) catches it just bloomed. Later flares follow a
+  // seeded 14-26 s cadence, colors alternating, never near center twice
+  // in a row.
+  var flares = [];
+  (function () {
+    var r = mulberry32(1011173);
+    flares.push({ t0: 10.2, fx: 0.22, fy: 0.24, col: MAG, seed: r() });
+    var t = 10.2, prevCenter = false, useMag = false;
+    for (var i = 0; i < 40; i++) {
+      t += 14 + r() * 12;
+      var fx = 0.08 + r() * 0.84, fy = 0.08 + r() * 0.70;
+      var center = Math.abs(fx - 0.5) < 0.16 && Math.abs(fy - 0.42) < 0.16;
+      if (center && prevCenter) fx = fx < 0.5 ? fx + 0.34 : fx - 0.34;
+      prevCenter = center;
+      flares.push({ t0: t, fx: fx, fy: fy, col: useMag ? MAG : GRN, seed: r() });
+      useMag = !useMag;
+    }
+  })();
+
+  // ---------- drag bend state (events; strength is closed-form in t) ----------
+  var bend = { x: 0, y: 0, dragging: false, startT: 0, startS: 0, relT: -10, relS: 0 };
+  function bendStrength(t) {
+    if (bend.dragging) {
+      return bend.startS + (1 - bend.startS) * (1 - Math.exp(-(t - bend.startT) / 0.25));
+    }
+    if (t <= bend.relT) return bend.relS;
+    return bend.relS * Math.exp(-(t - bend.relT) / 1.0);   // ~gone by 3 s
+  }
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 720, H = 720, nowT = T0;
+  function viewportSize() {
+    var w, h;
+    if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.width) {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    } else if (typeof window !== 'undefined' && window.innerWidth) {
+      w = window.innerWidth; h = window.innerHeight;
+    } else { w = W; h = H; }
+    return [Math.round(w), Math.round(h)];
+  }
+  function isPhone() {
+    if (typeof window !== 'undefined' && window.screen && window.screen.width) {
+      return Math.min(window.screen.width, window.screen.height) < 700;
+    }
+    return H > W * 1.15;
+  }
+  function resize() {
+    var s = viewportSize(); W = s[0]; H = s[1];
+    canvas.width = W; canvas.height = H;
+    draw(nowT);
+  }
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', resize);
+    }
+    if (window.addEventListener) window.addEventListener('resize', resize);
+  }
+
+  // ---------- wall ----------
+  var BUCKETS = 14;
+  function drawWall(t) {
+    ctx.fillStyle = FIELD;
+    ctx.fillRect(0, 0, W, H);
+    var phone = isPhone();
+    var spacing = phone ? 7.5 : 6.0;          // phone: density stepped down
+    var segLen = phone ? 34 : 30, half = segLen / 2;
+    var bs = bendStrength(t);
+    var bendR = 0.30 * Math.min(W, H);
+    var buckets = [];
+    for (var b = 0; b < BUCKETS; b++) buckets.push([]);
+    var uMax = (W + H) * SQ + spacing * 2;
+    var vMin = -H * SQ - segLen, vMax = W * SQ + segLen;
+    var kMax = Math.ceil(uMax / spacing);
+    for (var k = 0; k <= kMax; k++) {
+      var u0 = k * spacing + jOff[k % NJ];
+      var lt = jTilt[k % NJ];
+      for (var v = vMin; v <= vMax; v += segLen) {
+        var u = u0 - waveDisp(u0, v, t);
+        var cx = (u + v) * SQ, cy = (u - v) * SQ;
+        if (cx < -44 || cx > W + 44 || cy < -44 || cy > H + 44) continue;
+        var n = 0.5 + 0.5 * waveB(cx, cy, t);
+        var alpha = 0.05 + 0.50 * Math.pow(n, 1.6);
+        var tilt = -Math.PI / 4 + waveTilt(u, v, t) + lt;
+        if (bs > 0.003) {
+          var dx = cx - bend.x, dy = cy - bend.y;
+          var g = Math.exp(-(dx * dx + dy * dy) / (bendR * bendR));
+          if (g > 0.01) {
+            var push = 11 * bs * g;             // lines spread around the finger
+            cx += SQ * push; cy += SQ * push;
+            alpha += 0.22 * bs * g;
+            tilt += 0.12 * bs * g;
+          }
+        }
+        if (alpha < 0.035) continue;
+        var bi = Math.floor(clamp(alpha, 0, 0.62) / 0.62 * BUCKETS);
+        if (bi >= BUCKETS) bi = BUCKETS - 1;
+        var ca = Math.cos(tilt) * half, sa = Math.sin(tilt) * half;
+        buckets[bi].push(cx - ca, cy - sa, cx + ca, cy + sa);
+      }
+    }
+    ctx.lineWidth = phone ? 1.15 : 1.3;
+    ctx.lineCap = 'round';
+    for (var i = 0; i < BUCKETS; i++) {
+      var arr = buckets[i];
+      if (!arr.length) continue;
+      var a = (i + 0.5) / BUCKETS * 0.62;
+      ctx.strokeStyle = 'rgba(255,255,255,' + a.toFixed(3) + ')';
+      ctx.beginPath();
+      for (var j = 0; j < arr.length; j += 4) {
+        ctx.moveTo(arr[j], arr[j + 1]);
+        ctx.lineTo(arr[j + 2], arr[j + 3]);
+      }
+      ctx.stroke();
+    }
+  }
+
+  // ---------- figure (small, dark, bottom: the wall is the subject) ----------
+  function drawFigure(t) {
+    var fh = H * 0.17;
+    var fx = W * 0.5 + 2.2 * Math.sin(t * 0.32);       // the sway: +/-2 px
+    var feetY = H * 0.968;
+    var lean = 1.6 * Math.sin(t * 0.32 + 0.4);
+    var headR = fh * 0.088;
+    var headY = feetY - fh + headR;
+    var shY = headY + headR * 1.55;                    // shoulders
+    var hipY = feetY - fh * 0.46;
+    ctx.fillStyle = FIG;
+    ctx.beginPath();
+    ctx.arc(fx + lean, headY, headR, 0, Math.PI * 2);
+    ctx.fill();
+    // torso and legs as one tapered silhouette
+    ctx.beginPath();
+    ctx.moveTo(fx + lean - fh * 0.075, shY);
+    ctx.lineTo(fx + lean + fh * 0.075, shY);
+    ctx.lineTo(fx + fh * 0.038, hipY);
+    ctx.lineTo(fx + fh * 0.052, feetY);                // right leg
+    ctx.lineTo(fx + fh * 0.012, feetY);
+    ctx.lineTo(fx, hipY + fh * 0.05);
+    ctx.lineTo(fx - fh * 0.012, feetY);                // left leg
+    ctx.lineTo(fx - fh * 0.052, feetY);
+    ctx.lineTo(fx - fh * 0.038, hipY);
+    ctx.closePath();
+    ctx.fill();
+    // arms hanging at the sides
+    ctx.beginPath();
+    ctx.moveTo(fx + lean - fh * 0.075, shY + fh * 0.01);
+    ctx.lineTo(fx - fh * 0.105, hipY + fh * 0.06);
+    ctx.lineTo(fx - fh * 0.082, hipY + fh * 0.07);
+    ctx.lineTo(fx + lean - fh * 0.052, shY + fh * 0.05);
+    ctx.closePath();
+    ctx.moveTo(fx + lean + fh * 0.075, shY + fh * 0.01);
+    ctx.lineTo(fx + fh * 0.105, hipY + fh * 0.06);
+    ctx.lineTo(fx + fh * 0.082, hipY + fh * 0.07);
+    ctx.lineTo(fx + lean + fh * 0.052, shY + fh * 0.05);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  // ---------- flares ----------
+  function drawFlares(t) {
+    for (var i = 0; i < flares.length; i++) {
+      var f = flares[i];
+      var age = t - f.t0;
+      if (age < 0 || age > 1.5) continue;
+      var env = Math.sin(Math.PI * age / 1.5);
+      env = Math.pow(env, 1.4);
+      var x = f.fx * W, y = f.fy * H;
+      var r = mulberry32(Math.floor(f.seed * 1e9) + 7);
+      var cr = f.col[0], cg = f.col[1], cb = f.col[2];
+      // layered core glow (flat alpha discs, no gradient)
+      for (var d = 3; d >= 1; d--) {
+        ctx.fillStyle = 'rgba(' + cr + ',' + cg + ',' + cb + ',' + (0.05 * env).toFixed(3) + ')';
+        ctx.beginPath();
+        ctx.arc(x, y, 9 * d * (0.6 + 0.4 * env), 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.fillStyle = 'rgba(' + cr + ',' + cg + ',' + cb + ',' + (0.5 * env).toFixed(3) + ')';
+      ctx.beginPath();
+      ctx.arc(x, y, 2.2, 0, Math.PI * 2);
+      ctx.fill();
+      // radial rays
+      var rays = 16;
+      ctx.lineWidth = 1;
+      for (var q = 0; q < rays; q++) {
+        var ang = (q / rays) * Math.PI * 2 + f.seed * 3.1;
+        var len = (26 + 96 * r()) * (0.35 + 0.65 * env);
+        var a = 0.42 * env * (0.35 + 0.65 * r());
+        if (a < 0.02) continue;
+        ctx.strokeStyle = 'rgba(' + cr + ',' + cg + ',' + cb + ',' + a.toFixed(3) + ')';
+        ctx.beginPath();
+        ctx.moveTo(x + Math.cos(ang) * 3, y + Math.sin(ang) * 3);
+        ctx.lineTo(x + Math.cos(ang) * len, y + Math.sin(ang) * len);
+        ctx.stroke();
+      }
+      // four long sparkle rays on the diagonals
+      ctx.lineWidth = 1.2;
+      for (var s = 0; s < 4; s++) {
+        var sa2 = Math.PI / 4 + s * Math.PI / 2 + f.seed;
+        var sl = 130 * env;
+        ctx.strokeStyle = 'rgba(' + cr + ',' + cg + ',' + cb + ',' + (0.30 * env).toFixed(3) + ')';
+        ctx.beginPath();
+        ctx.moveTo(x - Math.cos(sa2) * sl * 0.12, y - Math.sin(sa2) * sl * 0.12);
+        ctx.lineTo(x + Math.cos(sa2) * sl, y + Math.sin(sa2) * sl);
+        ctx.stroke();
+      }
+    }
+  }
+
+  // ---------- draw ----------
+  function draw(t) {
+    nowT = t;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    drawWall(t);
+    drawFlares(t);
+    drawFigure(t);
+  }
+
+  // ---------- audio (lazy, gesture-only, guarded) ----------
+  var AC = null, droneOsc = null, droneSub = null, droneFilter = null, droneGain = null;
+  function initAudio() {
+    if (AC) { if (AC.resume) AC.resume(); return; }
+    var Ctor = null;
+    if (typeof AudioContext !== 'undefined') Ctor = AudioContext;
+    else if (typeof webkitAudioContext !== 'undefined') Ctor = webkitAudioContext;
+    if (!Ctor) return;
+    try {
+      AC = new Ctor();
+      droneFilter = AC.createBiquadFilter();
+      droneFilter.type = 'lowpass';
+      droneFilter.frequency.value = 200;
+      droneFilter.Q.value = 2;
+      droneGain = AC.createGain();
+      droneGain.gain.value = 0.0;
+      droneGain.gain.setTargetAtTime(0.045, AC.currentTime, 1.5);
+      droneOsc = AC.createOscillator();
+      droneOsc.type = 'sine';
+      droneOsc.frequency.value = 54;
+      droneSub = AC.createOscillator();
+      droneSub.type = 'triangle';
+      droneSub.frequency.value = 108.5;
+      var subGain = AC.createGain();
+      subGain.gain.value = 0.35;
+      droneOsc.connect(droneFilter);
+      droneSub.connect(subGain);
+      subGain.connect(droneFilter);
+      droneFilter.connect(droneGain);
+      droneGain.connect(AC.destination);
+      droneOsc.start();
+      droneSub.start();
+    } catch (e) { AC = null; }
+  }
+  function ping(col) {
+    if (!AC) return;
+    try {
+      var t = AC.currentTime;
+      var o = AC.createOscillator();
+      o.type = 'triangle';
+      o.frequency.value = (col === MAG) ? 1567 : 1318;
+      var g = AC.createGain();
+      g.gain.setValueAtTime(0.10, t);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.55);
+      o.connect(g);
+      g.connect(AC.destination);
+      o.start(t);
+      o.stop(t + 0.6);
+    } catch (e) { /* audio is garnish; the wall is silent-safe */ }
+  }
+  function audioTick(t, prevT) {
+    if (!AC) return;
+    // drone pitch tracks the global spacing wave (the -0.13 t term of
+    // waveDisp); filter sweeps with the brightness waves.
+    if (droneOsc) droneOsc.frequency.value = 54 + 5 * Math.sin(0.13 * t + 2.0);
+    if (droneSub) droneSub.frequency.value = 108.5 + 10 * Math.sin(0.13 * t + 2.0);
+    if (droneFilter) droneFilter.frequency.value = 190 + 130 * (0.5 + 0.5 * Math.sin(0.11 * t + 1.7));
+    for (var i = 0; i < flares.length; i++) {
+      if (flares[i].t0 > prevT && flares[i].t0 <= t) ping(flares[i].col);
+    }
+  }
+
+  // ---------- interaction: drag bends the field, nothing else ----------
+  function evtPos(e) {
+    var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    return [e.clientX - r.left, e.clientY - r.top];
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', function (e) {
+      initAudio();
+      var p = evtPos(e);
+      bend.startS = bendStrength(nowT);
+      bend.startT = nowT;
+      bend.x = p[0]; bend.y = p[1];
+      bend.dragging = true;
+    });
+    canvas.addEventListener('pointermove', function (e) {
+      if (!bend.dragging) return;
+      var p = evtPos(e);
+      bend.x = p[0]; bend.y = p[1];
+    });
+    var endDrag = function () {
+      if (!bend.dragging) return;
+      bend.relS = bendStrength(nowT);
+      bend.relT = nowT;
+      bend.dragging = false;
+    };
+    canvas.addEventListener('pointerup', endDrag);
+    canvas.addEventListener('pointercancel', endDrag);
+    canvas.addEventListener('pointerleave', endDrag);
+  }
+
+  // ---------- run ----------
+  var s0 = viewportSize(); W = s0[0]; H = s0[1];
+  canvas.width = W; canvas.height = H;
+  draw(T0);                                    // frame one: fixed phase, synchronous
+  if (typeof requestAnimationFrame === 'function') {
+    var startTs = null, prevT = T0;
+    var loop = function (ts) {
+      if (startTs === null) startTs = ts;
+      var t = T0 + (ts - startTs) / 1000;
+      draw(t);
+      audioTick(t, prevT);
+      prevT = t;
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
