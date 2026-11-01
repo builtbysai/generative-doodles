@@ -1,0 +1,35 @@
+# No.957 — Simulacrum (After)
+
+Study #117 reas, PP118 "Pen Plotter Study". After Reas's SIMULACRUM plotter drawings: a machine holds a Sakura Pigma Micron 08 and draws the five Platonic solids as wireframe ghosts on Strathmore paper.
+
+## Concept
+
+One pen, one ink per sheet, constant line weight, a steady machine hand. Each sheet is a single drawn walk: a wandering lead-in line, then the wireframe of each of the five Platonic solids in turn, joined by wandering connector lines, everything overlapping into one tangled drawing. The sheet takes four minutes to draw; then the paper clears, the pen is swapped (black, sepia, indigo, rotating), and a new sheet begins with a new seeded walk. Nothing is filled, nothing tapers, nothing hesitates: the steadiness is the aesthetic.
+
+## Construction
+
+- **Virtual sheet.** All geometry lives in a 1000x1000 unit square, scaled to the viewport's smaller dimension and centered; the solids land inside roughly the centered 86% of the sheet. Page ground is the paper color everywhere (light-ground phone rule). Paper grain is 1,400 seeded speckle points drawn per sheet.
+- **Solids.** Vertices for tetrahedron, cube, octahedron, dodecahedron and icosahedron are built from coordinates; edges are recovered uniformly as the pairs at minimum pairwise distance. Each solid gets a seeded center, radius (148–178 units) and 3D rotation, projected orthographically.
+- **Continuous trails.** Each wireframe must be drawn without lifting the pen, so the edge graph is made Eulerian: shortest paths between odd-degree vertices are duplicated (a real plotter repeats edges the same way), then a Hierholzer walk produces one continuous trail per solid.
+- **Overshoot.** At every trail vertex where the path turns sharper than about 25 degrees, the path runs 1.6 units past the corner along the incoming direction and comes back, the machine's slight overshoot, baked into the path data.
+- **Wanders.** Between solids, drawn connector lines: Catmull-Rom curves through 3–5 seeded control points, sampled into short straight segments. The pen stays down; in the base program of a sheet there are no travel (pen-up) segments at all. Travels enter only through interaction (tap re-seats, visitor-path insertion).
+- **Timeline.** The program is a flat segment list with per-segment lengths. Draw speed S and travel speed 4S; S is solved per sheet so total pen time is exactly 240 s (sheet 1: S = 71.8 units/s, about 52 px/s at the 720 px gallery size). Pen state at any time is found by walking the segment list, closed-form: no integration, no wall clock in any drawn state.
+- **Frame one.** Sheet 1 uses seed base 163, chosen because its seeded visit order is tetrahedron, cube, octahedron, icosahedron, dodecahedron. The boot fast-forwards the pen along the timeline to T0 = the start of the third solid plus 45% of its span (T0 = 86.6 s of 240 s, fraction 0.361): lead-in and first two solids complete, third mid-draw, nib dot at the line head.
+- **Ink rotation.** Sheet index mod 3 selects black #1A1A1A, sepia #6B4A2E, indigo #2B3A8C. One ink per sheet, never mixed.
+- **Sheet change.** When the program is exhausted, a paper-tone wipe slides across over 0.8 s, then the next sheet is built from the next seed and starts drawing from its beginning.
+- **Interaction.**
+  - Tap: the pen lifts, travels invisibly to the tap point, then to the start of the next solid, and resumes there. Simplification, recorded per the brief: the remainder of the current solid is abandoned rather than resumed.
+  - Drag: the visitor's path is drawn live as a pencil precursor (#B9B2A0 at 0.3 alpha, a gray derived from the paper family). On release it is spliced into the program immediately after the current solid completes: travel to the precursor start, ink it in the sheet ink, travel back to the programmed path. Only one pending precursor at a time; it is cleared once the pen reaches it. If the pen has already passed the insertion point, the path is appended at the end of the program instead.
+  - Double-tap: fresh sheet immediately (next ink, new seed). A single tap is held 350 ms so a double-tap can pre-empt it.
+- **Sound.** All audio is created lazily on the first pointer gesture and typeof-guarded. A looped filtered-noise stepper whir whose bandpass pitch follows the current segment speed (draw vs travel) and whose gain follows pen up/down; a low sine thunk on pen-down, a short square click on pen-up, a soft triangle sweep on sheet change. The piece renders complete in silence: the QA harness has no AudioContext and none is touched.
+- **House rules.** Canvas sized from the Visual Viewport API with resize listeners on both visualViewport and window; canvas style width/height pinned in px inside draw() every frame. Phone detection via window.screen physical size (min dimension < 700 px) with aspect h > w*1.15 as fallback only; on phones the grain is drawn at half density and the square sheet centers on the smaller dimension. requestAnimationFrame is typeof-guarded; with no rAF the boot draw is the whole piece. No gradients, no shadowBlur, no ctx.filter, no offscreen canvas, no microphone, no external assets, no visible text besides the title. `Date.now` appears once, as a fallback clock for pointer-event timing (tap vs double-tap) inside `perfNow()`; it never feeds drawn state, which comes only from the rAF timestamp delta and the seeded timeline.
+
+## QA log
+
+- Model probed in node with a stub DOM before rendering: sheet 1 total pen time 240.0 s (inside the 220–260 s target), T0 86.6 s (fraction 0.361), order tetra/cube/octa/icosa/dodeca, ink black; sheets 2 and 3 also total 240.0 s with sepia and indigo inks.
+- First render round: composition too small and clumped (radii 88–122, centers within ±105). Radii raised to 102–138 and centers spread to ±215, then radii to 148–178 and centers to ±235; full-sheet drawn extent is now x 128–730, y 243–847 of 1000.
+- Renders read back:
+  - Desktop (1280x900) and thumb (720x720): cream Strathmore paper with faint grain; one continuous black line: a smooth wandering lead-in from the left, a large complete tetrahedron below, a complete cube wireframe above it (nested-box projection), and the octahedron mid-draw overlapping the cube, its drawn edges ending at the visible nib dot. Constant weight throughout, no fills, generous margin.
+  - Mobile (390x844): the square sheet scales to the 390 px width and centers vertically; the same drawing, complete and unclipped; nothing touches the edges.
+- Determinism: thumb.png rendered twice with the QA renderer and compared with cmp: byte-identical, including after the final comment-only edit to index.html (thumb re-rendered from the final file and re-verified). Duplicate renders deleted.
+- Deviations from the brief, all recorded above: base sheet program contains no pen-up travel segments (travels arise from tap/visitor events and are timed at 4S exactly as specced); tap abandons the current solid (the brief's own sanctioned simplification); sheet duration is exact by construction at 240 s with S solved per sheet rather than fixed at 55 px/s, since path length varies by seed.
