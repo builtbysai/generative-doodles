@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Eye Spy</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #e8e2d4; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  // ---------- seeded PRNG (mulberry32), never Math.random ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(1423000);
+
+  // ---------- palette ----------
+  var PAPER = '#e8e2d4', GLASS = '#9ab4c0', EYEWHITE = '#f2f0e8',
+      IRIS = '#6a4a2a', GOLD = '#d4a24e', HIDDEN = '#2e6f8e',
+      PLAIN = '#8a8578', FAINT = '#b8b2a2';
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0, phone = false;
+  function sizeCanvas() {
+    var w, h;
+    if (typeof visualViewport !== 'undefined' && visualViewport) {
+      w = visualViewport.width; h = visualViewport.height;
+    } else if (typeof window !== 'undefined' && window.innerWidth) {
+      w = window.innerWidth; h = window.innerHeight;
+    } else { w = 1280; h = 900; }
+    W = w; H = h;
+    canvas.width = w; canvas.height = h;
+    canvas.style.width = w + 'px'; canvas.style.height = h + 'px';
+    var scrMin = 99999;
+    if (typeof window !== 'undefined' && window.screen) {
+      scrMin = Math.min(window.screen.width, window.screen.height);
+    }
+    phone = (scrMin < 700) || (h > w * 1.15);
+  }
+  sizeCanvas();
+  if (typeof visualViewport !== 'undefined' && visualViewport &&
+      visualViewport.addEventListener) {
+    visualViewport.addEventListener('resize', sizeCanvas);
+  }
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('resize', sizeCanvas);
+  }
+  if (typeof document !== 'undefined' && document.body && document.body.style) {
+    document.body.style.background = PAPER;
+  }
+
+  // ---------- helpers ----------
+  function r4(x) { return Math.round(x * 10000) / 10000; }
+  function clamp(x, a, b) { return x < a ? a : (x > b ? b : x); }
+  function smooth(x) { // smoothstep 0..1
+    x = clamp(x, 0, 1); return x * x * (3 - 2 * x);
+  }
+  function dot(x, y, r, col, alpha) {
+    ctx.fillStyle = col;
+    ctx.globalAlpha = r4(alpha);
+    ctx.fillRect(x - r, y - r, r * 2, r * 2);
+    ctx.globalAlpha = 1;
+  }
+  function disc(x, y, r, col, alpha) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fillStyle = col;
+    ctx.globalAlpha = r4(alpha);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+  function ring(x, y, r, col, lw, alpha) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.strokeStyle = col; ctx.lineWidth = lw;
+    ctx.globalAlpha = r4(alpha);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+  function line(x0, y0, x1, y1, col, lw, alpha) {
+    ctx.beginPath();
+    ctx.moveTo(x0, y0); ctx.lineTo(x1, y1);
+    ctx.strokeStyle = col; ctx.lineWidth = lw;
+    ctx.globalAlpha = r4(alpha);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- seeded field content (unit coords, scaled at draw) ----------
+  // Plain field: faint marks scattered across the whole field, always visible.
+  var plainMarks = [];
+  (function () {
+    var i;
+    for (i = 0; i < 46; i++) {
+      plainMarks.push({
+        x: rng(), y: rng(), r: 1 + rng() * 3,
+        kind: (i % 3 === 0) ? 'line' : 'dot',
+        a: 0.10 + rng() * 0.12
+      });
+    }
+  })();
+  // Hidden layer: one faint second drawing per side, revealed only while
+  // that side's figure holds the eyes.
+  function makeHidden(seedOff) {
+    var r = mulberry32(1423000 + seedOff), arr = [], i;
+    for (i = 0; i < 14; i++) {
+      arr.push({
+        x: 0.04 + r() * 0.42, y: 0.08 + r() * 0.84,
+        r: 3 + r() * 14, kind: ['circ', 'arc', 'cross', 'dots'][i % 4],
+        a: 0.28 + r() * 0.30
+      });
+    }
+    return arr;
+  }
+  var hiddenLeft = makeHidden(11), hiddenRight = makeHidden(77);
+
+  // ---------- pass schedule (closed-form over time) ----------
+  // 24 s cycle: hold left 5 s, travel L->R 7 s, hold right 5 s, travel R->L 7 s.
+  // Phase offset +2.5 s puts frame one mid-hold at the left hand.
+  var CYCLE = 24, HOLD = 5, TRAVEL = 7;
+  var steal = null; // {holder: 'left'|'right', t0: seconds} set on drag release
+  var drag = null;  // {x, y} while the parcel is grabbed
+  var nowT = 0;     // last drawn clock time (for drag-release anchoring)
+
+  function schedule(t) {
+    // Returns {phase: 'hold'|'travel', holder, from, to, u, holdAge}
+    var base, ph;
+    if (steal) {
+      var e = t - steal.t0;
+      if (e < 0) e = 0;
+      var cyc = e % CYCLE;
+      var first = steal.holder, second = (first === 'left') ? 'right' : 'left';
+      if (cyc < HOLD) return { phase: 'hold', holder: first, holdAge: cyc, cyc: cyc };
+      if (cyc < HOLD + TRAVEL) {
+        return { phase: 'travel', from: first, to: second,
+                 u: smooth((cyc - HOLD) / TRAVEL), cyc: cyc };
+      }
+      if (cyc < HOLD + TRAVEL + HOLD) {
+        return { phase: 'hold', holder: second, holdAge: cyc - HOLD - TRAVEL, cyc: cyc };
+      }
+      return { phase: 'travel', from: second, to: first,
+               u: smooth((cyc - HOLD - TRAVEL - HOLD) / TRAVEL), cyc: cyc };
+    }
+    ph = (t + 2.5) % CYCLE;
+    if (ph < HOLD) return { phase: 'hold', holder: 'left', holdAge: ph, cyc: ph };
+    if (ph < HOLD + TRAVEL) {
+      return { phase: 'travel', from: 'left', to: 'right',
+               u: smooth((ph - HOLD) / TRAVEL), cyc: ph };
+    }
+    if (ph < HOLD + TRAVEL + HOLD) {
+      return { phase: 'hold', holder: 'right',
+               holdAge: ph - HOLD - TRAVEL, cyc: ph };
+    }
+    return { phase: 'travel', from: 'right', to: 'left',
+             u: smooth((ph - HOLD - TRAVEL - HOLD) / TRAVEL), cyc: ph };
+  }
+
+  // Holder-side reveal alpha: ramps in over the first 0.8 s of a hold,
+  // out over the last 0.8 s; zero while travelling.
+  function holderAlpha(side, s) {
+    if (s.phase !== 'hold' || s.holder !== side) return 0;
+    var a = smooth(s.holdAge / 0.8) * smooth((HOLD - s.holdAge) / 0.8);
+    return a;
+  }
+
+  // ---------- geometry ----------
+  function hands() {
+    var cx = W / 2, hy = H * 0.52;
+    return {
+      left: { x: cx - W * 0.16, y: hy },
+      right: { x: cx + W * 0.16, y: hy }
+    };
+  }
+  function eyesPos(t, s) {
+    if (drag) return { x: drag.x, y: drag.y };
+    var hd = hands();
+    // Gentle bob, periodic over half the cycle so the loop closes exactly.
+    var bob = Math.sin(s.cyc * Math.PI / 6) * 2;
+    if (s.phase === 'hold') {
+      var p = (s.holder === 'left') ? hd.left : hd.right;
+      return { x: p.x, y: p.y + bob };
+    }
+    var a = (s.from === 'left') ? hd.left : hd.right;
+    var b = (s.to === 'left') ? hd.left : hd.right;
+    return { x: a.x + (b.x - a.x) * s.u, y: a.y + (b.y - a.y) * s.u + bob };
+  }
+  // Which side currently "holds" the view (nearest side while dragging).
+  function viewHolder(s, ep) {
+    if (drag) return (ep.x < W / 2) ? 'left' : 'right';
+    if (s.phase === 'hold') return s.holder;
+    return null;
+  }
+
+  // ---------- drawing ----------
+  function drawFigure(cx, faceInward, scale) {
+    // Transparent figure: edge lines only, no fill.
+    var s = scale, hy = H * 0.52;
+    var headR = 34 * s, headY = H * 0.30;
+    var shoulderY = headY + headR + 18 * s;
+    var hipY = H * 0.72, footY = H * 0.88;
+    ctx.strokeStyle = GLASS; ctx.lineWidth = Math.max(2, 2.5 * s);
+    ctx.globalAlpha = 0.95;
+    // head
+    ctx.beginPath();
+    ctx.moveTo(cx + headR, headY);
+    ctx.arc(cx, headY, headR, 0, Math.PI * 2);
+    ctx.stroke();
+    // torso
+    ctx.beginPath();
+    ctx.moveTo(cx, shoulderY); ctx.lineTo(cx, hipY);
+    ctx.stroke();
+    // arms: one reaching inward toward the hand point, one relaxed
+    var hx = cx + faceInward * W * 0.16, hy2 = hy;
+    ctx.beginPath();
+    ctx.moveTo(cx, shoulderY + 6 * s);
+    ctx.lineTo(hx, hy2);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(cx, shoulderY + 6 * s);
+    ctx.lineTo(cx - faceInward * 26 * s, shoulderY + 52 * s);
+    ctx.stroke();
+    // legs
+    ctx.beginPath();
+    ctx.moveTo(cx, hipY); ctx.lineTo(cx - 22 * s, footY);
+    ctx.moveTo(cx, hipY); ctx.lineTo(cx + 22 * s, footY);
+    ctx.stroke();
+    // hand: small open circle at the reaching hand
+    ctx.beginPath();
+    ctx.moveTo(hx + 9 * s, hy2);
+    ctx.arc(hx, hy2, 9 * s, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  function drawHiddenLayer(marks, x0, alpha) {
+    // marks carry unit x within a 0.46-wide side band; x0 is the band origin.
+    var i, m;
+    for (i = 0; i < marks.length; i++) {
+      m = marks[i];
+      var x = x0 + m.x * W * 0.46, y = m.y * H;
+      var a = m.a * alpha;
+      if (a <= 0.01) continue;
+      if (m.kind === 'circ') {
+        ring(x, y, m.r, HIDDEN, 2, a);
+      } else if (m.kind === 'arc') {
+        ctx.beginPath();
+        ctx.moveTo(x + m.r, y);
+        ctx.arc(x, y, m.r, 0.3, Math.PI * 0.9);
+        ctx.strokeStyle = HIDDEN; ctx.lineWidth = 2;
+        ctx.globalAlpha = r4(a); ctx.stroke(); ctx.globalAlpha = 1;
+      } else if (m.kind === 'cross') {
+        line(x - m.r, y, x + m.r, y, HIDDEN, 2, a);
+        line(x, y - m.r, x, y + m.r, HIDDEN, 2, a);
+      } else {
+        dot(x, y, 2, HIDDEN, a);
+        dot(x + 7, y - 5, 2, HIDDEN, a);
+        dot(x - 6, y + 6, 2, HIDDEN, a);
+      }
+    }
+  }
+
+  function drawEyes(ep) {
+    // Two eyeballs side by side, a small careful parcel.
+    var r = phone ? 11 : 13, gap = r + 4;
+    disc(ep.x - gap, ep.y, r, EYEWHITE, 1);
+    disc(ep.x + gap, ep.y, r, EYEWHITE, 1);
+    ring(ep.x - gap, ep.y, r, PLAIN, 1.5, 0.8);
+    ring(ep.x + gap, ep.y, r, PLAIN, 1.5, 0.8);
+    disc(ep.x - gap, ep.y, r * 0.42, IRIS, 1);
+    disc(ep.x + gap, ep.y, r * 0.42, IRIS, 1);
+    dot(ep.x - gap, ep.y - 1, 1.5, '#1a1a18', 1);
+    dot(ep.x + gap, ep.y - 1, 1.5, '#1a1a18', 1);
+  }
+
+  function draw(t) {
+    nowT = t;
+    var s = schedule(t);
+    var ep = eyesPos(t, s);
+    var vh = viewHolder(s, ep);
+    var aL = holderAlpha('left', s), aR = holderAlpha('right', s);
+    // While dragging, the nearest side holds the view instantly.
+    if (drag) {
+      if (vh === 'left') { aL = 1; aR = 0; }
+      else { aL = 0; aR = 1; }
+    }
+    var scale = phone ? 0.78 : 1;
+
+    // field
+    ctx.fillStyle = PAPER;
+    ctx.fillRect(0, 0, W, H);
+
+    // plain field marks (always visible, both sides)
+    var i, m;
+    for (i = 0; i < plainMarks.length; i++) {
+      m = plainMarks[i];
+      if (m.kind === 'line') {
+        line(m.x * W, m.y * H, m.x * W + 14, m.y * H + 4, FAINT, 1, m.a);
+      } else {
+        dot(m.x * W, m.y * H, m.r, PLAIN, m.a);
+      }
+    }
+
+    // hidden layers: left band starts at 0.02W, right band at 0.52W
+    drawHiddenLayer(hiddenLeft, W * 0.02, aL);
+    drawHiddenLayer(hiddenRight, W * 0.52, aR);
+
+    // view-shift accents on the holding side: gold edge-sharpening marks
+    // and a faint gold wash frame on that half.
+    if (vh) {
+      var hx0 = (vh === 'left') ? 0 : W / 2;
+      ctx.fillStyle = GOLD;
+      ctx.globalAlpha = r4(0.05);
+      ctx.fillRect(hx0, 0, W / 2, H);
+      ctx.globalAlpha = 1;
+      var gx = (vh === 'left') ? W * 0.10 : W * 0.90;
+      line(gx, H * 0.10, gx, H * 0.90, GOLD, 1.5, 0.5);
+      dot(gx, H * 0.10, 3, GOLD, 0.8);
+      dot(gx, H * 0.90, 3, GOLD, 0.8);
+    }
+
+    // figures (transparent, edge lines only), facing inward
+    drawFigure(W * 0.18, 1, scale);
+    drawFigure(W * 0.82, -1, scale);
+
+    // handoff pulse: a gold ring at the receiving hand early in a hold
+    if (s.phase === 'hold' && s.holdAge < 1.2) {
+      var hd = hands();
+      var hp = (s.holder === 'left') ? hd.left : hd.right;
+      var pu = 1 - s.holdAge / 1.2;
+      ring(hp.x, hp.y, 16 + (1 - pu) * 30, GOLD, 2, r4(0.7 * pu));
+    }
+
+    // the parcel itself, always on top
+    drawEyes(ep);
+  }
+
+  // ---------- interaction: drag the eyes mid-pass to steal them ----------
+  function parcelHit(x, y) {
+    var ep = eyesPos(nowT, schedule(nowT));
+    var dx = x - ep.x, dy = y - ep.y;
+    return (dx * dx + dy * dy) < 60 * 60;
+  }
+  function onDown(e) {
+    var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : null;
+    var x = e.clientX, y = e.clientY;
+    if (r) { x = e.clientX - r.left; y = e.clientY - r.top; }
+    if (parcelHit(x, y)) drag = { x: x, y: y };
+  }
+  function onMove(e) {
+    if (!drag) return;
+    var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : null;
+    var x = e.clientX, y = e.clientY;
+    if (r) { x = e.clientX - r.left; y = e.clientY - r.top; }
+    drag.x = clamp(x, 20, W - 20);
+    drag.y = clamp(y, 20, H - 20);
+  }
+  function onUp(e) {
+    if (!drag) return;
+    var side = (drag.x < W / 2) ? 'left' : 'right';
+    steal = { holder: side, t0: nowT };
+    drag = null;
+  }
+  canvas.addEventListener('pointerdown', onDown);
+  canvas.addEventListener('pointermove', onMove);
+  canvas.addEventListener('pointerup', onUp);
+  canvas.addEventListener('pointercancel', onUp);
+
+  // ---------- boot: frame one is draw(0); clock starts with the rAF loop ----------
+  draw(0);
+  var t0 = null;
+  function loop(ts) {
+    if (t0 === null) t0 = ts;
+    draw((ts - t0) / 1000);
+    if (typeof requestAnimationFrame !== 'undefined') {
+      requestAnimationFrame(loop);
+    }
+  }
+  if (typeof requestAnimationFrame !== 'undefined') {
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
