@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<!-- piece-9123-nightwatch -->
+<title>Nightwatch</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #04060c; overflow: hidden; }
+  canvas { display: block; position: fixed; inset: 0; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+/* Piece 9123 "Nightwatch" — driver core. Pure functions only, no DOM.
+ * Shared between the node harness and the shipped page (inlined at build). */
+'use strict';
+
+const TAU = Math.PI * 2;
+
+/** Beam angle at time t (seconds). Constant rate: one turn per `period`. */
+function beamAngle(t, omega, phase) {
+  return phase + omega * t;
+}
+
+/** Signed wrapped angular distance a-b, in [-PI, PI]. */
+function angDist(a, b) {
+  let d = (a - b) % TAU;
+  if (d > Math.PI) d -= TAU;
+  if (d < -Math.PI) d += TAU;
+  return d;
+}
+
+/**
+ * Beam falloff for an angular distance dAng from the beam axis.
+ * Gaussian in angle; halfWidth is the 1-sigma-ish scale (radians).
+ */
+function beamField(dAng, halfWidth) {
+  const z = dAng / halfWidth;
+  return Math.exp(-z * z * 1.5);
+}
+
+/**
+ * Illumination 0..1 of point (px,py) from a lamp at (lx,ly) with the beam
+ * pointing along angle phi. Purely angular: how close the point's direction
+ * from the lamp is to the beam axis.
+ */
+function illumAt(px, py, lx, ly, phi, halfWidth) {
+  const dx = px - lx, dy = py - ly;
+  if (dx === 0 && dy === 0) return 1;
+  const dir = Math.atan2(dy, dx);
+  return beamField(angDist(dir, phi), halfWidth);
+}
+
+/** Exponential decay factor for an age (s) with time constant tau (s). */
+function decayFactor(age, tau) {
+  return Math.exp(-age / tau);
+}
+
+/**
+ * One phosphor-charge step. The beam feeds `charge` at rate gain*field while
+ * it always leaks with time constant tau. Returns the new charge.
+ */
+function chargeStep(charge, field, dt, gain, tau) {
+  let c = charge + field * dt * gain;
+  c *= Math.exp(-dt / tau);
+  if (c < 0) c = 0;
+  if (c > 1.5) c = 1.5;
+  return c;
+}
+
+/** Deterministic PRNG (mulberry32) for seeded scene layout. */
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+
+</script>
+<script>
+/* Piece 9123 "Nightwatch" — scene renderer. Requires driver-core.js in scope. */
+(function () {
+  'use strict';
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  var PERIOD = 24, OMEGA = TAU / PERIOD, PHASE = 0;
+  var HW = 0.18;                    // beam field half-width (rad)
+  var FRONT = Math.PI / 2;          // beam-toward-viewer angle: the tick
+  var TAU_PHOSPHOR = 1.6;
+
+  var reduced = window.matchMedia &&
+      window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var timeScale = reduced ? 0.05 : 1;
+  var q = new URLSearchParams(location.search);
+  var T0 = parseFloat(q.get('t') || '0') || 0;
+
+  var rnd = mulberry32(9123);
+
+  var W = 0, H = 0, lampX = 0, lampY = 0, horizonY = 0, diag = 1;
+
+  var stars = [], waves = [], motes = [], rim = [], samples = [];
+
+  function initScene() {
+    var i;
+    for (i = 0; i < 95; i++) stars.push({
+      rx: rnd(), ry: rnd() * 0.56, r: 0.5 + rnd() * 1.1,
+      a: 0.08 + rnd() * 0.22, tw: rnd() * TAU });
+    for (i = 0; i < 70; i++) waves.push({
+      rx: 0.02 + rnd() * 0.96, ry: 0.645 + rnd() * 0.34,
+      len: 12 + rnd() * 44, ph: rnd() * TAU, sp: 0.4 + rnd() * 0.8,
+      wdt: 1 + rnd() * 1.2, charge: 0 });
+    for (i = 0; i < 130; i++) motes.push({
+      rx: rnd(), ry: rnd() * 0.58, r: 0.7 + rnd() * 1.6,
+      vx: -(4 + rnd() * 10), ph: rnd() * TAU, charge: 0 });
+    // rock rim: relative points along the headland crest (above the waterline only)
+    var pts = [[0.60,0.70],[0.64,0.62],[0.68,0.55],[0.70,0.545],
+               [0.72,0.53],[0.76,0.56],[0.82,0.62],[0.90,0.68]];
+    for (i = 0; i < pts.length; i++) rim.push({ rx: pts[i][0], ry: pts[i][1], charge: 0 });
+  }
+
+  function layout() {
+    W = window.innerWidth; H = window.innerHeight;
+    var DPR = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    shaft.width = Math.round(W * DPR);
+    shaft.height = Math.round(H * DPR);
+    sctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    lampX = W * 0.70; lampY = H * 0.41; horizonY = H * 0.62;
+    diag = Math.hypot(W, H);
+  }
+
+  // Soft beam: drawn offscreen so the cross-falloff is a true gradient.
+  var shaft = document.createElement('canvas');
+  var sctx = shaft.getContext('2d');
+  function drawShaft(phi) {
+    var L = diag * 1.6, ha = 0.13;
+    var c = Math.cos(phi), s = Math.sin(phi);
+    sctx.globalCompositeOperation = 'source-over';
+    sctx.clearRect(0, 0, W, H);
+    function wedgePath() {
+      sctx.beginPath();
+      sctx.moveTo(lampX, lampY);
+      sctx.lineTo(lampX + Math.cos(phi - ha) * L, lampY + Math.sin(phi - ha) * L);
+      sctx.lineTo(lampX + Math.cos(phi + ha) * L, lampY + Math.sin(phi + ha) * L);
+      sctx.closePath();
+    }
+    // along-beam fade
+    wedgePath();
+    var g1 = sctx.createLinearGradient(lampX, lampY, lampX + c * L, lampY + s * L);
+    g1.addColorStop(0, 'rgba(255,236,200,0.16)');
+    g1.addColorStop(1, 'rgba(255,236,200,0)');
+    sctx.fillStyle = g1; sctx.fill();
+    // across-beam soft mask
+    sctx.globalCompositeOperation = 'destination-in';
+    wedgePath();
+    var mx = lampX + c * L * 0.45, my = lampY + s * L * 0.45;
+    var ox = -s * ha * L * 0.55, oy = c * ha * L * 0.55;
+    var g2 = sctx.createLinearGradient(mx - ox, my - oy, mx + ox, my + oy);
+    g2.addColorStop(0, 'rgba(255,255,255,0)');
+    g2.addColorStop(0.5, 'rgba(255,255,255,1)');
+    g2.addColorStop(1, 'rgba(255,255,255,0)');
+    sctx.fillStyle = g2; sctx.fill();
+    // composite onto the scene
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.drawImage(shaft, 0, 0, W, H);
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  function rockPath() {
+    var p = [[0.50,1.02],[0.55,0.80],[0.585,0.735],[0.60,0.70],[0.64,0.62],
+             [0.66,0.585],[0.68,0.55],[0.70,0.545],[0.72,0.53],[0.74,0.545],
+             [0.76,0.56],[0.79,0.59],[0.82,0.62],[0.86,0.65],[0.90,0.68],
+             [0.95,0.71],[1.02,0.75],[1.02,1.02]];
+    ctx.beginPath();
+    ctx.moveTo(p[0][0] * W, p[0][1] * H);
+    for (var i = 1; i < p.length; i++) ctx.lineTo(p[i][0] * W, p[i][1] * H);
+    ctx.closePath();
+  }
+
+  var frameDts = [];
+  window.__nw = { frameDts: frameDts };
+
+  var last = performance.now(), startT = last, tick = 0;
+
+  function frame(now) {
+    var dt = Math.min((now - last) / 1000, 0.05); last = now;
+    var t = T0 + (now - startT) / 1000 * timeScale;
+    var phi = beamAngle(t, OMEGA, PHASE);
+    tick++;
+
+    // --- background ---
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.fillStyle = '#04060c'; ctx.fillRect(0, 0, W, horizonY + 1);
+    ctx.fillStyle = '#04070d'; ctx.fillRect(0, horizonY, W, H - horizonY);
+
+    // --- stars (washed by the shaft drawn later) ---
+    var i, s, x, y;
+    for (i = 0; i < stars.length; i++) {
+      s = stars[i];
+      var tw = 0.6 + 0.4 * Math.sin(t * 1.3 + s.tw);
+      ctx.fillStyle = 'rgba(200,215,235,' + (s.a * tw).toFixed(3) + ')';
+      ctx.fillRect(s.rx * W, s.ry * H, s.r, s.r);
+    }
+
+    // --- beam shaft (soft, additive) ---
+    drawShaft(phi);
+
+    // --- rocks + tower silhouettes ---
+    rockPath(); ctx.fillStyle = '#070a11'; ctx.fill();
+    var baseY = H * 0.555, topY = H * 0.44;
+    ctx.fillStyle = '#0a0e16';
+    ctx.beginPath();
+    ctx.moveTo(lampX - W * 0.030, baseY); ctx.lineTo(lampX + W * 0.030, baseY);
+    ctx.lineTo(lampX + W * 0.015, topY);  ctx.lineTo(lampX - W * 0.015, topY);
+    ctx.closePath(); ctx.fill();
+    // lamp room
+    ctx.fillStyle = '#0d1220';
+    ctx.fillRect(lampX - W * 0.021, H * 0.395, W * 0.042, H * 0.048);
+    ctx.beginPath();
+    ctx.moveTo(lampX - W * 0.021, H * 0.395); ctx.lineTo(lampX + W * 0.021, H * 0.395);
+    ctx.lineTo(lampX, H * 0.378); ctx.closePath(); ctx.fill();
+
+    // --- rock rim light (phosphor): a faint catch on the crest, nothing more ---
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.lineWidth = 2; ctx.lineCap = 'round';
+    for (i = 0; i < rim.length; i++) {
+      var rp = rim[i];
+      x = rp.rx * W; y = rp.ry * H;
+      rp.charge = chargeStep(rp.charge, illumAt(x, y, lampX, lampY, phi, HW), dt, 2.5, 1.6);
+    }
+    for (i = 0; i < rim.length - 1; i++) {
+      var a = (rim[i].charge + rim[i + 1].charge) * 0.5;
+      if (a < 0.01) continue;
+      ctx.strokeStyle = 'rgba(255,220,170,' + Math.min(0.28, a * 0.28).toFixed(3) + ')';
+      ctx.beginPath();
+      ctx.moveTo(rim[i].rx * W, rim[i].ry * H);
+      ctx.lineTo(rim[i + 1].rx * W, rim[i + 1].ry * H);
+      ctx.stroke();
+    }
+    ctx.globalCompositeOperation = 'source-over';
+
+    // --- beam-sea landing: record phosphor samples ---
+    var sinPhi = Math.sin(phi);
+    if (sinPhi > 0.1 && tick % 3 === 0) {
+      var xHit = lampX + (horizonY - lampY) * Math.cos(phi) / sinPhi;
+      if (xHit > -0.2 * W && xHit < 1.2 * W) {
+        var dist = (horizonY - lampY) / sinPhi;
+        var str = Math.max(0.15, Math.min(1, 1.2 - dist / (1.4 * diag)));
+        samples.push({ x: xHit, t: t, s: str });
+      }
+    }
+    while (samples.length && t - samples[0].t > 4.5) samples.shift();
+
+    // --- sea path glow (phosphor columns): small, tight, brightest at the kiss ---
+    ctx.globalCompositeOperation = 'lighter';
+    var seaH = H - horizonY, cy = horizonY + seaH * 0.30;
+    for (i = 0; i < samples.length; i++) {
+      var sm = samples[i], age = t - sm.t;
+      var sa = decayFactor(age, TAU_PHOSPHOR) * sm.s;
+      if (sa < 0.01) continue;
+      var rx = W * 0.030, ry = seaH * 0.36;
+      ctx.save();
+      ctx.translate(sm.x, cy); ctx.scale(rx / ry, 1);
+      var g = ctx.createRadialGradient(0, 0, 0, 0, 0, ry);
+      g.addColorStop(0, 'rgba(255,222,170,' + (0.30 * sa).toFixed(3) + ')');
+      g.addColorStop(0.55, 'rgba(255,205,150,' + (0.10 * sa).toFixed(3) + ')');
+      g.addColorStop(1, 'rgba(255,200,140,0)');
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(0, 0, ry, 0, TAU); ctx.fill();
+      ctx.restore();
+      // the kiss: where the beam meets the water (small, warm)
+      var kg = ctx.createRadialGradient(sm.x, horizonY, 0, sm.x, horizonY, 18);
+      kg.addColorStop(0, 'rgba(255,228,185,' + (0.38 * sa).toFixed(3) + ')');
+      kg.addColorStop(1, 'rgba(255,228,185,0)');
+      ctx.fillStyle = kg;
+      ctx.fillRect(sm.x - 18, horizonY - 18, 36, 36);
+    }
+
+    // --- waves: faint base + phosphor-lit crests ---
+    var wv;
+    for (i = 0; i < waves.length; i++) {
+      wv = waves[i];
+      x = wv.rx * W; y = wv.ry * H + Math.sin(t * wv.sp + wv.ph) * 3;
+      wv.charge = chargeStep(wv.charge, illumAt(x, y, lampX, lampY, phi, HW), dt, 2.2, 1.4);
+      ctx.strokeStyle = 'rgba(130,160,200,0.05)';
+      ctx.lineWidth = wv.wdt; ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(x - wv.len / 2, y); ctx.lineTo(x + wv.len / 2, y); ctx.stroke();
+      if (wv.charge > 0.02) {
+        ctx.strokeStyle = 'rgba(255,222,170,' + Math.min(0.5, wv.charge * 0.5).toFixed(3) + ')';
+        ctx.lineWidth = wv.wdt + wv.charge * 1.5;
+        ctx.beginPath(); ctx.moveTo(x - wv.len / 2, y); ctx.lineTo(x + wv.len / 2, y); ctx.stroke();
+      }
+    }
+    ctx.globalCompositeOperation = 'source-over';
+
+    // --- mist motes ignite in the beam ---
+    ctx.globalCompositeOperation = 'lighter';
+    var m;
+    for (i = 0; i < motes.length; i++) {
+      m = motes[i];
+      m.rx += m.vx * dt / W; if (m.rx < -0.02) m.rx += 1.04;
+      x = m.rx * W; y = m.ry * H + Math.sin(t * 0.7 + m.ph) * 6;
+      m.charge = chargeStep(m.charge, illumAt(x, y, lampX, lampY, phi, HW), dt, 3.0, 0.9);
+      if (m.charge < 0.02) continue;
+      ctx.fillStyle = 'rgba(255,232,195,' + (m.charge * 0.85).toFixed(3) + ')';
+      ctx.beginPath(); ctx.arc(x, y, m.r * (1 + m.charge * 0.8), 0, TAU); ctx.fill();
+    }
+    ctx.globalCompositeOperation = 'source-over';
+
+    // --- the lamp: always burning; flares on the tick ---
+    var dFlash = Math.abs(angDist(phi, FRONT));
+    var fl = dFlash < 0.5 ? 1 - dFlash / 0.5 : 0;
+    ctx.globalCompositeOperation = 'lighter';
+    var halo = ctx.createRadialGradient(lampX, lampY, 0, lampX, lampY, 90 + fl * 60);
+    halo.addColorStop(0, 'rgba(255,240,215,' + (0.20 + 0.30 * fl).toFixed(3) + ')');
+    halo.addColorStop(1, 'rgba(255,240,215,0)');
+    ctx.fillStyle = halo;
+    ctx.fillRect(lampX - 160, lampY - 160, 320, 320);
+    var core = ctx.createRadialGradient(lampX, lampY, 0, lampX, lampY, 24);
+    core.addColorStop(0, 'rgba(255,252,244,0.98)');
+    core.addColorStop(0.4, 'rgba(255,238,205,' + (0.85 + 0.15 * fl).toFixed(3) + ')');
+    core.addColorStop(1, 'rgba(255,238,205,0)');
+    ctx.fillStyle = core;
+    ctx.beginPath(); ctx.arc(lampX, lampY, 24, 0, TAU); ctx.fill();
+    if (fl > 0.02) {
+      ctx.strokeStyle = 'rgba(255,244,220,' + (0.5 * fl).toFixed(3) + ')';
+      ctx.lineWidth = 1.5;
+      for (var k = 0; k < 4; k++) {
+        var fa = k * Math.PI / 4 + 0.3;
+        var r1 = 26, r2 = 26 + 60 * fl;
+        ctx.beginPath();
+        ctx.moveTo(lampX + Math.cos(fa) * r1, lampY + Math.sin(fa) * r1);
+        ctx.lineTo(lampX + Math.cos(fa) * r2, lampY + Math.sin(fa) * r2);
+        ctx.stroke();
+      }
+    }
+    ctx.globalCompositeOperation = 'source-over';
+
+    // --- horizon hairline, vignette, caption ---
+    ctx.fillStyle = 'rgba(140,170,210,0.10)';
+    ctx.fillRect(0, horizonY, W, 1);
+    var vg = ctx.createRadialGradient(W / 2, H * 0.55, Math.min(W, H) * 0.35,
+                                      W / 2, H * 0.55, diag * 0.62);
+    vg.addColorStop(0, 'rgba(0,0,0,0)');
+    vg.addColorStop(1, 'rgba(0,0,0,0.40)');
+    ctx.fillStyle = vg; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = 'rgba(255,255,255,0.30)';
+    ctx.font = '10px Georgia, serif';
+    ctx.fillText('N I G H T W A T C H   ·   № 9123', 18, H - 16);
+
+    frameDts.push(dt); if (frameDts.length > 240) frameDts.shift();
+    requestAnimationFrame(frame);
+  }
+
+  initScene();
+  layout();
+  window.addEventListener('resize', layout);
+  requestAnimationFrame(frame);
+})();
+
+</script>
+</body>
+</html>
