@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Doll Records, Twenty Seconds</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #26241f; overflow: hidden; }
+  canvas { display: block; background: #26241f; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0, DPR = 1;
+
+  // Seeded PRNG (mulberry32). Never Math.random anywhere in this piece.
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  var rng = mulberry32(1428000);
+  // Precomputed crackle table: 128 entries, so the 160 s loop closes exactly
+  // (musical-time buckets at 8 Hz give 1280 buckets over the loop; 1280 % 128 == 0).
+  var CRACK = [];
+  for (var i = 0; i < 128; i++) CRACK.push(rng() * 2 - 1);
+  // Seeded per-record label tints (cream labels vary almost imperceptibly).
+  var LABEL_SHADE = [];
+  for (var j = 0; j < 8; j++) LABEL_SHADE.push(0.92 + rng() * 0.08);
+
+  var SLOT = 20;            // seconds per record, hard cap, however handled
+  var NCYCLE = 8 * SLOT;    // 160 s full cycle through all eight records
+  var MOTIFS = ['chirp', 'thump', 'drone', 'giggle', 'scrape', 'hum', 'rattle', 'sigh'];
+
+  // Closed-form state: event lists + piece time. No frame-integrated state.
+  var motorEvents = [{ t: 0, speed: 1, m: 0 }]; // musical time m advances at speed
+  var selectEvents = [];                        // { t: record, start }
+  var drag = null;                             // { kind, x, y, startY, startSpeed }
+  var needleAnim = null;                       // { fromX, fromY, toX, toY, t0, dur }
+  var hoverRecord = -1;
+
+  function musicalTime(t) {
+    var e = motorEvents[motorEvents.length - 1];
+    return e.m + e.speed * (t - e.t);
+  }
+  function motorSpeed() {
+    return motorEvents[motorEvents.length - 1].speed;
+  }
+  // Which record is playing at piece time t, and how far into its slot.
+  function currentSlot(t) {
+    // A needle-drop selection owns the next 20 s of wall-clock time, then the
+    // schedule resumes. The schedule itself is a pure function of t.
+    for (var k = selectEvents.length - 1; k >= 0; k--) {
+      var s = selectEvents[k];
+      if (t >= s.t && t < s.t + SLOT) return { record: s.record, progress: t - s.t, selected: true };
+    }
+    var p = t % NCYCLE;
+    return { record: Math.floor(p / SLOT) % 8, progress: p % SLOT, selected: false };
+  }
+
+  function r4(x) { return Math.round(x * 10000) / 10000; }
+  function rgba(hex, a) {
+    var r = parseInt(hex.slice(1, 3), 16), g = parseInt(hex.slice(3, 5), 16), b = parseInt(hex.slice(5, 7), 16);
+    return 'rgba(' + r + ',' + g + ',' + b + ',' + r4(a) + ')';
+  }
+  function dot(x, y, s, color) { ctx.fillStyle = color; ctx.fillRect(x - s / 2, y - s / 2, s, s); }
+  function circle(x, y, r, color) {
+    ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fillStyle = color; ctx.fill();
+  }
+  function ring(x, y, r, w, color) {
+    ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.strokeStyle = color; ctx.lineWidth = w; ctx.stroke();
+  }
+  function rect(x, y, w, h, color) { ctx.fillStyle = color; ctx.fillRect(x, y, w, h); }
+  function line(x1, y1, x2, y2, w, color) {
+    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2);
+    ctx.strokeStyle = color; ctx.lineWidth = w; ctx.stroke();
+  }
+
+  // Motif waveforms. Every motif is periodic within the 20 s slot (all internal
+  // periods divide 20), so the 160 s loop closes exactly.
+  function motifWave(m, mt) {
+    var s = mt % SLOT, v = 0, p;
+    if (m === 0) { // chirp: rising blips, 16 per slot (2 full cycles, so the
+      // blip tapers to exactly zero at its end and no branch flip can occur)
+      p = s % 1.25;
+      v = (p < 0.35) ? Math.sin((p / 0.35) * Math.PI * 2) * (0.4 + 0.6 * (p / 0.35)) : 0;
+    } else if (m === 1) { // thump: low pulses, 1 per second
+      p = s % 1;
+      v = (p < 0.18) ? Math.sin((p / 0.18) * Math.PI) : 0;
+    } else if (m === 2) { // drone: slow two-tone hum
+      v = Math.sin(s * Math.PI) * 0.55 + Math.sin(s * Math.PI * 0.5) * 0.35;
+    } else if (m === 3) { // giggle: short burst clusters, 2.5 s pattern
+      p = s % 2.5;
+      v = 0;
+      var bursts = [0.1, 0.35, 0.55, 1.3, 1.55, 1.8, 2.1];
+      for (var b = 0; b < bursts.length; b++) {
+        var d = p - bursts[b];
+        if (d >= 0 && d < 0.12) v += Math.sin((d / 0.12) * Math.PI) * 0.7;
+      }
+    } else if (m === 4) { // scrape: fast sawtooth rasp, 0.5 s period
+      p = s % 0.5;
+      v = (p / 0.5 * 2 - 1) * 0.45 + Math.sin(s * Math.PI * 4) * 0.2;
+    } else if (m === 5) { // hum: steady tone
+      v = Math.sin(s * Math.PI * 2) * 0.6;
+    } else if (m === 6) { // rattle: rapid ticks, 0.5 s period, drawn as
+      // triangular pulses so each tick tapers to zero at its edges
+      p = s % 0.5;
+      v = 0;
+      var ticks = [[0, 0.04], [0.12, 0.16], [0.28, 0.32]];
+      for (var ti = 0; ti < ticks.length; ti++) {
+        var ta = ticks[ti][0], tb = ticks[ti][1], tmid = (ta + tb) / 2, thw = (tb - ta) / 2;
+        if (p >= ta && p <= tb) v += (1 - Math.abs(p - tmid) / thw) * 0.85;
+      }
+    } else { // sigh: slow falling swells, 5 s pattern
+      p = s % 5;
+      v = (1 - p / 5) * Math.sin((p / 5) * Math.PI) * 0.9;
+    }
+    return v;
+  }
+
+  function size() {
+    var vv = (typeof visualViewport !== 'undefined' && visualViewport) ? visualViewport : null;
+    var w = vv ? vv.width : window.innerWidth;
+    var h = vv ? vv.height : window.innerHeight;
+    W = w; H = h;
+    canvas.width = Math.round(w); canvas.height = Math.round(h);
+    canvas.style.width = w + 'px'; canvas.style.height = h + 'px';
+  }
+
+  // Layout, recomputed per draw so it is a pure function of W/H.
+  function layout() {
+    var u = Math.min(W, H);
+    var landscape = W >= H * 1.05;
+    var cx = W / 2, cy = H * 0.50;
+    var L = {};
+    L.u = u;
+    if (landscape) {
+      L.boxCx = cx - 0.16 * u; L.boxCy = cy;
+      L.playerCx = cx + 0.44 * u; L.playerCy = cy + 0.02 * u;
+    } else {
+      L.boxCx = cx; L.boxCy = cy - 0.10 * u;
+      L.playerCx = cx; L.playerCy = cy + 0.34 * u;
+    }
+    L.boxW = 0.66 * u; L.boxH = 0.46 * u;
+    L.boxX = L.boxCx - L.boxW / 2; L.boxY = L.boxCy - L.boxH / 2;
+    L.fanR = 0.052 * u;
+    L.fanY = L.boxY + L.boxH - 0.10 * u;
+    L.fanX0 = L.boxCx - 0.26 * u; L.fanStep = 0.0745 * u;
+    L.platterR = 0.105 * u;
+    L.stripW = 0.62 * u; L.stripH = 0.055 * u;
+    L.stripX = cx - L.stripW / 2;
+    L.stripY = Math.max(L.boxY + L.boxH, L.playerCy + L.platterR) + 0.06 * u;
+    if (L.stripY + L.stripH > H - 0.03 * u) L.stripY = H - L.stripH - 0.03 * u;
+    return L;
+  }
+
+  function draw(t) {
+    var L = layout();
+    var u = L.u;
+    ctx.fillStyle = '#26241f';
+    ctx.fillRect(0, 0, W, H);
+
+    var slot = currentSlot(t);
+    var mt = musicalTime(t);
+    var speed = motorSpeed();
+    var crackThick = Math.max(0.7, Math.min(2.0, 1 / speed));
+
+    // Booklet: small upright rectangle leaning at the back-left of the box.
+    // Its "text" is only tiny line marks, far too small to read, never letters.
+    var bx = L.boxX - 0.10 * u, by = L.boxY - 0.13 * u, bw = 0.15 * u, bh = 0.21 * u;
+    ctx.save();
+    ctx.translate(bx + bw / 2, by + bh / 2); ctx.rotate(-0.1);
+    rect(-bw / 2, -bh / 2, bw, bh, '#ece8dc');
+    rect(-bw / 2, -bh / 2, bw, 0.012 * u, '#c8c2b2');
+    for (var li = 0; li < 6; li++) {
+      var ly = -bh / 2 + 0.035 * u + li * 0.024 * u;
+      rect(-bw / 2 + 0.015 * u, ly, bw - 0.03 * u, Math.max(1, 0.004 * u), '#8a8578');
+    }
+    ctx.restore();
+
+    // Box lid, open behind the box.
+    rect(L.boxX - 0.01 * u, L.boxY - 0.075 * u, L.boxW + 0.02 * u, 0.075 * u, '#2c5233');
+    rect(L.boxX - 0.01 * u, L.boxY - 0.075 * u, L.boxW + 0.02 * u, 0.012 * u, '#3a6a44');
+    // Box body.
+    rect(L.boxX, L.boxY, L.boxW, L.boxH, '#3a6a44');
+    rect(L.boxX, L.boxY, L.boxW, 0.014 * u, '#4a7a54');
+    rect(L.boxX, L.boxY + L.boxH - 0.014 * u, L.boxW, 0.014 * u, '#2c5233');
+    // Interior shadow panel.
+    rect(L.boxX + 0.02 * u, L.boxY + 0.03 * u, L.boxW - 0.04 * u, L.boxH - 0.06 * u, '#2e5a38');
+
+    // Eight tiny records fanned in a row inside the box.
+    var fanCenters = [];
+    for (var ri = 0; ri < 8; ri++) {
+      var fx = L.fanX0 + ri * L.fanStep;
+      var fy = L.fanY + Math.sin((ri / 7) * Math.PI) * -0.012 * u;
+      fanCenters.push({ x: fx, y: fy });
+      var isCur = (ri === slot.record);
+      circle(fx, fy, L.fanR, '#1a1712');
+      ring(fx, fy, L.fanR, Math.max(1, 0.004 * u), '#0e0c0a');
+      var shade = LABEL_SHADE[ri];
+      var lc = isCur ? '#f2ecdc' : '#e8e2d4';
+      circle(fx, fy, L.fanR * 0.45, lc);
+      dot(fx, fy, Math.max(2, 0.008 * u), '#1a1712');
+      if (isCur) ring(fx, fy, L.fanR + 0.008 * u, Math.max(1.5, 0.006 * u), '#b8352a');
+      if (ri === hoverRecord) ring(fx, fy, L.fanR + 0.014 * u, Math.max(1, 0.004 * u), rgba('#f2efe8', 0.5));
+      // Tiny groove arcs (own beginPath each, node-canvas safe).
+      ring(fx, fy, L.fanR * 0.72, 1, rgba('#f2efe8', 0.12));
+      ring(fx, fy, L.fanR * 0.88, 1, rgba('#f2efe8', 0.08));
+      void shade;
+    }
+
+    // Toy player beside the box: red plastic body, battery, platter, needle arm.
+    var px = L.playerCx, py = L.playerCy, pr = L.platterR;
+    var pw = pr * 2.7, ph = pr * 2.1;
+    rect(px - pw / 2, py - ph / 2, pw, ph, '#b8352a');
+    rect(px - pw / 2, py - ph / 2, pw, 0.01 * u, '#d05548');
+    // Battery nub on the player's side.
+    rect(px + pw / 2 - 0.012 * u, py - 0.02 * u, 0.012 * u, 0.04 * u, '#c8c2b2');
+    rect(px + pw / 2 - 0.004 * u, py - 0.012 * u, 0.008 * u, 0.024 * u, '#8a8578');
+    // Platter + playing record, spinning with musical time (0.5 rev/s at speed 1).
+    circle(px, py, pr, '#26241f');
+    circle(px, py, pr * 0.94, '#1a1712');
+    var spin = mt * Math.PI; // half turn per second at speed 1
+    var dotR = pr * 0.62;
+    var dx = px + Math.cos(spin) * dotR, dy = py + Math.sin(spin) * dotR;
+    circle(px, py, pr * 0.42, '#e8e2d4');
+    dot(px, py, Math.max(2, 0.008 * u), '#1a1712');
+    dot(dx, dy, Math.max(2, 0.01 * u), '#b8352a');
+    ring(px, py, pr * 0.7, 1, rgba('#f2efe8', 0.12));
+
+    // Needle arm: pivot upper-right of the platter, needle at the record edge.
+    var pivX = px + pr * 0.95, pivY = py - pr * 0.85;
+    var lift = (slot.progress >= SLOT - 1) ? (slot.progress - (SLOT - 1)) : 0; // 0..1 over last second
+    var nX = px + pr * 0.72, nY = py - pr * 0.28 - lift * pr * 0.55;
+    if (drag && drag.kind === 'needle') { nX = drag.x; nY = drag.y; }
+    else if (needleAnim) {
+      var ap = Math.min(1, (t - needleAnim.t0) / needleAnim.dur);
+      var ease = 1 - (1 - ap) * (1 - ap);
+      nX = needleAnim.fromX + (needleAnim.toX - needleAnim.fromX) * ease;
+      nY = needleAnim.fromY + (needleAnim.toY - needleAnim.fromY) * ease;
+      if (ap >= 1) needleAnim = null;
+    }
+    line(pivX, pivY, nX, nY, Math.max(2, 0.008 * u), '#ece8dc');
+    circle(pivX, pivY, Math.max(3, 0.012 * u), '#8a8578');
+    dot(nX, nY, Math.max(2, 0.008 * u), '#f2c832');
+    // Click tick: a short bright tick at the needle during the lift second.
+    if (lift > 0 && lift < 1) {
+      dot(nX + 0.014 * u, nY - 0.01 * u, Math.max(2, 0.007 * u), rgba('#f2efe8', 0.9));
+    }
+
+    // Waveform strip: the thin crackly sound, drawn as a line + crackle dots.
+    var sx = L.stripX, sy = L.stripY, sw = L.stripW, sh = L.stripH;
+    rect(sx, sy, sw, sh, '#1a1712');
+    ring(sx + sw / 2, sy + sh / 2, 0, 1, '#000000'); // no-op guard, keeps stroke path clean
+    var midY = sy + sh / 2;
+    line(sx, midY, sx + sw, midY, 1, rgba('#f2efe8', 0.15));
+    var bucket = Math.floor(mt * 8);
+    ctx.beginPath();
+    var first = true;
+    var step = Math.max(3, sw / 160);
+    for (var wx = 0; wx <= sw; wx += step) {
+      var frac = wx / sw;
+      var wv = motifWave(slot.record, mt + frac * 0.4);
+      var jit = CRACK[(Math.floor(wx / step) + bucket) % 128] * 0.18 * crackThick;
+      var wy = midY - (wv * 0.42 + jit * 0.3) * sh;
+      if (first) { ctx.moveTo(sx + wx, wy); first = false; }
+      else ctx.lineTo(sx + wx, wy);
+    }
+    ctx.strokeStyle = rgba('#f2efe8', 0.85); ctx.lineWidth = Math.max(1, 0.004 * u); ctx.stroke();
+    // Crackle dots scattered along the strip; thicker when the motor is slow.
+    for (var ci = 0; ci < 26; ci++) {
+      var cxp = sx + ((ci * 37 + bucket * 3) % 160) / 160 * sw;
+      var cyp = sy + ((CRACK[(ci * 7 + bucket) % 128] + 1) / 2) * sh;
+      dot(cxp, cyp, Math.max(1, 0.004 * u * crackThick), rgba('#f2efe8', 0.35));
+    }
+    // Current-record marker dots under the strip (one per record, no text).
+    for (var mi = 0; mi < 8; mi++) {
+      var mx = sx + (mi + 0.5) * (sw / 8);
+      dot(mx, sy + sh + 0.02 * u, Math.max(2, 0.008 * u), mi === slot.record ? '#b8352a' : rgba('#f2efe8', 0.25));
+    }
+  }
+
+  function pointerPos(e) {
+    var r = canvas.getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  }
+  function nowT() {
+    if (startTime === null) return 0;
+    return (performance.now() - startTime) / 1000;
+  }
+  function fanHit(x, y) {
+    var L = layout();
+    for (var i = 0; i < 8; i++) {
+      var fx = L.fanX0 + i * L.fanStep;
+      var fy = L.fanY + Math.sin((i / 7) * Math.PI) * -0.012 * L.u;
+      var ddx = x - fx, ddy = y - fy;
+      if (ddx * ddx + ddy * ddy <= (L.fanR * 1.4) * (L.fanR * 1.4)) return i;
+    }
+    return -1;
+  }
+  function needleHit(x, y, t) {
+    var L = layout();
+    var px = L.playerCx, py = L.playerCy, pr = L.platterR;
+    var pivX = px + pr * 0.95, pivY = py - pr * 0.85;
+    var nX = px + pr * 0.72, nY = py - pr * 0.28;
+    var d1 = Math.hypot(x - nX, y - nY), d2 = Math.hypot(x - pivX, y - pivY);
+    return d1 < pr * 0.7 || d2 < pr * 0.5;
+  }
+  function playerHit(x, y) {
+    var L = layout();
+    var px = L.playerCx, py = L.playerCy, pr = L.platterR;
+    return Math.abs(x - px) <= pr * 1.35 && Math.abs(y - py) <= pr * 1.05;
+  }
+
+  function onDown(e) {
+    var p = pointerPos(e);
+    var t = nowT();
+    if (needleHit(p.x, p.y, t)) {
+      drag = { kind: 'needle', x: p.x, y: p.y };
+      needleAnim = null;
+    } else if (playerHit(p.x, p.y)) {
+      drag = { kind: 'player', x: p.x, y: p.y, startY: p.y, startSpeed: motorSpeed() };
+    }
+    if (e.preventDefault) e.preventDefault();
+  }
+  function onMove(e) {
+    var p = pointerPos(e);
+    var t = nowT();
+    hoverRecord = fanHit(p.x, p.y);
+    if (!drag) return;
+    if (drag.kind === 'needle') {
+      drag.x = p.x; drag.y = p.y;
+    } else if (drag.kind === 'player') {
+      var ns = Math.max(0.5, Math.min(1.6, drag.startSpeed + (p.y - drag.startY) / 150));
+      var cur = motorEvents[motorEvents.length - 1];
+      var curM = cur.m + cur.speed * (t - cur.t);
+      motorEvents.push({ t: t, speed: ns, m: curM });
+    }
+  }
+  function onUp(e) {
+    var p = pointerPos(e);
+    var t = nowT();
+    if (drag && drag.kind === 'needle') {
+      var hit = fanHit(p.x, p.y);
+      var L = layout();
+      var px = L.playerCx, py = L.playerCy, pr = L.platterR;
+      needleAnim = {
+        fromX: drag.x, fromY: drag.y,
+        toX: px + pr * 0.72, toY: py - pr * 0.28,
+        t0: t, dur: 0.4
+      };
+      if (hit >= 0) {
+        selectEvents.push({ t: t, record: hit });
+        // Keep the event list short: drop selections older than one cycle.
+        while (selectEvents.length > 0 && selectEvents[0].t < t - NCYCLE) selectEvents.shift();
+      }
+    }
+    drag = null;
+    hoverRecord = -1;
+  }
+
+  canvas.addEventListener('pointerdown', onDown);
+  canvas.addEventListener('pointermove', onMove);
+  canvas.addEventListener('pointerup', onUp);
+  canvas.addEventListener('pointercancel', onUp);
+
+  size();
+  if (typeof visualViewport !== 'undefined' && visualViewport) {
+    visualViewport.addEventListener('resize', function () { size(); draw(lastT); });
+  }
+  window.addEventListener('resize', function () { size(); draw(lastT); });
+
+  var startTime = null;
+  var lastT = 0;
+  function loop(ts) {
+    if (startTime === null) startTime = ts;
+    var t = (ts - startTime) / 1000;
+    lastT = t;
+    draw(t);
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+  }
+  draw(0);
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
