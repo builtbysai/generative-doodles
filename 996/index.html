@@ -1,0 +1,573 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hold the Light</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #07080C; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded RNG (mulberry32) ----------
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- constants ----------
+  var T0 = 12;                  // frame-one piece time (seconds)
+  var SEED = 996157;
+  var SAMPLE_DT = 0.35;         // wireframe vertex sampling interval
+  var MAX_AGE = 9.45;           // vertex lifetime: 27 sample slots (26 kept + fade)
+  var FADE_SPAN = 1.05;         // oldest vertices fade over this span before release
+
+  var COL = {
+    room: '#07080C',
+    ball: '#FFFFFF',
+    beam: '#4FD6FF',
+    wire: '#7DF9C6',
+    dancer: '#F5F2EA',
+    flare: '#FFD93B'
+  };
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0, PHONE = false;
+
+  function viewportSize() {
+    var w, h;
+    if (typeof window !== 'undefined' && window.visualViewport) {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    } else {
+      w = window.innerWidth; h = window.innerHeight;
+    }
+    return { w: Math.max(50, Math.round(w)), h: Math.max(50, Math.round(h)) };
+  }
+
+  function resize() {
+    var s = viewportSize();
+    W = s.w; H = s.h;
+    if (canvas.width !== W) canvas.width = W;
+    if (canvas.height !== H) canvas.height = H;
+    var sw = (window.screen && window.screen.width) || W;
+    var sh = (window.screen && window.screen.height) || H;
+    PHONE = (Math.min(sw, sh) < 700) || (H > W * 1.15);
+  }
+
+  function unit() { return Math.min(W, H); }
+
+  // ---------- ball idle path (closed form, fractions of frame) ----------
+  function idlePath(t) {
+    return {
+      x: 0.55 + 0.24 * Math.sin(0.30 * t + 3.04) + 0.035 * Math.sin(0.83 * t + 0.7),
+      y: 0.47 + 0.19 * Math.sin(0.43 * t + 0.86) + 0.030 * Math.sin(1.07 * t + 0.4)
+    };
+  }
+
+  // ---------- dancers (seeded closed-form drift, fractions) ----------
+  var dancers = [];
+  (function initDancers() {
+    var rng = mulberry32(SEED ^ 0x51AB);
+    for (var i = 0; i < 3; i++) {
+      dancers.push({
+        cx: 0.24 + rng() * 0.52,
+        cy: 0.26 + rng() * 0.48,
+        ax: 0.10 + rng() * 0.13,
+        ay: 0.08 + rng() * 0.11,
+        fx: 0.21 + rng() * 0.25,
+        fy: 0.17 + rng() * 0.23,
+        px: rng() * Math.PI * 2,
+        py: rng() * Math.PI * 2,
+        flaring: false,
+        lastStrike: -10
+      });
+    }
+  })();
+  function dancerPos(d, t) {
+    return {
+      x: d.cx + d.ax * Math.sin(d.fx * t + d.px),
+      y: d.cy + d.ay * Math.sin(d.fy * t + d.py)
+    };
+  }
+
+  // ---------- beam sources: 2 per side (fractions) ----------
+  var SOURCES = [
+    { x: 0.25, y: 0 }, { x: 0.75, y: 0 },
+    { x: 0.25, y: 1 }, { x: 0.75, y: 1 },
+    { x: 0, y: 0.30 }, { x: 0, y: 0.70 },
+    { x: 1, y: 0.30 }, { x: 1, y: 0.70 }
+  ];
+
+  // ---------- state ----------
+  var state = {
+    T: T0,
+    mode: 'idle',            // 'idle' | 'drag'
+    // drag spring (fraction space)
+    sx: 0, sy: 0, svx: 0, svy: 0,
+    tx: 0, ty: 0,            // drag target
+    simT: T0,                // spring integrated up to this piece time
+    // hand-back offset after release: ball = idle + off * exp(-(t-tRel)/1.15)
+    offX: 0, offY: 0, tRel: -100,
+    history: [],             // { ts, fx, fy, rel } wireframe vertices (rel = release time or 0)
+    lastSample: T0,
+    trail: [],               // { fx, fy } fine samples for the fading trail
+    pulses: [],              // piece times of tap pulses
+    lastTapReal: -10000
+  };
+
+  function ballPosAt(t) {
+    // position used when not dragging: idle path plus decaying hand-back offset
+    var p = idlePath(t);
+    var k = Math.exp(-(t - state.tRel) / 1.15);
+    if (t < state.tRel) k = 0;
+    return { x: p.x + state.offX * k, y: p.y + state.offY * k };
+  }
+
+  function currentBall(t) {
+    if (state.mode === 'drag') return { x: state.sx, y: state.sy };
+    return ballPosAt(t);
+  }
+
+  function pushHistory(ts, p) {
+    state.history.push({ ts: ts, fx: p.x, fy: p.y, rel: 0 });
+    // drop entries that are fully gone
+    while (state.history.length && state.history.length > 80) state.history.shift();
+  }
+
+  // prefill: frame one already holds a partial volume and a trail
+  (function prefill() {
+    for (var k = 26; k >= 1; k--) {
+      var ts = T0 - SAMPLE_DT * k;
+      pushHistory(ts, idlePath(ts));
+    }
+    state.lastSample = T0 - SAMPLE_DT;
+    for (var j = 44; j >= 0; j--) {
+      var q = idlePath(T0 - j * 0.022);
+      state.trail.push({ fx: q.x, fy: q.y });
+    }
+  })();
+
+  function sampleHistory(upto) {
+    while (state.lastSample + SAMPLE_DT <= upto) {
+      state.lastSample += SAMPLE_DT;
+      pushHistory(state.lastSample, ballPosAt(state.lastSample));
+    }
+  }
+
+  function exhale(t) {
+    for (var i = 0; i < state.history.length; i++) {
+      if (!state.history[i].rel) state.history[i].rel = t;
+    }
+  }
+
+  // ---------- audio (lazy, gesture-gated, all guarded) ----------
+  var AC = null, humOsc = null, humOsc2 = null, humGain = null, humPan = null;
+  function ensureAudio() {
+    if (AC) return;
+    var Ctor = (typeof window !== 'undefined') && (window.AudioContext || window.webkitAudioContext);
+    if (!Ctor) return;
+    try {
+      AC = new Ctor();
+      humOsc = AC.createOscillator();
+      humOsc2 = AC.createOscillator();
+      humGain = AC.createGain();
+      humOsc.type = 'sine';
+      humOsc2.type = 'triangle';
+      humGain.gain.value = 0.0;
+      var node = humGain;
+      if (typeof AC.createStereoPanner === 'function') {
+        humPan = AC.createStereoPanner();
+        humGain.connect(humPan); humPan.connect(AC.destination);
+        node = humPan;
+      } else {
+        humGain.connect(AC.destination);
+      }
+      humOsc.connect(humGain); humOsc2.connect(humGain);
+      humOsc.start(); humOsc2.start();
+    } catch (e) { AC = null; }
+  }
+  function blip(freq, dur, gain, type, delay) {
+    if (!AC) return;
+    try {
+      var t0 = AC.currentTime + (delay || 0);
+      var o = AC.createOscillator(), g = AC.createGain();
+      o.type = type || 'sine';
+      o.frequency.value = freq;
+      g.gain.setValueAtTime(gain, t0);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      o.connect(g); g.connect(AC.destination);
+      o.start(t0); o.stop(t0 + dur + 0.02);
+    } catch (e) {}
+  }
+  function exhaleNoise() {
+    if (!AC) return;
+    try {
+      var dur = 0.9, sr = AC.sampleRate;
+      var buf = AC.createBuffer(1, Math.floor(sr * dur), sr);
+      var d = buf.getChannelData(0);
+      for (var i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / d.length);
+      var src = AC.createBufferSource(); src.buffer = buf;
+      var f = AC.createBiquadFilter(); f.type = 'lowpass';
+      f.frequency.setValueAtTime(2400, AC.currentTime);
+      f.frequency.exponentialRampToValueAtTime(220, AC.currentTime + dur);
+      var g = AC.createGain(); g.gain.value = 0.12;
+      src.connect(f); f.connect(g); g.connect(AC.destination);
+      src.start();
+    } catch (e) {}
+  }
+  function audioFrame(ball) {
+    if (!AC || !humOsc) return;
+    try {
+      humOsc.frequency.value = 168 - 74 * ball.y;
+      humOsc2.frequency.value = (168 - 74 * ball.y) * 1.5 + 2;
+      humGain.gain.value = 0.035;
+      if (humPan) humPan.pan.value = Math.max(-0.85, Math.min(0.85, (ball.x - 0.5) * 1.8));
+    } catch (e) {}
+  }
+
+  // ---------- geometry helpers ----------
+  function distToSeg(px, py, ax, ay, bx, by) {
+    var dx = bx - ax, dy = by - ay;
+    var L2 = dx * dx + dy * dy;
+    var u = L2 > 0 ? ((px - ax) * dx + (py - ay) * dy) / L2 : 0;
+    u = Math.max(0, Math.min(1, u));
+    var qx = ax + u * dx, qy = ay + u * dy;
+    return Math.sqrt((px - qx) * (px - qx) + (py - qy) * (py - qy));
+  }
+
+  // project history vertices into a slowly rotating pseudo-3D constellation
+  function projectVertices(t) {
+    var live = [];
+    var i, e;
+    for (i = 0; i < state.history.length; i++) {
+      e = state.history[i];
+      var age = t - e.ts;
+      if (e.rel) { if (t - e.rel > 1.5) continue; }
+      else if (age > MAX_AGE + 0.4) continue;
+      live.push(e);
+    }
+    if (!live.length) return live;
+    var cx = 0, cy = 0;
+    for (i = 0; i < live.length; i++) { cx += live[i].fx; cy += live[i].fy; }
+    cx /= live.length; cy /= live.length;
+    var u = unit();
+    var th = 0.13 * t;                    // slow Y rotation
+    var ph = 0.16 * Math.sin(0.07 * t + 1); // gentle X tilt
+    var cth = Math.cos(th), sth = Math.sin(th);
+    var cph = Math.cos(ph), sph = Math.sin(ph);
+    var F = 2.3 * u;
+    var n = live.length;
+    var out = [];
+    for (i = 0; i < n; i++) {
+      e = live[i];
+      var rank = (n - 1 - i) / Math.max(1, n - 1);   // 0 newest .. 1 oldest
+      var z = (rank - 0.5) * 0.62 * u;               // depth from path history
+      var dx = (e.fx - cx) * W, dy = (e.fy - cy) * H;
+      var xr = dx * cth + z * sth;
+      var zr = -dx * sth + z * cth;
+      var yr = dy * cph - zr * sph;
+      var z2 = dy * sph + zr * cph;
+      var sc = F / (F + z2);
+      var alpha;
+      if (e.rel) alpha = Math.max(0, 1 - (t - e.rel) / 1.5);
+      else {
+        var ageE = t - e.ts;
+        alpha = ageE > MAX_AGE - FADE_SPAN ? Math.max(0, (MAX_AGE - ageE) / FADE_SPAN) : 1;
+        alpha = Math.min(1, alpha + 0.001);
+        if (ageE <= MAX_AGE - FADE_SPAN) alpha = 1;
+      }
+      // released vertices drift away from the centroid as they fade
+      var drift = e.rel ? (t - e.rel) * 0.055 * u : 0;
+      var ddx = (e.fx - cx), ddy = (e.fy - cy);
+      var dl = Math.sqrt(ddx * ddx + ddy * ddy) || 1;
+      out.push({
+        x: cx * W + xr * sc + (ddx / dl) * drift,
+        y: cy * H + yr * sc + (ddy / dl) * drift,
+        alpha: alpha,
+        isNewest: i === n - 1
+      });
+    }
+    return out;
+  }
+
+  // ---------- drawing ----------
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.fillStyle = COL.room;
+    ctx.fillRect(0, 0, W, H);
+
+    var u = unit();
+    var ball = currentBall(t);
+    var bx = ball.x * W, by = ball.y * H;
+
+    // pulse flash factor for the volume
+    var flash = 0;
+    var pi;
+    for (pi = 0; pi < state.pulses.length; pi++) {
+      var pa = t - state.pulses[pi];
+      if (pa >= 0 && pa < 1.6) flash = Math.max(flash, Math.exp(-pa * 2.6));
+    }
+
+    // beams (under everything)
+    var si, s;
+    for (si = 0; si < SOURCES.length; si++) {
+      s = SOURCES[si];
+      var shimmer = 0.55 + 0.45 * (0.5 + 0.5 * Math.sin(t * 0.9 + si * 2.39));
+      ctx.strokeStyle = COL.beam;
+      ctx.globalAlpha = 0.25 * shimmer + flash * 0.25;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(s.x * W, s.y * H);
+      ctx.lineTo(bx, by);
+      ctx.stroke();
+      // travelling pulse wave along this beam
+      for (pi = 0; pi < state.pulses.length; pi++) {
+        var f = (t - state.pulses[pi]) / 0.45;
+        if (f < 0 || f > 1) continue;
+        var px = s.x * W + (bx - s.x * W) * f;
+        var py = s.y * H + (by - s.y * H) * f;
+        ctx.globalAlpha = 0.85 * (1 - Math.abs(f - 0.5));
+        ctx.lineWidth = 2.4;
+        ctx.beginPath();
+        var gx = bx - s.x * W, gy = by - s.y * H;
+        var gl = Math.sqrt(gx * gx + gy * gy) || 1;
+        ctx.moveTo(px - gx / gl * 9, py - gy / gl * 9);
+        ctx.lineTo(px + gx / gl * 9, py + gy / gl * 9);
+        ctx.stroke();
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    // wireframe constellation
+    var verts = projectVertices(t);
+    var i, j;
+    function edge(a, b, base) {
+      ctx.globalAlpha = base * Math.min(a.alpha, b.alpha) * (1 + flash * 1.4);
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    }
+    ctx.strokeStyle = COL.wire;
+    ctx.lineWidth = 1;
+    for (i = 0; i + 1 < verts.length; i++) edge(verts[i], verts[i + 1], 0.5);
+    for (j = 0; j + 3 < verts.length; j++) edge(verts[j], verts[j + 3], 0.30);
+    for (j = 0; j + 5 < verts.length; j++) edge(verts[j], verts[j + 5], 0.18);
+    for (j = 0; j + 9 < verts.length; j++) edge(verts[j], verts[j + 9], 0.12);
+    ctx.fillStyle = COL.wire;
+    for (i = 0; i < verts.length; i++) {
+      if (verts[i].alpha <= 0.01) continue;
+      ctx.globalAlpha = 0.85 * verts[i].alpha;
+      ctx.beginPath();
+      ctx.arc(verts[i].x, verts[i].y, verts[i].isNewest ? 2.6 : 1.8, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // ball trail (fading)
+    if (state.trail.length > 1) {
+      ctx.strokeStyle = COL.ball;
+      ctx.globalAlpha = 0.15;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      for (i = 0; i < state.trail.length; i++) {
+        var tp = state.trail[i];
+        if (i === 0) ctx.moveTo(tp.fx * W, tp.fy * H);
+        else ctx.lineTo(tp.fx * W, tp.fy * H);
+      }
+      ctx.lineTo(bx, by);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+
+    // dancers, flaring when a beam passes near
+    for (i = 0; i < dancers.length; i++) {
+      var dp = dancerPos(dancers[i], t);
+      var dxp = dp.x * W, dyp = dp.y * H;
+      var near = 1e9;
+      for (si = 0; si < SOURCES.length; si++) {
+        s = SOURCES[si];
+        var dd = distToSeg(dxp, dyp, s.x * W, s.y * H, bx, by);
+        if (dd < near) near = dd;
+      }
+      var fl = near < u * 0.035 ? 1 - near / (u * 0.035) : 0;
+      if (fl > 0.35 && !dancers[i].flaring && t - dancers[i].lastStrike > 0.6) {
+        blip(620 + i * 140, 0.14, 0.06, 'sine');
+        dancers[i].lastStrike = t;
+      }
+      dancers[i].flaring = fl > 0.35;
+      if (fl > 0) {
+        ctx.fillStyle = COL.flare;
+        ctx.globalAlpha = 0.28 * fl;
+        ctx.beginPath(); ctx.arc(dxp, dyp, 10 + 4 * fl, 0, Math.PI * 2); ctx.fill();
+      }
+      ctx.fillStyle = COL.dancer;
+      ctx.globalAlpha = 0.9;
+      ctx.beginPath(); ctx.arc(dxp, dyp, 3.6, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    // beam source projectors
+    for (si = 0; si < SOURCES.length; si++) {
+      s = SOURCES[si];
+      ctx.fillStyle = COL.beam;
+      ctx.globalAlpha = 0.85;
+      ctx.beginPath();
+      ctx.arc(s.x * W, s.y * H, 3, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // the luminous ball: layered flat-alpha halo (no gradient), then core
+    var br = Math.max(5, 0.0105 * u);
+    ctx.fillStyle = COL.ball;
+    ctx.globalAlpha = 0.05;
+    ctx.beginPath(); ctx.arc(bx, by, br * 5.2, 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = 0.09;
+    ctx.beginPath(); ctx.arc(bx, by, br * 3.4, 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = 0.16;
+    ctx.beginPath(); ctx.arc(bx, by, br * 2.1, 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.beginPath(); ctx.arc(bx, by, br, 0, Math.PI * 2); ctx.fill();
+  }
+
+  // ---------- interaction ----------
+  function ptr(e) {
+    var cx = (e.clientX !== undefined ? e.clientX : (e.touches && e.touches[0] ? e.touches[0].clientX : 0));
+    var cy = (e.clientY !== undefined ? e.clientY : (e.touches && e.touches[0] ? e.touches[0].clientY : 0));
+    return { x: cx, y: cy };
+  }
+  function nowReal() {
+    return (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+  }
+
+  var downInfo = null;
+  function onDown(e) {
+    ensureAudio();
+    if (AC && AC.resume) { try { AC.resume(); } catch (err) {} }
+    var p = ptr(e);
+    downInfo = { x: p.x, y: p.y, t: nowReal(), dragging: false };
+    if (e.preventDefault) e.preventDefault();
+  }
+  function onMove(e) {
+    if (!downInfo) return;
+    var p = ptr(e);
+    if (!downInfo.dragging && Math.sqrt((p.x - downInfo.x) * (p.x - downInfo.x) + (p.y - downInfo.y) * (p.y - downInfo.y)) > 9) {
+      // begin the hold: spring starts from wherever the ball is now
+      var b = currentBall(state.T);
+      state.sx = b.x; state.sy = b.y; state.svx = 0; state.svy = 0;
+      state.simT = state.T;
+      state.mode = 'drag';
+      downInfo.dragging = true;
+    }
+    if (downInfo.dragging) {
+      state.tx = Math.max(0, Math.min(1, p.x / W));
+      state.ty = Math.max(0, Math.min(1, p.y / H));
+    }
+  }
+  function onUp(e) {
+    if (!downInfo) return;
+    var wasDrag = downInfo.dragging;
+    downInfo = null;
+    if (wasDrag) {
+      // hand back to the room: idle drift resumes from here via a decaying offset
+      state.offX = state.sx - idlePath(state.T).x;
+      state.offY = state.sy - idlePath(state.T).y;
+      state.tRel = state.T;
+      state.mode = 'idle';
+      return;
+    }
+    // tap (or double-tap)
+    var now = nowReal();
+    if (now - state.lastTapReal < 340) {
+      exhale(state.T);
+      exhaleNoise();
+      state.lastTapReal = -10000;
+    } else {
+      state.pulses.push(state.T);
+      blip(1320, 0.10, 0.05, 'triangle');
+      blip(1760, 0.12, 0.04, 'triangle', 0.06);
+      state.lastTapReal = now;
+    }
+    if (state.pulses.length > 6) state.pulses.splice(0, state.pulses.length - 6);
+  }
+  canvas.addEventListener('pointerdown', onDown);
+  canvas.addEventListener('pointermove', onMove);
+  canvas.addEventListener('pointerup', onUp);
+  canvas.addEventListener('pointercancel', onUp);
+  canvas.addEventListener('touchstart', function () { ensureAudio(); }, { passive: true });
+
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { resize(); draw(state.T); });
+  }
+  window.addEventListener('resize', function () { resize(); draw(state.T); });
+
+  // ---------- main ----------
+  resize();
+  draw(state.T);
+
+  var lastReal = null;
+  function frame(ts) {
+    if (lastReal === null) lastReal = ts;
+    var dt = Math.min(0.05, (ts - lastReal) / 1000);
+    lastReal = ts;
+    var prevT = state.T;
+    state.T += dt;
+    var t = state.T;
+
+    if (state.mode === 'drag') {
+      // spring chase, fixed substeps: the ball has weight, it lags
+      var h = 1 / 120;
+      var from = Math.max(state.simT, prevT);
+      var tt = from;
+      while (tt < t) {
+        var step = Math.min(h, t - tt);
+        state.svx += ((state.tx - state.sx) * 90 - state.svx * 13) * step;
+        state.svy += ((state.ty - state.sy) * 90 - state.svy * 13) * step;
+        state.sx += state.svx * step;
+        state.sy += state.svy * step;
+        tt += step;
+        // record wireframe samples as they pass
+        if (tt >= state.lastSample + SAMPLE_DT) {
+          state.lastSample += SAMPLE_DT;
+          pushHistory(state.lastSample, { x: state.sx, y: state.sy });
+        }
+      }
+      state.simT = t;
+    } else {
+      sampleHistory(t);
+    }
+
+    // prune history entries that are fully invisible
+    while (state.history.length) {
+      var e0 = state.history[0];
+      if (e0.rel && t - e0.rel > 1.6) { state.history.shift(); continue; }
+      if (!e0.rel && t - e0.ts > MAX_AGE + 0.5) { state.history.shift(); continue; }
+      break;
+    }
+
+    var b = currentBall(t);
+    state.trail.push({ fx: b.x, fy: b.y });
+    if (state.trail.length > 46) state.trail.splice(0, state.trail.length - 46);
+
+    audioFrame(b);
+    draw(t);
+    requestAnimationFrame(frame);
+  }
+  if (typeof requestAnimationFrame === 'function') {
+    requestAnimationFrame(frame);
+  }
+})();
+</script>
+</body>
+</html>

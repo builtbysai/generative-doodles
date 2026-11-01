@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chains</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #07080C; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded RNG (mulberry32) ----------
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- constants ----------
+  var T0 = 30;                 // frame-one stream time (seconds)
+  var RATE = 2.2;              // mean events per second
+  var PER_BLOCK = 6;           // events per block
+  var TRAVEL = 4.5;            // seconds for a pulse to cross to the assembler
+  var BASE_SEED = 993154;
+
+  var COL = {
+    bed: '#07080C',
+    thread: '#1E222B',
+    buy: '#4FD6FF',
+    sell: '#FF4FD8',
+    trace: '#FFFFFF',
+    tick: '#8A8D84',
+    whale: '#FFD93B',
+    white: '#FFFFFF'
+  };
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0, PHONE = false;
+
+  function viewportSize() {
+    var w, h;
+    if (typeof window !== 'undefined' && window.visualViewport) {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    } else {
+      w = window.innerWidth; h = window.innerHeight;
+    }
+    return { w: Math.max(50, Math.round(w)), h: Math.max(50, Math.round(h)) };
+  }
+
+  function resize() {
+    var s = viewportSize();
+    W = s.w; H = s.h;
+    if (canvas.width !== W) canvas.width = W;
+    if (canvas.height !== H) canvas.height = H;
+    var sw = (window.screen && window.screen.width) || W;
+    var sh = (window.screen && window.screen.height) || H;
+    PHONE = (Math.min(sw, sh) < 700) || (H > W * 1.15);
+  }
+
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { resize(); draw(state.T); });
+  }
+  window.addEventListener('resize', function () { resize(); draw(state.T); });
+
+  // ---------- market model ----------
+  // Events: { spawn, lane, vol, dir (+1 buy / -1 sell), whale, injected, jitter }
+  // Arrival at the assembler happens at spawn + TRAVEL.
+  // Blocks: every PER_BLOCK arrivals (in arrival order) close into one block.
+  // Block level: cumulative drift from net signed volume. Midpoints are prices.
+  var state = {
+    seed: BASE_SEED,
+    rng: null,
+    events: [],          // sorted by spawn
+    genUntil: 0,         // schedule generated up to this stream time
+    nextWhale: 0,
+    blocks: [],          // derived: { close, total, net, level, whaleIdx (event ref) , index }
+    T: T0,
+    dilation: 1,
+    dilationTarget: 1,
+    lastTapT: -10,
+    lastTapReal: 0,
+    drag: null
+  };
+
+  function genEvents(upto) {
+    var rng = state.rng;
+    var t = state.genUntil;
+    while (t < upto) {
+      // exponential inter-arrival for a Poisson stream
+      t += -Math.log(1 - rng()) / RATE;
+      if (t >= state.nextWhale) {
+        // whale event: oversized, yellow, counts toward its block
+        state.events.push({
+          spawn: t, lane: Math.floor(rng() * 3), vol: 2.6 + rng() * 1.2,
+          dir: rng() < 0.5 ? 1 : -1, whale: true, injected: false,
+          jitter: (rng() - 0.5) * 6
+        });
+        state.nextWhale = t + 45 + rng() * 25;
+        continue;
+      }
+      var r = rng();
+      var vol = 0.3 + Math.pow(r, 1.6) * 1.15;      // skewed volumes
+      state.events.push({
+        spawn: t, lane: Math.floor(rng() * 3), vol: vol,
+        dir: rng() < 0.52 ? 1 : -1, whale: false, injected: false,
+        jitter: (rng() - 0.5) * 6
+      });
+    }
+    state.genUntil = t;
+    rebuildBlocks();
+  }
+
+  function rebuildBlocks() {
+    var arrivals = state.events.slice().sort(function (a, b) {
+      var d = (a.spawn + TRAVEL) - (b.spawn + TRAVEL);
+      return d !== 0 ? d : a.spawn - b.spawn;
+    });
+    var blocks = [];
+    var level = 0.5;
+    for (var i = 0; i + PER_BLOCK <= arrivals.length; i += PER_BLOCK) {
+      var total = 0, net = 0, whale = false;
+      for (var j = i; j < i + PER_BLOCK; j++) {
+        var e = arrivals[j];
+        total += e.vol;
+        net += e.dir * e.vol;
+        if (e.whale) whale = true;
+      }
+      level += net * 0.010;
+      if (level < 0.22) level = 0.22;
+      if (level > 0.78) level = 0.78;
+      blocks.push({
+        index: blocks.length,
+        close: arrivals[i + PER_BLOCK - 1].spawn + TRAVEL,
+        total: total, net: net, level: level, whale: whale
+      });
+    }
+    state.blocks = blocks;
+    state.arrivalTimes = arrivals.map(function (e) { return e.spawn + TRAVEL; });
+    // whale block lookup for shockwaves
+    state.whaleBlocks = blocks.filter(function (b) { return b.whale; });
+  }
+
+  function reseed(newSeed) {
+    state.seed = newSeed >>> 0;
+    state.rng = mulberry32(state.seed);
+    state.events = [];
+    var wrng = mulberry32(state.seed ^ 0x9E3779B9);
+    state.nextWhale = 40 + wrng() * 20;   // first whale a little after frame one
+    state.genUntil = 0;
+    state.T = T0;
+    genEvents(T0 + 40);
+  }
+
+  function injectTrade(x, y) {
+    var lane = 0, best = 1e9;
+    for (var i = 0; i < 3; i++) {
+      var d = Math.abs(y - threadY(i));
+      if (d < best) { best = d; lane = i; }
+    }
+    var vol = 0.45 + (1 - y / H) * 1.25;
+    var dir = y <= threadY(1) ? 1 : -1;
+    state.events.push({
+      spawn: state.T, lane: lane, vol: vol, dir: dir,
+      whale: false, injected: true, jitter: 0
+    });
+    state.events.sort(function (a, b) { return a.spawn - b.spawn; });
+    rebuildBlocks();
+  }
+
+  function threadY(i) { return H * (0.35 + 0.15 * i); }
+  function assemblerX() { return W * 0.8; }
+  function blockW() { return Math.max(13, Math.min(30, W * 0.021)); }
+  function blockGap() { return Math.max(3, W * 0.004); }
+
+  function lastClosedIndex(T) {
+    var idx = -1;
+    for (var i = 0; i < state.blocks.length; i++) {
+      if (state.blocks[i].close <= T) idx = i; else break;
+    }
+    return idx;
+  }
+
+  // block x (left edge) at stream time T, using even slot spacing
+  function blockX(b, T) {
+    var spacing = blockW() + blockGap();
+    var lc = lastClosedIndex(T);
+    var after = Math.max(0, lc - b.index);
+    // fractional slot: arrivals since the last close, as of time T
+    var frac = 0;
+    if (lc >= 0) {
+      var since = 0;
+      for (var i = 0; i < state.arrivalTimes.length; i++) {
+        var at = state.arrivalTimes[i];
+        if (at > state.blocks[lc].close && at <= T) since++;
+        else if (at > T) break;
+      }
+      frac = Math.min(1, since / PER_BLOCK);
+    }
+    return assemblerX() - (after + frac) * spacing - blockW();
+  }
+
+  function swellFor(b, T) {
+    // decaying elastic swell from whale shockwaves
+    var s = 1;
+    for (var i = 0; i < state.whaleBlocks.length; i++) {
+      var wb = state.whaleBlocks[i];
+      if (wb.close > T) continue;
+      var age = T - wb.close;
+      if (age > 3) continue;
+      var dist = Math.abs(b.index - wb.index);
+      if (dist > 3) continue;
+      var fall = 1 - dist / 4.5;
+      s += 0.38 * fall * Math.exp(-age / 1.05) * Math.cos(age * 7 - dist * 0.85);
+    }
+    return Math.max(0.55, s);
+  }
+
+  // ---------- audio (lazy, gesture-gated) ----------
+  var AC = null, droneOsc = null, droneGain = null;
+  function ensureAudio() {
+    if (AC) return;
+    var Ctor = (typeof window !== 'undefined') && (window.AudioContext || window.webkitAudioContext);
+    if (!Ctor) return;
+    try {
+      AC = new Ctor();
+      droneOsc = AC.createOscillator();
+      droneGain = AC.createGain();
+      droneOsc.type = 'sine';
+      droneOsc.frequency.value = 82;
+      droneGain.gain.value = 0.0;
+      droneOsc.connect(droneGain); droneGain.connect(AC.destination);
+      droneOsc.start();
+    } catch (e) { AC = null; }
+  }
+  function blip(freq, dur, gain, type) {
+    if (!AC) return;
+    try {
+      var o = AC.createOscillator(), g = AC.createGain();
+      o.type = type || 'square';
+      o.frequency.value = freq;
+      g.gain.setValueAtTime(gain, AC.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.0001, AC.currentTime + dur);
+      o.connect(g); g.connect(AC.destination);
+      o.start(); o.stop(AC.currentTime + dur + 0.02);
+    } catch (e) {}
+  }
+  function thunk() { blip(64, 0.22, 0.16, 'sine'); }
+  function boom() {
+    blip(46, 0.9, 0.3, 'sine');
+    blip(31, 1.3, 0.22, 'sine');
+  }
+  var audioCursor = { ev: 0, blk: 0, wh: 0 };
+  function audioAdvance(prevT, T) {
+    if (!AC) return;
+    // event ticks
+    for (var i = 0; i < state.events.length; i++) {
+      var e = state.events[i];
+      if (e.spawn > prevT && e.spawn <= T) {
+        blip(500 + e.vol * 620, 0.05, 0.045, 'square');
+        if (e.whale) boom();
+      }
+    }
+    for (var j = 0; j < state.blocks.length; j++) {
+      var b = state.blocks[j];
+      if (b.close > prevT && b.close <= T) thunk();
+    }
+    if (droneGain && state.blocks.length) {
+      var lv = currentLevel(T);
+      droneOsc.frequency.value = 58 + (0.8 - lv) * 90;
+      droneGain.gain.value = 0.035;
+    }
+  }
+  function currentLevel(T) {
+    var lv = 0.5;
+    for (var i = 0; i < state.blocks.length; i++) {
+      if (state.blocks[i].close <= T) lv = state.blocks[i].level; else break;
+    }
+    return lv;
+  }
+
+  // ---------- drawing ----------
+  function draw(T) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.fillStyle = COL.bed;
+    ctx.fillRect(0, 0, W, H);
+
+    // threads
+    ctx.strokeStyle = COL.thread;
+    ctx.lineWidth = 1;
+    for (var i = 0; i < 3; i++) {
+      ctx.beginPath();
+      ctx.moveTo(0, threadY(i) + 0.5);
+      ctx.lineTo(W, threadY(i) + 0.5);
+      ctx.stroke();
+    }
+
+    var ax = assemblerX();
+    var bw = blockW();
+
+    // blocks (oldest to newest)
+    var visible = [];
+    for (var bi = 0; bi < state.blocks.length; bi++) {
+      var b = state.blocks[bi];
+      if (b.close > T) break;
+      var x = blockX(b, T);
+      if (x + bw < -8) continue;
+      if (x > W + 8) continue;
+      visible.push({ b: b, x: x });
+    }
+
+    // whale shockwave rings (behind blocks)
+    for (var wi = 0; wi < state.whaleBlocks.length; wi++) {
+      var wb2 = state.whaleBlocks[wi];
+      if (wb2.close > T) continue;
+      var age = T - wb2.close;
+      if (age > 2.6) continue;
+      var cx = blockX(wb2, T) + bw / 2;
+      var cy = wb2.level * H;
+      var r = 12 + age * (W * 0.16);
+      ctx.strokeStyle = COL.whale;
+      ctx.globalAlpha = 0.55 * (1 - age / 2.6);
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+
+    for (var vi = 0; vi < visible.length; vi++) {
+      var vb = visible[vi].b;
+      var vx = visible[vi].x;
+      var sw = swellFor(vb, T);
+      var bh = Math.min(H * 0.34, vb.total * H * 0.036) * sw;
+      var midY = vb.level * H;
+      ctx.fillStyle = vb.net >= 0 ? COL.buy : COL.sell;
+      ctx.globalAlpha = vb.whale ? 0.95 : 0.82;
+      ctx.fillRect(vx, midY - bh / 2, bw, bh);
+      ctx.globalAlpha = 1;
+      // index tick notch on the top edge
+      ctx.strokeStyle = COL.tick;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(vx + bw - 3.5, midY - bh / 2);
+      ctx.lineTo(vx + bw - 3.5, midY - bh / 2 + 5);
+      ctx.stroke();
+    }
+
+    // price trace through midpoints, plus head point at the assembler
+    if (visible.length) {
+      ctx.strokeStyle = COL.trace;
+      ctx.globalAlpha = 0.8;
+      ctx.lineWidth = 1.4;
+      ctx.beginPath();
+      for (var ti = 0; ti < visible.length; ti++) {
+        var px = visible[ti].x + bw / 2;
+        var py = visible[ti].b.level * H;
+        if (ti === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+      }
+      ctx.lineTo(ax + bw / 2, currentLevel(T) * H);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+
+    // pulses in flight
+    var speed = (assemblerX() + 12) / TRAVEL;
+    for (var ei = 0; ei < state.events.length; ei++) {
+      var ev = state.events[ei];
+      if (ev.spawn > T) break;
+      var ageE = T - ev.spawn;
+      if (ageE > TRAVEL) continue;
+      var ex = -12 + ageE * speed;
+      var ey = threadY(ev.lane) + ev.jitter;
+      var col = ev.whale ? COL.whale : (ev.dir > 0 ? COL.buy : COL.sell);
+      var len = ev.whale ? 26 : 6 + ev.vol * 9;
+      var ht = ev.whale ? 7 : 2.5 + ev.vol * 2.4;
+      ctx.fillStyle = col;
+      ctx.globalAlpha = ev.whale ? 1 : 0.9;
+      ctx.fillRect(ex - len / 2, ey - ht / 2, len, ht);
+      if (ev.injected) {
+        ctx.fillStyle = COL.white;
+        ctx.globalAlpha = 1;
+        ctx.fillRect(ex - 2, ey - 1.5, 4, 3);
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    // assembler gate tick (faint): where pulses compress into blocks
+    ctx.strokeStyle = COL.thread;
+    ctx.beginPath();
+    ctx.moveTo(ax + bw + 0.5, threadY(0) - 10);
+    ctx.lineTo(ax + bw + 0.5, threadY(2) + 10);
+    ctx.stroke();
+  }
+
+  // ---------- interaction ----------
+  var downPos = null, downTime = 0, moved = false;
+
+  function ptr(e) {
+    var r = canvas.getBoundingClientRect();
+    var cx = (e.clientX !== undefined ? e.clientX : (e.touches && e.touches[0] ? e.touches[0].clientX : 0));
+    var cy = (e.clientY !== undefined ? e.clientY : (e.touches && e.touches[0] ? e.touches[0].clientY : 0));
+    return { x: cx - r.left, y: cy - r.top };
+  }
+
+  function onDown(e) {
+    ensureAudio();
+    if (AC && AC.resume) { try { AC.resume(); } catch (err) {} }
+    var p = ptr(e);
+    downPos = p; moved = false;
+    downTime = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+    state.drag = { x0: p.x, x: p.x };
+    if (e.preventDefault) e.preventDefault();
+  }
+  function onMove(e) {
+    if (!state.drag) return;
+    var p = ptr(e);
+    state.drag.x = p.x;
+    if (Math.abs(p.x - state.drag.x0) > 8 || Math.abs(p.y - downPos.y) > 8) moved = true;
+    var dx = p.x - state.drag.x0;
+    state.dilationTarget = Math.max(0.25, Math.min(3, 1 + dx / 220));
+  }
+  function onUp(e) {
+    if (!state.drag) return;
+    var p = ptr(e);
+    var now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+    state.dilationTarget = 1;
+    if (!moved && (now - downTime) < 400) {
+      // tap: double-tap reseeds, single tap injects
+      if (now - state.lastTapReal < 320) {
+        reseed((Math.imul(state.seed, 1664525) + 1013904223) >>> 0);
+        state.lastTapReal = -10000;
+      } else {
+        injectTrade(p.x, p.y);
+        state.lastTapReal = now;
+      }
+    }
+    state.drag = null;
+  }
+  canvas.addEventListener('pointerdown', onDown);
+  canvas.addEventListener('pointermove', onMove);
+  canvas.addEventListener('pointerup', onUp);
+  canvas.addEventListener('pointercancel', onUp);
+  canvas.addEventListener('touchstart', function () { ensureAudio(); }, { passive: true });
+
+  // ---------- main ----------
+  reseed(BASE_SEED);
+  resize();
+  draw(state.T);
+
+  var lastReal = null;
+  function frame(ts) {
+    if (lastReal === null) lastReal = ts;
+    var dt = Math.min(0.05, (ts - lastReal) / 1000);
+    lastReal = ts;
+    // dilation eases back to target (1 after release)
+    state.dilation += (state.dilationTarget - state.dilation) *
+      (state.drag ? 0.25 : Math.min(1, dt / 3 * 4));
+    var prevT = state.T;
+    state.T += dt * state.dilation;
+    if (state.T + 40 > state.genUntil) genEvents(state.T + 60);
+    audioAdvance(prevT, state.T);
+    draw(state.T);
+    requestAnimationFrame(frame);
+  }
+  if (typeof requestAnimationFrame === 'function') {
+    requestAnimationFrame(frame);
+  }
+})();
+</script>
+</body>
+</html>

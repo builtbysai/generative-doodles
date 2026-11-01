@@ -1,0 +1,661 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rules for a Body</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #07080C; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded RNG (mulberry32) ----------
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function hash01(n) { // deterministic hash -> [0,1)
+    var x = Math.sin(n * 127.1 + 311.7) * 43758.5453;
+    return x - Math.floor(x);
+  }
+
+  // ---------- constants ----------
+  var T0 = 7;                    // frame-one piece time (seconds): FRAGMENT active
+  var BASE_SEED = 995156;
+  var PHRASE = 10;               // phrase loop length (s)
+  var TRAIL_SPAN = 4;            // trail buffer length (s)
+  var TRAIL_N = 81;              // trail samples
+  var AUTO_EVERY = 14;           // auto rule cycle (s)
+  var HOLD_AFTER_TAP = 30;       // visitor rule hold (s)
+  var MORPH = 1.0;               // rule morph duration (s)
+  var INTEN_DEFAULT = 0.45;
+
+  var RULES = ['FRAGMENT', 'MIRROR', 'QUANTIZE', 'SPIRAL'];
+  var COL = {
+    stage: '#07080C',
+    dancer: '#F5F2EA',
+    frag: '#4FD6FF',
+    mirror: '#FF4FD8',
+    quant: '#7DF9C6',
+    spiral: '#FFD93B',
+    divider: '#3A3D46',
+    white: '#FFFFFF'
+  };
+  var RULE_COL = [COL.frag, COL.mirror, COL.quant, COL.spiral];
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0, PHONE = false;
+
+  function viewportSize() {
+    var w, h;
+    if (typeof window !== 'undefined' && window.visualViewport) {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    } else {
+      w = window.innerWidth; h = window.innerHeight;
+    }
+    return { w: Math.max(50, Math.round(w)), h: Math.max(50, Math.round(h)) };
+  }
+
+  function resize() {
+    var s = viewportSize();
+    W = s.w; H = s.h;
+    if (canvas.width !== W) canvas.width = W;
+    if (canvas.height !== H) canvas.height = H;
+    var sw = (window.screen && window.screen.width) || W;
+    var sh = (window.screen && window.screen.height) || H;
+    PHONE = (Math.min(sw, sh) < 700) || (H > W * 1.15);
+  }
+
+  // ---------- phrase / body model ----------
+  // All pose math is closed-form in t. Joints are returned in body units
+  // (1 unit = S px) relative to the hip; root carries sway/crouch offsets.
+  var seed = BASE_SEED;
+  var P = null;        // phrase params for current seed
+  var melody = [];     // seeded note schedule (freqs), 16 per phrase loop
+  var shardHash = [];  // per-shard orbit params
+
+  function buildPhrase(sd) {
+    var rnd = mulberry32(sd);
+    var p = { ph: [], ampA: 0, ampL: 0, mirrorAxis: 0, spiralDir: 1 };
+    for (var i = 0; i < 12; i++) p.ph.push(rnd() * Math.PI * 2);
+    p.ampA = 0.7 + rnd() * 0.35;
+    p.ampL = 0.42 + rnd() * 0.22;
+    p.mirrorAxis = 0.45 + rnd() * 0.55;      // diagonal axis angle (rad)
+    p.spiralDir = rnd() < 0.5 ? 1 : -1;
+    var scale = [261.63, 293.66, 329.63, 392.0, 440.0, 523.25];
+    melody = [];
+    for (var n = 0; n < 16; n++) melody.push(scale[Math.floor(rnd() * scale.length)]);
+    shardHash = [];
+    for (var j = 0; j < 24; j++) shardHash.push({ r: 0.3 + rnd() * 0.55, sp: 0.7 + rnd() * 0.6, rot: rnd() * Math.PI * 2 });
+    return p;
+  }
+  P = buildPhrase(seed);
+
+  function poseAt(t) {
+    var w = Math.PI * 2 / PHRASE;
+    var ph = P.ph;
+    var crouch = 0.5 + 0.5 * Math.sin(w * t + ph[0]);
+    var root = {
+      x: 0.16 * Math.sin(w * t + ph[1]) + 0.05 * Math.sin(2 * w * t + ph[2]),
+      y: 0.10 * crouch
+    };
+    var lean = 0.14 * Math.sin(w * t + ph[3]);
+    var spine = 0.50 * (1 - 0.16 * crouch);
+    var hip = { x: 0, y: 0 };
+    var neck = { x: lean, y: -spine };
+    var head = { x: lean * 1.35, y: -spine - 0.15 };
+    var shL = { x: neck.x - 0.13, y: neck.y + 0.03 };
+    var shR = { x: neck.x + 0.13, y: neck.y + 0.03 };
+    // arms: angle from straight down, swinging in the picture plane;
+    // a raised flourish lifts one arm overhead part of each phrase.
+    var raiseL = Math.pow(Math.max(0, Math.sin(w * t + ph[6])), 3) * 2.3;
+    var raiseR = Math.pow(Math.max(0, Math.sin(w * t + ph[6] + Math.PI)), 3) * 2.3;
+    var aUL = 0.35 + P.ampA * Math.sin(2 * w * t + ph[4]) + raiseL;
+    var aUR = 0.35 + P.ampA * Math.sin(2 * w * t + ph[4] + Math.PI) + raiseR;
+    var aFL = aUL + 0.55 + 0.45 * Math.sin(2 * w * t + ph[5]);
+    var aFR = aUR + 0.55 + 0.45 * Math.sin(2 * w * t + ph[5] + Math.PI);
+    var elL = { x: shL.x + 0.21 * Math.sin(aUL), y: shL.y + 0.21 * Math.cos(aUL) };
+    var elR = { x: shR.x + 0.21 * Math.sin(aUR), y: shR.y + 0.21 * Math.cos(aUR) };
+    var haL = { x: elL.x + 0.19 * Math.sin(aFL), y: elL.y + 0.19 * Math.cos(aFL) };
+    var haR = { x: elR.x + 0.19 * Math.sin(aFR), y: elR.y + 0.19 * Math.cos(aFR) };
+    // legs: stepping thighs, knees bend back.
+    var aTL = P.ampL * Math.sin(2 * w * t + ph[7]);
+    var aTR = P.ampL * Math.sin(2 * w * t + ph[7] + Math.PI);
+    var bL = 0.22 + 0.30 * (0.5 + 0.5 * Math.sin(2 * w * t + ph[8])) + 0.35 * crouch;
+    var bR = 0.22 + 0.30 * (0.5 + 0.5 * Math.sin(2 * w * t + ph[8] + Math.PI)) + 0.35 * crouch;
+    var hipL = { x: -0.07, y: 0.02 };
+    var hipR = { x: 0.07, y: 0.02 };
+    var knL = { x: hipL.x + 0.27 * Math.sin(aTL), y: hipL.y + 0.27 * Math.cos(aTL) };
+    var knR = { x: hipR.x + 0.27 * Math.sin(aTR), y: hipR.y + 0.27 * Math.cos(aTR) };
+    var ftL = { x: knL.x + 0.27 * Math.sin(aTL - bL), y: knL.y + 0.27 * Math.cos(aTL - bL) };
+    var ftR = { x: knR.x + 0.27 * Math.sin(aTR - bR), y: knR.y + 0.27 * Math.cos(aTR - bR) };
+    return { root: root, hip: hip, neck: neck, head: head, shL: shL, shR: shR,
+             elL: elL, elR: elR, haL: haL, haR: haR, hipL: hipL, hipR: hipR,
+             knL: knL, knR: knR, ftL: ftL, ftR: ftR };
+  }
+
+  // ---------- visitor state (events recorded with piece-time stamps) ----------
+  var ruleEvents = [];   // { t, idx, prevIdx }
+  var lastDrag = null;   // { endT, value }
+  var dragState = null;  // { startX, startInten, value }
+  var lastTapT = -10, lastTapWasGlyph = true;
+
+  function ruleInfo(t) {
+    var ev = null;
+    for (var i = ruleEvents.length - 1; i >= 0; i--) {
+      if (ruleEvents[i].t <= t) { ev = ruleEvents[i]; break; }
+    }
+    var startT, startIdx, prevIdx;
+    if (ev && t < ev.t + HOLD_AFTER_TAP) {
+      startT = ev.t; startIdx = ev.idx; prevIdx = ev.prevIdx;
+    } else {
+      var base = ev ? ev.t + HOLD_AFTER_TAP : 0;
+      var baseIdx = ev ? ev.idx : 0;
+      var steps = Math.floor((t - base) / AUTO_EVERY);
+      startIdx = (((baseIdx + steps) % 4) + 4) % 4;
+      startT = base + steps * AUTO_EVERY;
+      prevIdx = (((startIdx + 3) % 4) + 4) % 4;
+      if (!ev && steps === 0) prevIdx = startIdx;
+    }
+    var mix = Math.min(1, Math.max(0, (t - startT) / MORPH));
+    if (startT === 0 && !ev) mix = 1;
+    return { idx: startIdx, prevIdx: prevIdx, mix: mix };
+  }
+
+  function intensityAt(t) {
+    if (dragState) return dragState.value;
+    if (lastDrag) {
+      var d = INTEN_DEFAULT + (lastDrag.value - INTEN_DEFAULT) * Math.exp(-(t - lastDrag.endT) / 3.2);
+      return Math.min(1, Math.max(0, d));
+    }
+    return INTEN_DEFAULT;
+  }
+
+  // ---------- geometry helpers ----------
+  function stageGeom() {
+    var stripH = Math.max(40, H * 0.075);
+    var stageH = H - stripH;
+    var S = Math.min(W, stageH) * (PHONE ? 0.40 : 0.36);
+    return { stripH: stripH, stageH: stageH, S: S, cx: W * 0.25, cy: stageH * 0.40 };
+  }
+  function glyphCenters(g) {
+    var out = [];
+    for (var i = 0; i < 4; i++) out.push({ x: W * (0.5 + (i - 1.5) * 0.115), y: H - g.stripH / 2 });
+    return out;
+  }
+
+  // ---------- drawing ----------
+  function drawSkeleton(joints, mapFn, color, alpha, lw, squareJoints) {
+    function m(p) { return mapFn(p); }
+    var chains = [
+      [joints.hip, joints.neck],
+      [joints.neck, joints.head],
+      [joints.shL, joints.shR],
+      [joints.shL, joints.elL, joints.haL],
+      [joints.shR, joints.elR, joints.haR],
+      [joints.hipL, joints.hip, joints.hipR],
+      [joints.hipL, joints.knL, joints.ftL],
+      [joints.hipR, joints.knR, joints.ftR]
+    ];
+    ctx.strokeStyle = color; ctx.fillStyle = color;
+    ctx.globalAlpha = alpha; ctx.lineWidth = lw;
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    for (var c = 0; c < chains.length; c++) {
+      ctx.beginPath();
+      for (var k = 0; k < chains[c].length; k++) {
+        var q = m(chains[c][k]);
+        if (k === 0) ctx.moveTo(q.x, q.y); else ctx.lineTo(q.x, q.y);
+      }
+      ctx.stroke();
+    }
+    var names = ['shL', 'shR', 'elL', 'elR', 'haL', 'haR', 'knL', 'knR', 'ftL', 'ftR'];
+    for (var n = 0; n < names.length; n++) {
+      var jp = m(joints[names[n]]);
+      if (squareJoints) ctx.fillRect(jp.x - lw, jp.y - lw, lw * 2, lw * 2);
+      else { ctx.beginPath(); ctx.arc(jp.x, jp.y, lw * 0.85, 0, Math.PI * 2); ctx.fill(); }
+    }
+    var hp = m(joints.head);
+    ctx.beginPath(); ctx.arc(hp.x, hp.y, Math.max(3.5, lw * 2.8), 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  function drawRule(idx, t, g, buf, poseNow, inten, gain) {
+    if (gain <= 0.003) return;
+    var S = g.S;
+    var RC = { x: W - (g.cx + poseNow.root.x * S), y: g.cy + poseNow.root.y * S }; // mirrored root
+    var i, j, p, q;
+
+    if (idx === 0) {
+      // FRAGMENT: 24 shards, each carrying a window of the trail, orbiting RC.
+      ctx.strokeStyle = COL.frag; ctx.fillStyle = COL.frag;
+      ctx.lineWidth = 1.8; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+      for (j = 0; j < 24; j++) {
+        var sl = [];
+        for (var k = 0; k < 12; k++) {
+          var bi = Math.min(buf.length - 1, j * 2 + k);
+          sl.push(buf[bi]);
+        }
+        var gx = 0, gy = 0;
+        for (i = 0; i < sl.length; i++) { gx += sl[i].x; gy += sl[i].y; }
+        gx /= sl.length; gy /= sl.length;
+        var th = j * (Math.PI * 2 / 24) + t * 0.22;
+        var R = S * (0.20 + 0.34 * (shardHash[j].r - 0.3) / 0.55) * (0.7 + 0.6 * inten);
+        var tx = RC.x + Math.cos(th) * R, ty = RC.y + Math.sin(th) * R * 0.82;
+        // shards live in the right half, inside the stage
+        tx = Math.min(W - 12, Math.max(W / 2 + S * 0.10, tx));
+        ty = Math.min(g.stageH - 8, Math.max(S * 0.06, ty));
+        var rot = shardHash[j].rot + t * 0.15 * shardHash[j].sp;
+        var cr = Math.cos(rot), sr = Math.sin(rot);
+        ctx.globalAlpha = 0.8 * gain;
+        ctx.beginPath();
+        for (i = 0; i < sl.length; i++) {
+          var dx = (sl[i].x - gx) * 0.8, dy = (sl[i].y - gy) * 0.8;
+          var px = tx + dx * cr - dy * sr, py = ty + dx * sr + dy * cr;
+          if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+        }
+        ctx.stroke();
+        var sz = S * 0.045 * (0.8 + 0.6 * inten);
+        ctx.globalAlpha = 0.9 * gain;
+        ctx.beginPath();
+        for (var v = 0; v < 3; v++) {
+          var va = rot + v * (Math.PI * 2 / 3);
+          var vx = tx + Math.cos(va) * sz, vy = ty + Math.sin(va) * sz;
+          if (v === 0) ctx.moveTo(vx, vy); else ctx.lineTo(vx, vy);
+        }
+        ctx.closePath(); ctx.fill();
+      }
+      ctx.globalAlpha = 0.5 * gain;
+      ctx.beginPath(); ctx.arc(RC.x, RC.y, 2.5, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    if (idx === 1) {
+      // MIRROR: pose from 1.4 s ago, mapped right, reflected over a diagonal axis.
+      var C = { x: W * 0.75, y: g.cy };
+      var ax = P.mirrorAxis;
+      var ux = Math.cos(ax), uy = Math.sin(ax);
+      function reflect(pt) {
+        var dx = pt.x - C.x, dy = pt.y - C.y;
+        var proj = dx * ux + dy * uy;
+        return { x: C.x + 2 * proj * ux - dx, y: C.y + 2 * proj * uy - dy };
+      }
+      ctx.strokeStyle = COL.mirror; ctx.globalAlpha = 0.15 * gain;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(C.x - ux * S * 1.5, C.y - uy * S * 1.5);
+      ctx.lineTo(C.x + ux * S * 1.5, C.y + uy * S * 1.5);
+      ctx.stroke();
+      ctx.globalAlpha = 0.35 * gain; ctx.lineWidth = 1.4;
+      ctx.beginPath();
+      for (i = 0; i < buf.length; i++) {
+        q = reflect(buf[i]);
+        if (i === 0) ctx.moveTo(q.x, q.y); else ctx.lineTo(q.x, q.y);
+      }
+      ctx.stroke();
+      var past = poseAt(t - 1.4);
+      var mapR = function (jp) {
+        var lx = g.cx + (past.root.x + jp.x) * S, ly = g.cy + (past.root.y + jp.y) * S;
+        return reflect({ x: W - lx, y: ly });
+      };
+      drawSkeleton(past, mapR, COL.mirror, 0.95 * gain, 2.2, false);
+      if (inten > 0.35) {
+        // intensity: a second, perpendicular reflection joins in.
+        var ax2 = ax + Math.PI / 2, u2x = Math.cos(ax2), u2y = Math.sin(ax2);
+        var mapR2 = function (jp) {
+          var lx = g.cx + (past.root.x + jp.x) * S, ly = g.cy + (past.root.y + jp.y) * S;
+          var mx = W - lx, my = ly;
+          var dx = mx - C.x, dy = my - C.y;
+          var proj = dx * u2x + dy * u2y;
+          return { x: C.x + 2 * proj * u2x - dx, y: C.y + 2 * proj * u2y - dy };
+        };
+        drawSkeleton(past, mapR2, COL.mirror, 0.45 * ((inten - 0.35) / 0.65) * gain, 1.6, false);
+      }
+    }
+
+    if (idx === 2) {
+      // QUANTIZE: the same phrase, snapped to a coarse grid, stepping in time.
+      var cell = 14 + 36 * inten;
+      ctx.fillStyle = COL.quant; ctx.globalAlpha = 0.10 * gain;
+      for (var gx2 = W / 2 + cell; gx2 < W; gx2 += cell) {
+        for (var gy2 = cell; gy2 < g.stageH; gy2 += cell) {
+          ctx.fillRect(gx2 - 1, gy2 - 1, 2, 2);
+        }
+      }
+      ctx.globalAlpha = 0.3 * gain; ctx.strokeStyle = COL.quant; ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      for (i = 0; i < buf.length; i++) {
+        var sx = Math.round(buf[i].x / cell) * cell, sy = Math.round(buf[i].y / cell) * cell;
+        if (i === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
+      }
+      ctx.stroke();
+      var tq = Math.floor(t / 0.26) * 0.26;
+      var qp = poseAt(tq);
+      var mapQ = function (jp) {
+        var lx = g.cx + (qp.root.x + jp.x) * S, ly = g.cy + (qp.root.y + jp.y) * S;
+        return { x: Math.round((W - lx) / cell) * cell, y: Math.round(ly / cell) * cell };
+      };
+      drawSkeleton(qp, mapQ, COL.quant, 0.95 * gain, 2.4, true);
+    }
+
+    if (idx === 3) {
+      // SPIRAL: the trail winds into a helix around the mirrored body's vertical.
+      var axisX = RC.x;
+      ctx.strokeStyle = COL.spiral; ctx.globalAlpha = 0.15 * gain; ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(axisX, g.cy - S * 0.85); ctx.lineTo(axisX, g.cy + S * 0.95);
+      ctx.stroke();
+      ctx.globalAlpha = 0.9 * gain; ctx.lineWidth = 2; ctx.lineCap = 'round';
+      ctx.beginPath();
+      for (i = 0; i < buf.length; i++) {
+        p = buf[i];
+        var a = p.age; // seconds, 0 newest .. TRAIL_SPAN oldest
+        var u = (p.x - axisX) / S;
+        var phase = u * 2.4 + a * (2.2 + 3.4 * inten) * P.spiralDir + t * 0.2;
+        var r = S * (0.08 + 0.30 * (a / TRAIL_SPAN)) * (1.25 - 0.55 * inten);
+        var hx = axisX + Math.cos(phase) * r;
+        var hy = RC.y + ((p.y - RC.y) / S) * S * 0.85 + (a / TRAIL_SPAN - 0.5) * S * 0.55;
+        if (i === 0) ctx.moveTo(hx, hy); else ctx.lineTo(hx, hy);
+      }
+      ctx.stroke();
+      ctx.fillStyle = COL.spiral;
+      for (i = 0; i < buf.length; i += 6) {
+        p = buf[i];
+        var a2 = p.age;
+        var u2 = (p.x - axisX) / S;
+        var ph2 = u2 * 2.4 + a2 * (2.2 + 3.4 * inten) * P.spiralDir + t * 0.2;
+        var r2 = S * (0.08 + 0.30 * (a2 / TRAIL_SPAN)) * (1.25 - 0.55 * inten);
+        ctx.beginPath();
+        ctx.arc(axisX + Math.cos(ph2) * r2,
+                RC.y + ((p.y - RC.y) / S) * S * 0.85 + (a2 / TRAIL_SPAN - 0.5) * S * 0.55,
+                2, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function drawGlyph(i, x, y, gz, color, alpha) {
+    ctx.strokeStyle = color; ctx.fillStyle = color;
+    ctx.globalAlpha = alpha; ctx.lineWidth = 1.6; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    var k;
+    if (i === 0) { // shard cluster
+      var offs = [[-0.30, -0.22, 0.5], [0.26, -0.34, 2.2], [0.04, 0.26, 1.2], [-0.30, 0.30, 2.9]];
+      for (k = 0; k < offs.length; k++) {
+        var ox = x + offs[k][0] * gz, oy = y + offs[k][1] * gz, rot = offs[k][2], sz = gz * 0.26;
+        ctx.beginPath();
+        for (var v = 0; v < 3; v++) {
+          var va = rot + v * (Math.PI * 2 / 3);
+          var vx = ox + Math.cos(va) * sz, vy = oy + Math.sin(va) * sz;
+          if (v === 0) ctx.moveTo(vx, vy); else ctx.lineTo(vx, vy);
+        }
+        ctx.closePath(); ctx.fill();
+      }
+    } else if (i === 1) { // mirror pair
+      ctx.beginPath(); ctx.moveTo(x, y - gz * 0.55); ctx.lineTo(x, y + gz * 0.55); ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(x - gz * 0.42, y); ctx.lineTo(x - gz * 0.08, y - gz * 0.3); ctx.lineTo(x - gz * 0.08, y + gz * 0.3);
+      ctx.closePath(); ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo(x + gz * 0.42, y); ctx.lineTo(x + gz * 0.08, y - gz * 0.3); ctx.lineTo(x + gz * 0.08, y + gz * 0.3);
+      ctx.closePath(); ctx.fill();
+    } else if (i === 2) { // grid
+      var e = gz * 0.52;
+      ctx.strokeRect(x - e, y - e, e * 2, e * 2);
+      ctx.beginPath();
+      ctx.moveTo(x - e / 3, y - e); ctx.lineTo(x - e / 3, y + e);
+      ctx.moveTo(x + e / 3, y - e); ctx.lineTo(x + e / 3, y + e);
+      ctx.moveTo(x - e, y - e / 3); ctx.lineTo(x + e, y - e / 3);
+      ctx.moveTo(x - e, y + e / 3); ctx.lineTo(x + e, y + e / 3);
+      ctx.stroke();
+    } else { // helix
+      ctx.beginPath();
+      for (k = 0; k <= 24; k++) {
+        var s = k / 24, ang = s * Math.PI * 4;
+        var px = x + Math.cos(ang) * gz * 0.30 * (0.4 + 0.6 * s);
+        var py = y + (s - 0.5) * gz * 1.05;
+        if (k === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+      }
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function draw(t) {
+    resize();
+    var g = stageGeom();
+    var S = g.S;
+    ctx.fillStyle = COL.stage;
+    ctx.fillRect(0, 0, W, H);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+
+    var inten = intensityAt(t);
+    var poseNow = poseAt(t);
+
+    // ---- trail buffers: analytic samples of the phrase path ----
+    var headBuf = [], handBuf = [];
+    for (var i = 0; i < TRAIL_N; i++) {
+      var age = (i / (TRAIL_N - 1)) * TRAIL_SPAN; // 0 = newest
+      var past = poseAt(t - age);
+      var hx = g.cx + (past.root.x + past.head.x) * S;
+      var hy = g.cy + (past.root.y + past.head.y) * S;
+      headBuf.push({ x: W - hx, y: hy, age: age });
+      var ax2 = g.cx + (past.root.x + past.haR.x) * S;
+      var ay2 = g.cy + (past.root.y + past.haR.y) * S;
+      handBuf.push({ x: ax2, y: ay2, age: age });
+    }
+
+    // ---- left half: the dancer and its faint trail ----
+    function trailDraw(buf, mirror) {
+      ctx.strokeStyle = COL.white; ctx.lineWidth = 1.3; ctx.lineCap = 'round';
+      for (var sgm = 0; sgm < buf.length - 1; sgm++) {
+        var a0 = buf[sgm], a1 = buf[sgm + 1];
+        ctx.globalAlpha = 0.2 * (1 - a0.age / TRAIL_SPAN) + 0.02;
+        ctx.beginPath();
+        ctx.moveTo(a0.x, a0.y); ctx.lineTo(a1.x, a1.y);
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+    }
+    // head trail (left coords are stored mirrored in headBuf; rebuild left view)
+    var headLeft = [];
+    for (var hi = 0; hi < headBuf.length; hi++) headLeft.push({ x: W - headBuf[hi].x, y: headBuf[hi].y, age: headBuf[hi].age });
+    trailDraw(headLeft, false);
+    trailDraw(handBuf, false);
+
+    var mapL = function (jp) {
+      return { x: g.cx + (poseNow.root.x + jp.x) * S, y: g.cy + (poseNow.root.y + jp.y) * S };
+    };
+    drawSkeleton(poseNow, mapL, COL.dancer, 1, 2.5, false);
+
+    // ---- divider ----
+    ctx.strokeStyle = COL.divider; ctx.globalAlpha = 0.9; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(W / 2, 0); ctx.lineTo(W / 2, g.stageH); ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    // ---- right half: the decomposition ----
+    var ri = ruleInfo(t);
+    if (ri.mix < 1 && ri.prevIdx !== ri.idx) drawRule(ri.prevIdx, t, g, headBuf, poseNow, inten, 1 - ri.mix);
+    drawRule(ri.idx, t, g, headBuf, poseNow, inten, ri.mix < 1 ? ri.mix : 1);
+
+    // ---- rule strip ----
+    ctx.strokeStyle = COL.divider; ctx.globalAlpha = 0.55; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(0, g.stageH); ctx.lineTo(W, g.stageH); ctx.stroke();
+    ctx.globalAlpha = 1;
+    var centers = glyphCenters(g);
+    var gz = Math.min(W, H) * (PHONE ? 0.052 : 0.042);
+    for (var gi = 0; gi < 4; gi++) {
+      var active = (gi === ri.idx);
+      drawGlyph(gi, centers[gi].x, centers[gi].y, gz, RULE_COL[gi], active ? 1 : 0.32);
+      if (active) {
+        ctx.fillStyle = RULE_COL[gi]; ctx.globalAlpha = 0.9;
+        ctx.fillRect(centers[gi].x - gz * 0.55, H - 5, gz * 1.1, 2.5);
+        ctx.globalAlpha = 1;
+      }
+    }
+  }
+
+  // ---------- audio (lazy, guarded; first gesture only) ----------
+  var AC = null, master = null, delaySend = null, audioOn = false;
+  var nextNoteIdx = -1;
+  function initAudio() {
+    if (audioOn) return;
+    try {
+      var Ctor = (typeof window !== 'undefined') && (window.AudioContext || window.webkitAudioContext);
+      if (!Ctor) return;
+      AC = new Ctor();
+      master = AC.createGain(); master.gain.value = 0.9; master.connect(AC.destination);
+      var delay = AC.createDelay(1); delay.delayTime.value = 0.27;
+      var fb = AC.createGain(); fb.gain.value = 0.35;
+      var wet = AC.createGain(); wet.gain.value = 0.3;
+      delaySend = AC.createGain(); delaySend.gain.value = 1;
+      delaySend.connect(delay); delay.connect(fb); fb.connect(delay);
+      delay.connect(wet); wet.connect(master);
+      audioOn = true;
+    } catch (e) { AC = null; audioOn = false; }
+  }
+  function tone(freq, at, dur, type, vol, dest) {
+    if (!audioOn || !AC) return;
+    try {
+      var o = AC.createOscillator(), gn = AC.createGain();
+      o.type = type; o.frequency.value = freq;
+      gn.gain.setValueAtTime(0, at);
+      gn.gain.linearRampToValueAtTime(vol, at + 0.012);
+      gn.gain.exponentialRampToValueAtTime(0.0008, at + dur);
+      o.connect(gn); gn.connect(dest || master);
+      o.start(at); o.stop(at + dur + 0.05);
+    } catch (e) { /* audio is garnish */ }
+  }
+  function playNote(freq, ruleIdx, step) {
+    if (!audioOn || !AC) return;
+    var at = AC.currentTime + 0.03;
+    if (ruleIdx === 0) {           // FRAGMENT: granular shards of the note
+      for (var k = 0; k < 4; k++) {
+        tone(freq * (1 + (hash01(step * 7 + k) - 0.5) * 0.03), at + k * 0.045, 0.06, 'square', 0.045);
+      }
+    } else if (ruleIdx === 1) {    // MIRROR: note through the echo
+      tone(freq, at, 0.4, 'triangle', 0.085);
+      tone(freq, at, 0.4, 'triangle', 0.05, delaySend);
+    } else if (ruleIdx === 2) {    // QUANTIZE: stepped, squared, pitch-snapped
+      tone(Math.round(freq / 40) * 40, at, 0.13, 'square', 0.06);
+    } else {                       // SPIRAL: rising Shepard-ish steps
+      tone(freq * Math.pow(2, (step % 16) / 24), at, 0.42, 'sine', 0.08);
+    }
+  }
+  function audioTick(t) {
+    if (!audioOn) return;
+    var idx = Math.floor(t / (PHRASE / 16));
+    if (nextNoteIdx < 0) { nextNoteIdx = idx; return; }
+    while (nextNoteIdx < idx) {
+      nextNoteIdx++;
+      if (nextNoteIdx % 2 === 0 || hash01(nextNoteIdx) > 0.45) {
+        playNote(melody[nextNoteIdx % 16], ruleInfo(t).idx, nextNoteIdx);
+      }
+    }
+  }
+
+  // ---------- interaction ----------
+  function evtPos(e) {
+    var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    var cx = (e.clientX !== undefined) ? e.clientX : (e.touches && e.touches[0] ? e.touches[0].clientX : 0);
+    var cy = (e.clientY !== undefined) ? e.clientY : (e.touches && e.touches[0] ? e.touches[0].clientY : 0);
+    return { x: cx - r.left, y: cy - r.top };
+  }
+  function glyphAt(p) {
+    var g = stageGeom();
+    if (p.y < H - g.stripH - 6) return -1;
+    var centers = glyphCenters(g);
+    for (var i = 0; i < 4; i++) {
+      if (Math.abs(p.x - centers[i].x) < W * 0.055) return i;
+    }
+    return -1;
+  }
+  var downInfo = null;
+  function onDown(e) {
+    initAudio();
+    if (AC && AC.resume) { try { AC.resume(); } catch (err) {} }
+    var t = state.T;
+    var p = evtPos(e);
+    var gi = glyphAt(p);
+    if (gi >= 0) {
+      var cur = ruleInfo(t);
+      if (cur.idx !== gi || t >= (ruleEvents.length ? ruleEvents[ruleEvents.length - 1].t : -99) + HOLD_AFTER_TAP) {
+        ruleEvents.push({ t: t, idx: gi, prevIdx: cur.idx });
+      } else {
+        ruleEvents.push({ t: t, idx: gi, prevIdx: cur.prevIdx });
+      }
+      lastTapT = t; lastTapWasGlyph = true;
+      downInfo = { glyph: true };
+      return;
+    }
+    if (t - lastTapT < 0.32 && !lastTapWasGlyph) {
+      // double-tap: a new phrase
+      seed = seed + 7919;
+      P = buildPhrase(seed);
+      ruleEvents = [];
+      lastDrag = null;
+      lastTapT = -10;
+      downInfo = { glyph: true };
+      return;
+    }
+    lastTapT = t; lastTapWasGlyph = false;
+    dragState = { startX: p.x, startInten: intensityAt(t), value: intensityAt(t) };
+    downInfo = { glyph: false };
+  }
+  function onMove(e) {
+    if (!dragState) return;
+    var p = evtPos(e);
+    dragState.value = Math.min(1, Math.max(0, dragState.startInten + (p.x - dragState.startX) / (W * 0.4)));
+  }
+  function onUp() {
+    if (dragState) {
+      lastDrag = { endT: state.T, value: dragState.value };
+      dragState = null;
+    }
+    downInfo = null;
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+    canvas.addEventListener('touchstart', function () { initAudio(); }, { passive: true });
+  }
+
+  // ---------- main ----------
+  var state = { T: T0 };
+  resize();
+  draw(state.T);
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { draw(state.T); });
+  }
+  window.addEventListener('resize', function () { draw(state.T); });
+
+  var hasPerf = (typeof performance !== 'undefined') && performance && (typeof performance.now === 'function');
+  var startStamp = hasPerf ? performance.now() : 0;
+  if (hasPerf && typeof requestAnimationFrame === 'function') {
+    var loop = function () {
+      state.T = T0 + (performance.now() - startStamp) / 1000;
+      draw(state.T);
+      audioTick(state.T);
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>

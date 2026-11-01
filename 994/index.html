@@ -1,0 +1,666 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>The Invisible Blade</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #07080C; overflow: hidden; height: 100%; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* No.994 "The Invisible Blade" -- a fencing tracking system draws what
+   the eye cannot follow. The fencer-dot runs seeded lunge phrases; the
+   blade tip is too fast to see, so the machine synthesizes its path --
+   honestly, a beat late. The drawn trail follows the DETECTED tip (the
+   true tip 140 ms ago, plus sensor noise, smoothed), and every property
+   of the trail encodes the tip's true physics at that moment:
+   brightness = speed, width = acceleration, color = turning (cyan
+   straight, magenta turning). At each lunge's end the path freezes into
+   a gray engraving; the arena keeps the last twelve as a score.
+   Everything is a closed-form function of piece time plus recorded
+   visitor events; frame one is the synchronous draw at the fixed offset
+   T0 and never touches the wall clock. */
+
+// ---------- seeded rng / hash ----------
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function hash2(a, b) { // deterministic per-index hash -> [0,1)
+  var h = Math.imul((a ^ 0x9E3779B9) | 0, 2654435761) ^ Math.imul(b + 1, 40503);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+
+// ---------- palette ----------
+var ARENA = "#07080C", FENCER = "#F5F2EA";
+var CYAN = [79, 214, 255], MAGENTA = [255, 79, 216];
+var GRAY = "#8A8D84", AMBER = "#FFD93B";
+
+// ---------- constants ----------
+var BASE_SEED = 994155;
+var T0 = 14.78;            // frame one: mid-remise, seven engravings scored, reticle on the blade
+var LAG = 0.14;            // detection latency (s): the honest lag
+var TRAIL_SPAN = 1.6;      // live trail window (s)
+var TRAIL_N = 64;          // live trail samples
+var MAX_RECORDS = 12;
+
+var canvas = document.getElementById("c");
+var ctx = canvas.getContext("2d");
+var W = 0, H = 0, PHONE = false;
+
+// ---------- visitor events / epoch ----------
+var seedBase = BASE_SEED;
+var epoch = 0;             // piece time where the current seed's timeline starts
+var events = [];           // {kind:'lunge'|'replay', ...} recorded visitor moves
+
+// ---------- sizing: Visual Viewport API ----------
+function fit() {
+  var vv = window.visualViewport;
+  var w = vv && vv.width ? vv.width : window.innerWidth;
+  var h = vv && vv.height ? vv.height : window.innerHeight;
+  W = Math.max(50, Math.round(w)); H = Math.max(50, Math.round(h));
+  if (canvas.width !== W) canvas.width = W;
+  if (canvas.height !== H) canvas.height = H;
+  var sw = window.screen ? window.screen.width : W;
+  var sh = window.screen ? window.screen.height : H;
+  PHONE = Math.min(sw, sh) < 700 || H > W * 1.15;
+}
+if (window.visualViewport && window.visualViewport.addEventListener) {
+  window.visualViewport.addEventListener("resize", fit);
+}
+window.addEventListener("resize", fit);
+
+// ---------- helpers ----------
+function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
+function lerp(a, b, u) { return a + (b - a) * u; }
+function easeInOut(u) { return u < 0.5 ? 4 * u * u * u : 1 - Math.pow(-2 * u + 2, 3) / 2; }
+function easeOutCubic(u) { return 1 - Math.pow(1 - u, 3); }
+
+// ---------- seeded phrase timeline ----------
+// A phrase: advance, lunge, hold, [remise, hold], retreat. Positions are
+// stage units (1 unit = min(W,H) px), origin at the piste center.
+var PHRASES = [];
+function genPhrase() {
+  var k = PHRASES.length;
+  var h = function (n) { return hash2(seedBase, k * 131 + n); };
+  var prev = k > 0 ? PHRASES[k - 1] : null;
+  var dir = prev ? prev.dir : 1;
+  var x0 = prev ? prev.x1 : -0.20;
+  var y0 = prev ? prev.y1 : 0.0;
+
+  var adv = 0.05 + 0.05 * h(5);
+  var A = 0.55 + 0.35 * h(6);
+  var dist = 0.30 + 0.07 * h(7);
+  var L = 0.35;
+  var Hd = 0.42 + 0.28 * h(8);
+  var remise = h(9) < 0.35;
+  var RM = 0.28, H2 = 0.30;
+  var dist2 = 0.09 + 0.03 * h(10);
+  var R = 0.55 + 0.25 * h(11);
+  var arc = (h(12) - 0.3) * 0.07;
+  var ret = dist * (0.5 + 0.15 * h(13)) + adv * 0.8;
+
+  // Face so the WHOLE phrase (advance + lunge + remise) stays on the
+  // piste: if the full reach would cross a bound, turn around.
+  var reach = adv + dist + (remise ? dist2 : 0);
+  if (x0 + dir * reach > 0.40) dir = -1;
+  else if (x0 + dir * reach < -0.40) dir = 1;
+  else if (h(3) < 0.22 && x0 - dir * reach > -0.40 && x0 - dir * reach < 0.40) dir = -dir;
+
+  var xA = x0 + dir * adv;
+  var xL = clamp(xA + dir * dist, -0.42, 0.42);
+  var xR = remise ? clamp(xL + dir * dist2, -0.42, 0.42) : xL;
+  var x1 = clamp(xR - dir * ret, -0.34, 0.34);
+  var y1 = clamp(y0 + (h(14) - 0.5) * 0.045, -0.055, 0.055);
+
+  var t0 = prev ? prev.t1 : 0;
+  var segs = [], ends = [], u = 0;
+  function seg(kind, dur) { segs.push({ kind: kind, dur: dur, at: u }); u += dur; }
+  seg("advance", A);
+  var lsLunge = t0 + u; seg("lunge", L);
+  ends.push({ ls: lsLunge, le: t0 + u, kind: "lunge" });
+  seg("hold", Hd);
+  if (remise) {
+    var lsRem = t0 + u; seg("remise", RM);
+    ends.push({ ls: lsRem, le: t0 + u, kind: "remise" });
+    seg("hold", H2);
+  }
+  seg("retreat", R);
+
+  PHRASES.push({
+    k: k, t0: t0, t1: t0 + u, dir: dir,
+    x0: x0, y0: y0, xA: xA, xL: xL, xR: xR, x1: x1, y1: y1,
+    adv: adv, dist: dist, dist2: dist2, ret: ret, arc: arc,
+    segs: segs, ends: ends
+  });
+}
+function ensurePhrases(lt) {
+  var guard = 0;
+  while ((PHRASES.length === 0 || PHRASES[PHRASES.length - 1].t1 < lt) && guard++ < 10000) genPhrase();
+}
+function phraseAt(lt) {
+  ensurePhrases(lt);
+  var lo = 0, hi = PHRASES.length - 1, ans = 0;
+  while (lo <= hi) {
+    var mid = (lo + hi) >> 1;
+    if (PHRASES[mid].t0 <= lt) { ans = mid; lo = mid + 1; } else hi = mid - 1;
+  }
+  return PHRASES[ans];
+}
+
+// State inside one phrase at local time u (seconds since phrase start).
+// Returns {x, y, bx, by}: fencer position and blade vector (stage units).
+function phraseState(ph, u) {
+  var x = ph.x0, y = ph.y0, len = 0.115, th = 0, i, sg, su;
+  for (i = 0; i < ph.segs.length; i++) {
+    sg = ph.segs[i];
+    if (u < sg.at + sg.dur || i === ph.segs.length - 1) {
+      su = clamp((u - sg.at) / sg.dur, 0, 1);
+      if (sg.kind === "advance") {
+        x = lerp(ph.x0, ph.xA, easeInOut(su));
+        y = ph.y0 + Math.sin(su * sg.dur * 22) * 0.0012;
+        len = 0.115; th = 0.07 * Math.sin(su * sg.dur * 8 + ph.k * 1.7);
+      } else if (sg.kind === "lunge") {
+        x = lerp(ph.xA, ph.xL, easeOutCubic(su));
+        y = ph.y0 + ph.arc * Math.sin(Math.PI * su);
+        len = 0.115 + 0.095 * easeOutCubic(Math.min(1, su * 1.7));
+        th = -0.13 * Math.sin(Math.PI * su);
+      } else if (sg.kind === "hold") {
+        x = (i > 1 && ph.segs[i - 1].kind === "remise") ? ph.xR : ph.xL;
+        y = ph.y0;
+        x += Math.sin((ph.t0 + u) * 31) * 0.0008;
+        len = 0.205; th = -0.02;
+      } else if (sg.kind === "remise") {
+        x = lerp(ph.xL, ph.xR, easeOutCubic(su));
+        y = ph.y0 + ph.arc * 0.5 * Math.sin(Math.PI * su);
+        len = 0.21; th = -0.06 * Math.sin(Math.PI * su);
+      } else { // retreat
+        x = lerp(ph.xR, ph.x1, easeInOut(su));
+        y = lerp(ph.y0, ph.y1, easeInOut(su));
+        len = lerp(0.205, 0.115, su);
+        th = 0.04 * Math.sin(su * 5 + ph.k);
+      }
+      break;
+    }
+  }
+  return { x: x, y: y, bx: ph.dir * len * Math.cos(th), by: len * Math.sin(th) };
+}
+
+function seededState(lt) {
+  if (lt < 0) lt = 0;
+  var ph = phraseAt(lt);
+  return phraseState(ph, lt - ph.t0);
+}
+
+// ---------- visitor move overrides ----------
+// A visitor lunge: the dot darts to the tap, holds, then blends back to
+// the seeded phrase. A replay: the tip replays a dragged path exactly
+// (the dot anchors at the path start). Both are stored data; stateAt
+// stays a pure function of (t, events).
+function stateAt(t) {
+  var s = seededState(t - epoch);
+  var ev = null, i;
+  for (i = 0; i < events.length; i++) {
+    if (t >= events[i].t0 && t <= events[i].tEnd) ev = events[i]; // latest wins
+  }
+  if (!ev) return s;
+  var u = t - ev.t0, pos, bv;
+  if (ev.kind === "lunge") {
+    var bl = { x: ev.tap.x - ev.dotTo.x, y: ev.tap.y - ev.dotTo.y };
+    var bln = Math.sqrt(bl.x * bl.x + bl.y * bl.y) || 1;
+    bl = { x: bl.x / bln, y: bl.y / bln };
+    if (u < ev.dur) {
+      var p = easeOutCubic(u / ev.dur);
+      pos = { x: lerp(ev.from.x, ev.dotTo.x, p), y: lerp(ev.from.y, ev.dotTo.y, p) };
+      var ln = 0.115 + 0.095 * easeOutCubic(Math.min(1, (u / ev.dur) * 1.7));
+      bv = { x: bl.x * ln, y: bl.y * ln };
+    } else if (u < ev.dur + ev.hold) {
+      pos = { x: ev.dotTo.x, y: ev.dotTo.y };
+      bv = { x: bl.x * 0.205, y: bl.y * 0.205 };
+    } else {
+      var v = easeInOut(clamp((u - ev.dur - ev.hold) / ev.ret, 0, 1));
+      pos = { x: lerp(ev.dotTo.x, s.x, v), y: lerp(ev.dotTo.y, s.y, v) };
+      bv = { x: lerp(bl.x * 0.205, s.bx, v), y: lerp(bl.y * 0.205, s.by, v) };
+    }
+    return { x: pos.x, y: pos.y, bx: bv.x, by: bv.y };
+  }
+  // replay
+  var anchor = ev.path[0];
+  if (t < ev.tStart) { // glide from current spot to the path start
+    var g = easeInOut(clamp((t - ev.t0) / (ev.tStart - ev.t0), 0, 1));
+    pos = { x: lerp(ev.from.x, anchor.x, g), y: lerp(ev.from.y, anchor.y, g) };
+    bv = { x: lerp(s.bx, ev.firstB.x, g), y: lerp(s.by, ev.firstB.y, g) };
+    return { x: pos.x, y: pos.y, bx: bv.x, by: bv.y };
+  }
+  if (u <= ev.tStart - ev.t0 + ev.dur) {
+    var tip = pathAt(ev, t - ev.tStart);
+    return { x: anchor.x, y: anchor.y, bx: tip.x - anchor.x, by: tip.y - anchor.y };
+  }
+  var w = easeInOut(clamp((t - (ev.tStart + ev.dur)) / ev.ret, 0, 1));
+  var last = ev.path[ev.path.length - 1];
+  pos = { x: lerp(anchor.x, s.x, w), y: lerp(anchor.y, s.y, w) };
+  bv = { x: lerp(last.x - anchor.x, s.bx, w), y: lerp(last.y - anchor.y, s.by, w) };
+  return { x: pos.x, y: pos.y, bx: bv.x, by: bv.y };
+}
+function pathAt(ev, o) {
+  var p = ev.path, i;
+  if (o <= 0) return p[0];
+  if (o >= ev.dur) return p[p.length - 1];
+  for (i = 1; i < p.length; i++) {
+    if (p[i].o >= o) {
+      var a = p[i - 1], b = p[i], u = (o - a.o) / Math.max(0.0001, b.o - a.o);
+      return { x: lerp(a.x, b.x, u), y: lerp(a.y, b.y, u) };
+    }
+  }
+  return p[p.length - 1];
+}
+
+// ---------- tip, physics, detection ----------
+function tipAt(t) {
+  var s = stateAt(t);
+  return { x: s.x + s.bx, y: s.y + s.by };
+}
+function physicsAt(t) { // true tip physics at time t (stage units, seconds)
+  var h = 0.01;
+  var p0 = tipAt(t), pA = tipAt(t - h), pB = tipAt(t + h);
+  var vx = (pB.x - pA.x) / (2 * h), vy = (pB.y - pA.y) / (2 * h);
+  var speed = Math.sqrt(vx * vx + vy * vy);
+  var ax = (pB.x - 2 * p0.x + pA.x) / (h * h), ay = (pB.y - 2 * p0.y + pA.y) / (h * h);
+  var accel = Math.sqrt(ax * ax + ay * ay);
+  var turn = 0;
+  var vAx = p0.x - pA.x, vAy = p0.y - pA.y, vBx = pB.x - p0.x, vBy = pB.y - p0.y;
+  var mA = Math.sqrt(vAx * vAx + vAy * vAy), mB = Math.sqrt(vBx * vBx + vBy * vBy);
+  if (mA > 0.0004 && mB > 0.0004) {
+    var cross = (vAx * vBy - vAy * vBx) / (mA * mB);
+    var dot = (vAx * vBx + vAy * vBy) / (mA * mB);
+    turn = Math.abs(Math.atan2(cross, dot)) / h; // rad per second
+  }
+  if (speed < 0.05) turn = 0;
+  return { speed: speed, accel: accel, turn: turn };
+}
+function detRaw(t) { // the system's noisy, late view of the tip
+  var tip = tipAt(t - LAG);
+  var idx = Math.floor((t - LAG) * 240);
+  var nx = (hash2(idx, seedBase * 7 + 1) - 0.5) * 0.006;
+  var ny = (hash2(idx, seedBase * 7 + 2) - 0.5) * 0.006;
+  return { x: tip.x + nx, y: tip.y + ny };
+}
+function detSm(t) { // smoothed detection: 4-tap average over 50 ms
+  var a = detRaw(t), b = detRaw(t - 0.016), c = detRaw(t - 0.033), d = detRaw(t - 0.05);
+  return { x: (a.x + b.x + c.x + d.x) / 4, y: (a.y + b.y + c.y + d.y) / 4 };
+}
+
+// ---------- records (frozen engravings) ----------
+// Each record samples the detected path over its lunge's detected window.
+function collectRecords(t) {
+  var recs = [], i, j, ph;
+  ensurePhrases(Math.max(0, t - epoch));
+  for (i = 0; i < PHRASES.length; i++) {
+    ph = PHRASES[i];
+    for (j = 0; j < ph.ends.length; j++) {
+      var e = ph.ends[j], te = epoch + e.le;
+      if (te <= t) recs.push({ te: te, ws: epoch + e.ls + LAG, we: te + LAG });
+    }
+  }
+  for (i = 0; i < events.length; i++) {
+    var ev = events[i];
+    if (ev.recTe != null && ev.recTe <= t) {
+      recs.push({ te: ev.recTe, ws: ev.recWs, we: ev.recWe });
+    }
+  }
+  recs.sort(function (a, b) { return b.te - a.te; });
+  return recs.slice(0, MAX_RECORDS);
+}
+function recordPoints(rec) {
+  var pts = [], tt, n = Math.max(4, Math.round((rec.we - rec.ws) / 0.02));
+  for (var i = 0; i <= n; i++) {
+    tt = rec.ws + (rec.we - rec.ws) * (i / n);
+    pts.push(detSm(tt));
+  }
+  return pts;
+}
+
+// ---------- audio (lazy, first gesture, guarded) ----------
+var AC = null, noiseBuf = null;
+function ensureAudio() {
+  if (AC) { if (AC.resume) AC.resume(); return; }
+  var Ctor = null;
+  if (typeof window !== "undefined") Ctor = window.AudioContext || window.webkitAudioContext;
+  if (typeof Ctor !== "function") return;
+  try {
+    AC = new Ctor();
+    var master = AC.createGain(); master.gain.value = 0.9; master.connect(AC.destination);
+    AC._master = master;
+    // carrier hum: the machine working, under the latency bar
+    var hum = AC.createOscillator(); hum.type = "sine"; hum.frequency.value = 110;
+    var hg = AC.createGain(); hg.gain.value = 0.005;
+    hum.connect(hg); hg.connect(master); hum.start();
+    // shared noise buffer for whooshes
+    var len = Math.floor(AC.sampleRate * 0.5);
+    noiseBuf = AC.createBuffer(1, len, AC.sampleRate);
+    var d = noiseBuf.getChannelData(0);
+    var r = mulberry32(4242);
+    for (var i = 0; i < len; i++) d[i] = r() * 2 - 1;
+  } catch (e) { AC = null; }
+}
+function whoosh(strength) {
+  if (!AC || !noiseBuf) return;
+  var tA = AC.currentTime;
+  var src = AC.createBufferSource(); src.buffer = noiseBuf;
+  var bp = AC.createBiquadFilter(); bp.type = "bandpass"; bp.Q.value = 1.1;
+  bp.frequency.setValueAtTime(380, tA);
+  bp.frequency.exponentialRampToValueAtTime(380 + 1000 * strength, tA + 0.16);
+  bp.frequency.exponentialRampToValueAtTime(300, tA + 0.42);
+  var g = AC.createGain();
+  g.gain.setValueAtTime(0.0001, tA);
+  g.gain.exponentialRampToValueAtTime(0.10 + 0.06 * strength, tA + 0.07);
+  g.gain.exponentialRampToValueAtTime(0.0001, tA + 0.45);
+  src.connect(bp); bp.connect(g); g.connect(AC._master);
+  src.start(tA); src.stop(tA + 0.5);
+}
+function tickSnd() {
+  if (!AC) return;
+  var tA = AC.currentTime, o = AC.createOscillator(), g = AC.createGain();
+  o.type = "square"; o.frequency.value = 2400;
+  g.gain.setValueAtTime(0.028, tA);
+  g.gain.exponentialRampToValueAtTime(0.0001, tA + 0.03);
+  o.connect(g); g.connect(AC._master); o.start(tA); o.stop(tA + 0.04);
+}
+function chime() {
+  if (!AC) return;
+  var tA = AC.currentTime;
+  [1320, 1980].forEach(function (f, i) {
+    var o = AC.createOscillator(), g = AC.createGain();
+    o.type = "sine"; o.frequency.value = f;
+    g.gain.setValueAtTime(i === 0 ? 0.045 : 0.02, tA);
+    g.gain.exponentialRampToValueAtTime(0.0001, tA + 0.55);
+    o.connect(g); g.connect(AC._master); o.start(tA); o.stop(tA + 0.6);
+  });
+}
+
+// ---------- interaction ----------
+var downPos = null, dragSamples = null, dragMoved = false;
+var lastTapT = -10, lastTapPos = null, pendingTapAt = -1, pendingTapPos = null;
+function layout() {
+  var S = Math.min(W, H);
+  // Tips range to about +-0.66 stage units; compress x on narrow frames
+  // so a full lunge plus blade always stays on the piste.
+  var UX = Math.min(S, (W / 2 - 10) / 0.66);
+  return { S: S, UX: UX, cx: W / 2, cy: H * (PHONE ? 0.40 : 0.46) };
+}
+function evtPosStage(e) {
+  var r = null;
+  if (canvas.getBoundingClientRect) r = canvas.getBoundingClientRect();
+  var x = e.clientX != null ? e.clientX : 0, y = e.clientY != null ? e.clientY : 0;
+  if (r) { x -= r.left; y -= r.top; }
+  var L = layout();
+  return { x: (x - L.cx) / L.UX, y: (y - L.cy) / L.S, px: x, py: y };
+}
+function onDown(e) {
+  ensureAudio();
+  var p = evtPosStage(e);
+  downPos = p; dragMoved = false;
+  dragSamples = [{ t: pieceT, x: p.x, y: p.y }];
+  if (canvas.setPointerCapture && e.pointerId != null) {
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+  }
+}
+function onMove(e) {
+  if (!downPos || !dragSamples) return;
+  var p = evtPosStage(e);
+  var dx = p.px - downPos.px, dy = p.py - downPos.py;
+  if (dx * dx + dy * dy > 36) dragMoved = true;
+  if (dragMoved) {
+    var last = dragSamples[dragSamples.length - 1];
+    var ddx = p.x - last.x, ddy = p.y - last.y;
+    if (ddx * ddx + ddy * ddy > 0.000016 || pieceT - last.t > 0.03) {
+      dragSamples.push({ t: pieceT, x: p.x, y: p.y });
+    }
+  }
+}
+function onUp(e) {
+  if (!downPos) return;
+  if (dragMoved && dragSamples && dragSamples.length >= 2) {
+    var first = dragSamples[0], lastS = dragSamples[dragSamples.length - 1];
+    var span = lastS.t - first.t;
+    if (span >= 0.12) {
+      // replay the dragged path at its own speeds, starting shortly
+      var scale = span < 0.3 ? 0.3 / span : 1;
+      var dur = Math.min(5, span * scale);
+      var path = [], i, o;
+      for (i = 0; i < dragSamples.length; i++) {
+        o = (dragSamples[i].t - first.t) * scale;
+        if (o <= dur) path.push({ o: o, x: dragSamples[i].x, y: dragSamples[i].y });
+      }
+      if (path.length >= 2) {
+        var st = stateAt(pieceT);
+        var f = path[0], s2 = path[Math.min(1, path.length - 1)];
+        var fx = s2.x - f.x, fy = s2.y - f.y, fm = Math.sqrt(fx * fx + fy * fy);
+        var firstB = fm > 0.001 ? { x: fx / fm * 0.16, y: fy / fm * 0.16 } : { x: st.bx, y: st.by };
+        var tStart = pieceT + 0.25;
+        events.push({
+          kind: "replay", t0: pieceT, tStart: tStart, dur: dur, ret: 0.6,
+          tEnd: tStart + dur + 0.6, path: path, firstB: firstB,
+          from: { x: st.x, y: st.y },
+          recTe: tStart + dur, recWs: tStart + LAG, recWe: tStart + dur + LAG
+        });
+      }
+    }
+  } else {
+    var p = evtPosStage(e);
+    if (pieceT - lastTapT < 0.35) {
+      // double-tap: clear the score, reseed the phrases
+      seedBase += 1; PHRASES = []; epoch = pieceT; events = [];
+      pendingTapAt = -1; lastTapT = -10;
+      prevLungeStarts = -1; prevRecordCount = -1;
+    } else {
+      lastTapT = pieceT; pendingTapAt = pieceT + 0.35; pendingTapPos = p;
+    }
+  }
+  downPos = null; dragSamples = null; dragMoved = false;
+}
+function executeTap() {
+  var p = pendingTapPos;
+  pendingTapAt = -1;
+  if (!p) return;
+  var tx = clamp(p.x, -0.44, 0.44), ty = clamp(p.y, -0.30, 0.30);
+  var st = stateAt(pieceT);
+  var dx = tx - st.x, dy = ty - st.y;
+  var dist = Math.sqrt(dx * dx + dy * dy);
+  if (dist < 0.05) return;
+  var ux = dx / dist, uy = dy / dist;
+  var dotTo = {
+    x: clamp(tx - ux * 0.16, -0.42, 0.42),
+    y: clamp(ty - uy * 0.16, -0.28, 0.28)
+  };
+  var ddx = dotTo.x - st.x, ddy = dotTo.y - st.y;
+  var dd = Math.sqrt(ddx * ddx + ddy * ddy);
+  var dur = clamp(dd / 2.2, 0.25, 0.55);
+  events.push({
+    kind: "lunge", t0: pieceT, dur: dur, hold: 0.45, ret: 0.6,
+    tEnd: pieceT + dur + 0.45 + 0.6,
+    from: { x: st.x, y: st.y }, dotTo: dotTo, tap: { x: tx, y: ty },
+    recTe: pieceT + dur, recWs: pieceT + LAG, recWe: pieceT + dur + LAG
+  });
+}
+if (canvas.addEventListener) {
+  canvas.addEventListener("pointerdown", onDown);
+  canvas.addEventListener("pointermove", onMove);
+  canvas.addEventListener("pointerup", onUp);
+  canvas.addEventListener("pointercancel", onUp);
+}
+
+// ---------- draw ----------
+function draw(t) {
+  canvas.style.width = W + "px";
+  canvas.style.height = H + "px";
+  ctx.fillStyle = ARENA;
+  ctx.fillRect(0, 0, W, H);
+  var LY = layout();
+  var S = LY.S, cx = LY.cx, cy = LY.cy;
+  var wScale = clamp(S / 800, 0.7, 1.2);
+  function X(sx) { return cx + sx * LY.UX; }
+  function Y(sy) { return cy + sy * S; }
+
+  // --- engravings: the score of frozen trajectories, settling downward
+  var stackY0 = cy + S * 0.34;
+  var rowGap = Math.max(8, (H * 0.985 - stackY0) / (MAX_RECORDS - 1));
+  var recs = collectRecords(t);
+  var ri, pts, j, dyT, dy, age;
+  for (ri = recs.length - 1; ri >= 0; ri--) {
+    pts = recordPoints(recs[ri]);
+    var cenY = 0;
+    for (j = 0; j < pts.length; j++) cenY += pts[j].y;
+    cenY /= pts.length;
+    dyT = (stackY0 + ri * rowGap) - (cy + cenY * S); // px offset to its row
+    age = t - recs[ri].te;
+    dy = dyT * easeOutCubic(clamp(age / 2.2, 0, 1)); // settle over 2.2 s
+    var alpha = 0.5 * clamp(age / (LAG + 0.12), 0, 1);
+    if (ri === MAX_RECORDS - 1) alpha *= 0.7;
+    ctx.strokeStyle = GRAY;
+    ctx.globalAlpha = alpha;
+    ctx.lineWidth = 1.4 * wScale;
+    ctx.lineJoin = "round";
+    ctx.beginPath();
+    for (j = 0; j < pts.length; j++) {
+      var px = X(pts[j].x), py = Y(pts[j].y) + dy;
+      if (j === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+
+  // --- latency bar: raw detection vs smoothed, the machine working
+  var stripY = H * (PHONE ? 0.045 : 0.055);
+  var sx0 = W * 0.08, sx1 = W * 0.92;
+  function stripX(sx) { return sx0 + (clamp(sx, -0.66, 0.66) + 0.66) / 1.32 * (sx1 - sx0); }
+  ctx.strokeStyle = GRAY;
+  ctx.globalAlpha = 0.4;
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(sx0, stripY); ctx.lineTo(sx1, stripY); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(sx0, stripY - 3); ctx.lineTo(sx0, stripY + 3); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(sx1, stripY - 3); ctx.lineTo(sx1, stripY + 3); ctx.stroke();
+  ctx.globalAlpha = 1;
+  var raw = detRaw(t), sm = detSm(t);
+  ctx.fillStyle = "rgb(" + CYAN[0] + "," + CYAN[1] + "," + CYAN[2] + ")";
+  ctx.beginPath(); ctx.arc(stripX(sm.x), stripY, 3 * wScale, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = AMBER;
+  ctx.beginPath(); ctx.arc(stripX(raw.x), stripY, 3 * wScale, 0, Math.PI * 2); ctx.fill();
+
+  // --- live trail: the detected path, encoded with true physics
+  var N = TRAIL_N, dtS = TRAIL_SPAN / N;
+  var tp = [], i2, tk, dp, ph2;
+  for (i2 = 0; i2 <= N; i2++) {
+    tk = t - (N - i2) * dtS;
+    dp = detSm(tk);
+    ph2 = physicsAt(tk - LAG);
+    tp.push({
+      x: dp.x, y: dp.y,
+      a: 0.30 + 0.70 * clamp(ph2.speed / 1.05, 0, 1),
+      w: (1 + 4 * clamp(ph2.accel / 10, 0, 1)) * wScale,
+      turn: clamp(ph2.turn / 4, 0, 1),
+      ramp: 0.35 + 0.65 * Math.pow(i2 / N, 0.7)
+    });
+  }
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  for (i2 = 1; i2 <= N; i2++) {
+    var A = tp[i2 - 1], B = tp[i2];
+    var rC = Math.round(lerp(CYAN[0], MAGENTA[0], B.turn));
+    var gC = Math.round(lerp(CYAN[1], MAGENTA[1], B.turn));
+    var bC = Math.round(lerp(CYAN[2], MAGENTA[2], B.turn));
+    ctx.strokeStyle = "rgb(" + rC + "," + gC + "," + bC + ")";
+    ctx.globalAlpha = B.a * B.ramp;
+    ctx.lineWidth = Math.max(A.w, B.w);
+    ctx.beginPath();
+    ctx.moveTo(X(A.x), Y(A.y));
+    ctx.lineTo(X(B.x), Y(B.y));
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+
+  // --- fencer, blade, ghost tip, reticle
+  var st = stateAt(t);
+  var tip = { x: st.x + st.bx, y: st.y + st.by };
+  ctx.strokeStyle = FENCER;
+  ctx.globalAlpha = 0.26;
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(X(st.x), Y(st.y)); ctx.lineTo(X(tip.x), Y(tip.y)); ctx.stroke();
+  ctx.globalAlpha = 1;
+  // ghost of the true tip: where the blade actually is
+  ctx.fillStyle = FENCER;
+  ctx.globalAlpha = 0.3;
+  ctx.beginPath(); ctx.arc(X(tip.x), Y(tip.y), 3 * wScale, 0, Math.PI * 2); ctx.fill();
+  ctx.globalAlpha = 1;
+  // the fencer-dot
+  ctx.fillStyle = FENCER;
+  ctx.beginPath(); ctx.arc(X(st.x), Y(st.y), Math.max(2.4, S * 0.0039), 0, Math.PI * 2); ctx.fill();
+  // detection reticle: corner brackets on the DETECTED tip (note the lag)
+  var rx = X(sm.x), ry = Y(sm.y);
+  var rbX = 0.012 * LY.UX, rbY = 0.012 * S, rlX = 0.007 * LY.UX, rlY = 0.007 * S;
+  ctx.strokeStyle = AMBER;
+  ctx.globalAlpha = 0.9;
+  ctx.lineWidth = 1.5 * wScale;
+  ctx.beginPath();
+  ctx.moveTo(rx - rbX, ry - rbY + rlY); ctx.lineTo(rx - rbX, ry - rbY); ctx.lineTo(rx - rbX + rlX, ry - rbY);
+  ctx.moveTo(rx + rbX - rlX, ry - rbY); ctx.lineTo(rx + rbX, ry - rbY); ctx.lineTo(rx + rbX, ry - rbY + rlY);
+  ctx.moveTo(rx + rbX, ry + rbY - rlY); ctx.lineTo(rx + rbX, ry + rbY); ctx.lineTo(rx + rbX - rlX, ry + rbY);
+  ctx.moveTo(rx - rbX + rlX, ry + rbY); ctx.lineTo(rx - rbX, ry + rbY); ctx.lineTo(rx - rbX, ry + rbY - rlY);
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+}
+
+// ---------- main loop ----------
+var pieceT = T0, lastTs = -1;
+var prevLungeStarts = -1, prevRecordCount = -1, lastTickT = -10;
+function lungeStartCount(lt) {
+  ensurePhrases(lt);
+  var n = 0, i, j;
+  for (i = 0; i < PHRASES.length; i++) {
+    for (j = 0; j < PHRASES[i].ends.length; j++) {
+      if (PHRASES[i].ends[j].ls <= lt) n++;
+    }
+  }
+  return n;
+}
+function frame(ts) {
+  if (lastTs < 0) lastTs = ts;
+  var dt = (ts - lastTs) / 1000; lastTs = ts;
+  if (dt > 0.1) dt = 0.1;
+  if (dt < 0) dt = 0;
+  pieceT += dt;
+  if (pendingTapAt > 0 && pieceT >= pendingTapAt) executeTap();
+  if (AC) {
+    var lt = pieceT - epoch;
+    var ls = lungeStartCount(lt);
+    if (prevLungeStarts >= 0 && ls > prevLungeStarts) whoosh(0.85);
+    prevLungeStarts = ls;
+    var rc = collectRecords(pieceT).length;
+    if (prevRecordCount >= 0 && rc > prevRecordCount) chime();
+    if (rc !== prevRecordCount && prevRecordCount < 0) { /* first sighting */ }
+    prevRecordCount = rc;
+    var phN = physicsAt(pieceT - LAG);
+    if (phN.turn > 0.55 && phN.speed > 0.35 && pieceT - lastTickT > 0.09) {
+      tickSnd(); lastTickT = pieceT;
+    }
+  }
+  draw(pieceT);
+  if (typeof requestAnimationFrame === "function") requestAnimationFrame(frame);
+}
+
+fit();
+draw(T0);
+if (typeof requestAnimationFrame === "function") requestAnimationFrame(frame);
+</script>
+</body>
+</html>
