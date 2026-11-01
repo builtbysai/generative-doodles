@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Carnets de là-bas: The Notebook That Remembers</title>
+<style>
+html, body { margin: 0; padding: 0; background: #e8e0d0; overflow: hidden; }
+canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  var cv = document.getElementById('c');
+  var ctx = cv.getContext('2d');
+
+  var FIELD = '#e8e0d0';
+  var GOLD = [217, 164, 65];
+  var COLOURS = [
+    [74, 90, 122],   /* slate */
+    [107, 74, 58],   /* walnut */
+    [46, 111, 106],  /* teal */
+    [168, 103, 74],  /* brick */
+    [184, 188, 192]  /* grey */
+  ];
+
+  var CYCLE = 60;   /* one drift-gather-hold-release arc, seconds */
+  var LOOP = 240;   /* four cycles; mutation repeats every 4 cycles, so t=240 is t=0 exactly */
+  var SEED = 1511000;
+  var NFRAG = 30;
+  var NSLOT = 24;   /* first 24 fragments take assembly slots; last 6 always drift */
+
+  var W = 0, H = 0, CX = 0, CY = 0, U = 0;
+  var curT = 0;
+  var startTime = null;
+
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function lerp(a, b, t) { return a + (b - a) * t; }
+  function sstep(t) { t = clamp(t, 0, 1); return t * t * (3 - 2 * t); }
+  function a4(x) { return Math.round(x * 10000) / 10000; }
+  function rgba(rgb, a) {
+    return 'rgba(' + rgb[0] + ',' + rgb[1] + ',' + rgb[2] + ',' + a4(a) + ')';
+  }
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  /* ---- fragment base attributes (seeded once, size-independent fractions) ---- */
+  var FRAGS = [];
+  (function buildFrags() {
+    var rng = mulberry32(SEED);
+    var i, type;
+    for (i = 0; i < NFRAG; i++) {
+      type = i % 3; /* 0 torn paper-shape, 1 line motif, 2 faded patch, cycling */
+      FRAGS.push({
+        idx: i, type: type,
+        col: COLOURS[Math.floor(rng() * COLOURS.length)],
+        fx: 0.06 + rng() * 0.88, fy: 0.08 + rng() * 0.84,
+        ax: 0.012 + rng() * 0.028, ay: 0.012 + rng() * 0.028,
+        px: [60, 80, 120, 240][Math.floor(rng() * 4)],
+        py: [60, 80, 120, 240][Math.floor(rng() * 4)],
+        phx: rng() * Math.PI * 2, phy: rng() * Math.PI * 2,
+        size: 0.028 + rng() * 0.024,
+        rot: (rng() - 0.5) * 1.0,
+        wob: (rng() - 0.5) * 0.16,
+        wobP: rng() < 0.5 ? 120 : 240,
+        wobPh: rng() * Math.PI * 2,
+        jag: (function () { var j = [], k; for (k = 0; k < 6; k++) j.push(0.7 + rng() * 0.6); return j; })(),
+        pts: (function () { var p = [], k; for (k = 0; k < 4; k++) p.push((rng() - 0.5) * 0.6); return p; })(),
+        stray: i >= NSLOT
+      });
+    }
+  })();
+
+  /* ---- per-cycle mutation: slot permutation, page offset, jitter, tilt ---- */
+  function cycleMut(cyc) {
+    var rng = mulberry32(SEED + cyc * 7919 + 13);
+    var perm = [], i, j, tmp;
+    for (i = 0; i < NSLOT; i++) perm.push(i);
+    for (i = NSLOT - 1; i > 0; i--) {
+      j = Math.floor(rng() * (i + 1));
+      tmp = perm[i]; perm[i] = perm[j]; perm[j] = tmp;
+    }
+    var jx = [], jy = [], tilt = [];
+    for (i = 0; i < NSLOT; i++) {
+      jx.push((rng() - 0.5) * 0.03);
+      jy.push((rng() - 0.5) * 0.03);
+      tilt.push((rng() - 0.5) * 0.24);
+    }
+    return {
+      perm: perm, jx: jx, jy: jy, tilt: tilt,
+      ox: (rng() - 0.5) * 0.04, oy: (rng() - 0.5) * 0.04
+    };
+  }
+  var MUTS = [cycleMut(0), cycleMut(1), cycleMut(2), cycleMut(3)];
+
+  function pageRect(cyc) {
+    var m = MUTS[cyc];
+    return {
+      x: CX - 0.29 * W + m.ox * W, y: CY - 0.30 * H + m.oy * H,
+      w: 0.58 * W, h: 0.60 * H
+    };
+  }
+  function slotPos(f, t) {
+    var absCycle = Math.floor(t / CYCLE);
+    var cyc = ((absCycle % 4) + 4) % 4;
+    var m = MUTS[cyc];
+    var s = m.perm[f.idx]; /* slot index this fragment takes this cycle */
+    var col = s % 6, row = Math.floor(s / 6);
+    var r = pageRect(cyc);
+    return {
+      x: r.x + (col + 0.5) * r.w / 6 + m.jx[f.idx] * U,
+      y: r.y + (row + 0.5) * r.h / 4 + m.jy[f.idx] * U
+    };
+  }
+  function driftPos(f, t) {
+    return {
+      x: f.fx * W + f.ax * U * Math.sin(2 * Math.PI * t / f.px + f.phx),
+      y: f.fy * H + f.ay * U * Math.sin(2 * Math.PI * t / f.py + f.phy)
+    };
+  }
+  /* assembly envelope over cycle-local time: 0 drift, 1 assembled */
+  function envAt(lt) {
+    if (lt < 16) return 0;
+    if (lt < 28) return sstep((lt - 16) / 12);
+    if (lt < 38) return 1;
+    if (lt < 48) return 1 - sstep((lt - 38) / 10);
+    return 0;
+  }
+  function goldAlphaAt(t) {
+    var lt = t - Math.floor(t / CYCLE) * CYCLE;
+    var e = envAt(lt);
+    return 0.35 * clamp((e - 0.5) * 2, 0, 1);
+  }
+
+  /* ---- drag state: recorded events, closed-form position ---- */
+  var grabbed = -1, grabX = 0, grabY = 0, grabDX = 0, grabDY = 0;
+  var ptrX = 0, ptrY = 0, dragging = false;
+  var earlyJoin = {}; /* frag idx -> absolute cycle it joined early */
+  var heldOut = {};   /* frag idx -> absolute cycle it sits out */
+  function pointerPos(e) {
+    if (e.clientX !== undefined) return { x: e.clientX, y: e.clientY };
+    if (e.touches && e.touches[0]) return { x: e.touches[0].clientX, y: e.touches[0].clientY };
+    return { x: 0, y: 0 };
+  }
+  function hitFrag(x, y) {
+    var best = -1, bestD = 0.06 * U, i, p, d;
+    for (i = 0; i < NFRAG; i++) {
+      p = fragPos(FRAGS[i], curT);
+      d = Math.sqrt((p.x - x) * (p.x - x) + (p.y - y) * (p.y - y));
+      if (d < bestD) { bestD = d; best = i; }
+    }
+    return best;
+  }
+  function onDown(e) {
+    var p = pointerPos(e);
+    ptrX = p.x; ptrY = p.y;
+    grabbed = hitFrag(p.x, p.y);
+    if (grabbed >= 0) {
+      var fp = fragPos(FRAGS[grabbed], curT);
+      grabDX = fp.x - p.x; grabDY = fp.y - p.y;
+      grabX = p.x; grabY = p.y;
+      dragging = true;
+    }
+  }
+  function onMove(e) {
+    var p = pointerPos(e);
+    ptrX = p.x; ptrY = p.y;
+  }
+  function onUp(e) {
+    if (grabbed < 0) { dragging = false; return; }
+    var p = pointerPos(e);
+    ptrX = p.x; ptrY = p.y;
+    var dGrab = Math.sqrt((grabX - CX) * (grabX - CX) + (grabY - CY) * (grabY - CY));
+    var dRel = Math.sqrt((p.x - CX) * (p.x - CX) + (p.y - CY) * (p.y - CY));
+    var absCycle = Math.floor(curT / CYCLE);
+    if (dGrab - dRel > 0.03 * U) earlyJoin[grabbed] = absCycle;
+    else if (dRel - dGrab > 0.03 * U) heldOut[grabbed] = absCycle + 1;
+    grabbed = -1; dragging = false;
+  }
+  cv.addEventListener('pointerdown', onDown);
+  cv.addEventListener('pointermove', onMove);
+  cv.addEventListener('pointerup', onUp);
+  cv.addEventListener('pointercancel', onUp);
+
+  function fragPos(f, t) {
+    var absCycle = Math.floor(t / CYCLE);
+    var lt = t - absCycle * CYCLE;
+    var d = driftPos(f, t);
+    if (f.stray) return d;
+    if (heldOut[f.idx] === absCycle) return d;
+    var s = slotPos(f, t);
+    if (earlyJoin[f.idx] === absCycle && lt < 16) return s;
+    var e = envAt(lt);
+    return { x: lerp(d.x, s.x, e), y: lerp(d.y, s.y, e) };
+  }
+  function fragRot(f, t) {
+    var absCycle = Math.floor(t / CYCLE);
+    var lt = t - absCycle * CYCLE;
+    var cyc = ((absCycle % 4) + 4) % 4;
+    var drift = f.rot + f.wob * Math.sin(2 * Math.PI * t / f.wobP + f.wobPh);
+    if (f.stray || heldOut[f.idx] === absCycle) return drift;
+    var e = envAt(lt);
+    var tilt = MUTS[cyc].tilt[f.idx];
+    return lerp(drift, tilt, e);
+  }
+
+  function drawFrag(f, x, y, rot) {
+    var r = f.size * U;
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(rot);
+    if (f.type === 0) {
+      /* torn paper-shape: jagged hexagon */
+      ctx.beginPath();
+      var k, ang, rr;
+      for (k = 0; k < 6; k++) {
+        ang = k * Math.PI / 3;
+        rr = r * f.jag[k];
+        if (k === 0) ctx.moveTo(Math.cos(ang) * rr, Math.sin(ang) * rr);
+        else ctx.lineTo(Math.cos(ang) * rr, Math.sin(ang) * rr);
+      }
+      ctx.closePath();
+      ctx.fillStyle = rgba(f.col, 0.92);
+      ctx.fill();
+    } else if (f.type === 1) {
+      /* short line motif: polyline with a dot at its start */
+      ctx.beginPath();
+      ctx.moveTo(-r * 1.4, f.pts[0] * r);
+      ctx.lineTo(-r * 0.4, f.pts[1] * r);
+      ctx.lineTo(r * 0.5, f.pts[2] * r);
+      ctx.lineTo(r * 1.4, f.pts[3] * r);
+      ctx.strokeStyle = rgba(f.col, 0.95);
+      ctx.lineWidth = Math.max(1.5, 0.008 * U);
+      ctx.stroke();
+      ctx.fillStyle = rgba(f.col, 0.95);
+      ctx.fillRect(-r * 1.4 - 0.008 * U, f.pts[0] * r - 0.008 * U, 0.016 * U, 0.016 * U);
+    } else {
+      /* faded colour patch: flat-alpha ellipse */
+      ctx.beginPath();
+      ctx.ellipse(0, 0, r * 1.3, r * 0.8, 0, 0, Math.PI * 2);
+      ctx.fillStyle = rgba(f.col, 0.5);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function size() {
+    var vw, vh;
+    if (typeof window !== 'undefined' && window.visualViewport) {
+      vw = window.visualViewport.width; vh = window.visualViewport.height;
+    } else if (typeof window !== 'undefined') {
+      vw = window.innerWidth; vh = window.innerHeight;
+    } else {
+      vw = 720; vh = 720;
+    }
+    W = vw; H = vh; CX = W / 2; CY = H / 2; U = Math.min(W, H);
+    cv.width = W; cv.height = H;
+  }
+  function draw(t) {
+    curT = t;
+    size();
+    /* pin canvas in draw() */
+    cv.style.width = W + 'px';
+    cv.style.height = H + 'px';
+    ctx.fillStyle = FIELD;
+    ctx.fillRect(0, 0, W, H);
+    var absCycle = Math.floor(t / CYCLE);
+    var cyc = ((absCycle % 4) + 4) % 4;
+    /* assembled-state gold edge, faint, around the page rect */
+    var ga = goldAlphaAt(t);
+    if (ga > 0) {
+      var r = pageRect(cyc);
+      ctx.strokeStyle = rgba(GOLD, ga);
+      ctx.lineWidth = 2;
+      ctx.strokeRect(r.x - 0.02 * U, r.y - 0.02 * U, r.w + 0.04 * U, r.h + 0.04 * U);
+    }
+    var i, f, p;
+    for (i = 0; i < NFRAG; i++) {
+      f = FRAGS[i];
+      if (dragging && grabbed === i) {
+        p = { x: ptrX + grabDX, y: ptrY + grabDY };
+        drawFrag(f, p.x, p.y, fragRot(f, t));
+      } else {
+        p = fragPos(f, t);
+        drawFrag(f, p.x, p.y, fragRot(f, t));
+      }
+    }
+  }
+
+  function onResize() { draw(curT); }
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('resize', onResize);
+  }
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', onResize);
+  }
+  if (typeof window !== 'undefined') {
+    window.__piece = {
+      LOOP: LOOP, CYCLE: CYCLE, draw: draw,
+      setTime: function (t) { curT = t; },
+      fragPos: function (i, t) { return fragPos(FRAGS[i], t); },
+      slotPos: function (i, t) { return slotPos(FRAGS[i], t); },
+      driftPos: function (i, t) { return driftPos(FRAGS[i], t); },
+      envAt: envAt, goldAlphaAt: goldAlphaAt,
+      fragCount: NFRAG, slotCount: NSLOT,
+      pointerDown: function (x, y) { onDown({ clientX: x, clientY: y }); },
+      pointerMove: function (x, y) { onMove({ clientX: x, clientY: y }); },
+      pointerUp: function (x, y) { onUp({ clientX: x, clientY: y }); },
+      centre: function () { return { x: CX, y: CY }; },
+      fragMeta: function (i) { return { type: FRAGS[i].type, stray: FRAGS[i].stray }; }
+    };
+  }
+  draw(0);
+  function loop(ts) {
+    if (startTime === null) startTime = ts;
+    var t = (ts - startTime) / 1000;
+    draw(t);
+    if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(loop);
+  }
+  if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
