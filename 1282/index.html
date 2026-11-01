@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Quilt Sandwich</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #171310; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  /* Seeded RNG: no Math.random anywhere. */
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  var rnd = mulberry32(1282);
+
+  /* Palette (prompt verbatim). */
+  var PAPER = '#DCD6C8', BATTING = '#F2EDE2', FABRIC = '#8E2F28',
+      GOLD = '#D9A441', BINDING = '#3A2A24', TSHADOW = '#6B5B4C',
+      GROUND = '#171310', PHOTO = '#E8DCC3', SEPIA = '#8A6B45';
+
+  var W = 0, H = 0, CX = 0, CY = 0, S = 0;
+  var ROT = -0.035; /* ~2 degrees, a little askew */
+  var curT = 0, booted = false, T0 = 0;
+
+  /* Baste stitches: {u (0..1 around rim), t0, tone}. Persist, cap 14. */
+  var bastes = [];
+  /* Corner drag: {corner (0..3), dx, dy, downX, downY, downT, released, relT, relDx, relDy} */
+  var drag = null, downEvt = null;
+
+  /* Small seeded jitter field for stitch placement. */
+  var jit = [];
+  for (var i = 0; i < 64; i++) jit.push((rnd() - 0.5) * 2);
+
+  function size() {
+    var vp = (typeof window.visualViewport !== 'undefined' && window.visualViewport)
+      ? window.visualViewport : null;
+    W = vp ? vp.width : window.innerWidth;
+    H = vp ? vp.height : window.innerHeight;
+    canvas.width = Math.round(W);
+    canvas.height = Math.round(H);
+    CX = W / 2; CY = H / 2;
+    S = Math.min(W, H) * 0.62;
+  }
+
+  function isPhone() {
+    var m = Math.min(window.screen.width, window.screen.height);
+    if (m < 700) return true;
+    return H > W * 1.15;
+  }
+
+  /* Rotate a local point into screen space. */
+  function rotPt(x, y) {
+    var c = Math.cos(ROT), s = Math.sin(ROT);
+    return { x: CX + x * c - y * s, y: CY + x * s + y * c };
+  }
+  /* Quilt corners in screen space (half-size hs). */
+  function corners(hs) {
+    return [rotPt(-hs, -hs), rotPt(hs, -hs), rotPt(hs, hs), rotPt(-hs, hs)];
+  }
+  /* Corner indices: 0 TL, 1 TR, 2 BR, 3 BL. */
+
+  function quadPath(pts, r) {
+    ctx.beginPath();
+    for (var i = 0; i < 4; i++) {
+      var p = pts[i], q = pts[(i + 1) % 4], o = pts[(i + 3) % 4];
+      var e1x = p.x - o.x, e1y = p.y - o.y, l1 = Math.sqrt(e1x * e1x + e1y * e1y) || 1;
+      var e2x = q.x - p.x, e2y = q.y - p.y, l2 = Math.sqrt(e2x * e2x + e2y * e2y) || 1;
+      var ax = p.x - (e1x / l1) * r, ay = p.y - (e1y / l1) * r;
+      var bx = p.x + (e2x / l2) * r, by = p.y + (e2y / l2) * r;
+      if (i === 0) ctx.moveTo(ax, ay); else ctx.lineTo(ax, ay);
+      ctx.quadraticCurveTo(p.x, p.y, bx, by);
+    }
+    ctx.closePath();
+  }
+
+  /* Displace one corner of a rect (local coords) by (dx,dy), then rotate. */
+  function layerPts(hs, ox, oy, corner, dx, dy) {
+    var raw = [
+      { x: -hs + ox, y: -hs + oy }, { x: hs + ox, y: -hs + oy },
+      { x: hs + ox, y: hs + oy }, { x: -hs + ox, y: hs + oy }
+    ];
+    if (corner !== null) { raw[corner].x += dx; raw[corner].y += dy; }
+    var out = [];
+    for (var i = 0; i < 4; i++) out.push(rotPt(raw[i].x, raw[i].y));
+    return out;
+  }
+
+  /* Lift vector at time t: while dragging, live delta; after release, exp decay. */
+  function liftAt(t) {
+    if (!drag) return { x: 0, y: 0 };
+    if (!drag.released) return { x: drag.dx, y: drag.dy };
+    var dt = t - drag.relT;
+    if (dt < 0) dt = 0;
+    var k = Math.exp(-dt / 0.9);
+    return { x: drag.relDx * k, y: drag.relDy * k };
+  }
+
+  /* Point on the binding rim path for parameter u (0..1), in local coords. */
+  function rimPoint(u, hs) {
+    var per = u * 4, side = Math.floor(per) % 4, f = per - Math.floor(per);
+    var v = -hs + f * 2 * hs;
+    if (side === 0) return { x: v, y: -hs };
+    if (side === 1) return { x: hs, y: v };
+    if (side === 2) return { x: hs - f * 2 * hs, y: hs };
+    return { x: -hs, y: hs - f * 2 * hs };
+  }
+
+  function drawStitchLine(x1, y1, x2, y2, color, wdt) {
+    ctx.strokeStyle = color; ctx.lineWidth = wdt; ctx.lineCap = 'round';
+    ctx.setLineDash([6, 5]);
+    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  function draw(t) {
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = GROUND;
+    ctx.fillRect(0, 0, W, H);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+
+    var lift = liftAt(t);
+    var breathe = Math.sin(2 * Math.PI * t / 7); /* 0 at t=0, gentle swell */
+    var bSep = breathe * 1.6; /* strata separation, fractions of a pixel scale */
+
+    /* Soft drop shadow beneath: layered flat alpha ellipses, no shadowBlur. */
+    ctx.fillStyle = 'rgba(0,0,0,0.30)';
+    ctx.beginPath(); ctx.ellipse(CX + 6, CY + S * 0.52 + 10, S * 0.52, S * 0.07, 0, 0, 2 * Math.PI); ctx.fill();
+    ctx.fillStyle = 'rgba(0,0,0,0.18)';
+    ctx.beginPath(); ctx.ellipse(CX + 8, CY + S * 0.52 + 12, S * 0.55, S * 0.085, 0, 0, 2 * Math.PI); ctx.fill();
+
+    /* Strata sized so every layer reads at the edges: binding rim 10, fabric
+       ring 16 (gold border rides its middle), batting ring 14, paper center. */
+    var hsB = S / 2 + 10, hsF = S / 2, hsBat = S / 2 - 16, hsP = S / 2 - 30;
+    var corner = drag ? drag.corner : null;
+
+    /* Binding: dark wrapped rim, lifts least. */
+    var ptsB = layerPts(hsB, 0, 0, corner, lift.x * 0.3, lift.y * 0.3);
+    ctx.fillStyle = BINDING; quadPath(ptsB, 10); ctx.fill();
+
+    /* Fabric: deep red phulkari cloth with gold stitch border. */
+    var ptsF = layerPts(hsF, 1, 2, corner, lift.x * 0.5, lift.y * 0.5);
+    ctx.fillStyle = FABRIC; quadPath(ptsF, 8); ctx.fill();
+    /* Gold phulkari dash border, riding the middle of the exposed fabric ring. */
+    var inset = hsF - 8;
+    var border = layerPts(inset, 1, 2, corner, lift.x * 0.5, lift.y * 0.5);
+    ctx.strokeStyle = GOLD; ctx.lineWidth = 2; ctx.setLineDash([7, 6]);
+    ctx.beginPath();
+    ctx.moveTo(border[0].x, border[0].y);
+    for (var bi = 1; bi <= 4; bi++) ctx.lineTo(border[bi % 4].x, border[bi % 4].y);
+    ctx.stroke(); ctx.setLineDash([]);
+
+    /* Batting: soft white puff, swells with the breath. */
+    var batScale = 1 + 0.004 * breathe;
+    var ptsBat = layerPts(hsBat * batScale, 3, 5 + bSep * 0.5, corner, lift.x * 0.75, lift.y * 0.75);
+    ctx.fillStyle = BATTING; quadPath(ptsBat, 6); ctx.fill();
+    /* Puff edge: small white scallops along the batting rim. */
+    ctx.fillStyle = BATTING;
+    for (var si = 0; si < 28; si++) {
+      var u = si / 28, rp = rimPoint(u, hsBat * batScale);
+      var sp = rotPt(rp.x + 3 + jit[si % 64] * 1.5, rp.y + 5 + bSep * 0.5);
+      ctx.beginPath(); ctx.arc(sp.x, sp.y, 2.6, 0, 2 * Math.PI); ctx.fill();
+    }
+
+    /* Paper: drawn layer on top, lifts most. */
+    var ptsP = layerPts(hsP, -1, -2 - bSep, corner, lift.x, lift.y);
+    ctx.fillStyle = PAPER; quadPath(ptsP, 5); ctx.fill();
+
+    /* Sepia vignette on the paper: loose washes + hands holding a photograph. */
+    ctx.save();
+    quadPath(ptsP, 5); ctx.clip();
+    /* Wash blobs (flat alpha, no gradients). */
+    ctx.fillStyle = 'rgba(138,107,69,0.20)';
+    var wp = rotPt(-hsP * 0.3, -hsP * 0.35);
+    ctx.beginPath(); ctx.ellipse(wp.x, wp.y, hsP * 0.55, hsP * 0.4, -0.3, 0, 2 * Math.PI); ctx.fill();
+    ctx.fillStyle = 'rgba(107,91,76,0.16)';
+    var wp2 = rotPt(hsP * 0.35, hsP * 0.3);
+    ctx.beginPath(); ctx.ellipse(wp2.x, wp2.y, hsP * 0.5, hsP * 0.42, 0.4, 0, 2 * Math.PI); ctx.fill();
+    /* Photograph: cream card with sepia inner, held at center. */
+    var ph = rotPt(0, -hsP * 0.08);
+    var pw = hsP * 0.85, phh = hsP * 0.62;
+    ctx.save();
+    ctx.translate(ph.x, ph.y); ctx.rotate(ROT + 0.05);
+    ctx.fillStyle = PHOTO; ctx.fillRect(-pw / 2, -phh / 2, pw, phh);
+    ctx.fillStyle = SEPIA; ctx.fillRect(-pw / 2 + 8, -phh / 2 + 8, pw - 16, phh - 28);
+    ctx.fillStyle = 'rgba(60,45,30,0.55)';
+    ctx.beginPath(); ctx.ellipse(0, -2, pw * 0.16, phh * 0.22, 0, 0, 2 * Math.PI); ctx.fill();
+    ctx.restore();
+    /* Hands: two soft cupping shapes at the photo's lower corners, each with
+       a thumb bump so they read as hands, not pills. */
+    ctx.fillStyle = 'rgba(122,95,66,0.85)';
+    var h1 = rotPt(-pw * 0.32, hsP * 0.28), h2 = rotPt(pw * 0.32, hsP * 0.28);
+    ctx.beginPath(); ctx.ellipse(h1.x, h1.y, hsP * 0.17, hsP * 0.10, 0.5, 0, 2 * Math.PI); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(h2.x, h2.y, hsP * 0.17, hsP * 0.10, -0.5, 0, 2 * Math.PI); ctx.fill();
+    var t1 = rotPt(-pw * 0.44, hsP * 0.18), t2 = rotPt(pw * 0.44, hsP * 0.18);
+    ctx.beginPath(); ctx.ellipse(t1.x, t1.y, hsP * 0.07, hsP * 0.05, 0.9, 0, 2 * Math.PI); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(t2.x, t2.y, hsP * 0.07, hsP * 0.05, -0.9, 0, 2 * Math.PI); ctx.fill();
+    /* Basting along the paper edge (structural, cream). */
+    var edge = layerPts(hsP - 8, -1, -2 - bSep, corner, lift.x, lift.y);
+    ctx.strokeStyle = 'rgba(242,237,226,0.85)'; ctx.lineWidth = 1.5; ctx.setLineDash([5, 6]);
+    ctx.beginPath();
+    ctx.moveTo(edge[0].x, edge[0].y);
+    for (var ei = 1; ei <= 4; ei++) ctx.lineTo(edge[ei % 4].x, edge[ei % 4].y);
+    ctx.stroke(); ctx.setLineDash([]);
+    ctx.restore();
+
+    /* Visitor baste stitches along the binding rim. */
+    for (var vi = 0; vi < bastes.length; vi++) {
+      var b = bastes[vi];
+      var frac = (t - b.t0) / 0.6; if (frac > 1) frac = 1; if (frac < 0) frac = 0;
+      if (frac <= 0) continue;
+      var p1 = rimPoint(b.u, hsB), p2 = rimPoint(b.u + 0.018 * frac, hsB);
+      var s1 = rotPt(p1.x, p1.y), s2 = rotPt(p2.x, p2.y);
+      drawStitchLine(s1.x, s1.y, s2.x, s2.y, b.tone, 3);
+    }
+
+    /* Ground note: nothing visible. Phone keeps shape; page ground is ink. */
+    if (isPhone()) { /* shape kept whole; ground already ink */ }
+  }
+
+  function loop(nowMs) {
+    if (!booted) { booted = true; T0 = nowMs; }
+    curT = (nowMs - T0) / 1000;
+    draw(curT);
+    if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(loop);
+  }
+
+  function pos(e) {
+    var r = canvas.getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  }
+
+  function nearestCorner(p) {
+    var cs = corners(S / 2 + 8);
+    var best = -1, bd = 1e9;
+    for (var i = 0; i < 4; i++) {
+      var d = (p.x - cs[i].x) * (p.x - cs[i].x) + (p.y - cs[i].y) * (p.y - cs[i].y);
+      if (d < bd) { bd = d; best = i; }
+    }
+    return bd < 70 * 70 ? best : -1;
+  }
+
+  function nearRim(p) {
+    var hs = S / 2 + 8;
+    /* distance to quilt square in local coords (approx, ignoring rotation) */
+    var c = Math.cos(-ROT), s = Math.sin(-ROT);
+    var lx = (p.x - CX) * c - (p.y - CY) * s, ly = (p.x - CX) * s + (p.y - CY) * c;
+    var dx = Math.max(Math.abs(lx) - hs, 0), dy = Math.max(Math.abs(ly) - hs, 0);
+    var outside = Math.sqrt(dx * dx + dy * dy);
+    var inside = Math.min(hs - Math.abs(lx), hs - Math.abs(ly));
+    return outside < 22 || (outside === 0 && inside < 22);
+  }
+
+  function rimParam(p) {
+    var hs = S / 2 + 8;
+    var c = Math.cos(-ROT), s = Math.sin(-ROT);
+    var lx = (p.x - CX) * c - (p.y - CY) * s, ly = (p.y - CY) * s + (p.x - CX) * c;
+    /* walk the rim: top edge u 0..0.25, right 0.25..0.5, bottom, left */
+    var ax = Math.abs(lx), ay = Math.abs(ly);
+    if (ay >= ax) {
+      if (ly < 0) return (lx + hs) / (2 * hs) * 0.25;
+      return 0.5 + (hs - lx) / (2 * hs) * 0.25;
+    }
+    if (lx > 0) return 0.25 + (ly + hs) / (2 * hs) * 0.25;
+    return 0.75 + (hs - ly) / (2 * hs) * 0.25;
+  }
+
+  canvas.addEventListener('pointerdown', function (e) {
+    var p = pos(e);
+    var cn = nearestCorner(p);
+    downEvt = { x: p.x, y: p.y, t: curT, corner: cn };
+    if (cn >= 0) drag = { corner: cn, dx: 0, dy: 0, released: false };
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (!drag || drag.released || !downEvt) return;
+    var p = pos(e);
+    var dx = p.x - downEvt.x, dy = p.y - downEvt.y;
+    var m = Math.sqrt(dx * dx + dy * dy);
+    if (m > 90) { dx *= 90 / m; dy *= 90 / m; }
+    drag.dx = dx; drag.dy = dy;
+  });
+  function endPointer(e) {
+    if (!downEvt) return;
+    var p = pos(e);
+    var moved = Math.sqrt((p.x - downEvt.x) * (p.x - downEvt.x) + (p.y - downEvt.y) * (p.y - downEvt.y));
+    var dur = curT - downEvt.t;
+    if (drag && !drag.released) {
+      drag.released = true; drag.relT = curT; drag.relDx = drag.dx; drag.relDy = drag.dy;
+      /* clear the drag after its decay finishes (closed-form: 6 s is >6 tau) */
+      var d = drag;
+      setTimeout(function () { if (drag === d) drag = null; }, 6000);
+    }
+    if (moved < 10 && dur < 1.5 && nearRim(p)) {
+      var tones = [GOLD, 'rgba(242,237,226,0.95)', GOLD];
+      bastes.push({ u: rimParam(p), t0: curT, tone: tones[bastes.length % 3] });
+      if (bastes.length > 14) bastes.shift();
+    }
+    downEvt = null;
+  }
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', endPointer);
+
+  function onResize() { size(); draw(curT); }
+  if (typeof window.visualViewport !== 'undefined' && window.visualViewport) {
+    window.visualViewport.addEventListener('resize', onResize);
+  }
+  window.addEventListener('resize', onResize);
+
+  size();
+  draw(0); /* boot flag: frame one at exactly t=0; clock starts with the rAF loop */
+  if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

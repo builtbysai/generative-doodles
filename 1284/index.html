@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mango Choga</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #161210; }
+  canvas { display: block; background: #161210; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // Seeded PRNG (mulberry32) - deterministic layout, no Math.random anywhere.
+  function rng(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  var W = 0, H = 0, robe = null, motifs = [];
+  var drags = []; // recorded drag events {x, y, t} - closed-form state only
+  var T0 = 0, booted = false;
+
+  function now() {
+    if (typeof performance !== 'undefined' && performance.now) return (performance.now() - T0) / 1000;
+    return 0;
+  }
+
+  function isPhone() {
+    try {
+      var s = window.screen;
+      if (s && s.width && s.height) return Math.min(s.width, s.height) < 700;
+    } catch (e) {}
+    return H > W * 1.15;
+  }
+
+  function size() {
+    var vw = 0, vh = 0;
+    try {
+      if (window.visualViewport) { vw = window.visualViewport.width; vh = window.visualViewport.height; }
+    } catch (e) {}
+    if (!vw || !vh) { vw = window.innerWidth; vh = window.innerHeight; }
+    W = vw; H = vh;
+    canvas.width = Math.round(vw); canvas.height = Math.round(vh);
+    build();
+  }
+
+  // Robe silhouette in unit space (u: 0..1 across, v: 0..1 down).
+  // Neck at top centre, shoulders out, sleeves suggested, body flaring to a wide hem.
+  function robePoint(u, v, rw, rh, ox, oy) {
+    return [ox + u * rw, oy + v * rh];
+  }
+  function robePath(rw, rh, ox, oy) {
+    var P = function (u, v) { return robePoint(u, v, rw, rh, ox, oy); };
+    var p = [];
+    // Outline traced clockwise from neck-left.
+    p.push(P(0.42, 0.00));
+    p.push(P(0.30, 0.015)); // left shoulder slope
+    p.push(P(0.16, 0.06));  // shoulder
+    p.push(P(0.055, 0.16)); // sleeve outer top
+    p.push(P(0.015, 0.34)); // sleeve outer fall
+    p.push(P(0.045, 0.44)); // wrist outer
+    p.push(P(0.125, 0.42)); // wrist inner
+    p.push(P(0.155, 0.30)); // sleeve inner up
+    p.push(P(0.185, 0.26)); // armpit
+    p.push(P(0.175, 0.55)); // body side upper
+    p.push(P(0.135, 0.86)); // body flaring down
+    p.push(P(0.105, 1.00)); // hem left
+    p.push(P(0.895, 1.00)); // hem right
+    p.push(P(0.865, 0.86));
+    p.push(P(0.825, 0.55));
+    p.push(P(0.815, 0.26)); // armpit right
+    p.push(P(0.845, 0.30));
+    p.push(P(0.875, 0.42));
+    p.push(P(0.955, 0.44));
+    p.push(P(0.985, 0.34));
+    p.push(P(0.945, 0.16));
+    p.push(P(0.84, 0.06));
+    p.push(P(0.70, 0.015));
+    p.push(P(0.58, 0.00));
+    return p;
+  }
+  function tracePath(pts) {
+    ctx.beginPath();
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    for (var i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+    ctx.closePath();
+  }
+  function smoothClosed(pts) {
+    // Catmull-Rom to bezier for a soft draped outline.
+    var n = pts.length;
+    ctx.beginPath();
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    for (var i = 0; i < n; i++) {
+      var p0 = pts[(i - 1 + n) % n], p1 = pts[i], p2 = pts[(i + 1) % n], p3 = pts[(i + 2) % n];
+      ctx.bezierCurveTo(
+        p1[0] + (p2[0] - p0[0]) / 6, p1[1] + (p2[1] - p0[1]) / 6,
+        p2[0] - (p3[0] - p1[0]) / 6, p2[1] - (p3[1] - p1[1]) / 6,
+        p2[0], p2[1]);
+    }
+    ctx.closePath();
+  }
+
+  // Paisley (Ambi) motif geometry, sampled as point lists so every line is
+  // rendered as hand-stitched dashes, never a smooth vector stroke.
+  function bez(p0, p1, p2, p3, n) {
+    var pts = [];
+    for (var i = 0; i <= n; i++) {
+      var t = i / n, u = 1 - t;
+      pts.push([
+        u*u*u*p0[0] + 3*u*u*t*p1[0] + 3*u*t*t*p2[0] + t*t*t*p3[0],
+        u*u*u*p0[1] + 3*u*u*t*p1[1] + 3*u*t*t*p2[1] + t*t*t*p3[1]
+      ]);
+    }
+    return pts;
+  }
+  function paisleyOutline(cx, cy, s, rot, r) {
+    // Mango / Ambi teardrop from three bezier segments: right side down to a
+    // round bottom, left side back up, then a hook curling inward at the tip.
+    var segs = [
+      bez([0.05, -1.15], [0.85, -0.90], [1.00, 0.10], [0.15, 0.95], 18),
+      bez([0.15, 0.95], [-0.90, 0.70], [-0.95, -0.30], [-0.35, -0.85], 18),
+      bez([-0.35, -0.85], [-0.10, -1.00], [0.25, -0.95], [0.35, -0.55], 10)
+    ];
+    var pts = [];
+    for (var k = 0; k < segs.length; k++) {
+      for (var i = 0; i < segs[k].length; i++) {
+        var x = segs[k][i][0], y = segs[k][i][1];
+        var xr = x * Math.cos(rot) - y * Math.sin(rot);
+        var yr = x * Math.sin(rot) + y * Math.cos(rot);
+        pts.push([cx + xr * s + (r() - 0.5) * s * 0.03, cy + yr * s + (r() - 0.5) * s * 0.03]);
+      }
+    }
+    return pts;
+  }
+  function paisleySpiral(cx, cy, s, rot, r) {
+    var pts = [];
+    var turns = 1.35, steps = 60;
+    for (var i = 0; i <= steps; i++) {
+      var f = i / steps;
+      var a = f * turns * Math.PI * 2 - Math.PI / 2;
+      var rad = s * (0.08 + f * 0.52);
+      var x = Math.cos(a) * rad, y = Math.sin(a) * rad;
+      var xr = x * Math.cos(rot) - y * Math.sin(rot);
+      var yr = x * Math.sin(rot) + y * Math.cos(rot);
+      pts.push([cx + xr + (r() - 0.5) * s * 0.02, cy + yr + (r() - 0.5) * s * 0.02]);
+    }
+    return pts;
+  }
+
+  function build() {
+    var r = rng(1284);
+    var phone = isPhone();
+    var rh = H * 0.88;
+    var rw = rh * 0.46;
+    if (rw > W * 0.84) { rw = W * 0.84; rh = rw / 0.46; }
+    var ox = (W - rw) / 2, oy = (H - rh) / 2;
+    robe = { w: rw, h: rh, x: ox, y: oy, path: robePath(rw, rh, ox, oy) };
+    motifs = [];
+    var threads = ['#A6343C', '#2F7D74', '#D9973B', '#C97B84'];
+    // Rows top to hem: spacing shrinks toward the hem (denser at the hem).
+    var rows = 11;
+    for (var row = 0; row < rows; row++) {
+      var v = 0.10 + (row / (rows - 1)) * 0.84; // down the robe
+      var density = 1 + v * 1.15; // hem rows pack tighter
+      var sBase = rw * 0.105 * (1 - v * 0.18);
+      var step = rw * 0.26 / density;
+      var stagger = (row % 2) * step * 0.5;
+      for (var x = ox + rw * 0.10 + stagger; x < ox + rw * 0.92; x += step) {
+        var cx = x + (r() - 0.5) * step * 0.25;
+        var cy = oy + v * rh + (r() - 0.5) * rh * 0.02;
+        // Keep motifs roughly inside the robe body; the clip finishes the cut.
+        if (cx < ox + rw * 0.03 || cx > ox + rw * 0.97) continue;
+        var s = sBase * (0.82 + r() * 0.42);
+        var rot = (r() - 0.5) * 1.1 + (r() < 0.5 ? 0 : Math.PI); // varied, never mirrored
+        motifs.push({
+          x: cx, y: cy, s: s, rot: rot,
+          color: threads[Math.floor(r() * threads.length)],
+          phase: (cx / W) * 0.35 + (cy / H) * 0.85, // travelling wave phase
+          outline: paisleyOutline(cx, cy, s, rot, r),
+          spiral: paisleySpiral(cx, cy, s, rot, r),
+          dots: (function () {
+            var d = [];
+            for (var k = 0; k < 4; k++) d.push([(r() - 0.5) * s * 0.9, (r() - 0.5) * s * 0.9]);
+            return d;
+          })()
+        });
+      }
+    }
+  }
+
+  // Draw a polyline as hand-stitched dashes.
+  function stitchLine(pts, dash, gap, color, width) {
+    ctx.strokeStyle = color; ctx.lineWidth = width; ctx.lineCap = 'round';
+    var acc = 0, drawing = true, px = pts[0][0], py = pts[0][1];
+    for (var i = 1; i < pts.length; i++) {
+      var x0 = px, y0 = py, x1 = pts[i][0], y1 = pts[i][1];
+      var dx = x1 - x0, dy = y1 - y0;
+      var len = Math.sqrt(dx * dx + dy * dy);
+      if (len === 0) continue;
+      var ux = dx / len, uy = dy / len;
+      var travelled = 0;
+      while (travelled < len) {
+        var segLen = drawing ? dash : gap;
+        var take = Math.min(segLen - acc, len - travelled);
+        if (drawing && take > 0) {
+          ctx.beginPath();
+          ctx.moveTo(x0 + ux * travelled, y0 + uy * travelled);
+          ctx.lineTo(x0 + ux * (travelled + take), y0 + uy * (travelled + take));
+          ctx.stroke();
+        }
+        travelled += take; acc += take;
+        if (acc >= segLen - 0.001) { drawing = !drawing; acc = 0; }
+      }
+      px = x1; py = y1;
+    }
+  }
+  function dot(x, y, rad, color) {
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.moveTo(x + rad, y);
+    ctx.arc(x, y, rad, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // Unfurl angle for one motif at time t: travelling wave + drag bloom.
+  function unfurl(m, t) {
+    var wave = Math.sin((t / 9 - m.phase) * Math.PI * 2) * 0.10; // ~6 degrees
+    var bloom = 0;
+    for (var i = 0; i < drags.length; i++) {
+      var d = drags[i];
+      if (d.t > t) continue;
+      var age = t - d.t;
+      if (age > 3) continue;
+      var dx = m.x - d.x, dy = m.y - d.y;
+      var dist = Math.sqrt(dx * dx + dy * dy);
+      var radius = Math.max(robe.w * 0.55, 90);
+      var fall = Math.max(0, 1 - dist / radius);
+      bloom += fall * fall * Math.exp(-age / 1.2);
+    }
+    if (bloom > 1) bloom = 1;
+    return wave + bloom * 0.45; // bloom opens a motif up to ~26 degrees
+  }
+  function rotatePts(pts, cx, cy, ang) {
+    var out = [];
+    var co = Math.cos(ang), si = Math.sin(ang);
+    for (var i = 0; i < pts.length; i++) {
+      var dx = pts[i][0] - cx, dy = pts[i][1] - cy;
+      out.push([cx + dx * co - dy * si, cy + dx * si + dy * co]);
+    }
+    return out;
+  }
+
+  function draw(t) {
+    ctx.fillStyle = '#161210';
+    ctx.fillRect(0, 0, W, H);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    if (!robe) return;
+    var rw = robe.w, rh = robe.h, ox = robe.x, oy = robe.y;
+
+    // Soft floor shadow under the robe (flat alpha shape, no blur).
+    ctx.fillStyle = 'rgba(0,0,0,0.45)';
+    ctx.beginPath();
+    ctx.moveTo(ox + rw * 0.05, oy + rh + 14);
+    ctx.ellipse(ox + rw * 0.5, oy + rh + 14, rw * 0.52, 12, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Robe body: muslin ground, deep paisley-ground panel inset.
+    ctx.save();
+    smoothClosed(robe.path);
+    ctx.fillStyle = '#E8DCC3';
+    ctx.fill();
+    ctx.restore();
+
+    // Motifs clipped exactly to the robe.
+    ctx.save();
+    smoothClosed(robe.path);
+    ctx.clip();
+    for (var i = 0; i < motifs.length; i++) {
+      var m = motifs[i];
+      var ang = unfurl(m, t);
+      stitchLine(m.outline, Math.max(3, m.s * 0.10), Math.max(2.5, m.s * 0.07), m.color, Math.max(1.4, m.s * 0.045));
+      var sp = rotatePts(m.spiral, m.x, m.y, ang);
+      stitchLine(sp, Math.max(2.5, m.s * 0.08), Math.max(2, m.s * 0.06), m.color, Math.max(1.2, m.s * 0.04));
+      dot(m.x, m.y, Math.max(1.5, m.s * 0.05), m.color);
+      for (var k = 0; k < m.dots.length; k++) {
+        dot(m.x + m.dots[k][0], m.y + m.dots[k][1], Math.max(1, m.s * 0.03), '#241E1A');
+      }
+    }
+    ctx.restore();
+
+    // Robe outline seam + neckline + hem stitch, all hand-stitched dashes.
+    ctx.save();
+    smoothClosed(robe.path);
+    ctx.strokeStyle = '#241E1A'; ctx.lineWidth = Math.max(1.5, rw * 0.006);
+    ctx.stroke();
+    ctx.restore();
+    var neck = [];
+    for (var a = 0; a <= 20; a++) {
+      var f = a / 20;
+      neck.push([ox + rw * (0.42 + f * 0.16), oy + rh * 0.012 + Math.sin(f * Math.PI) * rh * 0.035]);
+    }
+    stitchLine(neck, 5, 4, '#241E1A', Math.max(1.2, rw * 0.004));
+    var hem = [];
+    for (var b = 0; b <= 40; b++) {
+      var g = b / 40;
+      hem.push([ox + rw * (0.105 + g * 0.79), oy + rh * 0.985]);
+    }
+    stitchLine(hem, 6, 4, '#A6343C', Math.max(1.2, rw * 0.004));
+  }
+
+  function pos(e) {
+    var rect = canvas.getBoundingClientRect();
+    var cx = (e.clientX !== undefined) ? e.clientX : (e.touches && e.touches[0].clientX);
+    var cy = (e.clientY !== undefined) ? e.clientY : (e.touches && e.touches[0].clientY);
+    return { x: cx - rect.left, y: cy - rect.top };
+  }
+  function onDrag(e) {
+    var p = pos(e);
+    drags.push({ x: p.x, y: p.y, t: now() });
+    if (drags.length > 40) drags.splice(0, drags.length - 40);
+  }
+  canvas.addEventListener('pointerdown', onDrag);
+  canvas.addEventListener('pointermove', function (e) {
+    if (e.buttons) onDrag(e);
+  });
+
+  try {
+    if (window.visualViewport) window.visualViewport.addEventListener('resize', function () { size(); draw(0); });
+  } catch (e) {}
+  window.addEventListener('resize', function () { size(); draw(0); });
+
+  // Boot: frame one draws at exactly t = 0; the clock starts with the rAF loop.
+  size();
+  draw(0);
+  if (typeof requestAnimationFrame !== 'undefined') {
+    if (typeof performance !== 'undefined' && performance.now) T0 = performance.now();
+    booted = true;
+    (function loop() {
+      draw(now());
+      requestAnimationFrame(loop);
+    })();
+  }
+})();
+</script>
+</body>
+</html>
