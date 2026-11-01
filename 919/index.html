@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Atlantis</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0B0B0D; overflow: hidden; height: 100%; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded RNG (mulberry32) ----------
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- palette ----------
+  var GROUND = '#0B0B0D', INK = '#F2F0EB';
+  var GROUND_INV = '#FAFAF8', INK_INV = '#111111';
+
+  // ---------- ring model (all radii are fractions of half = min(w,h)/2) ----------
+  var RING_FRAC = [0.25, 0.50, 0.80];        // centre radius of each land ring
+  var RING_HALF_BAND = [0.045, 0.060, 0.070]; // half thickness of each land ring
+  var RING_PERIOD = [90, 180, 360];           // seconds per revolution: inner fastest
+  var RING_PHASE = [0.0, 2.1, 4.2];           // initial angles
+  var RING_ROWS = [2, 3, 3];                  // housing rows per ring
+  var BRIDGES = [Math.PI / 4, 3 * Math.PI / 4, 5 * Math.PI / 4, 7 * Math.PI / 4]; // fixed
+  var ISLAND_FRAC = 0.16;                     // temple island boundary
+  var TOWER_COUNT = 28, TOWER_FRAC = 0.885;   // watchtower dots on the outer rim
+  var PULSE_FULL = 1.9;                       // seconds for a signal pulse to reach 0.80 frac
+  var FLASH_SPAN = 0.9;                       // seconds a crossed ring stays lit
+
+  // ---------- housing placement (seeded, computed once) ----------
+  var rng = mulberry32(91980);
+  var blocks = []; // {ring, ang, rFrac, twFrac, rhFrac}
+  function angDist(a, b) {
+    var d = Math.abs(a - b) % (Math.PI * 2);
+    return d > Math.PI ? Math.PI * 2 - d : d;
+  }
+  for (var k = 0; k < 3; k++) {
+    var rows = RING_ROWS[k];
+    for (var r = 0; r < rows; r++) {
+      var rowFrac = RING_FRAC[k] + (rows === 1 ? 0 : (r / (rows - 1) - 0.5) * 2 * RING_HALF_BAND[k] * 0.58);
+      var a = rng() * Math.PI * 2;
+      var guard = 0;
+      while (a < Math.PI * 2 && guard < 400) {
+        guard++;
+        var twFrac = 0.026 + rng() * 0.012;              // tangential size (frac of half)
+        var rhFrac = 0.016 + rng() * 0.008;              // radial size
+        var step = (twFrac / rowFrac) * (1.5 + rng() * 1.1); // block + street gap, in radians
+        var nearBridge = false;
+        for (var b = 0; b < BRIDGES.length; b++) if (angDist(a, BRIDGES[b]) < 0.045) nearBridge = true;
+        if (!nearBridge && rng() > 0.16) {
+          blocks.push({ ring: k, ang: a, rFrac: rowFrac, twFrac: twFrac, rhFrac: rhFrac });
+        }
+        a += step;
+      }
+    }
+  }
+
+  // ---------- state: recorded events only; everything drawn is a function of (t, events) ----------
+  var signals = [];      // piece-times of confirmed taps (signal pulses)
+  var inversions = [];   // piece-times of double-taps (8 s palette flips)
+  var committedOffset = 0; // drag angle committed on release (radians, added to every ring)
+  var liveDelta = 0;       // drag angle accumulated during the current drag
+  var dragging = false;
+
+  function isInverted(t) {
+    for (var i = 0; i < inversions.length; i++) {
+      if (t >= inversions[i] && t < inversions[i] + 8) return true;
+    }
+    return false;
+  }
+  function ringAngle(k, t) {
+    return RING_PHASE[k] + (Math.PI * 2 * t) / RING_PERIOD[k] + committedOffset + liveDelta;
+  }
+  // piece-time at which a pulse fired at t0 crosses ring k's centre radius
+  function crossTime(t0, k) { return t0 + (RING_FRAC[k] / 0.80) * PULSE_FULL; }
+
+  // ---------- audio (lazy, gesture-gated, fully guarded) ----------
+  var AC = null, whirGain = null, whirTarget = 0, bellFired = {};
+  function initAudio() {
+    if (AC) return;
+    try {
+      var Ctx = null;
+      if (typeof AudioContext !== 'undefined') Ctx = AudioContext;
+      else if (typeof webkitAudioContext !== 'undefined') Ctx = webkitAudioContext;
+      if (!Ctx) return;
+      AC = new Ctx();
+      // breathing pulse: low sine, gain breathed by a 0.1 Hz LFO
+      var osc = AC.createOscillator(); osc.type = 'sine'; osc.frequency.value = 46;
+      var g = AC.createGain(); g.gain.value = 0.030;
+      var lfo = AC.createOscillator(); lfo.type = 'sine'; lfo.frequency.value = 0.1;
+      var lfoG = AC.createGain(); lfoG.gain.value = 0.020;
+      lfo.connect(lfoG); lfoG.connect(g.gain);
+      osc.connect(g); g.connect(AC.destination);
+      osc.start(); lfo.start();
+      // drag whir: looped noise through a bandpass, gain follows drag speed
+      var len = AC.sampleRate * 1.2, buf = AC.createBuffer(1, len, AC.sampleRate);
+      var d = buf.getChannelData(0);
+      var nr = mulberry32(4242);
+      for (var i = 0; i < len; i++) d[i] = nr() * 2 - 1;
+      var src = AC.createBufferSource(); src.buffer = buf; src.loop = true;
+      var bp = AC.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 320; bp.Q.value = 1.4;
+      whirGain = AC.createGain(); whirGain.gain.value = 0;
+      src.connect(bp); bp.connect(whirGain); whirGain.connect(AC.destination);
+      src.start();
+    } catch (e) { AC = null; }
+  }
+  function bell(freq) {
+    if (!AC) return;
+    try {
+      var t0 = AC.currentTime;
+      var g = AC.createGain();
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.exponentialRampToValueAtTime(0.14, t0 + 0.012);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + 1.9);
+      var o1 = AC.createOscillator(); o1.type = 'sine'; o1.frequency.value = freq;
+      var o2 = AC.createOscillator(); o2.type = 'sine'; o2.frequency.value = freq * 2.76;
+      var g2 = AC.createGain(); g2.gain.value = 0.25;
+      o1.connect(g); o2.connect(g2); g2.connect(g); g.connect(AC.destination);
+      o1.start(t0); o2.start(t0); o1.stop(t0 + 2.0); o2.stop(t0 + 2.0);
+    } catch (e) { /* silent */ }
+  }
+  var BELL_FREQ = [740, 587, 440];
+  function tickAudio(t, prevT) {
+    if (!AC) return;
+    // bells: fire when the piece clock passes a pulse/ring crossing
+    for (var s = 0; s < signals.length; s++) {
+      for (var k = 0; k < 3; k++) {
+        var key = s + ':' + k, tc = crossTime(signals[s], k);
+        if (!bellFired[key] && prevT < tc && t >= tc) { bellFired[key] = true; bell(BELL_FREQ[k]); }
+      }
+    }
+    if (whirGain) {
+      var cur = whirGain.gain.value;
+      whirGain.gain.value = cur + (whirTarget - cur) * 0.12;
+      whirTarget *= 0.90; // decays unless pointermove keeps feeding it
+    }
+  }
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  function viewSize() {
+    if (typeof window !== 'undefined' && window.visualViewport &&
+        typeof window.visualViewport.width === 'number') {
+      return { w: window.visualViewport.width, h: window.visualViewport.height };
+    }
+    return { w: window.innerWidth, h: window.innerHeight };
+  }
+  function isPhone(w, h) {
+    var sw = (typeof window !== 'undefined' && window.screen) ? window.screen.width : w;
+    var sh = (typeof window !== 'undefined' && window.screen) ? window.screen.height : h;
+    return Math.min(sw, sh) < 700 || h > w * 1.15;
+  }
+
+  // ---------- draw: pure function of (t, recorded events) ----------
+  function draw(t) {
+    var vs = viewSize();
+    var w = Math.max(50, Math.floor(vs.w)), h = Math.max(50, Math.floor(vs.h));
+    if (canvas.width !== w) canvas.width = w;
+    if (canvas.height !== h) canvas.height = h;
+    canvas.style.width = w + 'px';
+    canvas.style.height = h + 'px';
+
+    var inv = isInverted(t);
+    var ground = inv ? GROUND_INV : GROUND;
+    var ink = inv ? INK_INV : INK;
+
+    ctx.fillStyle = ground;
+    ctx.fillRect(0, 0, w, h);
+
+    var cx = w / 2, cy = h / 2;
+    var half = Math.min(w, h) / 2;
+    var phone = isPhone(w, h);
+    var lw = Math.max(1, half * 0.004);
+
+    var angles = [ringAngle(0, t), ringAngle(1, t), ringAngle(2, t)];
+
+    // land bands: faint thick strokes so the rings read as land, moats stay ground
+    ctx.strokeStyle = ink;
+    for (var k = 0; k < 3; k++) {
+      ctx.globalAlpha = 0.055;
+      ctx.lineWidth = RING_HALF_BAND[k] * 2 * half;
+      ctx.beginPath();
+      ctx.arc(cx, cy, RING_FRAC[k] * half, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    // ring boundary circles
+    ctx.globalAlpha = 0.85;
+    ctx.lineWidth = lw;
+    for (k = 0; k < 3; k++) {
+      ctx.beginPath();
+      ctx.arc(cx, cy, (RING_FRAC[k] - RING_HALF_BAND[k]) * half, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(cx, cy, (RING_FRAC[k] + RING_HALF_BAND[k]) * half, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    // temple island boundary
+    ctx.beginPath();
+    ctx.arc(cx, cy, ISLAND_FRAC * half, 0, Math.PI * 2);
+    ctx.stroke();
+
+    // ring flashes (signal crossings), under the housing
+    for (var s = 0; s < signals.length; s++) {
+      for (k = 0; k < 3; k++) {
+        var fage = t - crossTime(signals[s], k);
+        if (fage >= 0 && fage < FLASH_SPAN) {
+          ctx.globalAlpha = 0.26 * (1 - fage / FLASH_SPAN);
+          ctx.lineWidth = RING_HALF_BAND[k] * 2 * half;
+          ctx.beginPath();
+          ctx.arc(cx, cy, RING_FRAC[k] * half, 0, Math.PI * 2);
+          ctx.stroke();
+        }
+      }
+    }
+
+    // housing blocks: analytic position from the ring's current angle
+    ctx.fillStyle = ink;
+    ctx.globalAlpha = 0.95;
+    for (var i = 0; i < blocks.length; i++) {
+      var bl = blocks[i];
+      var a = bl.ang + angles[bl.ring];
+      var rr = bl.rFrac * half;
+      var px = cx + rr * Math.cos(a), py = cy + rr * Math.sin(a);
+      ctx.save();
+      ctx.translate(px, py);
+      ctx.rotate(a + Math.PI / 2);
+      var bw = Math.max(1.4, bl.twFrac * half), bh = Math.max(1.2, bl.rhFrac * half);
+      ctx.fillRect(-bw / 2, -bh / 2, bw, bh);
+      ctx.restore();
+    }
+
+    // bridges: fixed angles, the city turns under them
+    ctx.globalAlpha = 0.95;
+    ctx.strokeStyle = ink;
+    ctx.lineWidth = Math.max(1.6, half * 0.014);
+    ctx.beginPath();
+    for (var b = 0; b < BRIDGES.length; b++) {
+      var ba = BRIDGES[b];
+      ctx.moveTo(cx + 0.10 * half * Math.cos(ba), cy + 0.10 * half * Math.sin(ba));
+      ctx.lineTo(cx + 0.905 * half * Math.cos(ba), cy + 0.905 * half * Math.sin(ba));
+    }
+    ctx.stroke();
+
+    // temple: fixed square-and-steps glyph at the exact centre
+    ctx.globalAlpha = 0.95;
+    ctx.lineWidth = lw;
+    var steps = [0.085, 0.062, 0.040];
+    for (var st = 0; st < steps.length; st++) {
+      var sHalf = steps[st] * half;
+      ctx.strokeRect(cx - sHalf, cy - sHalf, sHalf * 2, sHalf * 2);
+    }
+    var core = 0.020 * half;
+    ctx.fillRect(cx - core, cy - core, core * 2, core * 2);
+
+    // watchtower dots: ride the outer ring, breathe on a 30 s cycle
+    ctx.fillStyle = ink;
+    for (var dI = 0; dI < TOWER_COUNT; dI++) {
+      var da = (dI / TOWER_COUNT) * Math.PI * 2 + angles[2];
+      var pulse = 0.45 + 0.40 * (0.5 + 0.5 * Math.sin((Math.PI * 2 * t) / 30 + dI * 0.7));
+      ctx.globalAlpha = pulse;
+      var dr = Math.max(1.5, half * 0.0062) * (phone ? 1.15 : 1);
+      ctx.beginPath();
+      ctx.arc(cx + TOWER_FRAC * half * Math.cos(da), cy + TOWER_FRAC * half * Math.sin(da), dr, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // signal pulses: expanding rings out of the temple
+    ctx.strokeStyle = ink;
+    for (s = 0; s < signals.length; s++) {
+      var age = t - signals[s];
+      if (age >= 0 && age < 2.6) {
+        ctx.globalAlpha = 0.85 * (1 - age / 2.6);
+        ctx.lineWidth = Math.max(1.2, half * 0.005);
+        ctx.beginPath();
+        ctx.arc(cx, cy, half * 0.80 * (age / PULSE_FULL), 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- clock ----------
+  function nowMs() {
+    return (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+  }
+  var startMs = nowMs();
+  var prevT = 0;
+  function pieceT() { return (nowMs() - startMs) / 1000; }
+  function frame() {
+    var t = pieceT();
+    tickAudio(t, prevT);
+    prevT = t;
+    draw(t);
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+  }
+  draw(0); // deterministic frame one
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+
+  function redraw() { draw(pieceT()); }
+  if (typeof window !== 'undefined' && window.addEventListener) window.addEventListener('resize', redraw);
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', redraw);
+  }
+
+  // ---------- pointer interaction ----------
+  var pDown = false, pMoved = false, pStartX = 0, pStartY = 0, pStartT = 0, pLastA = 0, pLastMs = 0;
+  var lastTapT = -10, pendingSignal = null;
+  function pointerAngle(x, y) {
+    var vs = viewSize();
+    return Math.atan2(y - vs.h / 2, x - vs.w / 2);
+  }
+  function normAng(d) {
+    while (d > Math.PI) d -= Math.PI * 2;
+    while (d < -Math.PI) d += Math.PI * 2;
+    return d;
+  }
+  function onDown(x, y) {
+    initAudio();
+    if (AC && typeof AC.resume === 'function') { try { AC.resume(); } catch (e) { /* noop */ } }
+    pDown = true; pMoved = false;
+    pStartX = x; pStartY = y; pStartT = pieceT();
+    pLastA = pointerAngle(x, y); pLastMs = nowMs();
+    liveDelta = 0;
+  }
+  function onMove(x, y) {
+    if (!pDown) return;
+    var dx = x - pStartX, dy = y - pStartY;
+    if (dx * dx + dy * dy > 36) pMoved = true;
+    if (pMoved) {
+      dragging = true;
+      var a = pointerAngle(x, y);
+      var d = normAng(a - pLastA);
+      liveDelta += d;
+      var ms = nowMs(), dt = Math.max(1, ms - pLastMs) / 1000;
+      whirTarget = Math.min(0.11, Math.abs(d) / dt * 0.05);
+      pLastA = a; pLastMs = ms;
+    }
+  }
+  function onUp(x, y) {
+    if (!pDown) return;
+    pDown = false;
+    committedOffset += liveDelta;
+    liveDelta = 0;
+    dragging = false;
+    whirTarget = 0;
+    var dur = pieceT() - pStartT;
+    var dx = x - pStartX, dy = y - pStartY;
+    if (!pMoved && dx * dx + dy * dy <= 36 && dur < 0.6) {
+      var t = pieceT();
+      if (t - lastTapT < 0.38) {
+        // double-tap: inversion, and cancel the pending single-tap signal
+        inversions.push(t);
+        lastTapT = -10;
+        if (pendingSignal !== null) { clearTimeout(pendingSignal); pendingSignal = null; }
+      } else {
+        lastTapT = t;
+        (function (tt) {
+          pendingSignal = setTimeout(function () { signals.push(tt); pendingSignal = null; }, 380);
+        })(t);
+      }
+    }
+    redraw();
+  }
+  function evtPos(e) {
+    if (e && typeof e.clientX === 'number') return { x: e.clientX, y: e.clientY };
+    if (e && e.touches && e.touches.length) return { x: e.touches[0].clientX, y: e.touches[0].clientY };
+    if (e && e.changedTouches && e.changedTouches.length) return { x: e.changedTouches[0].clientX, y: e.changedTouches[0].clientY };
+    return { x: 0, y: 0 };
+  }
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('pointerdown', function (e) { var p = evtPos(e); onDown(p.x, p.y); });
+    window.addEventListener('pointermove', function (e) { var p = evtPos(e); onMove(p.x, p.y); });
+    window.addEventListener('pointerup', function (e) { var p = evtPos(e); onUp(p.x, p.y); });
+    window.addEventListener('pointercancel', function () { pDown = false; dragging = false; liveDelta = 0; });
+  }
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,585 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Scorched Earth</title>
+<style>
+  html, body { margin: 0; padding: 0; overflow: hidden; background: #F4EFE6; height: 100%; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded RNG ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- constants ----------
+  var PAPER = '#F4EFE6', INK = '#1A1A1A', FLAME = '#FF6B1A',
+      RING = '#CC3D00', EDGE = '#FFB84D', CHAR = '#2A1A10';
+  var LINES = [
+    'Scorched Earth',
+    'One year of fire, drawn as it burnt.',
+    'Each tick of the ring is a fire.',
+    'The ring grows with the land burnt.',
+    "The roar is the day's area.",
+    'What remains is the record: rings.'
+  ];
+  // cycle phases, in seconds
+  var DUR = {
+    base:   { text: 4, flame: 1.2, burn: 40, hold: 6 },
+    single: { text: 0, flame: 1.0, burn: 40, hold: 6 },
+    dbl:    { text: 0, flame: 0.6, burn: 8,  hold: 6 }
+  };
+  var RESTORE = 1.2; // restore fade inside the hold
+  var RMAX = 0.44;   // final ring radius, fraction of min(viewport)
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('cv');
+  var ctx = canvas.getContext('2d');
+  var W = 300, H = 300, S = 300, isPhone = false;
+
+  function measure() {
+    var vv = (typeof window !== 'undefined' && window.visualViewport) ? window.visualViewport : null;
+    var w = vv ? vv.width : (window.innerWidth || 300);
+    var h = vv ? vv.height : (window.innerHeight || 300);
+    W = Math.max(50, Math.round(w));
+    H = Math.max(50, Math.round(h));
+    S = Math.min(W, H);
+    var sw = 0;
+    if (typeof window !== 'undefined' && window.screen && window.screen.width) {
+      sw = Math.min(window.screen.width, window.screen.height || window.screen.width);
+    }
+    isPhone = sw ? (sw < 700) : (H > W * 1.15);
+    if (canvas.width !== W) canvas.width = W;
+    if (canvas.height !== H) canvas.height = H;
+  }
+  measure();
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { measure(); draw(now()); });
+  }
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('resize', function () { measure(); draw(now()); });
+  }
+
+  // ---------- clock (never Date.now for drawn state) ----------
+  var t0 = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+  function now() {
+    if (typeof performance !== 'undefined' && performance.now) return (performance.now() - t0) / 1000;
+    return 0;
+  }
+
+  // ---------- fire data (seeded init data, one synthetic year) ----------
+  var DAYS = 365;
+  var dayArea = [], cumArea = [0], clicks = [];
+  var maxDay = 0, weekNorm = [], maxWeek = 0;
+  (function genData() {
+    var rng = mulberry32(91879);
+    var d, k, w;
+    for (d = 0; d < DAYS; d++) {
+      var s = Math.exp(-Math.pow((d - 198) / 64, 2)); // season peaks late July
+      var spike = (rng() < 0.05) ? 2.2 : 1;
+      var n = Math.max(0, Math.round((1.5 + 30 * s) * spike * (0.35 + rng() * 0.9)));
+      var area = n * (0.5 + rng() * 1.6) * (0.7 + 0.6 * s);
+      dayArea.push(area);
+      cumArea.push(cumArea[d] + area);
+      if (area > maxDay) maxDay = area;
+      var nc = Math.min(3, n);
+      for (k = 0; k < nc; k++) {
+        clicks.push({ u: (d + 0.08 + 0.84 * (k + 0.5) / Math.max(1, nc)) / DAYS, g: rng() });
+      }
+    }
+    var weekArea = [];
+    for (w = 0; w < 53; w++) {
+      var a = cumArea[Math.min(DAYS, (w + 1) * 7)] - cumArea[w * 7];
+      weekArea.push(a);
+      if (a > maxWeek) maxWeek = a;
+    }
+    for (w = 0; w < 53; w++) weekNorm.push(maxWeek > 0 ? weekArea[w] / maxWeek : 0);
+  })();
+  var TOTAL = cumArea[DAYS];
+
+  function radiusFrac(u) {
+    if (u <= 0) return 0;
+    if (u >= 1) return RMAX;
+    var df = u * DAYS, i = Math.floor(df);
+    if (i >= DAYS) i = DAYS - 1;
+    var f = df - i;
+    var c = cumArea[i] + (cumArea[i + 1] - cumArea[i]) * f;
+    return RMAX * Math.sqrt(c / TOTAL);
+  }
+  function weekRadiusFrac(w) {
+    return RMAX * Math.sqrt(cumArea[Math.min(DAYS, (w + 1) * 7)] / TOTAL);
+  }
+
+  // sparks for the flame (seeded params, positions derived from time)
+  var SPARKS = [];
+  (function genSparks() {
+    var rng = mulberry32(5177);
+    for (var i = 0; i < 14; i++) {
+      SPARKS.push({
+        off: rng(), spd: 0.5 + rng() * 0.9,
+        ph: rng() * Math.PI * 2, drift: (rng() - 0.5) * 2,
+        sz: 0.8 + rng() * 1.5, hot: rng() < 0.5
+      });
+    }
+  })();
+
+  // ---------- event log (all state derives from this + t) ----------
+  var taps = []; // {t, fx, fy} recorded at pointer-up
+  var segs = []; // closed drag segments {t0, t1, pts:[{t, x, y}]} displacement in fractions of S
+  var openSeg = null;
+
+  function deriveActions(t) {
+    var sorted = taps.slice().sort(function (p, q) { return p.t - q.t; });
+    var actions = [], pending = null, i, tp;
+    for (i = 0; i < sorted.length; i++) {
+      tp = sorted[i];
+      if (tp.t > t) break;
+      if (pending && tp.t - pending.t <= 0.35) {
+        actions.push({ t: tp.t, type: 'dbl', fx: tp.fx, fy: tp.fy });
+        pending = null;
+      } else {
+        if (pending) actions.push({ t: pending.t + 0.35, type: 'single', fx: pending.fx, fy: pending.fy });
+        pending = tp;
+      }
+    }
+    if (pending) actions.push({ t: pending.t + 0.35, type: 'single', fx: pending.fx, fy: pending.fy });
+    return actions.filter(function (a) { return a.t <= t; });
+  }
+
+  function cycleLen(d) { return d.text + d.flame + d.burn + d.hold; }
+
+  function buildCycles(t) {
+    var actions = deriveActions(t);
+    var cycles = [];
+    var start = 0, dur = DUR.base, ign = { fx: 0.5, fy: 0.5 }, type = 'base', ai = 0;
+    while (cycles.length < 10000) {
+      var end = start + cycleLen(dur);
+      var act = (ai < actions.length) ? actions[ai] : null;
+      if (act && act.t < end) {
+        cycles.push({ start: start, end: act.t, dur: dur, ign: ign, type: type, idx: cycles.length });
+        start = act.t; ign = { fx: act.fx, fy: act.fy }; type = act.type;
+        dur = (act.type === 'dbl') ? DUR.dbl : DUR.single;
+        ai++;
+      } else {
+        cycles.push({ start: start, end: end, dur: dur, ign: ign, type: type, idx: cycles.length });
+        if (end > t) break;
+        start = end; ign = { fx: 0.5, fy: 0.5 }; type = 'base'; dur = DUR.base;
+      }
+    }
+    return cycles;
+  }
+
+  function segDisp(seg, t) {
+    var pts = seg.pts, x = 0, y = 0, i;
+    for (i = 0; i < pts.length; i++) {
+      if (pts[i].t <= t) { x = pts[i].x; y = pts[i].y; } else break;
+    }
+    return { x: x, y: y };
+  }
+
+  function windAt(cyc, t) {
+    var burnStart = cyc.start + cyc.dur.text + cyc.dur.flame;
+    var burnEnd = burnStart + cyc.dur.burn;
+    if (t < burnStart) return { x: 0, y: 0 };
+    var wx = 0, wy = 0, i, seg, d;
+    var all = openSeg ? segs.concat([openSeg]) : segs;
+    for (i = 0; i < all.length; i++) {
+      seg = all[i];
+      if (seg.t0 < cyc.start || seg.t0 > burnEnd) continue;
+      if (t <= seg.t1 || seg === openSeg) {
+        d = segDisp(seg, Math.min(t, seg.t1));
+        wx += d.x; wy += d.y;
+      } else {
+        d = segDisp(seg, seg.t1);
+        var dec = Math.exp(-(t - seg.t1) / 2.5);
+        wx += d.x * dec; wy += d.y * dec;
+      }
+    }
+    var mag = Math.sqrt(wx * wx + wy * wy);
+    if (mag > 0.16) { wx *= 0.16 / mag; wy *= 0.16 / mag; }
+    return { x: wx, y: wy };
+  }
+
+  function deriveState(t) {
+    var cycles = buildCycles(t);
+    var cyc = cycles[cycles.length - 1], i;
+    for (i = 0; i < cycles.length; i++) {
+      if (cycles[i].start <= t && t < cycles[i].end) { cyc = cycles[i]; break; }
+    }
+    var local = t - cyc.start, d = cyc.dur;
+    var phase, phaseT, u = 0;
+    if (local < d.text) { phase = 'text'; phaseT = local; }
+    else if (local < d.text + d.flame) { phase = 'flame'; phaseT = local - d.text; }
+    else if (local < d.text + d.flame + d.burn) {
+      phase = 'burn'; phaseT = local - d.text - d.flame; u = phaseT / d.burn;
+    } else { phase = 'hold'; phaseT = local - d.text - d.flame - d.burn; u = 1; }
+    var day = Math.min(DAYS - 1, Math.floor(u * DAYS));
+    return {
+      cyc: cyc, phase: phase, phaseT: phaseT, u: u, day: day,
+      rFrac: radiusFrac(u), wind: windAt(cyc, t),
+      flameAge: (phase === 'flame') ? phaseT : (phase === 'burn' ? d.flame + phaseT : -1)
+    };
+  }
+
+  // ---------- drawing helpers ----------
+  function traceRing(cx, cy, rFrac, wind, reverse) {
+    // adds the ring as a subpath to the current path (no beginPath)
+    var r = rFrac * S;
+    var mag = Math.sqrt(wind.x * wind.x + wind.y * wind.y);
+    var asym = Math.min(0.15, mag * 0.9);
+    var phi = mag > 0.0001 ? Math.atan2(wind.y, wind.x) : 0;
+    var N = 90, k, i, th, rr;
+    for (k = 0; k <= N; k++) {
+      i = reverse ? (N - k) : k;
+      th = (i / N) * Math.PI * 2;
+      rr = r * (1 + asym * Math.cos(th - phi));
+      if (k === 0) ctx.moveTo(cx + Math.cos(th) * rr, cy + Math.sin(th) * rr);
+      else ctx.lineTo(cx + Math.cos(th) * rr, cy + Math.sin(th) * rr);
+    }
+  }
+  function ringPath(cx, cy, rFrac, wind) {
+    ctx.beginPath();
+    traceRing(cx, cy, rFrac, wind, false);
+    ctx.closePath();
+  }
+
+  function drawText(alpha) {
+    if (alpha <= 0) return;
+    var fs = Math.max(13, S * (isPhone ? 0.036 : 0.030));
+    var lh = fs * 1.55;
+    ctx.save();
+    ctx.globalAlpha = Math.min(1, alpha);
+    ctx.fillStyle = INK;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    for (var i = 0; i < LINES.length; i++) {
+      var size = (i === 0) ? fs * 1.3 : fs;
+      ctx.font = size + 'px Georgia, "Times New Roman", serif';
+      ctx.fillText(LINES[i], W / 2, H / 2 + (i - 2.5) * lh);
+    }
+    ctx.restore();
+  }
+
+  function drawFlame(x, y, scale, age, tAbs) {
+    var flick = 1 + 0.10 * Math.sin(tAbs * 13.7) + 0.06 * Math.sin(tAbs * 27.3 + 1.3);
+    var h = S * 0.062 * scale * flick;
+    var w = h * 0.52 * (1 + 0.08 * Math.sin(tAbs * 17.9 + 0.6));
+    if (h < 1) return;
+    var layers = [
+      { s: 1.00, c: FLAME, a: 0.85 },
+      { s: 0.66, c: EDGE,  a: 0.90 },
+      { s: 0.36, c: FLAME, a: 0.95 }
+    ];
+    var i, L, hh, ww, yo;
+    ctx.save();
+    for (i = 0; i < layers.length; i++) {
+      L = layers[i]; hh = h * L.s; ww = w * L.s; yo = (1 - L.s) * h * 0.30;
+      ctx.globalAlpha = L.a;
+      ctx.fillStyle = L.c;
+      ctx.beginPath();
+      ctx.moveTo(x, y - hh * 0.58 + yo);
+      ctx.bezierCurveTo(x + ww * 0.62, y - hh * 0.05 + yo, x + ww * 0.50, y + hh * 0.30 + yo, x, y + hh * 0.42 + yo);
+      ctx.bezierCurveTo(x - ww * 0.50, y + hh * 0.30 + yo, x - ww * 0.62, y - hh * 0.05 + yo, x, y - hh * 0.58 + yo);
+      ctx.fill();
+    }
+    // sparks: deterministic loops rising from the flame
+    for (i = 0; i < SPARKS.length; i++) {
+      var sp = SPARKS[i];
+      var life = (age * sp.spd + sp.off) % 1;
+      var sx = x + Math.sin(life * 5 + sp.ph) * S * 0.006 + sp.drift * life * S * 0.020;
+      var sy = y - life * S * 0.085;
+      ctx.globalAlpha = (1 - life) * 0.75 * Math.min(1, scale + 0.3);
+      ctx.fillStyle = sp.hot ? FLAME : EDGE;
+      ctx.beginPath();
+      ctx.arc(sx, sy, Math.max(0.6, sp.sz * (1 - life * 0.5)), 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    var st = deriveState(t);
+    var cyc = st.cyc;
+    if (typeof document !== 'undefined' && document.body && document.body.style) {
+      document.body.style.background = PAPER;
+    }
+    ctx.fillStyle = PAPER;
+    ctx.fillRect(0, 0, W, H);
+
+    var ix = cyc.ign.fx * W, iy = cyc.ign.fy * H;
+    var cx = ix + st.wind.x * S, cy = iy + st.wind.y * S;
+    var rFrac = st.rFrac;
+    var restoreP = 0;
+    if (st.phase === 'hold') {
+      restoreP = Math.max(0, Math.min(1, (st.phaseT - (cyc.dur.hold - RESTORE)) / RESTORE));
+    }
+
+    // ----- explainer text -----
+    if (st.phase === 'text') {
+      drawText(1); // frame one is the explainer, fully present from t = 0
+    } else if (st.phase === 'flame') {
+      drawText(1);
+    } else {
+      // burn and hold: the char takes the text where the ring has passed
+      if (rFrac > 0) {
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(0, 0, W, H);
+        traceRing(cx, cy, rFrac, st.wind, true); // reversed winding cuts the hole
+        ctx.closePath();
+        ctx.clip();
+        drawText(1 - restoreP);
+        ctx.restore();
+        if (restoreP > 0) drawText(restoreP);
+      } else {
+        drawText(1);
+      }
+    }
+
+    // ----- char, tree rings, burning edge -----
+    if ((st.phase === 'burn' || st.phase === 'hold') && rFrac > 0) {
+      var fade = 1 - restoreP;
+      // charred disc under the ring
+      ringPath(cx, cy, rFrac, st.wind);
+      ctx.fillStyle = CHAR;
+      ctx.globalAlpha = 0.88 * fade;
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      // weekly tree rings: the ring's history, darker where more land burnt
+      ctx.strokeStyle = CHAR;
+      for (var wI = 0; wI < 53; wI++) {
+        var wr = weekRadiusFrac(wI);
+        if (wr <= 0 || wr > rFrac * 1.001) continue;
+        ringPath(cx, cy, wr, st.wind);
+        ctx.globalAlpha = (0.20 + 0.65 * weekNorm[wI]) * fade;
+        ctx.lineWidth = 1 + 1.3 * weekNorm[wI];
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+      // the burning edge itself, layered flat strokes (the ring IS the fire)
+      var glow = 1;
+      if (st.phase === 'hold') glow = Math.max(0, 1 - st.phaseT / 2);
+      var fl = 0.85 + 0.15 * Math.sin(t * 17.0) * Math.sin(t * 7.3 + 1.0);
+      if (glow > 0.01) {
+        ringPath(cx, cy, rFrac, st.wind);
+        ctx.strokeStyle = EDGE; ctx.globalAlpha = 0.22 * glow * fade;
+        ctx.lineWidth = 7; ctx.stroke();
+        ringPath(cx, cy, rFrac, st.wind);
+        ctx.strokeStyle = FLAME; ctx.globalAlpha = 0.45 * glow * fade * fl;
+        ctx.lineWidth = 4; ctx.stroke();
+        ringPath(cx, cy, rFrac * 0.985, st.wind);
+        ctx.strokeStyle = EDGE; ctx.globalAlpha = 0.70 * glow * fade;
+        ctx.lineWidth = 1; ctx.stroke();
+        ctx.globalAlpha = 1;
+      }
+      ringPath(cx, cy, rFrac, st.wind);
+      ctx.strokeStyle = RING;
+      ctx.globalAlpha = 0.95 * fade;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+
+    // ----- flame at the ignition point -----
+    if (st.phase === 'flame') {
+      var grow = Math.min(1, st.phaseT / (cyc.dur.flame * 0.7));
+      drawFlame(ix, iy, 0.35 + 0.65 * grow, st.flameAge, t);
+    } else if (st.phase === 'burn' && st.phaseT < 2.4) {
+      drawFlame(ix, iy, Math.max(0, 1 - st.phaseT / 2.4), st.flameAge, t);
+    }
+
+    updateAudio(st);
+  }
+
+  // ---------- audio (lazy, gesture-gated, guarded) ----------
+  var audio = { ctx: null, roarGain: null, noiseBuf: null };
+  var aud = { cyc: -1, clickIdx: 0, week: -1, flameCyc: -1 };
+
+  function initAudio() {
+    if (audio.ctx) return;
+    var AC = (typeof window !== 'undefined') ? (window.AudioContext || window.webkitAudioContext) : null;
+    if (typeof AC !== 'function') return;
+    try {
+      var c = new AC();
+      // short white-noise buffer for clicks and bursts
+      var nb = c.createBuffer(1, Math.floor(c.sampleRate * 0.1), c.sampleRate);
+      var nd = nb.getChannelData(0);
+      var r1 = mulberry32(9182);
+      for (var i = 0; i < nd.length; i++) nd[i] = r1() * 2 - 1;
+      audio.noiseBuf = nb;
+      // roar: looped brown noise through a lowpass
+      var bb = c.createBuffer(1, Math.floor(c.sampleRate * 2), c.sampleRate);
+      var bd = bb.getChannelData(0);
+      var r2 = mulberry32(31415), last = 0;
+      for (var j = 0; j < bd.length; j++) {
+        var white = r2() * 2 - 1;
+        last = (last + 0.02 * white) / 1.02;
+        bd[j] = last * 3.2;
+      }
+      var src = c.createBufferSource();
+      src.buffer = bb; src.loop = true;
+      var lp = c.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 420;
+      var g = c.createGain(); g.gain.value = 0;
+      src.connect(lp); lp.connect(g); g.connect(c.destination);
+      src.start();
+      audio.ctx = c; audio.roarGain = g;
+    } catch (e) { audio.ctx = null; }
+  }
+  function clickTick(g) {
+    if (!audio.ctx) return;
+    try {
+      var c = audio.ctx, t = c.currentTime;
+      var src = c.createBufferSource(); src.buffer = audio.noiseBuf;
+      var bp = c.createBiquadFilter(); bp.type = 'bandpass';
+      bp.frequency.value = 1500 + g * 900; bp.Q.value = 1.4;
+      var gn = c.createGain();
+      gn.gain.setValueAtTime(0.05, t);
+      gn.gain.exponentialRampToValueAtTime(0.001, t + 0.03);
+      src.connect(bp); bp.connect(gn); gn.connect(c.destination);
+      src.start(t); src.stop(t + 0.04);
+    } catch (e) {}
+  }
+  function deepNote(week) {
+    if (!audio.ctx) return;
+    try {
+      var c = audio.ctx, t = c.currentTime;
+      var osc = c.createOscillator(); osc.type = 'sine';
+      osc.frequency.value = Math.max(70, 140 - week * 1.3);
+      var gn = c.createGain();
+      gn.gain.setValueAtTime(0.0001, t);
+      gn.gain.exponentialRampToValueAtTime(0.10, t + 0.03);
+      gn.gain.exponentialRampToValueAtTime(0.001, t + 1.4);
+      osc.connect(gn); gn.connect(c.destination);
+      osc.start(t); osc.stop(t + 1.5);
+    } catch (e) {}
+  }
+  function ignitionBurst() {
+    if (!audio.ctx) return;
+    try {
+      var c = audio.ctx, t = c.currentTime;
+      // paper catch: filtered noise burst
+      var src = c.createBufferSource(); src.buffer = audio.noiseBuf;
+      src.loop = true;
+      var lp = c.createBiquadFilter(); lp.type = 'lowpass';
+      lp.frequency.setValueAtTime(500, t);
+      lp.frequency.exponentialRampToValueAtTime(2600, t + 0.08);
+      lp.frequency.exponentialRampToValueAtTime(300, t + 0.35);
+      var gn = c.createGain();
+      gn.gain.setValueAtTime(0.0001, t);
+      gn.gain.exponentialRampToValueAtTime(0.09, t + 0.04);
+      gn.gain.exponentialRampToValueAtTime(0.001, t + 0.38);
+      src.connect(lp); lp.connect(gn); gn.connect(c.destination);
+      src.start(t); src.stop(t + 0.4);
+      // low thump
+      var osc = c.createOscillator(); osc.type = 'sine';
+      osc.frequency.setValueAtTime(72, t);
+      osc.frequency.exponentialRampToValueAtTime(44, t + 0.3);
+      var og = c.createGain();
+      og.gain.setValueAtTime(0.0001, t);
+      og.gain.exponentialRampToValueAtTime(0.12, t + 0.02);
+      og.gain.exponentialRampToValueAtTime(0.001, t + 0.35);
+      osc.connect(og); og.connect(c.destination);
+      osc.start(t); osc.stop(t + 0.4);
+    } catch (e) {}
+  }
+  function updateAudio(st) {
+    if (!audio.ctx) return;
+    try {
+      if (st.cyc.idx !== aud.cyc) {
+        aud.cyc = st.cyc.idx;
+        aud.week = Math.floor(st.u * DAYS / 7);
+        aud.clickIdx = 0;
+        while (aud.clickIdx < clicks.length && clicks[aud.clickIdx].u <= st.u) aud.clickIdx++;
+      }
+      if (st.phase === 'flame' && aud.flameCyc !== st.cyc.idx) {
+        aud.flameCyc = st.cyc.idx;
+        ignitionBurst();
+      }
+      if (st.phase === 'burn') {
+        var guard = 0;
+        while (aud.clickIdx < clicks.length && clicks[aud.clickIdx].u <= st.u && guard < 12) {
+          clickTick(clicks[aud.clickIdx].g);
+          aud.clickIdx++; guard++;
+        }
+        var wk = Math.floor(st.u * DAYS / 7);
+        if (wk > aud.week) { aud.week = wk; deepNote(wk); }
+      }
+      if (audio.roarGain) {
+        var target = 0;
+        if (st.phase === 'burn') target = 0.04 + 0.22 * (maxDay > 0 ? dayArea[st.day] / maxDay : 0);
+        else if (st.phase === 'flame') target = 0.015;
+        audio.roarGain.gain.setTargetAtTime(target, audio.ctx.currentTime, 0.15);
+      }
+    } catch (e) {}
+  }
+
+  // ---------- pointer interaction ----------
+  var dragging = false, downT = 0, downX = 0, downY = 0, lastX = 0, lastY = 0, moved = 0;
+  function ptrPos(e) {
+    var r = (canvas.getBoundingClientRect) ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    var px = (e.clientX !== undefined ? e.clientX : (e.touches && e.touches[0] ? e.touches[0].clientX : 0)) - r.left;
+    var py = (e.clientY !== undefined ? e.clientY : (e.touches && e.touches[0] ? e.touches[0].clientY : 0)) - r.top;
+    return { x: px, y: py };
+  }
+  canvas.addEventListener('pointerdown', function (e) {
+    initAudio();
+    if (audio.ctx && audio.ctx.resume) { try { audio.ctx.resume(); } catch (err) {} }
+    var pos = ptrPos(e);
+    dragging = true; moved = 0;
+    downT = now(); downX = lastX = pos.x; downY = lastY = pos.y;
+    openSeg = { t0: downT, t1: downT, pts: [{ t: downT, x: 0, y: 0 }] };
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (!dragging || !openSeg) return;
+    var pos = ptrPos(e);
+    moved += Math.abs(pos.x - lastX) + Math.abs(pos.y - lastY);
+    lastX = pos.x; lastY = pos.y;
+    var t = now();
+    openSeg.t1 = t;
+    openSeg.pts.push({ t: t, x: (pos.x - downX) / S, y: (pos.y - downY) / S });
+  });
+  function endPointer(e) {
+    if (!dragging) return;
+    dragging = false;
+    var t = now();
+    var pos = (e && e.clientX !== undefined) ? ptrPos(e) : { x: lastX, y: lastY };
+    if (openSeg) {
+      openSeg.t1 = t;
+      if (moved >= 8) segs.push(openSeg);
+      openSeg = null;
+    }
+    if (t - downT < 0.4 && moved < 8) {
+      taps.push({ t: t, fx: pos.x / W, fy: pos.y / H });
+    }
+  }
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', endPointer);
+
+  // ---------- frame one + loop ----------
+  draw(0);
+  if (typeof requestAnimationFrame === 'function') {
+    var loop = function () {
+      draw(now());
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
