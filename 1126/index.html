@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Symphonie Cinetique</title>
+<style>
+  html, body { margin:0; padding:0; background:#040406; overflow:hidden; height:100%; }
+  canvas { display:block; touch-action:none; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<script>
+(function(){
+'use strict';
+
+// ---------- seeded RNG (mulberry32) ----------
+function mulberry32(a){
+  return function(){
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+var rng = mulberry32(11260713);
+
+// ---------- palette ----------
+var BG    = '#040406';
+var BRASS = '#D8A94E';
+var AMBER = '#8A6A2E';
+var CONE  = '#2E3A4A';
+
+// ---------- score ----------
+// 180 s movement. All frequencies are whole cycles per 180 s so every
+// section function is 180-periodic and the loop wraps seamlessly.
+var LOOP = 180;
+var BOUNDS = [40, 80, 120, 155, 165]; // section start times after 0
+// sections: 0 chaos, 1 waves, 2 canon, 3 unison, 4 finale, 5 release(=chaos)
+var N = 11;
+var P = []; // per-pendulum seeded params
+for (var i = 0; i < N; i++){
+  var f = i / (N - 1);
+  P.push({
+    grad: 1 - 0.28 * f,                              // longer rods swing a touch less
+    lenF: 0.47 + 0.30 * f,                           // graduated lengths (fraction of height)
+    chaosK: 26 + Math.floor(rng() * 28),             // 26..53 cycles per loop
+    chaosA: 0.30 + rng() * 0.20,
+    chaosP: rng() * Math.PI * 2,
+    noteStep: [0, 3, 5, 7, 10, 12, 15, 17, 19, 22, 24][i] // pentatonic ladder
+  });
+}
+var PAD_GAIN = [0.016, 0.030, 0.024, 0.038, 0.050, 0.020];
+
+function sectionIndex(mt){
+  if (mt < 40)  return 0;
+  if (mt < 80)  return 1;
+  if (mt < 120) return 2;
+  if (mt < 155) return 3;
+  if (mt < 165) return 4;
+  return 5;
+}
+function sectionAngle(sec, i, t){
+  var p = P[i], w = Math.PI * 2 / LOOP;
+  if (sec === 0 || sec === 5){           // chaos / release
+    return p.chaosA * p.grad * Math.sin(w * p.chaosK * t + p.chaosP);
+  }
+  if (sec === 1){                        // waves: one frequency, phases march across the row
+    return 0.42 * p.grad * Math.sin(w * 36 * t - i * 0.62);
+  }
+  if (sec === 2){                        // canon: three voices, staggered swells
+    var swell = 0.78 + 0.22 * Math.sin(w * 3 * t + i * 1.1);
+    return 0.38 * p.grad * swell * Math.sin(w * 36 * t + (i % 3) * (Math.PI * 2 / 3) + Math.floor(i / 3) * 0.35);
+  }
+  if (sec === 3){                        // unison adagio
+    return 0.48 * p.grad * Math.sin(w * 30 * t + 0.8);
+  }
+  return 0;                              // finale: all hang vertical, one held beat
+}
+function smooth(x){ return x <= 0 ? 0 : x >= 1 ? 1 : x * x * (3 - 2 * x); }
+
+function scoreAngle(i, mt){
+  var sec = sectionIndex(mt);
+  var a = sectionAngle(sec, i, mt);
+  // 3 s crossfade just after each boundary
+  var starts = [0, 40, 80, 120, 155, 165];
+  var start = starts[sec];
+  if (sec > 0 && mt - start < 3){
+    var prev = sectionAngle(sec - 1, i, mt);
+    var wgt = smooth((mt - start) / 3);
+    a = prev * (1 - wgt) + a * wgt;
+  }
+  return a;
+}
+
+// ---------- interaction state ----------
+var epoch = 0;                 // piece-time of last restart
+var drag = null;               // {i, ang} while dragging a bob
+var release = [];              // per pendulum {t, delta} after a drag ends
+var lastTap = { t: -10, x: 0, y: 0 };
+
+function pendulumAngle(i, t){
+  var mt = (t - epoch) % LOOP; if (mt < 0) mt += LOOP;
+  var a = scoreAngle(i, mt);
+  if (drag && drag.i === i) return drag.ang;
+  var r = release[i];
+  if (r){
+    var dt = t - r.t;
+    if (dt < 5) a += r.delta * Math.exp(-dt / 1.2);
+  }
+  return a;
+}
+
+// ---------- audio (lazy, gesture-gated, guarded) ----------
+var AC = null, padGain = null, lastPadSet = 0;
+function initAudio(){
+  if (AC) return;
+  var Ctor = (typeof AudioContext !== 'undefined') ? AudioContext :
+             (typeof webkitAudioContext !== 'undefined') ? webkitAudioContext : null;
+  if (!Ctor) return;
+  try {
+    AC = new Ctor();
+    var master = AC.createGain(); master.gain.value = 0.9; master.connect(AC.destination);
+    AC._master = master;
+    // string pad: two detuned saws through a lowpass
+    padGain = AC.createGain(); padGain.gain.value = 0.0;
+    var lp = AC.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 420; lp.Q.value = 0.4;
+    padGain.connect(lp); lp.connect(master);
+    [110, 164.81].forEach(function(fr){
+      [-6, 6].forEach(function(det){
+        var o = AC.createOscillator(); o.type = 'sawtooth'; o.frequency.value = fr; o.detune.value = det;
+        o.connect(padGain); o.start();
+      });
+    });
+  } catch (e) { AC = null; }
+}
+function playNote(i, vel){
+  if (!AC || AC.state !== 'running') return;
+  try {
+    var t0 = AC.currentTime;
+    var fr = 220 * Math.pow(2, P[i].noteStep / 12);
+    var o = AC.createOscillator(); o.type = 'triangle'; o.frequency.value = fr;
+    var lp = AC.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 1150; lp.Q.value = 0.3;
+    var g = AC.createGain();
+    var v = Math.min(0.22, 0.04 + vel * 0.30);
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(v, t0 + 0.012);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + 1.25);
+    o.connect(lp); lp.connect(g); g.connect(AC._master);
+    o.start(t0); o.stop(t0 + 1.35);
+  } catch (e) {}
+}
+
+// ---------- layout / drawing ----------
+var canvas = document.getElementById('stage');
+var ctx = canvas.getContext('2d');
+var W = 0, H = 0;
+
+function isPhone(){
+  try {
+    var sw = window.screen ? Math.min(window.screen.width, window.screen.height) : 9999;
+    if (sw < 700) return true;
+  } catch (e) {}
+  return H > W * 1.15;
+}
+function fit(){
+  var vv = (typeof window !== 'undefined' && window.visualViewport) ? window.visualViewport : null;
+  W = vv ? vv.width : (window.innerWidth || 800);
+  H = vv ? vv.height : (window.innerHeight || 600);
+  var dpr = Math.min((typeof window !== 'undefined' && window.devicePixelRatio) || 1, 2);
+  canvas.width = Math.round(W * dpr);
+  canvas.height = Math.round(H * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+if (typeof window !== 'undefined'){
+  if (window.visualViewport && window.visualViewport.addEventListener)
+    window.visualViewport.addEventListener('resize', fit);
+  window.addEventListener('resize', fit);
+}
+fit();
+
+function layout(){
+  var ceilY = H / 6;
+  var spread = Math.min(W * 0.86, H * 1.10);
+  var raw = [], maxL = 0;
+  for (var i = 0; i < N; i++){
+    var L = Math.min(H * P[i].lenF, H - ceilY - H * 0.06);
+    raw.push(L); if (L > maxL) maxL = L;
+  }
+  // Fit: narrow the pivot spread and/or scale rod lengths so the widest
+  // score swing (amplitude ~0.50 rad on the longest rod, at the outermost
+  // pivot) always stays inside the frame — matters on square/portrait sizes.
+  var avail = W / 2 - 12;
+  var spreadHalf = Math.min(spread / 2, avail * 0.62);
+  var fitK = Math.min(1, (avail - spreadHalf) / (maxL * Math.sin(0.50)));
+  if (!(fitK > 0)) fitK = 0.1;
+  var out = [];
+  for (i = 0; i < N; i++){
+    var x = W / 2 + (i / (N - 1) - 0.5) * spreadHalf * 2;
+    var Lf = raw[i] * fitK;
+    out.push({ x: x, y: ceilY, L: Lf, r: Math.max(5, Math.min(16, Lf * 0.055)) });
+  }
+  return out;
+}
+
+function draw(t){
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  ctx.fillStyle = BG;
+  ctx.fillRect(0, 0, W, H);
+  var lay = layout();
+  var ceilY = H / 6;
+
+  // spotlight cone: stacked translucent triangles from top centre
+  var apexX = W / 2, baseHalf = Math.min(W, H) * 0.46;
+  var coneAlphas = [0.050, 0.036, 0.022];
+  var coneWidths = [1.0, 0.72, 0.46];
+  ctx.fillStyle = CONE;
+  for (var c = 0; c < 3; c++){
+    ctx.globalAlpha = coneAlphas[c];
+    ctx.beginPath();
+    ctx.moveTo(apexX, -H * 0.02);
+    ctx.lineTo(apexX - baseHalf * coneWidths[c], H);
+    ctx.lineTo(apexX + baseHalf * coneWidths[c], H);
+    ctx.closePath(); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // ceiling line + pivot ticks
+  ctx.strokeStyle = 'rgba(216,169,78,0.28)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(lay[0].x - W * 0.05, ceilY);
+  ctx.lineTo(lay[N - 1].x + W * 0.05, ceilY);
+  ctx.stroke();
+  ctx.beginPath();
+  for (var i = 0; i < N; i++){
+    ctx.moveTo(lay[i].x, ceilY - 5);
+    ctx.lineTo(lay[i].x, ceilY + 5);
+  }
+  ctx.stroke();
+
+  // trails: fading arc segments sampled from the same angle function
+  ctx.strokeStyle = AMBER;
+  ctx.lineCap = 'round';
+  for (i = 0; i < N; i++){
+    var g = lay[i];
+    ctx.lineWidth = Math.max(1.2, g.r * 0.30);
+    for (var k = 6; k >= 1; k--){
+      var a1 = pendulumAngle(i, t - k * 0.20);
+      var a2 = pendulumAngle(i, t - (k - 1) * 0.20);
+      if (Math.abs(a2 - a1) < 0.0004) continue;
+      ctx.globalAlpha = 0.20 * (1 - k / 7) + 0.02;
+      ctx.beginPath();
+      ctx.arc(g.x, g.y, g.L, Math.PI / 2 + Math.min(a1, a2), Math.PI / 2 + Math.max(a1, a2));
+      ctx.stroke();
+    }
+  }
+  ctx.globalAlpha = 1;
+
+  // rods + bobs
+  for (i = 0; i < N; i++){
+    var q = lay[i];
+    var th = pendulumAngle(i, t);
+    var bx = q.x + q.L * Math.sin(th);
+    var by = q.y + q.L * Math.cos(th);
+    ctx.strokeStyle = 'rgba(205,185,145,0.38)';
+    ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.moveTo(q.x, q.y); ctx.lineTo(bx, by); ctx.stroke();
+    ctx.fillStyle = BRASS;
+    ctx.beginPath(); ctx.arc(bx, by, q.r, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = 'rgba(255,240,205,0.55)';
+    ctx.beginPath(); ctx.arc(bx - q.r * 0.32, by - q.r * 0.32, q.r * 0.30, 0, Math.PI * 2); ctx.fill();
+    q.bx = bx; q.by = by;
+  }
+  return lay;
+}
+
+// ---------- pointer ----------
+function pointerPos(e){
+  var r = canvas.getBoundingClientRect();
+  return { x: e.clientX - r.left, y: e.clientY - r.top };
+}
+canvas.addEventListener('pointerdown', function(e){
+  initAudio();
+  if (AC && AC.state === 'suspended') { try { AC.resume(); } catch (err) {} }
+  var now = perfNow() / 1000;
+  var t = T0 + now - startStamp;
+  var pos = pointerPos(e);
+  // double-tap: restart the movement from the chaos section
+  if (now - lastTap.t < 0.35 && Math.hypot(pos.x - lastTap.x, pos.y - lastTap.y) < 48){
+    epoch = t;
+    drag = null; release = [];
+    lastTap.t = -10;
+    return;
+  }
+  lastTap = { t: now, x: pos.x, y: pos.y };
+  var lay = layout();
+  for (var i = 0; i < N; i++){
+    var th = pendulumAngle(i, t);
+    var bx = lay[i].x + lay[i].L * Math.sin(th);
+    var by = lay[i].y + lay[i].L * Math.cos(th);
+    if (Math.hypot(pos.x - bx, pos.y - by) < Math.max(36, lay[i].r * 2.4)){
+      drag = { i: i, x0: lay[i].x, y0: lay[i].y, ang: th };
+      drag.ang = clampAng(Math.atan2(pos.x - lay[i].x, pos.y - lay[i].y));
+      try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+      return;
+    }
+  }
+});
+canvas.addEventListener('pointermove', function(e){
+  if (!drag) return;
+  var pos = pointerPos(e);
+  drag.ang = clampAng(Math.atan2(pos.x - drag.x0, pos.y - drag.y0));
+});
+function endDrag(){
+  if (!drag) return;
+  var now = perfNow() / 1000;
+  var t = T0 + now - startStamp;
+  var mt = (t - epoch) % LOOP; if (mt < 0) mt += LOOP;
+  var delta = drag.ang - scoreAngle(drag.i, mt);
+  release[drag.i] = { t: t, delta: delta };
+  drag = null;
+}
+canvas.addEventListener('pointerup', endDrag);
+canvas.addEventListener('pointercancel', endDrag);
+function clampAng(a){ return a < -1.05 ? -1.05 : a > 1.05 ? 1.05 : a; }
+
+// ---------- time / loop ----------
+var T0 = 58;                    // fixed phase: inside the waves section, crest mid-row
+var startStamp = 0;
+function perfNow(){
+  return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+}
+var prevTheta = null, prevSign = null, lastNoteAt = [];
+function frame(){
+  var now = perfNow() / 1000;
+  var t = T0 + (now - startStamp);
+  var lay = draw(t);
+  // audio: extremity detection + pad envelope
+  if (AC && AC.state === 'running'){
+    var mt = (t - epoch) % LOOP; if (mt < 0) mt += LOOP;
+    var sec = sectionIndex(mt);
+    if (now - lastPadSet > 0.25){
+      lastPadSet = now;
+      try { padGain.gain.setTargetAtTime(PAD_GAIN[sec], AC.currentTime, 0.6); } catch (e) {}
+    }
+    if (prevTheta){
+      for (var i = 0; i < N; i++){
+        var th = pendulumAngle(i, t);
+        var v = th - prevTheta[i];
+        var s = v > 0 ? 1 : v < 0 ? -1 : 0;
+        if (s !== 0 && prevSign[i] !== 0 && s !== prevSign[i] &&
+            Math.abs(th) > 0.04 && (!lastNoteAt[i] || now - lastNoteAt[i] > 0.2)){
+          lastNoteAt[i] = now;
+          playNote(i, Math.abs(th));
+        }
+        if (s !== 0) prevSign[i] = s;
+        prevTheta[i] = th;
+      }
+    } else {
+      prevTheta = []; prevSign = [];
+      for (var j = 0; j < N; j++){ prevTheta.push(pendulumAngle(j, t)); prevSign.push(0); }
+    }
+  }
+  if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(frame);
+}
+startStamp = perfNow() / 1000;
+draw(T0);                                   // synchronous deterministic first frame
+if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

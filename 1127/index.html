@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Timescope</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#1A1C20; overflow:hidden; }
+  canvas { display:block; touch-action:none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  /* ------- Timescope (Joachim Sauter, 1995) -------
+     A grayscale city fills the frame. A brass viewfinder lens drifts over
+     it (or follows the visitor's finger with optical lag); through the
+     lens the SAME seeded city is drawn again in its augmented register:
+     teal extrusions, amber routes with travelling data dots, a river of
+     flowing light. Outside the lens: the monochrome past. Inside: the
+     augmented present. No offscreen canvas: the city function is simply
+     drawn twice, the second pass clipped to the lens. */
+
+  var PHASE = 14.0;              // fixed first-frame phase (seconds)
+  var TAU = 0.22;                // lens spring lag (seconds)
+  var IDLE_AFTER = 6.0;          // seconds of no pointer before the tour resumes
+  var TPI = Math.PI * 2;
+
+  // Palette — outside the lens (monochrome)
+  var SKY = '#1A1C20', BLDG = '#2E3238', RIVER = '#101216';
+  // Palette — inside the lens (augmented)
+  var CYAN = '#35E0FF', AMBER = '#FFB84D', TEAL = '#1E8FA3', RLIGHT = '#6FD8FF';
+  var BRASS = '#C8A24A';
+
+  /* ---------------- seeded rng ---------------- */
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function seedFromQuery() {
+    try {
+      var s = (typeof location !== 'undefined' && location.search) || '';
+      var m = /[?&]seed=(\d+)/.exec(s);
+      if (m) return parseInt(m[1], 10) >>> 0;
+    } catch (e) { /* no location: fall through */ }
+    return 1127;
+  }
+
+  /* ---------------- city generation ----------------
+     Geometry is stored in fractions of the frame (x, base, h in units of
+     W or H as noted) so one city serves every viewport size. */
+  function genCity(seed) {
+    var rng = mulberry32(seed);
+
+    function row(base, hMin, hMax, wMin, wMax) {
+      var bs = [], x = -0.06;
+      while (x < 1.06) {
+        var w = wMin + rng() * (wMax - wMin);
+        bs.push({
+          x: x, w: w, base: base,
+          h: hMin + rng() * (hMax - hMin),
+          antenna: rng() < 0.30, antH: 0.02 + rng() * 0.045,
+          box: rng() < 0.35, boxW: 0.25 + rng() * 0.3, boxH: 0.015 + rng() * 0.02
+        });
+        x += w + 0.004 + rng() * 0.012;
+      }
+      return bs;
+    }
+
+    var back = row(0.62, 0.10, 0.26, 0.040, 0.095);
+    var front = row(0.70, 0.16, 0.40, 0.050, 0.115);
+
+    var clouds = [];
+    for (var i = 0; i < 5; i++) {
+      clouds.push({
+        x: rng() * 1.1 - 0.05, y: 0.06 + rng() * 0.20,
+        s: 0.55 + rng() * 0.85, ph: rng() * TPI, sp: 0.5 + rng() * 0.8,
+        puffs: 3 + Math.floor(rng() * 3), seed: rng() * 100
+      });
+    }
+
+    // Routes connect front-row rooftops (with an occasional back-row hop).
+    // Building references are kept so node heights can follow the draw mode:
+    // inside the lens the same buildings stand taller (extruded).
+    var routes = [];
+    function addRoute(b1, b2) {
+      routes.push({
+        b1: b1, b2: b2,
+        dots: 2 + Math.floor(rng() * 2), off: rng(), sp: 0.5 + rng() * 0.9
+      });
+    }
+    for (var k = 0; k < front.length - 2; k++) {
+      if (rng() < 0.72) {
+        var j = k + 2 + Math.floor(rng() * 2);
+        if (j < front.length) addRoute(front[k], front[j]);
+      }
+    }
+    if (front.length > 5 && back.length > 4) {
+      addRoute(back[2], front[3]);
+      addRoute(back[back.length - 3], front[front.length - 2]);
+    }
+
+    var birds = [];
+    for (var b = 0; b < 4; b++) {
+      birds.push({ seed: rng(), y: 0.10 + rng() * 0.20, sp: 0.7 + rng() * 0.7, ph: rng() * TPI });
+    }
+
+    return { back: back, front: front, clouds: clouds, routes: routes, birds: birds };
+  }
+
+  function nodeOf(b, aug) {
+    var f = aug ? 1.45 : 1.0;
+    return { x: b.x + b.w / 2, y: b.base - b.h * f };
+  }
+
+  /* ---------------- canvas / viewport ---------------- */
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0, DPR = 1, PHONE = false;
+
+  function fit() {
+    var w, h;
+    if (typeof window !== 'undefined' && window.visualViewport) {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    } else if (typeof window !== 'undefined') {
+      w = window.innerWidth; h = window.innerHeight;
+    } else { w = 720; h = 720; }
+    DPR = 1;
+    if (typeof window !== 'undefined' && window.devicePixelRatio) {
+      DPR = Math.min(window.devicePixelRatio, 2);
+    }
+    W = Math.max(50, Math.round(w)); H = Math.max(50, Math.round(h));
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    // Phone: window.screen physical size, min dimension < 700px;
+    // aspect fallback only if screen is missing.
+    var sw = 0, sh = 0;
+    if (typeof window !== 'undefined' && window.screen) {
+      sw = window.screen.width || 0; sh = window.screen.height || 0;
+    }
+    if (sw && sh) PHONE = Math.min(sw, sh) < 700;
+    else PHONE = (H > W * 1.15) && Math.min(W, H) < 700;
+  }
+
+  /* ---------------- interaction state ----------------
+     Everything the visitor does is recorded as timestamped samples;
+     the lens position is a closed-form function of that list and t. */
+  var seed = seedFromQuery();
+  var city = genCity(seed);
+  var samples = [];        // {x, y, t} pointer targets, in order
+  var lastTapT = -10, lastTapX = 0, lastTapY = 0;
+
+  var startStamp = null;
+  function nowT() {
+    var ms;
+    if (typeof performance !== 'undefined' && performance.now) ms = performance.now();
+    else ms = Date.now();
+    if (startStamp === null) startStamp = ms;
+    return PHASE + (ms - startStamp) / 1000;
+  }
+
+  function idlePos(t) {
+    // Phases tuned so that at t = PHASE the lens rests right-of-centre
+    // over the rooftops at (0.64, 0.36) of the frame, where two seeded
+    // routes cross — frame one shows the amber lines inside the brass.
+    return {
+      x: W * (0.50 + 0.17 * Math.sin(t * 0.13 - 0.851)),
+      y: H * (0.44 + 0.13 * Math.sin(t * 0.09 - 1.922))
+    };
+  }
+
+  function lensRadius() { return 0.125 * Math.min(W, H); }
+
+  function clampLens(p) {
+    var R = lensRadius();
+    p.x = Math.max(R * 0.45, Math.min(W - R * 0.45, p.x));
+    p.y = Math.max(R * 0.45, Math.min(H - R * 0.45, p.y));
+    return p;
+  }
+
+  function lensPos(t) {
+    if (!samples.length) return clampLens(idlePos(t));
+    // Critically-damped-style chase, evaluated from the recorded samples:
+    // at each sample the target changes; between samples the position
+    // decays exponentially toward the current target.
+    var cur = idlePos(samples[0].t);
+    var tgt = { x: samples[0].x, y: samples[0].y };
+    var tt = samples[0].t;
+    for (var i = 1; i < samples.length; i++) {
+      var dt = samples[i].t - tt;
+      var e = Math.exp(-dt / TAU);
+      cur = { x: tgt.x + (cur.x - tgt.x) * e, y: tgt.y + (cur.y - tgt.y) * e };
+      tgt = { x: samples[i].x, y: samples[i].y };
+      tt = samples[i].t;
+    }
+    var since = t - tt;
+    if (since <= IDLE_AFTER) {
+      var e2 = Math.exp(-Math.max(0, since) / TAU);
+      return clampLens({ x: tgt.x + (cur.x - tgt.x) * e2, y: tgt.y + (cur.y - tgt.y) * e2 });
+    }
+    // Idle resumes: the tour picks the lens up from wherever it rested.
+    var relT = tt + IDLE_AFTER;
+    var e3 = Math.exp(-IDLE_AFTER / TAU);
+    var rel = { x: tgt.x + (cur.x - tgt.x) * e3, y: tgt.y + (cur.y - tgt.y) * e3 };
+    var ip = idlePos(relT);
+    var e4 = Math.exp(-(t - relT) / 1.4);
+    var now = idlePos(t);
+    return clampLens({
+      x: now.x + (rel.x - ip.x) * e4,
+      y: now.y + (rel.y - ip.y) * e4
+    });
+  }
+
+  function recordSample(e) {
+    var x = e.clientX, y = e.clientY;
+    if (canvas.getBoundingClientRect) {
+      var r = canvas.getBoundingClientRect();
+      x -= r.left; y -= r.top;
+    }
+    samples.push({ x: x, y: y, t: nowT() });
+    if (samples.length > 240) samples.splice(0, samples.length - 240);
+  }
+
+  function onDown(e) {
+    var t = nowT();
+    var x = e.clientX, y = e.clientY;
+    if (canvas.getBoundingClientRect) {
+      var r = canvas.getBoundingClientRect();
+      x -= r.left; y -= r.top;
+    }
+    var dx = x - lastTapX, dy = y - lastTapY;
+    if (t - lastTapT < 0.32 && dx * dx + dy * dy < 1600) {
+      // double-tap: reseed the city (never a reload)
+      seed = (Math.imul(seed, 1103515245) + 12345) & 0x7fffffff;
+      city = genCity(seed);
+      lastTapT = -10;
+    } else {
+      lastTapT = t; lastTapX = x; lastTapY = y;
+    }
+    recordSample(e);
+    if (e.preventDefault) e.preventDefault();
+  }
+
+  function addListeners() {
+    if (!canvas.addEventListener) return;
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', function (e) {
+      if (samples.length || (e.buttons && e.buttons > 0)) recordSample(e);
+      else recordSample(e); // hover also guides the lens on desktop
+    });
+    canvas.addEventListener('touchstart', function (e) {
+      if (e.touches && e.touches[0]) onDown(e.touches[0]);
+      if (e.preventDefault) e.preventDefault();
+    }, { passive: false });
+    canvas.addEventListener('touchmove', function (e) {
+      if (e.touches && e.touches[0]) recordSample(e.touches[0]);
+      if (e.preventDefault) e.preventDefault();
+    }, { passive: false });
+  }
+
+  function addResize() {
+    function onR() { fit(); draw(nowT()); }
+    if (typeof window !== 'undefined' && window.visualViewport &&
+        window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', onR);
+    }
+    if (typeof window !== 'undefined' && window.addEventListener) {
+      window.addEventListener('resize', onR);
+    }
+  }
+
+  /* ---------------- the city, drawn twice ---------------- */
+  function drawBuildings(list, aug, backRow) {
+    var f = aug ? 1.45 : 1.0;
+    for (var i = 0; i < list.length; i++) {
+      var b = list[i];
+      var x = b.x * W, w = b.w * W;
+      var base = b.base * H, top = (b.base - b.h * f) * H;
+      if (aug) {
+        ctx.globalAlpha = backRow ? 0.50 : 0.92;
+        ctx.fillStyle = TEAL;
+        ctx.fillRect(x, top, w, base - top);
+        ctx.globalAlpha = backRow ? 0.45 : 0.9;
+        ctx.strokeStyle = CYAN;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(x, base); ctx.lineTo(x, top); ctx.lineTo(x + w, top); ctx.lineTo(x + w, base);
+        ctx.stroke();
+      } else {
+        ctx.globalAlpha = backRow ? 0.50 : 1.0;
+        ctx.fillStyle = BLDG;
+        ctx.fillRect(x, top, w, base - top);
+      }
+      // rooftop furniture — same geometry in both registers
+      if (b.box) {
+        var bw = w * b.boxW, bh = b.boxH * H * f;
+        ctx.globalAlpha = aug ? 0.9 : (backRow ? 0.5 : 1.0);
+        ctx.fillStyle = aug ? TEAL : BLDG;
+        ctx.fillRect(x + w * 0.18, top - bh, bw, bh);
+        if (aug) {
+          ctx.strokeStyle = CYAN; ctx.globalAlpha = 0.7; ctx.lineWidth = 1;
+          ctx.strokeRect(x + w * 0.18, top - bh, bw, bh);
+        }
+      }
+      if (b.antenna) {
+        var ax = x + w * 0.68, ah = b.antH * H * f;
+        ctx.globalAlpha = aug ? 0.85 : (backRow ? 0.5 : 0.9);
+        ctx.strokeStyle = aug ? CYAN : BLDG;
+        ctx.lineWidth = Math.max(1, W * 0.0012);
+        ctx.beginPath(); ctx.moveTo(ax, top); ctx.lineTo(ax, top - ah); ctx.stroke();
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawCity(aug, t) {
+    // sky / ground field
+    ctx.fillStyle = SKY;
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = RIVER;
+    ctx.fillRect(0, 0.70 * H, W, 0.30 * H);
+
+    // clouds — drifting blobs on slow Lissajous paths
+    var ci, c;
+    for (ci = 0; ci < city.clouds.length; ci++) {
+      c = city.clouds[ci];
+      var cx = (c.x + 0.030 * Math.sin(t * 0.05 * c.sp + c.ph)) * W;
+      var cy = (c.y + 0.012 * Math.sin(t * 0.037 * c.sp + c.ph * 2.0)) * H;
+      ctx.fillStyle = aug ? CYAN : BLDG;
+      ctx.globalAlpha = aug ? 0.05 : 0.35;
+      for (var p = 0; p < c.puffs; p++) {
+        var px = cx + (p - (c.puffs - 1) / 2) * 0.045 * W * c.s;
+        var pr = (0.028 + 0.016 * Math.sin(c.seed + p * 1.7)) * W * c.s;
+        ctx.beginPath();
+        ctx.ellipse(px, cy + 0.008 * H * Math.sin(c.seed * 3 + p), pr, pr * 0.36, 0, 0, TPI);
+        ctx.fill();
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    // skyline, far row then near row
+    drawBuildings(city.back, aug, true);
+    drawBuildings(city.front, aug, false);
+
+    // routes with travelling data dots (augmented register only)
+    if (aug) {
+      var ri, r, a, b, mx, my, seg1, seg2, total;
+      for (ri = 0; ri < city.routes.length; ri++) {
+        r = city.routes[ri];
+        a = nodeOf(r.b1, true); b = nodeOf(r.b2, true);
+        mx = (a.x + b.x) / 2; my = Math.max(a.y, b.y) + 0.015;
+        ctx.strokeStyle = AMBER;
+        ctx.globalAlpha = 0.9;
+        ctx.lineWidth = Math.max(1.2, H * 0.0022);
+        ctx.beginPath();
+        ctx.moveTo(a.x * W, a.y * H);
+        ctx.lineTo(mx * W, my * H);
+        ctx.lineTo(b.x * W, b.y * H);
+        ctx.stroke();
+        // node ticks
+        ctx.fillStyle = AMBER; ctx.globalAlpha = 0.9;
+        ctx.fillRect(a.x * W - 1.5, a.y * H - 1.5, 3, 3);
+        ctx.fillRect(b.x * W - 1.5, b.y * H - 1.5, 3, 3);
+        // data dots, position closed-form in t along the two segments
+        seg1 = Math.hypot((mx - a.x) * W, (my - a.y) * H);
+        seg2 = Math.hypot((b.x - mx) * W, (b.y - my) * H);
+        total = seg1 + seg2;
+        for (var d = 0; d < r.dots; d++) {
+          var u = ((t * 0.045 * r.sp + r.off + d / r.dots) % 1 + 1) % 1;
+          var dist = u * total, px2, py2;
+          if (dist < seg1) {
+            var q1 = seg1 ? dist / seg1 : 0;
+            px2 = (a.x + (mx - a.x) * q1) * W; py2 = (a.y + (my - a.y) * q1) * H;
+          } else {
+            var q2 = seg2 ? (dist - seg1) / seg2 : 0;
+            px2 = (mx + (b.x - mx) * q2) * W; py2 = (my + (b.y - my) * q2) * H;
+          }
+          ctx.fillStyle = CYAN;
+          ctx.globalAlpha = 0.22;
+          ctx.beginPath(); ctx.arc(px2, py2, 5, 0, TPI); ctx.fill();
+          ctx.globalAlpha = 0.95;
+          ctx.beginPath(); ctx.arc(px2, py2, 2, 0, TPI); ctx.fill();
+        }
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    // river band — quiet dashes in mono, flowing light in augmented
+    var rTop = 0.80 * H, rBot = 0.90 * H;
+    ctx.fillStyle = aug ? TEAL : RIVER;
+    ctx.globalAlpha = aug ? 0.30 : 1;
+    ctx.fillRect(0, rTop, W, rBot - rTop);
+    ctx.globalAlpha = 1;
+    var dashLen = 0.030 * W, period = 0.058 * W;
+    for (var rowi = 0; rowi < 3; rowi++) {
+      var y = (0.822 + rowi * 0.026) * H;
+      var speed = aug ? 0.030 : 0.008;
+      var off = ((t * speed * (1 + rowi * 0.35) + rowi * 0.31) % 1) * period;
+      ctx.strokeStyle = aug ? RLIGHT : BLDG;
+      ctx.globalAlpha = aug ? 0.85 : 0.55;
+      ctx.lineWidth = Math.max(1, H * 0.0022);
+      ctx.beginPath();
+      for (var x = -period + off; x < W + period; x += period) {
+        ctx.moveTo(x, y);
+        ctx.lineTo(x + dashLen, y);
+      }
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+
+    // birds — the past only; the augmented register has no birds
+    if (!aug) {
+      ctx.strokeStyle = BLDG;
+      ctx.globalAlpha = 0.65;
+      ctx.lineWidth = Math.max(1, H * 0.0016);
+      for (var bi = 0; bi < city.birds.length; bi++) {
+        var bd = city.birds[bi];
+        var bx = (((bd.seed + t * 0.006 * bd.sp) % 1) * 1.15 - 0.075) * W;
+        var by = (bd.y + 0.010 * Math.sin(t * 0.5 + bd.ph)) * H;
+        var flap = Math.sin(t * 6 + bd.ph) * 0.006 * H;
+        var bw2 = 0.008 * W;
+        ctx.beginPath();
+        ctx.moveTo(bx - bw2, by - flap);
+        ctx.lineTo(bx, by);
+        ctx.lineTo(bx + bw2, by - flap);
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  /* ---------------- frame ---------------- */
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+    // the monochrome past, full frame
+    drawCity(false, t);
+
+    // the augmented present, through the lens
+    var lp = lensPos(t);
+    var R = lensRadius();
+
+    ctx.save();
+    ctx.beginPath(); ctx.arc(lp.x, lp.y, R, 0, TPI); ctx.clip();
+    ctx.translate(lp.x, lp.y); ctx.scale(1.05, 1.05); ctx.translate(-lp.x, -lp.y);
+    drawCity(true, t);
+    ctx.restore();
+
+    ctx.save();
+    ctx.beginPath(); ctx.arc(lp.x, lp.y, R * 0.93, 0, TPI); ctx.clip();
+    drawCity(true, t);
+    ctx.restore();
+
+    // brass ring
+    ctx.strokeStyle = BRASS;
+    ctx.globalAlpha = 0.95;
+    ctx.lineWidth = Math.max(2, R * 0.045);
+    ctx.beginPath(); ctx.arc(lp.x, lp.y, R, 0, TPI); ctx.stroke();
+    ctx.globalAlpha = 0.55;
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.arc(lp.x, lp.y, R + R * 0.07, 0, TPI); ctx.stroke();
+    ctx.globalAlpha = 0.35;
+    ctx.beginPath(); ctx.arc(lp.x, lp.y, R - R * 0.05, 0, TPI); ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    // etched crosshair
+    ctx.strokeStyle = BRASS;
+    ctx.globalAlpha = 0.16;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(lp.x - R * 0.92, lp.y); ctx.lineTo(lp.x + R * 0.92, lp.y);
+    ctx.moveTo(lp.x, lp.y - R * 0.92); ctx.lineTo(lp.x, lp.y + R * 0.92);
+    ctx.stroke();
+    ctx.globalAlpha = 0.32;
+    ctx.fillStyle = BRASS;
+    ctx.beginPath(); ctx.arc(lp.x, lp.y, 1.6, 0, TPI); ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  /* ---------------- run ---------------- */
+  fit();
+  addListeners();
+  addResize();
+  draw(PHASE); // synchronous first frame at the fixed phase
+
+  if (typeof requestAnimationFrame === 'function') {
+    var loop = function () {
+      draw(nowT());
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>

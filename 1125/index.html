@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Floating Numbers</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #10141B; overflow: hidden; height: 100%; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded RNG ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  var SEED = 11250607;
+  var T0 = 14.0;               // fixed first-frame phase (seconds)
+  var K = 7;                   // cluster count
+  var N = 340;                 // floating numbers (plus one hero)
+  var AUTO_TIDE = 90;          // seconds between idle data tides
+  var TIDE_BLEND = 4;          // seconds for anchors to ease to a new layout
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  var W = 0, H = 0, U = 1;      // viewport size, unit scale
+  var PHONE = false;
+
+  function isPhone(w, h) {
+    var sw = 0, sh = 0;
+    if (typeof window !== 'undefined' && window.screen) {
+      sw = window.screen.width || 0;
+      sh = window.screen.height || 0;
+    }
+    var minScreen = Math.min(sw, sh);
+    if (minScreen > 0) return minScreen < 700;
+    return h > w * 1.15;
+  }
+
+  function fit() {
+    var w, h;
+    if (typeof window !== 'undefined' && window.visualViewport) {
+      w = window.visualViewport.width;
+      h = window.visualViewport.height;
+    } else {
+      w = window.innerWidth;
+      h = window.innerHeight;
+    }
+    W = Math.max(50, Math.floor(w));
+    H = Math.max(50, Math.floor(h));
+    canvas.width = W;
+    canvas.height = H;
+    U = Math.min(W, H) / 800;
+    if (U < 0.35) U = 0.35;
+    PHONE = isPhone(W, H);
+  }
+
+  // ---------- glyphs ----------
+  function glyphFor(rng, type) {
+    var r = rng();
+    if (type === 'date') {
+      if (r < 0.45) return String(1952 + Math.floor(rng() * 72));            // 1952..2023
+      if (r < 0.75) return (1 + Math.floor(rng() * 12)) + '.' + (10 + Math.floor(rng() * 89));
+      return String(10 + Math.floor(rng() * 89)) + '.' + (1 + Math.floor(rng() * 12));
+    }
+    if (type === 'op') {
+      var ops = ['+', '%', '=', '-', '/', 'x', ':', '*'];
+      return ops[Math.floor(rng() * ops.length)];
+    }
+    // value
+    if (r < 0.4) return (rng() * 9.9).toFixed(1);
+    if (r < 0.62) return String(Math.floor(rng() * 1000));
+    if (r < 0.8) return (rng() * 99).toFixed(2);
+    if (r < 0.92) return String(Math.floor(rng() * 100));
+    return (rng() * 900 + 100).toFixed(1);
+  }
+
+  // cluster dominant types: values, values, dates, values, dates, mixed, values
+  var CLUSTER_TYPE = ['value', 'value', 'date', 'value', 'date', 'op', 'value'];
+  var COLORS = { value: '#7DF9FF', date: '#FFB84D', op: '#5A6472' };
+
+  // ---------- anchors: one layout per tide generation ----------
+  // fixed neighbourhood slots (keeps clusters spread, centre-weighted),
+  // re-jittered by the seeded RNG on every tide generation
+  var SLOTS = [
+    { x: 0.24, y: 0.30 }, { x: 0.44, y: 0.64 }, { x: 0.60, y: 0.26 },
+    { x: 0.78, y: 0.56 }, { x: 0.30, y: 0.80 }, { x: 0.58, y: 0.86 },
+    { x: 0.84, y: 0.22 }
+  ];
+  function anchorBase(gen, k) {
+    var rng = mulberry32(SEED + gen * 7919 + k * 131);
+    var s = SLOTS[k % SLOTS.length];
+    return {
+      x: s.x + (rng() - 0.5) * 0.09,
+      y: s.y + (rng() - 0.5) * 0.09
+    };
+  }
+  // per-anchor wander parameters (same across generations)
+  var anchorWander = [];
+  (function () {
+    var rng = mulberry32(SEED ^ 0xA5A5);
+    for (var k = 0; k < K; k++) {
+      anchorWander.push({
+        ax: 0.018 + rng() * 0.03, ay: 0.018 + rng() * 0.03,
+        px: rng() * Math.PI * 2, py: rng() * Math.PI * 2,
+        tx: 46 + rng() * 40, ty: 52 + rng() * 44
+      });
+    }
+  })();
+
+  function anchorPos(gen, k, t, out) {
+    var b = anchorBase(gen, k);
+    var wn = anchorWander[k];
+    out.x = (b.x + wn.ax * Math.sin(2 * Math.PI * t / wn.tx + wn.px)) * W;
+    out.y = (b.y + wn.ay * Math.sin(2 * Math.PI * t / wn.ty + wn.py)) * H;
+  }
+
+  // ---------- tide state ----------
+  var tideGen = 0;        // current generation
+  var tidePrev = 0;       // generation we are easing from
+  var tideStart = -1000;  // piece-time of last tide
+  var nextAutoTide = AUTO_TIDE;
+
+  function fireTide(t) {
+    tidePrev = tideGen;
+    tideGen += 1;
+    tideStart = t;
+    nextAutoTide = t + AUTO_TIDE;
+  }
+
+  var _aPrev = { x: 0, y: 0 }, _aCur = { x: 0, y: 0 };
+  function anchorNow(k, t, out) {
+    anchorPos(tideGen, k, t, _aCur);
+    var f = (t - tideStart) / TIDE_BLEND;
+    if (f < 1) {
+      anchorPos(tidePrev, k, t, _aPrev);
+      var s = f * f * (3 - 2 * f);
+      out.x = _aPrev.x + (_aCur.x - _aPrev.x) * s;
+      out.y = _aPrev.y + (_aCur.y - _aPrev.y) * s;
+    } else {
+      out.x = _aCur.x; out.y = _aCur.y;
+    }
+  }
+
+  // ---------- numbers ----------
+  var numbers = [];
+  (function build() {
+    var rng = mulberry32(SEED);
+    var perCluster = [];
+    var i, k;
+    for (k = 0; k < K; k++) perCluster.push(0);
+    for (i = 0; i < N; i++) {
+      // pick a cluster, denser toward the middle clusters
+      var ck = Math.floor(Math.pow(rng(), 0.8) * K);
+      if (ck >= K) ck = K - 1;
+      var dom = CLUSTER_TYPE[ck];
+      var type = dom;
+      var roll = rng();
+      if (dom === 'op') {
+        type = roll < 0.55 ? 'op' : (roll < 0.8 ? 'value' : 'date');
+      } else if (roll < 0.1) {
+        type = 'op';
+      }
+      var head = perCluster[ck] < 2;   // first two in each cluster are cluster-heads
+      perCluster[ck]++;
+      numbers.push({
+        k: ck,
+        glyph: glyphFor(rng, type),
+        type: type,
+        head: head,
+        r0: (head ? 30 : 18) + rng() * (head ? 66 : 128),
+        phase: rng() * Math.PI * 2,
+        period: 34 + rng() * 46,
+        dir: rng() < 0.5 ? 1 : -1,
+        bPhase: rng() * Math.PI * 2,
+        alpha: 0.5 + rng() * 0.45,
+        sizeJitter: 0.85 + rng() * 0.4
+      });
+    }
+  })();
+
+  // hero number: large, off-centre, slowly counting
+  var HERO = (function () {
+    var rng = mulberry32(SEED ^ 0xBEEF);
+    return {
+      x: 0.1 + rng() * 0.05,
+      y: 0.48 + rng() * 0.08,
+      start: 1200 + Math.floor(rng() * 400),
+      driftP: rng() * Math.PI * 2
+    };
+  })();
+
+  // ---------- brushed table texture (precomputed, normalised) ----------
+  var streaks = [];
+  (function () {
+    var rng = mulberry32(SEED ^ 0x57EA);
+    for (var i = 0; i < 110; i++) {
+      streaks.push({
+        y: rng(), x: rng() * 0.7, len: 0.1 + rng() * 0.45,
+        light: rng() < 0.5, a: 0.015 + rng() * 0.035
+      });
+    }
+  })();
+
+  // ---------- interaction: scatter impulses + ripples ----------
+  var impulses = [];  // {x, y, t, s}
+  var ripples = [];   // {x, y, t}
+  var MAX_IMP = 14;
+
+  function addImpulse(x, y, t, s) {
+    impulses.push({ x: x, y: y, t: t, s: s });
+    if (impulses.length > MAX_IMP) impulses.shift();
+  }
+
+  var pieceTime = T0;
+  var down = false, lastX = 0, lastY = 0, lastImpT = 0;
+  var downX = 0, downY = 0, downT = 0, downMoved = false;
+  var lastTapT = -10, lastTapX = 0, lastTapY = 0;
+
+  function ptrPos(e) {
+    var r = canvas.getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  }
+
+  canvas.addEventListener('pointerdown', function (e) {
+    var p = ptrPos(e);
+    down = true; downMoved = false;
+    downX = lastX = p.x; downY = lastY = p.y; downT = pieceTime;
+    addImpulse(p.x, p.y, pieceTime, 0.7);
+    ripples.push({ x: p.x, y: p.y, t: pieceTime });
+    if (ripples.length > 6) ripples.shift();
+    lastImpT = pieceTime;
+  });
+
+  canvas.addEventListener('pointermove', function (e) {
+    if (!down) return;
+    var p = ptrPos(e);
+    var dx = p.x - lastX, dy = p.y - lastY;
+    var d = Math.sqrt(dx * dx + dy * dy);
+    if (d > 6) downMoved = true;
+    if (pieceTime - lastImpT > 0.055 && d > 2) {
+      var s = Math.min(1.6, 0.4 + d / 60);
+      addImpulse(p.x, p.y, pieceTime, s);
+      lastImpT = pieceTime;
+    }
+    lastX = p.x; lastY = p.y;
+  });
+
+  function endPointer() {
+    if (!down) return;
+    down = false;
+    // a tap: short, nearly still
+    if (!downMoved && pieceTime - downT < 0.3) {
+      var dt = pieceTime - lastTapT;
+      var dd = Math.sqrt((downX - lastTapX) * (downX - lastTapX) + (downY - lastTapY) * (downY - lastTapY));
+      if (dt < 0.35 && dd < 40 * U + 12) {
+        fireTide(pieceTime);
+        lastTapT = -10;
+      } else {
+        lastTapT = pieceTime; lastTapX = downX; lastTapY = downY;
+      }
+    }
+  }
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', endPointer);
+  canvas.addEventListener('pointerleave', endPointer);
+
+  // ---------- scatter response (closed form) ----------
+  function scatterOffset(px, py, t, out) {
+    out.x = 0; out.y = 0;
+    for (var i = 0; i < impulses.length; i++) {
+      var e = impulses[i];
+      var dt = t - e.t;
+      if (dt <= 0 || dt > 4) continue;
+      var dx = px - e.x, dy = py - e.y;
+      var d2 = dx * dx + dy * dy;
+      var R = 170 * U + 30;
+      var fall = Math.exp(-d2 / (R * R));
+      if (fall < 0.01) continue;
+      var d = Math.sqrt(d2) || 1;
+      var ux = dx / d, uy = dy / d;
+      // swirl: radial + tangential, damped spring settle ~3 s
+      var env = Math.exp(-dt / 1.05) * Math.sin(dt * 5.2);
+      var amp = e.s * fall * env * 64 * U;
+      out.x += (ux + (-uy) * 0.85) * amp;
+      out.y += (uy + (ux) * 0.85) * amp;
+    }
+  }
+
+  // ---------- draw ----------
+  var anchorCache = [];
+  for (var k0 = 0; k0 < K; k0++) anchorCache.push({ x: 0, y: 0 });
+  var _sc = { x: 0, y: 0 };
+
+  function drawGlyph(x, y, size, glyph, color, alpha) {
+    ctx.font = size + 'px "Helvetica Neue", Helvetica, Arial, sans-serif';
+    // soft glow: one larger, faint copy beneath (no shadowBlur, no gradients)
+    ctx.globalAlpha = alpha * 0.14;
+    ctx.fillStyle = color;
+    ctx.fillText(glyph, x, y);
+    ctx.font = (size * 0.72) + 'px "Helvetica Neue", Helvetica, Arial, sans-serif';
+    ctx.globalAlpha = alpha;
+    ctx.fillText(glyph, x, y);
+  }
+
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+
+    // table
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = '#10141B';
+    ctx.fillRect(0, 0, W, H);
+
+    // brushed streaks
+    ctx.lineWidth = Math.max(1, U);
+    for (var i = 0; i < streaks.length; i++) {
+      var st = streaks[i];
+      ctx.strokeStyle = st.light ? '#FFFFFF' : '#000000';
+      ctx.globalAlpha = st.a;
+      var sy = st.y * H, sx = st.x * W, sl = st.len * W;
+      ctx.beginPath();
+      ctx.moveTo(sx, sy);
+      ctx.lineTo(sx + sl, sy);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+
+    // anchors for this frame
+    for (var k = 0; k < K; k++) anchorNow(k, t, anchorCache[k]);
+
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+
+    var baseSmall = 15 * U + 4;
+    var baseHead = 24 * U + 6;
+
+    for (var n = 0; n < numbers.length; n++) {
+      if (PHONE && n % 4 === 3) continue;   // thin the plankton slightly on phones
+      var num = numbers[n];
+      var a = anchorCache[num.k];
+      var breathe = 1 + 0.18 * Math.sin(2 * Math.PI * t / 55 + num.bPhase);
+      var ang = num.phase + num.dir * 2 * Math.PI * t / num.period;
+      var rad = num.r0 * U * breathe;
+      var xf = Math.min(1.7, Math.max(1, W / H));
+      var px = a.x + Math.cos(ang) * rad * xf;
+      var py = a.y + Math.sin(ang) * rad * 0.82;
+      scatterOffset(px, py, t, _sc);
+      px += _sc.x; py += _sc.y;
+      var size = (num.head ? baseHead : baseSmall) * num.sizeJitter;
+      drawGlyph(px, py, size, num.glyph, COLORS[num.type], num.alpha);
+    }
+
+    // hero number
+    var heroVal = HERO.start + Math.floor(t / 6);
+    var heroSize = 118 * U + 26;
+    var hx = (HERO.x + 0.012 * Math.sin(2 * Math.PI * t / 70 + HERO.driftP)) * W;
+    var hy = (HERO.y + 0.012 * Math.cos(2 * Math.PI * t / 83 + HERO.driftP)) * H;
+    // keep the hero fully on the table at narrow widths
+    ctx.font = heroSize + 'px "Helvetica Neue", Helvetica, Arial, sans-serif';
+    var heroHalf = ctx.measureText(String(heroVal)).width / 2 + 6;
+    if (hx < heroHalf) hx = heroHalf;
+    if (hx > W - heroHalf) hx = W - heroHalf;
+    if (hy < heroSize * 0.55) hy = heroSize * 0.55;
+    if (hy > H - heroSize * 0.55) hy = H - heroSize * 0.55;
+    drawGlyph(hx, hy, heroSize, String(heroVal), COLORS.value, 0.92);
+
+    // touch ripples
+    for (var r = 0; r < ripples.length; r++) {
+      var rp = ripples[r];
+      var age = t - rp.t;
+      if (age < 0 || age > 1.2) continue;
+      var rr = age * 110 * U + 6;
+      ctx.globalAlpha = 0.22 * (1 - age / 1.2);
+      ctx.strokeStyle = '#FFFFFF';
+      ctx.lineWidth = Math.max(1, 1.4 * U);
+      ctx.beginPath();
+      ctx.arc(rp.x, rp.y, rr, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- run ----------
+  fit();
+  draw(T0);
+  pieceTime = T0;
+
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener('resize', function () { fit(); draw(pieceTime); });
+    }
+    window.addEventListener('resize', function () { fit(); draw(pieceTime); });
+  }
+
+  var startStamp = null;
+  function frame(now) {
+    if (startStamp === null) startStamp = now;
+    pieceTime = T0 + (now - startStamp) / 1000;
+    if (pieceTime >= nextAutoTide) fireTide(pieceTime);
+    draw(pieceTime);
+    if (typeof requestAnimationFrame !== 'undefined') {
+      requestAnimationFrame(frame);
+    }
+  }
+  if (typeof requestAnimationFrame !== 'undefined') {
+    requestAnimationFrame(frame);
+  }
+})();
+</script>
+</body>
+</html>
