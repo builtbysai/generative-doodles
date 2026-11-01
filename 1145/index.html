@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Databend Canvas</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #000000; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // №1145 "Databend Canvas" — Rosa Menkman study block RM2
+  // (A Vernacular of File Formats; databending by "random data insertion").
+  // A procedural source — 64 horizontal scanlines of varying thickness,
+  // each a rule-based pattern of flat runs — is decoded wrong on an
+  // 8-second loop. A corruption front sweeps top to bottom: rows behind
+  // it smear horizontally, slide their colour channels, and take injected
+  // blocks of impossible colour; they hold, then partially recover
+  // (never fully) before the file is rewritten for the next pass.
+  // Corruption is always band-structured (whole rows), never noise.
+  // The first 64 display rows are the file "header": the sweep may only
+  // ever shift them slightly — no slide, no smear, no injection.
+  // Everything is computed per row at draw time from seeded data: no
+  // offscreen canvas, no ImageData, no real encoding. Watch-only.
+
+  // ---------- palette (flat only) ----------
+  var BG = '#000000';
+  var PAL = ['#FF2E88', '#00F0FF', '#B6FF00', '#FFD500', '#FFFFFF'];
+  var PINK = 0, CYAN = 1, LIME = 2, YELLOW = 3, WHITE = 4;
+  // channel permutation applied by the "slide": R/B-style swap walked
+  // through the palette — white reads cyan, pink reads lime, and so on.
+  var PERM = [LIME, WHITE, YELLOW, PINK, CYAN];
+
+  var LOOP = 8;               // seconds, seamless
+  var T0 = 2.2;               // fixed first-frame phase (front mid-canvas)
+  var ROWS = 208;             // display rows
+  var HEADER = 64;            // first 64 display rows: header-skip rule
+  var NLINES = 64;            // source scanlines
+
+  // ---------- seeded rng ----------
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function clamp(x, a, b) { return x < a ? a : x > b ? b : x; }
+  function smooth(x) { x = clamp(x, 0, 1); return x * x * (3 - 2 * x); }
+
+  // ---------- the source: 64 scanlines as run data ----------
+  // Each scanline: a thickness weight and a list of runs {x0, x1, c}
+  // in normalised x, c an index into PAL. Rule-based patterns only:
+  // ticks, a solid bar, blocks, or two-tone dashes.
+  var lines = [];
+  (function buildSource() {
+    var rng = mulberry32(11452);
+    for (var i = 0; i < NLINES; i++) {
+      var weight = 2 + Math.floor(rng() * 4);            // 2..5 units thick
+      var type = rng();
+      var base = Math.floor(rng() * 5);
+      var runs = [];
+      var x, len, gap, k, cyc;
+      if (type < 0.40) {                                 // ticks
+        x = rng() * 0.08; k = 0;
+        while (x < 0.995) {
+          len = 0.02 + rng() * 0.09;
+          runs.push({ x0: x, x1: Math.min(1, x + len), c: (base + k) % 5 });
+          gap = 0.015 + rng() * 0.07;
+          x += len + gap; k++;
+        }
+      } else if (type < 0.60) {                          // solid bar
+        x = rng() * 0.15;
+        runs.push({ x0: x, x1: Math.min(1, x + 0.55 + rng() * 0.45), c: base });
+      } else if (type < 0.80) {                          // blocks
+        x = rng() * 0.06; k = 0;
+        var nb = 2 + Math.floor(rng() * 3);
+        for (var b = 0; b < nb && x < 0.98; b++) {
+          len = 0.12 + rng() * 0.18;
+          runs.push({ x0: x, x1: Math.min(1, x + len), c: (base + k) % 5 });
+          x += len + 0.04 + rng() * 0.10; k++;
+        }
+      } else {                                           // dashes, two-tone
+        len = 0.06 + rng() * 0.06;
+        cyc = (base + 1 + Math.floor(rng() * 3)) % 5;
+        x = 0; k = 0;
+        while (x < 1) {
+          runs.push({ x0: x, x1: Math.min(1, x + len), c: (k % 2) ? cyc : base });
+          x += len * 1.55; k++;
+        }
+      }
+      lines.push({ weight: weight, runs: runs });
+    }
+  })();
+
+  // display row -> scanline, by cumulative thickness weights
+  var rowLine = new Array(ROWS);
+  (function mapRows() {
+    var total = 0, i, r, cum = 0;
+    var edges = [];
+    for (i = 0; i < NLINES; i++) {
+      total += lines[i].weight;
+    }
+    for (i = 0; i < NLINES; i++) {
+      cum += lines[i].weight;
+      edges.push(Math.round(cum / total * ROWS));   // first row NOT in line i
+    }
+    var li = 0;
+    for (r = 0; r < ROWS; r++) {
+      while (li < NLINES - 1 && r >= edges[li]) li++;
+      rowLine[r] = li;
+    }
+  })();
+
+  // ---------- per-row bend parameters (seeded, fixed) ----------
+  var rowBend = new Array(ROWS);
+  (function buildBend() {
+    for (var r = 0; r < ROWS; r++) {
+      var rng = mulberry32(77000 + r * 131);
+      rowBend[r] = {
+        shift: rng() * 2 - 1,                 // memcpy row shift, -1..1
+        smear: rng() < 0.42,                  // this row smears when bent
+        smearAmt: 0.5 + rng() * 2.1,          // run stretch factor at I=1
+        slide: rng() < 0.48,                  // this row channel-slides
+        slideAmt: (rng() * 2 - 1) * 0.030,    // channel separation, frac of W
+        inject: rng() < 0.30,                 // this row takes an injection
+        injX: rng() * 0.75,
+        injW: 0.06 + rng() * 0.26,
+        injC: Math.floor(rng() * 5)
+      };
+    }
+  })();
+
+  // ---------- corruption intensity: a pure function of (row, phase) ----------
+  // The front reaches row r at phase a(r) = 0.5 * yn, sweeping the whole
+  // canvas by mid-loop. Behind the front a row ramps up, holds at full
+  // bend for ~2 s (0.25 of the loop), then recovers to a 0.35 residual
+  // and stays there — never fully — until the last 8% of the loop eases
+  // everything home so the next pass starts from the clean file.
+  function rowIntensity(r, p) {
+    var a = 0.5 * (r + 0.5) / ROWS;
+    var u = p - a;
+    if (u <= 0) return 0;
+    var base;
+    if (u < 0.06) base = smooth(u / 0.06);
+    else if (u < 0.31) base = 1;
+    else if (u < 0.55) base = 1 - 0.65 * ((u - 0.31) / 0.24);
+    else base = 0.35;
+    if (p > 0.92) base *= 1 - smooth((p - 0.92) / 0.08);
+    return base;
+  }
+
+  // ---------- phone detection ----------
+  var sw = (window.screen && window.screen.width) || 0;
+  var sh = (window.screen && window.screen.height) || 0;
+  var minScreen = Math.min(sw || 9999, sh || 9999);
+  var isPhone = minScreen < 700 || (sh > sw * 1.15 && minScreen < 900);
+  // full-bleed on every screen; the flag is kept for house consistency —
+  // the row count drops slightly on phones so bands stay chunky.
+  var rowsEff = isPhone ? 176 : ROWS;
+
+  // ---------- view / canvas ----------
+  var canvas = document.getElementById('stage');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0;
+
+  function viewW() {
+    if (window.visualViewport && window.visualViewport.width) return window.visualViewport.width;
+    return window.innerWidth || 800;
+  }
+  function viewH() {
+    if (window.visualViewport && window.visualViewport.height) return window.visualViewport.height;
+    return window.innerHeight || 800;
+  }
+  function fit() {
+    W = viewW(); H = viewH();
+    canvas.width = W; canvas.height = H;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+  }
+
+  // ---------- draw ----------
+  function draw(t) {
+    fit();
+    var p = ((t % LOOP) + LOOP) % LOOP / LOOP;
+    var nR = rowsEff;
+    var rh = H / nR;
+
+    ctx.fillStyle = BG;
+    ctx.fillRect(0, 0, W, H);
+
+    for (var r = 0; r < nR; r++) {
+      // map the effective row back onto the canonical 208-row field so
+      // the seeded data (and the 64-row header) is identical everywhere
+      var cr = Math.floor(r * ROWS / nR);
+      var line = lines[rowLine[cr]];
+      var bend = rowBend[cr];
+      var header = cr < HEADER;
+      var I = rowIntensity(cr, p);
+      var y = r * rh;
+      var hh = rh + 0.6;
+
+      if (header) {
+        // header-skip: a slight shift only, however hard the sweep hits
+        var hs = bend.shift * 0.02 * W * I;
+        for (var q = 0; q < line.runs.length; q++) {
+          var run0 = line.runs[q];
+          ctx.fillStyle = PAL[run0.c];
+          ctx.fillRect(run0.x0 * W + hs, y, (run0.x1 - run0.x0) * W, hh);
+        }
+        continue;
+      }
+      if (I <= 0.001) {
+        for (var q2 = 0; q2 < line.runs.length; q2++) {
+          var run1 = line.runs[q2];
+          ctx.fillStyle = PAL[run1.c];
+          ctx.fillRect(run1.x0 * W, y, (run1.x1 - run1.x0) * W, hh);
+        }
+        continue;
+      }
+
+      var shift = bend.shift * 0.28 * W * I;
+      var slidePx = bend.slide ? bend.slideAmt * W * I : 0;
+      var doSlide = bend.slide && I > 0.30;
+      var stretch = bend.smear ? bend.smearAmt * I : 0;
+
+      for (var q3 = 0; q3 < line.runs.length; q3++) {
+        var run = line.runs[q3];
+        var col = doSlide ? PERM[run.c] : run.c;
+        // channel separation: colour runs slide one way, white the other
+        var cx = shift + (doSlide ? (run.c === WHITE ? -0.5 : 1) * slidePx : 0);
+        var x0 = run.x0 * W + cx;
+        var x1 = run.x1 * W + cx;
+        if (stretch > 0) x1 += (x1 - x0) * stretch + 0.03 * W * I;
+        if (x1 < 0 || x0 > W) continue;
+        ctx.fillStyle = PAL[col];
+        ctx.fillRect(x0, y, x1 - x0, hh);
+      }
+
+      // injection: a block of impossible colour where bytes were rewritten
+      if (bend.inject && I > 0.45) {
+        var iw = bend.injW * W * ((I - 0.45) / 0.55);
+        ctx.fillStyle = PAL[bend.injC];
+        ctx.fillRect(bend.injX * W + shift * 0.5, y, iw, hh);
+      }
+    }
+  }
+
+  // ---------- run: synchronous fixed-phase first frame, then guarded rAF ----------
+  var lastT = T0;
+  if (window.addEventListener) {
+    window.addEventListener('resize', function () { draw(lastT); });
+  }
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { draw(lastT); });
+  }
+
+  draw(T0);
+
+  var startStamp = null;
+  function frame(stamp) {
+    if (startStamp === null) startStamp = stamp;
+    var t = T0 + (stamp - startStamp) / 1000;
+    lastT = t;
+    draw(t);
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+  }
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

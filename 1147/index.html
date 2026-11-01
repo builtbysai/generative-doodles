@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vernacular Triptych</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #111111; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // №1147 "Vernacular Triptych" — Rosa Menkman study block RM4.
+  // The Vernacular of File Formats mechanism: one procedural source, one
+  // injected error, three compression languages. Left panel renders the
+  // source blocky (JPEG-like, DCT smear inside the error band), center
+  // renders it posterized (PNG-like, hard channel steps), right renders
+  // it dithered (GIF-like, ordered Bayer 4x4). The error — a vertical
+  // band where rows are sampled displaced — migrates across all three
+  // panels on a 20 s idle loop; drag scrubs it, double-tap reseeds the
+  // source geometry. No offscreen canvas, no ImageData: the source is a
+  // function and every panel is drawn by sampling it.
+
+  var TAU = Math.PI * 2;
+  function clamp(x, a, b) { return x < a ? a : x > b ? b : x; }
+
+  // ---------- palette ----------
+  var BG = [16, 16, 16];            // #101010
+  var MAG = [255, 45, 120];         // #FF2D78
+  var CYA = [0, 208, 255];          // #00D0FF
+  var YEL = [255, 196, 0];          // #FFC400
+  var GROUND = '#111111';
+  var GUTTER = '#000000';
+
+  var T0 = 2.0;                     // fixed first-frame phase: error band in the left panel
+  var LOOP = 20;                    // idle error traverse, seconds
+
+  // ---------- seeded rng ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- source geometry, derived from the seed ----------
+  var seed = 1147;
+  var P = null;
+  function regen() {
+    var rnd = mulberry32(seed * 7919 + 13);
+    P = {
+      sqX: 0.52 + (rnd() - 0.5) * 0.10,          // nested-squares center, fractions
+      sqY: 0.30 + (rnd() - 0.5) * 0.05,
+      sqJit: (rnd() - 0.5) * 0.03,               // slight center offset per ring
+      hatchY0: 0.55 + (rnd() - 0.5) * 0.04,
+      hatchY1: 0.80 + (rnd() - 0.5) * 0.04,
+      hatchPer: 0.13 + rnd() * 0.05,             // stripe period, fraction of panel width
+      discX: 0.30 + (rnd() - 0.5) * 0.08,
+      discY: 0.67 + (rnd() - 0.5) * 0.05,
+      discR: 0.25 + rnd() * 0.05,                // fraction of panel width
+      bandFrac: 0.13 + rnd() * 0.08              // error-band width, fraction of triptych width
+    };
+  }
+  regen();
+
+  // The source: panel-local pixel coords -> [r,g,b]. Flat palette only.
+  function srcRGB(x, y, pw, ph) {
+    var col = BG;
+    // diagonal hatch band
+    if (y > P.hatchY0 * ph && y < P.hatchY1 * ph) {
+      var per = P.hatchPer * pw;
+      var s = (x + y) / per;
+      if (s - Math.floor(s) < 0.5) col = CYA;
+    }
+    // solid disc, over the hatch
+    var ddx = x - P.discX * pw, ddy = y - P.discY * ph;
+    var rr = P.discR * pw;
+    if (ddx * ddx + ddy * ddy < rr * rr) col = YEL;
+    // magenta block, lower right
+    if (x > 0.68 * pw && x < 0.93 * pw && y > 0.85 * ph && y < 0.93 * ph) col = MAG;
+    // nested squares, on top
+    var cx = P.sqX * pw, cy = P.sqY * ph;
+    var th = Math.max(2.5, pw * 0.032);
+    var sizes = [0.40, 0.30, 0.21, 0.13];
+    var cols = [MAG, CYA, YEL, MAG];
+    for (var i = 0; i < 4; i++) {
+      var ccx = cx + P.sqJit * pw * i, ccy = cy + P.sqJit * ph * i * 0.4;
+      var d = Math.max(Math.abs(x - ccx), Math.abs(y - ccy));
+      var s = sizes[i] * pw;
+      if (d <= s && d > s - th) { col = cols[i]; break; }
+    }
+    // filled heart of the smallest square
+    var hd = Math.max(Math.abs(x - (cx + P.sqJit * pw * 3)), Math.abs(y - (cy + P.sqJit * ph * 1.2)));
+    if (hd < th * 0.9) col = YEL;
+    return col;
+  }
+
+  // ---------- phone detection ----------
+  var sw = (window.screen && window.screen.width) || 0;
+  var sh = (window.screen && window.screen.height) || 0;
+  var minScreen = Math.min(sw || 9999, sh || 9999);
+  var isPhone = minScreen < 700 || (sh > sw * 1.15 && minScreen < 900);
+
+  // ---------- view / canvas ----------
+  var canvas = document.getElementById('stage');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0, GEO = null;
+
+  function viewW() {
+    if (window.visualViewport && window.visualViewport.width) return window.visualViewport.width;
+    return window.innerWidth || 800;
+  }
+  function viewH() {
+    if (window.visualViewport && window.visualViewport.height) return window.visualViewport.height;
+    return window.innerHeight || 800;
+  }
+  function fit() {
+    W = viewW(); H = viewH();
+    canvas.width = W; canvas.height = H;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    var blockH = H * 0.94;
+    var blockW = blockH * 0.75;
+    if (blockW > W * 0.94) { blockW = W * 0.94; blockH = blockW / 0.75; }
+    var gut = 2;
+    var panelW = (blockW - gut * 2) / 3;
+    GEO = {
+      blockX: (W - blockW) / 2, blockY: (H - blockH) / 2,
+      blockW: blockW, blockH: blockH,
+      panelW: panelW, panelH: blockH, gut: gut,
+      block: Math.max(10, Math.round(panelW / 14)),
+      cell: 3,
+      shiftPx: Math.round(blockH * 0.055),
+      smearMax: panelW * 0.10
+    };
+  }
+
+  // ---------- the error band ----------
+  // Idle: smooth ping-pong traverse of the whole triptych width, 20 s.
+  function idleE(t) {
+    var p = ((t % LOOP) + LOOP) % LOOP / LOOP;
+    var f = 0.5 - 0.5 * Math.cos(TAU * p);
+    return GEO.blockX + GEO.blockW * f;
+  }
+  var dragE = null;          // {x} while dragging: band follows the pointer
+  var releaseEp = null;      // {t, off} after a drag: offset decays to idle
+  function errorE(t) {
+    if (dragE) return dragE.x;
+    var e = idleE(t);
+    if (releaseEp) {
+      var dt = t - releaseEp.t;
+      if (dt >= 0) e += releaseEp.off * Math.exp(-dt / 1.4);
+    }
+    return e;
+  }
+
+  // Sample the source for a point, applying the error inside the band:
+  // rows displaced vertically (wrapped), and — blocky panel only — a
+  // horizontal smear that decays from the band center.
+  function sampleSrc(canvasX, lx, ly, blocky, E, hw) {
+    var pw = GEO.panelW, ph = GEO.panelH;
+    var sx = lx, sy = ly;
+    var d = canvasX - E;
+    if (d > -hw && d < hw) {
+      sy = ly + GEO.shiftPx;
+      if (blocky) sx = lx + GEO.smearMax * (1 - Math.abs(d) / hw);
+    }
+    sy = ((sy % ph) + ph) % ph;
+    sx = ((sx % pw) + pw) % pw;
+    return srcRGB(sx, sy, pw, ph);
+  }
+
+  // ---------- css color cache ----------
+  var cssCache = {};
+  function css(r, g, b) {
+    var k = (r << 16) | (g << 8) | b;
+    var s = cssCache[k];
+    if (!s) { s = 'rgb(' + r + ',' + g + ',' + b + ')'; cssCache[k] = s; }
+    return s;
+  }
+
+  // ---------- panel renderers ----------
+  // (a) blocky: coarse blocks filled with the mean of 3x3 samples.
+  function renderBlocky(px0, E, hw) {
+    var g = GEO, B = g.block, pw = g.panelW, ph = g.panelH, py0 = g.blockY;
+    for (var by = 0; by < ph; by += B) {
+      var bh = Math.min(B, ph - by);
+      for (var bx = 0; bx < pw; bx += B) {
+        var bw = Math.min(B, pw - bx);
+        var r = 0, gg = 0, b = 0;
+        for (var sy = 0; sy < 3; sy++) {
+          for (var sx = 0; sx < 3; sx++) {
+            var lx = bx + (sx + 0.5) * B / 3;
+            var ly = by + (sy + 0.5) * B / 3;
+            var c = sampleSrc(px0 + lx, lx, ly, true, E, hw);
+            r += c[0]; gg += c[1]; b += c[2];
+          }
+        }
+        ctx.fillStyle = css(Math.round(r / 9), Math.round(gg / 9), Math.round(b / 9));
+        ctx.fillRect(px0 + bx, py0 + by, bw, bh);
+      }
+    }
+  }
+
+  // (b) posterized: fine cells, each channel snapped to 4 hard levels.
+  function q4(v) { return Math.round(v / 85) * 85; }
+  function renderPoster(px0, E, hw) {
+    var g = GEO, C = g.cell, pw = g.panelW, ph = g.panelH, py0 = g.blockY;
+    for (var y = 0; y < ph; y += C) {
+      var hh = Math.min(C, ph - y);
+      var ly = y + C / 2;
+      for (var x = 0; x < pw; x += C) {
+        var c = sampleSrc(px0 + x + C / 2, x + C / 2, ly, false, E, hw);
+        ctx.fillStyle = css(q4(c[0]), q4(c[1]), q4(c[2]));
+        ctx.fillRect(px0 + x, py0 + y, Math.min(C, pw - x), hh);
+      }
+    }
+  }
+
+  // (c) dithered: fine cells, ordered Bayer 4x4 between 4-level steps.
+  var BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
+  function qDither(v, bx, by) {
+    var f = v / 85;
+    var lo = Math.floor(f);
+    var thr = (BAYER[(by & 3) * 4 + (bx & 3)] + 0.5) / 16;
+    var lv = lo + ((f - lo) > thr ? 1 : 0);
+    if (lv > 3) lv = 3;
+    return lv * 85;
+  }
+  function renderDither(px0, E, hw) {
+    var g = GEO, C = g.cell, pw = g.panelW, ph = g.panelH, py0 = g.blockY;
+    var row = 0;
+    for (var y = 0; y < ph; y += C, row++) {
+      var hh = Math.min(C, ph - y);
+      var ly = y + C / 2;
+      var colI = 0;
+      for (var x = 0; x < pw; x += C, colI++) {
+        var c = sampleSrc(px0 + x + C / 2, x + C / 2, ly, false, E, hw);
+        ctx.fillStyle = css(
+          qDither(c[0], colI, row),
+          qDither(c[1], colI, row),
+          qDither(c[2], colI, row));
+        ctx.fillRect(px0 + x, py0 + y, Math.min(C, pw - x), hh);
+      }
+    }
+  }
+
+  // ---------- draw ----------
+  var CHIPS = ['#FF2D78', '#00D0FF', '#FFC400'];
+  function draw(t) {
+    fit();
+    var g = GEO;
+    var E = errorE(t);
+    var hw = g.blockW * P.bandFrac / 2;
+
+    ctx.fillStyle = GROUND;
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = GUTTER;
+    ctx.fillRect(g.blockX - g.gut, g.blockY - g.gut, g.blockW + g.gut * 2, g.blockH + g.gut * 2);
+
+    var px = [g.blockX, g.blockX + g.panelW + g.gut, g.blockX + 2 * (g.panelW + g.gut)];
+    renderBlocky(px[0], E, hw);
+    renderPoster(px[1], E, hw);
+    renderDither(px[2], E, hw);
+
+    // identification chips — color only, no labels
+    var cs = clamp(g.panelW * 0.09, 9, 16);
+    for (var i = 0; i < 3; i++) {
+      ctx.fillStyle = CHIPS[i];
+      ctx.fillRect(px[i] + g.panelW / 2 - cs / 2, g.blockY + cs * 0.7, cs, cs);
+    }
+  }
+
+  // ---------- interaction ----------
+  var lastT = T0;
+  var pDown = null;         // {x, y, ms, moved}
+  var lastDownMs = -1000, lastDownX = 0, lastDownY = 0;
+  var suppressDrag = false; // second tap of a double-tap: do not drag the band
+
+  function nowMs() {
+    return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+  }
+  function onDown(e) {
+    if (!e) return;
+    var x = e.clientX || 0, y = e.clientY || 0;
+    var ms = nowMs();
+    suppressDrag = false;
+    if (ms - lastDownMs < 350 &&
+        Math.abs(x - lastDownX) < 24 && Math.abs(y - lastDownY) < 24) {
+      // double-tap: reseed the source geometry (and the band width)
+      seed++;
+      regen();
+      suppressDrag = true;
+      dragE = null;
+      releaseEp = null;
+    }
+    lastDownMs = ms; lastDownX = x; lastDownY = y;
+    pDown = { x: x, y: y, ms: ms };
+  }
+  function onMove(e) {
+    if (!pDown || !e) return;
+    var x = e.clientX || 0;
+    // the band engages only once the press becomes a real drag
+    if (!suppressDrag && (dragE || Math.abs(x - pDown.x) > 6)) {
+      dragE = { x: clamp(x, 0, W) };
+    }
+  }
+  function onUp(e) {
+    if (!pDown) return;
+    if (dragE) {
+      // hand the band back to the idle traverse with a decaying offset
+      releaseEp = { t: lastT, off: dragE.x - idleE(lastT) };
+      dragE = null;
+    }
+    pDown = null;
+    suppressDrag = false;
+  }
+
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+  }
+  if (window.addEventListener) {
+    window.addEventListener('resize', function () { draw(lastT); });
+  }
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { draw(lastT); });
+  }
+
+  // ---------- run: synchronous fixed-phase first frame, then guarded rAF ----------
+  draw(T0);
+
+  var startStamp = null;
+  function frame(stamp) {
+    if (startStamp === null) startStamp = stamp;
+    var t = T0 + (stamp - startStamp) / 1000;
+    lastT = t;
+    draw(t);
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+  }
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
