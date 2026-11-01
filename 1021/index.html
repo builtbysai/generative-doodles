@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Where Ads Belong</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0A0B0D; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+// No.1021 "Where Ads Belong" - yuta-asai PP182 "Counterfeit Placement".
+// A drawn street wall carrying empty ad slots. On seeded schedules,
+// counterfeit generative posters composite into the slots with an inpaint
+// shimmer and a macroblock flicker (the placement ceremony), hang, fade,
+// and leave the slot waiting again. No brands, no letterforms: the
+// forgeries are pure marks. Frame one is the synchronous draw at fixed
+// T0; it is never derived from Date.now().
+
+var T0 = 12.0;                  // frame-one piece time (seconds)
+var BASE_SEED = 1021182;
+
+var COL = {
+  wall: '#0A0B0D', slot: '#050507', black: '#000000',
+  magenta: '#FF2EA6', cyan: '#00E5FF', halftone: '#8A8D84', white: '#FFFFFF',
+  shimmer: '#FFD93B', flicker: '#FF2E4D'
+};
+// Concrete near-tones: the wall hex nudged a few steps either way so the
+// block joints read as flat drawn masonry, not a photo.
+var CONCRETE = ['#0B0C0F', '#0D0F12', '#090A0C', '#0E1013', '#0A0B0E'];
+var RIM_HI = '#17191E';          // recessed-slot top light, from the wall family
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function hashN(a, b, c) {
+  var h = (Math.imul(a | 0, 374761393) + Math.imul(b | 0, 668265263) + Math.imul(c | 0, 974634211)) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var W = 720, H = 720, PHONE = false;
+
+function fit() {
+  var vv = (typeof window !== 'undefined' && window.visualViewport) ? window.visualViewport : null;
+  W = vv ? vv.width : (window.innerWidth || 720);
+  H = vv ? vv.height : (window.innerHeight || 720);
+  canvas.width = W; canvas.height = H;
+  var sw = (window.screen && window.screen.width) || W;
+  var sh = (window.screen && window.screen.height) || H;
+  PHONE = (Math.min(sw, sh) < 700) || (H > W * 1.15);
+}
+fit();
+if (window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', fit);
+if (window.addEventListener) window.addEventListener('resize', fit);
+
+// ---------------- wall generation (seeded) ----------------
+var wallSeed = BASE_SEED;
+var blocks = [];                // concrete blocks {x,y,w,h,tone}
+function genWall() {
+  blocks = [];
+  var rng = mulberry32(wallSeed ^ 0xB10C);
+  var rows = PHONE ? 9 : 8;
+  for (var r = 0; r < rows; r++) {
+    var y = r / rows, hh = 1 / rows;
+    var x = -0.04 - rng() * 0.05;
+    while (x < 1.0) {
+      var bw = 0.13 + rng() * 0.16;
+      blocks.push({ x: x, y: y, w: bw, h: hh, tone: Math.floor(rng() * CONCRETE.length) });
+      x += bw;
+    }
+  }
+}
+
+// ---------------- slots ----------------
+// Loose grid, never aligned. x,y,w,h are frame fractions.
+var SLOT_POS = [
+  { x: 0.07, y: 0.07, w: 0.30, h: 0.25 },
+  { x: 0.45, y: 0.04, w: 0.35, h: 0.29 },
+  { x: 0.60, y: 0.44, w: 0.33, h: 0.27 },
+  { x: 0.09, y: 0.47, w: 0.25, h: 0.29 },
+  { x: 0.40, y: 0.63, w: 0.24, h: 0.27 },
+  { x: 0.71, y: 0.79, w: 0.25, h: 0.18 }
+];
+// Cycle design: [empty E, paste 1.0, hang Hh, fade 2.0], offset o.
+// Tuned so at t=12: slot0 + slot1 hang (different styles), slot2 is
+// mid-paste (0.45 into paste), slots 3-5 wait empty.
+var SLOT_CYC = [
+  { E: 4, Hh: 11, o: 15.0 },
+  { E: 5, Hh: 13, o: 0.0 },
+  { E: 3, Hh: 10, o: 7.25 },
+  { E: 6, Hh: 12, o: 11.0 },
+  { E: 4, Hh: 9,  o: 5.0 },
+  { E: 5, Hh: 12, o: 8.5 }
+];
+var PASTE_DUR = 1.0, FADE_DUR = 2.0, SHIMMER_DUR = 0.6, FLICKER_DUR = 0.45;
+var overrides = [null, null, null, null, null, null]; // per-slot visitor edits
+var tears = [];                                       // tear particle events
+var tearCount = 0;
+
+function cycleLen(c) { return c.E + PASTE_DUR + c.Hh + FADE_DUR; }
+
+// Returns {phase, pt (time into phase), cyc (poster cycle index)}.
+function slotState(i, t) {
+  var ov = overrides[i];
+  if (ov) {
+    var lt = t - ov.start;
+    if (ov.type === 'reforge') {
+      if (lt < PASTE_DUR) return { phase: 'paste', pt: lt, cyc: ov.cyc };
+      if (lt < PASTE_DUR + 11) return { phase: 'hang', pt: lt - PASTE_DUR, cyc: ov.cyc };
+      if (lt < PASTE_DUR + 11 + FADE_DUR) return { phase: 'fade', pt: lt - PASTE_DUR - 11, cyc: ov.cyc };
+      overrides[i] = null;
+    } else if (ov.type === 'torn') {
+      if (lt < 3.0) return { phase: 'empty', pt: lt, cyc: -1 };
+      overrides[i] = null;
+    }
+  }
+  var c = SLOT_CYC[i], len = cycleLen(c);
+  var local = ((t + c.o) % len + len) % len;
+  var cyc = Math.floor((t + c.o) / len);
+  if (local < c.E) return { phase: 'empty', pt: local, cyc: cyc };
+  local -= c.E;
+  if (local < PASTE_DUR) return { phase: 'paste', pt: local, cyc: cyc };
+  local -= PASTE_DUR;
+  if (local < c.Hh) return { phase: 'hang', pt: local, cyc: cyc };
+  local -= c.Hh;
+  return { phase: 'fade', pt: local, cyc: cyc };
+}
+
+function posterSeed(i, cyc) {
+  return (Math.imul(wallSeed, 31) + Math.imul(i + 1, 7919) + Math.imul(cyc + 64, 104729)) | 0;
+}
+
+// ---------------- poster art (pure marks, no letterforms) ----------------
+function drawPoster(x, y, w, h, seed, alpha, slotIdx, cyc) {
+  var rng = mulberry32(seed);
+  // rotate the seeded style by slot + cycle so neighbouring slots and
+  // successive hangings never repeat the same forgery family back to back
+  var style = (Math.floor(rng() * 5) + (slotIdx || 0) * 2 + (cyc || 0)) % 5;
+  ctx.save();
+  ctx.beginPath(); ctx.rect(x, y, w, h); ctx.clip();
+  ctx.globalAlpha = alpha;
+  var i, j;
+  if (style === 0) {                       // neon slashes
+    ctx.fillStyle = COL.slot; ctx.fillRect(x, y, w, h);
+    ctx.fillStyle = COL.magenta;
+    ctx.save(); ctx.translate(x + w * 0.5, y + h * 0.5); ctx.rotate(-0.5 - rng() * 0.3);
+    ctx.fillRect(-w * 0.7, -h * 0.30, w * 1.4, h * 0.16);
+    ctx.fillStyle = COL.cyan;
+    ctx.fillRect(-w * 0.7, h * 0.02, w * 1.4, h * 0.10);
+    ctx.restore();
+    ctx.fillStyle = COL.white;
+    ctx.beginPath(); ctx.arc(x + w * (0.2 + rng() * 0.25), y + h * (0.62 + rng() * 0.2), h * 0.13, 0, 6.2832); ctx.fill();
+    ctx.fillStyle = COL.magenta;
+    ctx.fillRect(x + w * 0.68, y + h * 0.6, w * 0.2, h * 0.22);
+  } else if (style === 1) {                // halftone field + magenta disc
+    ctx.fillStyle = COL.halftone; ctx.fillRect(x, y, w, h);
+    var gx = 9, gy = 7, ph = rng() * 6.28;
+    ctx.fillStyle = COL.slot;
+    for (i = 0; i < gx; i++) for (j = 0; j < gy; j++) {
+      var rr = (0.5 + 0.5 * Math.sin(i * 0.9 + ph) * Math.cos(j * 1.1 + ph * 2)) * w / gx * 0.42;
+      if (rr < 0.6) continue;
+      ctx.beginPath(); ctx.arc(x + (i + 0.5) * w / gx, y + (j + 0.5) * h / gy, rr, 0, 6.2832); ctx.fill();
+    }
+    ctx.fillStyle = COL.magenta;
+    ctx.beginPath(); ctx.arc(x + w * (0.55 + rng() * 0.3), y + h * (0.3 + rng() * 0.3), h * 0.2, 0, 6.2832); ctx.fill();
+    ctx.fillStyle = COL.white;
+    ctx.fillRect(x, y + h * 0.82, w, h * 0.07);
+  } else if (style === 2) {                // bold white shapes on magenta
+    ctx.fillStyle = COL.magenta; ctx.fillRect(x, y, w, h);
+    ctx.fillStyle = COL.white;
+    ctx.beginPath(); ctx.arc(x + w * (0.3 + rng() * 0.15), y + h * 0.42, h * 0.3, 0, 6.2832); ctx.fill();
+    ctx.fillRect(x + w * 0.55, y + h * 0.62, w * 0.45, h * 0.16);
+    ctx.fillStyle = COL.cyan;
+    ctx.fillRect(x + w * 0.62, y + h * 0.12, w * 0.18, h * 0.2);
+    ctx.fillStyle = COL.slot;
+    ctx.beginPath(); ctx.arc(x + w * 0.3, y + h * 0.42, h * 0.13, 0, 6.2832); ctx.fill();
+  } else if (style === 3) {                // concentric rings
+    ctx.fillStyle = COL.slot; ctx.fillRect(x, y, w, h);
+    var cx = x + w * (0.42 + rng() * 0.16), cy = y + h * 0.5;
+    for (i = 6; i >= 1; i--) {
+      ctx.strokeStyle = (i % 2) ? COL.cyan : COL.magenta;
+      ctx.lineWidth = Math.max(2, h * 0.035);
+      ctx.beginPath(); ctx.arc(cx, cy, i * h * 0.075, 0, 6.2832); ctx.stroke();
+    }
+    ctx.fillStyle = COL.white;
+    ctx.beginPath(); ctx.arc(cx, cy, h * 0.05, 0, 6.2832); ctx.fill();
+    ctx.fillStyle = COL.cyan;
+    ctx.fillRect(x + w * 0.78, y, w * 0.06, h);
+  } else {                                 // seeded bar field
+    ctx.fillStyle = COL.slot; ctx.fillRect(x, y, w, h);
+    var bx = x, cols = [COL.white, COL.magenta, COL.halftone, COL.cyan];
+    while (bx < x + w) {
+      var bw = w * (0.05 + rng() * 0.13);
+      ctx.fillStyle = cols[Math.floor(rng() * cols.length)];
+      ctx.fillRect(bx, y, bw * 0.82, h);
+      bx += bw;
+    }
+    ctx.fillStyle = COL.slot;
+    ctx.fillRect(x, y + h * (0.3 + rng() * 0.3), w, h * 0.1);
+    ctx.fillStyle = COL.white;
+    ctx.beginPath(); ctx.arc(x + w * (0.25 + rng() * 0.5), y + h * 0.5, h * 0.09, 0, 6.2832); ctx.fill();
+  }
+  ctx.restore();
+  ctx.globalAlpha = 1;
+}
+
+// ---------------- fire escape (black line work, left side) ----------------
+function drawFireEscape() {
+  ctx.strokeStyle = COL.black;
+  ctx.lineWidth = Math.max(2, W * 0.0035);
+  ctx.lineCap = 'square';
+  var flights = PHONE ? 2 : 3;
+  var x0 = W * 0.015, x1 = W * 0.30;
+  var yBot = H * 0.985, yTop = H * (PHONE ? 0.52 : 0.34);
+  var fh = (yBot - yTop) / flights;
+  for (var f = 0; f < flights; f++) {
+    var yb = yBot - f * fh, yt = yb - fh;
+    var xa = (f % 2 === 0) ? x0 : x1, xb = (f % 2 === 0) ? x1 : x0;
+    // stair stringer + steps
+    ctx.beginPath(); ctx.moveTo(xa, yb); ctx.lineTo(xb, yt); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(xa, yb - H * 0.035); ctx.lineTo(xb, yt - H * 0.035); ctx.stroke();
+    var steps = PHONE ? 5 : 7;
+    for (var s = 1; s < steps; s++) {
+      var px = xa + (xb - xa) * s / steps, py = yb + (yt - yb) * s / steps;
+      ctx.beginPath(); ctx.moveTo(px - W * 0.012, py); ctx.lineTo(px + W * 0.012, py); ctx.stroke();
+    }
+    // landing at the top of each flight
+    ctx.strokeRect(Math.min(xb, xb - W * 0.02), yt - H * 0.035, W * 0.055, H * 0.035);
+    // vertical rails
+    ctx.beginPath(); ctx.moveTo(xa, yb); ctx.lineTo(xa, yb - H * 0.055); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(xb, yt); ctx.lineTo(xb, yt - H * 0.055); ctx.stroke();
+  }
+  // uprights
+  ctx.beginPath(); ctx.moveTo(x0, yBot); ctx.lineTo(x0, yTop - H * 0.02); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(x1, yBot); ctx.lineTo(x1, yTop - H * 0.02); ctx.stroke();
+}
+
+// ---------------- paste ceremony ----------------
+function drawShimmer(x, y, w, h, pt) {
+  var p = clamp(pt / SHIMMER_DUR, 0, 1);
+  var per = 2 * (w + h), upto = p * per;
+  ctx.strokeStyle = COL.shimmer;
+  ctx.lineWidth = Math.max(2, W * 0.004);
+  ctx.globalAlpha = 0.95;
+  // bright head segment + a short fading trail behind it, along the border
+  for (var k = 0; k < 3; k++) {
+    var end = upto - k * per * 0.05;
+    if (end <= 0) continue;
+    var start = Math.max(0, end - per * 0.055);
+    ctx.globalAlpha = 0.95 - k * 0.3;
+    borderSeg(x, y, w, h, start, end, per);
+  }
+  ctx.globalAlpha = 1;
+}
+function borderSeg(x, y, w, h, a, b, per) {
+  // draw border from arc-length a to b (clockwise from top-left)
+  var pts = [[x, y], [x + w, y], [x + w, y + h], [x, y + h], [x, y]];
+  var acc = 0;
+  ctx.beginPath();
+  var started = false;
+  for (var s = 0; s < 4; s++) {
+    var x1 = pts[s][0], y1 = pts[s][1], x2 = pts[s + 1][0], y2 = pts[s + 1][1];
+    var segLen = Math.abs(x2 - x1) + Math.abs(y2 - y1);
+    var s0 = Math.max(a, acc), s1 = Math.min(b, acc + segLen);
+    if (s1 > s0) {
+      var f0 = (s0 - acc) / segLen, f1 = (s1 - acc) / segLen;
+      if (!started) { ctx.moveTo(x1 + (x2 - x1) * f0, y1 + (y2 - y1) * f0); started = true; }
+      ctx.lineTo(x1 + (x2 - x1) * f1, y1 + (y2 - y1) * f1);
+    }
+    acc += segLen;
+  }
+  if (started) ctx.stroke();
+}
+function drawFlicker(x, y, w, h, pt, seed) {
+  var env = 1 - pt / FLICKER_DUR;
+  var step = Math.floor(pt * 24);
+  var gx = 6, gy = 5;
+  for (var i = 0; i < gx; i++) for (var j = 0; j < gy; j++) {
+    var r = hashN(seed, i * 31 + j * 7, step);
+    if (r > 0.30 * env + 0.04) continue;
+    ctx.fillStyle = COL.flicker;
+    ctx.globalAlpha = 0.85 * env;
+    ctx.fillRect(x + i * w / gx + 1, y + j * h / gy + 1, w / gx - 2, h / gy - 2);
+  }
+  ctx.globalAlpha = 1;
+}
+
+// ---------------- tear particles ----------------
+function drawTears(t) {
+  for (var k = tears.length - 1; k >= 0; k--) {
+    var ev = tears[k], age = t - ev.start;
+    if (age > 0.8) { tears.splice(k, 1); continue; }
+    if (age < 0) continue;
+    var rng = mulberry32(ev.seed);
+    for (var i = 0; i < 26; i++) {
+      var px = ev.x + rng() * ev.w, py = ev.y + rng() * ev.h;
+      var vx = (rng() - 0.5) * W * 0.25, vy = -rng() * H * 0.12;
+      var sz = 4 + rng() * 12;
+      var col = [COL.flicker, COL.magenta, COL.cyan, COL.white][Math.floor(rng() * 4)];
+      var gx = px + vx * age, gy = py + vy * age + H * 0.55 * age * age;
+      ctx.save();
+      ctx.translate(gx, gy); ctx.rotate((rng() - 0.5) * 6 * age);
+      ctx.globalAlpha = 0.9 * (1 - age / 0.8);
+      ctx.fillStyle = col;
+      ctx.fillRect(-sz / 2, -sz / 2, sz, sz * 0.7);
+      ctx.restore();
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+// ---------------- audio (lazy, gesture-gated, guarded) ----------------
+var AC = null;
+function ensureAudio() {
+  if (AC) { if (AC.resume) AC.resume(); return; }
+  try {
+    var Ctor = (typeof AudioContext !== 'undefined') ? AudioContext :
+               ((typeof window !== 'undefined' && window.webkitAudioContext) ? window.webkitAudioContext : null);
+    if (!Ctor) return;
+    AC = new Ctor();
+  } catch (e) { AC = null; }
+}
+function tone(f0, f1, dur, type, gain) {
+  if (!AC) return;
+  try {
+    var t = AC.currentTime, o = AC.createOscillator(), g = AC.createGain();
+    o.type = type; o.frequency.setValueAtTime(f0, t);
+    o.frequency.exponentialRampToValueAtTime(Math.max(30, f1), t + dur);
+    g.gain.setValueAtTime(gain, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g); g.connect(AC.destination); o.start(t); o.stop(t + dur + 0.02);
+  } catch (e) {}
+}
+function noiseBurst(dur, f0, f1, gain) {
+  if (!AC) return;
+  try {
+    var t = AC.currentTime, n = Math.floor(AC.sampleRate * dur);
+    var buf = AC.createBuffer(1, n, AC.sampleRate), d = buf.getChannelData(0);
+    for (var i = 0; i < n; i++) d[i] = Math.random() * 2 - 1;
+    var src = AC.createBufferSource(); src.buffer = buf;
+    var bp = AC.createBiquadFilter(); bp.type = 'bandpass'; bp.Q.value = 1.1;
+    bp.frequency.setValueAtTime(f0, t);
+    bp.frequency.exponentialRampToValueAtTime(Math.max(40, f1), t + dur);
+    var g = AC.createGain();
+    g.gain.setValueAtTime(gain, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    src.connect(bp); bp.connect(g); g.connect(AC.destination); src.start(t);
+  } catch (e) {}
+}
+function sndPaste() { tone(190, 65, 0.09, 'square', 0.16); noiseBurst(0.05, 3000, 1800, 0.10); tone(300, 640, 0.5, 'sine', 0.05); }
+function sndTear() { noiseBurst(0.35, 2600, 260, 0.22); }
+function sndFade() { tone(480, 130, 0.7, 'sine', 0.06); }
+
+// ---------------- main draw ----------------
+function slotRect(i) {
+  var s = SLOT_POS[i];
+  return { x: s.x * W, y: s.y * H, w: s.w * W, h: s.h * H };
+}
+
+function draw(t, live) {
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  ctx.fillStyle = COL.wall;
+  ctx.fillRect(0, 0, W, H);
+  // concrete blocks
+  for (var b = 0; b < blocks.length; b++) {
+    var bl = blocks[b];
+    ctx.fillStyle = CONCRETE[bl.tone];
+    ctx.fillRect(bl.x * W, bl.y * H, bl.w * W, bl.h * H);
+  }
+  ctx.strokeStyle = 'rgba(0,0,0,0.55)';
+  ctx.lineWidth = 1;
+  for (b = 0; b < blocks.length; b++) {
+    bl = blocks[b];
+    ctx.strokeRect(bl.x * W + 0.5, bl.y * H + 0.5, bl.w * W - 1, bl.h * H - 1);
+  }
+  drawFireEscape();
+  // slots
+  for (var i = 0; i < SLOT_POS.length; i++) {
+    var r = slotRect(i), st = slotState(i, t);
+    // recessed frame
+    ctx.fillStyle = COL.black;
+    ctx.fillRect(r.x - 3, r.y - 3, r.w + 6, r.h + 6);
+    ctx.fillStyle = COL.slot;
+    ctx.fillRect(r.x, r.y, r.w, r.h);
+    ctx.strokeStyle = RIM_HI;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(r.x, r.y + r.h - 0.5); ctx.lineTo(r.x, r.y); ctx.lineTo(r.x + r.w, r.y);
+    ctx.stroke();
+    if (st.phase === 'paste') {
+      drawPoster(r.x, r.y, r.w, r.h, posterSeed(i, st.cyc), clamp(st.pt / PASTE_DUR, 0, 1), i, st.cyc);
+      if (st.pt < FLICKER_DUR) drawFlicker(r.x, r.y, r.w, r.h, st.pt, posterSeed(i, st.cyc));
+      if (st.pt < SHIMMER_DUR) drawShimmer(r.x, r.y, r.w, r.h, st.pt);
+    } else if (st.phase === 'hang') {
+      drawPoster(r.x, r.y, r.w, r.h, posterSeed(i, st.cyc), 1, i, st.cyc);
+    } else if (st.phase === 'fade') {
+      drawPoster(r.x, r.y, r.w, r.h, posterSeed(i, st.cyc), 1 - st.pt / FADE_DUR, i, st.cyc);
+    }
+    if (live && AC) {
+      var prev = draw._prev && draw._prev[i];
+      if (prev && prev !== st.phase) {
+        if (st.phase === 'paste') sndPaste();
+        if (st.phase === 'fade') sndFade();
+      }
+    }
+    if (!draw._prev) draw._prev = [];
+    draw._prev[i] = st.phase;
+  }
+  drawTears(t);
+}
+
+genWall();
+draw(T0, false);
+
+// ---------------- live loop + interaction ----------------
+var pieceT = T0, lastTs = -1;
+function animate(ts) {
+  if (lastTs >= 0) pieceT += Math.min(0.1, (ts - lastTs) / 1000);
+  lastTs = ts;
+  draw(pieceT, true);
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(animate);
+}
+if (typeof requestAnimationFrame === 'function') requestAnimationFrame(animate);
+
+function slotAt(px, py) {
+  for (var i = 0; i < SLOT_POS.length; i++) {
+    var r = slotRect(i);
+    if (px >= r.x - 4 && px <= r.x + r.w + 4 && py >= r.y - 4 && py <= r.y + r.h + 4) return i;
+  }
+  return -1;
+}
+var downAt = null, downPos = null, lastTapT = -10, lastTapWall = -10;
+function evtPos(e) {
+  var rect = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+  var cx = (e.clientX !== undefined) ? e.clientX : (e.touches && e.touches[0] ? e.touches[0].clientX : 0);
+  var cy = (e.clientY !== undefined) ? e.clientY : (e.touches && e.touches[0] ? e.touches[0].clientY : 0);
+  return { x: cx - rect.left, y: cy - rect.top };
+}
+function onDown(e) {
+  ensureAudio();
+  var p = evtPos(e);
+  downAt = pieceT; downPos = p;
+}
+function onMove(e) {
+  if (!downPos) return;
+  var p = evtPos(e);
+  var i = slotAt(p.x, p.y);
+  if (i >= 0) {
+    var st = slotState(i, pieceT);
+    if (st.phase === 'hang' || st.phase === 'fade') {
+      var r = slotRect(i);
+      tears.push({ start: pieceT, x: r.x, y: r.y, w: r.w, h: r.h, seed: (wallSeed ^ Math.imul(++tearCount, 3313)) | 0 });
+      overrides[i] = { type: 'torn', start: pieceT };
+      sndTear();
+      downPos = null; // one tear per drag
+    }
+  }
+}
+function onUp(e) {
+  if (!downPos) return;
+  var p = evtPos(e);
+  var quick = (pieceT - downAt) < 0.4;
+  var still = Math.abs(p.x - downPos.x) + Math.abs(p.y - downPos.y) < 12;
+  downPos = null;
+  if (!quick || !still) return;
+  // double-tap: new wall
+  if (pieceT - lastTapT < 0.33) {
+    wallSeed = (Math.imul(wallSeed, 1103515245) + 12345) | 0;
+    genWall();
+    overrides = [null, null, null, null, null, null];
+    tears = [];
+    lastTapT = -10;
+    return;
+  }
+  lastTapT = pieceT;
+  var i = slotAt(p.x, p.y);
+  if (i >= 0) {
+    var st = slotState(i, pieceT);
+    overrides[i] = { type: 'reforge', start: pieceT, cyc: 900 + Math.floor(hashN(wallSeed, i, Math.floor(pieceT * 10)) * 500) };
+    if (st.phase !== 'paste') sndPaste();
+  }
+}
+if (canvas.addEventListener) {
+  canvas.addEventListener('pointerdown', onDown);
+  canvas.addEventListener('pointermove', onMove);
+  canvas.addEventListener('pointerup', onUp);
+  canvas.addEventListener('touchstart', onDown, { passive: true });
+  canvas.addEventListener('touchend', onUp);
+}
+</script>
+</body>
+</html>

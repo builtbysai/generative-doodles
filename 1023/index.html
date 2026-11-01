@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Blade, Sensed</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #000000; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<script>
+"use strict";
+/* No.1023 "The Blade, Sensed" - yuta-asai PP184 Piste.
+   The bout as data: two wireframe fencers on a dark strip, blade tips
+   tracked by detection brackets, cyan sensor trails with data ticks,
+   touches registered as macroblock bursts, the score kept as two
+   growing amber bars (never digits). No broadcast, no crowd. */
+
+var SEED0 = 1023184;
+var TICK = 1 / 120;          /* fixed sim step */
+var PREROLL = 1560;          /* 13 s - frame one is mid-bout */
+var TRAIL_N = 360;           /* 3 s of tip history at 120 Hz */
+
+/* ---------- rng ---------- */
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    var t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+function lerp(a, b, k) { return a + (b - a) * k; }
+function smooth(k) { return k * k * (3 - 2 * k); }
+
+/* ---------- world ----------
+   Piste in world units: x in [-1.6, 1.6], ground line y = 0.
+   Score slots live in "slot units" (1 unit = one segment) so the
+   bar accounting never touches string or numeral rendering. */
+var WORLD = { x0: -1.6, x1: 1.6 };
+
+var S = null;
+
+function makeFencer(seed, side) {
+  var rng = mulberry32(seed);
+  return {
+    side: side,                       /* -1 left, +1 right */
+    home: side * 0.62,
+    x: side * 0.62,                   /* root ground position */
+    vx: 0,
+    lean: 0,                          /* en-garde lean, eased */
+    arm: 0.55,                        /* extension 0..1 */
+    armV: 0,
+    crouch: 0.25 + rng() * 0.2,
+    bobPh: rng() * 6.283,
+    trail: [],                        /* ring of {x,y} world tip points */
+    score: 0,
+    guardFlash: 0
+  };
+}
+
+function newBout(seed) {
+  var rng = mulberry32(seed);
+  S = {
+    seed: seed,
+    rng: rng,
+    step: 0,
+    fencers: [makeFencer(seed * 7 + 11, -1), makeFencer(seed * 13 + 29, 1)],
+    /* director: exchanges separated by fencing phrases */
+    dir: { phase: "fence", t: 0, dur: 0.9 + rng() * 1.1, attacker: 0, touchDone: false },
+    bursts: [],                       /* {x,y,t0,seed} */
+    rigPh: [rng() * 6.283, rng() * 6.283, rng() * 6.283, rng() * 6.283],
+    dragPts: [],                      /* recorded drag disturbance */
+    events: []                        /* audio cues: {kind, t} */
+  };
+  /* pre-roll: frame one is a bout already being sensed */
+  for (var i = 0; i < PREROLL; i++) stepSim();
+  S.events.length = 0;                /* pre-roll stays silent */
+}
+function now() { return S.step * TICK; }
+
+/* ---------- skeleton ----------
+   Returns joint positions in world coords for a fencer at rest-pose
+   parameters. Blade tip is joint "tip"; trails sample it. */
+function pose(f) {
+  var d = -f.side;                    /* facing direction: toward the opponent */
+  var t = now();
+  var bob = Math.sin(t * 2.1 + f.bobPh) * 0.012;
+  var hipY = 0.46 - f.crouch * 0.10 + bob;
+  var hip = { x: f.x, y: hipY };
+  var lean = f.lean * 0.16 * d;
+  var neck = { x: hip.x + lean + d * 0.05, y: hipY + 0.34 };
+  var head = { x: neck.x + d * 0.03, y: neck.y + 0.11 };
+  /* legs: front knee forward, back leg extended */
+  var kneeF = { x: hip.x + d * (0.20 + f.crouch * 0.10), y: hipY * 0.52 };
+  var footF = { x: kneeF.x + d * 0.16, y: 0 };
+  var kneeB = { x: hip.x - d * 0.16, y: hipY * 0.55 };
+  var footB = { x: hip.x - d * (0.34 + f.crouch * 0.08), y: 0 };
+  /* sword arm: shoulder -> elbow -> hand -> tip; extension from f.arm */
+  var sh = { x: neck.x - d * 0.02, y: neck.y - 0.03 };
+  var ext = 0.24 + f.arm * 0.30;
+  var el = { x: sh.x + d * ext * 0.45, y: sh.y - 0.06 + f.arm * 0.05 };
+  var hand = { x: sh.x + d * ext, y: sh.y - 0.02 + f.arm * 0.07 };
+  var tip = { x: hand.x + d * (0.34 + f.arm * 0.10), y: hand.y + 0.03 - f.arm * 0.02 };
+  /* rear arm trails behind for balance */
+  var el2 = { x: sh.x - d * 0.20, y: sh.y + 0.02 };
+  var hand2 = { x: sh.x - d * (0.30 + f.crouch * 0.06), y: sh.y + 0.16 };
+  return { hip: hip, neck: neck, head: head, kneeF: kneeF, footF: footF,
+           kneeB: kneeB, footB: footB, sh: sh, el: el, hand: hand,
+           tip: tip, el2: el2, hand2: hand2 };
+}
+
+/* ---------- simulation ---------- */
+function directorStep(dt) {
+  var D = S.dir, rng = S.rng;
+  D.t += dt;
+  var A = S.fencers[D.attacker], B = S.fencers[1 - D.attacker];
+  if (D.phase === "fence") {
+    /* both fencers bounce and drift toward engagement distance */
+    for (var i = 0; i < 2; i++) {
+      var f = S.fencers[i];
+      var want = f.home + Math.sin(now() * 0.7 + f.bobPh) * 0.05;
+      f.vx += (want - f.x) * 2.2 * dt;
+      f.arm += (0.55 - f.arm) * 3 * dt;
+      f.lean += (0.4 - f.lean) * 3 * dt;
+    }
+    if (D.t >= D.dur) {
+      D.phase = "lunge"; D.t = 0; D.dur = 0.42; D.touchDone = false;
+      D.attacker = rng() < 0.5 ? 0 : 1;
+      S.events.push({ kind: "lunge", t: now() });
+    }
+  } else if (D.phase === "lunge") {
+    var k = smooth(clamp(D.t / D.dur, 0, 1));
+    A.vx += -A.side * 3.4 * k * dt;               /* drive toward opponent */
+    A.x += -A.side * 0.9 * k * dt;
+    A.arm += (1 - A.arm) * 14 * dt;
+    A.lean += (1 - A.lean) * 10 * dt;
+    B.arm += (0.8 - B.arm) * 6 * dt;              /* parry lift */
+    if (!D.touchDone && D.t > D.dur * 0.55) {
+      D.touchDone = true;
+      /* a touch lands if the tip has reached the guard zone */
+      var pa = pose(A), pb = pose(B);
+      var reach = Math.abs(pa.tip.x - pb.neck.x);
+      if (reach < 0.34 || S.rng() < 0.55) registerTouch(D.attacker, pa.tip);
+    }
+    if (D.t >= D.dur) { D.phase = "recover"; D.t = 0; D.dur = 0.7; }
+  } else { /* recover */
+    for (var j = 0; j < 2; j++) {
+      var g = S.fencers[j];
+      g.vx += (g.home - g.x) * 3.2 * dt;
+      g.arm += (0.55 - g.arm) * 5 * dt;
+      g.lean += (0.4 - g.lean) * 5 * dt;
+    }
+    if (D.t >= D.dur) {
+      D.phase = "fence"; D.t = 0; D.dur = 0.9 + rng() * 1.3;
+    }
+  }
+  /* integrate roots, keep the pair separated and on the strip */
+  for (var m = 0; m < 2; m++) {
+    var h = S.fencers[m];
+    h.vx *= Math.pow(0.12, dt);
+    h.x += h.vx * dt;
+    h.x = clamp(h.x, WORLD.x0 + 0.42, WORLD.x1 - 0.42);
+    h.guardFlash = Math.max(0, h.guardFlash - dt * 2.4);
+  }
+  var sep = S.fencers[1].x - S.fencers[0].x;
+  if (sep < 0.52) {
+    var push = (0.52 - sep) / 2;
+    S.fencers[0].x -= push; S.fencers[1].x += push;
+  }
+}
+
+function registerTouch(idx, tipPos) {
+  var f = S.fencers[idx];
+  f.score += 1;
+  var foe = S.fencers[1 - idx];
+  foe.guardFlash = 1;
+  S.bursts.push({ x: tipPos.x, y: tipPos.y, t0: now(), seed: S.rng() * 1e9 | 0 });
+  if (S.bursts.length > 6) S.bursts.shift();
+  S.events.push({ kind: "hit", t: now() });
+  S.events.push({ kind: "score", t: now(), who: idx });
+}
+
+function stepSim() {
+  directorStep(TICK);
+  S.step += 1;
+  for (var i = 0; i < 2; i++) {
+    var f = S.fencers[i];
+    var p = pose(f);
+    f.trail.push({ x: p.tip.x, y: p.tip.y });
+    if (f.trail.length > TRAIL_N) f.trail.shift();
+  }
+}
+
+/* trail point with drag disturbance applied (closed-form over the
+   recorded drag samples; the sim's stored history is never mutated) */
+function trailPoint(f, idx) {
+  var p = f.trail[idx];
+  var age = (f.trail.length - 1 - idx) * TICK;  /* seconds old */
+  var tAbs = now() - age;
+  var dx = 0, dy = 0;
+  for (var i = 0; i < S.dragPts.length; i++) {
+    var d = S.dragPts[i];
+    var dtA = tAbs - d.t;
+    if (dtA < 0 || dtA > 1.6) continue;
+    var dist = Math.hypot(p.x - d.x, p.y - d.y);
+    var infl = Math.exp(-dist * dist / 0.02) * Math.exp(-dtA * 2.2);
+    dx += d.nx * infl * 0.05;
+    dy += d.ny * infl * 0.05;
+  }
+  return { x: p.x + dx, y: p.y + dy };
+}
+
+/* ---------- audio (lazy, gesture-gated, guarded) ---------- */
+var AC = null, humOsc = null, humGain = null;
+function ensureAudio() {
+  if (AC || typeof AudioContext === "undefined") return;
+  try {
+    AC = new AudioContext();
+    humOsc = AC.createOscillator(); humGain = AC.createGain();
+    humOsc.type = "sine"; humOsc.frequency.value = 52;
+    humGain.gain.value = 0.0;
+    humOsc.connect(humGain); humGain.connect(AC.destination);
+    humOsc.start();
+  } catch (e) { AC = null; }
+}
+function beep(freq, dur, gain, type, slideTo) {
+  if (!AC) return;
+  try {
+    var o = AC.createOscillator(), g = AC.createGain();
+    o.type = type || "square";
+    o.frequency.setValueAtTime(freq, AC.currentTime);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, AC.currentTime + dur);
+    g.gain.setValueAtTime(gain, AC.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, AC.currentTime + dur);
+    o.connect(g); g.connect(AC.destination);
+    o.start(); o.stop(AC.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+function playEvents() {
+  if (!AC) return;
+  var horizon = now();
+  for (var i = S.events.length - 1; i >= 0; i--) {
+    var ev = S.events[i];
+    if (ev.t <= horizon) {
+      if (ev.kind === "lunge") beep(1900, 0.05, 0.015, "square");
+      else if (ev.kind === "hit") beep(320, 0.09, 0.09, "sawtooth", 90);
+      else if (ev.kind === "score") beep(420, 0.22, 0.05, "sine", 840);
+      S.events.splice(i, 1);
+    }
+  }
+  if (humGain) humGain.gain.value = 0.012;   /* the data hum under the trails */
+}
+
+/* ---------- view ---------- */
+var cv = document.getElementById("cv");
+var ctx = cv.getContext("2d");
+var W = 0, H = 0, PHONE = false;
+
+function resize() {
+  var vv = window.visualViewport;
+  W = vv ? vv.width : window.innerWidth;
+  H = vv ? vv.height : window.innerHeight;
+  var dpr = Math.min(window.devicePixelRatio || 1, 2);
+  cv.width = Math.round(W * dpr);
+  cv.height = Math.round(H * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  var sw = window.screen ? Math.min(window.screen.width, window.screen.height) : 9999;
+  PHONE = sw < 700 || H > W * 1.15;
+  draw();
+}
+if (window.visualViewport) window.visualViewport.addEventListener("resize", resize);
+window.addEventListener("resize", resize);
+
+/* world -> screen: piste spans the width; strip centre at 52% height */
+function proj(x, y) {
+  var pad = PHONE ? 10 : 26;
+  var sx = pad + (x - WORLD.x0) / (WORLD.x1 - WORLD.x0) * (W - pad * 2);
+  var unit = (W - pad * 2) / (WORLD.x1 - WORLD.x0);
+  var gy = H * 0.52 + (PHONE ? 30 : 44);
+  return { x: sx, y: gy - y * unit };
+}
+function unitPx() {
+  var pad = PHONE ? 10 : 26;
+  return (W - pad * 2) / (WORLD.x1 - WORLD.x0);
+}
+
+/* ---------- drawing ---------- */
+function drawFencer(f) {
+  var p = pose(f);
+  function P(q) { return proj(q.x, q.y); }
+  var bones = [
+    ["hip", "neck"], ["neck", "head"],
+    ["hip", "kneeF"], ["kneeF", "footF"],
+    ["hip", "kneeB"], ["kneeB", "footB"],
+    ["sh", "el"], ["el", "hand"], ["hand", "tip"],
+    ["sh", "el2"], ["el2", "hand2"]
+  ];
+  ctx.strokeStyle = "#FFFFFF";
+  ctx.lineWidth = 1.4;
+  ctx.globalAlpha = 0.92;
+  ctx.beginPath();
+  for (var i = 0; i < bones.length; i++) {
+    var a = P(p[bones[i][0]]), b = P(p[bones[i][1]]);
+    ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
+  }
+  ctx.stroke();
+  /* joints */
+  ctx.fillStyle = "#FFFFFF";
+  var joints = ["hip", "neck", "kneeF", "kneeB", "sh", "el", "hand", "el2", "hand2"];
+  for (var j = 0; j < joints.length; j++) {
+    var q = P(p[joints[j]]);
+    ctx.beginPath(); ctx.arc(q.x, q.y, 1.8, 0, 6.2832); ctx.fill();
+  }
+  var hd = P(p.head);
+  ctx.beginPath(); ctx.arc(hd.x, hd.y, 3.2, 0, 6.2832); ctx.fill();
+  /* guard flash ring when this fencer is touched */
+  if (f.guardFlash > 0) {
+    var hp = P(p.hand);
+    ctx.globalAlpha = f.guardFlash * 0.8;
+    ctx.strokeStyle = "#FF2E4D";
+    ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.arc(hp.x, hp.y, 7 + (1 - f.guardFlash) * 6, 0, 6.2832); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawTrail(f) {
+  var n = f.trail.length;
+  if (n < 2) return;
+  var u = unitPx();
+  ctx.lineWidth = 1.1;
+  /* segmented polyline, alpha by age; data ticks every 12 samples */
+  for (var i = 1; i < n; i++) {
+    var age = (n - 1 - i) / (TRAIL_N - 1);       /* 0 fresh .. 1 oldest */
+    var a = Math.pow(1 - age, 1.6) * 0.85;
+    if (a < 0.02) continue;
+    var p0 = trailPoint(f, i - 1), p1 = trailPoint(f, i);
+    var s0 = proj(p0.x, p0.y), s1 = proj(p1.x, p1.y);
+    ctx.strokeStyle = "#00E5FF";
+    ctx.globalAlpha = a;
+    ctx.beginPath(); ctx.moveTo(s0.x, s0.y); ctx.lineTo(s1.x, s1.y); ctx.stroke();
+    if (i % 12 === 0) {
+      /* data tick: a short vertical mark across the trail */
+      ctx.globalAlpha = a;
+      ctx.beginPath();
+      ctx.moveTo(s1.x, s1.y - 3.5);
+      ctx.lineTo(s1.x, s1.y + 3.5);
+      ctx.stroke();
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawBracket(f) {
+  var n = f.trail.length;
+  if (n < 20) return;
+  /* the bracket rides where the tip was 16 steps ago: an honest lag */
+  var idx = Math.max(0, n - 1 - 16);
+  var p = f.trail[idx];
+  var s = proj(p.x, p.y);
+  var r = PHONE ? 9 : 12, c = 5;
+  ctx.strokeStyle = "#FFFFFF";
+  ctx.globalAlpha = 0.8;
+  ctx.lineWidth = 1.3;
+  ctx.beginPath();
+  var cs = [[-1, -1], [1, -1], [-1, 1], [1, 1]];
+  for (var i = 0; i < 4; i++) {
+    var dx = cs[i][0], dy = cs[i][1];
+    ctx.moveTo(s.x + dx * r, s.y + dy * r - dy * (r - c));
+    ctx.lineTo(s.x + dx * r, s.y + dy * r);
+    ctx.lineTo(s.x + dx * r - dx * (r - c), s.y + dy * r);
+  }
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+}
+
+function drawBursts() {
+  var u = unitPx();
+  for (var i = S.bursts.length - 1; i >= 0; i--) {
+    var b = S.bursts[i];
+    var age = now() - b.t0;
+    if (age > 0.9) { S.bursts.splice(i, 1); continue; }
+    var rng = mulberry32(b.seed);
+    var s = proj(b.x, b.y);
+    var fade = 1 - age / 0.9;
+    for (var k = 0; k < 14; k++) {
+      var ang = rng() * 6.283, dist = rng() * 0.16 * (0.4 + age * 1.6);
+      var bx = s.x + Math.cos(ang) * dist * u;
+      var by = s.y + Math.sin(ang) * dist * u * 0.7;
+      var sz = (3 + rng() * 9) * (PHONE ? 0.7 : 1);
+      ctx.fillStyle = rng() < 0.55 ? "#00E5FF" : "#FF2E4D";
+      ctx.globalAlpha = fade * (0.35 + rng() * 0.6);
+      ctx.fillRect(bx - sz / 2, by - sz / 2, sz, sz * (0.5 + rng() * 0.8));
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawScore() {
+  /* two amber bars at the top: segments, never digits.
+     fencer A grows from the left, fencer B from the right. */
+  var segW = PHONE ? 8 : 11, segH = PHONE ? 6 : 8, gap = 2, y = PHONE ? 12 : 18;
+  ctx.fillStyle = "#FFD93B";
+  for (var s = 0; s < S.fencers[0].score; s++) {
+    ctx.globalAlpha = 0.95;
+    ctx.fillRect(14 + s * (segW + gap), y, segW, segH);
+  }
+  for (var t = 0; t < S.fencers[1].score; t++) {
+    ctx.globalAlpha = 0.95;
+    ctx.fillRect(W - 14 - (t + 1) * (segW + gap) + gap, y, segW, segH);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawRigs() {
+  var t = now();
+  var ends = [WORLD.x0 + 0.10, WORLD.x1 - 0.10];
+  for (var e = 0; e < 2; e++) {
+    var base = proj(ends[e], 0);
+    var bw = PHONE ? 16 : 24, bh = PHONE ? 20 : 30;
+    ctx.fillStyle = "#0A0B0D";
+    ctx.strokeStyle = "#1E2A4A";
+    ctx.lineWidth = 1;
+    ctx.fillRect(base.x - bw / 2, base.y - bh, bw, bh);
+    ctx.strokeRect(base.x - bw / 2, base.y - bh, bw, bh);
+    /* three blinking lights per rig, seeded phases */
+    for (var l = 0; l < 3; l++) {
+      var ph = S.rigPh[e * 2 + (l % 2)] + l * 2.1;
+      var on = Math.sin(t * 2.4 + ph) > 0.25;
+      ctx.fillStyle = "#3DDC84";
+      ctx.globalAlpha = on ? 0.95 : 0.18;
+      ctx.beginPath();
+      ctx.arc(base.x - bw / 4 + l * (bw / 4), base.y - bh + 7 + (l % 2) * 8, 1.7, 0, 6.2832);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+}
+
+function draw() {
+  ctx.fillStyle = "#000000";
+  ctx.fillRect(0, 0, W, H);
+  if (!S) return;
+  /* piste strip */
+  var a = proj(WORLD.x0, 0), b = proj(WORLD.x1, 0);
+  var stripH = PHONE ? 46 : 64;
+  ctx.fillStyle = "#0A0B0D";
+  ctx.fillRect(a.x, a.y - stripH * 0.30, b.x - a.x, stripH);
+  ctx.strokeStyle = "#1E2A4A";
+  ctx.lineWidth = 1.2;
+  ctx.strokeRect(a.x, a.y - stripH * 0.30, b.x - a.x, stripH);
+  /* centre line */
+  ctx.globalAlpha = 0.5;
+  ctx.beginPath();
+  ctx.moveTo((a.x + b.x) / 2, a.y - stripH * 0.30);
+  ctx.lineTo((a.x + b.x) / 2, a.y + stripH * 0.70);
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+
+  for (var i = 0; i < 2; i++) drawTrail(S.fencers[i]);
+  drawBursts();
+  drawRigs();
+  for (var j = 0; j < 2; j++) { drawFencer(S.fencers[j]); drawBracket(S.fencers[j]); }
+  drawScore();
+
+  /* pin the canvas CSS size every frame (house rule) */
+  cv.style.width = W + "px";
+  cv.style.height = H + "px";
+}
+
+/* ---------- interaction ---------- */
+var lastTap = 0, lastTapPos = null, dragMoved = false;
+
+function toWorld(cx, cy) {
+  var pad = PHONE ? 10 : 26;
+  var unit = (W - pad * 2) / (WORLD.x1 - WORLD.x0);
+  var x = WORLD.x0 + (cx - pad) / unit;
+  var gy = H * 0.52 + (PHONE ? 30 : 44);
+  var y = (gy - cy) / unit;
+  return { x: x, y: clamp(y, -0.3, 1.2) };
+}
+
+cv.addEventListener("pointerdown", function (e) {
+  ensureAudio();
+  dragMoved = false;
+  var t = performance.now() / 1000;
+  var w = toWorld(e.clientX, e.clientY);
+  if (lastTap && t - lastTap < 0.35 &&
+      Math.hypot(e.clientX - lastTapPos.x, e.clientY - lastTapPos.y) < 40) {
+    /* double-tap: a new bout */
+    newBout((Math.random() * 1e9) | 0);
+    lastTap = 0;
+    draw();
+    return;
+  }
+  lastTap = t; lastTapPos = { x: e.clientX, y: e.clientY };
+  S.dragPts.push({ x: w.x, y: w.y, t: now(), nx: 0, ny: 0 });
+});
+cv.addEventListener("pointermove", function (e) {
+  if (!lastTapPos || e.buttons === 0) return;
+  var w = toWorld(e.clientX, e.clientY);
+  var prev = S.dragPts[S.dragPts.length - 1];
+  if (prev) {
+    prev.nx = clamp((w.x - prev.x) * 2, -1, 1);
+    prev.ny = clamp((w.y - prev.y) * 2, -1, 1);
+  }
+  S.dragPts.push({ x: w.x, y: w.y, t: now(), nx: prev ? prev.nx : 0, ny: prev ? prev.ny : 0 });
+  if (S.dragPts.length > 240) S.dragPts.shift();
+  dragMoved = true;
+});
+cv.addEventListener("pointerup", function (e) {
+  if (!dragMoved && lastTap) {
+    /* a clean tap: force a touch for the nearer fencer */
+    var w = toWorld(e.clientX, e.clientY);
+    var d0 = Math.abs(w.x - S.fencers[0].x), d1 = Math.abs(w.x - S.fencers[1].x);
+    var idx = d0 <= d1 ? 0 : 1;
+    registerTouch(idx, pose(S.fencers[idx]).tip);
+    lastTap = 0;
+  }
+  lastTapPos = null;
+});
+
+/* ---------- main loop ---------- */
+newBout(SEED0);
+resize();
+
+var lastReal = -1, acc = 0;
+function frame(ts) {
+  if (lastReal < 0) lastReal = ts;
+  var dt = (ts - lastReal) / 1000;
+  lastReal = ts;
+  if (dt > 0.25) dt = 0.25;
+  acc += dt;
+  var steps = 0;
+  while (acc >= TICK && steps < 40) { stepSim(); acc -= TICK; steps++; }
+  if (steps === 40) acc = 0;
+  playEvents();
+  draw();
+}
+if (typeof requestAnimationFrame !== "undefined") {
+  requestAnimationFrame(frame);
+}
+</script>
+</body>
+</html>
