@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Other Audience</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #08080A; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded rng ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- palette (strict) ----------
+  var STAGE = '#08080A';
+  var HUMAN = '#E4E6EA';
+  var MARK = '#FFFFFF';
+  var IR = '#FF2E2E';
+  var WIRE = '#2A2D36';
+  var SPLIT = '#1A1B1E';
+
+  var LOOP = 50;              // seconds, seamless
+  var T0 = 11;                // frame one phase: a flare is mid-burn here
+  var FLARE_DUR = 0.7;
+  var BASE_SEED = 1039200;
+
+  var seed = BASE_SEED;
+  var objects = [];
+  var flareOrder = [];        // object index per scheduled flare slot
+  var tapFlares = [];         // recorded events {obj, t0}
+  var pieceT = T0;
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 720, H = 720;
+  var phoneNow = false;
+
+  function isPhone() {
+    var sw = 0, sh = 0;
+    if (typeof window !== 'undefined' && window.screen) {
+      sw = window.screen.width || 0; sh = window.screen.height || 0;
+    }
+    var mn = Math.min(sw, sh);
+    if (mn > 0 && mn < 700) return true;
+    return H > W * 1.15; // aspect fallback only
+  }
+
+  function fit() {
+    var vv = (typeof window !== 'undefined') ? window.visualViewport : null;
+    if (vv && vv.width) { W = vv.width; H = vv.height; }
+    else if (typeof window !== 'undefined' && window.innerWidth) { W = window.innerWidth; H = window.innerHeight; }
+    canvas.width = Math.round(W);
+    canvas.height = Math.round(H);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    phoneNow = isPhone();
+  }
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', function () { fit(); draw(pieceT); });
+    }
+    if (window.addEventListener) {
+      window.addEventListener('resize', function () { fit(); draw(pieceT); });
+    }
+  }
+
+  // ---------- inventory ----------
+  // Each object: kind, closed-form path params, size, marker constellation
+  // in local coords (fractions of object size, centered). One transform
+  // state per object per instant, shared by both views: sync is structural.
+  function buildInventory(s) {
+    var rng = mulberry32(s);
+    var kinds = ['cube', 'mobility', 'frame', 'cube', 'mobility'];
+    // spread homes so the five bodies keep their distance and read singly
+    var homes = [
+      { x: 0.30, y: 0.34 }, { x: 0.66, y: 0.30 }, { x: 0.50, y: 0.58 },
+      { x: 0.28, y: 0.72 }, { x: 0.72, y: 0.70 }
+    ];
+    objects = [];
+    for (var i = 0; i < kinds.length; i++) {
+      var kind = kinds[i];
+      var size = kind === 'frame' ? 0.30 : (kind === 'mobility' ? 0.27 : 0.20);
+      if (phoneNow) size *= 0.92;
+      var nm = 4 + Math.floor(rng() * 4); // 4..7 markers
+      var markers = [];
+      for (var m = 0; m < nm; m++) {
+        // constellation points spread over the body, deterministic per seed
+        var ang = (m / nm) * Math.PI * 2 + rng() * 0.7;
+        var rad = 0.22 + rng() * 0.26;
+        markers.push({ x: Math.cos(ang) * rad, y: Math.sin(ang) * rad * 0.8 });
+      }
+      objects.push({
+        kind: kind,
+        size: size,
+        ax: 0.045 + rng() * 0.05, ay: 0.04 + rng() * 0.045,
+        f1: 1 + Math.floor(rng() * 3), f2: 1 + Math.floor(rng() * 3),
+        p1: rng() * Math.PI * 2, p2: rng() * Math.PI * 2,
+        bx: homes[i].x - 0.5, by: homes[i].y - 0.5,
+        ra: 0.25 + rng() * 0.45, fr: 1 + Math.floor(rng() * 2),
+        pr: rng() * Math.PI * 2,
+        markers: markers
+      });
+    }
+    flareOrder = [];
+    for (var k = 0; k < 8; k++) flareOrder.push(Math.floor(rng() * objects.length));
+  }
+
+  function transformAt(o, t) {
+    var w = Math.PI * 2 / LOOP;
+    return {
+      x: 0.5 + o.bx + o.ax * Math.sin(w * o.f1 * t + o.p1),
+      y: 0.5 + o.by + o.ay * Math.sin(w * o.f2 * t + o.p2),
+      rot: o.ra * Math.sin(w * o.fr * t + o.pr)
+    };
+  }
+
+  function markerWorld(o, tr, m) {
+    var c = Math.cos(tr.rot), s = Math.sin(tr.rot);
+    var lx = m.x * o.size, ly = m.y * o.size;
+    return { x: tr.x + lx * c - ly * s, y: tr.y + lx * s + ly * c };
+  }
+
+  // ---------- flares ----------
+  // Scheduled: a flare starts every 9 s at 1.8 + 9k, lasts 0.7 s.
+  // At t = 11 the flare that started at 10.8 is 0.2 s in: mid-burn.
+  function scheduledFlare(t) {
+    var start = 1.8 + 9 * Math.floor((t - 1.8) / 9);
+    if (start < 1.8) start = 1.8;
+    var u = (t - start) / FLARE_DUR;
+    if (u < 0 || u > 1) return null;
+    var slot = Math.round((start - 1.8) / 9) % flareOrder.length;
+    return { obj: flareOrder[slot], env: Math.pow(Math.sin(Math.PI * u), 2), key: start };
+  }
+  function flareEnvFor(objIdx, t) {
+    var env = 0;
+    var sf = scheduledFlare(t);
+    if (sf && sf.obj === objIdx) env = Math.max(env, sf.env);
+    for (var i = 0; i < tapFlares.length; i++) {
+      if (tapFlares[i].obj !== objIdx) continue;
+      var u = (t - tapFlares[i].t0) / FLARE_DUR;
+      if (u >= 0 && u <= 1) env = Math.max(env, Math.pow(Math.sin(Math.PI * u), 2));
+    }
+    return env;
+  }
+
+  // ---------- interaction state ----------
+  var pointer = { down: false, wx: 0, wy: 0, inRight: false };
+  var downInfo = null;
+  var lastTap = { t: -10, x: 0, y: 0 };
+
+  // ---------- audio (lazy, guarded; first gesture only) ----------
+  var AC = null, roomNodes = null, lastFlareKey = null, lastFlareEndKey = null;
+  function audio() {
+    if (AC) return AC;
+    var Ctor = null;
+    if (typeof AudioContext !== 'undefined') Ctor = AudioContext;
+    else if (typeof window !== 'undefined' && window.webkitAudioContext) Ctor = window.webkitAudioContext;
+    if (!Ctor) return null;
+    try { AC = new Ctor(); } catch (e) { AC = null; }
+    if (AC) startRoomTone();
+    return AC;
+  }
+  function startRoomTone() {
+    try {
+      var g = AC.createGain(); g.gain.value = 0.0035;
+      var o1 = AC.createOscillator(); o1.type = 'sine'; o1.frequency.value = 54;
+      var o2 = AC.createOscillator(); o2.type = 'sine'; o2.frequency.value = 54.7;
+      o1.connect(g); o2.connect(g); g.connect(AC.destination);
+      o1.start(); o2.start();
+      roomNodes = { g: g };
+    } catch (e) { roomNodes = null; }
+  }
+  function blip(freq, dur, gain, type) {
+    if (!AC) return;
+    try {
+      var t = AC.currentTime;
+      var o = AC.createOscillator(), g = AC.createGain();
+      o.type = type || 'sine'; o.frequency.value = freq;
+      g.gain.setValueAtTime(gain, t);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      o.connect(g); g.connect(AC.destination);
+      o.start(t); o.stop(t + dur + 0.02);
+    } catch (e) { /* silent */ }
+  }
+  function chime() { blip(1174, 0.28, 0.03); blip(1760, 0.34, 0.02); }
+  function tick() { blip(2200, 0.045, 0.012, 'square'); }
+  function audioEvents(t) {
+    if (!AC) return;
+    var sf = scheduledFlare(t);
+    var key = sf ? sf.key : null;
+    if (key !== null && key !== lastFlareKey) { lastFlareKey = key; chime(); }
+    if (key === null && lastFlareKey !== null && lastFlareEndKey !== lastFlareKey) {
+      lastFlareEndKey = lastFlareKey; tick();
+    }
+  }
+
+  // ---------- view mapping ----------
+  // World is the unit square. Each half shows the whole scene, fit-centered.
+  function viewMap(half) { // half: 0 left, 1 right
+    var hw = W / 2;
+    var s = Math.min(hw, H) * 0.94;
+    return { ox: half * hw + hw / 2, oy: H / 2, s: s };
+  }
+  function toPx(vm, wx, wy) {
+    return { x: vm.ox + (wx - 0.5) * vm.s, y: vm.oy + (wy - 0.5) * vm.s };
+  }
+
+  // ---------- shape paths (local, centered, unit size = o.size in world) ----------
+  function traceShape(o, vm, tr, wob) {
+    var c = Math.cos(tr.rot), s = Math.sin(tr.rot);
+    var px = toPx(vm, tr.x + (wob ? wob.x : 0), tr.y + (wob ? wob.y : 0));
+    ctx.save();
+    ctx.translate(px.x, px.y);
+    ctx.rotate(Math.atan2(
+      (toPx(vm, tr.x + c, tr.y + s).y - px.y),
+      (toPx(vm, tr.x + c, tr.y + s).x - px.x)));
+    var u = o.size * vm.s; // object size in px
+    ctx.beginPath();
+    if (o.kind === 'cube') {
+      ctx.rect(-u / 2, -u / 2, u, u);
+    } else if (o.kind === 'mobility') {
+      // rounded shell: wide body, domed top
+      var w = u, h = u * 0.62, r = h * 0.48;
+      ctx.moveTo(-w / 2, h / 2);
+      ctx.lineTo(-w / 2, -h / 2 + r);
+      ctx.arc(-w / 2 + r, -h / 2 + r, r, Math.PI, Math.PI * 1.5);
+      ctx.lineTo(w / 2 - r, -h / 2);
+      ctx.arc(w / 2 - r, -h / 2 + r, r, Math.PI * 1.5, 0);
+      ctx.lineTo(w / 2, h / 2);
+      ctx.closePath();
+    } else { // frame: open rectangle (path traced as its outline band centerline)
+      var w2 = u, h2 = u * 0.7;
+      ctx.rect(-w2 / 2, -h2 / 2, w2, h2);
+    }
+    ctx.restore();
+    return px;
+  }
+
+  function drawHuman(vm, states) {
+    ctx.save();
+    ctx.beginPath(); ctx.rect(vm.ox - (W / 2) / 2, 0, W / 2, H); ctx.clip();
+    for (var i = 0; i < objects.length; i++) {
+      var o = objects[i], tr = states[i];
+      traceShape(o, vm, tr, null);
+      if (o.kind === 'frame') {
+        ctx.strokeStyle = HUMAN; ctx.globalAlpha = 0.6;
+        ctx.lineWidth = Math.max(3, o.size * vm.s * 0.10);
+        ctx.stroke();
+      } else {
+        ctx.fillStyle = HUMAN; ctx.globalAlpha = 0.62;
+        ctx.fill();
+      }
+    }
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
+  function drawCamera(vm, states, t) {
+    ctx.save();
+    ctx.beginPath(); ctx.rect(vm.ox - (W / 2) / 2, 0, W / 2, H); ctx.clip();
+    for (var i = 0; i < objects.length; i++) {
+      var o = objects[i], tr = states[i];
+      // occlusion: markers hidden under the finger on this side
+      var hidden = [];
+      var hiddenCount = 0;
+      for (var m = 0; m < o.markers.length; m++) {
+        var mw = markerWorld(o, tr, o.markers[m]);
+        var hid = false;
+        if (pointer.down && pointer.inRight) {
+          var dx = mw.x - pointer.wx, dy = mw.y - pointer.wy;
+          if (dx * dx + dy * dy < 0.085 * 0.085) hid = true;
+        }
+        hidden.push(hid);
+        if (hid) hiddenCount++;
+      }
+      var wob = null;
+      if (hiddenCount * 2 > o.markers.length) {
+        wob = { x: 0.007 * Math.sin(t * 39 + i * 7), y: 0.007 * Math.cos(t * 44 + i * 3) };
+      }
+      // wireframe
+      traceShape(o, vm, tr, wob);
+      ctx.strokeStyle = WIRE; ctx.globalAlpha = 0.95;
+      ctx.lineWidth = o.kind === 'frame' ? Math.max(2, o.size * vm.s * 0.07) : 2;
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+      // constellation: red links between marker positions (wobbled with body)
+      var pts = [];
+      for (var m2 = 0; m2 < o.markers.length; m2++) {
+        var mw2 = markerWorld(o, tr, o.markers[m2]);
+        if (wob) { mw2 = { x: mw2.x + wob.x, y: mw2.y + wob.y }; }
+        pts.push({ p: toPx(vm, mw2.x, mw2.y), hid: hidden[m2] });
+      }
+      ctx.strokeStyle = IR; ctx.globalAlpha = 0.5; ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      for (var m3 = 0; m3 < pts.length; m3++) {
+        var a = pts[m3], b = pts[(m3 + 1) % pts.length];
+        if (a.hid || b.hid) continue;
+        ctx.moveTo(a.p.x, a.p.y); ctx.lineTo(b.p.x, b.p.y);
+      }
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+      // markers: burning dots, layered-alpha halo (no gradients)
+      var env = flareEnvFor(i, t);
+      for (var m4 = 0; m4 < pts.length; m4++) {
+        if (pts[m4].hid) continue;
+        var p = pts[m4].p;
+        var rBase = Math.max(2.1, vm.s * 0.0075) * (1 + env * 0.9);
+        ctx.fillStyle = IR; ctx.globalAlpha = 0.30 + env * 0.3;
+        ctx.beginPath(); ctx.arc(p.x, p.y, rBase * 2.6, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = MARK; ctx.globalAlpha = 0.30 + env * 0.35;
+        ctx.beginPath(); ctx.arc(p.x, p.y, rBase * 1.6, 0, Math.PI * 2); ctx.fill();
+        ctx.globalAlpha = 1; ctx.fillStyle = MARK;
+        ctx.beginPath(); ctx.arc(p.x, p.y, rBase, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = IR;
+        ctx.beginPath(); ctx.arc(p.x, p.y, rBase * 0.38, 0, Math.PI * 2); ctx.fill();
+      }
+    }
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    pieceT = t;
+    ctx.fillStyle = STAGE;
+    ctx.fillRect(0, 0, W, H);
+    // one shared transform state for both audiences
+    var states = [];
+    for (var i = 0; i < objects.length; i++) states.push(transformAt(objects[i], t));
+    drawHuman(viewMap(0), states);
+    drawCamera(viewMap(1), states, t);
+    // the split
+    ctx.fillStyle = SPLIT;
+    ctx.fillRect(W / 2 - 1, 0, 2, H);
+  }
+
+  // ---------- pointer ----------
+  function eventWorld(e) {
+    var rect = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    var cx = e.clientX - rect.left, cy = e.clientY - rect.top;
+    var half = cx >= W / 2 ? 1 : 0;
+    var vm = viewMap(half);
+    return {
+      half: half,
+      wx: 0.5 + (cx - vm.ox) / vm.s,
+      wy: 0.5 + (cy - vm.oy) / vm.s,
+      cx: cx, cy: cy
+    };
+  }
+  function onDown(e) {
+    audio();
+    var p = eventWorld(e);
+    downInfo = { x: p.cx, y: p.cy, t: pieceT, moved: false };
+    pointer.down = true; pointer.inRight = p.half === 1;
+    pointer.wx = p.wx; pointer.wy = p.wy;
+    draw(pieceT);
+  }
+  function onMove(e) {
+    if (!pointer.down) return;
+    var p = eventWorld(e);
+    if (downInfo && (Math.abs(p.cx - downInfo.x) > 8 || Math.abs(p.cy - downInfo.y) > 8)) downInfo.moved = true;
+    pointer.inRight = p.half === 1;
+    pointer.wx = p.wx; pointer.wy = p.wy;
+    draw(pieceT);
+  }
+  function onUp(e) {
+    var wasDrag = downInfo && downInfo.moved;
+    pointer.down = false;
+    if (downInfo && !wasDrag) {
+      var p = eventWorld(e);
+      var now = pieceT;
+      if (now - lastTap.t < 0.35) {
+        // double tap: new inventory
+        seed = (seed * 1664525 + 1013904223) >>> 0;
+        tapFlares = [];
+        buildInventory(seed);
+        lastTap.t = -10;
+      } else {
+        // tap: force a flare on the nearest constellation
+        var best = -1, bd = 1e9;
+        for (var i = 0; i < objects.length; i++) {
+          var tr = transformAt(objects[i], now);
+          var dx = tr.x - p.wx, dy = tr.y - p.wy;
+          var d = dx * dx + dy * dy;
+          if (d < bd) { bd = d; best = i; }
+        }
+        if (best >= 0) { tapFlares.push({ obj: best, t0: now }); if (AC) chime(); }
+        lastTap.t = now; lastTap.x = p.cx; lastTap.y = p.cy;
+      }
+    }
+    downInfo = null;
+    draw(pieceT);
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', function () { pointer.down = false; downInfo = null; draw(pieceT); });
+  }
+
+  // ---------- boot: frame one, then the loop ----------
+  fit();
+  buildInventory(seed);
+  draw(T0);
+
+  if (typeof requestAnimationFrame !== 'undefined') {
+    var startStamp = null;
+    var loopFn = function (ms) {
+      if (startStamp === null) startStamp = ms;
+      var t = T0 + (ms - startStamp) / 1000;
+      audioEvents(t);
+      draw(t);
+      requestAnimationFrame(loopFn);
+    };
+    requestAnimationFrame(loopFn);
+  }
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Eyes, Issued</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #070708; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded rng ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- palette (strict) ----------
+  var FIELD = '#070708';
+  var BODY = '#15161A';
+  var LENS = '#0A0B0D';
+  var GLASS = '#7FD4FF';   // used at 0.4 alpha and below
+  var RIG = '#23262B';
+  var FISH = '#1A2030';    // used at 0.5 alpha
+  var CROSS = '#FF3B30';
+
+  var LOOP = 48;          // seconds, seamless
+  var T0 = 8;             // frame one phase: mid-scan, gaze left of center
+  var TWO_PI = Math.PI * 2;
+
+  // ---------- calibration-error model (per pair, seeded) ----------
+  // Each lens aims at gaze + err, where err is a small constant offset
+  // (the pair's calibration error, different per lens, so the two lenses
+  // never quite agree) plus a mechanical hunting jitter: two slow sines
+  // at integer cycle counts over the loop, different phase per lens.
+  var pairSeed = 1037198;
+  var pair = null;
+  function buildPair(seed) {
+    var rng = mulberry32(seed);
+    function mkLens() {
+      return {
+        ex: (rng() * 2 - 1) * 0.016,          // constant error, fraction of u
+        ey: (rng() * 2 - 1) * 0.012,
+        jAmp: 0.004 + rng() * 0.004,          // hunting amplitude, fraction of u
+        jCyc1: 29 + Math.floor(rng() * 10),   // integer cycles per loop
+        jCyc2: 7 + Math.floor(rng() * 5),
+        jPh1: rng() * TWO_PI,
+        jPh2: rng() * TWO_PI
+      };
+    }
+    return {
+      left: mkLens(),
+      right: mkLens(),
+      scanPhX: rng() * TWO_PI,
+      scanPhY: rng() * TWO_PI,
+      scanAx: 0.26 + rng() * 0.05,            // scan sweep, fraction of W/H
+      scanAy: 0.15 + rng() * 0.04
+    };
+  }
+  pair = buildPair(pairSeed);
+
+  // ---------- interaction state (recorded events only) ----------
+  var dragNow = null;        // {x, y} in px while pointer is down and moved
+  var releaseEv = null;      // {t, x, y} last drag release, for drift-back
+  var tapCals = [];          // piece-times of tap-forced calibrations
+  var downInfo = null;
+  var lastTapMs = -1e9;
+
+  // ---------- audio (lazy, guarded) ----------
+  var AC = null, washGain = null, servoOsc = null, servoGain = null;
+  function audio() {
+    if (AC) return AC;
+    var Ctor = null;
+    if (typeof AudioContext !== 'undefined') Ctor = AudioContext;
+    else if (typeof window !== 'undefined' && window.webkitAudioContext) Ctor = window.webkitAudioContext;
+    if (!Ctor) return null;
+    try {
+      AC = new Ctor();
+      // faint wide wash: looped noise through a lowpass
+      var len = AC.sampleRate * 2;
+      var buf = AC.createBuffer(1, len, AC.sampleRate);
+      var d = buf.getChannelData(0);
+      var rng = mulberry32(777);
+      for (var i = 0; i < len; i++) d[i] = rng() * 2 - 1;
+      var src = AC.createBufferSource();
+      src.buffer = buf; src.loop = true;
+      var lp = AC.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 420;
+      washGain = AC.createGain(); washGain.gain.value = 0.016;
+      src.connect(lp); lp.connect(washGain); washGain.connect(AC.destination);
+      src.start();
+      // servo hunting whir: quiet triangle, gain follows gaze speed
+      servoOsc = AC.createOscillator(); servoOsc.type = 'triangle'; servoOsc.frequency.value = 82;
+      var sf = AC.createBiquadFilter(); sf.type = 'lowpass'; sf.frequency.value = 300;
+      servoGain = AC.createGain(); servoGain.gain.value = 0;
+      servoOsc.connect(sf); sf.connect(servoGain); servoGain.connect(AC.destination);
+      servoOsc.start();
+    } catch (e) { AC = null; }
+    return AC;
+  }
+  function click(delay, freq, gain) {
+    if (!AC) return;
+    try {
+      var t = AC.currentTime + delay;
+      var o = AC.createOscillator(), g = AC.createGain();
+      o.type = 'square'; o.frequency.value = freq;
+      g.gain.setValueAtTime(gain, t);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.03);
+      o.connect(g); g.connect(AC.destination);
+      o.start(t); o.stop(t + 0.05);
+    } catch (e) {}
+  }
+  function shutter() { click(0, 2400, 0.05); click(0.09, 1800, 0.05); }
+
+  // ---------- canvas / viewport ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 720, H = 720, DPR = 1;
+
+  function isPhone() {
+    var sw = 0, sh = 0;
+    if (typeof window !== 'undefined' && window.screen) {
+      sw = window.screen.width || 0; sh = window.screen.height || 0;
+    }
+    var mn = Math.min(sw, sh);
+    if (mn > 0 && mn < 700) return true;
+    return H > W * 1.15;
+  }
+  function fit() {
+    var vv = (typeof window !== 'undefined') ? window.visualViewport : null;
+    if (vv && vv.width) { W = vv.width; H = vv.height; }
+    else if (typeof window !== 'undefined' && window.innerWidth) { W = window.innerWidth; H = window.innerHeight; }
+    DPR = (typeof window !== 'undefined' && window.devicePixelRatio) ? Math.min(window.devicePixelRatio, 2) : 1;
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+  }
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', function () { fit(); drawAt(lastT); });
+    }
+    if (window.addEventListener) {
+      window.addEventListener('resize', function () { fit(); drawAt(lastT); });
+    }
+  }
+
+  // ---------- gaze model (closed form in piece t + recorded events) ----------
+  function scanGaze(t) {
+    // slow Lissajous-ish sweep; integer cycle counts keep the 48 s loop seamless.
+    // Phases are set so that at t = 8 the gaze sits left of center.
+    var gx = 0.5 + pair.scanAx * Math.sin(TWO_PI * 2 * t / LOOP + Math.PI)
+                 + 0.05 * Math.sin(TWO_PI * 5 * t / LOOP + pair.scanPhX);
+    var gy = 0.46 + pair.scanAy * Math.sin(TWO_PI * 3 * t / LOOP + 0.7 + pair.scanPhY * 0.2);
+    return { x: gx * W, y: gy * H };
+  }
+  function smooth(a, b, x) {
+    var u = Math.min(1, Math.max(0, (x - a) / (b - a)));
+    return u * u * (3 - 2 * u);
+  }
+  // calibration envelope: periodic snaps every 12 s plus tap-forced ones.
+  function calEnv(t) {
+    var env = 0, starts = [0, 12, 24, 36], i, s, d;
+    for (i = 0; i < starts.length; i++) {
+      d = t - starts[i];
+      if (d >= -0.12 && d <= 0.85) env = Math.max(env, smooth(-0.12, 0.05, d) * (1 - smooth(0.55, 0.85, d)));
+    }
+    for (i = 0; i < tapCals.length; i++) {
+      s = tapCals[i]; d = t - s;
+      if (d < -1) d += LOOP;
+      if (d >= -0.12 && d <= 0.85) env = Math.max(env, smooth(-0.12, 0.05, d) * (1 - smooth(0.55, 0.85, d)));
+    }
+    return env;
+  }
+  function gazeAt(t) {
+    var g = scanGaze(t);
+    if (dragNow) {
+      g = { x: dragNow.x, y: dragNow.y };
+    } else if (releaseEv) {
+      var dt = t - releaseEv.t;
+      if (dt < -1) dt += LOOP;
+      var k = smooth(0, 1.4, dt);
+      if (k < 1) g = { x: releaseEv.x + (g.x - releaseEv.x) * k, y: releaseEv.y + (g.y - releaseEv.y) * k };
+    }
+    var env = calEnv(t);
+    if (env > 0) {
+      var cx = W / 2, cy = H * 0.46;
+      g = { x: g.x + (cx - g.x) * env, y: g.y + (cy - g.y) * env };
+    }
+    return { x: g.x, y: g.y, cal: env };
+  }
+  // per-lens aim point: gaze + constant error + hunting jitter
+  function lensAim(lens, gaze, t, u) {
+    var jx = lens.jAmp * u * (0.7 * Math.sin(TWO_PI * lens.jCyc1 * t / LOOP + lens.jPh1)
+                            + 0.3 * Math.sin(TWO_PI * lens.jCyc2 * t / LOOP + lens.jPh2));
+    var jy = lens.jAmp * u * (0.7 * Math.cos(TWO_PI * lens.jCyc1 * t / LOOP + lens.jPh1 * 1.7)
+                            + 0.3 * Math.sin(TWO_PI * lens.jCyc2 * t / LOOP + lens.jPh2 * 0.6));
+    return { x: gaze.x + lens.ex * u + jx, y: gaze.y + lens.ey * u + jy };
+  }
+
+  // ---------- fisheye field ----------
+  // Grid lines are drawn as polylines; every sample point is pushed through
+  // a fisheye warp centered on the gaze point, so the mediated world bulges
+  // and slides with the looking. Magnify near the gaze, compress far away.
+  function warp(px, py, c) {
+    var dx = px - c.x, dy = py - c.y;
+    var dist = Math.sqrt(dx * dx + dy * dy);
+    var rho = 0.34 * Math.min(W, H);
+    var f = 0.74 + 0.85 / (1 + (dist * dist) / (rho * rho));
+    return { x: c.x + dx * f, y: c.y + dy * f };
+  }
+  function drawFisheye(gaze) {
+    var u = Math.min(W, H);
+    var spacing = u / 7.5;
+    var step = Math.max(6, u / 90);
+    ctx.strokeStyle = FISH;
+    ctx.globalAlpha = 0.5;
+    ctx.lineWidth = 1;
+    var gx, gy, p, q;
+    // vertical lines, extended past the edges so the warp never opens gaps
+    for (gx = -spacing; gx <= W + spacing; gx += spacing) {
+      ctx.beginPath();
+      for (gy = -spacing; gy <= H + spacing; gy += step) {
+        p = warp(gx, gy, gaze);
+        if (gy === -spacing) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+      }
+      ctx.stroke();
+    }
+    for (gy = -spacing; gy <= H + spacing; gy += spacing) {
+      ctx.beginPath();
+      for (gx = -spacing; gx <= W + spacing; gx += step) {
+        q = warp(gx, gy, gaze);
+        if (gx === -spacing) ctx.moveTo(q.x, q.y); else ctx.lineTo(q.x, q.y);
+      }
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- headset ----------
+  function rr(x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.lineTo(x + w - r, y); ctx.arcTo(x + w, y, x + w, y + r, r);
+    ctx.lineTo(x + w, y + h - r); ctx.arcTo(x + w, y + h, x + w - r, y + h, r);
+    ctx.lineTo(x + r, y + h); ctx.arcTo(x, y + h, x, y + h - r, r);
+    ctx.lineTo(x, y + r); ctx.arcTo(x, y, x + r, y, r);
+    ctx.closePath();
+  }
+  function drawLens(cx, cy, R, aim, cal) {
+    // rim
+    ctx.fillStyle = RIG;
+    ctx.beginPath(); ctx.arc(cx, cy, R * 1.1, 0, TWO_PI); ctx.fill();
+    // glass body
+    ctx.fillStyle = LENS;
+    ctx.beginPath(); ctx.arc(cx, cy, R, 0, TWO_PI); ctx.fill();
+    // convex shading: faint layered alpha arcs, no gradients
+    ctx.globalAlpha = 0.05; ctx.fillStyle = GLASS;
+    ctx.beginPath(); ctx.arc(cx - R * 0.18, cy - R * 0.1, R * 0.7, 0, TWO_PI); ctx.fill();
+    ctx.globalAlpha = 0.035;
+    ctx.beginPath(); ctx.arc(cx + R * 0.3, cy + R * 0.34, R * 0.5, 0, TWO_PI); ctx.fill();
+    ctx.globalAlpha = 1;
+    // pupil: offset toward this lens's own aim point
+    var dx = aim.x - cx, dy = aim.y - cy;
+    var dist = Math.sqrt(dx * dx + dy * dy) || 1;
+    var off = Math.min(dist * 0.16, R * 0.42);
+    var ox = dx / dist * off, oy = dy / dist * off;
+    ctx.fillStyle = '#000000';
+    ctx.beginPath(); ctx.arc(cx + ox, cy + oy, R * 0.46, 0, TWO_PI); ctx.fill();
+    ctx.strokeStyle = RIG; ctx.lineWidth = Math.max(1.5, R * 0.03);
+    ctx.beginPath(); ctx.arc(cx + ox, cy + oy, R * 0.46, 0, TWO_PI); ctx.stroke();
+    // specular highlight: rides further along the same offset, per lens
+    ctx.globalAlpha = 0.4; ctx.fillStyle = GLASS;
+    ctx.beginPath(); ctx.arc(cx + ox * 1.5 - R * 0.1, cy + oy * 1.5 - R * 0.16, R * 0.10, 0, TWO_PI); ctx.fill();
+    // secondary crescent arc
+    ctx.globalAlpha = 0.13;
+    ctx.lineWidth = Math.max(1.5, R * 0.045); ctx.strokeStyle = GLASS;
+    ctx.beginPath(); ctx.arc(cx + ox * 0.8, cy + oy * 0.8, R * 0.66, Math.PI * 1.05, Math.PI * 1.55); ctx.stroke();
+    ctx.globalAlpha = 1;
+    // calibration crosshair
+    if (cal > 0.45) {
+      ctx.globalAlpha = Math.min(1, (cal - 0.45) * 2.4);
+      ctx.strokeStyle = CROSS; ctx.lineWidth = Math.max(1.2, R * 0.022);
+      var L = R * 0.8;
+      ctx.beginPath();
+      ctx.moveTo(cx - L, cy); ctx.lineTo(cx - R * 0.18, cy);
+      ctx.moveTo(cx + R * 0.18, cy); ctx.lineTo(cx + L, cy);
+      ctx.moveTo(cx, cy - L); ctx.lineTo(cx, cy - R * 0.18);
+      ctx.moveTo(cx, cy + R * 0.18); ctx.lineTo(cx, cy + L);
+      ctx.stroke();
+      ctx.beginPath(); ctx.arc(cx, cy, R * 0.3, 0, TWO_PI); ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+  }
+  function drawHeadset(gaze, t) {
+    var u = Math.min(W, H);
+    var cx = W / 2, cy = H * 0.46;
+    var R = u * 0.165;
+    var lx = cx - u * 0.205, rx = cx + u * 0.205;
+    // body shell
+    ctx.fillStyle = BODY;
+    rr(cx - u * 0.47, cy - u * 0.235, u * 0.94, u * 0.47, u * 0.09);
+    ctx.fill();
+    ctx.strokeStyle = RIG; ctx.lineWidth = Math.max(1, u * 0.004);
+    rr(cx - u * 0.47, cy - u * 0.235, u * 0.94, u * 0.47, u * 0.09);
+    ctx.stroke();
+    // top strap hint
+    ctx.fillStyle = RIG;
+    rr(cx - u * 0.30, cy - u * 0.285, u * 0.60, u * 0.05, u * 0.02);
+    ctx.fill();
+    // stereo rig bar between the lenses, with two camera nubs
+    ctx.fillStyle = RIG;
+    rr(cx - u * 0.085, cy - u * 0.045, u * 0.17, u * 0.09, u * 0.02);
+    ctx.fill();
+    ctx.beginPath(); ctx.arc(cx - u * 0.038, cy, u * 0.021, 0, TWO_PI); ctx.fill();
+    ctx.beginPath(); ctx.arc(cx + u * 0.038, cy, u * 0.021, 0, TWO_PI); ctx.fill();
+    ctx.fillStyle = '#000000';
+    ctx.beginPath(); ctx.arc(cx - u * 0.038, cy, u * 0.010, 0, TWO_PI); ctx.fill();
+    ctx.beginPath(); ctx.arc(cx + u * 0.038, cy, u * 0.010, 0, TWO_PI); ctx.fill();
+    // lenses
+    drawLens(lx, cy, R, lensAim(pair.left, gaze, t, u), gaze.cal);
+    drawLens(rx, cy, R, lensAim(pair.right, gaze, t, u), gaze.cal);
+  }
+
+  // ---------- draw ----------
+  var lastT = T0;
+  function drawAt(t) {
+    lastT = t;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = FIELD;
+    ctx.fillRect(0, 0, W, H);
+    var gaze = gazeAt(t);
+    drawFisheye(gaze);
+    drawHeadset(gaze, t);
+  }
+
+  // ---------- pointer ----------
+  function pos(e) {
+    var rect = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+  }
+  var pieceNow = T0; // updated by the loop; event times are read from it
+  function onDown(e) {
+    audio();
+    var p = pos(e);
+    downInfo = { x: p.x, y: p.y, moved: false };
+  }
+  function onMove(e) {
+    if (!downInfo) return;
+    var p = pos(e);
+    if (Math.abs(p.x - downInfo.x) > 6 || Math.abs(p.y - downInfo.y) > 6) downInfo.moved = true;
+    if (downInfo.moved) dragNow = { x: p.x, y: p.y };
+  }
+  function onUp(e) {
+    if (!downInfo) return;
+    var wasDrag = downInfo.moved;
+    downInfo = null;
+    if (wasDrag) {
+      if (dragNow) releaseEv = { t: pieceNow, x: dragNow.x, y: dragNow.y };
+      dragNow = null;
+      return;
+    }
+    // tap: force a calibration; double-tap: a new pair
+    var nowMs = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+    if (nowMs - lastTapMs < 350) {
+      pairSeed = (pairSeed * 1664525 + 1013904223) >>> 0;
+      pair = buildPair(pairSeed);
+      tapCals.length = 0;
+      lastTapMs = -1e9;
+    } else {
+      tapCals.push(pieceNow);
+      if (AC) shutter();
+      lastTapMs = nowMs;
+    }
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', function () { downInfo = null; dragNow = null; });
+  }
+
+  // ---------- boot: frame one, then the loop ----------
+  fit();
+  drawAt(T0);
+
+  if (typeof requestAnimationFrame !== 'undefined') {
+    var startMs = null, prevGaze = null, prevCal = 0;
+    var loop = function (ms) {
+      if (startMs === null) startMs = ms;
+      var t = (T0 + (ms - startMs) / 1000) % LOOP; // wrapped clock; the scan is LOOP-periodic
+      pieceNow = t;
+      drawAt(t);
+      // audio follow: servo gain from gaze speed, shutter on periodic cals
+      if (AC) {
+        var g = gazeAt(t);
+        if (prevGaze) {
+          var sp = Math.sqrt((g.x - prevGaze.x) * (g.x - prevGaze.x) + (g.y - prevGaze.y) * (g.y - prevGaze.y));
+          if (servoGain) servoGain.gain.value = Math.min(0.05, sp * 0.004);
+          if (servoOsc) servoOsc.frequency.value = 70 + Math.min(60, sp * 0.6);
+        }
+        prevGaze = g;
+        if (g.cal > 0.6 && prevCal <= 0.6) shutter();
+        prevCal = g.cal;
+      }
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
