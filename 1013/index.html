@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Eight Ways to Dream</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #050507; height: 100%; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- palette (strict, from the brief) ----------
+  var ROOM = '#050507', ROOM_RGB = [5, 5, 7];
+  var NOISE_RGB = [138, 141, 132];           // #8A8D84 static gray
+  var HUES = ['#4FD6FF', '#FF4FD8', '#7DF9C6', '#FFD93B',
+              '#B48CFF', '#FF8A5C', '#5CE1FF', '#E2FF5C'];
+  var HUE_RGB = HUES.map(function (hx) {
+    return [parseInt(hx.slice(1, 3), 16), parseInt(hx.slice(3, 5), 16), parseInt(hx.slice(5, 7), 16)];
+  });
+  var T0 = 13;                  // frame one: cascade mid-flow
+  var CYCLE = 20;               // 14 s denoise + 2 s hold + 4 s re-noise
+  var BUCKETS_PER_SEC = 8;      // static shimmer rate
+
+  // ---------- seeded rng ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function smooth(a, b, x) { var u = clamp((x - a) / (b - a), 0, 1); return u * u * (3 - 2 * u); }
+
+  // integer hash noise: pure function of (a, b, c) -> [0, 1)
+  function hash3(a, b, c) {
+    var h = (a * 374761393 + b * 668265263 + c * 2246822519) | 0;
+    h = Math.imul(h ^ (h >>> 13), 1274126177);
+    return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+  }
+
+  // ---------- the latent: ONE composition, all eight lanes ----------
+  // 5-7 soft discs/ridges over a gentle base slope, generated from a seed.
+  var latent = null;
+  function buildLatent(seed) {
+    var rng = mulberry32(seed);
+    var discs = [], i;
+    var n = 5 + Math.floor(rng() * 3);
+    for (i = 0; i < n; i++) {
+      discs.push({
+        x: 0.12 + rng() * 0.76, y: 0.15 + rng() * 0.70,
+        r: 0.11 + rng() * 0.12, amp: 0.60 + rng() * 0.45,
+        sx: 0.8 + rng() * 0.8                      // horizontal squash: discs and ridges
+      });
+    }
+    return {
+      discs: discs,
+      gx: (rng() - 0.5) * 0.3, gy: (rng() - 0.5) * 0.3,
+      base: 0.05 + rng() * 0.05
+    };
+  }
+  function latentAt(L, u, v) {
+    var val = L.base + L.gx * (u - 0.5) + L.gy * (v - 0.5), i, d, dx, dy, q;
+    for (i = 0; i < L.discs.length; i++) {
+      d = L.discs[i];
+      dx = (u - d.x) / (d.r * d.sx); dy = (v - d.y) / d.r;
+      q = dx * dx + dy * dy;
+      if (q < 4) val += d.amp * Math.exp(-q * 1.6);
+    }
+    return clamp(val, 0, 1);
+  }
+  latent = buildLatent(1013174);
+
+  // ---------- view / canvas ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0, phone = false;
+  function resize() {
+    var w = 0, h = 0;
+    if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.width) {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    } else if (typeof window !== 'undefined' && window.innerWidth) {
+      w = window.innerWidth; h = window.innerHeight;
+    }
+    if (!w || !h) { w = 720; h = 720; }
+    W = w; H = h;
+    canvas.width = Math.round(w); canvas.height = Math.round(h);
+    var minDim = 100000;
+    if (typeof window !== 'undefined' && window.screen) {
+      minDim = Math.min(window.screen.width || 100000, window.screen.height || 100000);
+    }
+    phone = minDim < 700 || h > w * 1.15;
+  }
+  resize();
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', resize);
+    }
+    if (window.addEventListener) window.addEventListener('resize', resize);
+  }
+
+  // ---------- cascade: lane noise s(t), closed form ----------
+  function laneS(lane, t) {
+    var ph = ((t + lane * (CYCLE / 8)) % CYCLE + CYCLE) % CYCLE;
+    if (ph < 14) { var u = ph / 14; return 1 - 0.92 * (u * u * (3 - 2 * u)); }
+    if (ph < 16) return 0.08;
+    var u2 = (ph - 16) / 4; return 0.08 + 0.92 * (u2 * u2 * (3 - 2 * u2));
+  }
+
+  // ---------- interaction state (recorded events only) ----------
+  var solo = null;              // {lane, start, dur}
+  var injections = [];          // {lane, cx, cy, t0} in lane units
+  var newDreamAt = -1;          // epoch of last double-tap reseed
+  var lastTap = null;           // {lane, t}
+
+  // ---------- audio (lazy, gesture-gated, fully guarded) ----------
+  var AC = null, laneOsc = [], laneGain = [], laneNoiseGain = [], master = null;
+  function initAudio() {
+    if (AC) return;
+    if (typeof window === 'undefined') return;
+    var Ctor = window.AudioContext || window.webkitAudioContext;
+    if (typeof Ctor !== 'function') return;
+    try {
+      AC = new Ctor();
+      master = AC.createGain(); master.gain.value = 0.5; master.connect(AC.destination);
+      var len = AC.sampleRate * 1.5, buf = AC.createBuffer(1, len, AC.sampleRate), ch = buf.getChannelData(0), i;
+      var r = mulberry32(777);
+      for (i = 0; i < len; i++) ch[i] = r() * 2 - 1;
+      var freqs = [110, 147, 165, 196, 220, 262, 294, 330];
+      for (i = 0; i < 8; i++) {
+        var src = AC.createBufferSource(); src.buffer = buf; src.loop = true;
+        src.playbackRate.value = 0.7 + i * 0.06;
+        var bp = AC.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 300 + i * 160; bp.Q.value = 0.8;
+        var ng = AC.createGain(); ng.gain.value = 0;
+        src.connect(bp); bp.connect(ng); ng.connect(master); src.start();
+        var osc = AC.createOscillator(); osc.type = 'sine'; osc.frequency.value = freqs[i];
+        var og = AC.createGain(); og.gain.value = 0;
+        osc.connect(og); og.connect(master); osc.start();
+        laneNoiseGain.push(ng); laneOsc.push(osc); laneGain.push(og);
+      }
+    } catch (e) { AC = null; }
+  }
+  function updateAudio(t) {
+    if (!AC) return;
+    try {
+      var ct = AC.currentTime, i, c;
+      for (i = 0; i < 8; i++) {
+        c = 1 - laneS(i, t);
+        laneGain[i].gain.setTargetAtTime(0.05 * c * c, ct, 0.2);
+        laneNoiseGain[i].gain.setTargetAtTime(0.012 + 0.05 * (1 - c), ct, 0.2);
+      }
+    } catch (e) { /* silent */ }
+  }
+
+  // ---------- drawing ----------
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.fillStyle = ROOM;
+    ctx.fillRect(0, 0, W, H);
+
+    var bucket = Math.floor(t * BUCKETS_PER_SEC);
+    var soloLane = -1, soloA = 0;
+    if (solo) {
+      var age = t - solo.start;
+      if (age >= 0 && age < solo.dur) { soloLane = solo.lane; soloA = smooth(0, 0.35, age) * (1 - smooth(solo.dur - 0.35, solo.dur, age)); }
+    }
+
+    var laneH = H / 8, i;
+    for (i = 0; i < 8; i++) {
+      var y0 = i * laneH, hh = laneH;
+      if (soloLane >= 0) {
+        if (i === soloLane) { y0 = i * laneH * (1 - soloA); hh = laneH + (H - laneH) * soloA; }
+        else {
+          var f = 1 - soloA;
+          y0 = (i < soloLane ? i * laneH * f : H - (8 - i) * laneH * f);
+          hh = laneH * f;
+        }
+      }
+      if (hh > 0.5) drawLane(i, 0, y0, W, hh, t, bucket);
+    }
+    updateAudio(t);
+  }
+
+  function drawLane(lane, x0, y0, w, h, t, bucket) {
+    var cols = phone ? 48 : 64, rows = phone ? 9 : 12;
+    var cw = w / cols, chh = h / rows;
+    var s = laneS(lane, t);
+    var hue = HUE_RGB[lane];
+    var cellInj = injections.length ? injections : null;
+    var r, c, u, v, lat, nz, val, bright, k;
+    var grayMix = s;                       // static leans gray as s rises
+    for (r = 0; r < rows; r++) {
+      v = (r + 0.5) / rows;
+      for (c = 0; c < cols; c++) {
+        u = (c + 0.5) / cols;
+        var se = s;
+        if (cellInj) {
+          for (k = 0; k < cellInj.length; k++) {
+            var inj = cellInj[k];
+            if (inj.lane !== lane) continue;
+            var age = t - inj.t0;
+            if (age < 0 || age > 4.5) continue;
+            var du = (u - inj.cx) * 3.2, dv = (v - inj.cy) * 3.2;
+            var d2 = du * du + dv * dv;
+            if (d2 < 1.6) se = Math.min(1, se + 0.55 * Math.exp(-d2 * 1.8) * (1 - smooth(2.5, 4.5, age)));
+          }
+        }
+        lat = latentAt(latent, u, v);
+        nz = hash3(c + lane * 131, r + bucket * 17, 1013);
+        val = lat * (1 - se) + nz * se;
+        bright = 0.06 + 0.94 * val;
+        var colR = (ROOM_RGB[0] + (hue[0] - ROOM_RGB[0]) * bright) * (1 - grayMix) +
+                   (ROOM_RGB[0] + (NOISE_RGB[0] - ROOM_RGB[0]) * bright) * grayMix;
+        var colG = (ROOM_RGB[1] + (hue[1] - ROOM_RGB[1]) * bright) * (1 - grayMix) +
+                   (ROOM_RGB[1] + (NOISE_RGB[1] - ROOM_RGB[1]) * bright) * grayMix;
+        var colB = (ROOM_RGB[2] + (hue[2] - ROOM_RGB[2]) * bright) * (1 - grayMix) +
+                   (ROOM_RGB[2] + (NOISE_RGB[2] - ROOM_RGB[2]) * bright) * grayMix;
+        ctx.fillStyle = 'rgb(' + (colR | 0) + ',' + (colG | 0) + ',' + (colB | 0) + ')';
+        ctx.fillRect(x0 + c * cw, y0 + r * chh, cw + 0.6, chh + 0.6);
+      }
+    }
+    // loss curve: last 20 s of s, falling as the dream clarifies
+    ctx.strokeStyle = '#FFFFFF';
+    ctx.globalAlpha = 0.85;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    var steps = 72, px, pt, ps;
+    for (px = 0; px <= steps; px++) {
+      pt = t - 20 + (px / steps) * 20;
+      ps = laneS(lane, pt);
+      var lx = x0 + (px / steps) * w;
+      var ly = y0 + h - 2 - ps * (h * 0.26);
+      if (px === 0) ctx.moveTo(lx, ly); else ctx.lineTo(lx, ly);
+    }
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    // hairline divider
+    ctx.fillStyle = '#14161C';
+    ctx.fillRect(x0, y0 + h - 1, w, 1);
+  }
+
+  // ---------- pointer interaction ----------
+  function laneAt(y) { return clamp(Math.floor((y / H) * 8), 0, 7); }
+  var drag = null;
+  var startPerf = (typeof performance !== 'undefined' && performance.now) ? performance.now() / 1000 : 0;
+  function pieceT() { return T0 + ((typeof performance !== 'undefined' && performance.now) ? performance.now() / 1000 : 0) - startPerf; }
+
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', function (e) {
+      initAudio();
+      if (AC && AC.resume) { try { AC.resume(); } catch (err) {} }
+      var t = pieceT();
+      drag = { lane: laneAt(e.clientY || 0), moved: false, x: e.clientX || 0, y: e.clientY || 0, t: t };
+    });
+    canvas.addEventListener('pointermove', function (e) {
+      if (!drag) return;
+      var x = e.clientX || 0, y = e.clientY || 0;
+      if (Math.abs(x - drag.x) + Math.abs(y - drag.y) > 6) drag.moved = true;
+      if (drag.moved) {
+        injections.push({ lane: drag.lane, cx: clamp(x / W, 0, 1), cy: clamp(((y % (H / 8))) / (H / 8), 0, 1), t0: pieceT() });
+        if (injections.length > 240) injections.splice(0, injections.length - 240);
+      }
+      drag.x = x; drag.y = y;
+    });
+    function endPointer(e) {
+      if (!drag) return;
+      var t = pieceT(), d = drag; drag = null;
+      if (d.moved) return;
+      // tap: double-tap within 0.4 s reseeds; single tap solos the lane
+      if (lastTap && t - lastTap.t < 0.4) {
+        latent = buildLatent(1013174 + Math.floor(t * 7) % 100000 + 31);
+        newDreamAt = t; lastTap = null; injections = [];
+      } else {
+        lastTap = { lane: d.lane, t: t };
+        solo = { lane: d.lane, start: t + 0.4, dur: 10 };   // starts after the double-tap window
+      }
+    }
+    canvas.addEventListener('pointerup', endPointer);
+    canvas.addEventListener('pointercancel', function () { drag = null; });
+  }
+
+  // ---------- main loop: synchronous frame one, then rAF if present ----------
+  draw(T0);
+  var t0ms = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+  if (typeof requestAnimationFrame === 'function') {
+    var loop = function () {
+      var el = (typeof performance !== 'undefined' && performance.now) ? (performance.now() - t0ms) / 1000 : 0;
+      draw(T0 + el);
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>

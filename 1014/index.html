@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>What the Sound Casts</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0A0B0D; height: 100%; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- seeded rng (mulberry32) ----------
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  var BASE_SEED = 101417;
+  var T0 = 15;                    // frame one: fixed time offset, seconds
+  var WALL_Z = 2.0;               // wall plane in the virtual room
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  var W = 0, H = 0, U = 0, CX = 0, CY = 0, PHONE = false;
+
+  function measure() {
+    var vv = (typeof window !== 'undefined') ? window.visualViewport : null;
+    var w = vv ? vv.width : window.innerWidth;
+    var h = vv ? vv.height : window.innerHeight;
+    W = Math.max(50, Math.floor(w)); H = Math.max(50, Math.floor(h));
+    canvas.width = W; canvas.height = H;
+    U = Math.min(W, H); CX = W / 2; CY = H / 2;
+    var sw = 0, sh = 0;
+    if (window.screen) { sw = window.screen.width || 0; sh = window.screen.height || 0; }
+    var mn = Math.min(sw, sh);
+    PHONE = (mn > 0 && mn < 700) || (H > W * 1.15 && mn === 0);
+  }
+  measure();
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { measure(); draw(currentT); });
+  }
+  if (window.addEventListener) {
+    window.addEventListener('resize', function () { measure(); draw(currentT); });
+  }
+
+  // ---------- the sound state ----------
+  // One seeded closed-form swell drives BOTH the branch growth (the shadows)
+  // and the generative audio. Neither reads the other; both read this.
+  function swellAt(t, phase) {
+    var s = Math.sin((t / 21) * Math.PI * 2 + phase)
+          + 0.38 * Math.sin((t / 8.7) * Math.PI * 2 + phase * 1.7)
+          + 0.16 * Math.sin((t / 3.9) * Math.PI * 2 + phase * 0.6);
+    s = s / 1.54 * 0.5 + 0.5;                       // ~0..1
+    return Math.pow(Math.max(0, Math.min(1, s)), 1.25);
+  }
+
+  // ---------- the sound-objects (never drawn) ----------
+  // Seeded recursive branch systems in a virtual 3D room. Only their
+  // shadows, projected from a virtual light onto the wall plane, are drawn.
+  function buildTree(rng, root, height, spread) {
+    var segs = [];
+    function grow(x, y, z, dx, dy, dz, len, depth, key) {
+      var x2 = x + dx * len, y2 = y + dy * len, z2 = z + dz * len;
+      var k2 = key + len * (0.75 + rng() * 0.5);
+      segs.push({ x1: x, y1: y, z1: z, x2: x2, y2: y2, z2: z2, depth: depth, key: k2 });
+      if (depth >= 7 || segs.length > 240) return;
+      var kids = depth < 2 ? 2 : (rng() < 0.78 ? 2 : (rng() < 0.5 ? 1 : 3));
+      for (var i = 0; i < kids; i++) {
+        var a = (rng() - 0.5) * 2 * spread;              // yaw perturbation
+        var b = (rng() - 0.5) * 2 * spread * 0.8;       // pitch perturbation
+        var ca = Math.cos(a), sa = Math.sin(a), cb = Math.cos(b), sb = Math.sin(b);
+        var nx = dx * ca - dz * sa, nz = dx * sa + dz * ca, ny = dy;
+        var mx = nx, mz = nz, my = ny * cb - mz * sb; mz = ny * sb + mz * cb;
+        var il = 1 / Math.max(0.0001, Math.sqrt(mx * mx + my * my + mz * mz));
+        grow(x2, y2, z2, mx * il, my * il, mz * il,
+             len * (0.68 + rng() * 0.22), depth + 1, k2);
+        if (segs.length > 240) return;
+      }
+    }
+    grow(root.x, root.y, root.z, (rng() - 0.5) * 0.3, -1, (rng() - 0.5) * 0.25,
+         height * 0.30, 0, 0);
+    var maxKey = 0;
+    for (var i = 0; i < segs.length; i++) if (segs[i].key > maxKey) maxKey = segs[i].key;
+    return { segs: segs, maxKey: maxKey, root: root };
+  }
+
+  var room = null;   // { seed, start, trees:[{tree, phase, rotSpeed, sway}] }
+  function buildRoom(seed, start) {
+    var rng = mulberry32(seed);
+    var defs = [
+      { root: { x: -0.30, y: 0.34, z: 0.55 }, h: 0.78, sp: 0.62 },
+      { root: { x: 0.31, y: 0.36, z: 0.78 }, h: 0.66, sp: 0.70 },
+      { root: { x: 0.03, y: 0.38, z: 0.42 }, h: 0.55, sp: 0.55 }
+    ];
+    var trees = [];
+    for (var i = 0; i < defs.length; i++) {
+      trees.push({
+        tree: buildTree(rng, defs[i].root, defs[i].h, defs[i].sp),
+        phase: rng() * Math.PI * 2,
+        rotSpeed: (0.030 + rng() * 0.035) * (rng() < 0.5 ? -1 : 1),
+        rotBase: rng() * Math.PI * 2,
+        sway: 0.16 + rng() * 0.14
+      });
+    }
+    return { seed: seed, start: start, trees: trees };
+  }
+  room = buildRoom(BASE_SEED, 0);
+
+  // ---------- the virtual light ----------
+  var LIGHT_HOME = { x: -0.18, y: -0.42, z: -1.35 };
+  var light = { x: LIGHT_HOME.x, y: LIGHT_HOME.y, z: LIGHT_HOME.z };
+  var lightTarget = { x: LIGHT_HOME.x, y: LIGHT_HOME.y };
+  var dragging = false;
+
+  function project(px, py, pz) {
+    var k = (WALL_Z - light.z) / Math.max(0.15, pz - light.z);
+    return { x: light.x + (px - light.x) * k, y: light.y + (py - light.y) * k, k: k };
+  }
+
+  // ---------- console geometry ----------
+  function consoleRect() {
+    var cw = Math.max(54, W * 0.12);
+    var ch = cw * 0.58;
+    return { x: CX - cw / 2, y: H - ch - Math.max(10, H * 0.028), w: cw, h: ch };
+  }
+
+  // ---------- drawing ----------
+  function lerp(a, b, f) { return a + (b - a) * f; }
+
+  function drawTree(tr, t, growIn, shadowRGB, passes) {
+    var swell = swellAt(t, tr.phase);
+    var g = (0.40 + 0.60 * swell) * growIn;                 // growth fraction
+    var ay = tr.rotBase + t * tr.rotSpeed;
+    var ax = Math.sin(t * 0.045 + tr.phase) * tr.sway;
+    var cay = Math.cos(ay), say = Math.sin(ay), cax = Math.cos(ax), sax = Math.sin(ax);
+    var root = tr.tree.root, segs = tr.tree.segs, maxKey = tr.tree.maxKey;
+    var span = maxKey * 1.04;
+    var pts = [];
+    var i, s, f, ex, ey, ez;
+    for (i = 0; i < segs.length; i++) {
+      s = segs[i];
+      f = (g * span - s.key) / (0.10 * maxKey + 0.001);
+      f = f < 0 ? 0 : (f > 1 ? 1 : f);
+      if (f <= 0) { pts.push(null); continue; }
+      ex = s.x1 + (s.x2 - s.x1) * f; ey = s.y1 + (s.y2 - s.y1) * f; ez = s.z1 + (s.z2 - s.z1) * f;
+      pts.push({ ax: s.x1, ay: s.y1, az: s.z1, bx: ex, by: ey, bz: ez, d: s.depth });
+    }
+    function rot(px, py, pz) {
+      var x = px - root.x, y = py - root.y, z = pz - root.z;
+      var x1 = x * cay + z * say, z1 = -x * say + z * cay;
+      var y2 = y * cax - z1 * sax, z2 = y * sax + z1 * cax;
+      return { x: x1 + root.x, y: y2 + root.y, z: z2 + root.z };
+    }
+    for (var p = 0; p < passes.length; p++) {
+      ctx.strokeStyle = shadowRGB;
+      ctx.globalAlpha = passes[p].alpha;
+      ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+      ctx.beginPath();
+      var any = false;
+      for (i = 0; i < pts.length; i++) {
+        var q = pts[i]; if (!q) continue;
+        var r1 = rot(q.ax, q.ay, q.az), r2 = rot(q.bx, q.by, q.bz);
+        ctx.lineWidth = Math.max(0.6, (0.024 * (1 - q.d / 9) + 0.004) * r1k(r1) * U * passes[p].w);
+        var s1 = project(r1.x, r1.y, r1.z), s2 = project(r2.x, r2.y, r2.z);
+        ctx.moveTo(CX + s1.x * U, CY + s1.y * U);
+        ctx.lineTo(CX + s2.x * U, CY + s2.y * U);
+        any = true;
+      }
+      if (any) ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+    function r1k(r) { return (WALL_Z - light.z) / Math.max(0.15, r.z - light.z); }
+  }
+
+  function draw(t) {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    // wall
+    ctx.fillStyle = '#0A0B0D';
+    ctx.fillRect(0, 0, W, H);
+
+    var age = t - room.start;
+    var growIn = age >= 4 ? 1 : (age <= 0 ? 0 : (age / 4) * (age / 4) * (3 - 2 * (age / 4)));
+    var swell0 = swellAt(t, 0.9);
+    // projection wash: the lit area, centered between middle and light
+    var wx = CX + light.x * U * 0.35, wy = CY + light.y * U * 0.30;
+    ctx.fillStyle = '#2A2D33';
+    var WASH_N = 10;
+    for (var i = 0; i < WASH_N; i++) {
+      var wf = i / (WASH_N - 1);                       // 0 outer .. 1 inner
+      var wr = 0.98 - 0.74 * wf;
+      ctx.globalAlpha = (0.034 + 0.062 * wf) * (0.8 + 0.35 * swell0) * (0.55 + 0.45 * growIn);
+      ctx.beginPath();
+      ctx.ellipse(wx, wy, wr * U, wr * 0.84 * U, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // shadow tone deepens toward #050607 as the swell peaks
+    var sr = Math.round(lerp(14, 5, swell0));
+    var sg = Math.round(lerp(15, 6, swell0));
+    var sb = Math.round(lerp(18, 7, swell0));
+    var shadowRGB = 'rgb(' + sr + ',' + sg + ',' + sb + ')';
+    var passes = [
+      { w: 3.4, alpha: 0.075 }, { w: 2.1, alpha: 0.12 },
+      { w: 1.25, alpha: 0.19 }, { w: 0.62, alpha: 0.30 }
+    ];
+    for (i = 0; i < room.trees.length; i++) drawTree(room.trees[i], t, growIn, shadowRGB, passes);
+
+    // console: small dark slab, faint interface, subordinate
+    var r = consoleRect();
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = '#14161C';
+    ctx.fillRect(r.x, r.y, r.w, r.h);
+    ctx.strokeStyle = 'rgba(61,220,132,0.16)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1);
+    ctx.strokeStyle = '#3DDC84';
+    ctx.fillStyle = '#3DDC84';
+    // waveform squiggle: amplitude IS the swell (the machine shows the sound)
+    ctx.beginPath();
+    var n = 22, midY = r.y + r.h * 0.34, amp = r.h * 0.20 * (0.25 + swell0);
+    for (i = 0; i <= n; i++) {
+      var fx = r.x + 6 + (r.w - 12) * (i / n);
+      var fy = midY + Math.sin(i * 1.35 + t * 1.7) * amp * Math.sin(i / n * Math.PI);
+      if (i === 0) ctx.moveTo(fx, fy); else ctx.lineTo(fx, fy);
+    }
+    ctx.globalAlpha = 0.42; ctx.lineWidth = 1; ctx.stroke();
+    // tick rows: brightness from the same swell field
+    for (var row = 0; row < 2; row++) {
+      for (var cix = 0; cix < 9; cix++) {
+        var b = swellAt(t * 0.6, cix * 0.83 + row * 2.1);
+        ctx.globalAlpha = 0.10 + 0.4 * b;
+        var tx = r.x + 7 + cix * ((r.w - 14) / 8);
+        var ty = r.y + r.h * (0.66 + row * 0.17);
+        if ((cix + row) % 3 === 0) ctx.fillRect(tx - 1, ty - 1, 2, 2);
+        else ctx.fillRect(tx - 2, ty - 0.5, 4 + 3 * b, 1);
+      }
+    }
+    // one status dot breathing with the master swell
+    ctx.globalAlpha = 0.25 + 0.55 * swell0;
+    ctx.beginPath();
+    ctx.arc(r.x + r.w - 8, r.y + 8, 2, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- audio (lazy, gesture-gated, guarded) ----------
+  var AC = null, master = null, oscGain = null, filt = null, lastShedBand = -1;
+  function ensureAudio() {
+    if (AC) { if (AC.resume) AC.resume(); return; }
+    try {
+      var Ctor = (typeof window !== 'undefined') && (window.AudioContext || window.webkitAudioContext);
+      if (!Ctor) return;
+      AC = new Ctor();
+      master = AC.createGain(); master.gain.value = 0.0; master.connect(AC.destination);
+      filt = AC.createBiquadFilter(); filt.type = 'lowpass'; filt.frequency.value = 320; filt.connect(master);
+      oscGain = AC.createGain(); oscGain.gain.value = 0.05; oscGain.connect(filt);
+      var o1 = AC.createOscillator(); o1.type = 'sine'; o1.frequency.value = 55;
+      var o2 = AC.createOscillator(); o2.type = 'sine'; o2.frequency.value = 82.7;
+      var o3 = AC.createOscillator(); o3.type = 'triangle'; o3.frequency.value = 110.3;
+      var g3 = AC.createGain(); g3.gain.value = 0.35;
+      o1.connect(oscGain); o2.connect(oscGain); o3.connect(g3); g3.connect(oscGain);
+      o1.start(); o2.start(); o3.start();
+      master.gain.setTargetAtTime(0.14, AC.currentTime, 1.2);
+    } catch (e) { AC = null; }
+  }
+  function shedBlip(strength) {
+    if (!AC || !master) return;
+    try {
+      var o = AC.createOscillator(), g = AC.createGain();
+      o.type = 'sine';
+      o.frequency.setValueAtTime(300 + 120 * strength, AC.currentTime);
+      o.frequency.exponentialRampToValueAtTime(84, AC.currentTime + 0.9);
+      g.gain.setValueAtTime(0.05 * strength, AC.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.0004, AC.currentTime + 1.1);
+      o.connect(g); g.connect(master); o.start(); o.stop(AC.currentTime + 1.2);
+    } catch (e) { /* stay silent */ }
+  }
+  function audioFrame(t) {
+    if (!AC || !oscGain || !filt) return;
+    var s = swellAt(t, 0.9);
+    try {
+      oscGain.gain.setTargetAtTime(0.02 + 0.11 * s, AC.currentTime, 0.25);
+      filt.frequency.setTargetAtTime(180 + 700 * s, AC.currentTime, 0.4);
+      var band = Math.floor(s * 6);
+      if (lastShedBand >= 0 && band < lastShedBand) shedBlip(0.5 + 0.5 * (lastShedBand - band) / 3);
+      lastShedBand = band;
+    } catch (e) { /* stay silent */ }
+  }
+
+  // ---------- interaction ----------
+  var isDown = false, downAt = 0, downX = 0, downY = 0, moved = false, lastTapAt = -10, lastTapX = 0, lastTapY = 0;
+  function toLight(px, py) {
+    lightTarget.x = ((px / W) - 0.5) * (W / U) * 1.15;
+    lightTarget.y = ((py / H) - 0.5) * (H / U) * 1.15;
+  }
+  function inConsole(px, py) {
+    var r = consoleRect();
+    return px >= r.x - 6 && px <= r.x + r.w + 6 && py >= r.y - 6 && py <= r.y + r.h + 6;
+  }
+  function onDown(e) {
+    ensureAudio();
+    var p = e.touches && e.touches[0] ? e.touches[0] : e;
+    isDown = true;
+    downAt = currentT; downX = p.clientX; downY = p.clientY; moved = false;
+    dragging = false;
+  }
+  function onMove(e) {
+    if (!isDown) return;
+    var p = e.touches && e.touches[0] ? e.touches[0] : e;
+    if (Math.abs(p.clientX - downX) + Math.abs(p.clientY - downY) > 7) moved = true;
+    if (moved) { dragging = true; toLight(p.clientX, p.clientY); }
+  }
+  function onUp(e) {
+    if (!isDown) return;
+    isDown = false;
+    var p = e.changedTouches && e.changedTouches[0] ? e.changedTouches[0] : e;
+    var wasDrag = dragging;
+    dragging = false;
+    if (!wasDrag && currentT - downAt < 0.45) {
+      var dbl = (currentT - lastTapAt < 0.38) &&
+                (Math.abs(p.clientX - lastTapX) + Math.abs(p.clientY - lastTapY) < 44);
+      if (dbl) {
+        room = buildRoom((Math.random() * 1e9) | 0, currentT);   // new room
+        lastTapAt = -10;
+      } else if (inConsole(p.clientX, p.clientY)) {
+        room = buildRoom((Math.random() * 1e9) | 0, currentT);   // retune: new objects grow in
+        lastTapAt = currentT; lastTapX = p.clientX; lastTapY = p.clientY;
+      } else {
+        lastTapAt = currentT; lastTapX = p.clientX; lastTapY = p.clientY;
+      }
+    }
+    if (!dragging) { lightTarget.x = LIGHT_HOME.x; lightTarget.y = LIGHT_HOME.y; }
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('touchstart', onDown, { passive: true });
+    canvas.addEventListener('touchmove', onMove, { passive: true });
+    canvas.addEventListener('touchend', onUp);
+  }
+
+  // ---------- run ----------
+  // Frame one: synchronous draw at the fixed offset. Never from a wall clock.
+  var currentT = T0;
+  draw(currentT);
+
+  var raf = (typeof requestAnimationFrame === 'function') ? requestAnimationFrame : null;
+  if (raf) {
+    var lastStamp = null;
+    var step = function (stamp) {
+      if (lastStamp === null) lastStamp = stamp;
+      var dt = (stamp - lastStamp) / 1000;
+      lastStamp = stamp;
+      if (dt > 0.06) dt = 0.06;
+      if (dt > 0) currentT += dt;
+      // light follows target (fast while dragging, slow drift home)
+      var f = dragging ? 0.35 : 0.045;
+      light.x += (lightTarget.x - light.x) * f;
+      light.y += (lightTarget.y - light.y) * f;
+      draw(currentT);
+      audioFrame(currentT);
+      raf(step);
+    };
+    raf(step);
+  }
+})();
+</script>
+</body>
+</html>
