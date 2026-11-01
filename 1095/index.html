@@ -1,0 +1,401 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Robot's Cue Sheet</title>
+<style>
+  html, body {
+    margin: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #101014;
+  }
+  canvas {
+    display: block;
+    touch-action: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="piece"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // Frame one is a fixed phase: t = 14s. The second cue (t=10) has fired,
+  // the PRESENT transition (1.5s) has settled, the display reads
+  // "POSE: PRESENT" and the playhead stands at 28% of the strip.
+  var T0 = 14;
+  var LOOP = 50;
+  var WORLD = 1000;
+  var canvas = document.getElementById('piece');
+  var ctx = canvas.getContext('2d');
+  var currentT = T0;
+  var view = { w: 0, h: 0, dpr: 1, scale: 1, ox: 0, oy: 0, phone: false };
+
+  var COLORS = {
+    lab: '#101014',
+    body: '#8A8F98',
+    edge: '#C9CDD4',
+    joint: '#3A3D44',
+    track: '#1C1E24',
+    cue: '#FFB02E',
+    playhead: '#E8E8E6',
+    face: '#4AE3FF',
+    label: '#5C6B80',
+    panel: '#0B0D11',
+    dark: '#555B64'
+  };
+
+  function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+  function lerp(a, b, u) { return a + (b - a) * u; }
+  function smoother(u) { u = clamp(u, 0, 1); return u * u * u * (u * (u * 6 - 15) + 10); }
+  function deg(d) { return d * Math.PI / 180; }
+
+  function resize() {
+    var vw = window.innerWidth;
+    var vh = window.innerHeight;
+    if (window.visualViewport) {
+      vw = window.visualViewport.width;
+      vh = window.visualViewport.height;
+    }
+    var dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.max(1, Math.round(vw * dpr));
+    canvas.height = Math.max(1, Math.round(vh * dpr));
+    var screenMin = 0;
+    if (window.screen) screenMin = Math.min(window.screen.width || 0, window.screen.height || 0);
+    var phone = screenMin > 0 ? screenMin < 700 : vh > vw * 1.15;
+    var scale = Math.min(vw / WORLD, vh / WORLD);
+    view = {
+      w: vw,
+      h: vh,
+      dpr: dpr,
+      scale: scale,
+      ox: (vw - WORLD * scale) / 2,
+      oy: (vh - WORLD * scale) / 2,
+      phone: phone
+    };
+  }
+
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', function () { resize(); draw(currentT); });
+  }
+  window.addEventListener('resize', function () { resize(); draw(currentT); });
+  resize();
+
+  // ---- Pose tree -------------------------------------------------------
+  // Angles in degrees. Shoulder/elbow are absolute segment directions
+  // measured from straight down (0 = hanging, 90 = forward horizontal,
+  // 180 = straight up). head = head-block tilt, lean = whole upper
+  // assembly leaning about the column base. face = face-state enum:
+  // 0 idle, 1 open, 2 smile, 3 focus.
+  var POSES = [
+    { name: 'REST',    shoulder: 15,  elbow: 27,  head: 2,   lean: 0,  face: 0 },
+    { name: 'GREET',   shoulder: 155, elbow: 137, head: -4,  lean: -2, face: 1 },
+    { name: 'PRESENT', shoulder: 88,  elbow: 94,  head: 6,   lean: 0,  face: 2 },
+    { name: 'POINT',   shoulder: 128, elbow: 130, head: 10,  lean: -3, face: 3 },
+    { name: 'SCAN',    shoulder: 62,  elbow: 92,  head: 24,  lean: 4,  face: 3 },
+    { name: 'BOW',     shoulder: 30,  elbow: 46,  head: 36,  lean: 10, face: 0 }
+  ];
+  // Cue times in the 50s loop and the pose each cue calls.
+  var CUES = [2, 10, 18, 26, 34, 42];
+  var CUE_POSE = [1, 2, 3, 4, 5, 0];
+  var TRANS = 1.5;
+
+  // Closed-form pose state at loop time tt: the current joint set, the
+  // displayed pose index and the face state. Transitions ease over 1.5s
+  // after each cue; the face swaps at the transition midpoint; the
+  // display names the incoming pose from the cue itself.
+  function poseAt(tt) {
+    var ci = -1;
+    for (var i = 0; i < CUES.length; i++) if (tt >= CUES[i]) ci = i;
+    if (ci < 0) {
+      return { pose: POSES[0], display: 0, face: POSES[0].face, moving: 0 };
+    }
+    var to = POSES[CUE_POSE[ci]];
+    var from = ci === 0 ? POSES[0] : POSES[CUE_POSE[ci - 1]];
+    var u = smoother((tt - CUES[ci]) / TRANS);
+    var out = { display: CUE_POSE[ci], moving: u < 1 ? 1 - Math.abs(u - 0.5) * 2 : 0 };
+    var keys = ['shoulder', 'elbow', 'head', 'lean'];
+    for (var k = 0; k < keys.length; k++) out[keys[k]] = lerp(from[keys[k]], to[keys[k]], u);
+    out.face = u < 0.5 ? from.face : to.face;
+    out.pose = out;
+    return out;
+  }
+
+  // Micro servo-breathe during holds: ~0.5 degrees, integer cycles per
+  // loop so the seam is invisible.
+  function breathe(tt, k, amp) {
+    return Math.sin(2 * Math.PI * k * tt / LOOP) * amp;
+  }
+
+  // ---- Geometry --------------------------------------------------------
+  var BASE = { x: 500, floorY: 800, hipY: 745 };
+  var SHOULDER = { x: 524, y: 592 };
+  var NECK = { x: 500, y: 548 };
+  var L1 = 122, L2 = 106;
+
+  function seg(x, y, angDeg, len) {
+    var a = deg(angDeg);
+    return { x: x + Math.sin(a) * len, y: y + Math.cos(a) * len };
+  }
+
+  function thickLine(x1, y1, x2, y2, w, color) {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = w;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.stroke();
+  }
+
+  function circle(x, y, r, color) {
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  function rrect(x, y, w, h, r, color) {
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.lineTo(x + w - r, y);
+    ctx.arcTo(x + w, y, x + w, y + r, r);
+    ctx.lineTo(x + w, y + h - r);
+    ctx.arcTo(x + w, y + h, x + w - r, y + h, r);
+    ctx.lineTo(x + r, y + h);
+    ctx.arcTo(x, y + h, x, y + h - r, r);
+    ctx.lineTo(x, y + r);
+    ctx.arcTo(x, y, x + r, y, r);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  // ---- Face panel ------------------------------------------------------
+  // Light patterns only: no face. Four states — idle (dim dots, flat
+  // line), open (round eyes, open mouth), smile (arc eyes, smile arc),
+  // focus (visor line, small dot).
+  function drawFace(state, cx, cy) {
+    var c = COLORS.face;
+    ctx.strokeStyle = c;
+    ctx.fillStyle = c;
+    ctx.lineCap = 'round';
+    if (state === 0) {
+      ctx.globalAlpha = 0.55;
+      circle(cx - 13, cy - 6, 3.2, c);
+      circle(cx + 13, cy - 6, 3.2, c);
+      ctx.globalAlpha = 0.55;
+      ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(cx - 10, cy + 13); ctx.lineTo(cx + 10, cy + 13); ctx.stroke();
+    } else if (state === 1) {
+      circle(cx - 13, cy - 7, 4.6, c);
+      circle(cx + 13, cy - 7, 4.6, c);
+      ctx.beginPath(); ctx.arc(cx, cy + 10, 6.5, 0, Math.PI * 2); ctx.fill();
+    } else if (state === 2) {
+      ctx.lineWidth = 3.4;
+      ctx.beginPath(); ctx.arc(cx - 13, cy - 3, 6, Math.PI * 1.08, Math.PI * 1.92); ctx.stroke();
+      ctx.beginPath(); ctx.arc(cx + 13, cy - 3, 6, Math.PI * 1.08, Math.PI * 1.92); ctx.stroke();
+      ctx.beginPath(); ctx.arc(cx, cy + 4, 10, Math.PI * 0.15, Math.PI * 0.85); ctx.stroke();
+    } else {
+      ctx.lineWidth = 4;
+      ctx.beginPath(); ctx.moveTo(cx - 19, cy - 6); ctx.lineTo(cx + 19, cy - 6); ctx.stroke();
+      circle(cx, cy + 11, 3, c);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---- Robot -----------------------------------------------------------
+  function drawRobot(st, tt) {
+    // the whole figure is scaled about its floor point so it stands
+    // ~55% of the frame height, as specced
+    ctx.save();
+    ctx.translate(BASE.x, BASE.floorY);
+    ctx.scale(1.45, 1.45);
+    ctx.translate(-BASE.x, -BASE.floorY);
+    drawRobotFigure(st, tt);
+    ctx.restore();
+  }
+
+  function drawRobotFigure(st, tt) {
+    var shoulder = st.shoulder + breathe(tt, 13, 0.5);
+    var elbow = st.elbow + breathe(tt, 17, 0.4);
+    var head = st.head + breathe(tt, 11, 0.3);
+
+    // floor shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.beginPath();
+    ctx.ellipse(BASE.x, BASE.floorY + 10, 150, 15, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // pedestal (never leans)
+    ctx.fillStyle = COLORS.dark;
+    ctx.beginPath();
+    ctx.moveTo(BASE.x - 82, BASE.floorY);
+    ctx.lineTo(BASE.x - 52, BASE.hipY);
+    ctx.lineTo(BASE.x + 52, BASE.hipY);
+    ctx.lineTo(BASE.x + 82, BASE.floorY);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = COLORS.joint;
+    ctx.fillRect(BASE.x - 88, BASE.floorY - 4, 176, 8);
+
+    // upper assembly leans about the column base
+    ctx.save();
+    ctx.translate(BASE.x, BASE.hipY);
+    ctx.rotate(deg(st.lean));
+    ctx.translate(-BASE.x, -BASE.hipY);
+
+    // column
+    rrect(BASE.x - 24, 556, 48, 192, 8, COLORS.body);
+    ctx.fillStyle = COLORS.edge;
+    ctx.fillRect(BASE.x - 24, 556, 5, 192);
+    // column base joint
+    circle(BASE.x, BASE.hipY, 17, COLORS.joint);
+    circle(BASE.x, BASE.hipY, 6, COLORS.dark);
+
+    // arm: shoulder -> elbow -> wrist, FK from the pose angles
+    var el = seg(SHOULDER.x, SHOULDER.y, shoulder, L1);
+    var wr = seg(el.x, el.y, elbow, L2);
+    thickLine(SHOULDER.x, SHOULDER.y, el.x, el.y, 27, COLORS.body);
+    thickLine(el.x, el.y, wr.x, wr.y, 22, COLORS.body);
+    // edge light along the segments
+    ctx.save();
+    ctx.globalAlpha = 0.7;
+    thickLine(SHOULDER.x - 6, SHOULDER.y, el.x - 6, el.y, 4, COLORS.edge);
+    thickLine(el.x - 5, el.y, wr.x - 5, wr.y, 3.5, COLORS.edge);
+    ctx.restore();
+    // end effector: a small block on the wrist, aligned with the forearm
+    ctx.save();
+    ctx.translate(wr.x, wr.y);
+    ctx.rotate(deg(elbow - 90));
+    rrect(-7, -14, 30, 28, 5, COLORS.dark);
+    ctx.fillStyle = COLORS.joint;
+    ctx.fillRect(16, -14, 7, 28);
+    ctx.restore();
+    // joints
+    circle(SHOULDER.x, SHOULDER.y, 16, COLORS.joint);
+    circle(SHOULDER.x, SHOULDER.y, 6, COLORS.dark);
+    circle(el.x, el.y, 13, COLORS.joint);
+    circle(el.x, el.y, 5, COLORS.dark);
+    circle(wr.x, wr.y, 9, COLORS.joint);
+
+    // head block on the column top, tilting about the neck
+    ctx.save();
+    ctx.translate(NECK.x, NECK.y);
+    ctx.rotate(deg(head));
+    ctx.translate(-NECK.x, -NECK.y);
+    rrect(NECK.x - 14, 520, 28, 30, 5, COLORS.joint); // neck post
+    rrect(NECK.x - 47, 442, 94, 82, 10, COLORS.body);
+    ctx.fillStyle = COLORS.edge;
+    ctx.fillRect(NECK.x - 47, 442, 94, 5);
+    ctx.fillRect(NECK.x - 47, 442, 5, 82);
+    // face light panel: inset on the front of the block
+    rrect(NECK.x - 34, 456, 68, 54, 6, COLORS.panel);
+    drawFace(st.face, NECK.x, 484);
+    ctx.restore();
+
+    ctx.restore();
+  }
+
+  // ---- Timeline strip --------------------------------------------------
+  var STRIP_Y = 820;
+  var TRACK = { x0: 90, x1: 910, y: 908 };
+
+  function trackX(t) { return TRACK.x0 + (t / LOOP) * (TRACK.x1 - TRACK.x0); }
+
+  function drawTimeline(tt) {
+    // divider + strip ground
+    ctx.fillStyle = COLORS.track;
+    ctx.fillRect(0, STRIP_Y, WORLD, 2);
+    ctx.fillStyle = 'rgba(255,255,255,0.02)';
+    ctx.fillRect(0, STRIP_Y + 2, WORLD, WORLD - STRIP_Y);
+
+    // track with elapsed portion
+    rrect(TRACK.x0, TRACK.y - 5, TRACK.x1 - TRACK.x0, 10, 5, COLORS.track);
+    var px = trackX(tt);
+    if (px > TRACK.x0) {
+      ctx.fillStyle = '#2B303B';
+      ctx.fillRect(TRACK.x0, TRACK.y - 5, px - TRACK.x0, 10);
+    }
+    // cue markers: amber diamonds, bright once the cue has fired
+    for (var i = 0; i < CUES.length; i++) {
+      var mx = trackX(CUES[i]);
+      var fired = tt >= CUES[i];
+      ctx.save();
+      ctx.translate(mx, TRACK.y);
+      ctx.rotate(Math.PI / 4);
+      ctx.fillStyle = COLORS.cue;
+      ctx.globalAlpha = fired ? 1 : 0.38;
+      var s = fired ? 9 : 7.5;
+      ctx.fillRect(-s / 2, -s / 2, s, s);
+      ctx.restore();
+    }
+    // playhead
+    ctx.strokeStyle = COLORS.playhead;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(px, STRIP_Y + 26);
+    ctx.lineTo(px, 962);
+    ctx.stroke();
+    ctx.fillStyle = COLORS.playhead;
+    ctx.beginPath();
+    ctx.moveTo(px - 7, STRIP_Y + 14);
+    ctx.lineTo(px + 7, STRIP_Y + 14);
+    ctx.lineTo(px, STRIP_Y + 26);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  // ---- State display ---------------------------------------------------
+  function drawDisplay(st) {
+    ctx.fillStyle = COLORS.label;
+    ctx.font = '600 27px monospace';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillText('POSE: ' + POSES[st.display].name, 46, 66);
+    // small amber square while a transition is running
+    if (st.moving > 0) {
+      ctx.fillStyle = COLORS.cue;
+      ctx.globalAlpha = 0.35 + 0.65 * st.moving;
+      ctx.fillRect(48, 82, 12, 12);
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function draw(t) {
+    currentT = t;
+    canvas.style.width = view.w + 'px';
+    canvas.style.height = view.h + 'px';
+    ctx.setTransform(view.dpr || 1, 0, 0, view.dpr || 1, 0, 0);
+    ctx.fillStyle = COLORS.lab;
+    ctx.fillRect(0, 0, view.w, view.h);
+    ctx.translate(view.ox, view.oy);
+    ctx.scale(view.scale, view.scale);
+
+    var tt = ((t % LOOP) + LOOP) % LOOP;
+    var st = poseAt(tt);
+
+    // lab floor line
+    ctx.fillStyle = COLORS.track;
+    ctx.fillRect(60, BASE.floorY + 2, WORLD - 120, 2);
+
+    drawRobot(st, tt);
+    drawTimeline(tt);
+    drawDisplay(st);
+  }
+
+  function frame(ms) {
+    var t = T0 + (typeof ms === 'number' && isFinite(ms) ? ms / 1000 : 0);
+    draw(t);
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+  }
+
+  frame(0);
+})();
+</script>
+</body>
+</html>
