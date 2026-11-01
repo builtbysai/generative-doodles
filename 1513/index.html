@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Krump Meets Rameau</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #101014; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // ---- palette (only these colors) ----
+  var STAGE = '#101014';
+  var GOLD = '#c9a86a';
+  var RED = '#c23b2a';
+  var CREAM = '#e8e0d0';
+  var GREY = '#55565e';
+
+  // ---- timing ----
+  var PULSE = 2;          // seconds per pulse
+  var CYCLE = 16;         // 8 pulses per cycle
+  var LOOP = 64;          // 4 cycles per loop
+  var MARKS = 7;
+  var SWAP_MARK = 3;
+
+  // ---- sequencers (loop-local, seeded layout only) ----
+  var STEP_ARM = [0.35, 0.15, -0.15, -0.35, -0.35, -0.15, 0.15, 0.35];
+  var STEP_LEG = [0.25, 0.10, -0.10, -0.25, -0.25, -0.10, 0.10, 0.25];
+  var BURST_MOVES = ['pop', 'swing', 'stomp', 'freeze', 'swing', 'pop', 'freeze', 'stomp'];
+
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+  function lerp(a, b, t) { return a + (b - a) * t; }
+  function sstep(a, b, x) {
+    var t = (x - a) / (b - a);
+    t = t < 0 ? 0 : (t > 1 ? 1 : t);
+    return t * t * (3 - 2 * t);
+  }
+  function round4(v) { return Math.round(v * 10000) / 10000; }
+
+  // ---- viewport (fully guarded branches) ----
+  function vpSize() {
+    if (typeof window !== 'undefined' && window.visualViewport &&
+        window.visualViewport.width && window.visualViewport.height) {
+      return [window.visualViewport.width, window.visualViewport.height];
+    }
+    if (typeof window !== 'undefined' && window.innerWidth && window.innerHeight) {
+      return [window.innerWidth, window.innerHeight];
+    }
+    return [720, 720];
+  }
+  var W = 720, H = 720;
+  function resize() {
+    var s = vpSize();
+    W = s[0]; H = s[1];
+    canvas.width = W; canvas.height = H;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+  }
+  resize();
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', resize);
+    }
+    if (window.addEventListener) {
+      window.addEventListener('resize', resize);
+    }
+  }
+
+  // ---- interaction state: closed-form over recorded events ----
+  var drags = [];       // finalized: {type, dx, dy, t0, t1}
+  var active = null;    // in-progress drag
+  var clockT = 0;       // piece time, set by the rAF loop (or by probes)
+
+  function onDown(e) {
+    var x = (e.clientX !== undefined) ? e.clientX : (e.offsetX || 0);
+    var y = (e.clientY !== undefined) ? e.clientY : (e.offsetY || 0);
+    active = { x0: x, y0: y, t0: clockT, dx: 0, dy: 0, type: null };
+  }
+  function onMove(e) {
+    if (!active) return;
+    var x = (e.clientX !== undefined) ? e.clientX : (e.offsetX || 0);
+    var y = (e.clientY !== undefined) ? e.clientY : (e.offsetY || 0);
+    active.dx = x - active.x0;
+    active.dy = y - active.y0;
+    if (!active.type && Math.max(Math.abs(active.dx), Math.abs(active.dy)) > 12) {
+      active.type = (Math.abs(active.dx) >= Math.abs(active.dy)) ? 'rate' : 'gap';
+    }
+  }
+  function onUp() {
+    if (!active) return;
+    if (active.type) {
+      drags.push({ type: active.type, dx: active.dx, dy: active.dy, t0: active.t0, t1: clockT });
+    }
+    active = null;
+  }
+  canvas.addEventListener('pointerdown', onDown);
+  canvas.addEventListener('pointermove', onMove);
+  canvas.addEventListener('pointerup', onUp);
+  canvas.addEventListener('pointercancel', onUp);
+
+  function rateDrags(t) {
+    var list = drags.slice();
+    if (active && active.type === 'rate') {
+      list.push({ type: 'rate', dx: active.dx, dy: active.dy, t0: active.t0, t1: t });
+    }
+    return list;
+  }
+  function effT(t) {
+    var eff = t;
+    var list = rateDrags(t);
+    for (var i = 0; i < list.length; i++) {
+      var d = list[i];
+      var rate = clamp(1 + d.dx / 1000, 0.85, 1.15);
+      var lo = Math.max(d.t0, 0), hi = Math.min(d.t1, t);
+      if (hi > lo) eff += (rate - 1) * (hi - lo);
+    }
+    return eff;
+  }
+  function gapAt(t) {
+    var best = null;
+    for (var i = 0; i < drags.length; i++) {
+      if (drags[i].type === 'gap' && (!best || drags[i].t0 >= best.t0)) best = drags[i];
+    }
+    if (active && active.type === 'gap' && (!best || active.t0 >= best.t0)) {
+      best = { dy: active.dy, t0: active.t0 };
+    }
+    if (!best) return 0.5;
+    return clamp(0.5 + best.dy / 600, 0.30, 0.85);
+  }
+
+  // ---- poses ----
+  // pose: {armL, armR, legL, legR, squash, bounce} — angles in radians
+  function strictPose(pulse, ph) {
+    var n = (pulse + 1) % 8;
+    var k = sstep(0, 1, ph);
+    var arm = lerp(STEP_ARM[pulse], STEP_ARM[n], k);
+    var leg = lerp(STEP_LEG[pulse], STEP_LEG[n], k);
+    return { armL: -arm, armR: arm, legL: -leg, legR: leg, squash: 1, bounce: Math.sin(Math.PI * ph) };
+  }
+  function burstEnv(ph) {
+    if (ph < 0.25) return sstep(0, 0.25, ph);
+    if (ph < 0.6) return 1;
+    return 1 - sstep(0.6, 1, ph);
+  }
+  function burstPoseRaw(pulse, ph, forceEnv) {
+    var move = BURST_MOVES[pulse];
+    if (move === 'freeze') {
+      // hold the previous pulse's mid-pose, frozen
+      return burstPoseRaw((pulse + 7) % 8, 0.5, 1);
+    }
+    var env = (forceEnv !== undefined) ? forceEnv : burstEnv(ph);
+    // baseline articulation: even at rest (env 0) a burst mark reads as a
+    // dancer-mark, never a bare vertical line
+    if (move === 'pop') {
+      return { armL: -(0.18 + 0.35 * env), armR: 0.18 + 0.35 * env, legL: -(0.12 + 0.05 * env), legR: 0.12 + 0.05 * env, squash: 1 - 0.2 * env, bounce: 0.6 * env };
+    }
+    if (move === 'swing') {
+      return { armL: -(0.18 + 0.15 * env), armR: 0.18 + 1.0 * env, legL: -(0.12 + 0.05 * env), legR: 0.12 + 0.05 * env, squash: 1, bounce: 0.3 * env };
+    }
+    // stomp
+    return { armL: -(0.18 + 0.05 * env), armR: 0.18 + 0.05 * env, legL: -(0.12 + 0.05 * env), legR: 0.12 + 0.8 * env, squash: 1, bounce: 0.2 * env };
+  }
+  function poseFor(row, index, pulse, ph, cycle, swapCycle) {
+    // row: 'strict' | 'burst'; mark 3 swaps styles from the swap cycle on
+    if (index === SWAP_MARK && cycle >= swapCycle) {
+      if (row === 'strict') return { kind: 'burst', pose: burstPoseRaw(pulse, ph) };
+      return { kind: 'strict', pose: strictPose(pulse, ph) };
+    }
+    if (row === 'strict') return { kind: 'strict', pose: strictPose(pulse, ph) };
+    return { kind: 'burst', pose: burstPoseRaw(pulse, ph) };
+  }
+
+  function stateAt(t) {
+    var eff = effT(t);
+    var lt = ((eff % LOOP) + LOOP) % LOOP;
+    var cycle = Math.floor(lt / CYCLE);
+    var inCycle = lt % CYCLE;
+    var pulse = Math.floor(inCycle / PULSE) % 8;
+    var ph = (inCycle % PULSE) / PULSE;
+    var gap = gapAt(t);
+    var swapCycle = (gap < 0.35) ? 2 : 3;
+    var pulseY = 0.5 * H;
+    var strictY = pulseY - gap * 0.22 * H;
+    var burstY = pulseY + gap * 0.22 * H;
+    return { t: t, eff: eff, lt: lt, cycle: cycle, pulse: pulse, ph: ph,
+             gap: gap, swapCycle: swapCycle, pulseY: pulseY,
+             strictY: strictY, burstY: burstY };
+  }
+
+  function line(x1, y1, x2, y2) {
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.stroke();
+  }
+  function drawGlyph(cx, cy, unit, color, pose) {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = Math.max(2, 0.006 * unit);
+    ctx.lineCap = 'round';
+    var torso = 0.055 * unit * pose.squash;
+    var bounce = pose.bounce * 0.008 * unit;
+    var y = cy + bounce;
+    var shoulderY = y - torso * 0.85;
+    var hipY = y + torso * 0.15;
+    var armLen = 0.035 * unit, legLen = 0.04 * unit;
+    // torso
+    line(cx, y - torso, cx, hipY);
+    // arms from shoulder
+    line(cx, shoulderY, cx + Math.sin(pose.armL) * armLen, shoulderY + Math.cos(pose.armL) * armLen);
+    line(cx, shoulderY, cx + Math.sin(pose.armR) * armLen, shoulderY + Math.cos(pose.armR) * armLen);
+    // legs from hip
+    line(cx, hipY, cx + Math.sin(pose.legL) * legLen, hipY + Math.cos(pose.legL) * legLen);
+    line(cx, hipY, cx + Math.sin(pose.legR) * legLen, hipY + Math.cos(pose.legR) * legLen);
+  }
+
+  function draw(t) {
+    resize();
+    var st = stateAt(t);
+    var unit = Math.min(W, H);
+    ctx.fillStyle = STAGE;
+    ctx.fillRect(0, 0, W, H);
+    // shared pulse line (faint cream) and floor line (grey)
+    ctx.fillStyle = CREAM;
+    ctx.globalAlpha = round4(0.35);
+    ctx.fillRect(0.15 * W, st.pulseY - 1, 0.70 * W, 2);
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = GREY;
+    ctx.fillRect(0.15 * W, 0.74 * H - 1, 0.70 * W, 2);
+    // marks
+    for (var i = 0; i < MARKS; i++) {
+      var x = lerp(0.18 * W, 0.82 * W, i / (MARKS - 1));
+      var s = poseFor('strict', i, st.pulse, st.ph, st.cycle, st.swapCycle);
+      drawGlyph(x, st.strictY, unit, GOLD, s.pose);
+      var b = poseFor('burst', i, st.pulse, st.ph, st.cycle, st.swapCycle);
+      drawGlyph(x, st.burstY, unit, RED, b.pose);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // frame one: fixed phase, drawn synchronously at load
+  draw(0);
+
+  // rAF loop, anchored at its first call; guarded for the QA renderer
+  var t0 = null;
+  function loop(ts) {
+    if (t0 === null) t0 = ts;
+    clockT = (ts - t0) / 1000;
+    draw(clockT);
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+  }
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+
+  // probe API for the QA harness (not part of the visible piece)
+  if (typeof window !== 'undefined') {
+    window.__piece = {
+      drawAt: function (t) { clockT = t; draw(t); },
+      pointer: function (type, x, y, t) {
+        clockT = t;
+        var e = { clientX: x, clientY: y };
+        if (type === 'down') onDown(e);
+        else if (type === 'move') onMove(e);
+        else if (type === 'up') onUp(e);
+      },
+      stateAt: stateAt,
+      poseFor: poseFor,
+      effT: effT,
+      gapAt: gapAt,
+      palette: [STAGE, GOLD, RED, CREAM, GREY]
+    };
+  }
+})();
+</script>
+</body>
+</html>
