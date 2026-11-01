@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>I Am a Piece. Ask Me Anything.</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #FAF7F0; height: 100%; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  var PAPER = '#FAF7F0';
+  var INK = '#141210';
+  var RED = '#E4572E';
+  var GOLD = '#C9A227';
+  var GRAY = '#8A8578';
+
+  var CARD_SECONDS = 7;   // the narrator advances on its own timer: card 5 of the script states its own loop honestly elsewhere; this is the page timer
+  var FLASH_SECONDS = 0.2; // the slam flash, stated in the study prompt as 200 ms
+
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  var viewW = 300, viewH = 300, dpr = 1, isPhone = false;
+
+  function measure() {
+    var w = 0, h = 0;
+    if (typeof window !== 'undefined') {
+      if (window.visualViewport && window.visualViewport.width) {
+        w = window.visualViewport.width; h = window.visualViewport.height;
+      } else if (window.innerWidth) {
+        w = window.innerWidth; h = window.innerHeight;
+      }
+    }
+    if (!w) { w = 300; h = 300; }
+    viewW = w; viewH = h;
+    dpr = (typeof window !== 'undefined' && window.devicePixelRatio) ? window.devicePixelRatio : 1;
+    if (dpr < 1) dpr = 1; if (dpr > 3) dpr = 3;
+    var sw = 0, sh = 0;
+    if (typeof window !== 'undefined' && window.screen) { sw = window.screen.width || 0; sh = window.screen.height || 0; }
+    isPhone = (Math.min(sw, sh) > 0 && Math.min(sw, sh) < 700) || (viewH > viewW * 1.15);
+    canvas.width = Math.round(viewW * dpr);
+    canvas.height = Math.round(viewH * dpr);
+  }
+  measure();
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', measure);
+    if (window.addEventListener) window.addEventListener('resize', measure);
+  }
+
+  // Seeded RNG (mulberry32): used only for the slam page jump and the fixed tick ring.
+  function mulberry(seed) {
+    var s = seed | 0;
+    return function () {
+      s = (s + 0x6D2B79F5) | 0;
+      var t = Math.imul(s ^ (s >>> 15), 1 | s);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  var slamRng = mulberry(92990);
+
+  // The piece's own clock: seconds since load. Frame one is draw(0), synchronously.
+  function rawNow() {
+    if (typeof performance !== 'undefined' && performance.now) return performance.now() / 1000;
+    return 0;
+  }
+  var startT = rawNow();
+  function elapsed() { return Math.max(0, rawNow() - startT); }
+
+  // ----- Layout -----
+  function ruleY() { return viewH * 0.66; }
+  function pad() { return Math.max(18, viewW * 0.045); }
+  function fieldCY() { return ruleY() * 0.52; }
+  function stripLen() { return Math.round(viewW * 0.6); } // S, card 3: exactly 60% of the width, rounded
+
+  // Card 7's marks: a fixed ring of ticks. M is the length of this array, counted, never typed.
+  var TICKS = (function () {
+    var r = mulberry(92907);
+    var arr = [];
+    for (var i = 0; i < 48; i++) {
+      arr.push({ a: (i / 48) * Math.PI * 2 + (r() - 0.5) * 0.1, jr: 0.92 + r() * 0.16, len: 7 + r() * 6, tilt: (r() - 0.5) * 0.7 });
+    }
+    return arr;
+  })();
+
+  // ----- Narrator state: closed-form over (t, recorded events) -----
+  var anchorIdx = 0;      // card showing when the anchor was set
+  var anchorT = 0;        // piece-time the anchor was set
+  var anchorFresh = true; // the opening card has been open since before load: no wipe at t = 0
+  var flashT = -10;       // piece-time of the last slam
+  var pendingTapT = -1;   // a tap waiting out the double-tap window
+  var lastTapT = -10;
+  var drag = null;        // {startY, lift} while a pointer is held and moved
+  var releaseEvt = null;  // {t, lift} of the last release, for the spring
+  var lastLiftPx = 0;     // the most recent held lift, card 6's memory
+
+  function cardAt(t) {
+    var steps = Math.floor(Math.max(0, t - anchorT) / CARD_SECONDS);
+    var changeT = steps === 0 ? (anchorFresh ? -1 : anchorT) : anchorT + steps * CARD_SECONDS;
+    return { idx: (anchorIdx + steps) % 10, changeT: changeT };
+  }
+  function liftAt(t) {
+    if (drag) return drag.lift;
+    if (releaseEvt) {
+      var dt = t - releaseEvt.t;
+      if (dt >= 0 && dt < 1.4) {
+        var v = releaseEvt.lift * Math.exp(-3.2 * dt) * Math.cos(11 * dt);
+        return Math.max(-14, v);
+      }
+    }
+    return 0;
+  }
+
+  // ----- Measured facts (computed from the live canvas at draw time) -----
+  function facts(t) {
+    var W = Math.round(viewW), H = Math.round(viewH);
+    var S = stripLen();
+    var T = Math.floor(Math.max(0, t));
+    return {
+      W: W, H: H, S: S, T: T, babies: 4 * T,
+      A: (Math.round(lastLiftPx * 0.021 * 10) / 10).toFixed(1),
+      M: TICKS.length
+    };
+  }
+
+  // Card script. Segments: [text, color]. Numbers come from facts(), measured, never typed.
+  function cardSegments(i, f) {
+    switch (i) {
+      case 0: return [['Hello. ', INK], ['I am a piece. ', RED], ['Ask me anything.', INK]];
+      case 1: return [['I am ', INK], [f.W + ' pixels wide. ', RED], ['I weigh nothing, but if I were printed ', INK], ['I would be heavy.', GRAY]];
+      case 2: return [['This strip is ', INK], [f.S + ' pixels long. ', RED], ['Not ', INK], [(f.S - 1) + '. ', GRAY], ['Not ', INK], [(f.S + 1) + '. ', GRAY], [f.S + '.', RED]];
+      case 3: return [['You have been looking at me for ', INK], [f.T + ' seconds. ', RED], ['In that time about ', INK], [f.babies + ' babies were born. ', RED], ['I counted none of them.', GRAY]];
+      case 4: return [['Lift me. Go on. ', INK], ['I am data, ', RED], ['I can take it.', INK]];
+      case 5: return [['You are holding me ', INK], [f.A + ' anteater-tongues up. ', RED], ['Impressive.', GRAY]];
+      case 6: return [['I am drawn with ', INK], [f.M + ' marks. ', RED], ['Every mark is ', INK], ['load-bearing.', GRAY]];
+      case 7: return [['I am ', INK], [f.H + ' pixels tall. ', RED], ['From rule to rim.', GRAY]];
+      case 8: return [['Slam me shut and I will tell you something new. ', INK], ['That is the deal.', RED]];
+      case 9: return [['That is everything I know. It was all true. ', INK], ['Ask me anything.', RED]];
+    }
+    return [];
+  }
+
+  // ----- Drawing helpers -----
+  function drawStrip(cx, cy, len, alpha) {
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    var h = Math.max(10, Math.min(16, viewW * 0.02));
+    ctx.fillStyle = GOLD;
+    ctx.fillRect(cx - len / 2, cy - h / 2, len, h);
+    ctx.strokeStyle = INK;
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(cx - len / 2, cy - h / 2 - 9); ctx.lineTo(cx - len / 2, cy + h / 2 + 9);
+    ctx.moveTo(cx + len / 2, cy - h / 2 - 9); ctx.lineTo(cx + len / 2, cy + h / 2 + 9);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawObject(idx, t, lift) {
+    var cx = viewW / 2, cy = fieldCY() - lift;
+    var S = stripLen();
+    ctx.save();
+    if (idx === 4) { // invite: a gentle tilt about the strip's centre
+      ctx.translate(cx, cy);
+      ctx.rotate(0.045 * Math.sin(t * 0.9));
+      ctx.translate(-cx, -cy);
+    }
+    switch (idx) {
+      case 0:
+        drawStrip(cx, cy, viewW * 0.5, 1);
+        break;
+      case 1:
+        drawStrip(cx, cy, viewW, 1); // spans exactly the canvas width, edge to edge
+        break;
+      case 2:
+        drawStrip(cx, cy, S, 1); // exactly S px long
+        break;
+      case 3: { // a thin progress line of the elapsed seconds, gold-capped
+        var maxLen = viewW * 0.7;
+        var len = Math.min(facts(t).T, 600) / 600 * maxLen;
+        ctx.strokeStyle = GRAY; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(cx - maxLen / 2, cy); ctx.lineTo(cx + maxLen / 2, cy); ctx.stroke();
+        ctx.strokeStyle = INK; ctx.lineWidth = 2.5;
+        ctx.beginPath(); ctx.moveTo(cx - maxLen / 2, cy); ctx.lineTo(cx - maxLen / 2 + len, cy); ctx.stroke();
+        ctx.fillStyle = GOLD;
+        ctx.beginPath(); ctx.arc(cx - maxLen / 2 + len, cy, 5, 0, Math.PI * 2); ctx.fill();
+        drawStrip(cx, cy + ruleY() * 0.22, viewW * 0.5, 0.35);
+        break;
+      }
+      case 4:
+        drawStrip(cx, cy, viewW * 0.5, 1);
+        break;
+      case 5: // the strip sits where you last held it: raised by the last lift
+        drawStrip(cx, fieldCY() - Math.min(lastLiftPx, ruleY() * 0.4), viewW * 0.5, 1);
+        break;
+      case 6: {
+        drawStrip(cx, cy, viewW * 0.5, 1);
+        ctx.strokeStyle = INK; ctx.lineWidth = 2;
+        var rx = viewW * 0.36, ry = ruleY() * 0.30;
+        for (var i = 0; i < TICKS.length; i++) {
+          var tk = TICKS[i];
+          var x = cx + Math.cos(tk.a) * rx * tk.jr;
+          var y = cy + Math.sin(tk.a) * ry * tk.jr;
+          var dx = Math.cos(tk.a + Math.PI / 2 + tk.tilt), dy = Math.sin(tk.a + Math.PI / 2 + tk.tilt);
+          ctx.beginPath();
+          ctx.moveTo(x - dx * tk.len / 2, y - dy * tk.len / 2);
+          ctx.lineTo(x + dx * tk.len / 2, y + dy * tk.len / 2);
+          ctx.stroke();
+        }
+        break;
+      }
+      case 7: { // a vertical strip of exactly H px at the left edge, rim to rim
+        var w = Math.max(10, Math.min(16, viewW * 0.02));
+        var x = pad();
+        ctx.fillStyle = GOLD;
+        ctx.fillRect(x, -lift, w, viewH); // length is exactly the canvas height
+        ctx.strokeStyle = INK; ctx.lineWidth = 2.5;
+        ctx.beginPath();
+        ctx.moveTo(x - 6, -lift + 1); ctx.lineTo(x + w + 6, -lift + 1);
+        ctx.moveTo(x - 6, viewH - lift - 1); ctx.lineTo(x + w + 6, viewH - lift - 1);
+        ctx.stroke();
+        drawStrip(cx, cy, viewW * 0.5, 0.5);
+        break;
+      }
+      case 8:
+        drawStrip(cx, cy, viewW * 0.5, 0.45); // dimmed, expectant
+        break;
+      case 9: { // the little museum: every earlier measurement, faintly together
+        ctx.fillStyle = GOLD; ctx.globalAlpha = 0.18;
+        ctx.fillRect(pad(), -lift, Math.max(10, Math.min(16, viewW * 0.02)), viewH);
+        ctx.globalAlpha = 1;
+        drawStrip(cx, cy - ruleY() * 0.16, viewW, 0.22);
+        drawStrip(cx, cy + ruleY() * 0.05, S, 0.35);
+        drawStrip(cx, cy + ruleY() * 0.24, viewW * 0.5, 0.5);
+        break;
+      }
+    }
+    ctx.restore();
+  }
+
+  // Word-wrapped rich text, centred, in the caption band.
+  function drawCaption(segs, topY) {
+    var fs = Math.max(15, Math.min(27, viewW * (isPhone ? 0.052 : 0.034)));
+    ctx.font = fs + 'px Georgia, "Times New Roman", serif';
+    ctx.textBaseline = 'alphabetic';
+    var words = [];
+    for (var s = 0; s < segs.length; s++) {
+      var parts = segs[s][0].split(' ');
+      for (var p = 0; p < parts.length; p++) if (parts[p]) words.push([parts[p], segs[s][1]]);
+    }
+    var maxW = viewW - pad() * 2;
+    var spaceW = ctx.measureText(' ').width;
+    var lines = [], cur = [], curW = 0;
+    for (var i = 0; i < words.length; i++) {
+      var ww = ctx.measureText(words[i][0]).width;
+      var add = (cur.length ? spaceW : 0) + ww;
+      if (cur.length && curW + add > maxW) { lines.push(cur); cur = []; curW = 0; add = ww; }
+      cur.push(words[i]); curW += add;
+    }
+    if (cur.length) lines.push(cur);
+    var lh = fs * 1.45;
+    var y = topY + fs + Math.max(6, ((viewH - ruleY()) - lh * lines.length) / 2);
+    for (var li = 0; li < lines.length; li++) {
+      var line = lines[li], lw = 0, j;
+      for (j = 0; j < line.length; j++) lw += ctx.measureText(line[j][0]).width + (j ? spaceW : 0);
+      var x = (viewW - lw) / 2;
+      for (j = 0; j < line.length; j++) {
+        ctx.fillStyle = line[j][1];
+        ctx.fillText(line[j][0], x, y);
+        x += ctx.measureText(line[j][0]).width + spaceW;
+      }
+      y += lh;
+    }
+  }
+
+  function draw(t) {
+    canvas.style.width = viewW + 'px';
+    canvas.style.height = viewH + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = PAPER;
+    ctx.fillRect(0, 0, viewW, viewH);
+
+    var card = cardAt(t);
+    var lift = liftAt(t);
+    var f = facts(t);
+
+    // Upper field, with the page-turn wipe over fresh cards.
+    ctx.save();
+    var p = Math.min(1, Math.max(0, (t - card.changeT) / 0.45));
+    if (p < 1) {
+      ctx.beginPath();
+      ctx.rect(0, 0, viewW * (0.15 + 0.85 * p), ruleY());
+      ctx.clip();
+    }
+    drawObject(card.idx, t, lift);
+    ctx.restore();
+    if (p < 1) { // the turning page's edge
+      var ex = viewW * (0.15 + 0.85 * p);
+      ctx.strokeStyle = GRAY; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(ex, 0); ctx.lineTo(ex, ruleY()); ctx.stroke();
+      ctx.strokeStyle = INK; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(ex - 2, 0); ctx.lineTo(ex - 2, ruleY()); ctx.stroke();
+    }
+
+    // The rule.
+    ctx.strokeStyle = INK; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(0, ruleY()); ctx.lineTo(viewW, ruleY()); ctx.stroke();
+
+    // Caption band: while lifting, the altitude card speaks instead.
+    var segs;
+    if (drag) segs = cardSegments(5, facts(t));
+    else segs = cardSegments(card.idx, f);
+    drawCaption(segs, ruleY());
+
+    // The slam: a full-screen ink flash, 200 ms.
+    if (t - flashT >= 0 && t - flashT < FLASH_SECONDS) {
+      ctx.fillStyle = INK;
+      ctx.fillRect(0, 0, viewW, viewH);
+    }
+  }
+
+  // ----- Sound: lazy, guarded, first gesture only. No voice, ever. -----
+  var AC = null;
+  function audio() {
+    if (AC) return AC;
+    try {
+      if (typeof window !== 'undefined' && (window.AudioContext || window.webkitAudioContext)) {
+        AC = new (window.AudioContext || window.webkitAudioContext)();
+      }
+    } catch (e) { AC = null; }
+    return AC;
+  }
+  function swish() {
+    var ac = audio(); if (!ac) return;
+    try {
+      var dur = 0.28, buf = ac.createBuffer(1, ac.sampleRate * dur, ac.sampleRate);
+      var d = buf.getChannelData(0), r = mulberry(41);
+      for (var i = 0; i < d.length; i++) d[i] = (r() * 2 - 1) * Math.sin(Math.PI * i / d.length);
+      var src = ac.createBufferSource(); src.buffer = buf;
+      var flt = ac.createBiquadFilter(); flt.type = 'bandpass'; flt.frequency.value = 900; flt.Q.value = 0.7;
+      var g = ac.createGain(); g.gain.value = 0.12;
+      src.connect(flt); flt.connect(g); g.connect(ac.destination); src.start();
+    } catch (e) {}
+  }
+  function thump() {
+    var ac = audio(); if (!ac) return;
+    try {
+      var o = ac.createOscillator(), g = ac.createGain();
+      o.type = 'sine'; o.frequency.setValueAtTime(72, ac.currentTime);
+      o.frequency.exponentialRampToValueAtTime(38, ac.currentTime + 0.18);
+      g.gain.setValueAtTime(0.25, ac.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.001, ac.currentTime + 0.22);
+      o.connect(g); g.connect(ac.destination); o.start(); o.stop(ac.currentTime + 0.25);
+    } catch (e) {}
+  }
+  var lastCreak = 0;
+  function creak(t) {
+    if (t - lastCreak < 0.12) return; lastCreak = t;
+    var ac = audio(); if (!ac) return;
+    try {
+      var dur = 0.06, buf = ac.createBuffer(1, ac.sampleRate * dur, ac.sampleRate);
+      var d = buf.getChannelData(0), r = mulberry(7 + Math.floor(t * 10));
+      for (var i = 0; i < d.length; i++) d[i] = (r() * 2 - 1) * (i / d.length);
+      var src = ac.createBufferSource(); src.buffer = buf;
+      var flt = ac.createBiquadFilter(); flt.type = 'bandpass'; flt.frequency.value = 300; flt.Q.value = 2;
+      var g = ac.createGain(); g.gain.value = 0.05;
+      src.connect(flt); flt.connect(g); g.connect(ac.destination); src.start();
+    } catch (e) {}
+  }
+
+  // ----- Interaction -----
+  function resolvePendingTap(t) {
+    if (pendingTapT >= 0 && t - pendingTapT > 0.35) {
+      var c = cardAt(pendingTapT);
+      anchorIdx = (c.idx + 1) % 10;
+      anchorT = pendingTapT;
+      anchorFresh = false;
+      pendingTapT = -1;
+      swish();
+    }
+  }
+  var downEvt = null;
+  function onDown(x, y) {
+    var t = elapsed();
+    audio(); // first gesture wakes the (silent until used) context
+    downEvt = { x: x, y: y, moved: false };
+    drag = null;
+  }
+  function onMove(x, y) {
+    if (!downEvt) return;
+    var t = elapsed();
+    var dy = downEvt.y - y; // upward is positive lift
+    if (Math.abs(y - downEvt.y) > 8 || Math.abs(x - downEvt.x) > 8) downEvt.moved = true;
+    if (downEvt.moved) {
+      var lift = Math.max(0, Math.min(dy, ruleY() * 0.55));
+      drag = { startY: downEvt.y, lift: lift };
+      lastLiftPx = lift;
+      creak(t);
+    }
+  }
+  function onUp(x, y) {
+    var t = elapsed();
+    if (drag) {
+      releaseEvt = { t: t, lift: drag.lift };
+      lastLiftPx = drag.lift;
+      drag = null; downEvt = null;
+      return;
+    }
+    downEvt = null;
+    // A tap. Two inside the window make a slam; one turns the page.
+    if (pendingTapT >= 0 && t - pendingTapT <= 0.35) {
+      pendingTapT = -1;
+      var c = cardAt(t);
+      anchorIdx = (c.idx + 1 + Math.floor(slamRng() * 9)) % 10; // a seeded jump of 1..9 pages
+      anchorT = t;
+      anchorFresh = false;
+      flashT = t;
+      thump();
+    } else {
+      pendingTapT = t;
+    }
+    lastTapT = t;
+  }
+  function pt(e) {
+    if (e && typeof e.clientX === 'number') return { x: e.clientX, y: e.clientY };
+    if (e && e.touches && e.touches[0]) return { x: e.touches[0].clientX, y: e.touches[0].clientY };
+    if (e && e.changedTouches && e.changedTouches[0]) return { x: e.changedTouches[0].clientX, y: e.changedTouches[0].clientY };
+    return { x: 0, y: 0 };
+  }
+  if (canvas.addEventListener) {
+    canvas.addEventListener('pointerdown', function (e) { var p = pt(e); onDown(p.x, p.y); });
+    canvas.addEventListener('pointermove', function (e) { var p = pt(e); onMove(p.x, p.y); });
+    canvas.addEventListener('pointerup', function (e) { var p = pt(e); onUp(p.x, p.y); });
+    canvas.addEventListener('mousedown', function (e) { var p = pt(e); onDown(p.x, p.y); });
+    canvas.addEventListener('mousemove', function (e) { var p = pt(e); onMove(p.x, p.y); });
+    canvas.addEventListener('mouseup', function (e) { var p = pt(e); onUp(p.x, p.y); });
+    canvas.addEventListener('touchstart', function (e) { var p = pt(e); onDown(p.x, p.y); });
+    canvas.addEventListener('touchmove', function (e) { var p = pt(e); onMove(p.x, p.y); });
+    canvas.addEventListener('touchend', function (e) { var p = pt(e); onUp(p.x, p.y); });
+  }
+
+  // Frame one: card 1, strip at rest. Synchronous, at t = 0 exactly.
+  draw(0);
+
+  if (typeof requestAnimationFrame === 'function') {
+    var loop = function () {
+      var t = elapsed();
+      resolvePendingTap(t);
+      draw(t);
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
