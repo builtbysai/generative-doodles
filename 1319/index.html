@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Event Score</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #0D0F0C; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // Seeded PRNG (mulberry32). Never Math.random.
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  var W = 0, H = 0, S = 0;
+
+  function viewportSize() {
+    var vw, vh;
+    if (typeof visualViewport !== 'undefined' && visualViewport) {
+      vw = visualViewport.width; vh = visualViewport.height;
+    } else {
+      vw = window.innerWidth; vh = window.innerHeight;
+    }
+    return [vw, vh];
+  }
+
+  function isPhone() {
+    var minDim = 99999;
+    if (typeof window !== 'undefined' && window.screen) {
+      minDim = Math.min(window.screen.width, window.screen.height);
+    }
+    if (minDim < 700) return true;
+    return H > W * 1.15;
+  }
+
+  function sizeCanvas() {
+    var v = viewportSize();
+    W = Math.round(v[0]); H = Math.round(v[1]);
+    S = Math.min(W, H);
+    canvas.width = W; canvas.height = H;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+  }
+
+  // Dot helper: one subpath per dot, moveTo before every arc (node-canvas quirk).
+  function dot(x, y, r, color) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fillStyle = color;
+    ctx.fill();
+  }
+
+  function ellipse(x, y, rx, ry, color) {
+    ctx.beginPath();
+    ctx.moveTo(x + rx, y);
+    ctx.ellipse(x, y, rx, ry, 0, 0, Math.PI * 2);
+    ctx.fillStyle = color;
+    ctx.fill();
+  }
+
+  function strokeEllipse(x, y, rx, ry, color, width) {
+    ctx.beginPath();
+    ctx.moveTo(x + rx, y);
+    ctx.ellipse(x, y, rx, ry, 0, 0, Math.PI * 2);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width;
+    ctx.stroke();
+  }
+
+  function poly(points, color) {
+    ctx.beginPath();
+    ctx.moveTo(points[0][0], points[0][1]);
+    for (var i = 1; i < points.length; i++) ctx.lineTo(points[i][0], points[i][1]);
+    ctx.closePath();
+    ctx.fillStyle = color;
+    ctx.fill();
+  }
+
+  function strokePoly(points, color, width) {
+    ctx.beginPath();
+    ctx.moveTo(points[0][0], points[0][1]);
+    for (var i = 1; i < points.length; i++) ctx.lineTo(points[i][0], points[i][1]);
+    ctx.closePath();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width;
+    ctx.stroke();
+  }
+
+  function strokeLine(x1, y1, x2, y2, color, width) {
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width;
+    ctx.stroke();
+  }
+
+  function rect(x, y, w, h, color) {
+    ctx.fillStyle = color;
+    ctx.fillRect(x, y, w, h);
+  }
+
+  var BONE = '#D9CFB8', SHADOW = '#8A7A5E', COBALT = '#2E4E7A',
+      TILEW = '#F0EBDD', TERRA = '#B25A38', COPPER = '#B0703A',
+      MON = '#0D0F0C', PHOS = '#D8E2D0';
+
+  // Metadata lines: object names and short material notes only, never sentences.
+  var META = [
+    'CONCH - CAST BRONZE', '00:00:12 - INTAKE',
+    'TAMBOURINE - TRIANGLE', '00:00:24 - LAYERING',
+    'CYMBAL - BONE', '00:00:36 - STAMPING',
+    'BASIN HMM', '00:00:48 - HOLD',
+    'HUM', '00:01:00 - RELEASE',
+    'HYMN', '00:01:12 - RETURN'
+  ];
+
+  // Pulse patterns. 4/4: one beat per slot, slow. 7/8: broken grouping.
+  // Slots: 0 conch, 1 tambourine, 2 cymbal, -1 rest.
+  var PAT44 = [0, 1, 2, -1];
+  var PAT78 = [0, 1, -1, 2, 0, -1, 1];
+  var BEAT44 = 1.1, BEAT78 = 0.55;
+
+  // Tap events: recorded piece times. Mode is a closed-form function of them.
+  var taps = [];
+  function modeAt(t) {
+    var n = 0;
+    for (var i = 0; i < taps.length; i++) if (taps[i] <= t) n++;
+    return n % 2; // 0 = 4/4, 1 = 7/8
+  }
+
+  // Current struck instrument and glow strength at piece time t, closed-form.
+  function pulseAt(t) {
+    var mode = modeAt(t);
+    var pat = mode === 0 ? PAT44 : PAT78;
+    var beat = mode === 0 ? BEAT44 : BEAT78;
+    var slot = Math.floor(t / beat) % pat.length;
+    var phase = (t % beat) / beat;
+    var glow = Math.max(0, 1 - phase * 1.6);
+    return { inst: pat[slot], glow: glow, phase: phase, beat: beat, mode: mode };
+  }
+
+  // Soft glow as layered flat-alpha ellipses (no shadowBlur, no gradients).
+  function glowAt(x, y, rx, ry, strength) {
+    if (strength <= 0.01) return;
+    ellipse(x, y, rx * 1.45, ry * 1.45, 'rgba(217,207,184,' + (0.07 * strength).toFixed(3) + ')');
+    ellipse(x, y, rx * 1.2, ry * 1.2, 'rgba(217,207,184,' + (0.12 * strength).toFixed(3) + ')');
+    ellipse(x, y, rx * 1.02, ry * 1.02, 'rgba(240,235,221,' + (0.16 * strength).toFixed(3) + ')');
+  }
+
+  function drawConch(x, y, r, glow) {
+    glowAt(x, y, r * 1.1, r * 0.9, glow);
+    // Cast-bronze conch: spiral of bone arcs over a shadow-bronze fan.
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(-0.35);
+    ellipse(0, 0, r, r * 0.78, SHADOW);
+    for (var i = 5; i >= 1; i--) {
+      ctx.beginPath();
+      ctx.moveTo(r * 0.62 * i / 5, 0);
+      ctx.arc(0, 0, r * 0.62 * i / 5, -0.4, Math.PI * 0.9);
+      ctx.strokeStyle = i % 2 ? BONE : '#C9B995';
+      ctx.lineWidth = Math.max(1.5, r * 0.10);
+      ctx.stroke();
+    }
+    ctx.restore();
+    // Spire: small tapered wedge hugging the fan's upper-left edge, and lip.
+    poly([[x - r * 0.78, y - r * 0.42], [x - r * 0.52, y - r * 0.88], [x - r * 0.28, y - r * 0.52]], BONE);
+    strokeLine(x - r * 0.7, y + r * 0.55, x + r * 0.75, y + r * 0.62, '#C9B995', Math.max(1.5, r * 0.06));
+  }
+
+  function drawTambourine(x, y, r, glow) {
+    glowAt(x, y, r, r, glow);
+    // Triangular tambourine: bone triangle, jingle dots at corners and edges.
+    var p = [[x, y - r], [x + r * 0.95, y + r * 0.7], [x - r * 0.95, y + r * 0.7]];
+    strokePoly(p, BONE, Math.max(2, r * 0.09));
+    poly([[x, y - r * 0.72], [x + r * 0.68, y + r * 0.5], [x - r * 0.68, y + r * 0.5]], 'rgba(138,122,94,0.45)');
+    var corners = [[x, y - r], [x + r * 0.95, y + r * 0.7], [x - r * 0.95, y + r * 0.7],
+                   [x + r * 0.48, y - r * 0.15], [x - r * 0.48, y - r * 0.15], [x, y + r * 0.7]];
+    for (var i = 0; i < corners.length; i++) dot(corners[i][0], corners[i][1], Math.max(2, r * 0.09), COPPER);
+  }
+
+  function drawCymbal(x, y, rx, ry, glow) {
+    glowAt(x, y, rx, ry, glow);
+    ellipse(x, y, rx, ry, SHADOW);
+    ellipse(x, y, rx * 0.82, ry * 0.82, BONE);
+    strokeEllipse(x, y, rx * 0.55, ry * 0.55, '#C9B995', Math.max(1, rx * 0.03));
+    dot(x, y, Math.max(2, rx * 0.08), COPPER);
+  }
+
+  // Small line icons for the monitor, drawn in phosphor stroke.
+  function iconConch(x, y, r) {
+    ctx.save();
+    ctx.translate(x, y);
+    for (var i = 3; i >= 1; i--) {
+      ctx.beginPath();
+      ctx.moveTo(r * 0.6 * i / 3, 0);
+      ctx.arc(0, 0, r * 0.6 * i / 3, -0.4, Math.PI * 0.9);
+      ctx.strokeStyle = PHOS; ctx.lineWidth = 1.2; ctx.stroke();
+    }
+    ctx.restore();
+  }
+  function iconTamb(x, y, r) {
+    strokePoly([[x, y - r], [x + r * 0.95, y + r * 0.7], [x - r * 0.95, y + r * 0.7]], PHOS, 1.2);
+  }
+  function iconCym(x, y, rx, ry) {
+    strokeEllipse(x, y, rx, ry, PHOS, 1.2);
+    dot(x, y, 1.5, PHOS);
+  }
+
+  function draw(t) {
+    var phone = isPhone();
+    var pulse = pulseAt(t);
+    var glows = [0, 0, 0];
+    if (pulse.inst >= 0) glows[pulse.inst] = pulse.glow;
+
+    // Layout: desktop landscape, frame left 62%, monitor right 38%.
+    // Phone: stacked, frame top 62% of height, monitor below.
+    var fx, fy, fw, fh, mx, my, mw, mh;
+    if (!phone) {
+      fx = 0; fy = 0; fw = W * 0.62; fh = H;
+      mx = W * 0.62; my = 0; mw = W * 0.38; mh = H;
+    } else {
+      fx = 0; fy = 0; fw = W; fh = H * 0.62;
+      mx = 0; my = H * 0.62; mw = W; mh = H * 0.38;
+    }
+
+    rect(0, 0, W, H, MON);
+
+    // ---- Framed still life ----
+    // Low concave frame: shadow-bronze border, inner edge bowed inward.
+    rect(fx, fy, fw, fh, SHADOW);
+    var bt = Math.max(6, Math.min(fw, fh) * 0.035); // border thickness
+    var ix = fx + bt, iy = fy + bt, iw = fw - bt * 2, ih = fh - bt * 2;
+
+    // Moroccan tile grid, seeded pattern, visible across the field.
+    var rng = mulberry32(1319000);
+    var tile = Math.max(14, Math.min(iw, ih) / 14);
+    var cols = Math.ceil(iw / tile), rows = Math.ceil(ih / tile);
+    var tileCols = [COBALT, TILEW, TERRA];
+    for (var r = 0; r < rows; r++) {
+      for (var c = 0; c < cols; c++) {
+        var pick = rng();
+        var col = tileCols[(r + c) % 3 === 0 ? 0 : (pick < 0.5 ? 1 : 2)];
+        rect(ix + c * tile, iy + r * tile, tile, tile, col);
+        // Small inner diamond on cobalt tiles.
+        if (col === COBALT) {
+          var cxd = ix + c * tile + tile / 2, cyd = iy + r * tile + tile / 2, d = tile * 0.22;
+          poly([[cxd, cyd - d], [cxd + d, cyd], [cxd, cyd + d], [cxd - d, cyd]], 'rgba(240,235,221,0.35)');
+        }
+      }
+    }
+    // Concave inner edge: thin bone line bowed inward on each side.
+    ctx.beginPath();
+    ctx.moveTo(ix, iy + ih * 0.08);
+    ctx.quadraticCurveTo(ix + iw * 0.5, iy - ih * 0.015, ix + iw, iy + ih * 0.08);
+    ctx.strokeStyle = 'rgba(217,207,184,0.5)'; ctx.lineWidth = Math.max(1, bt * 0.12); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(ix, iy + ih * 0.92);
+    ctx.quadraticCurveTo(ix + iw * 0.5, iy + ih * 1.015, ix + iw, iy + ih * 0.92);
+    ctx.strokeStyle = 'rgba(42,30,18,0.55)'; ctx.lineWidth = Math.max(1, bt * 0.12); ctx.stroke();
+
+    // Instruments, bone-colored abstractions on the tile field.
+    var u = Math.min(iw, ih);
+    var conchX = ix + iw * 0.26, conchY = iy + ih * 0.38, conchR = u * 0.16;
+    var tambX = ix + iw * 0.68, tambY = iy + ih * 0.30, tambR = u * 0.15;
+    var cymX = ix + iw * 0.52, cymY = iy + ih * 0.74, cymRx = u * 0.19, cymRy = u * 0.07;
+    drawConch(conchX, conchY, conchR, glows[0]);
+    drawTambourine(tambX, tambY, tambR, glows[1]);
+    drawCymbal(cymX, cymY, cymRx, cymRy, glows[2]);
+
+    // Copper wire staff-lines across the frame; faint vibration on beats.
+    var vib = pulse.phase < 0.25 ? Math.sin(pulse.phase * Math.PI * 4) * 1.5 * (1 - pulse.phase * 4) : 0;
+    for (var s = 0; s < 5; s++) {
+      var wy = iy + ih * (0.14 + s * 0.18) + vib * (s % 2 ? 1 : -1);
+      strokeLine(ix + iw * 0.04, wy, ix + iw * 0.96, wy, COPPER, Math.max(1, u * 0.004));
+    }
+    // Beat marker: a small copper dot riding the staff on the struck row.
+    if (pulse.inst >= 0) {
+      var beatY = iy + ih * (0.14 + pulse.inst * 0.18);
+      dot(ix + iw * 0.06 + (pulse.phase * iw * 0.88), beatY, Math.max(2, u * 0.012), COPPER);
+    }
+
+    // ---- Monitor: still-life score ----
+    rect(mx, my, mw, mh, MON);
+    var pad = Math.max(8, Math.min(mw, mh) * 0.05);
+    var mInX = mx + pad, mInY = my + pad, mInW = mw - pad * 2, mInH = mh - pad * 2;
+    // Thin bone frame for the monitor.
+    ctx.strokeStyle = BONE; ctx.lineWidth = Math.max(1, S * 0.002);
+    ctx.strokeRect(mInX, mInY, mInW, mInH);
+    // Line icons row at the top of the monitor.
+    var icY = mInY + mInH * 0.14, icR = Math.min(mInW * 0.12, mInH * 0.10);
+    iconConch(mInX + mInW * 0.18, icY, icR);
+    iconTamb(mInX + mInW * 0.50, icY, icR);
+    iconCym(mInX + mInW * 0.82, icY, icR * 1.1, icR * 0.4);
+    // Highlight the icon of the struck instrument.
+    if (pulse.inst === 0) strokeEllipse(mInX + mInW * 0.18, icY, icR * 1.15, icR * 1.15, 'rgba(217,207,184,' + (0.3 + 0.7 * pulse.glow).toFixed(3) + ')', 1);
+    if (pulse.inst === 1) strokePoly([[mInX + mInW * 0.50, icY - icR * 1.15], [mInX + mInW * 0.50 + icR * 1.1, icY + icR * 0.8], [mInX + mInW * 0.50 - icR * 1.1, icY + icR * 0.8]], 'rgba(217,207,184,' + (0.3 + 0.7 * pulse.glow).toFixed(3) + ')', 1);
+    if (pulse.inst === 2) strokeEllipse(mInX + mInW * 0.82, icY, icR * 1.25, icR * 0.5, 'rgba(217,207,184,' + (0.3 + 0.7 * pulse.glow).toFixed(3) + ')', 1);
+    strokeLine(mInX + pad * 0.5, icY + icR * 1.6, mInX + mInW - pad * 0.5, icY + icR * 1.6, 'rgba(216,226,208,0.35)', 1);
+
+    // Scrolling metadata: closed-form scroll, frame one at offset zero.
+    var lineH = Math.max(13, Math.min(mInW * 0.055, mInH * 0.045));
+    var listTop = icY + icR * 1.9, listH = mInY + mInH - listTop - pad * 0.5 - lineH * 1.2;
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(mInX + pad * 0.5, listTop, mInW - pad, listH);
+    ctx.clip();
+    ctx.fillStyle = PHOS;
+    ctx.font = Math.round(lineH * 0.72) + 'px monospace';
+    ctx.textBaseline = 'top';
+    var totalH = META.length * lineH;
+    var off = (t * lineH * 0.9) % totalH;
+    for (var k = -1; k < META.length + 1; k++) {
+      var ly = listTop + k * lineH - off;
+      if (ly < listTop - lineH || ly > listTop + listH) continue;
+      ctx.fillText(META[((k % META.length) + META.length) % META.length], mInX + pad * 0.5, ly);
+    }
+    ctx.restore();
+
+    // Mode label: small, part of the score readout.
+    ctx.fillStyle = 'rgba(216,226,208,0.6)';
+    ctx.font = Math.round(lineH * 0.6) + 'px monospace';
+    ctx.fillText(pulse.mode === 0 ? '4/4' : '7/8', mInX + pad * 0.5, mInY + mInH - lineH * 0.9);
+  }
+
+  // Tap toggles the pulse between 4/4 and a broken 7/8. Never tap-to-reload.
+  function onTap(e) {
+    if (e && e.preventDefault) e.preventDefault();
+    var t = start === null ? 0 : (nowMs() - start) / 1000;
+    taps.push(t);
+  }
+  canvas.addEventListener('pointerdown', onTap);
+
+  // Boot: frame one is exactly draw(0). The clock starts with the rAF loop.
+  sizeCanvas();
+  draw(0);
+  var booted = true;
+
+  var start = null;
+  function nowMs() {
+    if (typeof performance !== 'undefined' && performance.now) return performance.now();
+    return Date.now();
+  }
+  function loop() {
+    if (start === null) start = nowMs();
+    var t = (nowMs() - start) / 1000;
+    draw(t);
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+  }
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+
+  function onResize() {
+    sizeCanvas();
+    // Redraw at the current piece time, never restarting the performance.
+    if (booted) {
+      var t = start === null ? 0 : (nowMs() - start) / 1000;
+      draw(t);
+    }
+  }
+  if (typeof visualViewport !== 'undefined' && visualViewport) {
+    visualViewport.addEventListener('resize', onResize);
+  }
+  window.addEventListener('resize', onResize);
+})();
+</script>
+</body>
+</html>
