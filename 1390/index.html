@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Bite Spreads</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0c0d10; overflow: hidden; }
+  canvas { display: block; background: #0c0d10; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // Seeded PRNG (mulberry32). No Math.random anywhere in this piece.
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  var FIELD = '#0c0d10', EDGE = '#2e3138', NODE = '#5a5e66',
+      BITE = '#ff2a2a', UNDEAD = '#e0962a';
+
+  // ---- viewport (Visual Viewport API, pinned in draw) ----
+  var W = 0, H = 0, isPhone = false;
+  function measure() {
+    var vv = (typeof window !== 'undefined' && window.visualViewport) ? window.visualViewport : null;
+    W = vv ? vv.width : window.innerWidth;
+    H = vv ? vv.height : window.innerHeight;
+    var minScreen = Math.min(window.screen.width, window.screen.height);
+    isPhone = minScreen < 700 || (H > W * 1.15);
+  }
+
+  // ---- network layout, seeded per cycle (field re-seeds on a long cycle) ----
+  var CYCLE = 150; // seconds; bitten nodes fade back, then the field re-seeds
+  var network = null, networkCycle = -1;
+
+  function buildNetwork(cycle) {
+    var rng = mulberry32(1390000 + cycle * 7919);
+    var nodes = [], i, j, tries = 0;
+    var target = 64, minD = Math.min(W, H) * 0.10;
+    while (nodes.length < target && tries < 4000) {
+      tries++;
+      var x = W * (0.06 + 0.88 * rng()), y = H * (0.06 + 0.88 * rng());
+      var ok = true;
+      for (j = 0; j < nodes.length; j++) {
+        var dx = nodes[j].x - x, dy = nodes[j].y - y;
+        if (dx * dx + dy * dy < minD * minD) { ok = false; break; }
+      }
+      if (ok) nodes.push({ x: x, y: y, phase: rng() * 6.2832, r: 3.2 + rng() * 1.6 });
+    }
+    // Edges to near neighbours (organic scatter, never a grid).
+    var edges = [], seen = {};
+    var maxD = Math.max(W, H) * 0.30;
+    for (i = 0; i < nodes.length; i++) {
+      var near = [];
+      for (j = 0; j < nodes.length; j++) {
+        if (i === j) continue;
+        var ddx = nodes[j].x - nodes[i].x, ddy = nodes[j].y - nodes[i].y;
+        var d = Math.sqrt(ddx * ddx + ddy * ddy);
+        if (d < maxD) near.push({ j: j, d: d });
+      }
+      near.sort(function (a, b) { return a.d - b.d; });
+      var k = Math.min(3, near.length);
+      for (var m = 0; m < k; m++) {
+        var a = Math.min(i, near[m].j), b = Math.max(i, near[m].j);
+        var key = a + ':' + b;
+        if (!seen[key]) { seen[key] = true; edges.push({ a: a, b: b }); }
+      }
+    }
+    // Adjacency for BFS hop distances.
+    var adj = [];
+    for (i = 0; i < nodes.length; i++) adj.push([]);
+    for (i = 0; i < edges.length; i++) {
+      adj[edges[i].a].push(edges[i].b);
+      adj[edges[i].b].push(edges[i].a);
+    }
+    return { nodes: nodes, edges: edges, adj: adj };
+  }
+
+  function networkAt(t) {
+    var cycle = Math.floor(t / CYCLE);
+    if (!network || networkCycle !== cycle) {
+      network = buildNetwork(cycle);
+      networkCycle = cycle;
+      bites = []; // old bites belong to the old field; the re-seeded field starts clean
+      lastTrail = null;
+    }
+    return network;
+  }
+
+  // ---- bites: recorded events only. State is a closed-form function of
+  // (piece time - bite time, graph hops from the bite source). ----
+  var bites = [];
+  var lastTrail = null;
+  var HOP = 0.45, FLARE = 1.4, UNDEAD_SPAN = 26, FADE_SPAN = 8;
+
+  function bfsDistances(adj, src) {
+    var dist = [], q = [src], i;
+    for (i = 0; i < adj.length; i++) dist.push(-1);
+    dist[src] = 0;
+    while (q.length) {
+      var n = q.shift();
+      for (i = 0; i < adj[n].length; i++) {
+        var nb = adj[n][i];
+        if (dist[nb] < 0) { dist[nb] = dist[n] + 1; q.push(nb); }
+      }
+    }
+    return dist;
+  }
+
+  function plantBite(x, y, t) {
+    var net = networkAt(t);
+    var best = 0, bd = 1e18, i;
+    for (i = 0; i < net.nodes.length; i++) {
+      var dx = net.nodes[i].x - x, dy = net.nodes[i].y - y, d = dx * dx + dy * dy;
+      if (d < bd) { bd = d; best = i; }
+    }
+    bites.push({ node: best, t0: t, dist: bfsDistances(net.adj, best) });
+    if (bites.length > 24) bites.shift();
+  }
+
+  // Node state for one bite: 0 susceptible, 1 flaring, 2 undead, 3 fading.
+  // Returns {state, k} where k is the envelope 0..1 within the phase.
+  function nodeState(bite, d, t) {
+    var arrival = bite.t0 + d * HOP;
+    var e = t - arrival;
+    if (e < 0) return { state: 0, k: 0 };
+    if (e < FLARE) return { state: 1, k: 1 - e / FLARE * 0.25 };
+    if (e < FLARE + UNDEAD_SPAN) return { state: 2, k: 1 - (e - FLARE) / UNDEAD_SPAN * 0.35 };
+    if (e < FLARE + UNDEAD_SPAN + FADE_SPAN) return { state: 3, k: 1 - (e - FLARE - UNDEAD_SPAN) / FADE_SPAN };
+    return { state: 0, k: 0 };
+  }
+
+  // ---- drawing ----
+  function draw(t) {
+    measure();
+    canvas.width = W; canvas.height = H;
+    canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+    var net = networkAt(t);
+    var nodes = net.nodes, edges = net.edges, i, b;
+
+    ctx.fillStyle = FIELD;
+    ctx.fillRect(0, 0, W, H);
+
+    // Node states: highest-priority phase across all bites wins
+    // (flare beats undead beats fading beats susceptible).
+    var states = [];
+    for (i = 0; i < nodes.length; i++) {
+      var best = { state: 0, k: 0 };
+      for (b = 0; b < bites.length; b++) {
+        var d = bites[b].dist[i];
+        if (d < 0) continue;
+        var st = nodeState(bites[b], d, t);
+        if (st.state > best.state || (st.state === best.state && st.k > best.k)) best = st;
+      }
+      states.push(best);
+    }
+
+    // Edges: dim base; amber when both ends undead; travelling red pulse
+    // where the wavefront currently crosses the edge.
+    for (i = 0; i < edges.length; i++) {
+      var e = edges[i], A = nodes[e.a], B = nodes[e.b];
+      var sa = states[e.a], sb = states[e.b];
+      ctx.strokeStyle = EDGE; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(A.x, A.y); ctx.lineTo(B.x, B.y); ctx.stroke();
+      if (sa.state === 2 && sb.state === 2) {
+        ctx.strokeStyle = 'rgba(224,150,42,0.35)'; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(A.x, A.y); ctx.lineTo(B.x, B.y); ctx.stroke();
+      }
+      // Wavefront pulses, closed-form from bite time and hop distance.
+      for (b = 0; b < bites.length; b++) {
+        var da = bites[b].dist[e.a], db = bites[b].dist[e.b];
+        if (da < 0 || db < 0) continue;
+        var ta = bites[b].t0 + da * HOP, tb = bites[b].t0 + db * HOP;
+        var lo = Math.min(ta, tb), hi = Math.max(ta, tb);
+        if (t >= lo && t <= hi + 0.25 && hi > lo) {
+          var f = (t - lo) / (hi - lo);
+          if (f > 1) f = 1;
+          var px = A.x + (B.x - A.x) * f, py = A.y + (B.y - A.y) * f;
+          ctx.fillStyle = 'rgba(255,42,42,0.9)';
+          ctx.beginPath(); ctx.moveTo(px + 3, py); ctx.arc(px, py, 3, 0, 6.2832); ctx.fill();
+        }
+      }
+    }
+
+    // Nodes: breathing gray; red flare with flat-alpha halo; amber undead.
+    for (i = 0; i < nodes.length; i++) {
+      var n = nodes[i], st = states[i];
+      var breathe = 1 + 0.18 * Math.sin(t * 0.8 + n.phase);
+      var r = n.r * breathe;
+      if (st.state === 1) {
+        ctx.fillStyle = 'rgba(255,42,42,0.16)';
+        ctx.beginPath(); ctx.moveTo(n.x + r + 10, n.y); ctx.arc(n.x, n.y, r + 10, 0, 6.2832); ctx.fill();
+        ctx.fillStyle = BITE;
+        ctx.beginPath(); ctx.moveTo(n.x + r + 3, n.y); ctx.arc(n.x, n.y, r + 3, 0, 6.2832); ctx.fill();
+      } else if (st.state === 2) {
+        ctx.fillStyle = 'rgba(224,150,42,' + (0.25 + 0.55 * st.k).toFixed(3) + ')';
+        ctx.beginPath(); ctx.moveTo(n.x + r + 1, n.y); ctx.arc(n.x, n.y, r + 1, 0, 6.2832); ctx.fill();
+      } else if (st.state === 3) {
+        ctx.fillStyle = 'rgba(224,150,42,' + (0.55 * st.k).toFixed(3) + ')';
+        ctx.beginPath(); ctx.moveTo(n.x + r, n.y); ctx.arc(n.x, n.y, r, 0, 6.2832); ctx.fill();
+        ctx.fillStyle = NODE;
+        ctx.beginPath(); ctx.moveTo(n.x + r * 0.6, n.y); ctx.arc(n.x, n.y, r * 0.6, 0, 6.2832); ctx.fill();
+      } else {
+        ctx.fillStyle = NODE;
+        ctx.beginPath(); ctx.moveTo(n.x + r, n.y); ctx.arc(n.x, n.y, r, 0, 6.2832); ctx.fill();
+      }
+    }
+  }
+
+  // ---- interaction: touch plants a bite; drag draws bite trails ----
+  var down = false, pieceT = 0;
+  function pos(ev) {
+    var rect = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+    return { x: ev.clientX - rect.left, y: ev.clientY - rect.top };
+  }
+  canvas.addEventListener('pointerdown', function (ev) {
+    down = true;
+    var p = pos(ev);
+    plantBite(p.x, p.y, pieceT);
+    lastTrail = p;
+  });
+  canvas.addEventListener('pointermove', function (ev) {
+    if (!down) return;
+    var p = pos(ev);
+    if (lastTrail) {
+      var dx = p.x - lastTrail.x, dy = p.y - lastTrail.y;
+      if (dx * dx + dy * dy > 36 * 36) {
+        plantBite(p.x, p.y, pieceT);
+        lastTrail = p;
+      }
+    } else lastTrail = p;
+  });
+  function endPointer() { down = false; lastTrail = null; }
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', endPointer);
+
+  function onResize() { draw(pieceT); }
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', onResize);
+  }
+  if (window.addEventListener) window.addEventListener('resize', onResize);
+
+  // ---- boot: frame one is draw(0); the clock starts only with the rAF loop ----
+  var booted = false, startTs = 0;
+  draw(0);
+  function loop(ts) {
+    if (!booted) { booted = true; startTs = ts; }
+    pieceT = (ts - startTs) / 1000;
+    draw(pieceT);
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+  }
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
