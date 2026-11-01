@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<!-- piece-9124-the-long-drift -->
+<title>The Long Drift</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #06070d; }
+  canvas { display: block; width: 100vw; height: 100vh; touch-action: none; cursor: grab; }
+  canvas.dragging { cursor: grabbing; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+// №9124 driver core — pure functions, no DOM. Shared by node harness and index.html.
+'use strict';
+
+const LAYERS = 5;
+// speed scale per layer: index 0 = farthest, 4 = nearest
+const SPEED_SCALE = [0.12, 0.28, 0.50, 0.75, 1.00];
+const WRAP_MARGIN = 80;
+
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+const STAR_COLORS = [
+  [214, 226, 240], // cool white
+  [214, 226, 240],
+  [235, 222, 196], // amber-ish
+  [190, 205, 228], // blue-grey
+];
+const DUST_COLORS = [
+  [196, 150, 96],   // ochre
+  [150, 96, 70],    // rust
+  [140, 160, 190],  // cold blue-grey
+  [170, 170, 180],
+];
+
+function gauss(rng) {
+  // approx standard normal in [-1.5, 1.5]-ish range via Irwin-Hall
+  return (rng() + rng() + rng() - 1.5) / 1.5;
+}
+
+function makeSector(seed, W, H) {
+  const rng = mulberry32(seed);
+  const stars = [];
+  const dust = [];
+  const wisps = [];
+  // a diagonal dust lane crosses the sector; dust and wisps gather near it
+  const laneSlope = 0.32;
+  const laneY = (x) => H * 0.52 + (x - W / 2) * laneSlope;
+  for (let i = 0; i < LAYERS; i++) {
+    const n = 40 * (i + 2);
+    for (let k = 0; k < n; k++) {
+      const c = STAR_COLORS[Math.floor(rng() * STAR_COLORS.length)];
+      const x = rng() * W, y = rng() * H;
+      stars.push({
+        x, y, tx: x, ty: y, layer: i,
+        size: 0.4 + rng() * (i === 4 ? 1.8 : i === 3 ? 1.2 : 0.8),
+        bright: 0.35 + rng() * 0.65,
+        twinkle: i === 0,                      // far layer only
+        phase: rng() * Math.PI * 2,
+        color: c,
+      });
+    }
+    const nd = 30 * (i + 2);
+    for (let k = 0; k < nd; k++) {
+      const c = DUST_COLORS[Math.floor(rng() * DUST_COLORS.length)];
+      const x = rng() * W;
+      // dust hugs the lane, spread widening on near layers
+      const y = laneY(x) + gauss(rng) * H * (0.10 + i * 0.035);
+      dust.push({
+        x, y, tx: x, ty: y, layer: i,
+        r: 0.5 + rng() * (0.8 + i * 0.35),
+        alpha: 0.16 + rng() * 0.34,
+        color: c,
+      });
+    }
+    if (i < 2) {
+      const nw = 3 + i * 2;
+      for (let k = 0; k < nw; k++) {
+        const x = rng() * W;
+        const y = laneY(x) + gauss(rng) * H * 0.10;
+        wisps.push({
+          x, y, tx: x, ty: y, layer: i,
+          r: 170 + rng() * 230,
+          alpha: 0.07 + rng() * 0.09,
+          hue: rng(), // 0 = indigo, 1 = teal-rust
+        });
+      }
+    }
+  }
+  return {
+    seed, W, H,
+    baseVx: 42, baseVy: 24,          // near-layer base drift, px/s
+    impulseVx: 0, impulseVy: 0,      // drag steering velocity, decays
+    tau: 3.2,                        // impulse decay seconds
+    stars, dust, wisps,
+  };
+}
+
+function layerSpeed(field, i) {
+  return SPEED_SCALE[i];
+}
+
+function wrap(v, max) {
+  const m = WRAP_MARGIN;
+  const span = max + m * 2;
+  v += m;
+  v = ((v % span) + span) % span;
+  return v - m;
+}
+
+function stepField(field, dt) {
+  const decay = Math.exp(-dt / field.tau);
+  field.impulseVx *= decay;
+  field.impulseVy *= decay;
+  const move = (p) => {
+    const s = SPEED_SCALE[p.layer];
+    p.tx += (field.baseVx * s + field.impulseVx * s) * dt;
+    p.ty += (field.baseVy * s + field.impulseVy * s) * dt;
+    p.x = wrap(p.tx, field.W);
+    p.y = wrap(p.ty, field.H);
+  };
+  for (const p of field.stars) move(p);
+  for (const p of field.dust) move(p);
+  for (const p of field.wisps) move(p);
+}
+
+// Drag: steering impulse in px/s (screen-space delta mapped by caller)
+function applyDrag(field, vx, vy) {
+  field.impulseVx += vx;
+  field.impulseVy += vy;
+}
+
+function centroid(field) {
+  // unwrapped mean position — used to measure drag deflection
+  let sx = 0, sy = 0, n = 0;
+  for (const p of field.stars) { sx += p.tx; sy += p.ty; n++; }
+  return { x: sx / n, y: sy / n };
+}
+
+if (typeof module !== 'undefined') module.exports = {
+  LAYERS, SPEED_SCALE, WRAP_MARGIN, mulberry32, makeSector,
+  stepField, applyDrag, centroid, layerSpeed,
+};
+
+
+// ---- rendering (decoration; the driver above owns the motion) ----
+(function () {
+  'use strict';
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+
+  let W = 0, H = 0, DPR = 1;
+  let field = null;
+  let seed = (Math.random() * 1e9) | 0;
+  let vignette = null;
+  const grainSprites = [];
+
+  function makeGrainSprite(color) {
+    const s = 32;
+    const cv = document.createElement('canvas');
+    cv.width = s; cv.height = s;
+    const g = cv.getContext('2d');
+    const grad = g.createRadialGradient(s/2, s/2, 0, s/2, s/2, s/2);
+    const c = color;
+    grad.addColorStop(0, 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',0.9)');
+    grad.addColorStop(0.25, 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',0.35)');
+    grad.addColorStop(1, 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',0)');
+    g.fillStyle = grad;
+    g.fillRect(0, 0, s, s);
+    return cv;
+  }
+
+  function makeVignette() {
+    const cv = document.createElement('canvas');
+    cv.width = Math.max(2, W); cv.height = Math.max(2, H);
+    const g = cv.getContext('2d');
+    const r = Math.hypot(W, H) / 2;
+    const grad = g.createRadialGradient(W/2, H/2, r * 0.42, W/2, H/2, r);
+    grad.addColorStop(0, 'rgba(0,0,0,0)');
+    grad.addColorStop(1, 'rgba(2,3,7,0.55)');
+    g.fillStyle = grad;
+    g.fillRect(0, 0, W, H);
+    vignette = cv;
+  }
+
+  const DUST_COLORS_LOCAL = [[196,150,96],[150,96,70],[140,160,190],[170,170,180]];
+
+  function resize() {
+    DPR = Math.min(2, window.devicePixelRatio || 1);
+    W = Math.floor(window.innerWidth);
+    H = Math.floor(window.innerHeight);
+    canvas.width = Math.floor(W * DPR);
+    canvas.height = Math.floor(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    field = makeSector(seed, W, H);
+    makeVignette();
+    grainSprites.length = 0;
+    for (const c of DUST_COLORS_LOCAL) grainSprites.push(makeGrainSprite(c));
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  function wispColor(hue) {
+    // indigo -> cold teal, always faint
+    const r = Math.round(70 + hue * 60);
+    const g = Math.round(82 + hue * 40);
+    const b = Math.round(150 - hue * 40);
+    return [r, g, b];
+  }
+
+  function drawWisp(w) {
+    const c = wispColor(w.hue);
+    const grad = ctx.createRadialGradient(w.x, w.y, 0, w.x, w.y, w.r);
+    grad.addColorStop(0, 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + w.alpha.toFixed(3) + ')');
+    grad.addColorStop(1, 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',0)');
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(w.x, w.y, w.r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  function render(t) {
+    ctx.fillStyle = '#06070d';
+    ctx.fillRect(0, 0, W, H);
+
+    for (const w of field.wisps) drawWisp(w);
+
+    // dust grains: pre-rendered soft sprites
+    for (const d of field.dust) {
+      const idx = DUST_COLORS_LOCAL.findIndex(c =>
+        c[0] === d.color[0] && c[1] === d.color[1] && c[2] === d.color[2]);
+      const spr = grainSprites[idx < 0 ? 0 : idx];
+      const s = d.r * 4;
+      ctx.globalAlpha = Math.min(1, d.alpha * 2.2);
+      ctx.drawImage(spr, d.x - s / 2, d.y - s / 2, s, s);
+    }
+    ctx.globalAlpha = 1;
+
+    // stars
+    for (const s of field.stars) {
+      let a = s.bright;
+      if (s.twinkle) a *= 0.55 + 0.45 * Math.sin(t * 2.1 + s.phase);
+      const c = s.color;
+      ctx.fillStyle = 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a.toFixed(3) + ')';
+      if (s.size <= 1.1) {
+        ctx.fillRect(s.x, s.y, s.size, s.size);
+      } else {
+        ctx.beginPath();
+        ctx.arc(s.x, s.y, s.size * 0.55, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    ctx.drawImage(vignette, 0, 0, W, H);
+  }
+
+  // ---- interaction: drag steers through the dust, tap reseeds a new sector ----
+  let dragging = false, moved = 0, downT = 0, lastX = 0, lastY = 0;
+
+  canvas.addEventListener('pointerdown', (e) => {
+    dragging = true; moved = 0; downT = performance.now();
+    lastX = e.clientX; lastY = e.clientY;
+    canvas.classList.add('dragging');
+    canvas.setPointerCapture(e.pointerId);
+  });
+  canvas.addEventListener('pointermove', (e) => {
+    if (!dragging) return;
+    const dx = e.clientX - lastX, dy = e.clientY - lastY;
+    lastX = e.clientX; lastY = e.clientY;
+    moved += Math.abs(dx) + Math.abs(dy);
+    // steering kick: drag direction pushes the field the other way (fly-through feel)
+    applyDrag(field, -dx * 14, -dy * 14);
+  });
+  function endDrag(e) {
+    if (!dragging) return;
+    dragging = false;
+    canvas.classList.remove('dragging');
+    const dtMs = performance.now() - downT;
+    if (moved < 10 && dtMs < 350) {
+      seed = (Math.random() * 1e9) | 0;
+      field = makeSector(seed, W, H);
+    }
+  }
+  canvas.addEventListener('pointerup', endDrag);
+  canvas.addEventListener('pointercancel', endDrag);
+
+  let last = performance.now();
+  function frame(now) {
+    let dt = (now - last) / 1000;
+    last = now;
+    if (dt > 0.1) dt = 0.1;
+    stepField(field, dt);
+    render(now / 1000);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
