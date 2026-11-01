@@ -1,0 +1,609 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Omnia</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #F5F1E6; height: 100%; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="omnia"></canvas>
+<script>
+(function () {
+  'use strict';
+
+  // Palette (strict): paper, five wash hues, one pool tone. Ink is sampled wash darkened.
+  var PAPER = [245, 241, 230];            // #F5F1E6
+  var POOL  = [58, 64, 56];               // #3A4038
+  var HUES  = [
+    [157, 184, 154],                      // sage   #9DB89A
+    [138, 107, 74],                       // umber  #8A6B4A
+    [110, 123, 139],                      // slate  #6E7B8B
+    [192, 139, 139],                      // rose   #C08B8B
+    [92, 107, 60]                         // moss   #5C6B3C
+  ];
+  var PAPER_CSS = '#F5F1E6';
+
+  var SEED = 954115;
+  var STEP = 1 / 120;                     // fixed timestep, 120 Hz
+  var PREROLL = 3000;                     // exactly 3000 steps (25 s) before frame one
+  var AGENTS_DESKTOP = 200, AGENTS_PHONE = 140;
+  var DOT_CAP = 9000, DOT_LIFE = 240;     // ink dots: cap and lifetime in seconds
+  var FADE_DUR = 20;                      // painting crossfade, seconds
+  var WASHOUT_DUR = 5;                    // old ink washout, seconds
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function hash1(i, s) {
+    var h = Math.imul(i, 374761393) ^ Math.imul(s, 668265263);
+    h = Math.imul(h ^ (h >>> 13), 1274126177);
+    return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+  }
+  function hash2(ix, iy, s) {
+    var h = Math.imul(ix, 374761393) ^ Math.imul(iy, 668265263) ^ Math.imul(s, 974634211);
+    h = Math.imul(h ^ (h >>> 13), 1274126177);
+    return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+  }
+  function vn1(x, s) {
+    var i = Math.floor(x), f = x - i;
+    var u = f * f * (3 - 2 * f);
+    var a = hash1(i, s), b = hash1(i + 1, s);
+    return a + (b - a) * u;
+  }
+  function vn2(x, y, s) {
+    var ix = Math.floor(x), iy = Math.floor(y);
+    var fx = x - ix, fy = y - iy;
+    var sx = fx * fx * (3 - 2 * fx), sy = fy * fy * (3 - 2 * fy);
+    var a = hash2(ix, iy, s), b = hash2(ix + 1, iy, s);
+    var c = hash2(ix, iy + 1, s), d = hash2(ix + 1, iy + 1, s);
+    return a + (b - a) * sx + (c - a) * sy + (a - b - c + d) * sx * sy;
+  }
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+  function clamp01(v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
+  function lerp(a, b, u) { return a + (b - a) * u; }
+  function sstep(u) { u = clamp01(u); return u * u * (3 - 2 * u); }
+  function css(c) { return 'rgb(' + Math.round(c[0]) + ',' + Math.round(c[1]) + ',' + Math.round(c[2]) + ')'; }
+
+  var canvas = document.getElementById('omnia');
+  var ctx = canvas.getContext('2d');
+
+  var W = 720, H = 720, MINWH = 720, PHONE = false, CELL = 8, SZ = 1;
+  var sim = null;
+
+  function viewSize() {
+    var w = 720, h = 720;
+    try {
+      if (window.visualViewport && window.visualViewport.width) {
+        w = window.visualViewport.width; h = window.visualViewport.height;
+      } else if (window.innerWidth) { w = window.innerWidth; h = window.innerHeight; }
+    } catch (e) {}
+    return [Math.max(60, Math.floor(w)), Math.max(60, Math.floor(h))];
+  }
+  function detectPhone(w, h) {
+    var m = 0;
+    try { if (window.screen) m = Math.min(window.screen.width || 0, window.screen.height || 0); } catch (e) {}
+    if (m > 0) return m < 700;
+    return h > w * 1.15;
+  }
+
+  // ---------- the wash: an analytic field of seeded metaball blooms ----------
+  // darkness(x,y) and color(x,y) are closed-form functions of the bloom set.
+  // The renderer evaluates the same function on a grid; the agents sample it directly.
+  function makePainting(seed) {
+    var rng = mulberry32(seed);
+    var n = 5 + Math.floor(rng() * 3);            // 5 to 7 blooms
+    var blooms = [], i, lastHue = -1;
+    for (i = 0; i < n; i++) {
+      var hue = Math.floor(rng() * HUES.length);
+      if (hue === lastHue) hue = (hue + 1 + Math.floor(rng() * (HUES.length - 1))) % HUES.length;
+      lastHue = hue;
+      blooms.push({
+        fx: 0.15 + 0.70 * rng(),
+        fy: 0.15 + 0.70 * rng(),
+        fr: 0.17 + 0.16 * rng(),                  // radius, fraction of min dimension
+        s: 0.78 + 0.38 * rng(),
+        col: HUES[hue],
+        x: 0, y: 0, r: 0                          // pixel cache, filled by layoutPainting
+      });
+    }
+    return { blooms: blooms, mottle: Math.floor(rng() * 100000), pools: [] };
+  }
+  function layoutPainting(P) {
+    var i, b, a, k;
+    // on tall frames the blooms grow a little so the painting still fills its sheet
+    var stretch = clamp(1 + 0.38 * (H / W - 1), 0.95, 1.5);
+    for (i = 0; i < P.blooms.length; i++) {
+      b = P.blooms[i];
+      b.x = b.fx * W; b.y = b.fy * H; b.r = b.fr * MINWH * stretch;
+    }
+    // spawn pools: points on each bloom's rim ring (the dark pooling edge) plus inner points
+    P.pools = [];
+    for (i = 0; i < P.blooms.length; i++) {
+      b = P.blooms[i];
+      for (k = 0; k < 16; k++) {
+        a = (k / 16) * Math.PI * 2 + hash1(i * 31 + k, 77) * 0.3;
+        P.pools.push({ x: b.x + Math.cos(a) * b.r * 0.9, y: b.y + Math.sin(a) * b.r * 0.9 });
+      }
+      for (k = 0; k < 6; k++) {
+        a = hash1(i * 57 + k, 91) * Math.PI * 2;
+        P.pools.push({ x: b.x + Math.cos(a) * b.r * 0.45, y: b.y + Math.sin(a) * b.r * 0.45 });
+      }
+    }
+  }
+
+  var _fc = { r: 0, g: 0, b: 0, dark: 0, cov: 0 };
+  function fieldCore(x, y, P, bumps, t, out) {
+    var sumW = 0, rimSum = 0, cr = 0, cg = 0, cb = 0, i, b, dx, dy, d, q, wIn, wRim, w;
+    for (i = 0; i < P.blooms.length; i++) {
+      b = P.blooms[i];
+      dx = x - b.x; dy = y - b.y;
+      d = Math.sqrt(dx * dx + dy * dy) / b.r;
+      if (d > 2.3) continue;
+      wIn = b.s * Math.exp(-d * d * 1.55);
+      q = (d - 0.9) / 0.13;
+      wRim = b.s * 0.85 * Math.exp(-q * q * 0.5);
+      w = wIn + wRim;
+      sumW += w; rimSum += wRim;
+      cr += w * b.col[0]; cg += w * b.col[1]; cb += w * b.col[2];
+    }
+    var mott = 0.92 + 0.16 * vn2(x * 0.0045, y * 0.0045, P.mottle);
+    var cov = (1 - Math.exp(-sumW * 1.7)) * mott;
+    var edge = Math.min(x, y, W - x, H - y);
+    cov *= sstep((edge - MINWH * 0.012) / (MINWH * 0.05));      // deckle: bare paper at the shore
+    var r = PAPER[0], g = PAPER[1], bl = PAPER[2];
+    if (sumW > 0.0001) {
+      var k = cov * 0.94;
+      r = lerp(PAPER[0], cr / sumW, k);
+      g = lerp(PAPER[1], cg / sumW, k);
+      bl = lerp(PAPER[2], cb / sumW, k);
+    }
+    var rimAmt = (1 - Math.exp(-rimSum * 1.5)) * clamp01(cov * 1.6);
+    var rk = rimAmt * 0.42;                                     // pigment pooling at the rim
+    r = lerp(r, POOL[0], rk); g = lerp(g, POOL[1], rk); bl = lerp(bl, POOL[2], rk);
+    var dark = clamp01(cov * 0.66 + rimAmt * 0.5);
+    if (bumps && bumps.length) {
+      var bs = 0, bp, age, amp, bd;
+      for (i = 0; i < bumps.length; i++) {
+        bp = bumps[i];
+        age = t - bp.born;
+        if (age < 0) continue;
+        amp = bp.amp * Math.exp(-age / 20);                   // relaxes away over ~60 s
+        if (amp < 0.012) continue;
+        dx = x - bp.x; dy = y - bp.y;
+        bd = Math.sqrt(dx * dx + dy * dy) / bp.r;
+        if (bd > 2.2) continue;
+        bs += amp * Math.exp(-bd * bd * 2.2);
+      }
+      if (bs > 0.001) {
+        var bk = clamp01(bs) * 0.4;
+        r = lerp(r, POOL[0], bk); g = lerp(g, POOL[1], bk); bl = lerp(bl, POOL[2], bk);
+        dark = clamp01(dark + bs * 0.55);
+        cov = clamp01(cov + bs * 0.2);
+      }
+    }
+    out.r = r; out.g = g; out.b = bl; out.dark = dark; out.cov = cov;
+    return out;
+  }
+
+  // darkness for agents: current painting blended with the previous during a crossfade, plus bumps
+  function darkAt(x, y) {
+    var s = sim;
+    if (s.prev) {
+      var u = sstep((s.t - s.fadeStart) / FADE_DUR);
+      var dA = fieldCore(x, y, s.prev, null, s.t, _fc).dark;
+      var dB = fieldCore(x, y, s.cur, s.bumps, s.t, _fc).dark;
+      return lerp(dA, dB, u);
+    }
+    return fieldCore(x, y, s.cur, s.bumps, s.t, _fc).dark;
+  }
+  // wash color for ink sampling (no bumps: ink reads the painting itself)
+  function colorAt(x, y, out) {
+    var s = sim;
+    if (s.prev) {
+      var u = sstep((s.t - s.fadeStart) / FADE_DUR);
+      var a = fieldCore(x, y, s.prev, null, s.t, { r: 0, g: 0, b: 0, dark: 0, cov: 0 });
+      var b = fieldCore(x, y, s.cur, null, s.t, { r: 0, g: 0, b: 0, dark: 0, cov: 0 });
+      out.r = lerp(a.r, b.r, u); out.g = lerp(a.g, b.g, u); out.b = lerp(a.b, b.b, u);
+      return out;
+    }
+    return fieldCore(x, y, s.cur, null, s.t, out);
+  }
+
+  // pre-rendered grid of flat cells for one painting (the renderer sampling the field);
+  // each cell averages 2x2 sub-samples of the field so neighbouring cells meet softly
+  function buildGrid(P) {
+    var cols = Math.ceil(W / CELL), rows = Math.ceil(H / CELL);
+    var cells = [], gx, gy, sx, sy, f = { r: 0, g: 0, b: 0, dark: 0, cov: 0 };
+    var offs = [0.25, 0.75];
+    for (gy = 0; gy < rows; gy++) {
+      for (gx = 0; gx < cols; gx++) {
+        var ar = 0, ag = 0, ab = 0, ac = 0;
+        for (sy = 0; sy < 2; sy++) {
+          for (sx = 0; sx < 2; sx++) {
+            fieldCore(gx * CELL + CELL * offs[sx], gy * CELL + CELL * offs[sy], P, null, 0, f);
+            ar += f.r; ag += f.g; ab += f.b; ac += f.cov;
+          }
+        }
+        if (ac * 0.25 > 0.015) cells.push({ x: gx * CELL, y: gy * CELL, c: css([ar * 0.25, ag * 0.25, ab * 0.25]) });
+      }
+    }
+    return cells;
+  }
+
+  // ---------- sim ----------
+  function makeSim() {
+    var P = makePainting(SEED);
+    layoutPainting(P);
+    return {
+      t: 0, gen: 0,
+      cur: P, curGrid: buildGrid(P),
+      prev: null, prevGrid: null, fadeStart: -1e9, washT: -1e9,
+      agents: [], dots: [], bumps: [],
+      spawnAcc: 0, rng: mulberry32(SEED ^ 0x9E3779),
+      target: PHONE ? AGENTS_PHONE : AGENTS_DESKTOP,
+      tickDark: -1
+    };
+  }
+
+  function spawnAgent(s, poolIdx) {
+    var P = s.cur;
+    var p = P.pools[poolIdx % P.pools.length];
+    var rng = s.rng;
+    var a = {
+      x: p.x + (rng() - 0.5) * 14, y: p.y + (rng() - 0.5) * 14,
+      head: rng() * Math.PI * 2,
+      wseed: rng() * 100,
+      depInt: 0.45 + rng() * 0.2, dep: rng() * 0.4,
+      age: 0, life: 60 + rng() * 80,
+      fade: 0
+    };
+    s.agents.push(a);
+    return a;
+  }
+
+  function stepSim() {
+    var s = sim, dt = STEP;
+    s.t += dt;
+
+    // retire a finished crossfade
+    if (s.prev && s.t - s.fadeStart >= FADE_DUR) { s.prev = null; s.prevGrid = null; }
+
+    // trickle: keep the reader population at target
+    if (s.agents.length < s.target) {
+      s.spawnAcc += dt;
+      var interval = 10 / s.target;
+      while (s.spawnAcc >= interval && s.agents.length < s.target) {
+        s.spawnAcc -= interval;
+        spawnAgent(s, Math.floor(s.rng() * s.cur.pools.length));
+      }
+    }
+
+    var spdScale = clamp(MINWH / 720, 0.7, 1.35);
+    var cxC = W * 0.5, cyC = H * 0.5;
+    var i, a, dark, spd, k;
+    for (i = s.agents.length - 1; i >= 0; i--) {
+      a = s.agents[i];
+      a.age += dt;
+      if (a.age >= a.life || a.x < -20 || a.x > W + 20 || a.y < -20 || a.y > H + 20) {
+        s.agents.splice(i, 1);
+        continue;
+      }
+      a.fade = Math.min(1, a.age / 1.0, (a.life - a.age) / 3);
+      dark = darkAt(a.x, a.y);
+      // terrain drives speed: dark pigment is viscous, pale wash is quick
+      spd = lerp(30, 6, dark) * spdScale;
+      // wander: smooth seeded steering, plus a gentle pull back inside the shore
+      a.head += (vn1(s.t * 0.30 + a.wseed, 7) - 0.5) * 2.3 * dt * 2;
+      if (a.x < W * 0.05 || a.x > W * 0.95 || a.y < H * 0.05 || a.y > H * 0.95) {
+        var want = Math.atan2(cyC - a.y, cxC - a.x);
+        var dh = want - a.head;
+        while (dh > Math.PI) dh -= Math.PI * 2;
+        while (dh < -Math.PI) dh += Math.PI * 2;
+        a.head += dh * Math.min(1, dt * 1.5);
+      }
+      a.x += Math.cos(a.head) * spd * dt;
+      a.y += Math.sin(a.head) * spd * dt;
+      // deposit ink: the dot's color samples the wash beneath, darkened toward pool ink
+      a.dep += dt;
+      if (a.dep >= a.depInt) {
+        a.dep = 0;
+        if (s.dots.length < DOT_CAP + 400) {
+          var c = colorAt(a.x, a.y, { r: 0, g: 0, b: 0, dark: 0, cov: 0 });
+          var ink = css([lerp(c.r, POOL[0], 0.5), lerp(c.g, POOL[1], 0.5), lerp(c.b, POOL[2], 0.5)]);
+          s.dots.push({
+            x: a.x, y: a.y,
+            r: (0.85 + hash1(s.dots.length, 55) * 1.05) * SZ,
+            c: ink, born: s.t, gen: s.gen
+          });
+          if (dark > s.tickDark) s.tickDark = dark;
+        }
+      }
+    }
+    // cull dead ink
+    for (k = s.dots.length - 1; k >= 0; k--) {
+      var d0 = s.dots[k];
+      if (s.t - d0.born > DOT_LIFE) s.dots.splice(k, 1);
+      else if (d0.gen < s.gen && s.t - s.washT > WASHOUT_DUR) s.dots.splice(k, 1);
+    }
+    if (s.dots.length > DOT_CAP) s.dots.splice(0, s.dots.length - DOT_CAP);
+    // prune exhausted bumps
+    for (k = s.bumps.length - 1; k >= 0; k--) {
+      if (s.bumps[k].amp * Math.exp(-(s.t - s.bumps[k].born) / 20) < 0.012) s.bumps.splice(k, 1);
+    }
+  }
+
+  // ---------- draw ----------
+  function drawGrid(cells, alpha) {
+    ctx.globalAlpha = alpha;
+    for (var i = 0; i < cells.length; i++) {
+      ctx.fillStyle = cells[i].c;
+      ctx.fillRect(cells[i].x - 0.6, cells[i].y - 0.6, CELL + 1.6, CELL + 1.6);
+    }
+    ctx.globalAlpha = 1;
+  }
+  function drawBumpPatches() {
+    var s = sim;
+    if (!s.bumps.length) return;
+    var f = { r: 0, g: 0, b: 0, dark: 0, cov: 0 };
+    var seen = {};
+    for (var bi = 0; bi < s.bumps.length; bi++) {
+      var bp = s.bumps[bi];
+      var ampNow = bp.amp * Math.exp(-(s.t - bp.born) / 20);
+      if (ampNow < 0.03) continue;
+      var x0 = Math.max(0, Math.floor((bp.x - bp.r * 1.8) / CELL)), x1 = Math.min(Math.ceil(W / CELL) - 1, Math.ceil((bp.x + bp.r * 1.8) / CELL));
+      var y0 = Math.max(0, Math.floor((bp.y - bp.r * 1.8) / CELL)), y1 = Math.min(Math.ceil(H / CELL) - 1, Math.ceil((bp.y + bp.r * 1.8) / CELL));
+      for (var gy = y0; gy <= y1; gy++) {
+        for (var gx = x0; gx <= x1; gx++) {
+          var key = gx + ':' + gy;
+          if (seen[key]) continue;
+          seen[key] = 1;
+          fieldCore(gx * CELL + CELL * 0.5, gy * CELL + CELL * 0.5, s.cur, s.bumps, s.t, f);
+          if (f.cov > 0.015) {
+            ctx.fillStyle = css([f.r, f.g, f.b]);
+            ctx.fillRect(gx * CELL - 0.6, gy * CELL - 0.6, CELL + 1.6, CELL + 1.6);
+          }
+        }
+      }
+    }
+  }
+  var grain = [];
+  function buildGrain() {
+    grain = [];
+    var rng = mulberry32(SEED ^ 0x51F15E);
+    var n = Math.round(W * H / 1100), i;
+    for (i = 0; i < n; i++) {
+      grain.push({ x: rng() * W, y: rng() * H, big: rng() < 0.1 });
+    }
+  }
+  function draw() {
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    var s = sim;
+    ctx.fillStyle = PAPER_CSS;
+    ctx.fillRect(0, 0, W, H);
+    if (s.prev) {
+      drawGrid(s.prevGrid, 1);
+      drawGrid(s.curGrid, sstep((s.t - s.fadeStart) / FADE_DUR));
+    } else {
+      drawGrid(s.curGrid, 1);
+    }
+    drawBumpPatches();
+    // ink cartography
+    var i, d;
+    for (i = 0; i < s.dots.length; i++) {
+      d = s.dots[i];
+      var age = s.t - d.born;
+      var al = Math.min(1, age / 0.5);
+      if (age > DOT_LIFE - 60) al *= clamp01((DOT_LIFE - age) / 60);
+      if (d.gen < s.gen) al *= clamp01(1 - (s.t - s.washT) / WASHOUT_DUR);
+      if (al <= 0.01) continue;
+      ctx.globalAlpha = al * 0.88;
+      ctx.fillStyle = d.c;
+      ctx.beginPath();
+      ctx.arc(d.x, d.y, d.r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    // the readers themselves: small dark specks
+    ctx.fillStyle = 'rgba(43,48,42,0.8)';
+    for (i = 0; i < s.agents.length; i++) {
+      var a = s.agents[i];
+      ctx.globalAlpha = 0.8 * Math.max(0, a.fade);
+      ctx.beginPath();
+      ctx.arc(a.x, a.y, 1.6 * SZ, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    // paper grain over everything
+    ctx.fillStyle = 'rgba(58,64,56,0.055)';
+    for (i = 0; i < grain.length; i++) {
+      var g = grain[i];
+      ctx.fillRect(g.x, g.y, g.big ? 2 : 1, g.big ? 2 : 1);
+    }
+  }
+
+  // ---------- build / resize ----------
+  function build() {
+    var sz = viewSize();
+    W = sz[0]; H = sz[1]; MINWH = Math.min(W, H);
+    PHONE = detectPhone(W, H);
+    CELL = clamp(Math.round(MINWH / 120), 6, 10);
+    SZ = clamp(MINWH / 720, 0.65, 1.3);
+    canvas.width = W; canvas.height = H;
+    sim = makeSim();
+    buildGrain();
+    for (var i = 0; i < PREROLL; i++) stepSim();
+    draw();
+  }
+
+  // ---------- interaction ----------
+  function rain(x, y) {
+    var s = sim, pools = s.cur.pools, best = 0, bd = 1e18, i;
+    for (i = 0; i < pools.length; i++) {
+      var dx = pools[i].x - x, dy = pools[i].y - y, dd = dx * dx + dy * dy;
+      if (dd < bd) { bd = dd; best = i; }
+    }
+    for (i = 0; i < 12; i++) {
+      var a = spawnAgent(s, best + Math.floor(s.rng() * 7) - 3);
+      a.life *= 0.55;                       // rain readers are mayflies; the trickle restores balance
+    }
+    while (s.agents.length > s.target + 40) s.agents.shift();
+    bloomSound();
+  }
+  function newPainting() {
+    var s = sim;
+    s.prev = s.cur; s.prevGrid = s.curGrid;
+    s.gen++;
+    var P = makePainting(SEED + s.gen * 131071);
+    layoutPainting(P);
+    s.cur = P; s.curGrid = buildGrid(P);
+    s.fadeStart = s.t; s.washT = s.t;
+    for (var i = 0; i < 12; i++) spawnAgent(s, Math.floor(s.rng() * P.pools.length));
+    bloomSound();
+  }
+  function addBump(x, y) {
+    var s = sim;
+    s.bumps.push({ x: x, y: y, r: 0.075 * MINWH, amp: 0.55, born: s.t });
+    if (s.bumps.length > 40) s.bumps.shift();
+  }
+
+  var downX = 0, downY = 0, dragging = false, moved = false, lastBumpX = 0, lastBumpY = 0;
+  var lastTapWall = -1e9, pendingTap = null;
+  function evtPos(e) {
+    var r = { x: 0, y: 0 };
+    if (e && typeof e.clientX === 'number') { r.x = e.clientX; r.y = e.clientY; }
+    return r;
+  }
+  function wallNow() {
+    try { if (typeof performance !== 'undefined' && performance.now) return performance.now(); } catch (e) {}
+    return 0;
+  }
+  canvas.addEventListener('pointerdown', function (e) {
+    ensureAudio();
+    var p = evtPos(e);
+    downX = lastBumpX = p.x; downY = lastBumpY = p.y;
+    dragging = true; moved = false;
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (!dragging) return;
+    var p = evtPos(e);
+    var dx = p.x - downX, dy = p.y - downY;
+    if (dx * dx + dy * dy > 36) moved = true;
+    if (moved) {
+      var bx = p.x - lastBumpX, by = p.y - lastBumpY;
+      if (bx * bx + by * by > 144) { addBump(p.x, p.y); lastBumpX = p.x; lastBumpY = p.y; }
+    }
+  });
+  function endPointer(e) {
+    if (!dragging) return;
+    dragging = false;
+    if (moved) return;                                  // a drag stirs; it is not a tap
+    var p = evtPos(e);
+    var now = wallNow();
+    if (pendingTap && now - lastTapWall < 350) {
+      pendingTap = null; lastTapWall = -1e9;
+      newPainting();                                    // double-tap: a new painting
+    } else {
+      pendingTap = { x: p.x, y: p.y, wall: now };
+      lastTapWall = now;
+    }
+  }
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', function () { dragging = false; });
+
+  // ---------- audio (lazy, guarded; the piece is silent in QA) ----------
+  var AC = null, master = null, lastTickAt = 0;
+  function ensureAudio() {
+    try {
+      if (AC) { if (AC.resume) AC.resume(); return; }
+      var Ctor = null;
+      if (typeof window !== 'undefined') Ctor = window.AudioContext || window.webkitAudioContext;
+      if (!Ctor) return;
+      AC = new Ctor();
+      master = AC.createGain(); master.gain.value = 0.9; master.connect(AC.destination);
+      // paper-and-water bed: looped noise through a low filter, kept low
+      var len = AC.sampleRate * 2;
+      var buf = AC.createBuffer(1, len, AC.sampleRate);
+      var ch = buf.getChannelData(0), rng = mulberry32(SEED ^ 0xBED);
+      for (var i = 0; i < len; i++) ch[i] = rng() * 2 - 1;
+      var src = AC.createBufferSource(); src.buffer = buf; src.loop = true;
+      var lp = AC.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 360;
+      var bg = AC.createGain(); bg.gain.value = 0.04;
+      src.connect(lp); lp.connect(bg); bg.connect(master);
+      src.start();
+    } catch (e) { AC = null; }
+  }
+  function tickSound(dark) {
+    if (!AC) return;
+    try {
+      var now = AC.currentTime;
+      if (now - lastTickAt < 0.09) return;               // throttled: dots are many, ticks are sparse
+      lastTickAt = now;
+      var o = AC.createOscillator(), g = AC.createGain();
+      o.type = 'triangle';
+      o.frequency.value = 1500 - 800 * clamp01(dark);
+      g.gain.setValueAtTime(0.026, now);
+      g.gain.exponentialRampToValueAtTime(0.0008, now + 0.06);
+      o.connect(g); g.connect(master);
+      o.start(now); o.stop(now + 0.07);
+    } catch (e) {}
+  }
+  function bloomSound() {
+    if (!AC) return;
+    try {
+      var now = AC.currentTime;
+      var o = AC.createOscillator(), g = AC.createGain();
+      o.type = 'sine';
+      o.frequency.setValueAtTime(170, now);
+      o.frequency.exponentialRampToValueAtTime(82, now + 0.45);
+      g.gain.setValueAtTime(0.0008, now);
+      g.gain.exponentialRampToValueAtTime(0.055, now + 0.09);
+      g.gain.exponentialRampToValueAtTime(0.0008, now + 0.5);
+      o.connect(g); g.connect(master);
+      o.start(now); o.stop(now + 0.55);
+    } catch (e) {}
+  }
+  function audioTick() {
+    if (!AC || !sim) return;
+    if (sim.tickDark >= 0) { tickSound(sim.tickDark); sim.tickDark = -1; }
+  }
+
+  // ---------- run ----------
+  build();
+  try {
+    if (window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', build);
+    window.addEventListener('resize', build);
+  } catch (e) {}
+
+  var lastNow = 0, acc = 0;
+  function tick(now) {
+    if (!lastNow) lastNow = now;
+    var el = (now - lastNow) / 1000;
+    lastNow = now;
+    if (el > 0.25) el = 0.25;
+    acc += el;
+    var n = Math.floor(acc / STEP);
+    if (n > 40) n = 40;                                   // cap fixed steps per frame
+    acc -= n * STEP;
+    for (var i = 0; i < n; i++) stepSim();
+    if (pendingTap && wallNow() - pendingTap.wall > 340) {
+      var pt = pendingTap; pendingTap = null;
+      rain(pt.x, pt.y);                                   // a settled single tap rains readers
+    }
+    if (n > 0) { draw(); audioTick(); }
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(tick);
+  }
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(tick);
+})();
+</script>
+</body>
+</html>
