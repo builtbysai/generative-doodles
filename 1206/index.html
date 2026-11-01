@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Float / Sink</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0A1E5E; overflow: hidden; height: 100%; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+// No.1206 "Float / Sink" — Evan Meaney study block EV7.
+// A first-person drift through a glitching ghost town at the blue hour,
+// after the Ghosttown Spirit Simulator's grammar (Meaney led the 3D
+// ghosttown design): "Press spacebar to float weightless. Press C to
+// sink." Here buoyancy is the ONLY control: press and hold to float up,
+// a second touch (or a hold at the bottom edge) to sink, release to
+// hang in the air. No HUD, no score, no map. The town re-seeds on every
+// arrival — session start, and again after 60 seconds idle — so you can
+// never step into the same Ghosttown twice.
+
+var T0 = 14;                // fixed phase of the synchronous first frame
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var W = 720, H = 720;
+
+// ---------- seeded rng / hash (mulberry32 family) ----------
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function hash1(n) { // deterministic [0,1) from an integer
+  var x = Math.sin(n * 127.1 + 311.7) * 43758.5453;
+  return x - Math.floor(x);
+}
+
+// ---------- color helpers ----------
+function hx(c) {
+  return [parseInt(c.slice(1, 3), 16), parseInt(c.slice(3, 5), 16), parseInt(c.slice(5, 7), 16)];
+}
+function mixc(c1, c2, f) {
+  var a = hx(c1), b = hx(c2);
+  return 'rgb(' + Math.round(a[0] + (b[0] - a[0]) * f) + ',' +
+                  Math.round(a[1] + (b[1] - a[1]) * f) + ',' +
+                  Math.round(a[2] + (b[2] - a[2]) * f) + ')';
+}
+function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+// ---------- palette ----------
+var SKY_DEEP = '#0A1E5E', SKY_HOR = '#2A4FD8';
+var BLDG = '#141019', TOWER = '#1E1420', RUST = '#6B4F35';
+var SHEAR_C = '#BFD4FF', FRINGE = '#FF2B8D', DUST = '#8A8A93';
+
+// ---------- pointer state: rate segments + activity times ----------
+// Altitude is a closed-form walk over recorded rate segments (never
+// frame-integrated state): +3.2/s under a one-finger hold, -4.5/s under
+// a two-finger hold or a bottom-edge hold, 0 released. Events are few,
+// so altitudeAt(t) simply replays the segment list.
+var rateEvents = [];    // {t, rate} — rate changes only, times ascending
+var activityTimes = []; // piece-times of downs / ups / mode changes / moves
+var pointers = {};      // pointerId -> {x, y} as fractions of W / H
+var curRate = 0;
+var lastMoveAct = -10;
+
+// ---------- town layout (seeded per arrival) ----------
+var townCache = { seed: -1, layout: null };
+function buildTown(seed) {
+  if (townCache.seed === seed && townCache.layout) return townCache.layout;
+  var rnd = mulberry32(seed * 7919 + 120613);
+  var layers = [
+    { n: 6, d0: 0.12, d1: 0.38 },   // far
+    { n: 7, d0: 0.40, d1: 0.68 },   // mid (index 3 is the water tower)
+    { n: 5, d0: 0.70, d1: 0.98 }    // near
+  ];
+  var bs = [];
+  for (var L = 0; L < 3; L++) {
+    var lay = layers[L];
+    for (var i = 0; i < lay.n; i++) {
+      var tower = (L === 1 && i === 3);
+      var d = tower ? 0.58 : lay.d0 + (lay.d1 - lay.d0) * ((i + 0.5) / lay.n) + (rnd() - 0.5) * 0.05;
+      var side = tower ? 1 : ((i + (rnd() < 0.5 ? 0 : 1)) % 2 === 0 ? -1 : 1);
+      bs.push({
+        d: clamp(d, 0.08, 0.99),
+        side: side,
+        u: rnd(),                                  // lateral jitter
+        w: 0.10 + rnd() * 0.11,                    // width factor
+        h: 0.50 + rnd() * 0.50,                    // height factor
+        roof: tower ? 3 : Math.floor(rnd() * 3),   // 0 flat, 1 gable, 2 parapet, 3 tower
+        tower: tower,
+        seed: Math.floor(rnd() * 100000)
+      });
+    }
+  }
+  bs.sort(function (a, b) { return a.d - b.d; });    // far first
+  var fences = [];
+  for (var s = -1; s <= 1; s += 2) {
+    var posts = [];
+    for (var k = 0; k < 5; k++) {
+      posts.push({ d: 0.70 + k * 0.07 + (hash1(seed * 331 + s * 17 + k * 7) - 0.5) * 0.02, side: s });
+    }
+    fences.push(posts);
+  }
+  var layout = { buildings: bs, fences: fences };
+  townCache = { seed: seed, layout: layout };
+  return layout;
+}
+
+// ---------- arrival / idle-reseed state (pure function of t + events) ----------
+// Idle clock starts at load. A dissolve + reseed fires every 60 s of
+// idleness, except that before the first touch the town only re-seeds
+// once piece time passes 240 s (the 60 s checks at 60/120/180 no-op).
+function townState(t) {
+  var seed = 0, lastAct = 0, lastReseed = -1000, ei = 0, ever = false;
+  while (true) {
+    var nextEv = ei < activityTimes.length ? activityTimes[ei] : Infinity;
+    var R = lastAct + 60;
+    if (nextEv <= R && nextEv <= t) { lastAct = nextEv; ei++; ever = true; continue; }
+    if (R <= t) {
+      if (ever || R >= 240) { seed++; lastReseed = R; }
+      lastAct = R;
+      continue;
+    }
+    break;
+  }
+  var phase = (t - lastReseed < 1.6) ? (t - lastReseed) / 1.6 : -1;
+  var drawSeed = seed;
+  if (phase >= 0 && phase < 0.5) drawSeed = seed - 1;  // old town until mid-dissolve
+  return { seed: drawSeed, phase: phase };
+}
+
+// ---------- altitude (closed-form over rate segments) ----------
+function altitudeAt(t) {
+  var a = 6, last = 0, rate = 0;
+  for (var i = 0; i < rateEvents.length; i++) {
+    var e = rateEvents[i];
+    if (e.t > t) break;
+    a = clamp(a + rate * (e.t - last), 0, 40);
+    last = e.t; rate = e.rate;
+  }
+  a = clamp(a + rate * (t - last), 0, 40);
+  return a + 0.25 * Math.sin(t * 0.11);   // hover bob
+}
+
+// ---------- shear events (hashed schedule, gaps 10-20 s, 1.1 s each) ----------
+var SHEARS = (function () {
+  var rnd = mulberry32(1206077);
+  var evs = [], t = 16 + rnd() * 4;         // first shear after frame one
+  while (t < 4000) { evs.push({ start: t, dur: 1.1 }); t += 10 + rnd() * 10; }
+  return evs;
+})();
+function shearAt(t) {
+  for (var i = 0; i < SHEARS.length; i++) {
+    var e = SHEARS[i];
+    if (t < e.start) return null;
+    if (t < e.start + e.dur) return { e: e, idx: i, p: (t - e.start) / e.dur };
+  }
+  return null;
+}
+function stripOffset(strip, sh, t) {
+  var step = Math.floor((t - sh.e.start) / 0.18);
+  var env = Math.sin(Math.PI * sh.p);
+  return (hash1(sh.idx * 7919 + strip * 131 + step * 17) - 0.5) * 2 * 0.028 * W * env;
+}
+
+// ---------- geometry ----------
+// A building at depth d (0 = horizon, 1 = nearest): its base rides the
+// ground factor g = d^1.4; altitude pushes nearer bases down-screen
+// faster (altF grows with d) and trims apparent height slightly, so
+// rising drops the near buildings toward the bottom edge and opens sky.
+function groundBaseY(d, a, horizonY) {
+  var g = Math.pow(d, 1.4);
+  var altF = 1 + a * 0.011 * (0.25 + 0.75 * d);
+  return horizonY + (H - horizonY) * g * altF;
+}
+function geom(b, a, horizonY) {
+  var cx = W / 2;
+  var hScale = 1 / (1 + a * 0.005 * (0.3 + 0.7 * b.d));
+  var hgt = H * 0.60 * b.h * Math.pow(b.d, 1.1) * hScale * (b.tower ? 1.9 : 1);
+  var wid = W * b.w * (0.22 + 0.78 * b.d);
+  var inner = cx + b.side * W * (0.030 + 0.40 * Math.pow(b.d, 0.85)) * (1 + b.u * 0.30);
+  var x0 = b.side > 0 ? inner : inner - wid;
+  return { x0: x0, x1: x0 + wid, midX: x0 + wid / 2, baseY: groundBaseY(b.d, a, horizonY), topY: 0, wid: wid, hgt: hgt };
+}
+
+// ---------- scene ----------
+function drawBuilding(b, a, horizonY) {
+  var g = geom(b, a, horizonY);
+  var hgt = g.hgt, baseY = g.baseY;
+  var atm = (1 - b.d) * 0.18;                       // far layers lift toward sky
+  var face = mixc(BLDG, SKY_HOR, atm);
+  var topC = mixc(BLDG, SKY_HOR, 0.14 + atm * 0.7);
+  if (b.tower) {
+    var tankW = g.wid * 0.95, tankH = hgt * 0.30;
+    var tankTop = baseY - hgt, tankBot = tankTop + tankH;
+    var tx0 = g.midX - tankW / 2, tx1 = g.midX + tankW / 2;
+    ctx.strokeStyle = mixc(TOWER, SKY_HOR, atm);
+    ctx.lineWidth = Math.max(1.5, b.d * 4);
+    ctx.beginPath();
+    ctx.moveTo(tx0 + tankW * 0.10, tankBot); ctx.lineTo(g.x0 + g.wid * 0.16, baseY);
+    ctx.moveTo(tx1 - tankW * 0.10, tankBot); ctx.lineTo(g.x1 - g.wid * 0.16, baseY);
+    ctx.moveTo(tx0 + tankW * 0.10, tankBot); ctx.lineTo(g.x1 - g.wid * 0.16, baseY);
+    ctx.moveTo(tx1 - tankW * 0.10, tankBot); ctx.lineTo(g.x0 + g.wid * 0.16, baseY);
+    ctx.stroke();
+    // tank
+    ctx.fillStyle = mixc(TOWER, SKY_HOR, atm);
+    ctx.fillRect(tx0, tankTop, tankW, tankH);
+    // rust band at the tank's foot + rust conical roof
+    ctx.fillStyle = RUST;
+    ctx.fillRect(tx0, tankBot - tankH * 0.16, tankW, tankH * 0.16);
+    ctx.beginPath();
+    ctx.moveTo(tx0 - tankW * 0.06, tankTop);
+    ctx.lineTo(g.midX, tankTop - hgt * 0.11);
+    ctx.lineTo(tx1 + tankW * 0.06, tankTop);
+    ctx.closePath();
+    ctx.fillStyle = mixc(RUST, TOWER, 0.35);
+    ctx.fill();
+    g.topY = tankTop - hgt * 0.11;
+    return g;
+  }
+  var roofH = b.roof === 1 ? hgt * 0.18 : 0;
+  var topY = baseY - hgt + roofH;
+  // top face: top edge shifted a step toward the vanishing point
+  var lean = (W / 2 - g.midX) * 0.10, lift = hgt * 0.05 + 2;
+  ctx.fillStyle = topC;
+  ctx.beginPath();
+  ctx.moveTo(g.x0, topY); ctx.lineTo(g.x1, topY);
+  ctx.lineTo(g.x1 + lean, topY - lift); ctx.lineTo(g.x0 + lean, topY - lift);
+  ctx.closePath(); ctx.fill();
+  // front face
+  ctx.fillStyle = face;
+  ctx.fillRect(g.x0, topY, g.wid, baseY - topY);
+  if (b.roof === 1) {           // gable
+    ctx.beginPath();
+    ctx.moveTo(g.x0, topY); ctx.lineTo(g.midX, topY - roofH); ctx.lineTo(g.x1, topY);
+    ctx.closePath(); ctx.fillStyle = face; ctx.fill();
+  } else if (b.roof === 2) {    // parapet lip
+    ctx.fillStyle = topC;
+    ctx.fillRect(g.x0 - 1.5, topY - 3, g.wid + 3, 4);
+  }
+  // sparse dim windows — a few lit panes in the blue hour
+  var nw = Math.floor(hash1(b.seed) * 4);
+  ctx.fillStyle = 'rgba(70,96,160,0.75)';
+  for (var i = 0; i < nw; i++) {
+    var wx = g.x0 + g.wid * (0.18 + 0.64 * hash1(b.seed + i * 13));
+    var wy = topY + (baseY - topY) * (0.25 + 0.55 * hash1(b.seed + i * 29));
+    var ws = 2.5 + b.d * 4;
+    ctx.fillRect(wx, wy, ws, ws * 1.25);
+  }
+  g.topY = topY - (b.roof === 1 ? roofH : 0);
+  return g;
+}
+
+function drawFences(layout, a, horizonY) {
+  ctx.strokeStyle = 'rgba(107,79,53,0.6)';
+  ctx.fillStyle = 'rgba(107,79,53,0.6)';
+  for (var f = 0; f < layout.fences.length; f++) {
+    var posts = layout.fences[f], tops = [], mids = [];
+    for (var k = 0; k < posts.length; k++) {
+      var p = posts[k];
+      var baseY = groundBaseY(p.d, a, horizonY);
+      var x = W / 2 + p.side * W * (0.030 + 0.40 * Math.pow(p.d, 0.85)) * 0.92;
+      var ph = H * 0.055 * Math.pow(p.d, 1.1) * (1 / (1 + a * 0.005 * (0.3 + 0.7 * p.d)));
+      var pw = 1.5 + p.d * 3;
+      ctx.fillRect(x - pw / 2, baseY - ph, pw, ph);
+      tops.push({ x: x, y: baseY - ph });
+      mids.push({ x: x, y: baseY - ph * 0.5 });
+    }
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    for (var j = 0; j < tops.length; j++) { if (j === 0) ctx.moveTo(tops[j].x, tops[j].y); else ctx.lineTo(tops[j].x, tops[j].y); }
+    ctx.stroke();
+    ctx.beginPath();
+    for (var m = 0; m < mids.length; m++) { if (m === 0) ctx.moveTo(mids[m].x, mids[m].y); else ctx.lineTo(mids[m].x, mids[m].y); }
+    ctx.stroke();
+  }
+}
+
+function drawScene(t, layout, a) {
+  var horizonY = H * 0.40, cx = W / 2, i;
+  // sky: flat bands, deep blue up top opening to the horizon blue
+  var bands = 12;
+  for (i = 0; i < bands; i++) {
+    ctx.fillStyle = mixc(SKY_DEEP, SKY_HOR, (i + 1) / bands);
+    ctx.fillRect(0, horizonY * i / bands, W, horizonY / bands + 1);
+  }
+  // moon
+  var mr = Math.min(W, H) * 0.030;
+  ctx.fillStyle = 'rgba(201,212,234,0.9)';
+  ctx.beginPath(); ctx.moveTo(cx + W * 0.26 + mr, H * 0.13); ctx.arc(cx + W * 0.26, H * 0.13, mr, 0, Math.PI * 2); ctx.fill();
+  // ground + street corridor to the vanishing point
+  ctx.fillStyle = '#0A0810';
+  ctx.fillRect(0, horizonY, W, H - horizonY);
+  ctx.fillStyle = '#131020';
+  ctx.beginPath();
+  ctx.moveTo(cx - W * 0.012, horizonY); ctx.lineTo(cx + W * 0.012, horizonY);
+  ctx.lineTo(cx + W * 0.17, H); ctx.lineTo(cx - W * 0.17, H);
+  ctx.closePath(); ctx.fill();
+  // town, far to near; fences ride the same ground math between mid and near
+  var fencesDone = false;
+  for (i = 0; i < layout.buildings.length; i++) {
+    var b = layout.buildings[i];
+    if (!fencesDone && b.d > 0.68) { drawFences(layout, a, horizonY); fencesDone = true; }
+    drawBuilding(b, a, horizonY);
+  }
+  if (!fencesDone) drawFences(layout, a, horizonY);
+  // dust motes: closed-form drift, sinking slightly as the camera rises
+  ctx.fillStyle = DUST;
+  for (i = 0; i < 50; i++) {
+    var hx1 = hash1(i * 37 + 5), hy1 = hash1(i * 91 + 11), spd = 0.5 + hash1(i * 53 + 3);
+    var mx = W * ((hx1 + t * 0.0035 * spd) % 1);
+    var my = (0.05 + hy1 * 0.85) * H + Math.sin(t * 0.3 + i * 1.7) * 4 + a * (0.5 + hash1(i * 71)) * 1.3;
+    if (my > H) my = H - 2;
+    ctx.globalAlpha = 0.30 + 0.30 * hash1(i * 17 + 9);
+    var ms = 1.5 + hash1(i * 23) * 1.5;
+    ctx.fillRect(mx, my, ms, ms);
+  }
+  ctx.globalAlpha = 1;
+}
+
+// magenta fringes on rooftops inside displaced strips, during a shear
+function drawFringe(t, layout, a, sh) {
+  var horizonY = H * 0.40;
+  ctx.strokeStyle = FRINGE;
+  ctx.lineWidth = 2;
+  for (var i = 0; i < layout.buildings.length; i++) {
+    var b = layout.buildings[i];
+    var g = geom(b, a, horizonY);
+    if (b.tower) g.topY = g.baseY - g.hgt - g.hgt * 0.11;
+    else g.topY = g.baseY - g.hgt;
+    var strip = clamp(Math.floor(g.topY / (H / 10)), 0, 9);
+    var off = stripOffset(strip, sh, t);
+    if (Math.abs(off) < 0.25 * 0.028 * W) continue;
+    ctx.globalAlpha = 0.55 * Math.sin(Math.PI * sh.p);
+    ctx.beginPath();
+    ctx.moveTo(g.x0 + off, g.topY);
+    ctx.lineTo(g.x1 + off, g.topY);
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+}
+
+// idle dissolve: hashed static bands, triangular over 1.6 s
+function drawDissolve(t, phase) {
+  var amp = Math.sin(Math.PI * clamp(phase, 0, 1));
+  var step = Math.floor(phase * 10);
+  var cols = ['#BFD4FF', '#141019', '#2A4FD8', '#141019', '#BFD4FF'];
+  var rowH = 10;
+  for (var r = 0; r * rowH < H; r++) {
+    for (var k = 0; k < 3; k++) {
+      var hsh = hash1(r * 131 + k * 17 + step * 101 + Math.floor(t * 8) * 7);
+      if (hsh < 0.35) continue;
+      var bw = 30 + hash1(r * 57 + k * 31 + step) * 70;
+      var bx = hash1(r * 91 + k * 43 + step * 13) * (W - bw);
+      ctx.globalAlpha = 0.5 * amp * (0.4 + 0.6 * hsh);
+      ctx.fillStyle = (k === 2 && hsh > 0.93) ? FRINGE : cols[Math.floor(hsh * cols.length) % cols.length];
+      ctx.fillRect(bx, r * rowH, bw, rowH - 1);
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+function draw(t) {
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  ctx.fillStyle = SKY_DEEP;   // slivers revealed by sheared strips stay deep blue
+  ctx.fillRect(0, 0, W, H);
+  var ts = townState(t);
+  var layout = buildTown(ts.seed);
+  var a = altitudeAt(t);
+  var sh = shearAt(t);
+  if (sh) {
+    var strips = 10;
+    for (var i = 0; i < strips; i++) {
+      var y0 = i * H / strips;
+      ctx.save();
+      ctx.beginPath(); ctx.rect(0, y0 - 0.5, W, H / strips + 1); ctx.clip();
+      ctx.translate(stripOffset(i, sh, t), 0);
+      drawScene(t, layout, a);
+      ctx.restore();
+    }
+    drawFringe(t, layout, a, sh);
+  } else {
+    drawScene(t, layout, a);
+  }
+  if (ts.phase >= 0) drawDissolve(t, ts.phase);
+}
+
+// ---------- sizing (Visual Viewport API) ----------
+function fit() {
+  var vv = window.visualViewport;
+  W = vv ? vv.width : (window.innerWidth || 720);
+  H = vv ? vv.height : (window.innerHeight || 720);
+  var dpr = window.devicePixelRatio || 1;
+  canvas.width = W; canvas.height = H;
+  void dpr;
+  var sw = window.screen ? Math.min(window.screen.width, window.screen.height) : 9999;
+  var phone = sw < 700 || H > W * 1.15;
+  void phone;   // field-like piece: full-bleed at every size
+}
+if (window.visualViewport && window.visualViewport.addEventListener) {
+  window.visualViewport.addEventListener('resize', function () { fit(); draw(nowT()); });
+}
+window.addEventListener('resize', function () { fit(); draw(nowT()); });
+
+// ---------- clock: fixed-phase first frame, rAF anchored ----------
+var startStamp = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+function nowT() {
+  var n = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+  return T0 + (n - startStamp) / 1000;
+}
+fit();
+draw(T0);
+if (typeof requestAnimationFrame === 'function') {
+  var loop = function () { draw(nowT()); requestAnimationFrame(loop); };
+  requestAnimationFrame(loop);
+}
+
+// ---------- pointer: buoyancy is the only control ----------
+function evtPos(e) {
+  var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0, width: W, height: H };
+  return { x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height };
+}
+function currentRate() {
+  var ids = Object.keys(pointers);
+  if (ids.length === 0) return 0;
+  if (ids.length >= 2) return -4.5;                 // second touch: sink
+  var p = pointers[ids[0]];
+  return (p.y > 0.82) ? -4.5 : 3.2;                 // bottom-edge hold: sink; else float
+}
+function noteActivity(t) { activityTimes.push(t); }
+function refreshRate(t) {
+  var m = currentRate();
+  if (m !== curRate) {
+    curRate = m;
+    rateEvents.push({ t: t, rate: m });
+    noteActivity(t);
+  }
+}
+canvas.addEventListener('pointerdown', function (e) {
+  var t = nowT(), p = evtPos(e);
+  pointers[e.pointerId] = p;
+  noteActivity(t);
+  refreshRate(t);
+});
+canvas.addEventListener('pointermove', function (e) {
+  if (!pointers[e.pointerId]) return;
+  var t = nowT();
+  pointers[e.pointerId] = evtPos(e);
+  if (t - lastMoveAct > 5) { lastMoveAct = t; noteActivity(t); }
+  refreshRate(t);   // crossing the bottom edge flips float -> sink
+});
+function pointerEnd(e) {
+  if (!pointers[e.pointerId]) return;
+  var t = nowT();
+  delete pointers[e.pointerId];
+  noteActivity(t);
+  refreshRate(t);
+}
+canvas.addEventListener('pointerup', pointerEnd);
+canvas.addEventListener('pointercancel', pointerEnd);
+canvas.addEventListener('pointerleave', pointerEnd);
+</script>
+</body>
+</html>
