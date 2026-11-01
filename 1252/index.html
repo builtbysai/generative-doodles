@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Grey Areas</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #232323; overflow: hidden; height: 100%; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+/* No.1252 "Grey Areas" - Jenna Maurice study block JM5.
+   After Maurice's grey-areas video essay (2023): "what is the exact
+   moment it is not OK?" - partially-defined domains where new things
+   emerge. Four soft forms drift in a dark field and never resolve:
+   one is almost a hand, one almost a cloud. A threshold drifts on a
+   slow walk; as it falls a form gathers layers and an indigo edge
+   begins to shimmer, as it rises the form thins back towards noise
+   and sheds rust flecks at its edge. Nothing ever lands - the max
+   sharpness is capped, the min presence floored. A classification
+   bar at the bottom carries the drifting threshold marker and
+   nothing else: no labels, no ticks, no names.
+   Interaction: drag vertically to push the threshold (down = towards
+   noise, up = towards figure; the drift continues around the push).
+   Tap freezes the nearest form mid-resolution for 20 seconds.
+   Double-tap reseeds the forms. Ships silent. Flat fills only;
+   seeded hashes only. */
+
+var T0 = 14;                   // fixed first-frame phase, seconds
+
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var W = 0, H = 0, DPR = 1;
+
+var PAL = {
+  bg: '#232323',
+  fog: '#B9B7B2',
+  mist: '#D8D4CC',
+  indigo: '#4A4E69',
+  rust: '#9C6644'
+};
+/* per-layer colours, outer fog -> inner figure-mist */
+var LAYER_COL = ['#B9B7B2', '#BDBBB6', '#C9C6C0', '#D2CFC7', '#D8D4CC'];
+/* per-layer radius scale and base alpha, outer -> inner. Each layer
+   is filled ONCE as a union path, so these alphas are the layer's
+   true opacity - interiors stack to ~0.6 at most, never solid. */
+var LAYER_SCALE = [1.30, 1.12, 0.95, 0.79, 0.64];
+var LAYER_ALPHA = [0.10, 0.11, 0.14, 0.19, 0.27];
+
+var D_MAX = 0.88;              // sharpest a form may ever get: unresolved
+var D_MIN = 0.06;
+
+/* ---------- seeded hash (integer, deterministic) ---------- */
+function ih(a, b) {
+  var x = ((a | 0) * 374761393 + (b | 0) * 668265263) >>> 0;
+  x = Math.imul(x ^ (x >>> 13), 1274126177) >>> 0;
+  return ((x ^ (x >>> 16)) >>> 0) / 4294967296;
+}
+function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+function lerp(a, b, f) { return a + (b - a) * f; }
+
+/* ---------- time ---------- */
+function perfNow() {
+  return (typeof performance !== 'undefined' && performance.now) ? performance.now() / 1000 : 0;
+}
+var startPerf = perfNow();
+function pieceNow() { return T0 + (perfNow() - startPerf); }
+
+/* ---------- the threshold ----------
+   A slow walk of two sine sums, period ~43 s dominant. T in [~0.12,
+   ~0.88]: high T dissolves forms towards noise, low T lets them
+   approach figure. The visitor's drag adds an offset the drift
+   continues around. At T0 = 14 s, T = 0.372 (marker near mid-bar). */
+function thresholdAt(t) {
+  return 0.5 + 0.26 * Math.sin(2 * Math.PI * t / 43 + 3.9)
+             + 0.12 * Math.sin(2 * Math.PI * t / 19 + 1.3);
+}
+
+/* ---------- forms ----------
+   Each form: a skeleton of control points with radii, grouped into
+   segments (polylines). Local units: 1 = the form's radius R.
+   phi = latent figure-ness: how readily the threshold lets it
+   sharpen. Archetypes are fixed; salt jitters placement and phi. */
+var salt = 0;
+var forms = [];
+
+function buildForms() {
+  forms = [];
+  var defs = [
+    { kind: 'hand',  phi: 0.82, bx: 0.30, by: 0.33, rot: -0.12 },
+    { kind: 'cloud', phi: 0.36, bx: 0.68, by: 0.23, rot:  0.05 },
+    { kind: 'mound', phi: 0.48, bx: 0.71, by: 0.63, rot:  0.10 },
+    { kind: 'wisp',  phi: 0.20, bx: 0.22, by: 0.68, rot: -0.06 }
+  ];
+  for (var i = 0; i < defs.length; i++) {
+    var d = defs[i];
+    var jx = (ih(100 + i, salt) - 0.5) * 0.07;
+    var jy = (ih(200 + i, salt) - 0.5) * 0.07;
+    var f = {
+      kind: d.kind,
+      phi: clamp(d.phi + (ih(300 + i, salt) - 0.5) * 0.08, 0.05, 0.95),
+      bx: d.bx + jx, by: d.by + jy,
+      rot0: d.rot + (ih(400 + i, salt) - 0.5) * 0.2,
+      driftAx: 0.028 + ih(500 + i, salt) * 0.022,
+      driftAy: 0.024 + ih(600 + i, salt) * 0.020,
+      driftP1: 47 + ih(700 + i, salt) * 30,
+      driftP2: 59 + ih(800 + i, salt) * 34,
+      ph1: ih(900 + i, salt) * 6.283, ph2: ih(1000 + i, salt) * 6.283,
+      breatheP: 21 + ih(1100 + i, salt) * 9,
+      segs: skeleton(d.kind)
+    };
+    forms.push(f);
+  }
+}
+
+/* Skeletons return a list of polylines; each point is [x, y, r]. */
+function skeleton(kind) {
+  if (kind === 'hand') {
+    /* a palm, a wrist, four finger chains. The chains suggest a
+       hand; nothing ever outlines one. */
+    var lines = [];
+    lines.push([[0, 0.52, 0.30], [0, 0.10, 0.42]]);              // wrist -> palm
+    var bases = [[-0.30, -0.10], [-0.10, -0.20], [0.12, -0.20], [0.32, -0.08]];
+    var dirs  = [[-0.55, -1.0], [-0.18, -1.0], [0.18, -1.0], [0.52, -0.95]];
+    var lens  = [0.62, 0.74, 0.70, 0.52];
+    for (var f = 0; f < 4; f++) {
+      var line = [[0, 0.05, 0.40], [bases[f][0], bases[f][1], 0.20]];
+      var dl = Math.sqrt(dirs[f][0] * dirs[f][0] + dirs[f][1] * dirs[f][1]);
+      var dx = dirs[f][0] / dl, dy = dirs[f][1] / dl;
+      var steps = [0.45, 0.75, 1.0], rr = [0.155, 0.125, 0.095];
+      for (var s = 0; s < 3; s++) {
+        line.push([bases[f][0] + dx * lens[f] * steps[s],
+                   bases[f][1] + dy * lens[f] * steps[s], rr[s]]);
+      }
+      lines.push(line);
+    }
+    return lines;
+  }
+  if (kind === 'cloud') {
+    return [[[-0.95, 0.06, 0.42], [-0.50, -0.12, 0.55], [0.0, -0.20, 0.62],
+             [0.50, -0.10, 0.52], [0.95, 0.08, 0.40]],
+            [[-0.45, 0.16, 0.46], [0.05, 0.14, 0.50], [0.50, 0.18, 0.42]]];
+  }
+  if (kind === 'mound') {
+    return [[[-0.80, 0.28, 0.38], [-0.40, -0.02, 0.50], [0.0, -0.22, 0.56],
+             [0.40, -0.02, 0.50], [0.80, 0.28, 0.38]]];
+  }
+  /* wisp: a loose, barely-connected cluster */
+  return [[[0.0, 0.0, 0.48], [0.48, -0.32, 0.32]],
+          [[0.0, 0.0, 0.48], [-0.44, -0.26, 0.28]],
+          [[0.0, 0.0, 0.48], [0.12, 0.48, 0.26]]];
+}
+
+/* ---------- interaction state ---------- */
+var userOffset = 0;            // threshold push from vertical drags
+var freezes = {};              // form index -> { d, until }
+var pDown = null;
+var lastTapT = -10, lastTapX = 0, lastTapY = 0;
+
+function formCenter(f, t) {
+  return [
+    (f.bx + f.driftAx * Math.sin(2 * Math.PI * t / f.driftP1 + f.ph1)) * W,
+    (f.by + f.driftAy * Math.sin(2 * Math.PI * t / f.driftP2 + f.ph2)) * H
+  ];
+}
+function formD(f, T) {
+  return clamp(0.5 + (f.phi - T) * 1.3, D_MIN, D_MAX);
+}
+function effectiveT(t) {
+  return clamp(thresholdAt(t) + userOffset, 0.04, 0.96);
+}
+
+canvas.addEventListener('pointerdown', function (e) {
+  pDown = { x: e.clientX, y: e.clientY, t: pieceNow(), off: userOffset };
+});
+canvas.addEventListener('pointermove', function (e) {
+  if (!pDown) return;
+  var dy = e.clientY - pDown.y;
+  if (Math.abs(dy) > 6) userOffset = clamp(pDown.off + dy * 0.0022, -0.45, 0.45);
+});
+canvas.addEventListener('pointerup', function (e) {
+  if (!pDown) return;
+  var now = pieceNow();
+  var dx = e.clientX - pDown.x, dy = e.clientY - pDown.y;
+  var dist = Math.sqrt(dx * dx + dy * dy);
+  if (dist < 8 && now - pDown.t < 0.5) {
+    if (now - lastTapT < 0.35) {
+      /* double-tap: reseed the forms */
+      salt++;
+      buildForms();
+      freezes = {};
+    } else {
+      /* tap: freeze the nearest form at its current resolution */
+      var T = effectiveT(now), best = -1, bestD = 1e18;
+      for (var i = 0; i < forms.length; i++) {
+        var c = formCenter(forms[i], now);
+        var dd = (c[0] - e.clientX) * (c[0] - e.clientX) + (c[1] - e.clientY) * (c[1] - e.clientY);
+        if (dd < bestD) { bestD = dd; best = i; }
+      }
+      if (best >= 0) freezes[best] = { d: formD(forms[best], T), until: now + 20 };
+    }
+    lastTapT = now; lastTapX = e.clientX; lastTapY = e.clientY;
+  }
+  pDown = null;
+});
+canvas.addEventListener('pointercancel', function () { pDown = null; });
+
+/* ---------- layout ---------- */
+function isPhone() {
+  var s = window.screen;
+  if (s && Math.min(s.width, s.height) < 700) return true;
+  return H > W * 1.15;
+}
+function resize() {
+  var vv = window.visualViewport;
+  W = Math.floor(vv ? vv.width : window.innerWidth);
+  H = Math.floor(vv ? vv.height : window.innerHeight);
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.width = Math.floor(W * DPR); canvas.height = Math.floor(H * DPR);
+  canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+if (window.visualViewport) window.visualViewport.addEventListener('resize', function () { resize(); draw(pieceNow()); });
+window.addEventListener('resize', function () { resize(); draw(pieceNow()); });
+
+/* ---------- drawing ---------- */
+function rgba(hex, a) {
+  var r = parseInt(hex.slice(1, 3), 16), g = parseInt(hex.slice(3, 5), 16), b = parseInt(hex.slice(5, 7), 16);
+  return 'rgba(' + r + ',' + g + ',' + b + ',' + a + ')';
+}
+function circ(x, y, r) { ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill(); }
+
+/* Sample a form's skeleton into screen-space points for one layer.
+   Returns a list of [x, y, radiusPx]. */
+function sampleForm(f, t, layerScale) {
+  var u = Math.min(W, H);
+  var R = u * (isPhone() ? 0.155 : 0.175);
+  var c = formCenter(f, t);
+  var rot = f.rot0 + 0.16 * Math.sin(2 * Math.PI * t / 61 + f.ph1);
+  var breathe = 1 + 0.05 * Math.sin(2 * Math.PI * t / f.breatheP + f.ph2);
+  var cosr = Math.cos(rot), sinr = Math.sin(rot);
+  var out = [];
+  for (var li = 0; li < f.segs.length; li++) {
+    var line = f.segs[li];
+    for (var si = 0; si < line.length - 1; si++) {
+      var p1 = line[si], p2 = line[si + 1];
+      var segLen = Math.sqrt((p2[0] - p1[0]) * (p2[0] - p1[0]) + (p2[1] - p1[1]) * (p2[1] - p1[1]));
+      var n = Math.max(1, Math.ceil(segLen / 0.16));
+      for (var k = 0; k < n; k++) {
+        var fr = k / n;
+        var lx = lerp(p1[0], p2[0], fr) * breathe, ly = lerp(p1[1], p2[1], fr) * breathe;
+        var lr = lerp(p1[2], p2[2], fr);
+        out.push([c[0] + (lx * cosr - ly * sinr) * R, c[1] + (lx * sinr + ly * cosr) * R, lr * R * layerScale]);
+      }
+    }
+    var last = line[line.length - 1];
+    out.push([c[0] + (last[0] * breathe * cosr - last[1] * breathe * sinr) * R,
+              c[1] + (last[0] * breathe * sinr + last[1] * breathe * cosr) * R,
+              last[2] * R * layerScale]);
+  }
+  return out;
+}
+
+function drawForm(f, idx, t, T) {
+  var fr = freezes[idx];
+  var d = (fr && t < fr.until) ? fr.d : formD(f, T);
+  var k;
+  /* layered flat-alpha union, outermost first. Each layer is one
+     path of circles (moveTo before every arc) filled a single time,
+     so the union takes the layer alpha exactly - no stacking. */
+  for (k = 0; k < 5; k++) {
+    var s = d * 1.15 + 0.18 - (4 - k) * 0.17;
+    var vis = clamp(s, k === 0 ? 0.8 : 0, 1);   // outer layer floored: never fully gone
+    var a = LAYER_ALPHA[k] * vis;
+    if (a <= 0.004) continue;
+    var pts = sampleForm(f, t, LAYER_SCALE[k]);
+    ctx.fillStyle = rgba(LAYER_COL[k], a);
+    ctx.beginPath();
+    for (var i = 0; i < pts.length; i++) {
+      ctx.moveTo(pts[i][0] + pts[i][2], pts[i][1]);
+      ctx.arc(pts[i][0], pts[i][1], pts[i][2], 0, Math.PI * 2);
+    }
+    ctx.fill();
+  }
+  /* indigo edge shimmer as the form approaches figure - still no
+     hard outline: the stroke rides the innermost circles' rims */
+  if (d > 0.70) {
+    var ra = clamp((d - 0.70) / 0.18, 0, 1) * 0.24;
+    var rim = sampleForm(f, t, LAYER_SCALE[4]);
+    ctx.strokeStyle = rgba(PAL.indigo, ra);
+    ctx.lineWidth = Math.max(1, Math.min(W, H) * 0.0022);
+    for (var j = 0; j < rim.length; j++) {
+      ctx.beginPath(); ctx.arc(rim[j][0], rim[j][1], rim[j][2], 0, Math.PI * 2); ctx.stroke();
+    }
+  }
+  /* rust flecks while a form crosses the mid-zone: the dissolve
+     made visible at its edge */
+  if (d > 0.15 && d < 0.72) {
+    var nf = Math.round(5 * (1 - Math.abs(d - 0.45) / 0.30));
+    if (nf > 0) {
+      var edge = sampleForm(f, t, LAYER_SCALE[0]);
+      ctx.fillStyle = rgba(PAL.rust, 0.6);
+      for (var m = 0; m < nf; m++) {
+        var p = edge[Math.floor(ih(idx * 37 + m * 11, Math.floor(t / 7)) * edge.length) % edge.length];
+        var jr = 2.0 + ih(m * 7 + 3, idx) * 2.6;
+        circ(p[0] + (ih(m, idx * 3) - 0.5) * 8, p[1] + (ih(m * 5, idx) - 0.5) * 8, jr);
+      }
+    }
+  }
+}
+
+function drawBar(t, T) {
+  var u = Math.min(W, H);
+  var x0 = W * 0.08, x1 = W * 0.92, y = H - u * 0.075, h = Math.max(5, u * 0.011);
+  /* the grey zone band: the middle of the track, lighter */
+  ctx.fillStyle = rgba(PAL.fog, 0.16);
+  ctx.fillRect(x0 + (x1 - x0) * 0.32, y - h * 0.7, (x1 - x0) * 0.36, h * 2.4);
+  /* the track */
+  ctx.fillStyle = rgba(PAL.indigo, 0.55);
+  ctx.fillRect(x0, y, x1 - x0, h);
+  /* the marker: where the threshold stands right now */
+  var mx = x0 + (x1 - x0) * T;
+  ctx.fillStyle = rgba(PAL.indigo, 0.95);
+  ctx.fillRect(mx - Math.max(2, u * 0.005), y - h * 1.5, Math.max(4, u * 0.010), h * 4);
+  ctx.fillStyle = rgba(PAL.mist, 0.85);
+  ctx.fillRect(mx - Math.max(1, u * 0.002), y - h * 0.9, Math.max(2, u * 0.004), h * 2.8);
+}
+
+function draw(t) {
+  canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+  var u = Math.min(W, H);
+  ctx.fillStyle = PAL.bg;
+  ctx.fillRect(0, 0, W, H);
+  /* faint grain: the field the forms drift through */
+  var cell = Math.max(18, u * 0.036);
+  ctx.fillStyle = rgba(PAL.fog, 0.045);
+  for (var gx = 0; gx * cell < W; gx++) {
+    for (var gy = 0; gy * cell < H; gy++) {
+      if (ih(gx * 3 + 1, gy * 7 + 2) > 0.55) ctx.fillRect(gx * cell + ih(gx, gy) * cell * 0.6, gy * cell + ih(gy, gx) * cell * 0.6, 1.4, 1.4);
+    }
+  }
+  /* slow threshold contours: large indigo rings breathing through */
+  ctx.strokeStyle = rgba(PAL.indigo, 0.07);
+  ctx.lineWidth = 1;
+  for (var r = 0; r < 3; r++) {
+    var rcx = W * (0.25 + 0.25 * r) + Math.sin(2 * Math.PI * t / (83 + r * 29) + r * 2.1) * W * 0.03;
+    var rcy = H * (0.30 + 0.18 * r) + Math.cos(2 * Math.PI * t / (97 + r * 23) + r) * H * 0.03;
+    ctx.beginPath(); ctx.arc(rcx, rcy, u * (0.34 + r * 0.13), 0, Math.PI * 2); ctx.stroke();
+  }
+  var T = effectiveT(t);
+  for (var i = 0; i < forms.length; i++) drawForm(forms[i], i, t, T);
+  drawBar(t, T);
+}
+
+buildForms();
+resize();
+draw(T0);                      // synchronous first frame at exactly T0
+if (typeof requestAnimationFrame === 'function') {
+  var tick = function () { draw(pieceNow()); requestAnimationFrame(tick); };
+  requestAnimationFrame(tick);
+}
+</script>
+</body>
+</html>
