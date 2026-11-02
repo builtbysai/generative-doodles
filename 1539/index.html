@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Grid That Swells</title>
+<style>
+html, body { margin: 0; padding: 0; background: #121014; overflow: hidden; }
+canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+
+// Seeded PRNG (mulberry32). All variation comes from this stream, never unseeded randomness.
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    var t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+var rand = mulberry32(1539000);
+
+var COLS = 6, ROWS = 4, NTILES = 24;
+var GROUND = '#121014', TILE_GROUND = '#26221e', SWOLLEN_GROUND = '#2a2622';
+var COLORS = ['#cfc8b8', '#8f3a2c', '#a87f3d', '#4a615a', '#b8b8b8'];
+var TYPES = ['disc', 'bar', 'ring', 'zigzag', 'dots'];
+
+// Tile bank: 24 tiles, mark types and colors distributed evenly, then shuffled
+// by the seeded stream, so every type and color appears several times.
+function shuffled(arr) {
+  var a = arr.slice();
+  for (var i = a.length - 1; i > 0; i--) {
+    var j = Math.floor(rand() * (i + 1));
+    var tmp = a[i]; a[i] = a[j]; a[j] = tmp;
+  }
+  return a;
+}
+var typeBag = [], colorBag = [];
+for (var i = 0; i < NTILES; i++) { typeBag.push(TYPES[i % TYPES.length]); colorBag.push(COLORS[i % COLORS.length]); }
+typeBag = shuffled(typeBag); colorBag = shuffled(colorBag);
+var tiles = [];
+for (var n = 0; n < NTILES; n++) tiles.push({ type: typeBag[n], color: colorBag[n] });
+
+// Pairing rule: the next swollen tile rhymes in outline (same mark type) or
+// inverts in color. Inversion is a fixed rotation of the palette order.
+function invertColor(c) {
+  var idx = COLORS.indexOf(c);
+  return COLORS[(idx + 2) % COLORS.length];
+}
+
+// Swell schedule: 10 start-to-start intervals in [8, 15] s, drawn from the
+// seeded stream. LOOP is their exact sum, so the schedule repeats exactly and
+// no swell crosses the loop boundary (each swell spans 6.6 s < 8 s minimum).
+var intervals = [];
+for (var s = 0; s < 10; s++) intervals.push(8 + rand() * 7);
+var LOOP = 0;
+for (var s2 = 0; s2 < intervals.length; s2++) LOOP += intervals[s2];
+var events = [];
+var prevTile = Math.floor(rand() * NTILES);
+var acc = 0;
+for (var e = 0; e < intervals.length; e++) {
+  var tile = prevTile;
+  if (e > 0) {
+    var prev = tiles[prevTile];
+    var cands = [];
+    for (var q = 0; q < NTILES; q++) {
+      if (q === prevTile) continue;
+      var tq = tiles[q];
+      if (tq.type === prev.type || tq.color === invertColor(prev.color)) cands.push(q);
+    }
+    tile = cands[Math.floor(rand() * cands.length)];
+  }
+  events.push({ start: acc, tile: tile });
+  prevTile = tile;
+  acc += intervals[e];
+}
+
+// Discrete swell steps. Never interpolated: the scale jumps 1x, 2x, 4x,
+// full-frame, then back down in the same steps. 0 means no swell.
+function swellPhase(dt) {
+  if (dt < 0) return 0;
+  if (dt < 0.6) return 1;
+  if (dt < 1.2) return 2;
+  if (dt < 1.8) return 4;
+  if (dt < 4.8) return 'full';
+  if (dt < 5.4) return 4;
+  if (dt < 6.0) return 2;
+  if (dt < 6.6) return 1;
+  return 0;
+}
+
+// Recorded drag events. Everything stays closed-form over piece time and
+// these logs, never frame-integrated.
+var manuals = []; // {tile, start}
+var holds = [];   // {tile, start, end} — end null while pressed
+var pressing = false;
+var lastT = 0;
+
+function scheduledSwell(u) {
+  for (var k = 0; k < events.length; k++) {
+    var ph = swellPhase(u - events[k].start);
+    if (ph !== 0) return { tile: events[k].tile, scale: ph, kind: 'scheduled' };
+  }
+  return null;
+}
+function manualSwell(t) {
+  for (var j = 0; j < manuals.length; j++) {
+    var ph = swellPhase(t - manuals[j].start);
+    if (ph !== 0) return { tile: manuals[j].tile, scale: ph, kind: 'manual' };
+  }
+  return null;
+}
+function effectiveSwell(t) {
+  for (var i = 0; i < holds.length; i++) {
+    var h = holds[i];
+    if (t >= h.start && (h.end === null || t <= h.end)) {
+      return { tile: h.tile, scale: 'full', kind: 'hold' };
+    }
+  }
+  var m = manualSwell(t);
+  if (m) return m;
+  var u = ((t % LOOP) + LOOP) % LOOP;
+  return scheduledSwell(u);
+}
+
+// Geometry. The grid is a 3:2 rect, the largest that fits the viewport, so
+// tiles stay square on every screen. Page ground is the grid ground.
+var W = 0, H = 0, gridX = 0, gridY = 0, gridW = 0, gridH = 0, cellSize = 0, gap = 0;
+function size() {
+  var vw = 720, vh = 720;
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport) { vw = window.visualViewport.width; vh = window.visualViewport.height; }
+    else if (window.innerWidth) { vw = window.innerWidth; vh = window.innerHeight; }
+  }
+  W = vw; H = vh;
+  canvas.width = W; canvas.height = H;
+  canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+  gridW = Math.min(W, H * 1.5);
+  gridH = gridW * 2 / 3;
+  gridX = (W - gridW) / 2;
+  gridY = (H - gridH) / 2;
+  cellSize = gridW / COLS;
+  gap = cellSize * 0.1;
+}
+function cellRect(idx) {
+  var col = idx % COLS, row = Math.floor(idx / COLS);
+  return { x: gridX + col * cellSize, y: gridY + row * cellSize, w: cellSize, h: cellSize };
+}
+function tileRect(idx) {
+  var c = cellRect(idx);
+  return { x: c.x + gap / 2, y: c.y + gap / 2, w: c.w - gap, h: c.h - gap };
+}
+// Current on-screen rect of a swollen tile, for hit-testing.
+function swollenRect(sw) {
+  if (sw.scale === 'full') return { x: 0, y: 0, w: W, h: H };
+  var c = cellRect(sw.tile);
+  var cx = c.x + c.w / 2, cy = c.y + c.h / 2;
+  var s = (cellSize - gap) * sw.scale;
+  return { x: cx - s / 2, y: cy - s / 2, w: s, h: s };
+}
+function cellAt(x, y) {
+  for (var i = 0; i < NTILES; i++) {
+    var c = cellRect(i);
+    if (x >= c.x && x < c.x + c.w && y >= c.y && y < c.y + c.h) return i;
+  }
+  return -1;
+}
+
+function drawMark(type, color, cx, cy, ms) {
+  ctx.fillStyle = color;
+  ctx.strokeStyle = color;
+  if (type === 'disc') {
+    ctx.beginPath();
+    ctx.moveTo(cx + ms / 2, cy);
+    ctx.arc(cx, cy, ms / 2, 0, Math.PI * 2);
+    ctx.fill();
+  } else if (type === 'bar') {
+    ctx.fillRect(cx - ms / 2, cy - ms * 0.11, ms, ms * 0.22);
+  } else if (type === 'ring') {
+    ctx.lineWidth = Math.max(1, ms * 0.12);
+    ctx.lineCap = 'butt';
+    ctx.beginPath();
+    ctx.moveTo(cx + ms * 0.32, cy);
+    ctx.arc(cx, cy, ms * 0.32, 0, Math.PI * 2);
+    ctx.stroke();
+  } else if (type === 'zigzag') {
+    ctx.lineWidth = Math.max(1, ms * 0.1);
+    ctx.lineCap = 'butt';
+    ctx.lineJoin = 'miter';
+    ctx.beginPath();
+    ctx.moveTo(cx - ms / 2, cy + ms * 0.2);
+    ctx.lineTo(cx - ms / 4, cy - ms * 0.2);
+    ctx.lineTo(cx, cy + ms * 0.2);
+    ctx.lineTo(cx + ms / 4, cy - ms * 0.2);
+    ctx.lineTo(cx + ms / 2, cy + ms * 0.2);
+    ctx.stroke();
+  } else if (type === 'dots') {
+    var d = ms * 0.16, o = ms * 0.26;
+    var pts = [[0, 0], [-o, -o], [o, -o], [-o, o], [o, o]];
+    for (var i = 0; i < pts.length; i++) {
+      ctx.fillRect(cx + pts[i][0] - d / 2, cy + pts[i][1] - d / 2, d, d);
+    }
+  }
+}
+
+function drawTile(idx, rx, ry, rw, ground) {
+  var t = tiles[idx];
+  ctx.fillStyle = ground;
+  ctx.fillRect(rx, ry, rw, rw);
+  var ms = rw * 0.5;
+  drawMark(t.type, t.color, rx + rw / 2, ry + rw / 2, ms);
+}
+
+function draw(t) {
+  size();
+  lastT = t;
+  ctx.fillStyle = GROUND;
+  ctx.fillRect(0, 0, W, H);
+  for (var i = 0; i < NTILES; i++) {
+    var r = tileRect(i);
+    drawTile(i, r.x, r.y, r.w, TILE_GROUND);
+  }
+  var sw = effectiveSwell(t);
+  if (sw && sw.scale !== 1) {
+    var st = tiles[sw.tile];
+    if (sw.scale === 'full') {
+      ctx.fillStyle = SWOLLEN_GROUND;
+      ctx.fillRect(0, 0, W, H);
+      drawMark(st.type, st.color, W / 2, H / 2, Math.min(W, H) * 0.4);
+    } else {
+      var c = cellRect(sw.tile);
+      var s = (cellSize - gap) * sw.scale;
+      var ox = c.x + c.w / 2 - s / 2, oy = c.y + c.h / 2 - s / 2;
+      ctx.fillStyle = SWOLLEN_GROUND;
+      ctx.fillRect(ox, oy, s, s);
+      drawMark(st.type, st.color, ox + s / 2, oy + s / 2, s * 0.5);
+    }
+  }
+  if (typeof window !== 'undefined') {
+    var cells = [];
+    for (var j = 0; j < NTILES; j++) cells.push(cellRect(j));
+    window.__t39 = {
+      loop: LOOP, events: events, tiles: tiles,
+      grid: { cols: COLS, rows: ROWS, cells: cells },
+      current: sw, time: t,
+      field: { x: 0, y: 0, w: W, h: H }
+    };
+  }
+}
+
+function onDown(e) {
+  if (pressing) return;
+  pressing = true;
+  size();
+  var x = e.clientX, y = e.clientY;
+  var sw = effectiveSwell(lastT);
+  if (sw) {
+    var r = swollenRect(sw);
+    if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) {
+      holds.push({ tile: sw.tile, start: lastT, end: null });
+      if (e.preventDefault) e.preventDefault();
+      return;
+    }
+  }
+  var cell = cellAt(x, y);
+  if (cell >= 0) {
+    var manualActive = manualSwell(lastT) !== null;
+    if (!manualActive) manuals.push({ tile: cell, start: lastT });
+  }
+  if (e.preventDefault) e.preventDefault();
+}
+function onUp() {
+  pressing = false;
+  for (var i = 0; i < holds.length; i++) {
+    if (holds[i].end === null) holds[i].end = lastT;
+  }
+}
+canvas.addEventListener('pointerdown', onDown);
+if (typeof window !== 'undefined' && window.addEventListener) {
+  window.addEventListener('pointerup', onUp);
+  window.addEventListener('pointercancel', onUp);
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', size);
+  }
+  window.addEventListener('resize', size);
+}
+
+var startT = null;
+function loop(ts) {
+  if (startT === null) startT = ts;
+  draw((ts - startT) / 1000);
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+}
+draw(0);
+if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Two Affects, One Cut</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0d0c10; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // Seeded PRNG (mulberry32). All cycle variation comes from this stream,
+  // never from unseeded randomness, so every cycle index is reproducible.
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rand = mulberry32(1538000);
+
+  // --- State schedule: 8 cycles of A then B, fixed per cycle index. ---
+  // A durations in [3,8] s, B durations in [5,12] s, drawn from the seed.
+  // A: 5.664, 6.963, 3.005, 6.450, 3.547, 7.350, 4.369, 6.186 (total 43.533)
+  // B: 7.254, 10.751, 5.107, 8.598, 6.334, 7.730, 11.932, 10.091 (total 67.796)
+  // Super-loop LOOP = 111.330 s. Successive cycles differ by construction.
+  var NCY = 8;
+  var aDur = [], bDur = [], totalA = 0, totalB = 0;
+  for (var i = 0; i < NCY; i++) {
+    var a = 3 + 5 * rand();
+    var b = 5 + 7 * rand();
+    aDur.push(a); bDur.push(b); totalA += a; totalB += b;
+  }
+  var LOOP = totalA + totalB;
+
+  // Schedule walk for loop-local time u in [0, LOOP).
+  // Returns state, cycle, elapsed inside the segment, and both state clocks
+  // (accumulated time spent in each state up to u).
+  function scheduleAt(u) {
+    var t = u, ca = 0, cb = 0;
+    for (var k = 0; k < NCY; k++) {
+      if (t < aDur[k]) return { state: 'A', cycle: k, segElapsed: t, clockA: ca + t, clockB: cb };
+      t -= aDur[k]; ca += aDur[k];
+      if (t < bDur[k]) return { state: 'B', cycle: k, segElapsed: t, clockA: ca, clockB: cb + t };
+      t -= bDur[k]; cb += bDur[k];
+    }
+    return { state: 'A', cycle: 0, segElapsed: 0, clockA: 0, clockB: 0 };
+  }
+  // State clocks for arbitrary piece time t (seconds since load).
+  function aClockAt(t) {
+    if (t <= 0) return 0;
+    var full = Math.floor(t / LOOP), u = t - full * LOOP;
+    return full * totalA + scheduleAt(u).clockA;
+  }
+  function bClockAt(t) {
+    if (t <= 0) return 0;
+    var full = Math.floor(t / LOOP), u = t - full * LOOP;
+    return full * totalB + scheduleAt(u).clockB;
+  }
+
+  // --- Marks. ---
+  // State A: 48 small marks in 6 clusters of 8. Motion is a closed-form
+  // function of the A-clock, periodic over totalA with integer cycle counts,
+  // so the frame at t=LOOP equals the frame at t=0 exactly.
+  var ACOLORS = ['#e8e0d0', '#b33324', '#c98f3d', '#c9a86a'];
+  var marksA = [];
+  for (var m = 0; m < 48; m++) {
+    marksA.push({
+      cluster: Math.floor(m / 8),
+      color: ACOLORS[Math.floor(rand() * ACOLORS.length)],
+      cx: 0.14 + 0.72 * rand(),
+      cy: 0.14 + 0.72 * rand(),
+      ax: 0.02 + 0.03 * rand(),
+      ay: 0.02 + 0.03 * rand(),
+      mx: 1 + Math.floor(rand() * 6),
+      my: 1 + Math.floor(rand() * 6),
+      px: 2 * Math.PI * rand(),
+      py: 2 * Math.PI * rand(),
+      spin: 1 + Math.floor(rand() * 4),
+      sp: 2 * Math.PI * rand(),
+      shape: Math.floor(rand() * 4),
+      size: 0.008 + 0.006 * rand()
+    });
+  }
+  // State B: three large marks, drifting almost imperceptibly. Motion is a
+  // closed-form function of the B-clock, periodic over totalB.
+  var marksB = [
+    { color: '#7a7568', bx: 0.30, by: 0.42, ax: 0.025, ay: 0.018, mx: 1, my: 1, px: 0.6, py: 2.1, shape: 0 },
+    { color: '#cfc8b8', bx: 0.52, by: 0.50, ax: 0.020, ay: 0.022, mx: 1, my: 2, px: 2.4, py: 0.3, shape: 1 },
+    { color: '#7a7568', bx: 0.70, by: 0.58, ax: 0.028, ay: 0.016, mx: 2, my: 1, px: 4.1, py: 1.2, shape: 2 }
+  ];
+
+  // --- Drag sessions (recorded events, never frame-integrated state). ---
+  // A session: {kind:'A', cluster, start, end|null}. While active, that
+  // cluster's clock runs at half rate: the cluster lags behind by half the
+  // A-clock time elapsed under the drag. B session: {kind:'B', mark, ...},
+  // and that mark's clock runs at double rate while dragged.
+  var sessions = [];
+  var lastT = 0;
+  function draggedA(cluster, t) {
+    var d = 0;
+    for (var s = 0; s < sessions.length; s++) {
+      var se = sessions[s];
+      if (se.kind !== 'A' || se.cluster !== cluster) continue;
+      var e = (se.end === null) ? t : Math.min(se.end, t);
+      if (e > se.start) d += aClockAt(e) - aClockAt(se.start);
+    }
+    return d;
+  }
+  function draggedB(mark, t) {
+    var d = 0;
+    for (var s = 0; s < sessions.length; s++) {
+      var se = sessions[s];
+      if (se.kind !== 'B' || se.mark !== mark) continue;
+      var e = (se.end === null) ? t : Math.min(se.end, t);
+      if (e > se.start) d += bClockAt(e) - bClockAt(se.start);
+    }
+    return d;
+  }
+
+  // --- Viewport. ---
+  var W = 720, H = 720, fieldX = 0, fieldY = 0, fieldW = 720, fieldH = 720;
+  function size() {
+    var vv = (typeof window !== 'undefined' && window.visualViewport) ? window.visualViewport : null;
+    var w = vv ? vv.width : ((typeof window !== 'undefined' && window.innerWidth) ? window.innerWidth : 720);
+    var h = vv ? vv.height : ((typeof window !== 'undefined' && window.innerHeight) ? window.innerHeight : 720);
+    W = w; H = h;
+    // Both states are full-frame, so the field is the whole viewport on
+    // phones and desktop alike.
+    fieldX = 0; fieldY = 0; fieldW = w; fieldH = h;
+    if (canvas.width !== Math.round(w)) canvas.width = Math.round(w);
+    if (canvas.height !== Math.round(h)) canvas.height = Math.round(h);
+  }
+
+  // --- Positions (closed-form). ---
+  function posA(mk, clock) {
+    var u = clock / totalA;
+    var x = fieldX + (mk.cx + mk.ax * Math.sin(2 * Math.PI * mk.mx * u + mk.px)) * fieldW;
+    var y = fieldY + (mk.cy + mk.ay * Math.sin(2 * Math.PI * mk.my * u + mk.py)) * fieldH;
+    var ang = 2 * Math.PI * mk.spin * u + mk.sp;
+    return { x: x, y: y, ang: ang };
+  }
+  function posB(mk, clock) {
+    var u = clock / totalB;
+    var x = fieldX + (mk.bx + mk.ax * Math.sin(2 * Math.PI * mk.mx * u + mk.px)) * fieldW;
+    var y = fieldY + (mk.by + mk.ay * Math.sin(2 * Math.PI * mk.my * u + mk.py)) * fieldH;
+    return { x: x, y: y };
+  }
+
+  function drawMarkA(mk, p, unit) {
+    var s = mk.size * unit * 4;
+    ctx.fillStyle = mk.color;
+    ctx.strokeStyle = mk.color;
+    if (mk.shape === 0) {
+      // Disc: single arc per path, with moveTo first.
+      ctx.beginPath();
+      ctx.moveTo(p.x + s, p.y);
+      ctx.arc(p.x, p.y, s, 0, 2 * Math.PI);
+      ctx.fill();
+    } else if (mk.shape === 1) {
+      // Bar, spinning.
+      ctx.save();
+      ctx.translate(p.x, p.y);
+      ctx.rotate(p.ang);
+      ctx.fillRect(-s * 1.4, -s * 0.35, s * 2.8, s * 0.7);
+      ctx.restore();
+    } else if (mk.shape === 2) {
+      // Ring.
+      ctx.lineWidth = Math.max(1, s * 0.3);
+      ctx.lineCap = 'butt';
+      ctx.beginPath();
+      ctx.moveTo(p.x + s, p.y);
+      ctx.arc(p.x, p.y, s, 0, 2 * Math.PI);
+      ctx.stroke();
+    } else {
+      // Zigzag.
+      ctx.lineWidth = Math.max(1, s * 0.3);
+      ctx.lineCap = 'butt';
+      ctx.beginPath();
+      ctx.moveTo(p.x - s, p.y + s * 0.5);
+      ctx.lineTo(p.x - s * 0.33, p.y - s * 0.5);
+      ctx.lineTo(p.x + s * 0.33, p.y + s * 0.5);
+      ctx.lineTo(p.x + s, p.y - s * 0.5);
+      ctx.stroke();
+    }
+  }
+
+  function draw(t) {
+    size();
+    lastT = t;
+    var u = ((t % LOOP) + LOOP) % LOOP;
+    var sch = scheduleAt(u);
+    var clockA = sch.clockA + Math.floor(t / LOOP) * totalA;
+    var clockB = sch.clockB + Math.floor(t / LOOP) * totalB;
+    var unit = Math.min(fieldW, fieldH);
+    var hookA = [], hookB = [];
+
+    if (sch.state === 'A') {
+      ctx.fillStyle = '#2a1f16';
+      ctx.fillRect(0, 0, W, H);
+      for (var i = 0; i < marksA.length; i++) {
+        var mk = marksA[i];
+        var cClock = clockA - 0.5 * draggedA(mk.cluster, t);
+        var p = posA(mk, cClock);
+        drawMarkA(mk, p, unit);
+        hookA.push({ x: p.x, y: p.y, cluster: mk.cluster });
+      }
+      for (var j = 0; j < marksB.length; j++) hookB.push({ x: -1, y: -1 });
+    } else {
+      ctx.fillStyle = '#0d0c10';
+      ctx.fillRect(0, 0, W, H);
+      for (var k = 0; k < marksB.length; k++) {
+        var bm = marksB[k];
+        var mClock = clockB + draggedB(k, t);
+        var bp = posB(bm, mClock);
+        var R = unit * 0.09;
+        ctx.fillStyle = bm.color;
+        ctx.strokeStyle = bm.color;
+        if (bm.shape === 0) {
+          ctx.beginPath();
+          ctx.moveTo(bp.x + R, bp.y);
+          ctx.arc(bp.x, bp.y, R, 0, 2 * Math.PI);
+          ctx.fill();
+        } else if (bm.shape === 1) {
+          ctx.lineWidth = Math.max(2, R * 0.16);
+          ctx.lineCap = 'butt';
+          ctx.beginPath();
+          ctx.moveTo(bp.x + R, bp.y);
+          ctx.arc(bp.x, bp.y, R, 0, 2 * Math.PI);
+          ctx.stroke();
+        } else {
+          ctx.save();
+          ctx.translate(bp.x, bp.y);
+          ctx.fillRect(-R * 1.3, -R * 0.22, R * 2.6, R * 0.44);
+          ctx.restore();
+        }
+        hookB.push({ x: bp.x, y: bp.y });
+      }
+      for (var a = 0; a < marksA.length; a++) hookA.push({ x: -1, y: -1, cluster: marksA[a].cluster });
+    }
+
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+
+    if (typeof window !== 'undefined') {
+      window.__t38 = {
+        state: sch.state, cycle: sch.cycle, loop: LOOP,
+        clockA: clockA, clockB: clockB,
+        marksA: hookA, marksB: hookB
+      };
+    }
+  }
+
+  // --- Interaction. ---
+  function currentPositions(t) {
+    var u = ((t % LOOP) + LOOP) % LOOP;
+    var sch = scheduleAt(u);
+    var clockA = sch.clockA + Math.floor(t / LOOP) * totalA;
+    var clockB = sch.clockB + Math.floor(t / LOOP) * totalB;
+    var outA = [], outB = [];
+    for (var i = 0; i < marksA.length; i++) {
+      var mk = marksA[i];
+      var cClock = clockA - 0.5 * draggedA(mk.cluster, t);
+      outA.push(posA(mk, cClock));
+    }
+    for (var k = 0; k < marksB.length; k++) {
+      outB.push(posB(marksB[k], clockB + draggedB(k, t)));
+    }
+    return { state: sch.state, a: outA, b: outB };
+  }
+  function toFrac(e) {
+    size();
+    return { x: (e.clientX - fieldX) / fieldW, y: (e.clientY - fieldY) / fieldH };
+  }
+  function onDown(e) {
+    size();
+    var p = toFrac(e);
+    var px = fieldX + p.x * fieldW, py = fieldY + p.y * fieldH;
+    var cur = currentPositions(lastT);
+    if (cur.state === 'A') {
+      // Nearest mark's cluster: pressing on or near a mark slows its cluster.
+      var best = -1, bestD = 1e18;
+      for (var i = 0; i < marksA.length; i++) {
+        var dx = cur.a[i].x - px, dy = cur.a[i].y - py;
+        var d = dx * dx + dy * dy;
+        if (d < bestD) { bestD = d; best = marksA[i].cluster; }
+      }
+      sessions.push({ kind: 'A', cluster: best, start: lastT, end: null });
+    } else {
+      var bi = -1, bd = 1e18;
+      for (var k = 0; k < marksB.length; k++) {
+        var ddx = cur.b[k].x - px, ddy = cur.b[k].y - py;
+        var dd = ddx * ddx + ddy * ddy;
+        if (dd < bd) { bd = dd; bi = k; }
+      }
+      sessions.push({ kind: 'B', mark: bi, start: lastT, end: null });
+    }
+    if (e.preventDefault) e.preventDefault();
+  }
+  function onUp() {
+    for (var s = 0; s < sessions.length; s++) {
+      if (sessions[s].end === null) sessions[s].end = lastT;
+    }
+  }
+  canvas.addEventListener('pointerdown', onDown);
+  canvas.addEventListener('pointerup', onUp);
+  canvas.addEventListener('pointercancel', onUp);
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport && window.visualViewport.addEventListener) {
+      window.visualViewport.addEventListener('resize', size);
+    }
+    if (window.addEventListener) window.addEventListener('resize', size);
+  }
+
+  var startT = null;
+  function loop(ts) {
+    if (startT === null) startT = ts;
+    draw((ts - startT) / 1000);
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+  }
+  draw(0);
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
