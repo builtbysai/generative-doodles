@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Three Rooms, One Evening</title>
+<style>
+html, body { margin: 0; padding: 0; background: #14121a; overflow: hidden; }
+canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+  var FIELD = '#14121a', OCHRE = '#c98f3d', BONE = '#d8d2c4', BRICK = '#a34a2e';
+  var DIVC = '#3a3540', GOLD = '#c9a86a';
+  var GOLD_RGB = [201, 168, 106];
+  var LOOP = 120, PULSE = 2;
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rnd = mulberry32(1525000);
+  function rr(a, b) { return a + rnd() * (b - a); }
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function smooth(t) { t = clamp(t, 0, 1); return t * t * (3 - 2 * t); }
+  function lerp(a, b, w) { return a + (b - a) * w; }
+
+  // Tableau poses: arm angles measured from straight up, leg angles from straight down.
+  var POSES = [
+    { aL: -0.6, aR: 0.6, lL: -0.25, lR: 0.25 },
+    { aL: 1.2, aR: -1.2, lL: -0.1, lR: 0.1 },
+    { aL: -0.3, aR: 2.9, lL: -0.55, lR: 0.55 },
+    { aL: -1.5, aR: 1.5, lL: -0.15, lR: 0.35 },
+    { aL: -2.8, aR: 2.8, lL: -0.4, lR: 0.2 }
+  ];
+
+  // Four marks per band. Left: circling. Middle: tableau. Right: pulse bouncer.
+  var leftMarks = [], middleMarks = [], rightMarks = [];
+  var i;
+  for (i = 0; i < 4; i++) {
+    leftMarks.push({ fx: 0.16 + 0.22 * i + rr(-0.04, 0.04), fy: 0.22 + 0.15 * i + rr(-0.03, 0.03),
+      orbR: rr(0.020, 0.034), orbP: [24, 30, 40, 60][i], orbPh: rr(0, 6.283) });
+    middleMarks.push({ fx: 0.16 + 0.22 * i + rr(-0.04, 0.04), fy: 0.24 + 0.14 * i + rr(-0.03, 0.03),
+      poseOff: i });
+    rightMarks.push({ fx: 0.16 + 0.22 * i + rr(-0.04, 0.04), baseFy: 0.24 + 0.14 * i + rr(-0.03, 0.03),
+      bounceAmp: rr(0.020, 0.038) });
+  }
+  var CROSS = 1; // leftMarks[CROSS] is the scheduled crossing mark.
+  var CROSS_HOME = leftMarks[CROSS];
+  // Crossing schedule (loop-local seconds): travel out 20-32, adopt 32-68,
+  // travel back 68-80, home 80-120. Blend weight ramps over 20-40 and 68-88.
+
+  // Divider fractions (persistent across resizes). Dragged dividers stay put.
+  var df = [1 / 3, 2 / 3];
+  var active = null; // {kind:'div', idx} or {kind:'mark'}
+  var markSegs = []; // crossing-mark drag segments {s, e} in loop-local time
+  var downT = 0, downPos = null;
+  var lastT = 0;
+
+  function size() {
+    var w, h;
+    if (typeof window !== 'undefined' && window.visualViewport &&
+        typeof window.visualViewport.width === 'number') {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    } else if (typeof window !== 'undefined' && typeof window.innerWidth === 'number') {
+      w = window.innerWidth; h = window.innerHeight;
+    } else { w = 720; h = 720; }
+    return { w: w, h: h };
+  }
+  function isPhone(W, H) {
+    var m = 1e9;
+    if (typeof window !== 'undefined' && window.screen &&
+        typeof window.screen.width === 'number') {
+      m = Math.min(window.screen.width, window.screen.height);
+    }
+    if (m < 700) return true;
+    return H > W * 1.15;
+  }
+
+  function bandX(b, W) {
+    if (b === 0) return [0, df[0] * W];
+    if (b === 1) return [df[0] * W, df[1] * W];
+    return [df[1] * W, W];
+  }
+
+  // Overlap of recorded crossing-mark drag segments with [a, b], up to time t.
+  function dragOverlap(t, a, b) {
+    var tot = 0, k, s, e;
+    for (k = 0; k < markSegs.length; k++) {
+      s = markSegs[k].s; e = markSegs[k].e;
+      if (e === null) e = t;
+      tot += Math.max(0, Math.min(e, b, t) - Math.max(s, a));
+    }
+    // An open drag counts live, up to the current time, so the hurry shows
+    // while the pointer is still down, not only after release.
+    if (active && active.kind === 'mark') {
+      tot += Math.max(0, Math.min(t, b, t) - Math.max(downT, a));
+    }
+    return tot;
+  }
+  // Blend weight of the crossing mark at loop-local time t (0 = home circling,
+  // 1 = fully adopted tableau in the middle band). Drags during a travel
+  // window hurry that window: boosted time advances 3x while dragging.
+  function crossW(t) {
+    var up, down;
+    if (t < 20) return 0;
+    if (t < 68) {
+      up = t + 2 * dragOverlap(t, 20, 40);
+      return smooth((up - 20) / 20);
+    }
+    if (t < 88) {
+      down = t + 2 * dragOverlap(t, 68, 88);
+      return 1 - smooth((down - 68) / 20);
+    }
+    return 0;
+  }
+
+  function circlePose(m, t, W, H, bx) {
+    var ang = m.orbPh + 6.283185307 * (t / m.orbP);
+    var sw = Math.sin(ang);
+    return {
+      x: bx[0] + m.fx * (bx[1] - bx[0]) + Math.cos(ang) * m.orbR * Math.min(W, H),
+      y: m.fy * H + Math.sin(ang) * m.orbR * Math.min(W, H) * 0.6,
+      aL: -0.8 + 0.3 * sw, aR: 0.8 - 0.3 * sw,
+      lL: 0.35 + 0.25 * Math.sin(ang + 1), lR: -0.35 - 0.25 * Math.sin(ang + 1)
+    };
+  }
+  function tableauPose(m, t, W, H, bx) {
+    var p = POSES[(Math.floor(t / 8) + m.poseOff) % 5];
+    return {
+      x: bx[0] + m.fx * (bx[1] - bx[0]), y: m.fy * H,
+      aL: p.aL, aR: p.aR, lL: p.lL, lR: p.lR
+    };
+  }
+  function bouncePose(m, t, W, H, bx) {
+    var ph = (t % PULSE) / PULSE;
+    var b = Math.abs(Math.sin(3.141592654 * ph));
+    return {
+      x: bx[0] + m.fx * (bx[1] - bx[0]), y: m.baseFy * H - b * m.bounceAmp * H,
+      aL: -0.7 - 0.3 * b, aR: 0.7 + 0.3 * b,
+      lL: 0.3 + 0.2 * b, lR: -0.3 - 0.2 * b
+    };
+  }
+
+  function drawGlyph(ctx, x, y, h, g, color, lw) {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = lw;
+    ctx.lineCap = 'round';
+    var sh = y - 0.28 * h, hip = y + 0.28 * h, al = 0.30 * h, ll = 0.32 * h;
+    ctx.beginPath(); ctx.moveTo(x, y - 0.45 * h); ctx.lineTo(x, y + 0.45 * h); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x, sh); ctx.lineTo(x + Math.sin(g.aL) * al, sh - Math.cos(g.aL) * al); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x, sh); ctx.lineTo(x + Math.sin(g.aR) * al, sh - Math.cos(g.aR) * al); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x, hip); ctx.lineTo(x + Math.sin(g.lL) * ll, hip + Math.cos(g.lL) * ll); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x, hip); ctx.lineTo(x + Math.sin(g.lR) * ll, hip + Math.cos(g.lR) * ll); ctx.stroke();
+  }
+
+  function draw(t) {
+    var s = size(), W = s.w, H = s.h;
+    var canvas = document.getElementById('c');
+    var dpr = (typeof window !== 'undefined' && window.devicePixelRatio) || 1;
+    canvas.width = Math.round(W * dpr);
+    canvas.height = Math.round(H * dpr);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    var ctx = canvas.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    var tau = ((t % LOOP) + LOOP) % LOOP;
+    lastT = tau;
+
+    ctx.fillStyle = FIELD;
+    ctx.fillRect(0, 0, W, H);
+
+    var b0 = bandX(0, W), b1 = bandX(1, W), b2 = bandX(2, W);
+    var minDim = Math.min(W, H);
+    var gh = 0.085 * minDim;
+    var lw = Math.max(1.5, 0.003 * minDim);
+
+    // Dividers: thin lines, never walls.
+    ctx.strokeStyle = DIVC;
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(df[0] * W, 0); ctx.lineTo(df[0] * W, H); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(df[1] * W, 0); ctx.lineTo(df[1] * W, H); ctx.stroke();
+
+    // Shared pulse line across the bottom, breathing on the 2 s pulse.
+    var pa = (tau % PULSE) / PULSE;
+    var alpha = 0.45 + 0.35 * Math.sin(6.283185307 * pa);
+    ctx.strokeStyle = 'rgba(' + GOLD_RGB[0] + ',' + GOLD_RGB[1] + ',' + GOLD_RGB[2] + ',' + alpha.toFixed(4) + ')';
+    ctx.lineWidth = Math.max(1.5, 0.0025 * minDim);
+    ctx.beginPath(); ctx.moveTo(0, 0.92 * H); ctx.lineTo(W, 0.92 * H); ctx.stroke();
+
+    // Crossing mark: blend of circling (home) and tableau (middle) behaviour.
+    var w = crossW(tau);
+    var home = circlePose(CROSS_HOME, tau, W, H, b0);
+    var away = tableauPose({ fx: 0.5, fy: 0.5, poseOff: 2 }, tau, W, H, b1);
+    var cross = {
+      x: lerp(home.x, away.x, w), y: lerp(home.y, away.y, w),
+      aL: lerp(home.aL, away.aL, w), aR: lerp(home.aR, away.aR, w),
+      lL: lerp(home.lL, away.lL, w), lR: lerp(home.lR, away.lR, w)
+    };
+
+    var hookMarks = [];
+    var k, g;
+    for (k = 0; k < 4; k++) {
+      if (k === CROSS) {
+        drawGlyph(ctx, cross.x, cross.y, gh, cross, OCHRE, lw);
+        hookMarks.push({ band: 'L', x: cross.x, y: cross.y, color: OCHRE, crossing: true, w: w });
+      } else {
+        g = circlePose(leftMarks[k], tau, W, H, b0);
+        drawGlyph(ctx, g.x, g.y, gh, g, OCHRE, lw);
+        hookMarks.push({ band: 'L', x: g.x, y: g.y, color: OCHRE, crossing: false, w: 0 });
+      }
+      g = tableauPose(middleMarks[k], tau, W, H, b1);
+      drawGlyph(ctx, g.x, g.y, gh, g, BONE, lw);
+      hookMarks.push({ band: 'M', x: g.x, y: g.y, color: BONE, crossing: false, w: 0 });
+      g = bouncePose(rightMarks[k], tau, W, H, b2);
+      drawGlyph(ctx, g.x, g.y, gh, g, BRICK, lw);
+      hookMarks.push({ band: 'R', x: g.x, y: g.y, color: BRICK, crossing: false, w: 0 });
+    }
+    if (typeof window !== 'undefined' && window) {
+      window.__t25 = { t: tau, d1: df[0] * W, d2: df[1] * W, marks: hookMarks };
+    }
+    void isPhone;
+  }
+
+  function evPos(e) {
+    if (typeof e.clientX === 'number') return { x: e.clientX, y: e.clientY };
+    return { x: e.offsetX || 0, y: e.offsetY || 0 };
+  }
+  function onDown(e) {
+    var s = size(), W = s.w;
+    var p = evPos(e);
+    var hook = (typeof window !== 'undefined' && window) ? window.__t25 : null;
+    var grab = Math.max(28, 0.06 * Math.min(W, s.h));
+    if (hook) {
+      var cm = null, k;
+      for (k = 0; k < hook.marks.length; k++) {
+        if (hook.marks[k].crossing) { cm = hook.marks[k]; break; }
+      }
+      if (cm && Math.abs(p.x - cm.x) <= grab && Math.abs(p.y - cm.y) <= grab) {
+        active = { kind: 'mark' };
+        downT = lastT; downPos = p;
+        if (e.preventDefault) e.preventDefault();
+        return;
+      }
+    }
+    if (Math.abs(p.x - df[0] * W) <= 16) { active = { kind: 'div', idx: 0 }; }
+    else if (Math.abs(p.x - df[1] * W) <= 16) { active = { kind: 'div', idx: 1 }; }
+    else { active = null; }
+    downPos = p;
+    if (e.preventDefault) e.preventDefault();
+  }
+  function onMove(e) {
+    var s = size(), W = s.w;
+    var p = evPos(e);
+    if (!active) return;
+    if (active.kind === 'div') {
+      var f = p.x / W;
+      if (active.idx === 0) {
+        df[0] = clamp(f, 0.18, df[1] - 0.15);
+      } else {
+        df[1] = clamp(f, df[0] + 0.15, 0.82);
+      }
+    }
+    downPos = p;
+  }
+  function onUp() {
+    if (active && active.kind === 'mark') {
+      markSegs.push({ s: downT, e: lastT });
+    }
+    active = null;
+  }
+
+  var canvas = document.getElementById('c');
+  canvas.addEventListener('pointerdown', onDown);
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
+  } else {
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+  }
+
+  var startTs = null;
+  function loop(ts) {
+    if (startTs === null) startTs = ts;
+    var t = (ts - startTs) / 1000;
+    draw(t);
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+  }
+  draw(0);
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

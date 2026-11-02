@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Slowed Time</title>
+<style>
+html, body { margin: 0; padding: 0; background: #16141c; overflow: hidden; }
+canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+'use strict';
+
+// Seeded PRNG (mulberry32). No unseeded randomness anywhere.
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    var t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+var rand = mulberry32(1527000);
+
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+
+// Loop and band constants. Loop = 60 s. Band width = 0.25 of the field.
+// The band centre travels from -0.125 to 1.125 of the field over one loop,
+// so it covers any fixed mark for exactly 12 s per loop; a mark's warped
+// clock therefore advances exactly 51 s per loop, and every dance uses
+// frequencies that are whole multiples of 1/51 Hz, so t = 60 closes exactly.
+var LOOP = 60;
+var PHASE = 18;
+var BAND_W = 0.25;
+var BAND_HALF = 0.125;
+// Scheduled-centre speed, fractions of the field per second.
+var BAND_RATE = (1 + BAND_W) / LOOP;
+
+var W = 0, H = 0, phone = false;
+var fieldX = 0, fieldY = 0, fieldW = 0, fieldH = 0;
+
+function size() {
+  var vw, vh;
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.width) {
+    vw = window.visualViewport.width; vh = window.visualViewport.height;
+  } else if (typeof window !== 'undefined' && window.innerWidth) {
+    vw = window.innerWidth; vh = window.innerHeight;
+  } else { vw = 720; vh = 720; }
+  if (vw !== W || vh !== H) {
+    W = vw; H = vh;
+    canvas.width = W; canvas.height = H;
+  }
+  var sw = W, sh = H;
+  if (typeof window !== 'undefined' && window.screen) {
+    if (window.screen.width) sw = window.screen.width;
+    if (window.screen.height) sh = window.screen.height;
+  }
+  phone = (Math.min(sw, sh) < 700) || (H > W * 1.15);
+  if (phone) { fieldX = 0; fieldY = 0; fieldW = W; fieldH = H; }
+  else {
+    var side = Math.min(W, H);
+    fieldX = (W - side) / 2; fieldY = (H - side) / 2; fieldW = side; fieldH = side;
+  }
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+}
+
+// Marks: 14 articulated glyphs on a jittered 5 x 3 grid, fractions of the
+// field, so the layout survives any viewport. Colours alternate brick/ochre.
+var marks = [];
+(function () {
+  var cols = 5;
+  for (var i = 0; i < 14; i++) {
+    var col = i % cols, row = Math.floor(i / cols);
+    var fx = (col + 0.2 + 0.6 * rand()) / cols;
+    var fy = 0.12 + ((row + 0.25 + 0.5 * rand()) / 3) * 0.7;
+    marks.push({
+      fx: fx, fy: fy,
+      color: (i % 2 === 0) ? '#a34a2e' : '#c98f3d',
+      mStep: 13 + Math.floor(rand() * 9),
+      mHop: 11 + Math.floor(rand() * 8),
+      mArm: 15 + Math.floor(rand() * 8),
+      mSpin: 2 + Math.floor(rand() * 4),
+      pStep: rand() * Math.PI * 2,
+      pHop: rand() * Math.PI * 2,
+      pArm: rand() * Math.PI * 2,
+      pSpin: rand() * Math.PI * 2,
+      hopAmp: 0.25 + rand() * 0.35,
+      spinDir: (rand() < 0.5) ? 1 : -1
+    });
+  }
+})();
+
+// Scheduled band centre, as a fraction of the field, at piece time t.
+function scheduled(t) {
+  var u = (t + PHASE) % LOOP;
+  if (u < 0) u += LOOP;
+  return -BAND_HALF + (1 + BAND_W) * (u / LOOP);
+}
+
+// Total seconds in [0, t] during which the scheduled band covers a mark
+// whose base x fraction is fx. The band covers fx while its centre lies in
+// [fx - 0.125, fx + 0.125], i.e. while loop-local time lies in
+// [48*fx, 48*fx + 12]. Summed over whole loop cycles, exactly, in closed form.
+function covered(t, fx) {
+  var q1 = 48 * fx, q2 = q1 + 12;
+  var start = PHASE, end = t + PHASE;
+  var c = 0;
+  var k0 = Math.floor(start / LOOP), k1 = Math.floor(end / LOOP);
+  for (var k = k0; k <= k1; k++) {
+    var lo = Math.max(start, k * LOOP + q1);
+    var hi = Math.min(end, k * LOOP + q2);
+    if (hi > lo) c += hi - lo;
+  }
+  return c;
+}
+
+// Displayed-band coverage (for the warped clock). The displayed band path
+// is: scheduled drift, except during a drag session (piecewise constant
+// from the move log) and during the spring-back after a release (scheduled
+// + exponential decay). Coverage of a mark is the total time the displayed
+// centre spends within BAND_HALF of the mark's fx.
+// NOTE on the clamp: displayed() clamps the centre to [-BAND_HALF,
+// 1+BAND_HALF], but every mark's window [fx-BAND_HALF, fx+BAND_HALF] lies
+// strictly inside that range (fx in [0.04, 0.96) for this piece), so the
+// clamp never changes coverage membership; the unclamped path is used here.
+function crossLevel(h, level, p, q) {
+  // h continuous and monotonic on [p, q]; return s with h(s) = level, or null.
+  var hp = h(p), hq = h(q);
+  if (hp === level) return p;
+  if (hq === level) return q;
+  if ((hp - level) * (hq - level) > 0) return null;
+  var lo = p, hi = q, hplo = hp;
+  for (var i = 0; i < 80; i++) {
+    var mid = (lo + hi) / 2;
+    var hm = h(mid);
+    if (hm === level) return mid;
+    if ((hm - level) * (hplo - level) > 0) { lo = mid; hplo = hm; } else { hi = mid; }
+  }
+  return (lo + hi) / 2;
+}
+
+function measureMonotonic(h, increasing, p, q, lo, hi) {
+  // Measure of {s in [p, q] : lo <= h(s) <= hi} for h monotonic on [p, q].
+  var u, v;
+  if (increasing) {
+    if (h(p) > hi || h(q) < lo) return 0;
+    u = (h(p) >= lo) ? p : crossLevel(h, lo, p, q);
+    v = (h(q) <= hi) ? q : crossLevel(h, hi, p, q);
+  } else {
+    if (h(p) < lo || h(q) > hi) return 0;
+    u = (h(p) <= hi) ? p : crossLevel(h, hi, p, q);
+    v = (h(q) >= lo) ? q : crossLevel(h, lo, p, q);
+  }
+  if (u === null || v === null || v <= u) return 0;
+  return v - u;
+}
+
+// Coverage of mark fx on [a, b] during a spring-back segment that started
+// at t1 with offset relOff. [a, b] contains no loop reset, so scheduled(s)
+// is linear with slope BAND_RATE. The spring-back centre is
+// scheduled(s) + relOff*exp(-(s-t1)/1.2) (1.2 s decay, matching displayed()).
+// Its derivative is monotonic in s, so it has at most one interior extremum.
+function springCovered(a, b, fx, t1, relOff) {
+  var lo = fx - BAND_HALF, hi = fx + BAND_HALF;
+  var beta = scheduled(a) - BAND_RATE * a;
+  function h(s) { return BAND_RATE * s + beta + relOff * Math.exp(-(s - t1) / 1.2); }
+  if (relOff === 0) {
+    var sAtLo = (lo - beta) / BAND_RATE, sAtHi = (hi - beta) / BAND_RATE;
+    return Math.max(0, Math.min(b, sAtHi) - Math.max(a, sAtLo));
+  }
+  var sStar = null;
+  if (relOff >= 1.2 * BAND_RATE) {
+    var cand = t1 - 1.2 * Math.log(1.2 * BAND_RATE / relOff);
+    if (cand > a && cand < b) sStar = cand;
+  }
+  if (sStar === null) {
+    return measureMonotonic(h, h(b) >= h(a), a, b, lo, hi);
+  }
+  return measureMonotonic(h, false, a, sStar, lo, hi) +
+         measureMonotonic(h, true, sStar, b, lo, hi);
+}
+
+// Coverage of mark fx on one elementary interval [a, b] that contains no
+// session boundary, move time, or loop reset, so a single path regime holds.
+function segmentCovered(a, b, fx, lo, hi) {
+  var dragSession = null, springSession = null;
+  for (var i = 0; i < sessions.length; i++) {
+    var s = sessions[i];
+    if (s.t0 <= a && (s.t1 === null || a < s.t1)) { dragSession = s; break; }
+    if (s.t1 !== null && s.t1 <= a) { springSession = s; }
+  }
+  if (dragSession) {
+    var mv = dragSession.moves[0];
+    for (var j = 0; j < dragSession.moves.length; j++) {
+      if (dragSession.moves[j].t <= a) { mv = dragSession.moves[j]; } else { break; }
+    }
+    var c = clamp(mv.frac - dragSession.grabOff, -BAND_HALF, 1 + BAND_HALF);
+    return (c >= lo && c <= hi) ? (b - a) : 0;
+  }
+  if (springSession) {
+    return springCovered(a, b, fx, springSession.t1, springSession.relOff);
+  }
+  var beta = scheduled(a) - BAND_RATE * a;
+  var sAtLo = (lo - beta) / BAND_RATE, sAtHi = (hi - beta) / BAND_RATE;
+  return Math.max(0, Math.min(b, sAtHi) - Math.max(a, sAtLo));
+}
+
+// Total displayed-band coverage of mark fx over piece time [0, t].
+// With no drag sessions this is exactly covered() (bit-identical fast path),
+// so no-drag behaviour — including byte-exact loop closure — is untouched.
+function displayedCovered(t, fx) {
+  if (sessions.length === 0) return covered(t, fx);
+  var lo = fx - BAND_HALF, hi = fx + BAND_HALF;
+  var pts = [0, t];
+  function addPt(p) { if (p > 0 && p < t) pts.push(p); }
+  for (var i = 0; i < sessions.length; i++) {
+    var s = sessions[i];
+    addPt(s.t0);
+    if (s.t1 !== null) addPt(s.t1);
+    for (var j = 0; j < s.moves.length; j++) addPt(s.moves[j].t);
+  }
+  for (var k = 0; k * LOOP - PHASE <= t; k++) addPt(k * LOOP - PHASE);
+  pts.sort(function (a, b) { return a - b; });
+  var total = 0;
+  for (var n = 0; n + 1 < pts.length; n++) {
+    if (pts[n + 1] > pts[n]) total += segmentCovered(pts[n], pts[n + 1], fx, lo, hi);
+  }
+  return total;
+}
+
+// Warped clock for one mark: real time minus the 0.75 share of DISPLAYED
+// covered time (a covered mark runs at quarter speed). Colour and rhythm
+// now follow the same band, so a held band really holds the slowed scene.
+// Snapped to a 1e-9 grid so the loop-end value lands on exactly 51, 102, ...
+// and frames close byte-exact.
+function tauOf(t, fx) {
+  var tau = t - 0.75 * displayedCovered(t, fx);
+  return Math.round(tau * 1e9) / 1e9;
+}
+
+// Drag state. While dragging, the band follows the pointer; on release it
+// springs back to the scheduled drift with a 1.2 s decay. All closed-form
+// over the recorded drag events, never integrated frame by frame.
+// Drag history: every session records its grab offset, every pointer-move
+// fraction with the piece time at which it was recorded (lastT), and the
+// release time/offset. The displayed band path is therefore a pure function
+// of piece time and this log. A session still open has t1 === null.
+var dragOn = false, grabOff = 0, dragFrac = 0;
+var relT = null, relOff = 0;
+var lastT = 0, lastDC = 0.25;
+var sessions = [];
+var curSession = null;
+
+function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+
+function displayed(t) {
+  if (dragOn) return clamp(dragFrac - grabOff, -BAND_HALF, 1 + BAND_HALF);
+  if (relT !== null && t >= relT) {
+    return clamp(scheduled(t) + relOff * Math.exp(-(t - relT) / 1.2), -BAND_HALF, 1 + BAND_HALF);
+  }
+  return scheduled(t);
+}
+
+function toFrac(clientX) { return (clientX - fieldX) / fieldW; }
+
+function onDown(e) {
+  size();
+  var f = toFrac(e.clientX);
+  if (Math.abs(f - lastDC) <= BAND_HALF + 0.06) {
+    if (curSession) {
+      // A second grab supersedes the open session; its spring-back interval
+      // is empty (the new session starts at the same time), so it contributes
+      // nothing to coverage.
+      curSession.t1 = lastT;
+      curSession.relOff = lastDC - scheduled(lastT);
+    }
+    dragOn = true; grabOff = f - lastDC; dragFrac = f; relT = null;
+    curSession = { t0: lastT, grabOff: grabOff, moves: [{ t: lastT, frac: f }], t1: null, relOff: 0 };
+    sessions.push(curSession);
+  }
+  if (e.preventDefault) e.preventDefault();
+}
+function onMove(e) {
+  if (dragOn) {
+    size();
+    dragFrac = clamp(toFrac(e.clientX), -BAND_HALF, 1 + BAND_HALF);
+    if (curSession) curSession.moves.push({ t: lastT, frac: dragFrac });
+  }
+}
+function onUp() {
+  if (dragOn) {
+    dragOn = false; relT = lastT;
+    var disp = clamp(dragFrac - grabOff, -BAND_HALF, 1 + BAND_HALF);
+    relOff = disp - scheduled(relT);
+    if (curSession) { curSession.t1 = lastT; curSession.relOff = relOff; curSession = null; }
+  }
+}
+canvas.addEventListener('pointerdown', onDown);
+canvas.addEventListener('pointermove', onMove);
+canvas.addEventListener('pointerup', onUp);
+canvas.addEventListener('pointercancel', onUp);
+if (typeof window !== 'undefined') {
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', size);
+  }
+  if (window.addEventListener) window.addEventListener('resize', size);
+}
+
+function draw(t) {
+  size();
+  lastT = t;
+  var dc = displayed(t);
+  lastDC = dc;
+
+  ctx.fillStyle = '#16141c';
+  ctx.fillRect(0, 0, W, H);
+
+  // Faint ground line.
+  ctx.strokeStyle = '#2a2630';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(fieldX, fieldY + fieldH * 0.86);
+  ctx.lineTo(fieldX + fieldW, fieldY + fieldH * 0.86);
+  ctx.stroke();
+
+  // Slow band: one flat translucent rectangle, never a second band.
+  var bx = fieldX + (dc - BAND_HALF) * fieldW;
+  ctx.fillStyle = 'rgba(201,168,106,0.14)';
+  ctx.fillRect(bx, fieldY, fieldW * BAND_W, fieldH);
+
+  // Dancer-marks. Each dances on its own warped clock: quick steps, jumps
+  // and spins outside the band, stretched long and held inside it, where
+  // its colour swaps to bone. All motion is a closed-form function of tau.
+  var unit = Math.min(fieldW, fieldH) * 0.028;
+  ctx.lineCap = 'round';
+  ctx.lineWidth = Math.max(2, unit * 0.14);
+  var hookMarks = [];
+  for (var i = 0; i < marks.length; i++) {
+    var m = marks[i];
+    var tau = tauOf(t, m.fx);
+    var slow = Math.abs(dc - m.fx) <= BAND_HALF;
+    var x = fieldX + m.fx * fieldW;
+    var y = fieldY + m.fy * fieldH;
+    var hop = Math.abs(Math.sin(2 * Math.PI * m.mHop * tau / 51 + m.pHop)) * unit * m.hopAmp;
+    var step = Math.sin(2 * Math.PI * m.mStep * tau / 51 + m.pStep);
+    var arm = Math.sin(2 * Math.PI * m.mArm * tau / 51 + m.pArm);
+    var spinEnv = Math.pow(Math.max(0, Math.sin(2 * Math.PI * m.mSpin * tau / 51 + m.pSpin)), 8);
+    var rot = spinEnv * 0.9 * m.spinDir;
+    ctx.save();
+    ctx.translate(x, y - hop);
+    ctx.rotate(rot);
+    ctx.strokeStyle = slow ? '#e0d6c0' : m.color;
+    ctx.beginPath();
+    ctx.moveTo(0, -unit);
+    ctx.lineTo(0, unit);
+    ctx.moveTo(0, -unit * 0.6);
+    ctx.lineTo(-unit * 0.8, -unit * 0.2 + arm * unit * 0.35);
+    ctx.moveTo(0, -unit * 0.6);
+    ctx.lineTo(unit * 0.8, -unit * 0.2 - arm * unit * 0.35);
+    var lLift = Math.max(0, step) * unit * 0.45;
+    var rLift = Math.max(0, -step) * unit * 0.45;
+    ctx.moveTo(0, unit);
+    ctx.lineTo(-unit * 0.55, unit * 1.9 - lLift);
+    ctx.moveTo(0, unit);
+    ctx.lineTo(unit * 0.55, unit * 1.9 - rLift);
+    ctx.stroke();
+    ctx.restore();
+    hookMarks.push({ x: x, y: y - hop, color: slow ? '#e0d6c0' : m.color, slow: slow, tau: tau, fx: m.fx });
+  }
+
+  if (typeof window !== 'undefined') {
+    window.__t27 = {
+      bandCenter: dc, bandWidth: BAND_W,
+      field: { x: fieldX, y: fieldY, w: fieldW, h: fieldH },
+      marks: hookMarks
+    };
+  }
+}
+
+var startT = null;
+function loop(ts) {
+  if (startT === null) startT = ts;
+  draw((ts - startT) / 1000);
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+}
+draw(0);
+if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
