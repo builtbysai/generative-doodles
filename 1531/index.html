@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Grain From Inside</title>
+<style>
+html, body { margin: 0; padding: 0; background: #2a2622; overflow: hidden; }
+canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+
+var LOOP = 60;      // seconds; 5 messages per loop, one every 12 s
+var TRAVEL = 6;     // seconds for one message to cross the gap
+var STEP = 12;      // seconds between message launches
+var FIRST = 4;      // loop-local launch time of the first message
+var BEAT = 4;       // seconds a mark-drag holds up its next message
+var SEED = 1531000;
+
+var W = 720, H = 720;
+var lastT = 0;
+var lastMsg = null;
+var lastMarks = [];
+var phone = false;
+
+// Seeded PRNG (mulberry32), used only for fixed mark jitter at build time.
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// Coordinate hash for the grain field: a pure function of cell coords,
+// so the grain is identical in every instance and never changes.
+function hash2(gx, gy) {
+  var h = (Math.imul(gx, 374761393) + Math.imul(gy, 668265263) + SEED) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  h = h ^ (h >>> 16);
+  return ((h >>> 0) % 10000) / 10000;
+}
+
+function size() {
+  var w = 720, h = 720;
+  if (typeof window !== 'undefined') {
+    if (window.visualViewport) {
+      w = window.visualViewport.width; h = window.visualViewport.height;
+    } else if (window.innerWidth) {
+      w = window.innerWidth; h = window.innerHeight;
+    }
+  }
+  W = Math.round(w); H = Math.round(h);
+  canvas.width = W; canvas.height = H;
+  if (typeof window !== 'undefined' && window.screen) {
+    var m = Math.min(window.screen.width, window.screen.height);
+    phone = (m < 700) || (H > W * 1.15);
+  } else {
+    phone = false;
+  }
+}
+
+// Marks: two groups of three, left and right of a wide empty gap.
+// Jitter is fixed at build time from the seeded stream, never re-rolled.
+var leftMarks = [], rightMarks = [];
+(function () {
+  var rnd = mulberry32(SEED);
+  var lf = [[0.18, 0.32], [0.24, 0.52], [0.16, 0.70]];
+  var rf = [[0.82, 0.30], [0.76, 0.52], [0.84, 0.68]];
+  for (var i = 0; i < 3; i++) {
+    leftMarks.push({ id: 'L' + i, fx: lf[i][0] + (rnd() - 0.5) * 0.02, fy: lf[i][1] + (rnd() - 0.5) * 0.03, ph: rnd() * Math.PI * 2 });
+    rightMarks.push({ id: 'R' + i, fx: rf[i][0] + (rnd() - 0.5) * 0.02, fy: rf[i][1] + (rnd() - 0.5) * 0.03, ph: rnd() * Math.PI * 2 });
+  }
+})();
+
+function markPos(m) { return { x: m.fx * W, y: m.fy * H }; }
+
+// Message schedule: message k launches at k*STEP + FIRST (global time).
+// Even k travel left-to-right, odd k right-to-left. The sender is the
+// k%3-th mark of the sending group, so each mark sends every 6 messages.
+function baseLaunch(k) { return k * STEP + FIRST; }
+function senderOf(k) {
+  if (k % 2 === 0) return leftMarks[k % 3];
+  return rightMarks[k % 3];
+}
+function receiverOf(k) {
+  var s = senderOf(k);
+  if (s.id.charAt(0) === 'L') return rightMarks[parseInt(s.id.charAt(1), 10)];
+  return leftMarks[parseInt(s.id.charAt(1), 10)];
+}
+
+// Recorded drag events. Everything below is a pure function of piece
+// time and these lists: no frame-integrated state anywhere.
+var delayEvents = [];   // { mark, time } — press on a mark
+var hurrySessions = []; // { k, t0, t1 } — press-and-hold on a message
+
+// Delay for message k: one beat per press on its sender mark that fell
+// after that mark's previous scheduled send and no later than this send.
+function delayShift(k) {
+  var s = senderOf(k);
+  var base = baseLaunch(k);
+  var prev = (k >= 6) ? baseLaunch(k - 6) : -1e9;
+  var n = 0;
+  for (var i = 0; i < delayEvents.length; i++) {
+    var e = delayEvents[i];
+    if (e.mark === s.id && e.time > prev && e.time <= base) n++;
+  }
+  return n * BEAT;
+}
+function launchOf(k) { return baseLaunch(k) + delayShift(k); }
+
+// Hurry boost for message k at time t: while a press is held on the
+// message, its clock runs double, so the boost equals the held time
+// overlapping [launch, t]. Frozen at release. Closed-form, deterministic.
+function hurryBoost(k, t) {
+  var L = launchOf(k);
+  var b = 0;
+  for (var i = 0; i < hurrySessions.length; i++) {
+    var s = hurrySessions[i];
+    if (s.k !== k) continue;
+    var end = (s.t1 === null) ? t : s.t1;
+    var ov = Math.min(t, end) - Math.max(s.t0, L);
+    if (ov > 0) b += ov;
+  }
+  return b;
+}
+
+// The travelling message at time t, if any. At most one: launches are
+// 12 s apart and travel takes 6 s, and delay shifts only push later.
+function messageAt(t) {
+  var k0 = Math.floor((t - FIRST) / STEP);
+  for (var k = k0 - 1; k <= k0 + 1; k++) {
+    if (k < 0) continue;
+    var L = launchOf(k);
+    var p = (t - L + hurryBoost(k, t)) / TRAVEL;
+    if (p >= 0 && p < 1) {
+      var s = senderOf(k), r = receiverOf(k);
+      var sp = markPos(s), rp = markPos(r);
+      return {
+        k: k, p: p, sender: s.id, receiver: r.id,
+        dir: (k % 2 === 0) ? 'L2R' : 'R2L',
+        x: sp.x + (rp.x - sp.x) * p,
+        y: sp.y + (rp.y - sp.y) * p,
+        sx: sp.x, sy: sp.y, rx: rp.x, ry: rp.y
+      };
+    }
+  }
+  return null;
+}
+
+function drawGrain() {
+  var cell = phone ? 14 : 12;
+  var cols = Math.ceil(W / cell), rows = Math.ceil(H / cell);
+  var quad = [0, 0, 0, 0];
+  for (var gy = 0; gy < rows; gy++) {
+    for (var gx = 0; gx < cols; gx++) {
+      var q = (gx < cols / 2 ? 0 : 1) + (gy < rows / 2 ? 0 : 2);
+      var v = hash2(gx, gy);
+      var px = gx * cell + 2, py = gy * cell + 2;
+      if (v < 0.30) {
+        ctx.fillStyle = 'rgba(74,69,60,0.5)';
+        ctx.fillRect(px, py, 4, 4);
+        quad[q]++;
+      } else if (v < 0.55) {
+        ctx.fillStyle = 'rgba(14,12,10,0.5)';
+        ctx.fillRect(px, py, 4, 4);
+        quad[q]++;
+      }
+      var v2 = hash2(gx + 1013, gy + 1013);
+      if (v2 < 0.06) {
+        ctx.fillStyle = (hash2(gx + 7, gy + 7) < 0.5) ? 'rgba(14,12,10,0.5)' : 'rgba(74,69,60,0.5)';
+        ctx.fillRect(gx * cell + 1, gy * cell + 1, 9, 9);
+        quad[q]++;
+      }
+    }
+  }
+  return { cells: cols * rows, quad: quad };
+}
+
+function drawMark(m, u) {
+  var p = markPos(m);
+  var sway = 0.05 * Math.sin(2 * Math.PI * u / LOOP + m.ph);
+  ctx.save();
+  ctx.translate(p.x, p.y);
+  ctx.rotate(sway);
+  ctx.strokeStyle = '#cfc8b8';
+  ctx.lineWidth = 2;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(0, -13);
+  ctx.lineTo(0, 13);
+  ctx.moveTo(0, -6);
+  ctx.lineTo(-9, 0);
+  ctx.moveTo(0, -6);
+  ctx.lineTo(9, 0);
+  ctx.moveTo(0, 13);
+  ctx.lineTo(-7, 26);
+  ctx.moveTo(0, 13);
+  ctx.lineTo(7, 26);
+  ctx.stroke();
+  ctx.restore();
+  return p;
+}
+
+function draw(t) {
+  size();
+  lastT = t;
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  var u = ((t % LOOP) + LOOP) % LOOP;
+
+  ctx.fillStyle = '#2a2622';
+  ctx.fillRect(0, 0, W, H);
+
+  var grain = drawGrain();
+
+  // The dividing line: barely visible, full height. Messages cross it,
+  // marks never do (marks are placed far from it and never move).
+  ctx.fillStyle = 'rgba(58,53,46,0.8)';
+  ctx.fillRect(Math.round(W * 0.5), 0, 1, H);
+
+  var marks = [];
+  var all = leftMarks.concat(rightMarks);
+  for (var i = 0; i < all.length; i++) {
+    var p = drawMark(all[i], u);
+    marks.push({ id: all[i].id, x: p.x, y: p.y, side: all[i].id.charAt(0) });
+  }
+
+  var msg = messageAt(t);
+  var hookMsg = null;
+  if (msg) {
+    // Afterimages: stored past positions, fading with age. Never a fade
+    // wash over the frame; each trail rect is drawn explicitly.
+    var trail = [];
+    var steps = [[0.08, 0.35], [0.16, 0.22], [0.24, 0.12]];
+    for (var j = 0; j < steps.length; j++) {
+      var pp = msg.p - steps[j][0];
+      if (pp > 0) {
+        var tx = msg.sx + (msg.rx - msg.sx) * pp;
+        var ty = msg.sy + (msg.ry - msg.sy) * pp;
+        ctx.fillStyle = 'rgba(90,83,72,' + steps[j][1] + ')';
+        ctx.fillRect(tx - 7, ty - 4, 14, 8);
+        trail.push({ x: tx, y: ty, a: steps[j][1] });
+      }
+    }
+    ctx.fillStyle = '#e8b04b';
+    ctx.fillRect(msg.x - 7, msg.y - 4, 14, 8);
+    hookMsg = { k: msg.k, p: msg.p, x: msg.x, y: msg.y, dir: msg.dir, sender: msg.sender, receiver: msg.receiver, trail: trail };
+  }
+  lastMsg = msg;
+  lastMarks = marks;
+
+  if (typeof window !== 'undefined') {
+    window.__t31 = {
+      t: t, loop: LOOP, dividerX: W * 0.5,
+      marks: marks, message: hookMsg,
+      grainCells: grain.cells, grainQuad: grain.quad
+    };
+  }
+}
+
+function dist(ax, ay, bx, by) {
+  var dx = ax - bx, dy = ay - by;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
+var openHurry = null;
+function onDown(e) {
+  size();
+  var x = e.clientX, y = e.clientY;
+  if (lastMsg && dist(x, y, lastMsg.x, lastMsg.y) <= 26) {
+    if (!openHurry) {
+      openHurry = { k: lastMsg.k, t0: lastT, t1: null };
+      hurrySessions.push(openHurry);
+    }
+  } else {
+    for (var i = 0; i < lastMarks.length; i++) {
+      if (dist(x, y, lastMarks[i].x, lastMarks[i].y) <= 26) {
+        delayEvents.push({ mark: lastMarks[i].id, time: lastT });
+        break;
+      }
+    }
+  }
+  if (e.preventDefault) e.preventDefault();
+}
+function onUp() {
+  if (openHurry) { openHurry.t1 = lastT; openHurry = null; }
+}
+canvas.addEventListener('pointerdown', onDown);
+canvas.addEventListener('pointermove', function () {});
+canvas.addEventListener('pointerup', onUp);
+canvas.addEventListener('pointercancel', onUp);
+if (typeof window !== 'undefined') {
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', size);
+  }
+  if (window.addEventListener) window.addEventListener('resize', size);
+}
+
+var startT = null;
+function loop(ts) {
+  if (startT === null) startT = ts;
+  draw((ts - startT) / 1000);
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+}
+draw(0);
+if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

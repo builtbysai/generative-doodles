@@ -1,0 +1,589 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Costume Changes the Bearer</title>
+<style>
+html, body { margin: 0; padding: 0; background: #121014; overflow: hidden; }
+canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+'use strict';
+
+// Seeded PRNG (mulberry32). No unseeded randomness anywhere.
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    var t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+var rand = mulberry32(1530000);
+
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+
+// Loop = 180 s. The arc replays each loop: wander, pickup, circle, exchange.
+// Within one loop a decoration is never removed, only exchanged; the loop
+// boundary is the film-loop restart, exactly like every other loop piece.
+var LOOP = 180;
+var TRANS = 6;        // seconds to blend from pickup point onto the circle
+var BUMP_W = 10;      // seconds of approach pull toward the pickup piece
+var BERTH_R = 90;     // px (at reference 720 field) inside which undecorated
+                      // marks are pushed away from decorated marks
+var CONTACT = 30;     // px (at reference 720 field) for a decorated meeting
+var DRAG_BACK = 3;    // seconds to blend a released mark back to its circle
+var SPRING_BACK = 1.2;// seconds for a dropped piece to return home
+
+var W = 0, H = 0, phone = false;
+var fieldX = 0, fieldY = 0, fieldW = 0, fieldH = 0;
+
+function size() {
+  var vw, vh;
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.width) {
+    vw = window.visualViewport.width; vh = window.visualViewport.height;
+  } else if (typeof window !== 'undefined' && window.innerWidth) {
+    vw = window.innerWidth; vh = window.innerHeight;
+  } else { vw = 720; vh = 720; }
+  if (vw !== W || vh !== H) {
+    W = vw; H = vh;
+    canvas.width = W; canvas.height = H;
+  }
+  var sw = W, sh = H;
+  if (typeof window !== 'undefined' && window.screen) {
+    if (window.screen.width) sw = window.screen.width;
+    if (window.screen.height) sh = window.screen.height;
+  }
+  phone = (Math.min(sw, sh) < 700) || (H > W * 1.15);
+  if (phone) { fieldX = 0; fieldY = 0; fieldW = W; fieldH = H; }
+  else {
+    var side = Math.min(W, H);
+    fieldX = (W - side) / 2; fieldY = (H - side) / 2; fieldW = side; fieldH = side;
+  }
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+}
+
+function minDim() { return Math.min(fieldW, fieldH); }
+function wrapU(t) { var u = t % LOOP; if (u < 0) u += LOOP; return u; }
+function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+function smooth(s) { s = clamp(s, 0, 1); return s * s * (3 - 2 * s); }
+
+// Costume pieces: scattered, never clustered (seeded rejection sampling).
+// Piece i is the piece mark i picks up on schedule.
+var PIECE_TYPES = ['disc', 'rosette', 'streamer'];
+var PIECE_COLORS = ['#c23b2a', '#c9a86a', '#d8d8d8'];
+var pieces = [];
+(function () {
+  var placed = [];
+  for (var i = 0; i < 6; i++) {
+    var fx = 0.5, fy = 0.5, ok = false, tries = 0;
+    while (!ok && tries < 300) {
+      tries++;
+      fx = 0.12 + rand() * 0.76; fy = 0.15 + rand() * 0.70; ok = true;
+      for (var k = 0; k < placed.length; k++) {
+        var dx = fx - placed[k].fx, dy = fy - placed[k].fy;
+        if (dx * dx + dy * dy < 0.12 * 0.12) { ok = false; break; }
+      }
+    }
+    placed.push({ fx: fx, fy: fy });
+    pieces.push({ fx: fx, fy: fy, type: PIECE_TYPES[i % 3], color: PIECE_COLORS[(i + 1) % 3] });
+  }
+})();
+
+// Marks: closed-form wander (sums of sines with whole cycles per loop, so
+// every wander path is exactly periodic). Pickup times are a seeded
+// timetable, staggered; the approach bump below makes each mark visibly
+// touch its piece at its pickup time.
+var marks = [];
+(function () {
+  for (var i = 0; i < 6; i++) {
+    marks.push({
+      homeX: 0.20 + rand() * 0.60, homeY: 0.22 + rand() * 0.56,
+      ax: 0.08 + rand() * 0.04, ay: 0.06 + rand() * 0.04,
+      kx: 1 + Math.floor(rand() * 3), ky: 1 + Math.floor(rand() * 2),
+      px: rand() * Math.PI * 2, py: rand() * Math.PI * 2,
+      pickup: 18 + i * 18 + Math.floor(rand() * 11) - 5,
+      circleK: (i % 2 === 0) ? 1 : 3,
+      circlePh: rand() * Math.PI * 2,
+      ringOff: i * 0.0125
+    });
+  }
+})();
+
+// The shared circle centres on the first pickup point (piece 0's home).
+// The circle forms where the first gathering happens, never at a fixed
+// stage spot.
+function circleCentre() {
+  return { x: fieldX + pieces[0].fx * fieldW, y: fieldY + pieces[0].fy * fieldH };
+}
+function circleRadius(i) { return 0.16 * minDim() + marks[i].ringOff * minDim(); }
+
+function basePos(m, t) {
+  var u = wrapU(t);
+  return {
+    x: fieldX + (m.homeX + m.ax * Math.sin(2 * Math.PI * m.kx * u / LOOP + m.px)) * fieldW,
+    y: fieldY + (m.homeY + m.ay * Math.sin(2 * Math.PI * m.ky * u / LOOP + m.py)) * fieldH
+  };
+}
+
+// Raised-cosine approach pull: 1 exactly at the pickup time, 0 outside a
+// 10 s window, smooth at the edges. Guarantees the mark touches its piece.
+function bumpW(m, t) {
+  var u = wrapU(t);
+  var d = Math.abs(u - m.pickup);
+  if (d > LOOP / 2) d = LOOP - d;
+  if (d >= BUMP_W) return 0;
+  return 0.5 * (1 + Math.cos(Math.PI * d / BUMP_W));
+}
+
+function pieceHome(p) {
+  return { x: fieldX + p.fx * fieldW, y: fieldY + p.fy * fieldH };
+}
+
+// Recorded interaction events. Everything below is a closed-form function
+// of piece time and these logs, never frame-integrated state.
+var dragState = null;      // { kind: 'piece'|'mark', index, x, y }
+var dressEvents = [];      // { mark, piece, time }
+var markReleases = {};     // mark -> { time, fx, fy } (fractions)
+var pieceReleases = {};    // piece -> { time, fx, fy } (fractions)
+var lastT = 0;
+
+function dressOf(mark) {
+  for (var d = 0; d < dressEvents.length; d++) {
+    if (dressEvents[d].mark === mark) return dressEvents[d];
+  }
+  return null;
+}
+
+// Is mark i decorated at piece time t?
+function isDecorated(i, t) {
+  var dr = dressOf(i);
+  if (dr && t >= dr.time) return true;
+  return wrapU(t) >= marks[i].pickup;
+}
+
+// Circle point for mark i at piece time t. For a schedule-decorated mark
+// the angle runs on loop-local time; for a drag-dressed mark it runs from
+// the dress time. Both are closed-form.
+function circlePoint(i, t) {
+  var m = marks[i];
+  var dr = dressOf(i);
+  var teff = (dr && t >= dr.time) ? (t - dr.time) : (wrapU(t) - m.pickup);
+  var th = m.circlePh + (2 * Math.PI * m.circleK / LOOP) * (teff - TRANS);
+  var c = circleCentre();
+  var r = circleRadius(i);
+  return { x: c.x + r * Math.cos(th), y: c.y + r * Math.sin(th), th: th };
+}
+
+// Position of a decorated mark, ignoring any active drag.
+function decoratedPos(i, t) {
+  var m = marks[i];
+  var dr = dressOf(i);
+  if (dr && t >= dr.time) {
+    if (t < dr.time + TRANS) {
+      var s = smooth((t - dr.time) / TRANS);
+      var start = wanderPos(i, dr.time);
+      var cp = circlePoint(i, t);
+      return { x: start.x + s * (cp.x - start.x), y: start.y + s * (cp.y - start.y), th: cp.th };
+    }
+    return circlePoint(i, t);
+  }
+  var u = wrapU(t);
+  if (u < m.pickup + TRANS) {
+    var s2 = smooth((u - m.pickup) / TRANS);
+    var home = pieceHome(pieces[i]);
+    var cp2 = circlePoint(i, t);
+    return { x: home.x + s2 * (cp2.x - home.x), y: home.y + s2 * (cp2.y - home.y), th: cp2.th };
+  }
+  return circlePoint(i, t);
+}
+
+// Wandering position: base path, pulled to the piece at pickup time, and
+// pushed away from decorated marks (wide berth), with the push fading out
+// exactly as the approach pull takes over so the pickup touch is exact.
+function wanderPos(i, t) {
+  var m = marks[i];
+  var base = basePos(m, t);
+  var bw = bumpW(m, t);
+  var home = pieceHome(pieces[i]);
+  var baseAtPickup = basePos(m, m.pickup);
+  var x = base.x + bw * (home.x - baseAtPickup.x);
+  var y = base.y + bw * (home.y - baseAtPickup.y);
+  var pushX = 0, pushY = 0;
+  for (var j = 0; j < 6; j++) {
+    if (j === i) continue;
+    if (!isDecorated(j, t)) continue;
+    var dj = markPos(j, t);
+    var dx = x - dj.x, dy = y - dj.y;
+    var d = Math.sqrt(dx * dx + dy * dy);
+    if (d < BERTH_R * minDim() / 720 && d > 0.001) {
+      var f = 1 - d / (BERTH_R * minDim() / 720);
+      var strength = 70 * (minDim() / 720) * f * f;
+      pushX += dx / d * strength;
+      pushY += dy / d * strength;
+    }
+  }
+  var mag = Math.sqrt(pushX * pushX + pushY * pushY);
+  var cap = 85 * minDim() / 720;
+  if (mag > cap) { pushX = pushX / mag * cap; pushY = pushY / mag * cap; }
+  x += (1 - bw) * pushX;
+  y += (1 - bw) * pushY;
+  return { x: x, y: y };
+}
+
+// Full position of mark i at piece time t, including drags.
+function markPos(i, t) {
+  if (dragState && dragState.kind === 'mark' && dragState.index === i) {
+    return { x: dragState.x, y: dragState.y, dragged: true };
+  }
+  if (isDecorated(i, t)) {
+    var rel = markReleases[i];
+    if (rel && t >= rel.time && t < rel.time + DRAG_BACK) {
+      var s = smooth((t - rel.time) / DRAG_BACK);
+      var rx = fieldX + rel.fx * fieldW, ry = fieldY + rel.fy * fieldH;
+      var cp = circlePoint(i, t);
+      return { x: rx + s * (cp.x - rx), y: ry + s * (cp.y - ry), th: cp.th, blending: true };
+    }
+    var dp = decoratedPos(i, t);
+    dp.blending = false;
+    return dp;
+  }
+  var wp = wanderPos(i, t);
+  wp.blending = false;
+  return wp;
+}
+
+// Schedule-only worn state at loop-local time u: replay of pickups and
+// exchanges. Periodic by construction; used whenever no dress exists.
+function schedWorn(u) {
+  var worn = [-1, -1, -1, -1, -1, -1];
+  var evs = [];
+  for (var i = 0; i < 6; i++) evs.push({ time: marks[i].pickup, kind: 'pickup', mark: i, piece: i });
+  for (var e = 0; e < exchanges.length; e++) evs.push({ time: exchanges[e].t, kind: 'swap', a: exchanges[e].a, b: exchanges[e].b });
+  evs.sort(function (a, b) { return a.time - b.time; });
+  for (var k = 0; k < evs.length; k++) {
+    var ev = evs[k];
+    if (ev.time > u) break;
+    if (ev.kind === 'pickup') {
+      if (worn[ev.mark] === -1) worn[ev.mark] = ev.piece;
+    } else {
+      if (worn[ev.a] !== -1 && worn[ev.b] !== -1) {
+        var tmp = worn[ev.a]; worn[ev.a] = worn[ev.b]; worn[ev.b] = tmp;
+      }
+    }
+  }
+  return worn;
+}
+
+// Worn state at piece time t. With no dress events this is exactly the
+// periodic schedule state; with dresses, a full absolute replay from time
+// zero (schedule events expanded per cycle plus dress events, in order),
+// which is deterministic given the recorded event log.
+function wornAt(t) {
+  if (dressEvents.length === 0) return schedWorn(wrapU(t));
+  var worn = [-1, -1, -1, -1, -1, -1];
+  var evs = [];
+  var cycles = Math.floor(t / LOOP) + 1;
+  for (var c = 0; c < cycles; c++) {
+    for (var i = 0; i < 6; i++) {
+      var at = c * LOOP + marks[i].pickup;
+      if (at <= t) evs.push({ time: at, kind: 'pickup', mark: i, piece: i });
+    }
+    for (var e = 0; e < exchanges.length; e++) {
+      var at2 = c * LOOP + exchanges[e].t;
+      if (at2 <= t) evs.push({ time: at2, kind: 'swap', a: exchanges[e].a, b: exchanges[e].b });
+    }
+  }
+  for (var d = 0; d < dressEvents.length; d++) {
+    if (dressEvents[d].time <= t) evs.push({ time: dressEvents[d].time, kind: 'dress', mark: dressEvents[d].mark, piece: dressEvents[d].piece });
+  }
+  evs.sort(function (a, b) { return a.time - b.time; });
+  for (var k = 0; k < evs.length; k++) {
+    var ev = evs[k];
+    if (ev.kind === 'pickup' || ev.kind === 'dress') {
+      var owner = -1;
+      for (var m2 = 0; m2 < 6; m2++) if (worn[m2] === ev.piece) owner = m2;
+      if (worn[ev.mark] === -1 && owner === -1) worn[ev.mark] = ev.piece;
+    } else {
+      if (worn[ev.a] !== -1 && worn[ev.b] !== -1) {
+        var tmp2 = worn[ev.a]; worn[ev.a] = worn[ev.b]; worn[ev.b] = tmp2;
+      }
+    }
+  }
+  return worn;
+}
+
+// Exchange schedule: sample the natural choreography (reference 720 field)
+// for decorated pairs coming within contact range. Deterministic.
+var exchanges = [];
+(function computeExchanges() {
+  var saveX = fieldX, saveY = fieldY, saveW = fieldW, saveH = fieldH;
+  fieldX = 0; fieldY = 0; fieldW = 720; fieldH = 720;
+  var lastPair = {};
+  for (var t = 0.25; t < LOOP; t += 0.25) {
+    for (var i = 0; i < 6; i++) {
+      for (var j = i + 1; j < 6; j++) {
+        var key = i + ':' + j;
+        if (lastPair[key] !== undefined && t - lastPair[key] < 20) continue;
+        if (!isDecorated(i, t) || !isDecorated(j, t)) continue;
+        if (wrapU(t) < marks[i].pickup + TRANS || wrapU(t) < marks[j].pickup + TRANS) continue;
+        var pi = markPos(i, t), pj = markPos(j, t);
+        var dx = pi.x - pj.x, dy = pi.y - pj.y;
+        if (dx * dx + dy * dy < CONTACT * CONTACT) {
+          exchanges.push({ t: t, a: i, b: j });
+          lastPair[key] = t;
+        }
+      }
+    }
+  }
+  fieldX = saveX; fieldY = saveY; fieldW = saveW; fieldH = saveH;
+})();
+
+// Field position of an unclaimed piece at piece time t (with spring-back).
+function pieceFieldPos(p, t) {
+  var rel = pieceReleases[p];
+  if (rel && t >= rel.time && t < rel.time + SPRING_BACK) {
+    var s = smooth((t - rel.time) / SPRING_BACK);
+    var home = pieceHome(pieces[p]);
+    var rx = fieldX + rel.fx * fieldW, ry = fieldY + rel.fy * fieldH;
+    return { x: rx + s * (home.x - rx), y: ry + s * (home.y - ry) };
+  }
+  return pieceHome(pieces[p]);
+}
+
+// ---- Drawing helpers. One beginPath per glyph element; dots as filled
+// circles drawn with a single arc each, never batched arcs. ----
+
+function drawDot(x, y, r, color) {
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arc(x, y, r, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function drawPieceGlyph(type, color, x, y, u) {
+  if (type === 'disc') {
+    drawDot(x, y, u * 1.1, color);
+    drawDot(x, y, u * 0.35, '#26221e');
+  } else if (type === 'rosette') {
+    drawDot(x, y, u * 0.4, color);
+    for (var k = 0; k < 6; k++) {
+      var a = k * Math.PI / 3;
+      drawDot(x + Math.cos(a) * u * 0.95, y + Math.sin(a) * u * 0.95, u * 0.38, color);
+    }
+  } else {
+    ctx.strokeStyle = color;
+    // Explicit cap: the canvas cap state persists across draw() calls, and
+    // the marks below set round caps. Without this, the streamer tips
+    // would render with butt caps on the first frame and round caps after,
+    // so frame one would not equal later frames.
+    ctx.lineCap = 'butt';
+    ctx.lineWidth = Math.max(1.5, u * 0.22);
+    ctx.beginPath();
+    for (var s2 = -1; s2 <= 1; s2++) {
+      ctx.moveTo(x, y);
+      ctx.lineTo(x + s2 * u * 0.9, y + u * 1.6);
+    }
+    ctx.stroke();
+    drawDot(x, y, u * 0.32, color);
+  }
+}
+
+function drawMarkGlyph(x, y, u, color, stepPh, highStep, piece) {
+  ctx.strokeStyle = color;
+  ctx.lineWidth = Math.max(2, u * 0.16);
+  ctx.lineCap = 'round';
+  var liftL, liftR, bob;
+  if (highStep) {
+    liftL = Math.max(0, Math.sin(stepPh)) * u * 0.9;
+    liftR = Math.max(0, -Math.sin(stepPh)) * u * 0.9;
+    bob = Math.abs(Math.cos(stepPh)) * u * 0.12;
+  } else {
+    liftL = Math.max(0, Math.sin(stepPh)) * u * 0.4;
+    liftR = Math.max(0, -Math.sin(stepPh)) * u * 0.4;
+    bob = Math.abs(Math.cos(stepPh)) * u * 0.06;
+  }
+  var yy = y - bob;
+  ctx.beginPath();
+  ctx.moveTo(x, yy - u);
+  ctx.lineTo(x, yy + u);
+  ctx.moveTo(x, yy - u * 0.6);
+  ctx.lineTo(x - u * 0.8, yy - u * 0.2);
+  ctx.moveTo(x, yy - u * 0.6);
+  ctx.lineTo(x + u * 0.8, yy - u * 0.2);
+  ctx.moveTo(x, yy + u);
+  ctx.lineTo(x - u * 0.55, yy + u * 1.9 - liftL);
+  ctx.moveTo(x, yy + u);
+  ctx.lineTo(x + u * 0.55, yy + u * 1.9 - liftR);
+  ctx.stroke();
+  if (piece >= 0) {
+    drawPieceGlyph(pieces[piece].type, pieces[piece].color, x, yy - u * 2.3, u * 0.85);
+  }
+}
+
+function draw(t) {
+  size();
+  lastT = t;
+  var u = wrapU(t);
+  ctx.fillStyle = '#121014';
+  ctx.fillRect(0, 0, W, H);
+
+  var unit = minDim() * 0.022;
+  var worn = wornAt(t);
+  var owned = [];
+  for (var m2 = 0; m2 < 6; m2++) owned[m2] = false;
+  for (var mi = 0; mi < 6; mi++) if (worn[mi] !== -1) owned[worn[mi]] = true;
+
+  // Unclaimed costume pieces on the field (dragged piece follows pointer).
+  for (var p = 0; p < 6; p++) {
+    if (owned[p]) continue;
+    var pp;
+    if (dragState && dragState.kind === 'piece' && dragState.index === p) {
+      pp = { x: dragState.x, y: dragState.y };
+    } else {
+      pp = pieceFieldPos(p, t);
+    }
+    ctx.fillStyle = '#241f28';
+    ctx.fillRect(pp.x - unit * 1.5, pp.y + unit * 1.8, unit * 3, unit * 0.35);
+    drawPieceGlyph(pieces[p].type, pieces[p].color, pp.x, pp.y, unit * 1.3);
+  }
+
+  // Marks.
+  var hookMarks = [];
+  for (var i = 0; i < 6; i++) {
+    var pos = markPos(i, t);
+    var dec = isDecorated(i, t);
+    var color = dec ? '#e0d6c0' : '#7a7568';
+    var gait, stepPh;
+    if (pos.dragged) {
+      gait = 'plain-drag';
+      stepPh = 2 * Math.PI * 2 * u / LOOP + marks[i].px;
+    } else if (dec) {
+      gait = 'circle';
+      stepPh = (pos.th !== undefined ? pos.th : 0) * 6;
+    } else {
+      gait = 'wander';
+      stepPh = 2 * Math.PI * 2 * u / LOOP + marks[i].px;
+    }
+    ctx.fillStyle = '#241f28';
+    ctx.fillRect(pos.x - unit * 1.4, pos.y + unit * 2.1, unit * 2.8, unit * 0.35);
+    drawMarkGlyph(pos.x, pos.y, unit, color, stepPh, gait === 'circle', worn[i]);
+    hookMarks.push({
+      x: pos.x, y: pos.y, decorated: dec, circling: gait === 'circle',
+      gait: gait, color: color, piece: worn[i]
+    });
+  }
+
+  if (typeof window !== 'undefined') {
+    var hookPieces = [];
+    for (var p2 = 0; p2 < 6; p2++) {
+      var fp = pieceFieldPos(p2, t);
+      hookPieces.push({ x: fp.x, y: fp.y, claimed: owned[p2], owner: worn.indexOf(p2) });
+    }
+    var cc = circleCentre();
+    window.__t30 = {
+      marks: hookMarks,
+      pieces: hookPieces,
+      circle: { x: cc.x, y: cc.y },
+      pickupTimes: marks.map(function (mm) { return mm.pickup; }),
+      exchanges: exchanges,
+      loop: LOOP
+    };
+  }
+}
+
+function onDown(e) {
+  size();
+  var px = e.clientX, py = e.clientY;
+  var best = null, bestD = 1e9;
+  for (var p = 0; p < 6; p++) {
+    var worn = wornAt(lastT);
+    if (worn.indexOf(p) !== -1) continue;
+    var fp = pieceFieldPos(p, lastT);
+    var dx = px - fp.x, dy = py - fp.y;
+    var d = Math.sqrt(dx * dx + dy * dy);
+    if (d <= 26 && d < bestD) { best = { kind: 'piece', index: p }; bestD = d; }
+  }
+  for (var i = 0; i < 6; i++) {
+    if (!isDecorated(i, lastT)) continue;
+    var mp = markPos(i, lastT);
+    var dx2 = px - mp.x, dy2 = py - mp.y;
+    var d2 = Math.sqrt(dx2 * dx2 + dy2 * dy2);
+    if (d2 <= 30 && d2 < bestD) { best = { kind: 'mark', index: i }; bestD = d2; }
+  }
+  if (best) {
+    dragState = { kind: best.kind, index: best.index, x: px, y: py };
+    if (best.kind === 'piece') delete pieceReleases[best.index];
+    else delete markReleases[best.index];
+  }
+  if (e.preventDefault) e.preventDefault();
+}
+function onMove(e) {
+  if (dragState) {
+    size();
+    dragState.x = e.clientX;
+    dragState.y = e.clientY;
+  }
+}
+function onUp(e) {
+  if (!dragState) return;
+  var ds = dragState;
+  dragState = null;
+  if (ds.kind === 'piece') {
+    var target = -1, targetD = 1e9;
+    for (var i = 0; i < 6; i++) {
+      if (isDecorated(i, lastT)) continue;
+      var mp = markPos(i, lastT);
+      var dx = ds.x - mp.x, dy = ds.y - mp.y;
+      var d = Math.sqrt(dx * dx + dy * dy);
+      if (d <= 45 && d < targetD) { target = i; targetD = d; }
+    }
+    if (target !== -1) {
+      dressEvents.push({ mark: target, piece: ds.index, time: lastT });
+      delete pieceReleases[ds.index];
+    } else {
+      pieceReleases[ds.index] = {
+        time: lastT,
+        fx: (ds.x - fieldX) / fieldW,
+        fy: (ds.y - fieldY) / fieldH
+      };
+    }
+  } else {
+    markReleases[ds.index] = {
+      time: lastT,
+      fx: (ds.x - fieldX) / fieldW,
+      fy: (ds.y - fieldY) / fieldH
+    };
+  }
+}
+canvas.addEventListener('pointerdown', onDown);
+canvas.addEventListener('pointermove', onMove);
+canvas.addEventListener('pointerup', onUp);
+canvas.addEventListener('pointercancel', onUp);
+if (typeof window !== 'undefined') {
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', size);
+  }
+  if (window.addEventListener) window.addEventListener('resize', size);
+}
+
+var startT = null;
+function loop(ts) {
+  if (startT === null) startT = ts;
+  draw((ts - startT) / 1000);
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+}
+draw(0);
+if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
