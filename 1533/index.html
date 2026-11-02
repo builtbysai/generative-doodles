@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Coins With the Wrong King</title>
+<style>
+html, body { margin: 0; padding: 0; background: #17141c; overflow: hidden; }
+canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+'use strict';
+
+// Seeded PRNG (mulberry32). No unseeded randomness anywhere.
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    var t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+var rand = mulberry32(1533000);
+
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+
+// Loop = 180 s. Three 60 s clusters per loop. Frame one is phase-shifted
+// 20 s into the loop (loop-local 20 s): the bottom row is complete, the
+// first top disc has landed, the remaining discs are still falling.
+// Every schedule time below is a pure function of piece time, so the frame
+// at t = 180 and t = 360 is byte-identical to the frame at t = 0.
+var LOOP = 180;
+var PHASE = 20;
+var STACKED = 30;      // seconds a landed disc stays stacked before lifting
+var CLUSTER = 60;      // seconds between cluster landings per slot
+var LAND0 = 10;        // loop-local landing time of the first cluster
+var STAGGER = 1.5;     // seconds between slot landings inside a cluster
+var SLOTS = 12;        // 6 columns x 2 rows; the row never grows taller
+var COLS = 6;
+
+var W = 0, H = 0, phone = false;
+var fieldX = 0, fieldY = 0, fieldW = 0, fieldH = 0;
+
+function size() {
+  var vw, vh;
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.width) {
+    vw = window.visualViewport.width; vh = window.visualViewport.height;
+  } else if (typeof window !== 'undefined' && window.innerWidth) {
+    vw = window.innerWidth; vh = window.innerHeight;
+  } else { vw = 720; vh = 720; }
+  if (vw !== W || vh !== H) {
+    W = vw; H = vh;
+    canvas.width = W; canvas.height = H;
+  }
+  var sw = W, sh = H;
+  if (typeof window !== 'undefined' && window.screen) {
+    if (window.screen.width) sw = window.screen.width;
+    if (window.screen.height) sh = window.screen.height;
+  }
+  phone = (Math.min(sw, sh) < 700) || (H > W * 1.15);
+  if (phone) { fieldX = 0; fieldY = 0; fieldW = W; fieldH = H; }
+  else {
+    var side = Math.min(W, H);
+    fieldX = (W - side) / 2; fieldY = (H - side) / 2; fieldW = side; fieldH = side;
+  }
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+}
+
+function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+function lerp(a, b, t) { return a + (b - a) * t; }
+function sstep(t) { t = clamp(t, 0, 1); return t * t * (3 - 2 * t); }
+function mod(a, n) { var r = a % n; return r < 0 ? r + n : r; }
+
+// Per-slot seeded parameters. Slot j < 6 is the bottom row, column j;
+// slot j >= 6 is the top row, column j - 6. Landings inside a cluster run
+// bottom row first (slots 0-5), then top row (slots 6-11), so a top landing
+// always lands on top of its column's bottom disc.
+var FALL = [], SWAY_A = [], SWAY_K = [], SWAY_P = [], FD = [];
+(function () {
+  for (var j = 0; j < SLOTS; j++) {
+    FALL.push(10 + rand() * 8);
+    SWAY_A.push(6 + rand() * 8);
+    SWAY_K.push(2 + Math.floor(rand() * 3));
+    SWAY_P.push(rand() * Math.PI * 2);
+    var row = [];
+    for (var k = 0; k < 3; k++) row.push(rand() < 0.25);
+    FD.push(row);
+  }
+})();
+
+// Absolute landing time of slot j's m-th landing (m any integer).
+function landAbs(j, m) { return LAND0 + STAGGER * j - PHASE + CLUSTER * m; }
+function colOf(j) { return j % COLS; }
+function rowOf(j) { return j < COLS ? 0 : 1; }
+
+// Geometry, derived from the current field rect each draw.
+function geom() {
+  var r = Math.min(fieldW, fieldH) * 0.028;
+  var lineY = fieldY + fieldH * 0.78;
+  return { r: r, lineY: lineY };
+}
+function colX(j, g) {
+  return fieldX + fieldW * (0.15 + colOf(j) * 0.14);
+}
+function slotY(j, g) {
+  return g.lineY - g.r * (rowOf(j) === 0 ? 1 : 3);
+}
+function topY(g) { return fieldY - g.r; }
+
+// ---- Drag state: recorded events, never frame-integrated state. ----
+var lastT = 0;
+var speedSessions = [];  // {disc, grabY, moves:[{t,y}], endT|null}
+var liftEvents = [];     // {disc, time}
+var pendingLift = null;  // {disc, x, y}
+
+function multFrom(session, y) {
+  return 1 + clamp((y - session.grabY) / 150, -0.75, 1.5);
+}
+
+// ---- Modular base state (no drag events in the window). Exact, and the
+// frame at t + LOOP is identical to the frame at t by construction. ----
+function baseState(j, t, g) {
+  var u = mod(t + PHASE, LOOP);
+  for (var k = 0; k < 3; k++) {
+    var L = LAND0 + STAGGER * j + CLUSTER * k;
+    var F = L - FALL[j];
+    var U = L + STACKED;
+    var retDur = CLUSTER - FALL[j] - STACKED;
+    var dFall = mod(u - F, LOOP);
+    if (dFall < FALL[j]) {
+      var p = dFall / FALL[j];
+      return { phase: 'fall', p: p,
+        x: colX(j, g) + SWAY_A[j] * (1 - p) * Math.sin(2 * Math.PI * SWAY_K[j] * u / LOOP + SWAY_P[j]),
+        y: lerp(topY(g), slotY(j, g), p), color: 'gold', dark: false, slot: j };
+    }
+    var dStack = mod(u - L, LOOP);
+    if (dStack < STACKED) {
+      var dark = false;
+      if (j < COLS && FD[j][k] && dStack < 9) dark = true;
+      return { phase: 'stacked', p: 0, x: colX(j, g), y: slotY(j, g),
+        color: dark ? 'dark' : 'silver', dark: dark, slot: j };
+    }
+    var dRet = mod(u - U, LOOP);
+    if (dRet < retDur) {
+      var q = dRet / retDur;
+      return { phase: 'return', p: q,
+        x: colX(j, g) + SWAY_A[j] * q * Math.sin(2 * Math.PI * SWAY_K[j] * u / LOOP + SWAY_P[j]),
+        y: lerp(slotY(j, g), topY(g), q), color: 'gold', dark: false, slot: j };
+    }
+  }
+  return null;
+}
+
+// ---- Trip-list state (drag events present in the window). ----
+// A trip is {kind, key, fallStart, landing, lift, returnEnd, fd,
+// baseLanding, riseStart?}. Trips tile time: a truncated trip ends where
+// its extra trip begins, and a modified trip's return ends exactly at the
+// next surviving trip's start.
+function tripKey(tr) { return tr.kind === 'extra' ? tr.riseStart : tr.fallStart; }
+
+function buildTrips(j, t) {
+  var trips = [];
+  var m0 = Math.floor((t - 300 - (LAND0 + STAGGER * j - PHASE)) / CLUSTER) - 1;
+  var m1 = Math.ceil((t + 300 - (LAND0 + STAGGER * j - PHASE)) / CLUSTER) + 1;
+  for (var m = m0; m <= m1; m++) {
+    var L = landAbs(j, m);
+    var k = ((m % 3) + 3) % 3;
+    trips.push({ kind: 'base', m: m, fallStart: L - FALL[j], landing: L,
+      lift: L + STACKED, returnEnd: landAbs(j, m + 1) - FALL[j],
+      fd: (j < COLS) ? FD[j][k] : false, baseLanding: L });
+  }
+  trips.sort(function (a, b) { return tripKey(a) - tripKey(b); });
+
+  var evs = [];
+  for (var i = 0; i < liftEvents.length; i++) {
+    var e = liftEvents[i];
+    if (e.disc === j && e.time <= t && e.time >= t - 300) evs.push({ type: 'lift', time: e.time });
+  }
+  for (var s = 0; s < speedSessions.length; s++) {
+    var ss = speedSessions[s];
+    if (ss.disc === j && ss.start <= t && ss.start >= t - 300) evs.push({ type: 'speed', time: ss.start, s: ss });
+  }
+  evs.sort(function (a, b) { return a.time - b.time; });
+  for (var e2 = 0; e2 < evs.length; e2++) {
+    if (evs[e2].type === 'lift') applyLift(j, trips, evs[e2].time);
+    else applySpeed(j, trips, evs[e2].s, t);
+  }
+  // Face-down flip times for base trips, after all events: the first
+  // same-column top landing at or after the (possibly shifted) landing
+  // and before the lift flips a dark disc to silver.
+  for (var ti = 0; ti < trips.length; ti++) {
+    var tr = trips[ti];
+    tr.flipTime = null;
+    if (tr.kind === 'base' && tr.fd) {
+      for (var n = 0; n < 4; n++) {
+        var T = tr.baseLanding + 9 + CLUSTER * n;
+        if (T >= tr.landing && T < tr.lift) { tr.flipTime = T; break; }
+      }
+    }
+  }
+  trips.sort(function (a, b) { return tripKey(a) - tripKey(b); });
+  return trips;
+}
+
+function applyLift(j, trips, E) {
+  var idx = -1;
+  for (var i = 0; i < trips.length; i++) {
+    var tr = trips[i];
+    if (tr.kind === 'extra') {
+      if (tr.landing <= E && E < tr.lift) { idx = i; break; }
+    } else {
+      if (tr.landing <= E && E < tr.lift) { idx = i; break; }
+    }
+  }
+  if (idx < 0) return;
+  var tr0 = trips[idx];
+  tr0.lift = E;
+  tr0.returnEnd = E;
+  tr0.truncated = true;
+  var extraLift = E + 1 + FALL[j] + STACKED;
+  var rejoin = null;
+  for (var m = Math.floor((E - (LAND0 + STAGGER * j - PHASE)) / CLUSTER) - 1; ; m++) {
+    var fs = landAbs(j, m) - FALL[j];
+    if (fs >= extraLift + 2) { rejoin = fs; break; }
+  }
+  var kept = [];
+  for (var k2 = 0; k2 < trips.length; k2++) {
+    var tr2 = trips[k2];
+    if (tr2 !== tr0 && tripKey(tr2) > E && tripKey(tr2) < rejoin) continue;
+    kept.push(tr2);
+  }
+  kept.push({ kind: 'extra', riseStart: E, fallStart: E + 1,
+    landing: E + 1 + FALL[j], lift: extraLift, returnEnd: rejoin, fd: false });
+  kept.sort(function (a, b) { return tripKey(a) - tripKey(b); });
+  trips.length = 0;
+  for (var k3 = 0; k3 < kept.length; k3++) trips.push(kept[k3]);
+}
+
+function applySpeed(j, trips, s, t) {
+  var idx = -1;
+  for (var i = 0; i < trips.length; i++) {
+    var tr = trips[i];
+    if (tr.fallStart <= s.start && s.start < tr.landing) { idx = i; break; }
+  }
+  if (idx < 0) return;
+  var tr0 = trips[idx];
+  var fDur = FALL[j];
+  var cur = tr0.fallStart, mult = 1, prog = 0, landing2 = null;
+  var moves = [];
+  for (var mi = 0; mi < s.moves.length; mi++) {
+    var mv = s.moves[mi];
+    if (mv.t >= tr0.fallStart && mv.t <= t && (s.endT === null || mv.t <= s.endT)) moves.push(mv);
+  }
+  function advance(to) {
+    if (landing2 !== null) return;
+    if (to <= cur) return;
+    var d = to - cur;
+    var add = mult * d / fDur;
+    if (prog + add >= 1) { landing2 = cur + (1 - prog) * fDur / mult; prog = 1; }
+    else { prog += add; cur = to; }
+  }
+  for (var mj = 0; mj < moves.length; mj++) {
+    var mv2 = moves[mj];
+    if (mv2.t > cur) advance(Math.min(mv2.t, t));
+    if (landing2 !== null) break;
+    mult = multFrom(s, mv2.y);
+    if (mv2.t > cur) cur = mv2.t;
+  }
+  if (landing2 === null) {
+    var endT = (s.endT !== null && s.endT !== undefined) ? s.endT : t;
+    advance(Math.min(endT, t));
+    if (landing2 === null && s.endT !== null && s.endT < t) {
+      mult = 1;
+      advance(t);
+    }
+  }
+  tr0._prog = prog;
+  if (landing2 !== null && landing2 <= t) {
+    tr0.landing = landing2;
+    tr0.lift = landing2 + STACKED;
+    // Return ends at the next surviving trip's start, skipping at most
+    // one trip if the shifted lift leaves too little return time.
+    var order = trips.slice().sort(function (a, b) { return tripKey(a) - tripKey(b); });
+    var pos = order.indexOf(tr0);
+    var nxt = (pos >= 0 && pos + 1 < order.length) ? order[pos + 1] : null;
+    if (nxt && tr0.lift + 2 > tripKey(nxt)) {
+      var ni = trips.indexOf(nxt);
+      if (ni >= 0) trips.splice(ni, 1);
+      var order2 = trips.slice().sort(function (a, b) { return tripKey(a) - tripKey(b); });
+      var pos2 = order2.indexOf(tr0);
+      var nxt2 = (pos2 >= 0 && pos2 + 1 < order2.length) ? order2[pos2 + 1] : null;
+      tr0.returnEnd = nxt2 ? tripKey(nxt2) : tr0.returnEnd;
+    } else if (nxt) {
+      tr0.returnEnd = tripKey(nxt);
+    }
+  }
+}
+
+function tripState(j, trips, t, g) {
+  var u = mod(t + PHASE, LOOP);
+  for (var i = 0; i < trips.length; i++) {
+    var tr = trips[i];
+    if (tr.kind === 'extra' && tr.riseStart <= t && t < tr.fallStart) {
+      var q2 = sstep((t - tr.riseStart) / 1);
+      return { phase: 'rise', p: q2, x: colX(j, g),
+        y: lerp(slotY(j, g), topY(g), q2), color: 'gold', dark: false, slot: j };
+    }
+    if (tr.fallStart <= t && (t < tr.landing || (tr._prog !== undefined && tr._prog < 1))) {
+      var p = (tr._prog !== undefined) ? tr._prog : (t - tr.fallStart) / FALL[j];
+      p = clamp(p, 0, 1);
+      return { phase: 'fall', p: p,
+        x: colX(j, g) + SWAY_A[j] * (1 - p) * Math.sin(2 * Math.PI * SWAY_K[j] * u / LOOP + SWAY_P[j]),
+        y: lerp(topY(g), slotY(j, g), p), color: 'gold', dark: false, slot: j };
+    }
+    if (tr.landing <= t && t < tr.lift) {
+      var dark = false;
+      if (tr.kind === 'base' && tr.fd) {
+        dark = (tr.flipTime === null || t < tr.flipTime);
+      }
+      return { phase: 'stacked', p: 0, x: colX(j, g), y: slotY(j, g),
+        color: dark ? 'dark' : 'silver', dark: dark, slot: j };
+    }
+    if (tr.lift <= t && t < tr.returnEnd) {
+      var dur = tr.returnEnd - tr.lift;
+      var q = dur > 0 ? (t - tr.lift) / dur : 1;
+      q = clamp(q, 0, 1);
+      return { phase: 'return', p: q,
+        x: colX(j, g) + SWAY_A[j] * q * Math.sin(2 * Math.PI * SWAY_K[j] * u / LOOP + SWAY_P[j]),
+        y: lerp(slotY(j, g), topY(g), q), color: 'gold', dark: false, slot: j };
+    }
+  }
+  return null;
+}
+
+function stateAt(j, t, g) {
+  var hasEvents = false;
+  for (var i = 0; i < liftEvents.length; i++) {
+    if (liftEvents[i].disc === j && liftEvents[i].time <= t && liftEvents[i].time >= t - 300) { hasEvents = true; break; }
+  }
+  if (!hasEvents) {
+    for (var s = 0; s < speedSessions.length; s++) {
+      if (speedSessions[s].disc === j && speedSessions[s].start <= t && speedSessions[s].start >= t - 300) { hasEvents = true; break; }
+    }
+  }
+  if (!hasEvents) return baseState(j, t, g);
+  var trips = buildTrips(j, t);
+  return tripState(j, trips, t, g);
+}
+
+// ---- Pointer interaction. Falling discs first, then stacked discs,
+// where they overlap (a falling disc passing over the row). ----
+function hitDisc(x, y, g) {
+  var best = null, bestD = 1e9;
+  var order = ['fall', 'stacked'];
+  for (var oi = 0; oi < order.length; oi++) {
+    for (var j = 0; j < SLOTS; j++) {
+      var st = stateAt(j, lastT, g);
+      if (!st || st.phase !== order[oi]) continue;
+      var dx = st.x - x, dy = st.y - y;
+      var d = Math.sqrt(dx * dx + dy * dy);
+      if (d <= g.r * 1.6 && d < bestD) { best = { disc: j, phase: order[oi] }; bestD = d; }
+    }
+    if (best) return best;
+  }
+  return null;
+}
+
+function onDown(e) {
+  size();
+  var g = geom();
+  var hit = hitDisc(e.clientX, e.clientY, g);
+  if (!hit) return;
+  if (hit.phase === 'fall') {
+    speedSessions.push({ disc: hit.disc, grabY: e.clientY, moves: [], endT: null, start: lastT });
+  } else if (hit.phase === 'stacked') {
+    pendingLift = { disc: hit.disc, x: e.clientX, y: e.clientY };
+  }
+  if (e.preventDefault) e.preventDefault();
+}
+function onMove(e) {
+  if (pendingLift) {
+    var dx = e.clientX - pendingLift.x, dy = e.clientY - pendingLift.y;
+    if (Math.sqrt(dx * dx + dy * dy) > 5) {
+      liftEvents.push({ disc: pendingLift.disc, time: lastT });
+      pendingLift = null;
+    }
+  }
+  for (var i = 0; i < speedSessions.length; i++) {
+    var s = speedSessions[i];
+    if (s.endT === null) s.moves.push({ t: lastT, y: e.clientY });
+  }
+}
+function onUp() {
+  if (pendingLift) {
+    liftEvents.push({ disc: pendingLift.disc, time: lastT });
+    pendingLift = null;
+  }
+  for (var i = 0; i < speedSessions.length; i++) {
+    var s = speedSessions[i];
+    if (s.endT === null) s.endT = lastT;
+  }
+}
+canvas.addEventListener('pointerdown', onDown);
+canvas.addEventListener('pointermove', onMove);
+canvas.addEventListener('pointerup', onUp);
+canvas.addEventListener('pointercancel', onUp);
+if (typeof window !== 'undefined') {
+  if (window.visualViewport && window.visualViewport.addEventListener) {
+    window.visualViewport.addEventListener('resize', size);
+  }
+  if (window.addEventListener) window.addEventListener('resize', size);
+}
+
+// ---- Drawing. Canvas state set explicitly before every draw op: state
+// persists across draw() calls, so no branch may rely on another's state.
+function drawDisc(st, g) {
+  var r = g.r;
+  if (st.color === 'gold') {
+    ctx.fillStyle = '#c9a86a';
+    ctx.beginPath();
+    ctx.moveTo(st.x + r, st.y);
+    ctx.arc(st.x, st.y, r, 0, Math.PI * 2);
+    ctx.fill();
+    var dot = Math.max(1.5, r * 0.09);
+    ctx.fillStyle = '#26221e';
+    ctx.fillRect(st.x - r * 0.35 - dot, st.y - dot, dot * 2, dot * 2);
+    ctx.fillRect(st.x + r * 0.35 - dot, st.y - dot, dot * 2, dot * 2);
+  } else if (st.color === 'silver') {
+    ctx.fillStyle = '#d8d8d8';
+    ctx.beginPath();
+    ctx.moveTo(st.x + r, st.y);
+    ctx.arc(st.x, st.y, r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#26221e';
+    ctx.lineWidth = Math.max(1, r * 0.08);
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    for (var k = 0; k < 8; k++) {
+      var a = k * Math.PI / 4;
+      ctx.moveTo(st.x + Math.cos(a) * r * 0.25, st.y + Math.sin(a) * r * 0.25);
+      ctx.lineTo(st.x + Math.cos(a) * r * 0.85, st.y + Math.sin(a) * r * 0.85);
+    }
+    ctx.stroke();
+  } else {
+    ctx.fillStyle = '#2a2530';
+    ctx.beginPath();
+    ctx.moveTo(st.x + r, st.y);
+    ctx.arc(st.x, st.y, r, 0, Math.PI * 2);
+    ctx.fill();
+    var dot2 = Math.max(1.5, r * 0.09);
+    ctx.fillStyle = '#38322e';
+    ctx.fillRect(st.x - r * 0.35 - dot2, st.y - dot2, dot2 * 2, dot2 * 2);
+    ctx.fillRect(st.x + r * 0.35 - dot2, st.y - dot2, dot2 * 2, dot2 * 2);
+  }
+}
+
+function draw(t) {
+  size();
+  lastT = t;
+  var g = geom();
+  ctx.fillStyle = '#17141c';
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.strokeStyle = '#6a6258';
+  ctx.lineWidth = 2;
+  ctx.lineCap = 'butt';
+  ctx.beginPath();
+  ctx.moveTo(fieldX + fieldW * 0.06, g.lineY);
+  ctx.lineTo(fieldX + fieldW * 0.94, g.lineY);
+  ctx.stroke();
+
+  var states = [];
+  for (var j = 0; j < SLOTS; j++) {
+    var st = stateAt(j, t, g);
+    if (st) states.push(st);
+  }
+  var order = { 'stacked': 0, 'return': 1, 'rise': 1, 'fall': 2 };
+  states.sort(function (a, b) { return order[a.phase] - order[b.phase]; });
+  for (var i = 0; i < states.length; i++) drawDisc(states[i], g);
+
+  if (typeof window !== 'undefined') {
+    window.__t33 = {
+      discs: states,
+      field: { x: fieldX, y: fieldY, w: fieldW, h: fieldH },
+      tableY: g.lineY, radius: g.r
+    };
+  }
+}
+
+var startT = null;
+function loop(ts) {
+  if (startT === null) startT = ts;
+  draw((ts - startT) / 1000);
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+}
+draw(0);
+if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
