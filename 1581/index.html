@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Noise, Voronoi, Weave, Subdivide</title>
+<style>
+html, body { margin: 0; padding: 0; background: #A8A8AC; overflow: hidden; }
+canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+var TAU = Math.PI * 2;
+var GROUND = '#A8A8AC';
+var MESH = '#F2F2F2';
+var EDGE = '#2E2E2E';
+var AMBER = '#D9A441';
+var INACTIVE = '#7E7E82';
+var LOOP = 40;                      // seconds for one full pass through the stack
+var STAGES = 5;
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var VW = 0, VH = 0, lastT = 0, startT = null;
+var dragging = false, dragY = 0;
+var basePos = 0, baseT = 0;         // stack position anchor: pos = basePos + (t - baseT) * STAGES / LOOP
+
+// Icosahedron vertices: fixed authored table from the golden ratio.
+// (0, +/-1, +/-phi), (+/-1, +/-phi, 0), (+/-phi, 0, +/-1), normalized.
+var PHI = (1 + Math.sqrt(5)) / 2;
+var VERTS = (function () {
+  var raw = [
+    [0, 1, PHI], [0, 1, -PHI], [0, -1, PHI], [0, -1, -PHI],
+    [1, PHI, 0], [1, -PHI, 0], [-1, PHI, 0], [-1, -PHI, 0],
+    [PHI, 0, 1], [PHI, 0, -1], [-PHI, 0, 1], [-PHI, 0, -1]
+  ];
+  var out = [], i, v, len;
+  for (i = 0; i < raw.length; i++) {
+    v = raw[i];
+    len = Math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    out.push([v[0] / len, v[1] / len, v[2] / len]);
+  }
+  return out;
+})();
+// Icosahedron faces (20 triangles), fixed authored table.
+var FACES = [
+  [0, 8, 4], [0, 4, 6], [0, 6, 10], [0, 10, 2], [0, 2, 8],
+  [1, 4, 9], [1, 9, 3], [1, 3, 11], [1, 11, 6], [1, 6, 4],
+  [2, 10, 7], [2, 7, 5], [2, 5, 8], [3, 9, 5], [3, 5, 7],
+  [3, 7, 11], [4, 8, 9], [5, 9, 8], [6, 11, 10], [7, 10, 11]
+];
+var CHIPS = ['NOISE', 'VORONOI', 'TRIANGULATE', 'WOVEN', 'SUBDIV'];
+
+function size() {
+  var vw = 0, vh = 0;
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.width) {
+    vw = window.visualViewport.width; vh = window.visualViewport.height;
+  } else if (typeof window !== 'undefined' && window.innerWidth) {
+    vw = window.innerWidth; vh = window.innerHeight;
+  }
+  VW = vw; VH = vh;
+  canvas.width = VW; canvas.height = VH;
+  canvas.style.width = VW + 'px'; canvas.style.height = VH + 'px';
+}
+function isPhone() {
+  if (typeof window !== 'undefined' && window.screen && window.screen.width && window.screen.height) {
+    if (Math.min(window.screen.width, window.screen.height) < 700) return true;
+  }
+  return VH > VW * 1.15;
+}
+// Deterministic pseudo-noise from a vertex position: closed-form sines only.
+function noiseAt(x, y, z) {
+  return Math.sin(3.1 * x + 1.7) * Math.sin(2.7 * y + 2.3) * Math.sin(3.3 * z + 0.9);
+}
+// Stack position 0..5 at time t. Dragging freezes the auto-play; on release
+// the loop resumes from the scrubbed position.
+function stackPos(t) {
+  if (dragging) return basePos;
+  var p = basePos + (t - baseT) * STAGES / LOOP;
+  p = p - Math.floor(p / STAGES) * STAGES;
+  return p;
+}
+// Weight of modifier i (0..1): fully on once the pointer has passed it.
+function stageWeight(pos, i) {
+  var w = pos - i;
+  if (w <= 0) return 0;
+  if (w >= 1) return 1;
+  return w;
+}
+function shadeFill(nz) {
+  // Matte white shaded by face normal: 0.80 (facing away) to 1.00 (facing viewer).
+  var f = 0.80 + 0.20 * (nz * 0.5 + 0.5);
+  var v = Math.round(242 * f);
+  return 'rgb(' + v + ',' + v + ',' + v + ')';
+}
+function draw(t) {
+  lastT = t;
+  size();
+  var minDim = Math.min(VW, VH);
+  var u = minDim / 900;
+  var phone = isPhone();
+  var pos = stackPos(t);
+  var active = Math.floor(pos) % STAGES;
+  var frac = pos - Math.floor(pos);
+  var wNoise = stageWeight(pos, 0);
+  var wVor = stageWeight(pos, 1);
+  var wTri = stageWeight(pos, 2);
+  var wWeave = stageWeight(pos, 3);
+  var wSub = stageWeight(pos, 4);
+
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = GROUND;
+  ctx.fillRect(0, 0, VW, VH);
+
+  // ---- Projected icosahedron, mesh centered-right at ~65% of width ----
+  var cx = VW * (phone ? 0.58 : 0.65);
+  var cy = VH * 0.5;
+  var R = minDim * (phone ? 0.30 : 0.34);
+  // Slow fixed-phase rotation: angle is a pure function of t.
+  var ay = 0.6 + t * 0.11;
+  var ax = 0.35 + Math.sin(t * 0.05) * 0.08;
+  var cyA = Math.cos(ay), syA = Math.sin(ay), cxA = Math.cos(ax), sxA = Math.sin(ax);
+  var i, j, k;
+  // Deform + rotate + project every vertex.
+  var P = [];
+  for (i = 0; i < VERTS.length; i++) {
+    var v = VERTS[i];
+    var r = 1 + 0.13 * wNoise * noiseAt(v[0], v[1], v[2]);
+    var x = v[0] * r, y = v[1] * r, z = v[2] * r;
+    // Rotate around Y, then around X.
+    var x1 = x * cyA + z * syA;
+    var z1 = -x * syA + z * cyA;
+    var y1 = y * cxA - z1 * sxA;
+    var z2 = y * sxA + z1 * cxA;
+    var persp = 1 / (1 + z2 * 0.28);
+    P.push({
+      x: cx + x1 * R * persp,
+      y: cy + y1 * R * persp,
+      z: z2,
+      nx: x1, ny: y1, nz: z2
+    });
+  }
+  // Face list with depth, drawn far-to-near.
+  var order = [];
+  for (i = 0; i < FACES.length; i++) {
+    var f = FACES[i];
+    var mz = (P[f[0]].z + P[f[1]].z + P[f[2]].z) / 3;
+    // Face normal z from the rotated (pre-projection) positions.
+    var ux = P[f[1]].nx - P[f[0]].nx, uy = P[f[1]].ny - P[f[0]].ny, uz = P[f[1]].nz - P[f[0]].nz;
+    var vx = P[f[2]].nx - P[f[0]].nx, vy = P[f[2]].ny - P[f[0]].ny, vz = P[f[2]].nz - P[f[0]].nz;
+    var nz = ux * vy - uy * vx;
+    var nlen = Math.sqrt((uy * vz - uz * vy) * (uy * vz - uz * vy) + (uz * vx - ux * vz) * (uz * vx - ux * vz) + nz * nz);
+    nz = nlen > 0 ? nz / nlen : 0;
+    order.push({ f: f, mz: mz, nz: nz });
+  }
+  order.sort(function (a, b) { return a.mz - b.mz; });
+
+  function line(a, b) {
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x, b.y);
+    ctx.stroke();
+  }
+  function mid(a, b) {
+    return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, z: (a.z + b.z) / 2 };
+  }
+
+  for (k = 0; k < order.length; k++) {
+    var o = order[k];
+    var a = P[o.f[0]], b = P[o.f[1]], c = P[o.f[2]];
+    // Face fill: matte white, shaded by normal.
+    ctx.fillStyle = shadeFill(o.nz);
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x, b.y);
+    ctx.lineTo(c.x, c.y);
+    ctx.closePath();
+    ctx.fill();
+    // VORONOI: cell spokes from face centroid to each vertex, darkening
+    // as the stage takes over, so each face reads as a cell.
+    if (wVor > 0) {
+      var cen = { x: (a.x + b.x + c.x) / 3, y: (a.y + b.y + c.y) / 3 };
+      ctx.strokeStyle = EDGE;
+      ctx.lineWidth = Math.max(1, 1.4 * u);
+      ctx.globalAlpha = Number((0.55 * wVor).toFixed(4));
+      line(cen, a); line(cen, b); line(cen, c);
+      ctx.globalAlpha = 1;
+    }
+    // TRIANGULATE: inner triangle through the edge midpoints.
+    if (wTri > 0) {
+      var mAB = mid(a, b), mBC = mid(b, c), mCA = mid(c, a);
+      ctx.strokeStyle = EDGE;
+      ctx.lineWidth = Math.max(1, 1.1 * u);
+      ctx.globalAlpha = Number((0.85 * wTri).toFixed(4));
+      line(mAB, mBC); line(mBC, mCA); line(mCA, mAB);
+      ctx.globalAlpha = 1;
+    }
+    // WOVEN: dashed diagonals across each face, dash phase alternating
+    // by face so over/under reads as a weave.
+    if (wWeave > 0) {
+      ctx.strokeStyle = EDGE;
+      ctx.lineWidth = Math.max(1, 1.1 * u);
+      ctx.globalAlpha = Number((0.8 * wWeave).toFixed(4));
+      ctx.setLineDash([Math.max(3, 7 * u), Math.max(3, 7 * u)]);
+      ctx.lineDashOffset = (k % 2 === 0) ? 0 : Math.max(3, 7 * u);
+      var q1 = { x: a.x + (b.x - a.x) * 0.33, y: a.y + (b.y - a.y) * 0.33 };
+      var q2 = { x: a.x + (c.x - a.x) * 0.33, y: a.y + (c.y - a.y) * 0.33 };
+      line(q1, q2);
+      var q3 = { x: b.x + (c.x - b.x) * 0.33, y: b.y + (c.y - b.y) * 0.33 };
+      var q4 = { x: b.x + (a.x - b.x) * 0.33, y: b.y + (a.y - b.y) * 0.33 };
+      line(q3, q4);
+      ctx.setLineDash([]);
+      ctx.globalAlpha = 1;
+    }
+    // SUBDIV: a second level of edges, centroid to midpoints.
+    if (wSub > 0) {
+      var cen2 = { x: (a.x + b.x + c.x) / 3, y: (a.y + b.y + c.y) / 3 };
+      var sAB = mid(a, b), sBC = mid(b, c), sCA = mid(c, a);
+      ctx.strokeStyle = EDGE;
+      ctx.lineWidth = Math.max(0.75, 0.8 * u);
+      ctx.globalAlpha = Number((0.7 * wSub).toFixed(4));
+      line(cen2, sAB); line(cen2, sBC); line(cen2, sCA);
+      ctx.globalAlpha = 1;
+    }
+    // Outline: charcoal edge lines, always present.
+    ctx.strokeStyle = EDGE;
+    ctx.lineWidth = Math.max(1, 1.6 * u);
+    ctx.globalAlpha = 1;
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x, b.y);
+    ctx.lineTo(c.x, c.y);
+    ctx.closePath();
+    ctx.stroke();
+  }
+
+  // ---- Modifier chip stack down the left edge ----
+  var chipW = Math.round((phone ? 132 : 168) * u + 20);
+  var chipH = Math.round(34 * u + 8);
+  var gap = Math.round(12 * u + 4);
+  var totalH = STAGES * chipH + (STAGES - 1) * gap;
+  var chipX = Math.round(VW * 0.045);
+  var chipY0 = Math.round((VH - totalH) / 2);
+  var fs = Math.max(10, Math.round((phone ? 13 : 15) * u + 2));
+  // Rail line behind the chips.
+  ctx.strokeStyle = '#8E8E92';
+  ctx.lineWidth = Math.max(1, 1.2 * u);
+  ctx.beginPath();
+  ctx.moveTo(chipX + chipW / 2, chipY0 - gap);
+  ctx.lineTo(chipX + chipW / 2, chipY0 + totalH + gap);
+  ctx.stroke();
+  for (i = 0; i < STAGES; i++) {
+    var cyi = chipY0 + i * (chipH + gap);
+    var isActive = (i === active);
+    ctx.fillStyle = isActive ? AMBER : INACTIVE;
+    ctx.beginPath();
+    var r = Math.round(chipH * 0.28);
+    ctx.moveTo(chipX + r, cyi);
+    ctx.lineTo(chipX + chipW - r, cyi);
+    ctx.arcTo(chipX + chipW, cyi, chipX + chipW, cyi + r, r);
+    ctx.lineTo(chipX + chipW, cyi + chipH - r);
+    ctx.arcTo(chipX + chipW, cyi + chipH, chipX + chipW - r, cyi + chipH, r);
+    ctx.lineTo(chipX + r, cyi + chipH);
+    ctx.arcTo(chipX, cyi + chipH, chipX, cyi + chipH - r, r);
+    ctx.lineTo(chipX, cyi + r);
+    ctx.arcTo(chipX, cyi, chipX + r, cyi, r);
+    ctx.closePath();
+    ctx.fill();
+    // Active chip shows the blend progress as a dark underline.
+    if (isActive) {
+      ctx.fillStyle = EDGE;
+      var pw = Math.round((chipW - 16) * frac);
+      ctx.fillRect(chipX + 8, cyi + chipH - 4, pw, 2);
+    }
+    ctx.fillStyle = isActive ? EDGE : MESH;
+    ctx.font = '600 ' + fs + 'px sans-serif';
+    ctx.textBaseline = 'middle';
+    ctx.textAlign = 'center';
+    ctx.fillText(CHIPS[i], chipX + chipW / 2, cyi + chipH / 2 + 1);
+  }
+  ctx.textAlign = 'left';
+  if (typeof window !== 'undefined') {
+    window.__p1581 = {
+      t: t, stackPos: pos, active: active, phone: phone,
+      weights: [wNoise, wVor, wTri, wWeave, wSub]
+    };
+  }
+}
+function onDown(e) {
+  dragging = true;
+  dragY = (e && typeof e.clientY === 'number') ? e.clientY : 0;
+  basePos = stackPos(lastT);
+  baseT = lastT;
+}
+function onMove(e) {
+  if (!dragging) return;
+  var y = (e && typeof e.clientY === 'number') ? e.clientY : dragY;
+  // Drag down pushes deeper into the stack, drag up unwinds.
+  basePos += (y - dragY) / (VH * 0.22);
+  if (basePos < 0) basePos = 0;
+  if (basePos >= STAGES) basePos = STAGES - 0.001;
+  dragY = y;
+  draw(lastT);
+}
+function onUp() {
+  if (!dragging) return;
+  dragging = false;
+  baseT = lastT;
+}
+if (typeof window !== 'undefined') {
+  if (window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', size);
+  if (window.addEventListener) window.addEventListener('resize', size);
+}
+if (typeof document !== 'undefined' && canvas.addEventListener) {
+  canvas.addEventListener('pointerdown', onDown);
+  canvas.addEventListener('pointermove', onMove);
+  canvas.addEventListener('pointerup', onUp);
+  canvas.addEventListener('pointercancel', onUp);
+}
+draw(0);
+function loop(ts) {
+  if (startT === null) startT = ts;
+  var t = (ts - startT) / 1000;
+  draw(t);
+  if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(loop);
+}
+if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(loop);
+</script>
+</body>
+</html>
