@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ten Thousand Small Decisions</title>
+<style>
+html, body { margin: 0; padding: 0; background: #F2E8D5; overflow: hidden; }
+canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+var TAU = Math.PI * 2;
+// Wagasa palette: vermilion, ochre, teal, black, warm cream. Rim olive.
+var PAL = ['#C63B2A', '#D9A441', '#2E7D74', '#1A1A1A', '#F2E8D5'];
+var CREAM = '#F2E8D5';
+var RIM = '#8A8B5C';
+var BASE_SEED = 1560 * 7919;
+var TAP_STEP = 104729;
+var GRID = 15;          // cells across the mask bounding square (odd: center column on axis)
+var MUTATE_P = 0.04;    // per cell, per 4 s interval
+var MUTATE_EVERY = 4;    // seconds between re-draw intervals
+var FADE = 0.8;          // crossfade seconds after an interval starts
+var SCAN_BACK = 200;     // max intervals scanned back for a cell's latest mutation
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function h32(a, b, c) {
+  var h = a | 0;
+  h = Math.imul(h ^ (b | 0), 2654435761);
+  h = Math.imul(h ^ (c | 0), 40503);
+  h ^= h >>> 13;
+  h = Math.imul(h, 0x5bd1e995);
+  h ^= h >>> 15;
+  return h >>> 0;
+}
+function rngFor(seed, cell, salt) { return mulberry32(h32(seed, cell, salt)); }
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var VW = 0, VH = 0, lastT = 0, startT = null;
+var tapCount = 0;
+function seed() { return (BASE_SEED + tapCount * TAP_STEP) | 0; }
+// ---- symmetric blob: radius profile r(theta), theta measured from the top,
+// going clockwise down the right side; left side is the exact mirror. ----
+function blobCoeffs(sd) {
+  var r = rngFor(sd, 0, 0xB10B);
+  var amp = [0.10, 0.055, 0.03, 0.018];
+  var ph = [];
+  for (var i = 0; i < 4; i++) ph.push(r() * TAU);
+  return { amp: amp, ph: ph };
+}
+function blobR(co, th) {
+  var v = 1;
+  for (var i = 0; i < 4; i++) v += co.amp[i] * Math.cos((i + 1) * th + co.ph[i]);
+  return v;
+}
+// Points for theta in [0, PI] (top to bottom down the right side), mirrored exactly.
+function blobPoints(st) {
+  var co = blobCoeffs(st.sd);
+  var right = [], left = [];
+  var SEG = 80;
+  for (var i = 0; i <= SEG; i++) {
+    var th = Math.PI * i / SEG;
+    var rr = st.R * blobR(co, th);
+    var x = rr * Math.sin(th);
+    var y = -rr * Math.cos(th) * 1.08;
+    right.push([st.cx + x, st.cy + y]);
+    left.push([st.cx - x, st.cy + y]);
+  }
+  // Full polygon: right side top->bottom, then left side bottom->top.
+  var pts = right.slice();
+  for (var j = left.length - 2; j >= 1; j--) pts.push(left[j]);
+  return pts;
+}
+function pointInPoly(pts, x, y) {
+  var inside = false;
+  for (var i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+    var xi = pts[i][0], yi = pts[i][1], xj = pts[j][0], yj = pts[j][1];
+    if (((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi)) inside = !inside;
+  }
+  return inside;
+}
+function size() {
+  var vw = 0, vh = 0;
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.width) {
+    vw = window.visualViewport.width; vh = window.visualViewport.height;
+  } else if (typeof window !== 'undefined' && window.innerWidth) {
+    vw = window.innerWidth; vh = window.innerHeight;
+  }
+  VW = vw; VH = vh;
+  canvas.width = VW; canvas.height = VH;
+  canvas.style.width = VW + 'px'; canvas.style.height = VH + 'px';
+}
+function stateAt(t) {
+  var minDim = Math.min(VW, VH);
+  return {
+    sd: seed(), cx: VW / 2, cy: VH / 2, minDim: minDim,
+    R: 0.36 * minDim, G: 0.36 * minDim * 1.28, t: t
+  };
+}
+// ---- patch library: each cell draws one flat patch, origin at cell center ----
+function drawPatch(type, rot, c1, c2, s) {
+  var h = s / 2;
+  ctx.fillStyle = PAL[c1];
+  ctx.fillRect(-h, -h, s, s);
+  ctx.fillStyle = PAL[c2];
+  ctx.strokeStyle = PAL[c2];
+  var r = rot * Math.PI / 2;
+  ctx.save();
+  ctx.rotate(r);
+  if (type === 0) {          // quarter disc in a corner
+    ctx.beginPath(); ctx.moveTo(-h, -h);
+    ctx.arc(-h, -h, s * 0.96, 0, Math.PI / 2); ctx.closePath(); ctx.fill();
+  } else if (type === 1) {   // half disc along the top edge
+    ctx.beginPath(); ctx.moveTo(-h, 0);
+    ctx.arc(0, 0, h, Math.PI, 0); ctx.closePath(); ctx.fill();
+  } else if (type === 2) {   // inset square
+    var q = s * 0.30;
+    ctx.fillRect(-q, -q, 2 * q, 2 * q);
+  } else if (type === 3) {   // right triangle, half the cell
+    ctx.beginPath(); ctx.moveTo(-h, -h); ctx.lineTo(h, -h); ctx.lineTo(-h, h);
+    ctx.closePath(); ctx.fill();
+  } else if (type === 4) {   // dot
+    ctx.beginPath(); ctx.moveTo(h * 0.32, 0);
+    ctx.arc(0, 0, h * 0.32, 0, TAU); ctx.fill();
+  } else if (type === 5) {   // diagonal split: two triangles, two colors
+    ctx.beginPath(); ctx.moveTo(-h, -h); ctx.lineTo(h, -h); ctx.lineTo(h, h);
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle = PAL[c1];
+    ctx.beginPath(); ctx.moveTo(-h, -h); ctx.lineTo(h, h); ctx.lineTo(-h, h);
+    ctx.closePath(); ctx.fill();
+  } else if (type === 6) {   // ring
+    ctx.lineWidth = Math.max(1, s * 0.12);
+    ctx.beginPath(); ctx.moveTo(h * 0.30, 0);
+    ctx.arc(0, 0, h * 0.30, 0, TAU); ctx.stroke();
+  } else if (type === 7) {   // three vertical bars
+    var w = s / 3;
+    ctx.fillRect(-h, -h, w, s);
+    ctx.fillRect(-h + 2 * w, -h, w, s);
+  } else if (type === 8) {   // plus sign
+    var a = s * 0.16;
+    ctx.fillRect(-a, -h, 2 * a, s);
+    ctx.fillRect(-h, -a, s, 2 * a);
+  } else {                   // checker 2x2
+    var m = s / 2;
+    ctx.fillRect(-h, -h, m, m);
+    ctx.fillRect(0, 0, m, m);
+  }
+  ctx.restore();
+}
+// Patch spec for a cell: base (salt 0) or the mutation at interval j (salt j+1).
+function specRaw(sd, cell, salt) {
+  var r = rngFor(sd, cell, salt);
+  var type = Math.floor(r() * 10);
+  var rot = Math.floor(r() * 4);
+  var c1 = Math.floor(r() * 5);
+  var c2 = Math.floor(r() * 5);
+  if (c2 === c1) c2 = (c2 + 1) % 5;
+  return { type: type, rot: rot, c1: c1, c2: c2 };
+}
+function specSame(a, b) {
+  return a.type === b.type && a.rot === b.rot && a.c1 === b.c1 && a.c2 === b.c2;
+}
+function mutates(sd, cell, j) { return rngFor(sd, cell, 0xAAAA + j)() < MUTATE_P; }
+// Latest mutation interval <= k for this cell, or -1. Pure function of (sd, cell, k).
+function latestMutation(sd, cell, k) {
+  var lo = Math.max(0, k - SCAN_BACK);
+  for (var j = k; j >= lo; j--) if (mutates(sd, cell, j)) return j;
+  return -1;
+}
+// Spec in force at interval k, plus the interval it was set in (-1 = base).
+function specAtInterval(sd, cell, k) {
+  var j = latestMutation(sd, cell, k);
+  if (j < 0) return { spec: specRaw(sd, cell, 0), j: -1 };
+  var sp = specRaw(sd, cell, j + 1);
+  var prev = specAtInterval(sd, cell, j - 1).spec;
+  if (specSame(sp, prev)) sp.c1 = (sp.c1 + 1) % 5;
+  return { spec: sp, j: j };
+}
+function ease(u) { u = Math.max(0, Math.min(1, u)); return u * u * (3 - 2 * u); }
+function drawCell(st, pts, cell, gx, gy, cs, mirror) {
+  var x = st.cx + (gx - (GRID - 1) / 2) * cs;
+  var y = st.cy + (gy - (GRID - 1) / 2) * cs;
+  var k = Math.floor(st.t / MUTATE_EVERY);
+  var cur = specAtInterval(st.sd, cell, k);
+  var mx = 2 * st.cx - x;
+  var isCenter = (gx === (GRID - 1) / 2);
+  function paint(spec, alpha) {
+    var a = alpha < 1 ? Math.round(alpha * 10000) / 10000 : 1;
+    if (isCenter) {
+      // A center-column cell straddles the axis: draw its right half, then
+      // mirror that half into the left half, so the cell is symmetric by
+      // construction (an unmirrored patch here would break the mask).
+      ctx.save();
+      ctx.beginPath(); ctx.rect(x, y - cs / 2, cs / 2, cs); ctx.clip();
+      ctx.translate(x, y);
+      ctx.globalAlpha = a;
+      drawPatch(spec.type, spec.rot, spec.c1, spec.c2, cs);
+      ctx.restore();
+      ctx.save();
+      ctx.beginPath(); ctx.rect(x - cs / 2, y - cs / 2, cs / 2, cs); ctx.clip();
+      ctx.translate(x, y); ctx.scale(-1, 1);
+      ctx.globalAlpha = a;
+      drawPatch(spec.type, spec.rot, spec.c1, spec.c2, cs);
+      ctx.restore();
+      return;
+    }
+    ctx.save();
+    if (mirror) { ctx.translate(mx, y); ctx.scale(-1, 1); }
+    else ctx.translate(x, y);
+    if (alpha < 1) ctx.globalAlpha = a;
+    drawPatch(spec.type, spec.rot, spec.c1, spec.c2, cs);
+    ctx.restore();
+  }
+  var intoFade = cur.j >= 0 && (st.t - MUTATE_EVERY * cur.j) < FADE;
+  if (intoFade) {
+    var prev = specAtInterval(st.sd, cell, cur.j - 1).spec;
+    paint(prev, 1);
+    paint(cur.spec, ease((st.t - MUTATE_EVERY * cur.j) / FADE));
+  } else {
+    paint(cur.spec, 1);
+  }
+  // Slow shimmer: a whisper of cream breathing over the cell, pure function of t.
+  var ph = rngFor(st.sd, cell, 0x5A11)();
+  var sh = 0.045 * (0.5 + 0.5 * Math.sin(0.7 * st.t + ph * TAU));
+  ctx.save();
+  if (mirror) { ctx.translate(mx, y); ctx.scale(-1, 1); } else ctx.translate(x, y);
+  ctx.globalAlpha = Math.round(sh * 10000) / 10000;
+  ctx.fillStyle = CREAM;
+  ctx.fillRect(-cs / 2, -cs / 2, cs, cs);
+  ctx.restore();
+}
+function traceBlob(pts) {
+  ctx.beginPath();
+  ctx.moveTo(pts[0][0], pts[0][1]);
+  for (var i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+  ctx.closePath();
+}
+function draw(t) {
+  lastT = t;
+  size();
+  var st = stateAt(t);
+  var pts = blobPoints(st);
+  ctx.fillStyle = CREAM;
+  ctx.fillRect(0, 0, VW, VH);
+  // Quilt, clipped to the blob.
+  ctx.save();
+  traceBlob(pts);
+  ctx.clip();
+  var cs = 2 * st.G / GRID;
+  var half = cs / 2;
+  for (var gy = 0; gy < GRID; gy++) {
+    for (var gx = 0; gx < GRID; gx++) {
+      var cxp = st.cx + (gx - (GRID - 1) / 2) * cs;
+      var cyp = st.cy + (gy - (GRID - 1) / 2) * cs;
+      var inside = pointInPoly(pts, cxp, cyp)
+        || pointInPoly(pts, cxp - half, cyp - half)
+        || pointInPoly(pts, cxp + half, cyp - half)
+        || pointInPoly(pts, cxp - half, cyp + half)
+        || pointInPoly(pts, cxp + half, cyp + half);
+      if (!inside) continue;
+      // Right half + center column drawn once; left half is the exact mirror
+      // of the right cell (same spec id, mirrored transform), never an
+      // independently drawn patch.
+      var cell = gy * GRID + gx;
+      if (gx >= (GRID - 1) / 2) drawCell(st, pts, cell, gx, gy, cs, false);
+      if (gx > (GRID - 1) / 2) drawCell(st, pts, cell, gx, gy, cs, true);
+    }
+  }
+  ctx.restore();
+  // Thin olive rim around the mask.
+  traceBlob(pts);
+  ctx.strokeStyle = RIM;
+  ctx.lineWidth = Math.max(1.5, 0.009 * st.minDim);
+  ctx.stroke();
+  if (typeof window !== 'undefined') {
+    window.__p1560 = {
+      seed: st.sd, tapCount: tapCount, t: t,
+      cx: st.cx, cy: st.cy, minDim: st.minDim, R: st.R,
+      interval: Math.floor(t / MUTATE_EVERY)
+    };
+  }
+}
+function onDown(e) {
+  tapCount++;
+  draw(lastT);
+  if (typeof window !== 'undefined' && window.__p1560) window.__p1560.tapCount = tapCount;
+}
+canvas.addEventListener('pointerdown', onDown);
+if (typeof window !== 'undefined') {
+  if (window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', size);
+  if (window.addEventListener) window.addEventListener('resize', size);
+}
+draw(0);
+function loop(ts) {
+  if (startT === null) startT = ts;
+  var t = (ts - startT) / 1000;
+  draw(t);
+  if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(loop);
+}
+if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(loop);
+</script>
+</body>
+</html>
