@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Entretiempos Engine</title>
+<style>
+html, body { margin: 0; padding: 0; background: #F2EDE3; overflow: hidden; }
+canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+var TAU = Math.PI * 2;
+var PAPER = '#F2EDE3';
+var INK = '#1C1A17';
+var SEED = 1632007;
+var PHASE = 8;            /* frame one piece-time (s): envelope at 0.25, normal reading */
+var TRAV_PERIOD = 48;     /* Delaunay -> wild -> Delaunay, one full traversal */
+var REVEAL_PERIOD = 24;   /* normal 0-16 s, reveal 16-24 s, then repeats */
+var REVEAL_START = 16;
+var VAN_DISSOLVE = 3;     /* vanish: dissolve 0-3 s */
+var VAN_HOLD = 0.5;       /* near-empty 3-3.5 s */
+var VAN_REPAINT = 6;      /* progressive repaint 3.5-9.5 s */
+var VAN_TOTAL = VAN_DISSOLVE + VAN_HOLD + VAN_REPAINT;
+var N_CLUSTERS = 4;
+/* Delaunay homage palette, drifting toward the wild set with the envelope. */
+var DEL = [[166, 58, 46], [192, 138, 46], [39, 64, 139], [28, 26, 23]];
+var WILD = [[31, 122, 110], [107, 74, 138], [180, 80, 42], [166, 58, 46]];
+var HATCH = [94, 43, 122]; /* violet, used only for intersection hatch strokes */
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+function lerp(a, b, k) { return a + (b - a) * k; }
+function lerpRgb(c1, c2, k) {
+  return [Math.round(lerp(c1[0], c2[0], k)), Math.round(lerp(c1[1], c2[1], k)), Math.round(lerp(c1[2], c2[2], k))];
+}
+function rgba(c, a) {
+  return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a.toFixed(4) + ')';
+}
+function rgb(c) { return 'rgb(' + c[0] + ',' + c[1] + ',' + c[2] + ')'; }
+function pad2(n) { return (n < 10 ? '0' : '') + n; }
+var PAPER_RGB = [242, 237, 227];
+var INK_RGB = [28, 26, 23];
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var VW = 0, VH = 0, lastT = 0, isPhone = false;
+var reduced = false;
+if (typeof window !== 'undefined' && window.matchMedia) {
+  try { reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (e) { reduced = false; }
+}
+function size() {
+  var vw = 0, vh = 0;
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.width) {
+    vw = window.visualViewport.width; vh = window.visualViewport.height;
+  } else if (typeof window !== 'undefined' && window.innerWidth) {
+    vw = window.innerWidth; vh = window.innerHeight;
+  }
+  VW = vw; VH = vh;
+  canvas.width = VW; canvas.height = VH;
+  canvas.style.width = VW + 'px'; canvas.style.height = VH + 'px';
+  if (typeof window !== 'undefined' && window.screen) {
+    var mn = Math.min(window.screen.width, window.screen.height);
+    isPhone = mn < 700 || (VH > VW * 1.15 && mn < 900);
+  }
+}
+/* Square composition, centred. On phones the square spans the full width;
+   the page ground is the piece's own cream in both cases. */
+function compRect() {
+  var s = isPhone ? VW : Math.min(VW, VH) * 0.96;
+  return { x: (VW - s) / 2, y: (VH - s) / 2, w: s, h: s };
+}
+/* ---- seeded ring clusters, off-centre ---- */
+/* Four seeded clusters on a jittered corner grid: guaranteed separation,
+   guaranteed off-centre, so intersections happen at cluster edges rather
+   than piling into one central mass. */
+var SLOTS = [[0.30, 0.28], [0.70, 0.30], [0.28, 0.70], [0.70, 0.70]];
+function buildClusters() {
+  var rng = mulberry32(SEED);
+  var order = [0, 1, 2, 3];
+  var i, j, tmp;
+  for (i = order.length - 1; i > 0; i--) {
+    j = Math.floor(rng() * (i + 1));
+    tmp = order[i]; order[i] = order[j]; order[j] = tmp;
+  }
+  var cls = [];
+  for (i = 0; i < N_CLUSTERS; i++) {
+    var s = SLOTS[order[i]];
+    cls.push({
+      ux: s[0] + (rng() - 0.5) * 0.08,
+      uy: s[1] + (rng() - 0.5) * 0.08,
+      R: 0.16 + 0.08 * rng(),
+      ph: rng() * TAU, ph2: rng() * TAU,
+      drift: 0.015 + 0.015 * rng()
+    });
+  }
+  return cls;
+}
+var clusters = buildClusters();
+/* ---- parameter envelope: Delaunay (0) -> wild (1) -> Delaunay ---- */
+function envAt(t) { return 0.5 - 0.5 * Math.cos(TAU * t / TRAV_PERIOD); }
+function nRings(env) { return Math.round(5 + 6 * env); }
+/* Every ring in the field at piece-time t, in fixed seeded order. */
+function ringList(t, rect) {
+  var env = envAt(t);
+  var n = nRings(env);
+  var step = lerp(0.19, 0.095, env);
+  var rings = [];
+  var k, i;
+  for (k = 0; k < clusters.length; k++) {
+    var c = clusters[k];
+    var cx = rect.x + (c.ux + c.drift * Math.sin(TAU * t / 41 + c.ph)) * rect.w;
+    var cy = rect.y + (c.uy + c.drift * Math.sin(TAU * t / 53 + c.ph2)) * rect.h;
+    var grow = 1 + 0.10 * Math.sin(TAU * t / 17 + c.ph2);
+    for (i = 0; i < n; i++) {
+      rings.push({
+        x: cx, y: cy,
+        r: c.R * (0.38 + i * step) * grow * rect.w,
+        ci: i, ck: k,
+        color: lerpRgb(DEL[i % 4], WILD[i % 4], env)
+      });
+    }
+  }
+  return rings;
+}
+/* ---- circle-circle lens polygons, hatched ---- */
+function lensPoly(a, b) {
+  var dx = b.x - a.x, dy = b.y - a.y;
+  var d = Math.sqrt(dx * dx + dy * dy);
+  if (d <= 0 || d >= a.r + b.r || d <= Math.abs(a.r - b.r)) return null;
+  var phi = Math.atan2(dy, dx);
+  var c1 = clamp((a.r * a.r + d * d - b.r * b.r) / (2 * a.r * d), -1, 1);
+  var c2 = clamp((b.r * b.r + d * d - a.r * a.r) / (2 * b.r * d), -1, 1);
+  var al1 = Math.acos(c1), al2 = Math.acos(c2);
+  var pts = [];
+  var SEG = 20, s;
+  for (s = 0; s <= SEG; s++) {
+    var an = phi - al1 + (2 * al1) * s / SEG;
+    pts.push([a.x + a.r * Math.cos(an), a.y + a.r * Math.sin(an)]);
+  }
+  for (s = SEG; s >= 0; s--) {
+    var bn = phi + Math.PI - al2 + (2 * al2) * s / SEG;
+    pts.push([b.x + b.r * Math.cos(bn), b.y + b.r * Math.sin(bn)]);
+  }
+  var area = 0, p;
+  for (p = 0; p < pts.length; p++) {
+    var q = pts[(p + 1) % pts.length];
+    area += pts[p][0] * q[1] - q[0] * pts[p][1];
+  }
+  return { pts: pts, area: Math.abs(area) / 2 };
+}
+function lensList(rings) {
+  var out = [];
+  var i, j;
+  for (i = 0; i < rings.length; i++) {
+    for (j = i + 1; j < rings.length; j++) {
+      if (rings[i].ck === rings[j].ck) continue;
+      var L = lensPoly(rings[i], rings[j]);
+      if (!L) continue;
+      out.push({ pts: L.pts, area: L.area, a: rings[i], b: rings[j] });
+    }
+  }
+  out.sort(function (p, q) { return q.area - p.area; });
+  return out;
+}
+/* ---- vanishing mode: dissolve, hold, progressive repaint ---- */
+var vanishT = null; /* piece-time the vanishing was triggered, null when idle */
+var armed = false, armedAt = 0;
+function triggerVanish(t) { if (vanishT === null) vanishT = t; }
+/* Field-wide alpha at piece-time t (1 = fully present). */
+function vanishFieldAlpha(t) {
+  if (vanishT === null) return 1;
+  var vt = t - vanishT;
+  if (vt > VAN_TOTAL) { vanishT = null; return 1; }
+  if (vt < VAN_DISSOLVE) return 1 - 0.94 * (vt / VAN_DISSOLVE);
+  if (vt < VAN_DISSOLVE + VAN_HOLD) return 0.06;
+  return 0.06 + 0.94 * ((vt - VAN_DISSOLVE - VAN_HOLD) / VAN_REPAINT);
+}
+/* Per-ring repaint alpha: rings return in fixed seeded order. */
+function ringVanishAlpha(t, idx, total) {
+  if (vanishT === null) return 1;
+  var vt = t - vanishT;
+  if (vt < VAN_DISSOLVE + VAN_HOLD) return vanishFieldAlpha(t);
+  var p = (vt - VAN_DISSOLVE - VAN_HOLD) / VAN_REPAINT;
+  var th = (idx / total) * 0.8;
+  return clamp((p * 1.3 - th) / 0.3, 0, 1);
+}
+/* ---- drawing ---- */
+function drawRings(rings, alphaMul, rect) {
+  var lw = Math.max(1, rect.w * 0.0035);
+  ctx.lineWidth = lw;
+  var i;
+  for (i = 0; i < rings.length; i++) {
+    var rg = rings[i];
+    var a = 0.9 * alphaMul * ringVanishAlpha(lastT, i, rings.length);
+    if (a <= 0.01) continue;
+    ctx.strokeStyle = rgba(rg.color, a);
+    ctx.beginPath();
+    ctx.moveTo(rg.x + rg.r, rg.y);
+    ctx.arc(rg.x, rg.y, rg.r, 0, TAU);
+    ctx.stroke();
+  }
+}
+function drawLenses(lenses, alphaMul, rect) {
+  var cap = Math.min(lenses.length, 28);
+  var spacing = Math.max(5, rect.w * 0.014);
+  var i, s;
+  for (i = 0; i < cap; i++) {
+    var L = lenses[i];
+    var a = alphaMul * Math.min(ringVanishAlpha(lastT, L.a.ci + L.a.ck * 11, 44), ringVanishAlpha(lastT, L.b.ci + L.b.ck * 11, 44));
+    if (a <= 0.01) continue;
+    var fill = lerpRgb(WILD[(L.a.ci + L.b.ci) % 3], DEL[(L.a.ci + L.b.ci) % 3], 1 - envAt(lastT));
+    ctx.fillStyle = rgba(fill, 0.10 * a);
+    ctx.beginPath();
+    ctx.moveTo(L.pts[0][0], L.pts[0][1]);
+    for (s = 1; s < L.pts.length; s++) ctx.lineTo(L.pts[s][0], L.pts[s][1]);
+    ctx.closePath();
+    ctx.fill();
+    /* Hatch: parallel diagonal strokes clipped to the lens. */
+    var x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (s = 0; s < L.pts.length; s++) {
+      if (L.pts[s][0] < x0) x0 = L.pts[s][0];
+      if (L.pts[s][0] > x1) x1 = L.pts[s][0];
+      if (L.pts[s][1] < y0) y0 = L.pts[s][1];
+      if (L.pts[s][1] > y1) y1 = L.pts[s][1];
+    }
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(L.pts[0][0], L.pts[0][1]);
+    for (s = 1; s < L.pts.length; s++) ctx.lineTo(L.pts[s][0], L.pts[s][1]);
+    ctx.closePath();
+    ctx.clip();
+    ctx.strokeStyle = rgba(HATCH, 0.5 * a);
+    ctx.lineWidth = Math.max(1, rect.w * 0.002);
+    ctx.beginPath();
+    var d0 = x0 - (y1 - y0), d1 = x1;
+    var d;
+    for (d = d0; d <= d1; d += spacing) {
+      ctx.moveTo(d, y1);
+      ctx.lineTo(d + (y1 - y0), y0);
+    }
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+function drawRevealBands(t, rect) {
+  var env = envAt(t);
+  var bandW = rect.w * 0.045;
+  var maxR = rect.w * 0.75;
+  var cx0 = rect.x + rect.w / 2, cy0 = rect.y + rect.h / 2;
+  var centers = [[cx0, cy0]];
+  var k;
+  for (k = 0; k < clusters.length; k++) {
+    var c = clusters[k];
+    centers.push([
+      rect.x + (c.ux + c.drift * Math.sin(TAU * t / 41 + c.ph)) * rect.w,
+      rect.y + (c.uy + c.drift * Math.sin(TAU * t / 53 + c.ph2)) * rect.h
+    ]);
+  }
+  var ci, r, bi = 0;
+  for (ci = 0; ci < centers.length; ci++) {
+    for (r = maxR; r > 0; r -= bandW) {
+      var col = lerpRgb(DEL[bi % 4], WILD[bi % 4], env);
+      ctx.fillStyle = rgba(col, 0.10);
+      ctx.beginPath();
+      ctx.moveTo(centers[ci][0] + r, centers[ci][1]);
+      ctx.arc(centers[ci][0], centers[ci][1], r, 0, TAU);
+      ctx.fill();
+      bi++;
+    }
+  }
+}
+function drawText(rect) {
+  var titlePx = isPhone ? 18 : 20;
+  var smallPx = isPhone ? 11 : 12;
+  var cxm = rect.x + rect.w / 2;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  ctx.font = 'bold ' + titlePx + 'px monospace';
+  var titleW = ctx.measureText('Entretiempos Engine').width;
+  ctx.font = smallPx + 'px monospace';
+  var dateW = ctx.measureText('2006 · 07 · 01').width;
+  var plateW = Math.max(titleW, dateW) + 28;
+  var plateH = titlePx + smallPx + 22;
+  var plateX = cxm - plateW / 2, plateY = rect.y + 10;
+  ctx.fillStyle = PAPER;
+  ctx.fillRect(plateX, plateY, plateW, plateH);
+  ctx.fillStyle = INK;
+  ctx.font = 'bold ' + titlePx + 'px monospace';
+  ctx.fillText('Entretiempos Engine', cxm, plateY + 8);
+  ctx.font = smallPx + 'px monospace';
+  ctx.fillStyle = rgba(INK_RGB, 0.75);
+  ctx.fillText('2006 · 07 · 01', cxm, plateY + 8 + titlePx + 4);
+  var hint = 'Press R then Y, or tap, to vanish and repaint.';
+  var hintW = ctx.measureText(hint).width;
+  var hintPlateW = hintW + 24;
+  var hintPlateH = smallPx + 14;
+  var hintPlateX = cxm - hintPlateW / 2;
+  var hintPlateY = rect.y + rect.h - hintPlateH - 10;
+  ctx.fillStyle = PAPER;
+  ctx.fillRect(hintPlateX, hintPlateY, hintPlateW, hintPlateH);
+  ctx.fillStyle = rgba(INK_RGB, 0.85);
+  ctx.fillText(hint, cxm, hintPlateY + 7);
+}
+function draw(t) {
+  lastT = t;
+  size();
+  var rect = compRect();
+  ctx.fillStyle = PAPER;
+  ctx.fillRect(0, 0, VW, VH);
+  var vanishing = vanishT !== null && (t - vanishT) <= VAN_TOTAL;
+  var reveal = !vanishing && ((t % REVEAL_PERIOD) >= REVEAL_START);
+  var fa = vanishFieldAlpha(t);
+  /* The field lives inside the square frame; nothing bleeds past it. */
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(rect.x, rect.y, rect.w, rect.h);
+  ctx.clip();
+  if (reveal) drawRevealBands(t, rect);
+  var rings = ringList(t, rect);
+  var lenses = lensList(rings);
+  drawRings(rings, reveal ? 0.35 : 1, rect);
+  drawLenses(lenses, reveal ? 0.35 : 1, rect);
+  ctx.restore();
+  if (vanishing && fa < 1) {
+    /* The dissolve/hold reads as a near-empty field: a faint cream veil
+       over the frame keeps the near-nothing state visible, not blank. */
+    ctx.fillStyle = rgba(PAPER_RGB, (1 - fa) * 0.55);
+    ctx.fillRect(rect.x, rect.y, rect.w, rect.h);
+  }
+  drawText(rect);
+}
+/* ---- interaction: R then Y, or a tap (phones have no keys) ---- */
+function onKey(e) {
+  var k = (e && e.key) || '';
+  if (k === 'r' || k === 'R') { armed = true; armedAt = lastT; return; }
+  if ((k === 'y' || k === 'Y') && armed) {
+    if (lastT - armedAt <= 5) triggerVanish(lastT);
+    armed = false;
+    return;
+  }
+  armed = false;
+}
+function onTap() { triggerVanish(lastT); }
+if (typeof canvas.addEventListener === 'function') canvas.addEventListener('pointerdown', onTap);
+if (typeof window !== 'undefined' && window.addEventListener) window.addEventListener('keydown', onKey);
+if (typeof window !== 'undefined') {
+  if (window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', size);
+  if (window.addEventListener) window.addEventListener('resize', size);
+}
+/* ---- QA hooks: ?t0=SECONDS overrides the first-phase draw,
+   ?vanish=1 triggers vanishing at piece-time 0. Not user-facing. ---- */
+function queryParam(name) {
+  if (typeof location === 'undefined' || !location.search) return null;
+  var m = location.search.match(new RegExp('[?&]' + name + '=([^&]*)'));
+  return m ? m[1] : null;
+}
+/* ---- frame one: fixed phase, deterministic ---- */
+var animT0 = PHASE;
+var startTs = null;
+size();
+var qT0 = queryParam('t0');
+if (qT0 !== null) animT0 = clamp(parseFloat(qT0) || 0, 0, 100000);
+if (queryParam('vanish') === '1') vanishT = 0;
+if (reduced) {
+  draw(animT0);
+} else {
+  draw(animT0);
+  function loop(ts) {
+    if (startTs === null) startTs = ts;
+    var t = animT0 + (ts - startTs) / 1000;
+    draw(t);
+    if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(loop);
+  }
+  if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(loop);
+}
+if (typeof global !== 'undefined') {
+  global.__piece = {
+    draw: draw, envAt: envAt, ringList: ringList, lensList: lensList,
+    clusters: clusters, triggerVanish: triggerVanish,
+    vanishFieldAlpha: vanishFieldAlpha, PHASE: PHASE
+  };
+}
+</script>
+</body>
+</html>
