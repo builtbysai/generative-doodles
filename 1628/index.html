@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fold of Mountains</title>
+<style>
+html, body { margin: 0; padding: 0; background: #0A0A0B; overflow: hidden; }
+canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+var TAU = Math.PI * 2;
+var GROUND = '#0A0A0B';
+var INK = '#E8E6DF';
+var SEED = 1628007;
+var CONTOURS = 48;    /* ridge plus 47 echoing contours below it */
+var PER_S = 2.0;      /* one contour every 2 s, left to right, plotter speed */
+var RIDGE_FRAC = 0.40; /* ridge base crosses the middle third */
+var SPACE_FRAC = 0.009; /* contour spacing, as a fraction of field height */
+/* fBm ridge: four sine octaves, amplitudes as fractions of field height,
+   frequencies in cycles across the field width. Phases are seeded once,
+   then drift on a long timescale so a second viewing shows a new fold. */
+var OCTAVES = [
+  { f: 1.5,  a: 0.085, drift: 0.004 },
+  { f: 3.2,  a: 0.050, drift: 0.007 },
+  { f: 6.5,  a: 0.028, drift: 0.011 },
+  { f: 12.0, a: 0.014, drift: 0.017 }
+];
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+function hexRgb(h) {
+  return [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
+}
+function rgba(c, a) {
+  return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a.toFixed(4) + ')';
+}
+var INK_RGB = hexRgb(INK);
+var rng = mulberry32(SEED);
+var i;
+for (i = 0; i < OCTAVES.length; i++) OCTAVES[i].p0 = rng() * TAU;
+/* Spacing noise: two slow sines so contour gaps widen and narrow along x. */
+var SPACE_NOISE = [
+  { f: 2.3, p0: rng() * TAU, drift: 0.003 },
+  { f: 5.1, p0: rng() * TAU, drift: 0.005 }
+];
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var VW = 0, VH = 0, lastT = 0, isPhone = false;
+var reduced = false;
+if (typeof window !== 'undefined' && window.matchMedia) {
+  try { reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (e) { reduced = false; }
+}
+function size() {
+  var vw = 0, vh = 0;
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.width) {
+    vw = window.visualViewport.width; vh = window.visualViewport.height;
+  } else if (typeof window !== 'undefined' && window.innerWidth) {
+    vw = window.innerWidth; vh = window.innerHeight;
+  }
+  VW = vw; VH = vh;
+  canvas.width = VW; canvas.height = VH;
+  canvas.style.width = VW + 'px'; canvas.style.height = VH + 'px';
+  if (typeof window !== 'undefined' && window.screen) {
+    var mn = Math.min(window.screen.width, window.screen.height);
+    isPhone = mn < 700 || (VH > VW * 1.15 && mn < 900);
+  }
+}
+/* Portrait field: full-bleed on phones, a centred portrait on desktop. */
+function compRect() {
+  if (isPhone) return { x: 0, y: 0, w: VW, h: VH };
+  var h = Math.min(VH * 0.96, VW * 0.96 / 0.72);
+  var w = h * 0.72;
+  return { x: (VW - w) / 2, y: (VH - h) / 2, w: w, h: h };
+}
+/* ---- ridge and contours: pure functions of (rect, t, drags) ---- */
+function ridgeDisp(u, rect, t) {
+  var d = 0, o;
+  for (o = 0; o < OCTAVES.length; o++) {
+    var oc = OCTAVES[o];
+    d += oc.a * rect.h * Math.sin(TAU * oc.f * u + oc.p0 + oc.drift * t);
+  }
+  return d;
+}
+function spacingAt(u, rect, t) {
+  var m = 1 + 0.22 * Math.sin(TAU * SPACE_NOISE[0].f * u + SPACE_NOISE[0].p0 + SPACE_NOISE[0].drift * t)
+            + 0.13 * Math.sin(TAU * SPACE_NOISE[1].f * u + SPACE_NOISE[1].p0 + SPACE_NOISE[1].drift * t);
+  return SPACE_FRAC * rect.h * m;
+}
+/* Drags persist as Gaussian bends of the ridge, in field-relative units. */
+var drags = [];
+function dragDisp(u, rect) {
+  var d = 0, g;
+  for (g = 0; g < drags.length; g++) {
+    var dg = drags[g];
+    var du = (u - dg.u) / dg.sig;
+    d += dg.amp * rect.h * Math.exp(-0.5 * du * du);
+  }
+  return d;
+}
+function contourY(k, u, rect, t) {
+  var base = rect.y + RIDGE_FRAC * rect.h;
+  var disp = ridgeDisp(u, rect, t) * (1 + k * 0.006) + dragDisp(u, rect);
+  return base + disp + k * spacingAt(u, rect, t);
+}
+function contourAlpha(k) {
+  return Math.max(0.30, 0.92 - k * 0.013);
+}
+/* Frame one: ten contours fully drawn, the eleventh half drawn, so the
+   mountain already reads as a partly-drawn fold. */
+var PHASE = 10 * PER_S + PER_S * 0.5;
+var COMPLETE_T = CONTOURS * PER_S + 0.5;
+function drawContour(k, rect, t, uptoU) {
+  var steps = 120, s;
+  var lw = Math.max(0.9, rect.w * 0.0016);
+  ctx.strokeStyle = rgba(INK_RGB, contourAlpha(k));
+  ctx.lineWidth = lw;
+  ctx.beginPath();
+  for (s = 0; s <= steps; s++) {
+    var u = (s / steps) * uptoU;
+    var x = rect.x + u * rect.w;
+    var y = contourY(k, u, rect, t);
+    if (s === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+}
+function drawGhost(k, rect, t) {
+  var steps = 120, s;
+  ctx.strokeStyle = rgba(INK_RGB, 0.05);
+  ctx.lineWidth = Math.max(0.9, rect.w * 0.0016);
+  ctx.beginPath();
+  for (s = 0; s <= steps; s++) {
+    var u = s / steps;
+    var x = rect.x + u * rect.w;
+    var y = contourY(k, u, rect, t);
+    if (s === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+}
+function draw(t) {
+  lastT = t;
+  size();
+  var rect = compRect();
+  ctx.fillStyle = GROUND;
+  ctx.fillRect(0, 0, VW, VH);
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(rect.x, rect.y, rect.w, rect.h);
+  ctx.clip();
+  var k;
+  for (k = 0; k < CONTOURS; k++) {
+    var p = clamp((t - k * PER_S) / PER_S, 0, 1);
+    if (p <= 0) { drawGhost(k, rect, t); continue; }
+    drawContour(k, rect, t, p);
+  }
+  /* The pen: a small white dot at the head of the contour being drawn,
+     with a slight mechanical wobble perpendicular to the line. */
+  var cur = Math.floor(t / PER_S);
+  if (cur < CONTOURS) {
+    var p2 = clamp((t - cur * PER_S) / PER_S, 0, 1);
+    var px = rect.x + p2 * rect.w;
+    var py = contourY(cur, p2, rect, t) + Math.sin(t * 11) * 0.7;
+    ctx.fillStyle = rgba(INK_RGB, 0.95);
+    ctx.beginPath();
+    ctx.arc(px, py, Math.max(2, rect.w * 0.004), 0, TAU);
+    ctx.fill();
+  }
+  ctx.restore();
+  /* Title block and hint sit on dark plates, so the copy reads at every
+     size. No edition line: this piece is one drawing. */
+  var titlePx = isPhone ? 18 : 20;
+  var smallPx = isPhone ? 11 : 12;
+  var cxm = rect.x + rect.w / 2;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  ctx.font = 'bold ' + titlePx + 'px monospace';
+  var titleW = ctx.measureText('Fold of Mountains').width;
+  ctx.font = smallPx + 'px monospace';
+  var dateW = ctx.measureText('2006 · 06 · 27').width;
+  var plateW = Math.max(titleW, dateW) + 28;
+  var plateH = titlePx + smallPx + 20;
+  var plateX = cxm - plateW / 2, plateY = rect.y + 10;
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  ctx.fillRect(plateX, plateY, plateW, plateH);
+  ctx.fillStyle = INK;
+  ctx.font = 'bold ' + titlePx + 'px monospace';
+  ctx.fillText('Fold of Mountains', cxm, plateY + 8);
+  ctx.font = smallPx + 'px monospace';
+  ctx.fillStyle = rgba(INK_RGB, 0.75);
+  ctx.fillText('2006 · 06 · 27', cxm, plateY + 8 + titlePx + 4);
+  var hint = 'Drag to bend the ridge.';
+  var hintW = ctx.measureText(hint).width;
+  var hintPlateW = hintW + 24;
+  var hintPlateH = smallPx + 14;
+  var hintPlateX = cxm - hintPlateW / 2;
+  var hintPlateY = rect.y + rect.h - hintPlateH - 10;
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  ctx.fillRect(hintPlateX, hintPlateY, hintPlateW, hintPlateH);
+  ctx.fillStyle = rgba(INK_RGB, 0.85);
+  ctx.fillText(hint, cxm, hintPlateY + 7);
+}
+/* ---- drag: push and pull the ridge locally; the bend persists ---- */
+var activeDrag = null, dragStartY = 0;
+function pointerPos(e) {
+  var r = compRect();
+  var x = 0, y = 0;
+  if (typeof e.clientX === 'number') { x = e.clientX; y = e.clientY; }
+  else if (e.touches && e.touches[0]) { x = e.touches[0].clientX; y = e.touches[0].clientY; }
+  return { u: clamp((x - r.x) / r.w, 0, 1), y: y };
+}
+function onDown(e) {
+  var p = pointerPos(e);
+  activeDrag = { u: p.u, amp: 0, sig: 0.07 };
+  drags.push(activeDrag);
+  dragStartY = p.y;
+  if (typeof e.preventDefault === 'function') e.preventDefault();
+}
+function onMove(e) {
+  if (!activeDrag) return;
+  var p = pointerPos(e);
+  var rect = compRect();
+  activeDrag.amp = clamp((p.y - dragStartY) / rect.h, -0.09, 0.09);
+  draw(lastT);
+}
+function onUp() { activeDrag = null; }
+if (typeof canvas.addEventListener === 'function') {
+  canvas.addEventListener('pointerdown', onDown);
+  canvas.addEventListener('pointermove', onMove);
+  canvas.addEventListener('pointerup', onUp);
+  canvas.addEventListener('pointercancel', onUp);
+}
+if (typeof window !== 'undefined') {
+  if (window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', size);
+  if (window.addEventListener) window.addEventListener('resize', size);
+}
+/* ---- frame one: fixed phase, ten contours drawn, eleventh half drawn ---- */
+size();
+draw(reduced ? COMPLETE_T : PHASE);
+if (!reduced) {
+  var startT = null;
+  function loop(ts) {
+    if (startT === null) startT = ts;
+    var t = PHASE + (ts - startT) / 1000;
+    draw(t);
+    if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(loop);
+  }
+  if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(loop);
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Disorder</title>
+<style>
+html, body { margin: 0; padding: 0; background: #2E8B84; overflow: hidden; }
+canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+var TAU = Math.PI * 2;
+var GROUND = '#2E8B84';
+var COPPER = '#C98B5E';
+var COPPER_RGB = [201, 139, 94];
+var GROUND_RGB = [46, 139, 132];
+var SEED = 1626007;
+/* Growth model: one simulation step advances a single thread agent by
+   one short segment. Frame one is pre-grown to PRE_STEPS; after that
+   the nest keeps growing slowly at RATE steps per second of piece time.
+   Old strokes hold; nothing is ever erased or re-seeded. */
+var PRE_STEPS = 60000;
+var RATE = 500;
+var MAX_AGENTS = 180;
+var MAX_SEG = 120000;
+var rng = mulberry32(SEED);
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+function smooth(k) { k = clamp(k, 0, 1); return k * k * (3 - 2 * k); }
+function rgba(c, a) {
+  return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a.toFixed(4) + ')';
+}
+/* ---- deterministic value noise for the curl field ---- */
+function hash2(ix, iy) {
+  var h = Math.imul(ix, 374761393) ^ Math.imul(iy, 668265263);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+function vnoise(x, y) {
+  var ix = Math.floor(x), iy = Math.floor(y);
+  var fx = x - ix, fy = y - iy;
+  var ux = smooth(fx), uy = smooth(fy);
+  var a = hash2(ix, iy), b = hash2(ix + 1, iy);
+  var c = hash2(ix, iy + 1), d = hash2(ix + 1, iy + 1);
+  var ab = a + (b - a) * ux, cd = c + (d - c) * ux;
+  return ab + (cd - ab) * uy;
+}
+function flowAngle(x, y) {
+  var n = vnoise(x * 0.011 + 13.7, y * 0.011 + 7.3);
+  var n2 = vnoise(x * 0.0055 + 3.1, y * 0.0055 + 9.4);
+  return (n * 2 - 1) * Math.PI * 2.2 + (n2 - 0.5) * 1.6;
+}
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var VW = 0, VH = 0, lastT = 0, isPhone = false;
+var reduced = false;
+if (typeof window !== 'undefined' && window.matchMedia) {
+  try { reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (e) { reduced = false; }
+}
+function size() {
+  var vw = 0, vh = 0;
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.width) {
+    vw = window.visualViewport.width; vh = window.visualViewport.height;
+  } else if (typeof window !== 'undefined' && window.innerWidth) {
+    vw = window.innerWidth; vh = window.innerHeight;
+  }
+  VW = vw; VH = vh;
+  canvas.width = VW; canvas.height = VH;
+  canvas.style.width = VW + 'px'; canvas.style.height = VH + 'px';
+  if (typeof window !== 'undefined' && window.screen) {
+    var mn = Math.min(window.screen.width, window.screen.height);
+    isPhone = mn < 700 || (VH > VW * 1.15 && mn < 900);
+  }
+}
+/* Field-like composition: full-bleed on phones, a centred square on
+   desktop with the page ground the same teal. */
+function compRect() {
+  if (isPhone) return { x: 0, y: 0, w: VW, h: VH };
+  var s = Math.min(VW, VH) * 0.96;
+  return { x: (VW - s) / 2, y: (VH - s) / 2, w: s, h: s };
+}
+/* ---- nest state ---- */
+var rect = { x: 0, y: 0, w: 0, h: 0 };
+var rectKey = '';
+var voids = [];      /* {x, y, r, fixed} */
+var agents = [];     /* {x, y, h, age, life, alpha, width, alive} */
+var agentCursor = 0;
+var simStep = 0;
+var segs = [];       /* flat: x1, y1, x2, y2, alpha, width */
+var dragging = false;
+var dragOffX = 0, dragOffY = 0, dragLastX = 0, dragLastY = 0;
+function inVoid(x, y, pad) {
+  var i, v;
+  for (i = 0; i < voids.length; i++) {
+    v = voids[i];
+    var dx = x - v.x, dy = y - v.y;
+    if (dx * dx + dy * dy < (v.r + pad) * (v.r + pad)) return true;
+  }
+  return false;
+}
+function spawnPoint() {
+  var x, y, tries = 0;
+  do {
+    if (rng() < 0.45) {
+      /* near the nest's edges: a random point just inside the perimeter */
+      var edge = Math.floor(rng() * 4);
+      var m = rect.w * 0.06 * rng();
+      if (edge === 0) { x = rect.x + rng() * rect.w; y = rect.y + m; }
+      else if (edge === 1) { x = rect.x + rng() * rect.w; y = rect.y + rect.h - m; }
+      else if (edge === 2) { x = rect.x + m; y = rect.y + rng() * rect.h; }
+      else { x = rect.x + rect.w - m; y = rect.y + rng() * rect.h; }
+    } else {
+      x = rect.x + rng() * rect.w;
+      y = rect.y + rng() * rect.h;
+    }
+    tries++;
+  } while (inVoid(x, y, 12) && tries < 8);
+  return { x: x, y: y };
+}
+function spawnAgent(px, py) {
+  var p = (typeof px === 'number') ? { x: px, y: py } : spawnPoint();
+  var sc = rect.w / 720;
+  var a = {
+    x: p.x, y: p.y,
+    h: rng() * TAU,
+    ox: (rng() - 0.5) * 400, oy: (rng() - 0.5) * 400,
+    age: 0,
+    life: 80 + Math.floor(rng() * 220),
+    alpha: 0.28 + rng() * 0.62,
+    width: (0.7 + rng() * 0.9) * sc,
+    alive: true
+  };
+  var i;
+  for (i = 0; i < agents.length; i++) {
+    if (!agents[i].alive) { agents[i] = a; return; }
+  }
+  if (agents.length < MAX_AGENTS) agents.push(a);
+}
+function stepAgent(a) {
+  if (!a.alive) return;
+  a.age++;
+  if (a.age > a.life) { a.alive = false; return; }
+  var sc = rect.w / 720;
+  var stepLen = rect.w * 0.0035;
+  /* follow the curl field, with a little wander; each agent samples
+     the field at its own offset, so agents do not pile onto one
+     shared streamline and rope together */
+  var fa = flowAngle(a.x + a.ox, a.y + a.oy);
+  var diff = fa - a.h;
+  while (diff > Math.PI) diff -= TAU;
+  while (diff < -Math.PI) diff += TAU;
+  a.h += diff * 0.13 + (rng() - 0.5) * 0.6;
+  /* void repulsion: bend tangentially around the rim, never cross it */
+  var i, v;
+  for (i = 0; i < voids.length; i++) {
+    v = voids[i];
+    var dx = a.x - v.x, dy = a.y - v.y;
+    var d = Math.sqrt(dx * dx + dy * dy);
+    if (d < v.r + 30 * sc) {
+      var tang = Math.atan2(dy, dx) + Math.PI / 2;
+      var tx = Math.cos(tang), ty = Math.sin(tang);
+      if (tx * Math.cos(a.h) + ty * Math.sin(a.h) < 0) { tang += Math.PI; }
+      var w = smooth((v.r + 30 * sc - d) / (30 * sc)) * 0.85;
+      var td = tang - a.h;
+      while (td > Math.PI) td -= TAU;
+      while (td < -Math.PI) td += TAU;
+      a.h += td * w;
+      if (d < v.r + 6 * sc) {
+        /* pushed back out to the rim; never allowed inside */
+        a.x = v.x + (dx / (d || 1)) * (v.r + 6 * sc);
+        a.y = v.y + (dy / (d || 1)) * (v.r + 6 * sc);
+      }
+    }
+  }
+  var nx = a.x + Math.cos(a.h) * stepLen;
+  var ny = a.y + Math.sin(a.h) * stepLen;
+  /* agents die when they cross a rim; the segment is never drawn */
+  if (inVoid(nx, ny, 2)) { a.alive = false; return; }
+  if (nx < rect.x - 2 || nx > rect.x + rect.w + 2 ||
+      ny < rect.y - 2 || ny > rect.y + rect.h + 2) {
+    a.alive = false; return;
+  }
+  if (segs.length < MAX_SEG * 6) {
+    segs.push(a.x, a.y, nx, ny, a.alpha, a.width);
+  }
+  a.x = nx; a.y = ny;
+}
+function stepOnce() {
+  var guard = 0;
+  while (guard++ < agents.length) {
+    var a = agents[agentCursor];
+    agentCursor = (agentCursor + 1) % agents.length;
+    if (a.alive) { stepAgent(a); return; }
+  }
+  if (segs.length < MAX_SEG * 6) spawnAgent();
+}
+function advanceTo(target) {
+  while (simStep < target) {
+    stepOnce();
+    simStep++;
+    if (segs.length >= MAX_SEG * 6 && agents.every(function (a) { return !a.alive; })) break;
+  }
+}
+function buildNest(r) {
+  rect = r;
+  rng = mulberry32(SEED);
+  voids = [
+    { x: r.x + r.w * 0.68, y: r.y + r.h * 0.30, r: r.w * 0.165, fixed: false },
+    { x: r.x + r.w * 0.30, y: r.y + r.h * 0.72, r: r.w * 0.095, fixed: true }
+  ];
+  agents = [];
+  agentCursor = 0;
+  simStep = 0;
+  segs = [];
+  var i;
+  for (i = 0; i < MAX_AGENTS; i++) spawnAgent();
+  advanceTo(PRE_STEPS);
+}
+function draw(t) {
+  lastT = t;
+  size();
+  var r = compRect();
+  var key = Math.round(r.w) + 'x' + Math.round(r.h);
+  if (key !== rectKey) {
+    buildNest(r);
+    rectKey = key;
+  }
+  if (!reduced) advanceTo(PRE_STEPS + Math.floor(t * RATE));
+  ctx.fillStyle = GROUND;
+  ctx.fillRect(0, 0, VW, VH);
+  /* threads, batched by alpha and width bucket so the nest replays fast */
+  var buckets = {};
+  var i, k;
+  for (i = 0; i < segs.length; i += 6) {
+    k = Math.round(segs[i + 4] * 8) + ':' + Math.round(segs[i + 5] * 4);
+    if (!buckets[k]) buckets[k] = [];
+    buckets[k].push(segs[i], segs[i + 1], segs[i + 2], segs[i + 3]);
+  }
+  ctx.lineCap = 'round';
+  for (k in buckets) {
+    var parts = k.split(':');
+    var alpha = parseInt(parts[0], 10) / 8;
+    var width = parseInt(parts[1], 10) / 4;
+    ctx.strokeStyle = rgba(COPPER_RGB, clamp(alpha, 0.05, 1));
+    ctx.lineWidth = Math.max(0.6, width);
+    ctx.beginPath();
+    var b = buckets[k];
+    for (i = 0; i < b.length; i += 4) {
+      ctx.moveTo(b[i], b[i + 1]);
+      ctx.lineTo(b[i + 2], b[i + 3]);
+    }
+    ctx.stroke();
+  }
+  /* the voids are absolute: flat ground discs drawn over everything,
+     so no thread ever reads across them */
+  for (i = 0; i < voids.length; i++) {
+    ctx.fillStyle = GROUND;
+    ctx.beginPath();
+    ctx.arc(voids[i].x, voids[i].y, voids[i].r, 0, TAU);
+    ctx.fill();
+  }
+  /* Title block and hint on dark teal plates; copy in copper, in palette. */
+  var titlePx = isPhone ? 18 : 20;
+  var smallPx = isPhone ? 11 : 12;
+  var cxm = r.x + r.w / 2;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  ctx.font = 'bold ' + titlePx + 'px monospace';
+  var titleW = ctx.measureText('Disorder').width;
+  ctx.font = smallPx + 'px monospace';
+  var dateW = ctx.measureText('2006 · 06 · 25').width;
+  var plateW = Math.max(titleW, dateW) + 28;
+  var plateH = titlePx + smallPx + 22;
+  var plateX = cxm - plateW / 2, plateY = r.y + 10;
+  ctx.fillStyle = 'rgba(16,52,48,0.55)';
+  ctx.fillRect(plateX, plateY, plateW, plateH);
+  ctx.fillStyle = COPPER;
+  ctx.font = 'bold ' + titlePx + 'px monospace';
+  ctx.fillText('Disorder', cxm, plateY + 8);
+  ctx.font = smallPx + 'px monospace';
+  ctx.fillStyle = rgba(COPPER_RGB, 0.75);
+  ctx.fillText('2006 · 06 · 25', cxm, plateY + 8 + titlePx + 4);
+  var hint = 'Drag a void through the nest.';
+  var hintW = ctx.measureText(hint).width;
+  var hintPlateW = hintW + 24;
+  var hintPlateH = smallPx + 14;
+  var hintPlateX = cxm - hintPlateW / 2;
+  var hintPlateY = r.y + r.h - hintPlateH - 10;
+  ctx.fillStyle = 'rgba(16,52,48,0.55)';
+  ctx.fillRect(hintPlateX, hintPlateY, hintPlateW, hintPlateH);
+  ctx.fillStyle = rgba(COPPER_RGB, 0.85);
+  ctx.fillText(hint, cxm, hintPlateY + 7);
+}
+/* ---- drag: grab the large void and move it; the small one is a fixed
+   anchor. Threads re-route around the rim; fresh agents spawn at the
+   trailing edge so the nest re-knits behind the void. ---- */
+function pointerPos(e) {
+  var x = e.clientX, y = e.clientY;
+  if (typeof x !== 'number') { x = e.pageX || 0; y = e.pageY || 0; }
+  return { x: x, y: y };
+}
+function onDown(e) {
+  var p = pointerPos(e);
+  var v = voids[0];
+  var dx = p.x - v.x, dy = p.y - v.y;
+  if (dx * dx + dy * dy < (v.r * 1.15) * (v.r * 1.15)) {
+    dragging = true;
+    dragOffX = p.x - v.x; dragOffY = p.y - v.y;
+    dragLastX = p.x; dragLastY = p.y;
+    if (e.preventDefault) e.preventDefault();
+  }
+}
+function onMove(e) {
+  if (!dragging) return;
+  var p = pointerPos(e);
+  var v = voids[0];
+  var mx = p.x - dragLastX, my = p.y - dragLastY;
+  dragLastX = p.x; dragLastY = p.y;
+  var nx = clamp(p.x - dragOffX, rect.x + v.r * 0.5, rect.x + rect.w - v.r * 0.5);
+  var ny = clamp(p.y - dragOffY, rect.y + v.r * 0.5, rect.y + rect.h - v.r * 0.5);
+  v.x = nx; v.y = ny;
+  /* re-knit: fresh agents at the trailing edge, just outside the rim */
+  var ml = Math.sqrt(mx * mx + my * my) || 1;
+  var tx = -mx / ml, ty = -my / ml;
+  var j;
+  for (j = 0; j < 4; j++) {
+    var ang = Math.atan2(ty, tx) + (rng() - 0.5) * 1.6;
+    spawnAgent(
+      v.x + Math.cos(ang) * (v.r + 10),
+      v.y + Math.sin(ang) * (v.r + 10)
+    );
+  }
+  advanceTo(simStep + 60);
+  draw(lastT);
+}
+function onUp() { dragging = false; }
+if (typeof canvas.addEventListener === 'function') {
+  canvas.addEventListener('pointerdown', onDown);
+  canvas.addEventListener('pointermove', onMove);
+  canvas.addEventListener('pointerup', onUp);
+  canvas.addEventListener('pointercancel', onUp);
+}
+if (typeof window !== 'undefined') {
+  if (window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', size);
+  if (window.addEventListener) window.addEventListener('resize', size);
+}
+/* ---- frame one: fixed phase, nest pre-grown to PRE_STEPS ---- */
+size();
+var rect0 = compRect();
+buildNest(rect0);
+rectKey = Math.round(rect0.w) + 'x' + Math.round(rect0.h);
+draw(0);
+if (!reduced) {
+  var startT = null;
+  function loop(ts) {
+    if (startT === null) startT = ts;
+    var t = (ts - startT) / 1000;
+    draw(t);
+    if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(loop);
+  }
+  if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(loop);
+}
+</script>
+</body>
+</html>
