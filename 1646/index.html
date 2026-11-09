@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Absorption</title>
+<style>
+html, body { margin: 0; padding: 0; background: #121417; overflow: hidden; }
+canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+var TAU = Math.PI * 2;
+var GROUND = '#121417';
+var TEAL_DARK = '#2E5A56';
+var TEAL = '#4E8A84';
+var TEAL_BRIGHT = '#7FB3AC';
+var RUST_DARK = '#6E3A22';
+var RUST = '#A96A44';
+var RUST_BRIGHT = '#D09A6E';
+var WHITE = '#F5F2EA';
+var GOLD = '#D9A441';
+var INK = '#121417';
+var PLATE = '#0C0E10';
+var HINT_INK = '#E8E2D2';
+/* The death of a gesture. You draw a mark and it lasts three seconds
+   as yours, then the system eats it, and you watch it forget you.
+   Frame one is generation 120 of the seeded field: teal and rust
+   already at war, no gesture yet. */
+var SEED_FIELD = 1646001, SEED_STEP = 1646093;
+var PRE_RUN = 120;
+var GEN_PER_SEC = 12;
+var ABSORB_SECONDS = 3;
+var TRACE_HALF_LIFE_GEN = 170; /* ~14 s at 12 gen/s, visible ~20 s */
+var DRAW_BUDGET_PER_SEC = 900;
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+function lerp(a, b, f) { return a + (b - a) * f; }
+function hexRgb(h) {
+  return [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
+}
+function rgba(c, a) {
+  return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a.toFixed(4) + ')';
+}
+var TEAL_RGB = [hexRgb(TEAL_DARK), hexRgb(TEAL), hexRgb(TEAL_BRIGHT)];
+var RUST_RGB = [hexRgb(RUST_DARK), hexRgb(RUST), hexRgb(RUST_BRIGHT)];
+var GOLD_RGB = hexRgb(GOLD);
+var WHITE_RGB = hexRgb(WHITE);
+/* Vitality-quantized fill strings, so the hot loop never builds strings. */
+var LEVELS = 8, TEAL_COLS = [], RUST_COLS = [];
+(function buildCols() {
+  var i, f, c;
+  for (i = 0; i < LEVELS; i++) {
+    f = i / (LEVELS - 1);
+    c = [Math.round(lerp(TEAL_RGB[0][0], TEAL_RGB[2][0], f)),
+         Math.round(lerp(TEAL_RGB[0][1], TEAL_RGB[2][1], f)),
+         Math.round(lerp(TEAL_RGB[0][2], TEAL_RGB[2][2], f))];
+    TEAL_COLS.push('rgb(' + c[0] + ',' + c[1] + ',' + c[2] + ')');
+    c = [Math.round(lerp(RUST_RGB[0][0], RUST_RGB[2][0], f)),
+         Math.round(lerp(RUST_RGB[0][1], RUST_RGB[2][1], f)),
+         Math.round(lerp(RUST_RGB[0][2], RUST_RGB[2][2], f))];
+    RUST_COLS.push('rgb(' + c[0] + ',' + c[1] + ',' + c[2] + ')');
+  }
+})();
+var GOLD_STEPS = 7, GOLD_COLS = [];
+(function buildGold() {
+  var i;
+  for (i = 0; i < GOLD_STEPS; i++) {
+    GOLD_COLS.push(rgba(GOLD_RGB, 0.35 + 0.65 * (i / (GOLD_STEPS - 1))));
+  }
+})();
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var VW = 0, VH = 0, isPhone = false;
+var reduced = false;
+if (typeof window !== 'undefined' && window.matchMedia) {
+  try { reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (e) { reduced = false; }
+}
+function size() {
+  var vw = 0, vh = 0;
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.width) {
+    vw = window.visualViewport.width; vh = window.visualViewport.height;
+  } else if (typeof window !== 'undefined' && window.innerWidth) {
+    vw = window.innerWidth; vh = window.innerHeight;
+  }
+  VW = vw; VH = vh;
+  canvas.width = VW; canvas.height = VH;
+  canvas.style.width = VW + 'px'; canvas.style.height = VH + 'px';
+  if (typeof window !== 'undefined' && window.screen) {
+    var mn = Math.min(window.screen.width, window.screen.height);
+    isPhone = mn < 700 || (VH > VW * 1.15 && mn < 900);
+  }
+}
+/* ---- the automaton: two species, white gestures, gold conversion ---- */
+/* Species: 0 empty, 1 teal, 2 rust, 3 white (drawn), 4 converting (gold). */
+var COLS = 0, ROWS = 0, N = 0;
+var sp, vit, age, conv, convSp, trace;
+var sp2, vit2, age2, conv2, convSp2;
+var stepRng = mulberry32(SEED_STEP);
+var TRACE_DECAY = Math.pow(0.5, 1 / TRACE_HALF_LIFE_GEN);
+/* Non-standard neighborhoods, one per species: teal reads the 8
+   Moore neighbours, rust reads 4 orthogonal plus 4 at distance two,
+   white reads the 8 Moore neighbours. */
+var OFFS_TEAL = [[-1, -1], [0, -1], [1, -1], [-1, 0], [1, 0], [-1, 1], [0, 1], [1, 1]];
+var OFFS_RUST = [[0, -1], [-1, 0], [1, 0], [0, 1], [-2, 0], [2, 0], [0, -2], [0, 2]];
+var OFFS_WHITE = OFFS_TEAL;
+function allocGrid() {
+  COLS = isPhone ? 72 : 160;
+  ROWS = Math.max(24, Math.round(COLS * VH / VW));
+  N = COLS * ROWS;
+  sp = new Uint8Array(N); vit = new Float32Array(N);
+  age = new Uint16Array(N); conv = new Uint8Array(N);
+  convSp = new Uint8Array(N); trace = new Float32Array(N);
+  sp2 = new Uint8Array(N); vit2 = new Float32Array(N);
+  age2 = new Uint16Array(N); conv2 = new Uint8Array(N);
+  convSp2 = new Uint8Array(N);
+}
+function idx(x, y) { return y * COLS + x; }
+function inGrid(x, y) { return x >= 0 && y >= 0 && x < COLS && y < ROWS; }
+function seedField() {
+  var rng = mulberry32(SEED_FIELD);
+  var b, cx, cy, r, s, x, y, dx, dy, d2, i;
+  for (b = 0; b < 34; b++) {
+    cx = Math.floor(rng() * COLS);
+    cy = Math.floor(rng() * ROWS);
+    r = 5 + Math.floor(rng() * 12);
+    s = rng() < 0.5 ? 1 : 2;
+    for (y = cy - r; y <= cy + r; y++) {
+      for (x = cx - r; x <= cx + r; x++) {
+        if (!inGrid(x, y)) continue;
+        dx = x - cx; dy = y - cy; d2 = dx * dx + dy * dy;
+        if (d2 <= r * r && rng() < 0.82) {
+          i = idx(x, y);
+          sp[i] = s;
+          vit[i] = 0.45 + rng() * 0.55;
+        }
+      }
+    }
+  }
+}
+function countFoes(x, y, offs, foeA, foeB) {
+  var n = 0, k, nx, ny, s;
+  for (k = 0; k < offs.length; k++) {
+    nx = x + offs[k][0]; ny = y + offs[k][1];
+    if (!inGrid(nx, ny)) continue;
+    s = sp[idx(nx, ny)];
+    if (s === foeA || s === foeB) n++;
+  }
+  return n;
+}
+function dominantFoe(x, y, offs) {
+  var teal = 0, rust = 0, k, nx, ny, s;
+  for (k = 0; k < offs.length; k++) {
+    nx = x + offs[k][0]; ny = y + offs[k][1];
+    if (!inGrid(nx, ny)) continue;
+    s = sp[idx(nx, ny)];
+    if (s === 1) teal++;
+    else if (s === 2) rust++;
+  }
+  return teal >= rust ? 1 : 2;
+}
+/* Growth and white proliferation run as a second pass over the
+   current state, writing only into the next buffers, so a spread
+   into a not-yet-processed cell cannot be erased by the main loop's
+   per-cell copy. */
+function spreadPass() {
+  var x, y, i, s, k, offs, nx, ny, j;
+  for (y = 0; y < ROWS; y++) {
+    for (x = 0; x < COLS; x++) {
+      i = idx(x, y);
+      s = sp[i];
+      if (s === 0 || s === 4) continue;
+      offs = s === 2 ? OFFS_RUST : OFFS_TEAL;
+      k = Math.floor(stepRng() * offs.length);
+      nx = x + offs[k][0]; ny = y + offs[k][1];
+      if (!inGrid(nx, ny)) continue;
+      j = idx(nx, ny);
+      if (sp[j] !== 0 || sp2[j] !== 0) continue;
+      if (s === 3) {
+        if (age[i] < GEN_PER_SEC && stepRng() < 0.25) {
+          sp2[j] = 3; vit2[j] = 0.9; age2[j] = 0;
+        }
+      } else if (stepRng() < 0.02) {
+        sp2[j] = s; vit2[j] = Math.max(0.1, vit[i] * 0.8);
+      }
+    }
+  }
+}
+function step() {
+  var x, y, i, j, s, v, nx, ny, ns, nv, offs, k, foe, p, ageF;
+  for (y = 0; y < ROWS; y++) {
+    for (x = 0; x < COLS; x++) {
+      i = idx(x, y);
+      s = sp[i]; v = vit[i];
+      sp2[i] = s; vit2[i] = v; age2[i] = age[i]; conv2[i] = conv[i]; convSp2[i] = convSp[i];
+      if (trace[i] > 0.002) trace[i] *= TRACE_DECAY; else trace[i] = 0;
+      if (s === 0) {
+        /* Birth: three or more neighbours of one species, few of the other. */
+        var tc = countFoes(x, y, OFFS_TEAL, 1, 1);
+        var rc = countFoes(x, y, OFFS_RUST, 2, 2);
+        if (tc >= 3 && tc > rc + 1 && stepRng() < 0.08) {
+          sp2[i] = 1; vit2[i] = 0.4;
+        } else if (rc >= 3 && rc > tc + 1 && stepRng() < 0.08) {
+          sp2[i] = 2; vit2[i] = 0.4;
+        }
+      } else if (s === 1 || s === 2) {
+        offs = s === 1 ? OFFS_TEAL : OFFS_RUST;
+        foe = s === 1 ? 2 : 1;
+        /* One sampled neighbour decides attack, assimilation, or spread. */
+        k = Math.floor(stepRng() * offs.length);
+        nx = x + offs[k][0]; ny = y + offs[k][1];
+        if (inGrid(nx, ny)) {
+          j = idx(nx, ny); ns = sp[j]; nv = vit[j];
+          if (ns === foe) {
+            if (nv > v * 1.05 && stepRng() < 0.18) {
+              /* Attack: winner absorbs the loser's vitality. */
+              sp2[i] = foe; vit2[i] = Math.min(1, nv + v * 0.5);
+            }
+          } else if (ns === s) {
+            /* Assimilate: vitality shared slightly between kin. */
+            vit2[i] = Math.min(1, (v + nv) * 0.5 * 1.01);
+          }
+        }
+        vit2[i] *= 0.999;
+        if (vit2[i] < 0.08) { sp2[i] = 0; vit2[i] = 0; }
+      } else if (s === 3) {
+        /* White, drawn: proliferate briefly, then the field eats it. */
+        age2[i] = age[i] + 1;
+        vit2[i] = Math.max(0, v - 0.02);
+        var foes = countFoes(x, y, OFFS_WHITE, 1, 2);
+        /* Slow burn, then a hard deadline: a drawn cell is yours for
+           about two seconds, nearly all are eaten by three. */
+        ageF = age[i] > 2 * GEN_PER_SEC ? (age[i] - 2 * GEN_PER_SEC) * 0.09 : 0;
+        p = 0.008 + 0.015 * foes + ageF;
+        if (vit2[i] <= 0 || stepRng() < p) {
+          /* Conversion begins: gold while the rules take hold. */
+          sp2[i] = 4; conv2[i] = 6; convSp2[i] = dominantFoe(x, y, OFFS_WHITE);
+          vit2[i] = 0.6;
+        }
+      } else if (s === 4) {
+        if (conv[i] <= 1) {
+          /* Conversion completes: the gesture is now the field's,
+             and a fading gold ghost marks where it was absorbed. */
+          sp2[i] = convSp[i] || 1;
+          vit2[i] = 0.55; conv2[i] = 0;
+          trace[i] = 1;
+        } else {
+          conv2[i] = conv[i] - 1;
+        }
+      }
+    }
+  }
+  spreadPass();
+  var t;
+  t = sp; sp = sp2; sp2 = t;
+  t = vit; vit = vit2; vit2 = t;
+  t = age; age = age2; age2 = t;
+  t = conv; conv = conv2; conv2 = t;
+  t = convSp; convSp = convSp2; convSp2 = t;
+}
+/* ---- pointer: draw a shape, the field eats it ---- */
+var drawing = false, lastPX = 0, lastPY = 0;
+var drawBudget = DRAW_BUDGET_PER_SEC;
+function cellSize() { return { w: VW / COLS, h: VH / ROWS }; }
+function stampCell(cx, cy) {
+  if (drawBudget < 1) return;
+  var gx = Math.floor(cx / cellSize().w), gy = Math.floor(cy / cellSize().h);
+  var x, y, i;
+  for (y = gy - 1; y <= gy + 1; y++) {
+    for (x = gx - 1; x <= gx + 1; x++) {
+      if (!inGrid(x, y)) continue;
+      if (drawBudget < 1) return;
+      i = idx(x, y);
+      sp[i] = 3; vit[i] = 1; age[i] = 0; conv[i] = 0;
+      drawBudget -= 1;
+    }
+  }
+}
+function stampStroke(x0, y0, x1, y1) {
+  var dx = x1 - x0, dy = y1 - y0;
+  var dist = Math.sqrt(dx * dx + dy * dy);
+  var stepLen = Math.max(2, cellSize().w * 0.5);
+  var n = Math.max(1, Math.ceil(dist / stepLen));
+  var k;
+  for (k = 0; k <= n; k++) {
+    stampCell(x0 + dx * (k / n), y0 + dy * (k / n));
+    if (drawBudget < 1) return;
+  }
+}
+function pointerPos(e) {
+  var x = 0, y = 0;
+  if (e) {
+    if (typeof e.offsetX === 'number') { x = e.offsetX; y = e.offsetY; }
+    else if (typeof e.clientX === 'number') {
+      x = e.clientX; y = e.clientY;
+      try {
+        if (canvas.getBoundingClientRect) {
+          var r = canvas.getBoundingClientRect();
+          x -= r.left; y -= r.top;
+        }
+      } catch (err) { /* no rect: use raw client coords */ }
+    }
+  }
+  return { x: x, y: y };
+}
+function onPointerDown(e) {
+  var p = pointerPos(e);
+  drawing = true;
+  lastPX = p.x; lastPY = p.y;
+  stampCell(p.x, p.y);
+  if (e && e.preventDefault) e.preventDefault();
+}
+function onPointerMove(e) {
+  if (!drawing) return;
+  var p = pointerPos(e);
+  stampStroke(lastPX, lastPY, p.x, p.y);
+  lastPX = p.x; lastPY = p.y;
+  if (e && e.preventDefault) e.preventDefault();
+}
+function onPointerUp(e) {
+  drawing = false;
+  if (reduced) {
+    /* Reduced motion: no autonomous loop, so the stroke is absorbed
+       in one synchronous burst when the gesture ends. */
+    var i;
+    for (i = 0; i < ABSORB_SECONDS * GEN_PER_SEC; i++) step();
+    draw(clockT);
+  }
+}
+if (typeof canvas.addEventListener === 'function') {
+  canvas.addEventListener('pointerdown', onPointerDown);
+  canvas.addEventListener('pointermove', onPointerMove);
+  canvas.addEventListener('pointerup', onPointerUp);
+  canvas.addEventListener('pointercancel', onPointerUp);
+  canvas.addEventListener('mousedown', onPointerDown);
+  canvas.addEventListener('mousemove', onPointerMove);
+  canvas.addEventListener('mouseup', onPointerUp);
+}
+if (typeof window !== 'undefined') {
+  if (window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', size);
+  if (window.addEventListener) window.addEventListener('resize', size);
+}
+/* ---- drawing ---- */
+function drawPlates() {
+  var smallPx = isPhone ? 11 : 12;
+  var titlePx = isPhone ? 16 : 20;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.font = 'bold ' + titlePx + 'px monospace';
+  while (titlePx > 9 && ctx.measureText('The Absorption').width > VW - 60) {
+    titlePx -= 1;
+    ctx.font = 'bold ' + titlePx + 'px monospace';
+  }
+  var titleW = ctx.measureText('The Absorption').width;
+  ctx.font = smallPx + 'px monospace';
+  var dateW = ctx.measureText('2006 · 07 · 15').width;
+  var plateW = Math.max(titleW, dateW) + 28;
+  var plateH = titlePx + smallPx + 20;
+  ctx.fillStyle = PLATE;
+  ctx.fillRect(12, 12, plateW, plateH);
+  ctx.strokeStyle = rgba(GOLD_RGB, 0.45);
+  ctx.lineWidth = 1;
+  ctx.strokeRect(12.5, 12.5, plateW - 1, plateH - 1);
+  ctx.fillStyle = HINT_INK;
+  ctx.font = 'bold ' + titlePx + 'px monospace';
+  ctx.fillText('The Absorption', 26, 19);
+  ctx.font = smallPx + 'px monospace';
+  ctx.fillStyle = rgba(GOLD_RGB, 0.9);
+  ctx.fillText('2006 · 07 · 15', 26, 19 + titlePx + 3);
+  var hint = 'Draw to feed the field.';
+  ctx.font = smallPx + 'px monospace';
+  var hintW = ctx.measureText(hint).width;
+  var hintPlateW = hintW + 24;
+  var hintPlateH = smallPx + 14;
+  ctx.fillStyle = PLATE;
+  ctx.fillRect(12, VH - hintPlateH - 12, hintPlateW, hintPlateH);
+  ctx.strokeStyle = rgba(GOLD_RGB, 0.45);
+  ctx.lineWidth = 1;
+  ctx.strokeRect(12.5, VH - hintPlateH - 11.5, hintPlateW - 1, hintPlateH - 1);
+  ctx.fillStyle = rgba(WHITE_RGB, 0.9);
+  ctx.fillText(hint, 24, VH - hintPlateH - 5);
+}
+function draw(t) {
+  size();
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = GROUND;
+  ctx.fillRect(0, 0, VW, VH);
+  var cw = VW / COLS, ch = VH / ROWS;
+  var x, y, i, s, lvl;
+  for (y = 0; y < ROWS; y++) {
+    for (x = 0; x < COLS; x++) {
+      i = idx(x, y);
+      s = sp[i];
+      if (s === 0) {
+        if (trace[i] > 0.02) {
+          ctx.fillStyle = rgba(GOLD_RGB, trace[i] * 0.5);
+          ctx.fillRect(x * cw, y * ch, cw + 0.5, ch + 0.5);
+        }
+        continue;
+      }
+      if (s === 1) {
+        lvl = clamp(Math.floor(vit[i] * LEVELS), 0, LEVELS - 1);
+        ctx.fillStyle = TEAL_COLS[lvl];
+      } else if (s === 2) {
+        lvl = clamp(Math.floor(vit[i] * LEVELS), 0, LEVELS - 1);
+        ctx.fillStyle = RUST_COLS[lvl];
+      } else if (s === 3) {
+        ctx.fillStyle = WHITE;
+      } else {
+        ctx.fillStyle = GOLD_COLS[clamp(conv[i], 0, GOLD_STEPS - 1)];
+      }
+      ctx.fillRect(x * cw, y * ch, cw + 0.5, ch + 0.5);
+      if (s !== 0 && trace[i] > 0.02) {
+        ctx.fillStyle = rgba(GOLD_RGB, trace[i] * 0.3);
+        ctx.fillRect(x * cw, y * ch, cw + 0.5, ch + 0.5);
+      }
+    }
+  }
+  drawPlates();
+  ctx.globalCompositeOperation = 'source-over';
+}
+/* Exposed for the QA probe harness only. */
+if (typeof window !== 'undefined') {
+  window.__probe = {
+    counts: function () {
+      var c = { teal: 0, rust: 0, white: 0, gold: 0, empty: 0 };
+      var i, s;
+      for (i = 0; i < N; i++) {
+        s = sp[i];
+        if (s === 1) c.teal++;
+        else if (s === 2) c.rust++;
+        else if (s === 3) c.white++;
+        else if (s === 4) c.gold++;
+        else c.empty++;
+      }
+      return c;
+    },
+    stepN: function (n) { var i; for (i = 0; i < n; i++) step(); draw(clockT); },
+    stampAt: function (px, py) { stampCell(px, py); draw(clockT); },
+    drawAt: function (t) { draw(t); }
+  };
+}
+/* ---- frame one: fixed generation, fixed seeds, no wall clock ---- */
+size();
+allocGrid();
+seedField();
+(function preRun() {
+  var i;
+  for (i = 0; i < PRE_RUN; i++) step();
+})();
+var clockT = 0, prevTs = null, t0 = null, acc = 0;
+draw(clockT);
+if (!reduced && typeof requestAnimationFrame !== 'undefined') {
+  (function loop(ts) {
+    if (t0 === null) t0 = ts;
+    if (prevTs === null) prevTs = ts;
+    var dt = clamp((ts - prevTs) / 1000, 0, 0.05);
+    prevTs = ts;
+    clockT += dt;
+    drawBudget = Math.min(DRAW_BUDGET_PER_SEC, drawBudget + dt * DRAW_BUDGET_PER_SEC);
+    acc += dt;
+    var n = 0;
+    while (acc >= 1 / GEN_PER_SEC && n < 4) { step(); acc -= 1 / GEN_PER_SEC; n++; }
+    if (n >= 4) acc = 0;
+    draw(clockT);
+    if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(loop);
+  })(0);
+}
+</script>
+</body>
+</html>

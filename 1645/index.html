@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rain Blooms</title>
+<style>
+html, body { margin: 0; padding: 0; background: #0d0d14; overflow: hidden; }
+canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+/* Rain Blooms: a war that never ends. Stand at one border of a living
+   field for a minute and watch territory change hands three times;
+   nothing settles, nothing dissolves, the instability itself is the
+   bloom. Five colonies war across a dark field. Watch only. */
+var TAU = Math.PI * 2;
+var GROUND = '#0d0d14';
+var GROUND_RGB = [13, 13, 20];
+/* Species: 1 magenta, 2 cyan, 3 lime, 4 amber, 5 violet. */
+var SPECIES_RGB = [
+  null,
+  [255, 46, 136],   /* magenta: the brawler, Moore blob */
+  [0, 212, 232],    /* cyan: the assimilator, knight moves */
+  [168, 225, 12],   /* lime: the spreader, straight lines */
+  [255, 179, 0],    /* amber: the defender, diagonals only */
+  [138, 92, 255]    /* violet: the opportunist, seeded offsets */
+];
+var PHASE = 0;            /* frame one is generation 120, not t = 0 */
+var GEN0 = 120;           /* pre-run generations before frame one */
+var GEN_RATE = 5;         /* generations per second of piece time */
+var SEED = 1645001;
+var COLS_DESKTOP = 160, COLS_PHONE = 90;
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+function rgba(c, a) {
+  return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a.toFixed(4) + ')';
+}
+/* ---- per-species neighborhoods (fixed offset tables) ---- */
+var NB = [
+  null,
+  [[-1,-1],[0,-1],[1,-1],[-1,0],[1,0],[-1,1],[0,1],[1,1]],          /* Moore */
+  [[-2,-1],[-2,1],[-1,-2],[-1,2],[1,-2],[1,2],[2,-1],[2,1]],        /* knight */
+  [[-2,0],[-1,0],[1,0],[2,0],[0,-2],[0,-1],[0,1],[0,2],
+   [-1,-1],[1,-1],[-1,1],[1,1]],                                     /* cross r2 + diagonals */
+  [[-1,-1],[1,-1],[-1,1],[1,1],[-2,-2],[2,-2],[-2,2],[2,2]],        /* diagonal r1 + r2 */
+  null                                                                /* seeded below */
+];
+(function seedViolet() {
+  /* Four orthogonal neighbors, two seeded diagonals, two seeded
+     knight leaps: eight offsets like every other species, but a
+     shape no other species shares. */
+  var rng = mulberry32(SEED + 55);
+  var diags = [[-1, -1], [1, -1], [-1, 1], [1, 1]];
+  var knights = [[2, 1], [1, 2], [-2, -1], [-1, -2], [2, -1], [-2, 1], [1, -2], [-1, 2]];
+  var a = Math.floor(rng() * 4), b = Math.floor(rng() * 4);
+  if (b === a) b = (b + 1) % 4;
+  var k1 = Math.floor(rng() * 8), k2 = Math.floor(rng() * 8);
+  if (k2 === k1) k2 = (k2 + 1) % 8;
+  NB[5] = [[-1, 0], [1, 0], [0, -1], [0, 1], diags[a], diags[b], knights[k1], knights[k2]];
+})();
+/* ATTACK[a][b]: what species a does to species b. 1 attack, 0.5
+   assimilate, 0 ignore. A strict cycle, so no species can win:
+   magenta beats violet, violet beats amber, amber beats lime,
+   lime beats cyan, cyan beats magenta; each also assimilates the
+   species after its prey and ignores the other two. */
+var ATTACK = [
+  null,
+  [0, 0, 0.5, 0, 0, 1],    /* magenta attacks violet, assimilates cyan */
+  [0, 1, 0, 0.5, 0, 0],    /* cyan attacks magenta, assimilates lime */
+  [0, 0, 1, 0, 0.5, 0],    /* lime attacks cyan, assimilates amber */
+  [0, 0, 0, 1, 0, 0.5],    /* amber attacks lime, assimilates violet */
+  [0, 0.5, 0, 0, 1, 0]     /* violet attacks amber, assimilates magenta */
+];
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var VW = 0, VH = 0, isPhone = false;
+var reduced = false;
+if (typeof window !== 'undefined' && window.matchMedia) {
+  try { reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (e) { reduced = false; }
+}
+function size() {
+  var vw = 0, vh = 0;
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.width) {
+    vw = window.visualViewport.width; vh = window.visualViewport.height;
+  } else if (typeof window !== 'undefined' && window.innerWidth) {
+    vw = window.innerWidth; vh = window.innerHeight;
+  }
+  VW = vw; VH = vh;
+  canvas.width = VW; canvas.height = VH;
+  canvas.style.width = VW + 'px'; canvas.style.height = VH + 'px';
+  if (typeof window !== 'undefined' && window.screen) {
+    var mn = Math.min(window.screen.width, window.screen.height);
+    isPhone = mn < 700 || (VH > VW * 1.15 && mn < 900);
+  }
+}
+/* ---- the automaton ---- */
+var cols = 0, rows = 0, cellW = 0, cellH = 0;
+var sp = null, vit = null, sp2 = null, vit2 = null, flipGen = null, fert = null;
+var gen = 0;
+var rng = mulberry32(SEED);
+function buildFertility() {
+  /* Coarse seeded value noise, bilinearly interpolated: blobby
+     patches of fertile ground. Infertile cells stay dark forever,
+     so the dark ground is terrain the war plays across, not ground
+     the colonies failed to reach. */
+  var gw = 16, gh = Math.max(8, Math.round(16 * rows / cols));
+  var g = new Float32Array((gw + 1) * (gh + 1)), i;
+  var frng = mulberry32(SEED + 77);
+  for (i = 0; i < g.length; i++) g[i] = frng();
+  fert = new Uint8Array(cols * rows);
+  var x, y, gx, gy, fx, fy, x0, y0, v00, v10, v01, v11, v;
+  for (y = 0; y < rows; y++) {
+    gy = y / rows * gh; y0 = Math.min(gh - 1, Math.floor(gy)); fy = gy - y0;
+    for (x = 0; x < cols; x++) {
+      gx = x / cols * gw; x0 = Math.min(gw - 1, Math.floor(gx)); fx = gx - x0;
+      v00 = g[y0 * (gw + 1) + x0]; v10 = g[y0 * (gw + 1) + x0 + 1];
+      v01 = g[(y0 + 1) * (gw + 1) + x0]; v11 = g[(y0 + 1) * (gw + 1) + x0 + 1];
+      v = (v00 * (1 - fx) + v10 * fx) * (1 - fy) + (v01 * (1 - fx) + v11 * fx) * fy;
+      fert[y * cols + x] = v > 0.42 ? 1 : 0;
+    }
+  }
+}
+var COL_CACHE = {}; /* "species:level" -> rgb string */
+function colorFor(s, v) {
+  var level = Math.round(clamp(v, 0, 1) * 20);
+  var key = s + ':' + level;
+  var c = COL_CACHE[key];
+  if (c) return c;
+  var base = SPECIES_RGB[s], f = 0.25 + 0.75 * (level / 20), i, out = [0, 0, 0];
+  for (i = 0; i < 3; i++) out[i] = Math.round(GROUND_RGB[i] + (base[i] - GROUND_RGB[i]) * f);
+  if (level >= 17) { /* high vitality glows toward white */
+    var g = (level - 17) / 3 * 0.35;
+    for (i = 0; i < 3; i++) out[i] = Math.round(out[i] + (255 - out[i]) * g);
+  }
+  c = 'rgb(' + out[0] + ',' + out[1] + ',' + out[2] + ')';
+  COL_CACHE[key] = c;
+  return c;
+}
+function initGrid() {
+  cols = isPhone ? COLS_PHONE : COLS_DESKTOP;
+  rows = Math.max(40, Math.round(cols * VH / VW));
+  cellW = VW / cols; cellH = VH / rows;
+  var n = cols * rows, i;
+  sp = new Uint8Array(n); vit = new Float32Array(n);
+  sp2 = new Uint8Array(n); vit2 = new Float32Array(n);
+  flipGen = new Int32Array(n);
+  for (i = 0; i < n; i++) flipGen[i] = -1000;
+  gen = 0;
+  rng = mulberry32(SEED);
+  buildFertility();
+  /* Seed: eight blobs per species, strong vitality, plus lone
+     pioneers. Every species needs several footholds: the cycle
+     only turns while all five are alive. */
+  var s, b, cx, cy, r, x, y, dx, dy, idx;
+  for (s = 1; s <= 5; s++) {
+    for (b = 0; b < 8; b++) {
+      cx = Math.floor(rng() * cols); cy = Math.floor(rng() * rows);
+      r = 3 + Math.floor(rng() * 4);
+      for (dy = -r; dy <= r; dy++) for (dx = -r; dx <= r; dx++) {
+        if (dx * dx + dy * dy > r * r) continue;
+        x = (cx + dx + cols) % cols; y = (cy + dy + rows) % rows;
+        idx = y * cols + x;
+        if (sp[idx] === 0 && fert[idx]) { sp[idx] = s; vit[idx] = 0.75 + rng() * 0.25; }
+      }
+    }
+  }
+  for (i = 0; i < cols; i++) {
+    idx = Math.floor(rng() * n);
+    if (sp[idx] === 0 && fert[idx]) { sp[idx] = 1 + Math.floor(rng() * 5); vit[idx] = 0.75 + rng() * 0.25; }
+  }
+  /* Pre-run to a developed, contested field: frame one is GEN0. */
+  for (i = 0; i < GEN0; i++) step();
+}
+function step() {
+  var x, y, idx, s, v, b, k, nx, ny, nidx, nb;
+  var cnt = [0, 0, 0, 0, 0, 0], vitSum = [0, 0, 0, 0, 0, 0];
+  var moore = [0, 0, 0, 0, 0, 0], mooreVit = [0, 0, 0, 0, 0, 0];
+  var MOORE_OFFS = NB[1];
+  for (y = 0; y < rows; y++) {
+    for (x = 0; x < cols; x++) {
+      idx = y * cols + x;
+      if (!fert[idx]) { sp2[idx] = 0; vit2[idx] = 0; continue; }
+      s = sp[idx]; v = vit[idx];
+      for (b = 1; b <= 5; b++) { cnt[b] = 0; vitSum[b] = 0; moore[b] = 0; mooreVit[b] = 0; }
+      for (b = 1; b <= 5; b++) {
+        nb = NB[b];
+        for (k = 0; k < nb.length; k++) {
+          nx = (x + nb[k][0] + cols) % cols;
+          ny = (y + nb[k][1] + rows) % rows;
+          nidx = ny * cols + nx;
+          if (sp[nidx] === b) { cnt[b]++; vitSum[b] += vit[nidx]; }
+        }
+      }
+      /* Moore adjacency: a colony can only spread into ground it
+         actually touches, so radius-2 neighborhoods cannot jump
+         over a border to colonize behind it. The Moore counts also
+         run combat below: attack and assimilation are counted the
+         same way for every species, so a far-reaching neighborhood
+         cannot outgun a close one; neighborhoods shape growth,
+         the attack matrix shapes the war. */
+      for (k = 0; k < MOORE_OFFS.length; k++) {
+        nx = (x + MOORE_OFFS[k][0] + cols) % cols;
+        ny = (y + MOORE_OFFS[k][1] + rows) % rows;
+        nidx = ny * cols + nx;
+        if (sp[nidx] > 0) { moore[sp[nidx]]++; mooreVit[sp[nidx]] += vit[nidx]; }
+      }
+      if (s === 0) {
+        /* Empty ground: colonized by the best-represented neighbor.
+           Counts are normalized by neighborhood size, so a
+           12-offset species does not outbid an 8-offset one by
+           arithmetic alone; every species needs three neighbors
+           behind it to take open ground. */
+        var best = 0, bestScore = 0, bestC = 0, score;
+        for (b = 1; b <= 5; b++) {
+          if (cnt[b] === 0) continue;
+          score = cnt[b] / NB[b].length;
+          if (score > bestScore || (score === bestScore && rng() < 0.5)) {
+            bestScore = score; bestC = cnt[b]; best = b;
+          }
+        }
+        if (best > 0 && bestC >= 3 && moore[best] >= 1) {
+          sp2[idx] = best;
+          vit2[idx] = Math.min(0.8, 0.4 + 0.08 * bestC);
+          flipGen[idx] = gen + 1;
+        } else { sp2[idx] = 0; vit2[idx] = 0; }
+        continue;
+      }
+      /* Occupied: attack, assimilate, or hold. Cyclic predation:
+         a single predator neighbor can flip a cell, with a
+         probability that falls as the victim's vitality rises.
+         No local-majority threshold: a threshold lets the biggest
+         colony steamroll, because a small species can never
+         muster three converters around an enemy cell. Single
+         neighbor predation lets a small foothold punch back, and
+         the cycle (each species hunts one and is hunted by one)
+         keeps the waves chasing each other instead of settling. */
+      var atkBest = 0, atkC = 0, asmBest = 0, asmC = 0, pressure = 0;
+      for (b = 1; b <= 5; b++) {
+        if (b === s || moore[b] === 0) continue;
+        var rel = ATTACK[b][s];
+        if (rel === 1) { pressure += moore[b]; if (moore[b] > atkC) { atkC = moore[b]; atkBest = b; } }
+        else if (rel === 0.5) { pressure += moore[b] * 0.5; if (moore[b] > asmC) { asmC = moore[b]; asmBest = b; } }
+        /* "Ignore" is not peace: merely touching a rival grinds
+           vitality down slowly, so no border can freeze. */
+        else { pressure += moore[b] * 0.5; }
+      }
+      var nv = v;
+      if (atkBest) {
+        var pAtk = (1 - Math.pow(1 - 0.04, atkC)) * (1.3 - v);
+        if (rng() < pAtk) {
+          /* Overrun: the winner absorbs the loser. Flash white. */
+          sp2[idx] = atkBest; vit2[idx] = 0.45; flipGen[idx] = gen + 1;
+          continue;
+        }
+      }
+      if (asmBest) {
+        var pAsm = (1 - Math.pow(1 - 0.03, asmC)) * (1.3 - v);
+        if (rng() < pAsm) {
+          /* Assimilation converts and shares vitality: the new cell
+             carries the average of the victim and its converters. */
+          sp2[idx] = asmBest;
+          vit2[idx] = (v + mooreVit[asmBest] / asmC) / 2;
+          flipGen[idx] = gen + 1;
+          continue;
+        }
+      }
+      if (pressure >= 5) nv -= 0.08;                 /* siege wears vitality down */
+      else if (pressure > 0) nv -= 0.02 * pressure;   /* border friction: any enemy
+         contact grinds vitality down, so straight borders cannot
+         freeze; no regrow while in contact */
+      else if (moore[s] >= 3) nv += 0.02;             /* surrounded by kin: thrive */
+      else if (moore[s] === 0) nv -= 0.15;            /* utterly alone: die fast */
+      else if (moore[s] <= 1) nv -= 0.10;             /* isolated: wither */
+      else if (moore[s] <= 2) nv -= 0.05;             /* ragged edge: recede */
+      if (nv <= 0) { sp2[idx] = 0; vit2[idx] = 0; continue; }
+      sp2[idx] = s; vit2[idx] = nv > 1 ? 1 : nv;
+    }
+  }
+  /* A few spontaneous pioneers keep dead ground from going quiet. */
+  var tries = 2, ti, rx, ry, ridx;
+  for (ti = 0; ti < tries; ti++) {
+    rx = Math.floor(rng() * cols); ry = Math.floor(rng() * rows);
+    ridx = ry * cols + rx;
+    if (sp2[ridx] === 0 && fert[ridx]) { sp2[ridx] = 1 + Math.floor(rng() * 5); vit2[ridx] = 0.6; }
+  }
+  /* Rain blooms: every 40 generations a 3x3 foothold of one random
+     species lands on fertile ground, bursting through whatever is
+     there. A single pioneer cell withers before it can take hold,
+     but a 3x3 bloom survives and starts a new contested border,
+     so no species can go extinct for long and the war always has
+     a fresh front. */
+  if (gen % 40 === 0) {
+    var bs = 1 + Math.floor(rng() * 5);
+    var bcx = Math.floor(rng() * cols), bcy = Math.floor(rng() * rows);
+    var bdx, bdy, bx, by, bidx;
+    for (bdy = -1; bdy <= 1; bdy++) for (bdx = -1; bdx <= 1; bdx++) {
+      bx = (bcx + bdx + cols) % cols; by = (bcy + bdy + rows) % rows;
+      bidx = by * cols + bx;
+      if (fert[bidx]) { sp2[bidx] = bs; vit2[bidx] = 0.9; }
+    }
+  }
+  var tmp = sp; sp = sp2; sp2 = tmp;
+  var tmpv = vit; vit = vit2; vit2 = tmpv;
+  gen++;
+}
+function stepTo(t) {
+  var target = GEN0 + Math.floor(Math.max(0, t - PHASE) * GEN_RATE);
+  while (gen < target) step();
+}
+function drawField() {
+  var x, y, idx, s, a, px, py, pw, ph;
+  for (y = 0; y < rows; y++) {
+    py = Math.round(y * cellH); ph = Math.round((y + 1) * cellH) - py;
+    for (x = 0; x < cols; x++) {
+      idx = y * cols + x;
+      s = sp[idx];
+      if (s === 0) continue;
+      px = Math.round(x * cellW); pw = Math.round((x + 1) * cellW) - px;
+      ctx.fillStyle = colorFor(s, vit[idx]);
+      ctx.fillRect(px, py, pw, ph);
+      /* Attack flash: white at contact borders, fading over 4 gens. */
+      a = gen - flipGen[idx];
+      if (a >= 0 && a < 4) {
+        ctx.fillStyle = 'rgba(255,255,255,' + (0.55 * (1 - a / 4)).toFixed(4) + ')';
+        ctx.fillRect(px, py, pw, ph);
+      }
+    }
+  }
+}
+function drawText() {
+  var smallPx = isPhone ? 11 : 12;
+  var titlePx = isPhone ? 16 : 20;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.font = 'bold ' + titlePx + 'px monospace';
+  while (titlePx > 9 && ctx.measureText('Rain Blooms').width > VW - 60) {
+    titlePx -= 1;
+    ctx.font = 'bold ' + titlePx + 'px monospace';
+  }
+  var titleW = ctx.measureText('Rain Blooms').width;
+  ctx.font = smallPx + 'px monospace';
+  var dateW = ctx.measureText('2006 · 07 · 14').width;
+  var plateW = Math.max(titleW, dateW) + 28;
+  var plateH = titlePx + smallPx + 20;
+  ctx.fillStyle = 'rgba(13,13,20,0.82)';
+  ctx.fillRect(12, 12, plateW, plateH);
+  ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(12.5, 12.5, plateW - 1, plateH - 1);
+  ctx.fillStyle = '#f2f2f7';
+  ctx.font = 'bold ' + titlePx + 'px monospace';
+  ctx.fillText('Rain Blooms', 26, 19);
+  ctx.font = smallPx + 'px monospace';
+  ctx.fillStyle = 'rgba(242,242,247,0.8)';
+  ctx.fillText('2006 · 07 · 14', 26, 19 + titlePx + 3);
+  var hint = 'Watch only.';
+  ctx.font = smallPx + 'px monospace';
+  var hintW = ctx.measureText(hint).width;
+  var hintPlateW = hintW + 24;
+  var hintPlateH = smallPx + 14;
+  ctx.fillStyle = 'rgba(13,13,20,0.82)';
+  ctx.fillRect(12, VH - hintPlateH - 12, hintPlateW, hintPlateH);
+  ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(12.5, VH - hintPlateH - 11.5, hintPlateW - 1, hintPlateH - 1);
+  ctx.fillStyle = 'rgba(242,242,247,0.9)';
+  ctx.fillText(hint, 24, VH - hintPlateH - 12 + 7);
+}
+if (typeof window !== 'undefined') {
+  if (window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', size);
+  if (window.addEventListener) window.addEventListener('resize', size);
+}
+function draw(t) {
+  size();
+  if (!sp || cols !== (isPhone ? COLS_PHONE : COLS_DESKTOP) || rows !== Math.max(40, Math.round(cols * VH / VW))) initGrid();
+  stepTo(t);
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = GROUND;
+  ctx.fillRect(0, 0, VW, VH);
+  drawField();
+  drawText();
+}
+/* Exposed for the QA probe harness only. */
+if (typeof window !== 'undefined') {
+  window.__probe = {
+    drawAt: function (t) { draw(t); },
+    sharesAt: function (t) {
+      draw(t);
+      var counts = [0, 0, 0, 0, 0, 0], i;
+      for (i = 0; i < cols * rows; i++) counts[sp[i]]++;
+      return counts;
+    },
+    changedBetween: function (t1, t2) {
+      draw(t1);
+      var snap = new Uint8Array(sp), i, changed = 0;
+      draw(t2);
+      for (i = 0; i < cols * rows; i++) if (sp[i] !== snap[i]) changed++;
+      return changed;
+    },
+    genAt: function (t) { draw(t); return gen; },
+    nb5: function () { return NB[5]; },
+    stepOnly: function (t) {
+      size();
+      if (!sp || cols !== (isPhone ? COLS_PHONE : COLS_DESKTOP) || rows !== Math.max(40, Math.round(cols * VH / VW))) initGrid();
+      stepTo(t);
+    },
+    sharesRaw: function () {
+      var counts = [0, 0, 0, 0, 0, 0], i;
+      for (i = 0; i < cols * rows; i++) counts[sp[i]]++;
+      return counts;
+    },
+    changedRaw: function (t1, t2) {
+      this.stepOnly(t1);
+      var snap = new Uint8Array(sp), i, changed = 0;
+      this.stepOnly(t2);
+      for (i = 0; i < cols * rows; i++) if (sp[i] !== snap[i]) changed++;
+      return changed;
+    },
+    fertShare: function () {
+      draw(0);
+      var f = 0, i;
+      for (i = 0; i < cols * rows; i++) f += fert[i];
+      return (100 * f / (cols * rows)).toFixed(1) + '% fertile';
+    }
+  };
+}
+/* ---- frame one: fixed seed, fixed generation 120, no wall clock ---- */
+size();
+var clockT = PHASE, prevTs = null, t0 = null;
+draw(PHASE);
+if (!reduced && typeof requestAnimationFrame !== 'undefined') {
+  (function loop(ts) {
+    if (t0 === null) t0 = ts;
+    if (prevTs === null) prevTs = ts;
+    var dt = clamp((ts - prevTs) / 1000, 0, 0.05);
+    prevTs = ts;
+    clockT += dt;
+    draw(clockT);
+    if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(loop);
+  })(0);
+}
+</script>
+</body>
+</html>
