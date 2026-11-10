@@ -1,0 +1,19 @@
+# №1668 "Segs, Marbled" (JV5) - process notes
+
+- Title: Segs, Marbled. Date: 2006 · 08 · 06 (formula date). Gallery note: "Circle segments layer into agate strata until geometry becomes stone. Watch only."
+- Spec: BATCH-1668-1672-SPEC.md, №1668 JV5 (jos-vromans PP915). Code template: live №1667 (Golden Eye), fetched via fetch-blob.py.
+- Build: 6,500 circle-segment primitives (arc strokes, 10% small filled sectors at low alpha) drawn in heavy overlap at low alpha (0.07-0.18) in agate palette orange / orange2 / pale / cream / umber / dark maroon on white ground (#FBF8F1). Each segment's radius and color are biased by a wavy spatial band function of its vertical position, so orange, cream, umber and maroon strata emerge from the overlap. Sixteen thin vein lines follow the same wavy band function with a second harmonic. Field fills the frame edge to edge, no center, no border.
+- Motion: watch-only, no interaction. Segments reveal on a fixed schedule (reveal times drawn from ACCUM * rng^1.6, so accumulation is front-loaded): sparse arcs at t = 0, the phase change into marble around a minute in, full marble by t = 150 s, a hold, then a slow re-seed with a fresh seeded table every 210 s cycle. The band field drifts slowly (0.0006 * t) like a scanned stone slab. Reduced-motion honored via matchMedia.
+- Determinism: all tables from mulberry32(1668 + cycle * 7919); no Date.now() or Math.random() in frame logic. Frame one is t = 60 s, a fixed developed state with strata already emerging and circles still readable.
+- House rules: Visual Viewport sizing with resize on visualViewport and window; canvas pinned in draw() via style width/height in px; phone detection via window.screen (min dimension < 700 px) with aspect fallback; field-like composition full-bleed on phones and desktop; one synchronous frame at load; requestAnimationFrame guarded with typeof checks; title/date/hint plates drawn on canvas; no em dashes in visible copy; no click-to-reload.
+
+## Deviations from the prompt
+- None structural. Two judgment calls: (1) frame one is set at t = 60 s (mid phase-change) rather than t = 0, so the first frame already shows strata emerging while circles are still visible; the full sparse-to-marble arc still plays out over each 210 s cycle. (2) A small number of filled sectors (2%, small radius, half alpha) is included among the arc strokes to give the marble material density; no image textures are used anywhere.
+
+## QA
+- Rendered with node ~/workspace/tools/render-piece.js from the actual script at 1280x900 desktop, 390x844 mobile, 720x720 thumb (thumb.png IS the 720x720 render). All three renders inspected visually.
+- Round 1: field too sparse at frame one, wide empty gaps between bands, filled sectors reading as flat gray wedges. Fix: segments 3,600 to 6,500, alpha 0.05-0.14 to 0.07-0.18, reveal front-loaded (pow 1.6), filled sectors 10% to 4% at smaller radius.
+- Round 2: density much better but hard pale gaps remained where the band function bottoms out, and gray wedges still visible. Fix: radius floor raised (0.02 + 0.12*b to 0.05 + 0.09*b) so low bands still carry medium arcs, filled sectors 4% to 2% at 0.45 radius and half alpha, veins 16 to 10 with a second harmonic and lower alpha.
+- Round 3 (final, re-gated after the last edit): desktop shows dense wavy orange/umber/maroon strata alternating with pale cream bands, arcs overlapping into stone-like texture edge to edge; mobile shows the same structure, denser top and bottom with cream bands between; thumb matches the desktop composition. Title plate "Segs, Marbled / 2006 · 08 · 06" legible top left, "Watch only." hint bottom left, both plates readable on all three sizes. No gray wedges, no dead-white regions, no clipping. Gate passed.
+- md5 index.html: 64cebade417f9b222d50e484dbdcbbac
+- md5 thumb.png: 6afef6a27a06575f46f34b69869996f2
