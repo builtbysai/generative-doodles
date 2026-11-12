@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Eight Slices of Zion</title>
+<style>
+html, body { margin: 0; padding: 0; background: #FFFDF8; overflow: hidden; }
+canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+var TAU = Math.PI * 2;
+var GROUND = '#FFFDF8';
+var PLATE = '#17120F';
+var PLATE_LINE = 'rgba(232,134,42,0.55)';
+var TITLE_INK = '#FFFDF8';
+var HINT_INK = '#F0A94E';
+var PERIOD = 24;
+var FRAME_T = 6.0;
+var LEVELS = 8;
+var GRID = 100;
+var THRESH = [0.14, 0.26, 0.38, 0.50, 0.62, 0.72, 0.82, 0.92];
+var LAYER_COLORS = [
+  '#E9A13B', /* amber light */
+  '#DD7A24', /* amber */
+  '#C85A14', /* burnt orange */
+  '#F0B23E', /* golden yellow */
+  '#E8862A', /* amber */
+  '#B84A10', /* deep burnt orange */
+  '#F5C04A', /* golden */
+  '#FFF6E6'  /* cream white cap */
+];
+var SHADOW = 'rgba(96,42,8,0.28)';
+var EDGE = 'rgba(120,50,10,0.28)';
+function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+function mulberry32(seed) {
+  return function () {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    var t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+function hexRgb(h) {
+  return [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
+}
+function rgba(h, a) {
+  var c = hexRgb(h);
+  return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a.toFixed(4) + ')';
+}
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var VW = 0, VH = 0, isPhone = false;
+var reduced = false;
+try { reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (e) { reduced = false; }
+var rng = mulberry32(1719);
+var phaseT = FRAME_T;
+/* ---- drag-to-tilt state: eased toward the pointer target, 0 at frame one ---- */
+var tiltX = 0, tiltY = 0, tiltTX = 0, tiltTY = 0, dragging = false;
+var lastPX = 0, lastPY = 0;
+/* ---- seeded satellite jitter only; the heightfield is a closed form of (u, v, t) ---- */
+var SAT_JIT = [];
+(function () {
+  var i;
+  for (i = 0; i < 3; i++) SAT_JIT.push((rng() - 0.5) * 0.02);
+})();
+/* ---- canyon heightfield: one large mesa, three satellites, slow undulation ---- */
+function gauss(u, v, cx, cy, sx, sy, amp) {
+  var dx = (u - cx) / sx, dy = (v - cy) / sy;
+  return amp * Math.exp(-(dx * dx + dy * dy));
+}
+function heightAt(u, v, t) {
+  var breathe = 1 + 0.05 * Math.sin(TAU * t / PERIOD);
+  var wob1 = 0.35 * Math.sin(TAU * t / PERIOD + 0.8);
+  var wob2 = 0.35 * Math.sin(TAU * t / PERIOD + 2.1);
+  var cx = 0.50 + 0.008 * Math.sin(TAU * t / PERIOD + 1.1);
+  var cy = 0.48 + 0.006 * Math.sin(TAU * t / PERIOD + 2.4);
+  var h = 0;
+  h += gauss(u, v, cx, cy, 0.24, 0.20, 1.0) * breathe;
+  h += gauss(u, v, 0.14 + SAT_JIT[0], 0.20, 0.10, 0.08, 0.42);
+  h += gauss(u, v, 0.87 + SAT_JIT[1], 0.78, 0.11, 0.09, 0.38);
+  h += gauss(u, v, 0.85 + SAT_JIT[2], 0.16, 0.07, 0.06, 0.26);
+  h += 0.05 * Math.sin(TAU * (1.3 * u + 0.4) + wob1) * Math.sin(TAU * (1.1 * v + 0.2) + wob2);
+  return h;
+}
+function size() {
+  var vw = 0, vh = 0;
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.width) {
+    vw = window.visualViewport.width; vh = window.visualViewport.height;
+  } else if (typeof window !== 'undefined' && window.innerWidth) {
+    vw = window.innerWidth; vh = window.innerHeight;
+  }
+  VW = vw; VH = vh;
+  canvas.width = VW; canvas.height = VH;
+  canvas.style.width = VW + 'px'; canvas.style.height = VH + 'px';
+  if (typeof window !== 'undefined' && window.screen) {
+    var mn = Math.min(window.screen.width, window.screen.height);
+    isPhone = mn < 700 || VH > VW * 1.15;
+  }
+}
+/* ---- stage: square on desktop, full-bleed on phones (field-like composition) ---- */
+function stageRect() {
+  if (isPhone) return { x: 0, y: 0, w: VW, h: VH };
+  var s = Math.min(VW, VH);
+  return { x: (VW - s) / 2, y: (VH - s) / 2, w: s, h: s };
+}
+/* ---- marching squares: filled region where h >= level, one path per level ---- */
+function fillLevel(level, ox, oy, st) {
+  var n = GRID, i, j;
+  var vals = new Float32Array((n + 1) * (n + 1));
+  var t = phaseT;
+  for (j = 0; j <= n; j++) {
+    for (i = 0; i <= n; i++) {
+      vals[j * (n + 1) + i] = heightAt(i / n, j / n, t);
+    }
+  }
+  var cw = st.w / n, ch = st.h / n;
+  ctx.beginPath();
+  var a, b, c, d, idx, x0, y0, x1, y1, tx, ty, rx, ry, bx, by, lx, ly;
+  for (j = 0; j < n; j++) {
+    for (i = 0; i < n; i++) {
+      a = vals[j * (n + 1) + i];       /* TL */
+      b = vals[j * (n + 1) + i + 1];   /* TR */
+      c = vals[(j + 1) * (n + 1) + i + 1]; /* BR */
+      d = vals[(j + 1) * (n + 1) + i]; /* BL */
+      idx = 0;
+      if (a >= level) idx |= 8;
+      if (b >= level) idx |= 4;
+      if (c >= level) idx |= 2;
+      if (d >= level) idx |= 1;
+      if (idx === 0 || idx === 15) {
+        if (idx === 15) {
+          x0 = st.x + i * cw + ox; y0 = st.y + j * ch + oy;
+          ctx.moveTo(x0, y0);
+          ctx.lineTo(x0 + cw, y0);
+          ctx.lineTo(x0 + cw, y0 + ch);
+          ctx.lineTo(x0, y0 + ch);
+          ctx.closePath();
+        }
+        continue;
+      }
+      x0 = st.x + i * cw + ox; y0 = st.y + j * ch + oy;
+      /* edge crossings, interpolated in grid space then mapped to pixels */
+      tx = x0 + cw * ((level - a) / (b - a)); ty = y0;                 /* top */
+      rx = x0 + cw; ry = y0 + ch * ((level - b) / (c - b));           /* right */
+      bx = x0 + cw * ((level - d) / (c - d)); by = y0 + ch;           /* bottom */
+      lx = x0; ly = y0 + ch * ((level - a) / (d - a));                /* left */
+      var A = [x0, y0], B = [x0 + cw, y0], C = [x0 + cw, y0 + ch], D = [x0, y0 + ch];
+      var T = [tx, ty], R = [rx, ry], Bo = [bx, by], L = [lx, ly];
+      var polys = null;
+      if (idx === 1) polys = [[D, L, Bo]];
+      else if (idx === 2) polys = [[C, Bo, R]];
+      else if (idx === 3) polys = [[D, C, R, L]];
+      else if (idx === 4) polys = [[B, T, R]];
+      else if (idx === 5) polys = [[B, T, R], [D, L, Bo]];
+      else if (idx === 6) polys = [[B, C, Bo, T]];
+      else if (idx === 7) polys = [[T, B, C, D, L]];
+      else if (idx === 8) polys = [[A, L, T]];
+      else if (idx === 9) polys = [[A, D, Bo, T]];
+      else if (idx === 10) polys = [[A, L, T], [C, Bo, R]];
+      else if (idx === 11) polys = [[A, T, R, C, D]];
+      else if (idx === 12) polys = [[A, B, R, L]];
+      else if (idx === 13) polys = [[A, B, R, Bo, D, L]];
+      else if (idx === 14) polys = [[A, B, C, Bo, L]];
+      if (polys) {
+        var p, q;
+        for (p = 0; p < polys.length; p++) {
+          ctx.moveTo(polys[p][0][0], polys[p][0][1]);
+          for (q = 1; q < polys[p].length; q++) ctx.lineTo(polys[p][q][0], polys[p][q][1]);
+          ctx.closePath();
+        }
+      }
+    }
+  }
+}
+/* ---- marching squares contour lines: the level's ring edges, as segments ---- */
+function strokeLevel(level, ox, oy, st) {
+  var n = GRID, i, j;
+  var vals = new Float32Array((n + 1) * (n + 1));
+  var t = phaseT;
+  for (j = 0; j <= n; j++) {
+    for (i = 0; i <= n; i++) {
+      vals[j * (n + 1) + i] = heightAt(i / n, j / n, t);
+    }
+  }
+  var cw = st.w / n, ch = st.h / n;
+  ctx.beginPath();
+  var a, b, c, d, idx, x0, y0, tx, ty, rx, ry, bx, by, lx, ly;
+  for (j = 0; j < n; j++) {
+    for (i = 0; i < n; i++) {
+      a = vals[j * (n + 1) + i];
+      b = vals[j * (n + 1) + i + 1];
+      c = vals[(j + 1) * (n + 1) + i + 1];
+      d = vals[(j + 1) * (n + 1) + i];
+      idx = 0;
+      if (a >= level) idx |= 8;
+      if (b >= level) idx |= 4;
+      if (c >= level) idx |= 2;
+      if (d >= level) idx |= 1;
+      if (idx === 0 || idx === 15) continue;
+      x0 = st.x + i * cw + ox; y0 = st.y + j * ch + oy;
+      tx = x0 + cw * ((level - a) / (b - a)); ty = y0;
+      rx = x0 + cw; ry = y0 + ch * ((level - b) / (c - b));
+      bx = x0 + cw * ((level - d) / (c - d)); by = y0 + ch;
+      lx = x0; ly = y0 + ch * ((level - a) / (d - a));
+      var T = [tx, ty], R = [rx, ry], Bo = [bx, by], L = [lx, ly];
+      var segs = null;
+      if (idx === 1) segs = [[L, Bo]];
+      else if (idx === 2) segs = [[Bo, R]];
+      else if (idx === 3) segs = [[L, R]];
+      else if (idx === 4) segs = [[T, R]];
+      else if (idx === 5) segs = [[T, R], [L, Bo]];
+      else if (idx === 6) segs = [[T, Bo]];
+      else if (idx === 7) segs = [[T, L]];
+      else if (idx === 8) segs = [[L, T]];
+      else if (idx === 9) segs = [[Bo, T]];
+      else if (idx === 10) segs = [[L, T], [Bo, R]];
+      else if (idx === 11) segs = [[T, R]];
+      else if (idx === 12) segs = [[L, R]];
+      else if (idx === 13) segs = [[R, Bo]];
+      else if (idx === 14) segs = [[Bo, L]];
+      if (segs) {
+        var s;
+        for (s = 0; s < segs.length; s++) {
+          ctx.moveTo(segs[s][0][0], segs[s][0][1]);
+          ctx.lineTo(segs[s][1][0], segs[s][1][1]);
+        }
+      }
+    }
+  }
+}
+function draw() {
+  size();
+  ctx.fillStyle = GROUND;
+  ctx.fillRect(0, 0, VW, VH);
+  var st = stageRect();
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(st.x, st.y, st.w, st.h);
+  ctx.clip();
+  /* ease the tilt toward the drag target; 0 at frame one */
+  tiltX += (tiltTX - tiltX) * 0.08;
+  tiltY += (tiltTY - tiltY) * 0.08;
+  var li;
+  for (li = 0; li < LEVELS; li++) {
+    /* higher layers shift further with tilt: real parallax between slices */
+    var ox = tiltX * (li + 1) * 1.6;
+    var oy = tiltY * (li + 1) * 1.6;
+    fillLevel(THRESH[li], ox, oy, st);
+    ctx.fillStyle = LAYER_COLORS[li];
+    ctx.shadowColor = SHADOW;
+    ctx.shadowBlur = 7;
+    ctx.shadowOffsetX = 3;
+    ctx.shadowOffsetY = 4;
+    ctx.fill();
+    ctx.shadowColor = 'rgba(0,0,0,0)';
+    ctx.shadowBlur = 0;
+    ctx.shadowOffsetX = 0;
+    ctx.shadowOffsetY = 0;
+    strokeLevel(THRESH[li], ox, oy, st);
+    ctx.strokeStyle = EDGE;
+    ctx.lineWidth = 1.25;
+    ctx.stroke();
+  }
+  ctx.restore();
+  drawPlates();
+}
+function drawPlates() {
+  var smallPx = isPhone ? 11 : 12;
+  var titlePx = isPhone ? 16 : 20;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.font = 'bold ' + titlePx + 'px monospace';
+  while (titlePx > 9 && ctx.measureText('Eight Slices of Zion').width > VW - 60) {
+    titlePx -= 1;
+    ctx.font = 'bold ' + titlePx + 'px monospace';
+  }
+  var titleW = ctx.measureText('Eight Slices of Zion').width;
+  ctx.font = smallPx + 'px monospace';
+  var dateW = ctx.measureText('2006 · 09 · 26').width;
+  var plateW = Math.max(titleW, dateW) + 28;
+  var plateH = titlePx + smallPx + 20;
+  var plateX = 12, plateY = 12;
+  ctx.fillStyle = PLATE;
+  ctx.fillRect(plateX, plateY, plateW, plateH);
+  ctx.strokeStyle = PLATE_LINE;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(plateX + 0.5, plateY + 0.5, plateW - 1, plateH - 1);
+  ctx.fillStyle = TITLE_INK;
+  ctx.font = 'bold ' + titlePx + 'px monospace';
+  ctx.fillText('Eight Slices of Zion', plateX + 14, plateY + 7);
+  ctx.font = smallPx + 'px monospace';
+  ctx.fillStyle = HINT_INK;
+  ctx.fillText('2006 · 09 · 26', plateX + 14, plateY + 7 + titlePx + 3);
+  var hint = 'Drag to tilt.';
+  ctx.font = smallPx + 'px monospace';
+  var hintW = ctx.measureText(hint).width;
+  var hintPlateW = hintW + 24;
+  var hintPlateH = smallPx + 14;
+  var hintPlateX = 12;
+  var hintPlateY = VH - hintPlateH - 12;
+  ctx.fillStyle = PLATE;
+  ctx.fillRect(hintPlateX, hintPlateY, hintPlateW, hintPlateH);
+  ctx.strokeStyle = PLATE_LINE;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(hintPlateX + 0.5, hintPlateY + 0.5, hintPlateW - 1, hintPlateH - 1);
+  ctx.fillStyle = HINT_INK;
+  ctx.fillText(hint, hintPlateX + 12, hintPlateY + 7);
+}
+function pointerPos(e) {
+  var r = canvas.getBoundingClientRect();
+  return { x: e.clientX - r.left, y: e.clientY - r.top };
+}
+function onDown(e) {
+  dragging = true;
+  var p = pointerPos(e);
+  lastPX = p.x; lastPY = p.y;
+  if (e.preventDefault) e.preventDefault();
+}
+function onMove(e) {
+  if (!dragging) return;
+  var p = pointerPos(e);
+  tiltTX = clamp(tiltTX + (p.x - lastPX) / 220, -1, 1);
+  tiltTY = clamp(tiltTY + (p.y - lastPY) / 220, -1, 1);
+  lastPX = p.x; lastPY = p.y;
+  if (e.preventDefault) e.preventDefault();
+}
+function onUp() { dragging = false; }
+if (typeof window !== 'undefined') {
+  window.__probe = {
+    drawAt: function (t) { phaseT = t; draw(); },
+    levelCount: function () { return LEVELS; },
+    thresholds: function () { return THRESH.slice(); },
+    tilt: function () { return { x: tiltX, y: tiltY }; },
+    phaseT: function () { return phaseT; }
+  };
+  canvas.addEventListener('pointerdown', onDown);
+  canvas.addEventListener('pointermove', onMove);
+  canvas.addEventListener('pointerup', onUp);
+  canvas.addEventListener('pointercancel', onUp);
+  canvas.addEventListener('pointerleave', onUp);
+}
+/* ---- frame one: fixed phase t = 6.0s of a 24s period, mesa at full breath ---- */
+size();
+if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', size);
+if (typeof window !== 'undefined' && window.addEventListener) window.addEventListener('resize', size);
+draw();
+if (!reduced && typeof requestAnimationFrame !== 'undefined') {
+  (function loop() {
+    var t0 = null, prevTs = null, clockT = 0;
+    function step(now) {
+      if (t0 === null) t0 = now;
+      if (prevTs === null) prevTs = now;
+      var dt = clamp((now - prevTs) / 1000, 0, 0.05);
+      prevTs = now;
+      clockT += dt;
+      phaseT = (FRAME_T + clockT) % PERIOD;
+      var hidden = false;
+      try { hidden = document.hidden; } catch (e) { hidden = false; }
+      if (!hidden) draw();
+      if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  })();
+}
+</script>
+</body>
+</html>
