@@ -7,7 +7,8 @@ import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 
 export const PALETTE = {
   skin: new THREE.Color(0x8a5a3b),    // warm mid-brown skin
-  jersey: new THREE.Color(0x0b747d),  // deep teal jersey (NOT Vedel's pink)
+  jersey: new THREE.Color(0x0b747d),
+  headband: new THREE.Color(0xf09070),  // deep teal jersey (NOT Vedel's pink)
   cream: new THREE.Color(0xf4e4c8),   // cream shorts / trim
   shoe: new THREE.Color(0xffeddd),
   sole: new THREE.Color(0x263348),
@@ -349,7 +350,7 @@ function buildBodyGeometry() {
   band.rotateX(Math.PI / 2);
   band.scale(0.97, 1, 1.03);
   band.translate(0, 1.44, 0);
-  add(band, solidBone('head'), solidColor(PALETTE.jersey), 'headband');
+  add(band, solidBone('head'), solidColor(PALETTE.headband), 'headband');
 
   // Ears.
   for (const s of [-1, 1]) {
