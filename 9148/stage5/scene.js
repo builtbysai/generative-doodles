@@ -160,7 +160,9 @@ function makeBackdropMaterial(tex) {
       void main() {
         // The painting spans the full horizon. No paper wipe: free camera
         // rotation must not reveal unpainted wedges in the city.
-        vec3 paint = texture2D(uMap, vec2(vUv.x, 0.45 + vUv.y * 0.55)).rgb;
+        // From inside the cylinder, screen-right has decreasing cylinder U.
+        // Flip the image horizontally so signs and landmarks read normally.
+        vec3 paint = texture2D(uMap, vec2(1.0 - vUv.x, 0.45 + vUv.y * 0.55)).rgb;
         gl_FragColor = vec4(paint, uOpacity);
       #include <colorspace_fragment>
       }`,
@@ -285,7 +287,8 @@ export function createSceneManager({ scene, camera, sun, hemi }) {
     // The camera at +Z looks through the performer to the FAR wall -Z.
     // CylinderGeometry's u=.5 is this far wall. Aim the landmark at
     // azimuth + PI, rather than at the camera's own position.
-    lastRotY = (0.5 - curU) * Math.PI * 2;
+    // After mirroring the sample U, center the street's painted landmark.
+    lastRotY = (curU - 0.5) * Math.PI * 2;
     layers[0].mesh.rotation.y = lastRotY;
     layers[0].mat.uniforms.uMap.value = cur.tex;
     layers[0].mat.uniforms.uArcStart.value = curU - 40 / 360;
@@ -298,7 +301,7 @@ export function createSceneManager({ scene, camera, sun, hemi }) {
     if (fadeFrom >= 0) {
       const prev = baked[fadeFrom];
       const prevU = LANDMARK_U[prev.name];
-      layers[1].mesh.rotation.y = (0.5 - prevU) * Math.PI * 2;
+      layers[1].mesh.rotation.y = (prevU - 0.5) * Math.PI * 2;
       layers[1].mat.uniforms.uMap.value = prev.tex;
       layers[1].mat.uniforms.uArcStart.value = prevU - 40 / 360;
       layers[1].mat.uniforms.uArcLength.value = 1; // fully revealed
