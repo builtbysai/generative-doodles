@@ -550,8 +550,7 @@ export function createRoutine(player, poser) {
     // the wrist rotates smoothly instead of snapping at the
     // hand-offs and the spin's edges. poser.update() first, so the
     // blend starts from THIS frame's IK orientation, not the last
-    // frame's stale matrices.
-    poser.update();
+    // frame's stale matrices. endBatch() already refreshed the rig.
     for (const side of ['L', 'R']) {
       const q = bones[`hand_${side}`].getWorldQuaternion(new THREE.Quaternion());
       let set = false;
