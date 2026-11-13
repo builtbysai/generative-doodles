@@ -22,7 +22,8 @@ import { paintStreet, STREETS } from './paint-streets.js';
 export const BEATS_PER_STREET = 16;
 export const WIPE_LEAD_DEG = 45; // lead over the view direction
 const PAPER = new THREE.Color(0xf3e4ce); // blank canvas
-const CYL_RADIUS = 30;
+// Bring landmarks closer to the performer without enclosing the farthest shot.
+const CYL_RADIUS = 17;
 const CYL_HEIGHT = 12;
 
 // Where each street's landmark sits in the panorama (u coordinate):
@@ -66,7 +67,7 @@ const GROUND = {
 };
 
 // Court paint is a real top-down surface, not a decal hanging behind the
-// player. At 60 m diameter the playable markings occupy only the central
+// player. At 34 m diameter the playable markings occupy only the central
 // few meters; broad graphic shapes live outside the contact area.
 export function paintGround(name, size=1024) {
   const p=GROUND[name];
@@ -119,9 +120,9 @@ export function paintGround(name, size=1024) {
   }
   // The near player's key and center-circle marks use correct world size.
   g.strokeStyle=p.line;g.lineWidth=3.2;g.globalAlpha=.94;
-  g.beginPath();g.arc(C,C,S*.03,0,Math.PI*2);g.stroke();
-  g.strokeRect(S*.46,S*.50,S*.08,S*.10);
-  g.beginPath();g.arc(C,S*.50,S*.047,0,Math.PI);g.stroke();
+  g.beginPath();g.arc(C,C,S*.053,0,Math.PI*2);g.stroke();
+  g.strokeRect(S*.428,S*.50,S*.144,S*.171);
+  g.beginPath();g.arc(C,S*.50,S*.074,0,Math.PI);g.stroke();
   g.globalAlpha=1;
   return c;
 }
@@ -303,10 +304,10 @@ export function createSceneManager({ scene, camera, sun, hemi }) {
     const cur = baked[streetIndex];
     const curU = LANDMARK_U[cur.name];
     lastLandmarkU = curU;
-    // CylinderGeometry maps u=0 to local +Z, u=0.5 to local -Z.
-    // Rotating by az - landmark longitude faces the drawing toward the
-    // camera. The former +0.5 offset placed landmarks 180° behind it.
-    lastRotY = az - curU * Math.PI * 2;
+    // The camera at +Z looks through the performer to the FAR wall -Z.
+    // CylinderGeometry's u=.5 is this far wall. Aim the landmark at
+    // azimuth + PI, rather than at the camera's own position.
+    lastRotY = az + (0.5 - curU) * Math.PI * 2;
     layers[0].mesh.rotation.y = lastRotY;
     layers[0].mat.uniforms.uMap.value = cur.tex;
     layers[0].mat.uniforms.uArcStart.value = curU - 40 / 360;
@@ -318,7 +319,7 @@ export function createSceneManager({ scene, camera, sun, hemi }) {
     if (fadeFrom >= 0) {
       const prev = baked[fadeFrom];
       const prevU = LANDMARK_U[prev.name];
-      layers[1].mesh.rotation.y = az - prevU * Math.PI * 2;
+      layers[1].mesh.rotation.y = az + (0.5 - prevU) * Math.PI * 2;
       layers[1].mat.uniforms.uMap.value = prev.tex;
       layers[1].mat.uniforms.uArcStart.value = prevU - 40 / 360;
       layers[1].mat.uniforms.uArcLength.value = 1; // fully revealed
