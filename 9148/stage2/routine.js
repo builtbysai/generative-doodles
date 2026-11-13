@@ -49,6 +49,11 @@ export const BALL_HAND = {
 
 function clamp01(x) { return Math.min(1, Math.max(0, x)); }
 function smooth(t) { t = clamp01(t); return t * t * (3 - 2 * t); }
+// Procedural movement layers fade in/out at move boundaries, avoiding
+// the hard velocity changes of per-move sine functions.
+function motionWindow(beat, start, end, edge = 0.5) {
+  return smooth((beat - start) / edge) * (1 - smooth((beat - end + edge) / edge));
+}
 function lerp(a, b, t) { return a + (b - a) * t; }
 function lerp3(a, b, t) { return [lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t)]; }
 // Non-uniform Catmull-Rom (Barry-Goldman), time-parameterized by the
@@ -522,19 +527,37 @@ export function createRoutine(player, poser) {
 
   function applyPose(beat) {
     const p = interpolate(beat);
-    // All limb targets belong to the same posed instant. Accumulate them
-    // first and solve once instead of solving 1 + 2 + 3 + 4 chains.
+    const b = ((beat % ROUTINE_BEATS) + ROUTINE_BEATS) % ROUTINE_BEATS;
+    // A weighted athletic stance: knees absorb the dribble, pelvis shifts
+    // over the supporting feet, shoulders counter-rotate into the transfer.
+    // All secondary motion is analytic in beat time, so seeking, looping
+    // and exporting reproduce exactly the same position and contact.
+    const handles = Math.min(1, motionWindow(b, 0, 9, 0.65) +
+      motionWindow(b, 15, 18, 0.5));
+    const show = motionWindow(b, 18, 23, 0.65);
+    const groove = Math.sin(Math.PI * b);
+    const lift = Math.sin(Math.PI * b) ** 2;
+    const cross = motionWindow(b, 3, 5, 0.55);
+    const between = motionWindow(b, 5, 7, 0.55);
+    const behind = motionWindow(b, 7, 9, 0.55);
+    const counter = 0.07 * groove * handles - 0.11 * cross +
+      0.085 * between + 0.09 * behind;
+    const sideLean = (0.04 * groove + 0.013 * Math.sin(2 * Math.PI * b)) *
+      handles + 0.015 * Math.sin(Math.PI * b / 3) * show;
+    const lean = p.lean + handles * (0.034 * Math.cos(Math.PI * b));
+    const hipX = p.root[0] + handles * 0.018 * groove;
+    const hipY = p.pelvis - handles * 0.018 * lift +
+      show * 0.009 * Math.sin(Math.PI * b / 3);
+    // The feet remain exact world-space IK anchors. Only the pelvis moves
+    // slightly above them; the solver absorbs the shift at the knees.
     poser.beginBatch();
     poser.reset();
-    // The skeleton's root bone IS the pelvis: compose its position
-    // from the ground root (travel) and the pelvis channel (height).
-    poser.setRoot([p.root[0], p.pelvis, p.root[2]], [0, p.yaw, 0]);
-    // Torso lean (forward = +X rotation), head counter-tilt to stay level.
-    poser.setJoint('spine2', [p.lean * 0.4, 0, 0]);
-    poser.setJoint('spine3', [p.lean * 0.35, 0, 0]);
-    poser.setJoint('chest', [p.lean * 0.25, 0, 0]);
-    poser.setJoint('neck', [-p.lean * 0.5, 0, 0]);
-    poser.setJoint('head', [-p.lean * 0.3, 0, 0]);
+    poser.setRoot([hipX, hipY, p.root[2]], [0, p.yaw, 0]);
+    poser.setJoint('spine2', [lean * 0.42, counter * 0.33, sideLean * 0.4]);
+    poser.setJoint('spine3', [lean * 0.36, counter * 0.4, sideLean * 0.4]);
+    poser.setJoint('chest', [lean * 0.22, counter * 0.27, sideLean * 0.2]);
+    poser.setJoint('neck', [-lean * 0.48, -counter * 0.22, -sideLean * 0.33]);
+    poser.setJoint('head', [-lean * 0.28, -counter * 0.20, -sideLean * 0.23]);
     for (const side of ['L', 'R']) {
       if (p.feet[side]) poser.setFootTarget(side, p.feet[side], { flat: p.flat[side] !== false });
       else poser.clearTarget('foot', side);
@@ -563,6 +586,14 @@ export function createRoutine(player, poser) {
         set = true;
       }
       if (set) poser.setJointWorld(`hand_${side}`, q);
+    }
+    // During the 360 spin, the support shoe swivels on the ball of
+    // the planted foot. It remains anchored while its heading turns;
+    // beat 12 is 2PI and returns to world identity without a snap.
+    if (b >= PIVOT_START && b < PIVOT_END) {
+      const plantedYaw = new THREE.Quaternion().setFromAxisAngle(
+        new THREE.Vector3(0, 1, 0), p.yaw);
+      poser.setJointWorld('foot_L', plantedYaw);
     }
     // Finger-spin platform: index straight, the other fingers curled
     // into the palm so the ball reads as balanced on ONE finger. Curl
