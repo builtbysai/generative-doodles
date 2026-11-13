@@ -434,12 +434,19 @@ export function createRoutine(player, poser) {
   const FOOT_START = { L: [-0.16, 0.105, 0.06], R: [0.16, 0.105, -0.04] };
   const STEPS = {
     L: [
+      // The crossover sets the receiving foot, then resets for the
+      // between-the-legs preparation. Between steps, the foot is planted.
+      { from: 3.15, to: 3.68, fromPos: [-0.16, 0.105, 0.06], toPos: [-0.19, 0.105, 0.10], lift: 0.043 },
+      { from: 3.90, to: 4.33, fromPos: [-0.19, 0.105, 0.10], toPos: [-0.16, 0.105, 0.06], lift: 0.034 },
       { from: 4.4, to: 5.0, fromPos: [-0.16, 0.105, 0.06], toPos: [-0.20, 0.105, 0.30], lift: 0.10 },
       { from: 6.6, to: 7.0, fromPos: [-0.20, 0.105, 0.30], toPos: [-0.16, 0.105, 0.06], lift: 0.07 },
     ],
     R: [
       { from: 4.4, to: 5.0, fromPos: [0.16, 0.105, -0.04], toPos: [0.20, 0.105, -0.20], lift: 0.07 },
       { from: 6.6, to: 7.0, fromPos: [0.20, 0.105, -0.20], toPos: [0.16, 0.105, -0.04], lift: 0.07 },
+      // Behind-back transfer: free hand opens as the trailing foot rocks.
+      { from: 7.3, to: 7.76, fromPos: [0.16, 0.105, -0.04], toPos: [0.20, 0.105, -0.08], lift: 0.028 },
+      { from: 8.26, to: 8.86, fromPos: [0.20, 0.105, -0.08], toPos: [0.16, 0.105, -0.04], lift: 0.027 },
       { from: 9.0, to: 10.0, fromPos: [0.16, 0.105, -0.04], toPos: [-0.22, 0.105, -0.10], lift: 0.045 },
       { from: 10.0, to: 11.0, fromPos: [-0.22, 0.105, -0.10], toPos: [0.30, 0.105, 0.10], lift: 0.045 },
       { from: 11.0, to: 12.0, fromPos: [0.30, 0.105, 0.10], toPos: [0.16, 0.105, -0.04], lift: 0.045 },
