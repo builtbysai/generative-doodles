@@ -16,6 +16,11 @@ export function createOrbitCamera({ camera, element, onChange = () => {} }) {
 
   // Constrain the viewer inside the 17m panorama and above the court.
   function place() {
+    // At long zoom the camera must not rise above the 12m-high city
+    // panorama; otherwise the sky disappears into a flat clear color.
+    const maxElevation = Math.min(1.32,
+      Math.asin(clamp((11.5 - state.target.y) / state.radius, 0.05, 1)));
+    state.elevation = Math.min(state.elevation, maxElevation);
     const a = state.azimuth, e = state.elevation, r = state.radius;
     const ce = Math.cos(e);
     camera.position.set(
