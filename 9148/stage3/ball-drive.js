@@ -152,6 +152,16 @@ function buildArcTable(s) {
   return { table, length: len };
 }
 // Map a fractional distance (0-1) along the path to the spline's u.
+// Gentle release/catch acceleration, with a nearly constant-speed middle.
+// A full smoothstep would re-introduce the 5x speed variation the arc-length
+// table removed; this trapezoidal velocity profile tops out at just 1.14x.
+function passProgress(u) {
+  u = Math.min(1, Math.max(0, u));
+  const ramp = 0.12, denom = 2 * ramp * (1 - ramp);
+  if (u < ramp) return u * u / denom;
+  if (u > 1 - ramp) return 1 - (1 - u) * (1 - u) / denom;
+  return (u - ramp / 2) / (1 - ramp);
+}
 function arcToU(s, frac) {
   const { table, length } = s.arc;
   const target = frac * length;
@@ -195,8 +205,8 @@ export function createBallDrive(player, poser, routine) {
     return { pos: hp.clone().add(_v.copy(BALL_OFFSET).applyQuaternion(hq)), quat: hq };
   }
   // Fingertip ball-centre position at a beat (same math as routine.js).
-  function tipPos(beat) {
-    routine.applyPose(beat);
+  function tipPos(beat, poseReady = false) {
+    if (!poseReady) routine.applyPose(beat);
     const mid = bones.indexMiddle_R.getWorldPosition(new THREE.Vector3());
     const dist = bones.indexDistal_R.getWorldPosition(new THREE.Vector3());
     const dir = new THREE.Vector3().subVectors(dist, mid).normalize();
@@ -319,14 +329,14 @@ export function createBallDrive(player, poser, routine) {
       if (beat >= SPIN_T1 && beat < SPIN_T1 + 0.5) {
         // Gather: ball comes off the fingertip back into the palm.
         const u = smooth((beat - SPIN_T1) / 0.5);
-        ball.position.lerpVectors(tipPos(beat), palm, u);
+        ball.position.lerpVectors(tipPos(beat, true), palm, u);
         ball.quaternion.slerpQuaternions(spinQuat(SPIN_T1), hq, u);
       } else {
         ball.position.copy(palm);
         ball.quaternion.copy(hq);
       }
     } else if (s.kind === 'spin') {
-      const tip = tipPos(beat);
+      const tip = tipPos(beat, true);
       if (beat < SPIN_T0 + 0.5) {
         // Placement: hand lifts the ball onto the finger.
         ball.position.lerpVectors(palm, tip, smooth((beat - SPIN_T0) / 0.5));
@@ -339,7 +349,7 @@ export function createBallDrive(player, poser, routine) {
       // Catmull-Rom through the measured vias, not a ballistic arc.
       // Arc-length parameterisation: constant speed along the route
       // (Stage 12 — the raw spline parameter swung the speed 5x).
-      const u = arcToU(s, (beat - s.t0) / (s.t1 - s.t0));
+      const u = arcToU(s, passProgress((beat - s.t0) / (s.t1 - s.t0)));
       ball.position.set(...evalPath(s, u));
       ball.quaternion.slerpQuaternions(s.q0, s.q1, Math.min(1, u));
     } else {
