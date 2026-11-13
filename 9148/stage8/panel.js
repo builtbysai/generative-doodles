@@ -25,7 +25,7 @@ const FALLBACK = {
     noir: ['#e8e6e1', '#111111'],
     candy: ['#ffe9f2', '#40203a'],
   },
-  CAMERA_MODES: ['director', 'tracking', 'fixed'],
+  CAMERA_MODES: ['free', 'director', 'tracking', 'fixed'],
   LIGHTING: ['auto', 'golden', 'noon', 'dusk', 'night'],
   MOVES: ['full', 'Control dribble', 'Crossover', 'Between the legs', 'Behind the back',
     'Spin move', 'Around the world', 'Retrieval dribble', 'Finger spin'],
@@ -318,7 +318,8 @@ export function buildPanel(settings, container, hooks = {}, opts = {}) {
 
   // Camera
   const cam = section('Camera', 'camera');
-  selectRow(cam, 'cameraMode', 'Camera', optionList(presets, 'CAMERA_MODES', FALLBACK.CAMERA_MODES), cap);
+  selectRow(cam, 'cameraMode', 'Camera', optionList(presets, 'CAMERA_MODES', FALLBACK.CAMERA_MODES),
+    (v) => ({ free: 'Free orbit', director: 'Directed', tracking: 'Auto orbit', fixed: 'Fixed' }[v] || cap(v)));
   selectRow(cam, 'lighting', 'Lighting', optionList(presets, 'LIGHTING', FALLBACK.LIGHTING), cap);
   toggleRow(cam, 'fisheye', 'Fisheye');
   sliderRow(cam, 'fisheyeStrength', 'Fisheye amt', 0, 1, 0.05);

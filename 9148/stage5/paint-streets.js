@@ -379,6 +379,27 @@ function grainAndPaint(g,p,r,density,strokes) {
     brush(g,x,y,4+r()*28,(r()-.5)*20,p.bright,1+r()*3,.07+r()*.16);
   }
 }
+// Match the two edges of the wrap texture. The old flat postcard could
+// conceal this seam; a free 360-degree orbit cannot. Blend only a narrow
+// 64-pixel strip so the architectural detail in the central view survives.
+function stitchPanorama(g) {
+  const strip=64;
+  const left=g.getImageData(0,0,strip,H);
+  const right=g.getImageData(W-strip,0,strip,H);
+  for(let y=0;y<H;y++)for(let x=0;x<strip;x++){
+    const li=(y*strip+x)*4;
+    const ri=(y*strip+(strip-1-x))*4;
+    const t=(1-x/strip)**2;
+    for(let c=0;c<3;c++){
+      const a=left.data[li+c],b=right.data[ri+c];
+      const mid=(a+b)*.5;
+      left.data[li+c]=a+(mid-a)*t;
+      right.data[ri+c]=b+(mid-b)*t;
+    }
+  }
+  g.putImageData(left,0,0);
+  g.putImageData(right,W-strip,0);
+}
 export function paintStreet(name,{strokes=true,density=1}={}) {
   const p=STREET_ART[name];
   if(!p)throw new Error('Unknown street: '+name);
@@ -392,5 +413,6 @@ export function paintStreet(name,{strokes=true,density=1}={}) {
   else coney(g,p,r);
   paintGroundInPanorama(g,p,r);
   grainAndPaint(g,p,random(seed+733),density,strokes);
+  stitchPanorama(g);
   return c;
 }

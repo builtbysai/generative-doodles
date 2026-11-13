@@ -30,8 +30,8 @@ import { MOVE_MAP, ROUTINE_BEATS } from '../stage2/routine.js';
 export const DEFAULT_SETTINGS = {
   strokeSize: 1.1, density: 0.92, disorder: 0.68, tempo: 144,
   kit: 'teal', ball: 'orange', palette: 'studio',
-  cameraMode: 'director', lighting: 'auto',
-  fisheye: true, fisheyeStrength: 0.38,
+  cameraMode: 'free', lighting: 'auto',
+  fisheye: false, fisheyeStrength: 0.38,
   move: 'full', routine: 'full', format: '16:9', sound: false,
 };
 
@@ -67,6 +67,7 @@ export const PRESETS = {
     finger: { start: 18, end: 24 },
   },
   FORMATS: ['16:9', '9:16', '1:1', '4:5'],
+  CAMERA_MODES: ['free', 'director', 'tracking', 'fixed'],
 };
 
 // Map an absolute beat to the looped routine beat for a section.
@@ -90,7 +91,7 @@ const ENUMS = {
   kit: PRESETS.KITS,
   ball: PRESETS.BALLS,
   palette: PRESETS.PALETTES,
-  cameraMode: { director: 1, tracking: 1, fixed: 1 },
+  cameraMode: { free: 1, director: 1, tracking: 1, fixed: 1 },
   lighting: { auto: 1, ...PRESETS.LIGHTING },
   routine: PRESETS.ROUTINES,
   format: Object.fromEntries(PRESETS.FORMATS.map((f) => [f, 1])),

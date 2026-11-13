@@ -143,7 +143,8 @@ function makeBackdropMaterial(tex) {
       uMap: { value: tex },
       uPaper: { value: PAPER },
       uArcStart: { value: 0 },  // turns
-      uArcLength: { value: 0 }, // turns
+      uArcLength: { value: 1 }, // retained for diagnostics
+      uOpacity: { value: 1 },
     },
     vertexShader: `
       varying vec2 vUv;
@@ -154,31 +155,14 @@ function makeBackdropMaterial(tex) {
     fragmentShader: `
       uniform sampler2D uMap;
       uniform vec3 uPaper;
-      uniform float uArcStart;
-      uniform float uArcLength;
+      uniform float uOpacity;
       varying vec2 vUv;
       void main() {
+        // The painting spans the full horizon. No paper wipe: free camera
+        // rotation must not reveal unpainted wedges in the city.
         vec3 paint = texture2D(uMap, vec2(vUv.x, 0.45 + vUv.y * 0.55)).rgb;
-        // Vertical map, done HERE (not via texture repeat/offset — a
-        // custom shader ignores the texture matrix, so repeat/offset
-        // silently did nothing and the first version showed the
-        // painting upside-down with the ground on the cylinder).
-        // CylinderGeometry's torso pushes uvs.push(u, 1 - v) with
-        // vertex.y = -v*height + halfHeight, so uv.y = 1 at the TOP
-        // and 0 at the BOTTOM (verified in the vendored source — an
-        // earlier version assumed the opposite and inverted the sky).
-        // v' = 0.45 + uv.y*0.55 maps the cylinder top to the painting's
-        // top (sky) and the cylinder bottom to the painting's horizon
-        // (55% height) — the sky + landmarks half.
-        // Wipe in panorama turns: revealed if inside the arc.
-        float d = mod(vUv.x - uArcStart, 1.0);
-        // 0.5-degree soft edge (0.0014 turns). When the arc is complete,
-        // force fully revealed (else the modulo seam shows a paper sliver).
-        float edge = uArcLength >= 0.999 ? 1.0
-          : smoothstep(uArcLength + 0.0014, uArcLength - 0.0014, d);
-        vec3 col = mix(uPaper, paint, edge);
-        gl_FragColor = vec4(col, 1.0);
-        #include <colorspace_fragment>
+        gl_FragColor = vec4(paint, uOpacity);
+      #include <colorspace_fragment>
       }`,
   });
 }
@@ -233,10 +217,8 @@ export function createSceneManager({ scene, camera, sun, hemi }) {
   let streetIndex = 0;      // current street
   let fadeFrom = -1;        // street fading out, or -1
   let fadeT = 1;            // 0..1 across the 1-beat fade
-  // Wipe arc in panorama TURNS. The cylinder counter-rotates with the
-  // camera, so the view always hits the panorama at the street's
-  // landmark u (LANDMARK_U). The arc starts 40 degrees behind the view
-  // so the whole visible window is revealed from the first frame.
+  // The full panorama stays visible at every camera angle. Keep the
+  // old wipe measurements for compatibility; no paper gaps during orbit.
   let arcLength = 0;        // wipe arc length (turns)
   let beatOffset = 0;       // beat at which the current street started
   let lastBeat = 0;
@@ -295,23 +277,20 @@ export function createSceneManager({ scene, camera, sun, hemi }) {
     // would shrink the arc back when the wipe completes its turn.
     arcLength = Math.min(
       progress + (40 + WIPE_LEAD_DEG) / 360, 1);
-    // Layers: layer 0 = current street, layer 1 = fading street. Each
-    // layer counter-rotates with the camera so ITS landmark faces the
-    // camera — the painting unrolls behind the character as the camera
-    // orbits. (The first version rotated both layers identically and
-    // DUMBO's off-centre tower sat 54 degrees off-screen.)
-    const az = azimuth !== undefined ? azimuth : cameraAzimuth(beat);
+    // Backdrop is part of the WORLD, not the camera rig. Its landmark
+    // anchors to the far side of the court and stays fixed on free orbit.
     const cur = baked[streetIndex];
     const curU = LANDMARK_U[cur.name];
     lastLandmarkU = curU;
     // The camera at +Z looks through the performer to the FAR wall -Z.
     // CylinderGeometry's u=.5 is this far wall. Aim the landmark at
     // azimuth + PI, rather than at the camera's own position.
-    lastRotY = az + (0.5 - curU) * Math.PI * 2;
+    lastRotY = (0.5 - curU) * Math.PI * 2;
     layers[0].mesh.rotation.y = lastRotY;
     layers[0].mat.uniforms.uMap.value = cur.tex;
     layers[0].mat.uniforms.uArcStart.value = curU - 40 / 360;
-    layers[0].mat.uniforms.uArcLength.value = arcLength;
+    layers[0].mat.uniforms.uArcLength.value = 1;
+    layers[0].mat.uniforms.uOpacity.value = 1;
     layers[0].mesh.visible = true;
     layers[0].mat.opacity = 1;
     grounds[0].mat.map = cur.groundTex;
@@ -319,12 +298,12 @@ export function createSceneManager({ scene, camera, sun, hemi }) {
     if (fadeFrom >= 0) {
       const prev = baked[fadeFrom];
       const prevU = LANDMARK_U[prev.name];
-      layers[1].mesh.rotation.y = az + (0.5 - prevU) * Math.PI * 2;
+      layers[1].mesh.rotation.y = (0.5 - prevU) * Math.PI * 2;
       layers[1].mat.uniforms.uMap.value = prev.tex;
       layers[1].mat.uniforms.uArcStart.value = prevU - 40 / 360;
       layers[1].mat.uniforms.uArcLength.value = 1; // fully revealed
       layers[1].mesh.visible = true;
-      layers[1].mat.opacity = 1 - fadeT;
+      layers[1].mat.uniforms.uOpacity.value = 1 - fadeT;
       grounds[1].mat.map = prev.groundTex;
       grounds[1].mat.opacity = 1 - fadeT;
       setLights(cur.name, prev.name, 1 - fadeT);
