@@ -28,10 +28,10 @@ import { recolourKit } from '../stage1/player-model.js';
 import { MOVE_MAP, ROUTINE_BEATS } from '../stage2/routine.js';
 
 export const DEFAULT_SETTINGS = {
-  strokeSize: 1.0, density: 1.0, disorder: 0.78, tempo: 144,
-  kit: 'teal', ball: 'orange', palette: 'golden',
+  strokeSize: 1.1, density: 0.92, disorder: 0.68, tempo: 144,
+  kit: 'teal', ball: 'orange', palette: 'studio',
   cameraMode: 'director', lighting: 'auto',
-  fisheye: true, fisheyeStrength: 0.6,
+  fisheye: true, fisheyeStrength: 0.38,
   move: 'full', routine: 'full', format: '16:9', sound: false,
 };
 
@@ -39,18 +39,19 @@ const DEFAULT_DISORDER = 0.78; // == the Stage 4 uErode default
 
 export const PRESETS = {
   KITS: {
-    teal: { jersey: '#0f766e', shorts: '#f5efe0', headband: '#0f766e' },
-    crimson: { jersey: '#991b1b', shorts: '#fef2f2', headband: '#991b1b' },
-    royal: { jersey: '#1d4ed8', shorts: '#eff6ff', headband: '#1d4ed8' },
-    black: { jersey: '#18181b', shorts: '#e4e4e7', headband: '#18181b' },
+    teal: { jersey: '#0b747d', shorts: '#f4e4c8', headband: '#f09070' },
+    crimson: { jersey: '#c94b52', shorts: '#f6e2c6', headband: '#f1bc7d' },
+    royal: { jersey: '#445cb3', shorts: '#eec9ba', headband: '#f5b36c' },
+    black: { jersey: '#24283d', shorts: '#f3c8a1', headband: '#f08979' },
   },
   BALLS: {
-    orange: '#e8722a', black: '#26262a', pink: '#f472b6', blue: '#3b82f6',
+    orange: '#ed7339', black: '#31334a', pink: '#e77c91', blue: '#547ac7',
   },
   PALETTES: {
-    golden: { paper: '#efe8d8', ink: '#1a1512' },
-    noir: { paper: '#e8e8e8', ink: '#000000' },
-    candy: { paper: '#ffe8f0', ink: '#3a1a2a' },
+    studio: { paper: '#f3e4ce', ink: '#263348' },
+    golden: { paper: '#f9e8c6', ink: '#58424a' },
+    noir: { paper: '#d4dce5', ink: '#19273b' },
+    candy: { paper: '#f9dfe2', ink: '#47324d' },
   },
   LIGHTING: {
     golden: { sun: '#ffb347', sunI: 2.2, hemiSky: '#ffd9a0', hemiGround: '#8a6a4a', hemiI: 0.9 },

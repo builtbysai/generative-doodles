@@ -34,39 +34,71 @@ const FALLBACK = {
 };
 
 const CSS = `
-.fbp { position: fixed; top: 12px; right: 12px; z-index: 50; width: 300px;
-  max-width: calc(100vw - 24px); max-height: calc(100vh - 24px); overflow-y: auto;
-  background: rgba(18,18,22,0.88); color: #f2ede2; border-radius: 10px;
-  border: 1px solid rgba(255,255,255,0.12); box-shadow: 0 4px 24px rgba(0,0,0,0.4);
-  font: 13px/1.4 system-ui, sans-serif; }
-.fbp.fbp-collapsed { width: auto; }
-.fbp-head { display: flex; justify-content: space-between; align-items: center;
-  padding: 10px 12px; cursor: pointer; font-weight: 700; font-size: 14px;
-  user-select: none; }
-.fbp-head button { background: none; border: none; color: inherit; font: inherit;
-  cursor: pointer; padding: 0 2px; }
-.fbp-sec-head { display: flex; justify-content: space-between; align-items: center;
-  padding: 8px 12px 2px; font-weight: 700; font-size: 11px;
-  text-transform: uppercase; letter-spacing: 0.06em; opacity: 0.75;
-  cursor: pointer; user-select: none; }
-.fbp-row { display: flex; align-items: center; gap: 8px; padding: 5px 12px; }
-.fbp-row > label { flex: 0 0 84px; opacity: 0.9; }
-.fbp-row input[type=range] { flex: 1; min-width: 0; }
-.fbp-val { flex: 0 0 auto; text-align: right; opacity: 0.8; min-width: 34px; }
-.fbp-chips { display: flex; gap: 6px; flex-wrap: wrap; flex: 1; }
-.fbp-chip { display: flex; gap: 2px; padding: 3px; border-radius: 6px;
-  border: 1px solid rgba(255,255,255,0.25); background: transparent; cursor: pointer; }
-.fbp-chip.on { border-color: #fff; box-shadow: 0 0 0 1px #fff; }
-.fbp-dot { width: 14px; height: 14px; border-radius: 50%; display: block; }
-.fbp-row select { flex: 1; min-width: 0; background: #222; color: inherit;
-  border: 1px solid rgba(255,255,255,0.2); border-radius: 6px; padding: 4px 6px;
-  font: inherit; }
-.fbp-row input[type=checkbox] { accent-color: #f2ede2; width: 16px; height: 16px; }
-.fbp-foot { display: flex; gap: 8px; padding: 10px 12px 12px; margin-top: 6px;
-  border-top: 1px solid rgba(255,255,255,0.12); }
-.fbp-foot button { flex: 1; background: #f2ede2; color: #111; border: none;
-  border-radius: 6px; padding: 7px 4px; font: inherit; font-weight: 600; cursor: pointer; }
-.fbp-foot button:disabled { opacity: 0.35; cursor: default; }
+.fbp {
+  position:fixed;top:18px;right:18px;z-index:50;width:312px;
+  max-width:calc(100vw - 36px);max-height:calc(100dvh - 36px);overflow-y:auto;
+  background:#f6e7d1;color:#263348;border:1px solid #263348;
+  box-shadow:7px 7px 0 rgba(38,51,72,.21);
+  font:12px/1.45 "Trebuchet MS", system-ui, sans-serif;
+  scrollbar-width:thin;scrollbar-color:#a68f83 transparent;
+}
+.fbp button,.fbp select,.fbp input {font:inherit}
+.fbp.fbp-collapsed {width:auto;background:#263348;color:#fff0d7;box-shadow:4px 4px 0 rgba(38,51,72,.22)}
+.fbp-head {
+  display:flex;align-items:center;justify-content:space-between;gap:22px;
+  min-height:40px;padding:0 13px;cursor:pointer;user-select:none;
+  font-size:10px;font-weight:800;letter-spacing:.13em;text-transform:uppercase;
+  border-bottom:1px solid rgba(38,51,72,.22);
+}
+.fbp-collapsed .fbp-head {border-bottom:0}
+.fbp-head:before {content:"";display:block;width:8px;height:8px;flex:none;background:#ed885e;transform:rotate(45deg)}
+.fbp-head span {flex:1}
+.fbp-head button {border:0;color:inherit;background:transparent;cursor:pointer;font-size:17px;line-height:1;padding:8px 0}
+.fbp-head:focus-visible,.fbp-sec-head:focus-visible,.fbp button:focus-visible,
+.fbp input:focus-visible,.fbp select:focus-visible {outline:2px solid #f08d60;outline-offset:2px}
+.fbp-sec-head {
+  display:flex;align-items:center;justify-content:space-between;
+  padding:12px 13px 8px;border-top:1px solid rgba(38,51,72,.14);
+  font-size:10px;font-weight:800;letter-spacing:.13em;text-transform:uppercase;
+  cursor:pointer;user-select:none
+}
+.fbp-sec-head span:last-child{font-size:13px;opacity:.7}
+.fbp-sec-body{padding-bottom:10px}
+.fbp-row{display:flex;align-items:center;gap:10px;padding:5px 13px;min-height:27px}
+.fbp-row>label{flex:0 0 81px;color:#6e6570;font-weight:600;font-size:11px}
+.fbp-row input[type=range] {
+  flex:1;min-width:0;height:3px;border-radius:0;cursor:pointer;
+  accent-color:#e57250
+}
+.fbp-val{flex:0 0 auto;min-width:36px;text-align:right;color:#5e5b6b;font:600 10px/1.2 ui-monospace,monospace}
+.fbp-chips{display:flex;flex:1;flex-wrap:wrap;gap:5px}
+.fbp-chip{
+  display:flex;gap:1px;padding:3px;border-radius:0;cursor:pointer;
+  border:1px solid #cbb6a2;background:#e7d5c3;transition:border-color .15s ease,background .15s ease
+}
+.fbp-chip.on{border-color:#263348;background:#263348}
+.fbp-dot{display:block;width:14px;height:17px}
+.fbp-row select{
+  flex:1;min-width:0;background:#f9eedc;color:#263348;
+  padding:6px;border:1px solid #cbb6a2;border-radius:0
+}
+.fbp-row input[type=checkbox]{accent-color:#e57250;width:16px;height:16px}
+.fbp-foot{
+  display:grid;grid-template-columns:1fr 1fr 1.2fr;gap:6px;
+  padding:12px 13px 14px;border-top:1px solid rgba(38,51,72,.2)
+}
+.fbp-foot button{
+  min-height:36px;padding:5px 2px;border:1px solid #263348;border-radius:0;
+  color:#263348;background:transparent;cursor:pointer;
+  font-size:10px;font-weight:700;letter-spacing:.02em
+}
+.fbp-foot button:last-of-type{background:#263348;color:#f6e7d1}
+.fbp-foot button:disabled{opacity:.32;cursor:default}
+@media (max-width:600px){
+  .fbp{top:auto;right:0;left:0;bottom:0;width:auto;max-width:none;max-height:75dvh;border-left:0;border-right:0;border-bottom:0;box-shadow:0 -9px 28px rgba(25,35,49,.2)}
+  .fbp.fbp-collapsed{top:12px;right:12px;bottom:auto;left:auto;width:auto;max-height:none;box-shadow:3px 3px 0 rgba(38,51,72,.22)}
+  .fbp-head{min-height:42px}
+}
 `;
 
 function injectCss() {
@@ -125,7 +157,7 @@ export function buildPanel(settings, container, hooks = {}, opts = {}) {
 
   // Header: title + collapse toggle. Collapsed, only this row shows.
   const head = el('div', 'fbp-head');
-  head.appendChild(el('span', '', 'Settings'));
+  head.appendChild(el('span', '', 'Streetball / 9148'));
   const collapseBtn = el('button', '', '-');
   collapseBtn.setAttribute('data-action', 'collapse-panel');
   collapseBtn.setAttribute('aria-label', 'Collapse panel');
@@ -134,13 +166,23 @@ export function buildPanel(settings, container, hooks = {}, opts = {}) {
 
   const body = el('div', 'fbp-body');
   root.appendChild(body);
-  head.addEventListener('click', () => {
+  head.setAttribute('role','button');
+  head.tabIndex=0;
+  head.setAttribute('aria-expanded', String(!opts.startCollapsed));
+  const togglePanel = () => {
     const hidden = body.style.display === 'none';
     body.style.display = hidden ? '' : 'none';
     collapseBtn.textContent = hidden ? '-' : '+';
     // Collapsed, the panel shrinks to the header (otherwise the 300 px
     // header bar covers the HUD on a 390 px phone).
     root.classList.toggle('fbp-collapsed', !hidden);
+    head.setAttribute('aria-expanded', String(hidden));
+  };
+  head.addEventListener('click', togglePanel);
+  head.addEventListener('keydown', (event) => {
+    if (event.target === head && (event.key === 'Enter' || event.key === ' ')) {
+      event.preventDefault();togglePanel();
+    }
   });
   // Start collapsed (the piece is the point; the panel is a tool).
   // The viewer passes this on narrow viewports, where the open panel
@@ -154,15 +196,24 @@ export function buildPanel(settings, container, hooks = {}, opts = {}) {
   function section(title, key) {
     const secHead = el('div', 'fbp-sec-head');
     secHead.setAttribute('data-section', key);
+    secHead.setAttribute('role','button');secHead.tabIndex=0;
     secHead.appendChild(el('span', '', title));
     const ind = el('span', '', '-');
     secHead.appendChild(ind);
     const secBody = el('div', 'fbp-sec-body');
-    secHead.addEventListener('click', () => {
+    const toggleSection = () => {
       const hidden = secBody.style.display === 'none';
       secBody.style.display = hidden ? '' : 'none';
       ind.textContent = hidden ? '-' : '+';
+      secHead.setAttribute('aria-expanded', String(hidden));
+    };
+    secHead.addEventListener('click', toggleSection);
+    secHead.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();toggleSection();
+      }
     });
+    secHead.setAttribute('aria-expanded','true');
     body.appendChild(secHead);
     body.appendChild(secBody);
     return secBody;

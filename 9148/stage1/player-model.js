@@ -7,13 +7,14 @@ import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 
 export const PALETTE = {
   skin: new THREE.Color(0x8a5a3b),    // warm mid-brown skin
-  jersey: new THREE.Color(0x0f766e),  // deep teal jersey (NOT Vedel's pink)
-  cream: new THREE.Color(0xf5efe0),   // cream shorts / trim
-  shoe: new THREE.Color(0xf2f2f2),
-  sole: new THREE.Color(0x262626),
+  jersey: new THREE.Color(0x0b747d),
+  headband: new THREE.Color(0xf09070),  // deep teal jersey (NOT Vedel's pink)
+  cream: new THREE.Color(0xf4e4c8),   // cream shorts / trim
+  shoe: new THREE.Color(0xffeddd),
+  sole: new THREE.Color(0x263348),
   hair: new THREE.Color(0x1a1210),
-  ink: new THREE.Color(0x1a1440),    // dark navy ink (eyes, smile)
-  cheek: new THREE.Color(0xf472b6),   // soft pink cheeks
+  ink: new THREE.Color(0x263348),    // dark navy ink (eyes, smile)
+  cheek: new THREE.Color(0xd88180),   // soft pink cheeks
 };
 
 // The torso lathe mixes two kit colours in ONE geometry part: jersey
@@ -349,7 +350,7 @@ function buildBodyGeometry() {
   band.rotateX(Math.PI / 2);
   band.scale(0.97, 1, 1.03);
   band.translate(0, 1.44, 0);
-  add(band, solidBone('head'), solidColor(PALETTE.jersey), 'headband');
+  add(band, solidBone('head'), solidColor(PALETTE.headband), 'headband');
 
   // Ears.
   for (const s of [-1, 1]) {
@@ -510,14 +511,23 @@ function buildBodyGeometry() {
 // Basketball prop (separate, unskinned mesh; parented to the hand bone).
 // ---------------------------------------------------------------------------
 // colour: the ball's base (Stage 8 setting). Seams stay dark.
-export function makeBallTexture(colour = '#e8722a') {
+export function makeBallTexture(colour = '#ed7339') {
   const c = document.createElement('canvas');
   c.width = 512;
   c.height = 256;
   const g = c.getContext('2d');
   g.fillStyle = colour;
   g.fillRect(0, 0, 512, 256);
-  g.strokeStyle = '#1a1a1a';
+  // Restrained porous leather and uneven ink, stable across recolours.
+  let seed = 890313;
+  const r = () => { seed = (seed * 16807) % 2147483647; return seed / 2147483647; };
+  for (let i = 0; i < 4200; i++) {
+    const x = r() * 512, y = r() * 256;
+    g.fillStyle = r() > 0.5 ? 'rgba(255,243,217,0.10)' : 'rgba(67,31,31,0.10)';
+    const rad = 0.3 + r() * 1.1;
+    g.beginPath(); g.arc(x, y, rad, 0, Math.PI * 2); g.fill();
+  }
+  g.strokeStyle = '#342b38';
   g.lineWidth = 6;
   g.lineCap = 'round';
   g.beginPath(); g.moveTo(0, 128); g.lineTo(512, 128); g.stroke(); // equator

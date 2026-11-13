@@ -1,7 +1,7 @@
 <!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Stage 8 — Settings + export viewer</title>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Streetball | Generative Doodles</title>
 <style>
-  html, body { margin: 0; padding: 0; background: #efe8d8; overflow: hidden; }
+  html, body { margin: 0; padding: 0; background: #f3e4ce; overflow: hidden; }
   /* The canvas is centred both ways: margin auto only centres
      horizontally, which left the whole paper band at the bottom on
      tall phones (real-device check 2026-11-13: 18% blank below). */
@@ -29,8 +29,8 @@
 import * as THREE from 'three';
 import { createPlayer } from '../stage1/player-model.js';
 import { createPoser } from '../stage2/pose.js';
-import { createRoutine } from '../stage2/routine.js';
-import { createBallDrive } from '../stage3/ball-drive.js';
+import { createRoutine, BEAT } from '../stage2/routine.js';
+import { createBallDrive, evalFree } from '../stage3/ball-drive.js';
 import { makeBrushTexture, makeToonGradient, makeHull, makeHalftoneShadow, updateHullUniforms } from '../stage4/look.js';
 import { createStrokeMesh, createBallStrokeMesh } from '../stage4/strokes.js';
 import { createLensPass, fisheyeParams } from '../stage4/lens.js';
@@ -38,7 +38,7 @@ import { createSceneManager, BEATS_PER_STREET } from '../stage5/scene.js';
 import { createBeatClock } from '../stage6/beat-clock.js';
 import { createAudioEngine } from '../stage6/audio.js';
 import { createDirector } from '../stage7/director.js';
-import { createSettings, loopBeat } from './settings.js';
+import { createSettings, loopBeat, DEFAULT_SETTINGS } from './settings.js';
 import { buildPanel } from './panel.js';
 import { createExporter } from './export.js';
 import { savePreset, loadPreset } from './presets.js';
@@ -64,7 +64,7 @@ const softwareGL = /swiftshader|llvmpipe|software/i.test(rendererName);
 const lowCost = qualityParam === 'low' || (qualityParam !== 'high' && (smallTouch || softwareGL));
 const maxPixelRatio = qualityParam === 'low' ? 1 : Math.min(window.devicePixelRatio || 1, smallTouch ? 1.5 : 2);
 renderer.setPixelRatio(maxPixelRatio);
-renderer.shadowMap.enabled = true;
+renderer.shadowMap.enabled = !lowCost;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 document.body.appendChild(renderer.domElement);
 
@@ -72,6 +72,7 @@ document.body.appendChild(renderer.domElement);
 // renders directly (the exact 13c path); above 0 the scene renders
 // through the lens (see renderFrame).
 const lensPass = createLensPass({ renderer, lowCost });
+let exportLens = null;
 
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(40, 16 / 9, 0.1, 100);
@@ -88,7 +89,11 @@ scene.add(sun);
 
 const sceneManager = createSceneManager({ scene, camera, sun, hemi });
 
-const brushTex = makeBrushTexture();
+const brushTex = makeBrushTexture({
+  size: DEFAULT_SETTINGS.strokeSize,
+  density: DEFAULT_SETTINGS.density,
+  disorder: DEFAULT_SETTINGS.disorder,
+});
 const toonGrad = makeToonGradient();
 const player = createPlayer();
 scene.add(player.group);
@@ -105,6 +110,12 @@ player.ball.material = new THREE.MeshToonMaterial({
 });
 const heroHull = makeHull(heroMesh, { erode: true });
 const ballHull = makeHull(player.ball, { erode: true });
+// Ensure the initial frame and the open-settings values match exactly.
+heroHull.material.color.set('#263348');
+ballHull.material.color.set('#263348');
+const initialErode = 2 * 0.78 - DEFAULT_SETTINGS.disorder;
+heroHull.material.userData.uErode.value = initialErode;
+ballHull.material.userData.uErode.value = initialErode;
 player.group.add(heroHull);
 player.ball.add(ballHull);
 // Stage 13c: brush strokes as geometry — a skinned stroke mesh sharing
@@ -121,7 +132,77 @@ player.ball.add(ballStrokeMesh);
 updateHullUniforms(heroHull, camera, window.innerHeight * renderer.getPixelRatio());
 updateHullUniforms(ballHull, camera, window.innerHeight * renderer.getPixelRatio());
 const halftone = makeHalftoneShadow(sun, { dotScale: 200 });
+halftone.material.uniforms.uInk.value.set('#263348');
+halftone.visible = !lowCost;
 scene.add(halftone);
+
+// Small/software GPUs: painted contact shadows instead of a fullscreen
+// shadow map and multi-tap PCF. The three shadows follow planted feet
+// and the basketball's solved world position.
+const contactShadows = [];
+if (lowCost) {
+  const sc = document.createElement('canvas');
+  sc.width = sc.height = 128;
+  const sg = sc.getContext('2d');
+  const ink = sg.createRadialGradient(64,64,5,64,64,62);
+  ink.addColorStop(0,'rgba(32,45,66,0.48)');
+  ink.addColorStop(0.48,'rgba(32,45,66,0.25)');
+  ink.addColorStop(1,'rgba(32,45,66,0)');
+  sg.fillStyle=ink;sg.fillRect(0,0,128,128);
+  const tex = new THREE.CanvasTexture(sc);
+  const geometry = new THREE.PlaneGeometry(1,1);
+  for (let i=0;i<3;i++) {
+    const m=new THREE.Mesh(geometry,new THREE.MeshBasicMaterial({
+      map:tex,transparent:true,depthWrite:false,opacity:0.8,
+      side:THREE.DoubleSide,
+    }));
+    m.rotation.x=-Math.PI/2;
+    m.position.y=0.015+i*0.001;
+    m.renderOrder=1;
+    scene.add(m);contactShadows.push(m);
+  }
+}
+function updateContactShadows(beat) {
+  if (!contactShadows.length || exporting) return;
+  const p=routine.interpolate(beat);
+  for (let i=0;i<2;i++) {
+    const f=p.feet[i===0?'L':'R'],m=contactShadows[i];
+    m.position.set(f[0],0.015+i*0.001,f[2]);
+    const raised=Math.max(0,f[1]-0.105);
+    m.scale.set(0.38+raised*0.7,0.30+raised*0.5,1);
+    m.material.opacity=0.86*Math.max(.35,1-raised*7);
+  }
+  const b=player.ball.position,h=Math.max(0,b.y-0.12);
+  const m=contactShadows[2];
+  m.position.set(b.x,0.017,b.z);
+  m.scale.set(0.40+0.20*h,0.32+0.17*h,1);
+  m.material.opacity=0.92*Math.max(.12,1-h/1.45);
+}
+
+// One tiny animated chalk-ring at a real floor collision. The mark expands
+// and vanishes; it is driven from the same solved bounce time as the ball.
+const impactMat = new THREE.MeshBasicMaterial({
+  color: 0xffe7c0, transparent: true, opacity: 0,
+  depthWrite: false, side: THREE.DoubleSide,
+});
+const impactRing = new THREE.Mesh(new THREE.RingGeometry(0.15, 0.164, 48), impactMat);
+impactRing.rotation.x = -Math.PI / 2;
+impactRing.renderOrder = 3;
+impactRing.visible = false;
+scene.add(impactRing);
+function updateImpact(beat) {
+  const s = ballDrive.segAt(beat);
+  impactRing.visible = false;
+  if (s.kind !== 'bounce') return;
+  const dt = (beat - s.t0) * BEAT - s.tB;
+  if (dt < 0 || dt > 0.19) return;
+  const u = dt / 0.19;
+  const hit = evalFree(s, s.tB);
+  impactRing.visible = true;
+  impactRing.position.set(hit.x, 0.022, hit.z);
+  impactRing.scale.setScalar(1 + 1.45 * u);
+  impactMat.opacity = 0.48 * (1 - u) * (1 - u);
+}
 
 const clock = createBeatClock({ bpm: 144 });
 const audio = createAudioEngine({ clock, ballDrive, routine });
@@ -239,6 +320,8 @@ function renderFrame(beat, render = true) {
   // The ball drive poses the character itself. Calling routine.update()
   // first posed every bone twice and repeatedly re-parented the ball.
   ballDrive.update(routineBeat);
+  updateImpact(routineBeat);
+  updateContactShadows(routineBeat);
   driveCamera(beat, routineBeat);
   // The lighting override applies AFTER the scene manager's per-frame
   // lighting (otherwise the per-street lighting overwrites it).
@@ -275,7 +358,7 @@ function renderFrame(beat, render = true) {
   halftone.userData.updateFromLight();
   if (render) {
     if (fStrength > 0) {
-      lensPass.render(scene, camera, { strength: fStrength, fovDeg: camera.fov, mag: fMag });
+      (exportLens || lensPass).render(scene, camera, { strength: fStrength, fovDeg: camera.fov, mag: fMag });
     } else {
       renderer.render(scene, camera);
     }
@@ -304,6 +387,13 @@ async function onExport() {
   // The export is 1920x1080 (16:9): set the camera aspect for it, or
   // the frames stretch. Restored afterwards.
   const prevAspect = camera.aspect;
+  const liveShadowEnabled = renderer.shadowMap.enabled;
+  const liveHalftoneVisible = halftone.visible;
+  // Export always uses full paint-quality shadows and a high-precision
+  // fisheye buffer, independent of the live phone performance profile.
+  renderer.shadowMap.enabled = true;
+  halftone.visible = true;
+  contactShadows.forEach(m => { m.visible = false; });
   camera.aspect = 16 / 9;
   camera.updateProjectionMatrix();
   // The export renders at 1920x1080 with pixel ratio 1: the hull
@@ -312,6 +402,7 @@ async function onExport() {
   updateHullUniforms(heroHull, camera, 1080);
   updateHullUniforms(ballHull, camera, 1080);
   try {
+    if (lowCost) exportLens = createLensPass({ renderer, lowCost: false });
     const { blob, mimeType, durationMs } = await exporter.exportClip({
       seconds: 30, width: 1920, height: 1080,
       onProgress: (s) => {
@@ -333,6 +424,10 @@ async function onExport() {
     setTimeout(() => { progress.style.display = 'none'; }, 6000);
     throw e;
   } finally {
+    if (exportLens) { exportLens.dispose(); exportLens = null; }
+    renderer.shadowMap.enabled = liveShadowEnabled;
+    halftone.visible = liveHalftoneVisible;
+    contactShadows.forEach(m => { m.visible = true; });
     camera.aspect = prevAspect;
     camera.updateProjectionMatrix();
     updateHullUniforms(heroHull, camera, formatSize.h * renderer.getPixelRatio());
@@ -360,7 +455,7 @@ async function onLoadPreset(file) {
 const panel = buildPanel(settings, document.body, { onExport, onSavePreset, onLoadPreset },
   // On a narrow viewport the open panel covers the whole portrait
   // stage — start collapsed there (the user taps Settings to open it).
-  { startCollapsed: window.innerWidth < 600 });
+  { startCollapsed: true });
 
 let lastBeat = -1;
 if (staticBeat !== null) {
@@ -431,7 +526,7 @@ if (staticBeat !== null) {
   requestAnimationFrame(frame);
 }
 
-window.__stage8 = { THREE, player, poser, routine, ballDrive, sceneManager, clock, audio, director, settings, panel, exporter, heroHull, ballHull, halftone, heroMesh, lensPass, renderer, scene, camera, sun, hemi, renderFrame, applyFormat, onExport, onSavePreset, onLoadPreset, formatSize: () => formatSize, get strokeMesh() { return strokeMesh; }, get ballStrokeMesh() { return ballStrokeMesh; } };
+window.__stage8 = { THREE, player, poser, routine, ballDrive, sceneManager, clock, audio, director, settings, panel, exporter, heroHull, ballHull, halftone, heroMesh, lensPass, renderer, scene, camera, sun, hemi, impactRing, renderFrame, applyFormat, onExport, onSavePreset, onLoadPreset, formatSize: () => formatSize, get strokeMesh() { return strokeMesh; }, get ballStrokeMesh() { return ballStrokeMesh; } };
 window.__measure8 = installMeasure8({ THREE, player, poser, routine, ballDrive, sceneManager, clock, audio, director, settings, exporter, heroMesh, heroHull, ballHull, halftone, renderer, scene, camera, sun, hemi, renderFrame, applyFormat, onExport });
 window.__ready = true;
 </script>
