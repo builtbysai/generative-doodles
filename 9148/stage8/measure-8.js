@@ -78,6 +78,23 @@ export function installMeasure8(ctx) {
     check('kit recolours', JSON.stringify(c0) !== JSON.stringify(c1), `jersey ${c0} -> ${c1}`);
     settings.set({ kit: 'teal' });
 
+    // 5b. kit: the stroke mesh rebuilds with the new kit colours
+    // (stale strokes were the open 13c limitation). Crimson jersey
+    // #991b1b is ~linear (0.32, 0.01, 0.01); strokes carry it with
+    // 0.9-1.1 jitter and a 0.72 dark factor on 15%.
+    const sm0 = player.group.getObjectByName('strokeMesh');
+    settings.set({ kit: 'crimson' });
+    const sm1 = player.group.getObjectByName('strokeMesh');
+    let crimsonVerts = 0;
+    const ac = sm1.geometry.getAttribute('aColor');
+    for (let i = 0; i < ac.count; i++) {
+      const r = ac.getX(i), g = ac.getY(i), b = ac.getZ(i);
+      if (r > 0.2 && r < 0.42 && g < 0.05 && b < 0.05) crimsonVerts++;
+    }
+    check('kit rebuilds strokes', sm1 !== sm0 && crimsonVerts > 100,
+      `mesh ${sm1 !== sm0 ? 'rebuilt' : 'same'}, ${crimsonVerts} crimson verts`);
+    settings.set({ kit: 'teal' });
+
     // 6. ball: the ball texture object changes.
     const ballTex0 = player.ball.material.map;
     settings.set({ ball: 'pink' });
