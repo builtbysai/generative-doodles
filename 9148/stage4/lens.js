@@ -72,15 +72,14 @@ void main() {
   #include <colorspace_fragment>
 }`;
 
-export function createLensPass({ renderer }) {
+export function createLensPass({ renderer, lowCost = false }) {
   const dbSize = new THREE.Vector2();
   renderer.getDrawingBufferSize(dbSize);
-  // Half-float: the scene renders linear into the target, and an 8-bit
-  // linear buffer would band in the darks before the sRGB conversion
-  // in the blit. samples: 4 keeps the MSAA the direct render had.
+  // Reduce expensive MSAA resolves on desktop. Low-cost devices keep the
+  // fisheye distortion with an 8-bit non-MSAA target to save bandwidth.
   const rt = new THREE.WebGLRenderTarget(dbSize.x, dbSize.y, {
-    type: THREE.HalfFloatType,
-    samples: 4,
+    type: lowCost ? THREE.UnsignedByteType : THREE.HalfFloatType,
+    samples: lowCost ? 0 : 2,
   });
   const mat = new THREE.ShaderMaterial({
     uniforms: {
