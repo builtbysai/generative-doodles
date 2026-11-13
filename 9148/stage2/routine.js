@@ -460,7 +460,9 @@ export function createRoutine(player, poser) {
         const e = smooth(u);
         pos = [
           lerp(st.fromPos[0], st.toPos[0], e),
-          0.105 + st.lift * Math.sin(Math.PI * u),
+          // Squared sine keeps vertical foot velocity continuous at lift-off
+          // and landing (plain sin produced a sharp velocity discontinuity).
+          0.105 + st.lift * Math.sin(Math.PI * u) ** 2,
           lerp(st.fromPos[2], st.toPos[2], e),
         ];
         planted = false;
