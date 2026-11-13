@@ -28,7 +28,7 @@ import { recolourKit } from '../stage1/player-model.js';
 import { MOVE_MAP, ROUTINE_BEATS } from '../stage2/routine.js';
 
 export const DEFAULT_SETTINGS = {
-  strokeSize: 1.1, density: 0.92, disorder: 0.68, tempo: 138,
+  strokeSize: 1.1, density: 0.92, disorder: 0.68, tempo: 144,
   kit: 'teal', ball: 'orange', palette: 'studio',
   cameraMode: 'director', lighting: 'auto',
   fisheye: true, fisheyeStrength: 0.38,
