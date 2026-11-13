@@ -21,7 +21,7 @@ import { paintStreet, STREETS } from './paint-streets.js';
 
 export const BEATS_PER_STREET = 16;
 export const WIPE_LEAD_DEG = 45; // lead over the view direction
-const PAPER = new THREE.Color(0xefe8d8); // blank canvas
+const PAPER = new THREE.Color(0xf3e4ce); // blank canvas
 const CYL_RADIUS = 30;
 const CYL_HEIGHT = 12;
 
@@ -39,10 +39,10 @@ const LANDMARK_U = {
 // Per-street light: the character's toon lighting shifts with the time
 // of day. Lerped during the street fade.
 const STREET_LIGHTS = {
-  'washington-square': { sun: 0xffb347, sunI: 2.2, hemiSky: 0xffd9a0, hemiGround: 0x8a6a4a, hemiI: 0.9 },
-  'dumbo': { sun: 0xfff4e0, sunI: 2.0, hemiSky: 0xbcd8e8, hemiGround: 0x777777, hemiI: 0.8 },
-  'soho': { sun: 0xff8a5c, sunI: 1.6, hemiSky: 0x7a5a8a, hemiGround: 0x4a3a4a, hemiI: 0.7 },
-  'coney-island': { sun: 0x7a9cc8, sunI: 1.2, hemiSky: 0x2a3a5a, hemiGround: 0x1a1a2a, hemiI: 0.5 },
+  'washington-square': { sun: 0xffd6a0, sunI: 2.35, hemiSky: 0xb6d1d2, hemiGround: 0x986b62, hemiI: 0.90 },
+  'dumbo': { sun: 0xffd5b8, sunI: 2.1, hemiSky: 0xadb8db, hemiGround: 0x626c82, hemiI: 0.84 },
+  'soho': { sun: 0xffac8f, sunI: 1.90, hemiSky: 0x8875ab, hemiGround: 0x53476a, hemiI: 0.84 },
+  'coney-island': { sun: 0x87cbd6, sunI: 1.75, hemiSky: 0x536b9f, hemiGround: 0x50446e, hemiI: 0.82 },
 };
 
 // Sky-top colour per street (the top of each painting's sky gradient
@@ -51,92 +51,78 @@ const STREET_LIGHTS = {
 // the frame's top shows the black void. A flat sky-top colour blends
 // with the painting's sky at its top edge. Lerped during the fade.
 const STREET_SKY = {
-  'washington-square': 0xf7b733,
-  'dumbo': 0x7fb2d9,
-  'soho': 0x6b4a7a,
-  'coney-island': 0x0d1b3a,
+  'washington-square': 0x183b60,
+  'dumbo': 0x434f83,
+  'soho': 0x302e63,
+  'coney-island': 0x121f40,
 };
 
 // Ground colours per street (top-down texture).
 const GROUND = {
-  'washington-square': { base: '#b98a5e', seam: '#7a4a2e', line: '#f2ede2' },
-  'dumbo': { base: '#6f6a63', seam: '#4a4642', line: '#e8e2d4' },
-  'soho': { base: '#4a4442', seam: '#2a2624', line: '#d8d2c4' },
-  'coney-island': { base: '#7a5a3a', seam: '#4a3420', line: '#f2e8d8' },
+  'washington-square': { base:'#bc806e', field:'#cb9478', edge:'#986677', seam:'#6b5a6a', line:'#fff0d0', accent:'#f6ac6e' },
+  dumbo: { base:'#677888', field:'#7c8796', edge:'#4d6a7d', seam:'#44556a', line:'#fbe5c9', accent:'#dc9c90' },
+  soho: { base:'#554c6d', field:'#695672', edge:'#785569', seam:'#342e51', line:'#ffe0bd', accent:'#ea997d' },
+  'coney-island': { base:'#46445d', field:'#54516e', edge:'#704f6c', seam:'#2e365a', line:'#ffdfbb', accent:'#ff8c83' }
 };
 
-// Top-down ground texture: base wash, sparse radial seams, court lines
-// (centre circle + key, centred on the character), sparse dashes.
-// Dimensions are REAL: the disc is 60 m across, so 1024 px = 60 m
-// (17 px/m). The centre circle is 1.8 m radius, the key 4.9 x 5.8 m —
-// the first version drew them at 3x scale and the court dwarfed the
-// character. Seams are thin, low-alpha, and start away from the centre
-// (16 full-length seams read as a starburst under the character).
-export function paintGround(name, size = 1024) {
-  const g = GROUND[name];
-  const c = document.createElement('canvas');
-  c.width = c.height = size;
-  const x = c.getContext('2d');
-  const S = size;
-  x.fillStyle = g.base;
-  x.fillRect(0, 0, S, S);
-  // Radial seams from r = 0.15S outward: 8, thin, low-alpha.
-  x.strokeStyle = g.seam;
-  x.lineWidth = 1.5;
-  x.globalAlpha = 0.3;
-  for (let i = 0; i < 8; i++) {
-    const a = (i / 8) * Math.PI * 2;
-    x.beginPath();
-    x.moveTo(S / 2 + Math.cos(a) * S * 0.15, S / 2 + Math.sin(a) * S * 0.15);
-    x.lineTo(S / 2 + Math.cos(a) * S, S / 2 + Math.sin(a) * S);
-    x.stroke();
+// Court paint is a real top-down surface, not a decal hanging behind the
+// player. At 60 m diameter the playable markings occupy only the central
+// few meters; broad graphic shapes live outside the contact area.
+export function paintGround(name, size=1024) {
+  const p=GROUND[name];
+  if(!p)throw new Error('Unknown ground: '+name);
+  const c=document.createElement('canvas');c.width=c.height=size;
+  const g=c.getContext('2d'), S=size, C=S/2;
+  let seed=3781+name.length*193;
+  const rnd=()=>{seed=(seed*16807)%2147483647;return seed/2147483647;};
+  const rectangle=(x,y,w,h,col)=>{g.fillStyle=col;g.fillRect(x,y,w,h);};
+  const polygon=(points,col)=>{
+    g.fillStyle=col;g.beginPath();g.moveTo(points[0][0],points[0][1]);
+    for(let i=1;i<points.length;i++)g.lineTo(points[i][0],points[i][1]);
+    g.closePath();g.fill();
+  };
+  const stroke=(x1,y1,x2,y2,col,w,alpha=1)=>{
+    g.strokeStyle=col;g.lineWidth=w;g.globalAlpha=alpha;
+    g.lineCap='round';g.beginPath();g.moveTo(x1,y1);g.lineTo(x2,y2);g.stroke();g.globalAlpha=1;
+  };
+  rectangle(0,0,S,S,p.base);
+  // Large asymmetrical print blocks: pigment, not colored glass or noise.
+  polygon([[0,S*.17],[S*.23,0],[S*.37,0],[0,S*.45]],p.edge);
+  polygon([[S*.74,0],[S,0],[S,S*.42],[S*.91,S*.36]],p.field);
+  polygon([[0,S*.8],[S*.22,S],[0,S]],p.field);
+  polygon([[S*.82,S],[S,S*.68],[S,S]],p.edge);
+  // Rectilinear masonry grids, faint and broken, remain outside the court.
+  for(let i=0;i<16;i++){
+    const y=i*S/15;stroke(0,y,S,y,p.seam,1.8,.11);
+    if(i%3===0)stroke(0,y+5,S*.32,y+5,p.line,1.5,.08);
   }
-  x.globalAlpha = 1;
-  // Sparse dashes.
-  x.lineWidth = 3;
-  let seed = 7;
-  const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
-  for (let i = 0; i < 90; i++) {
-    const px = rnd() * S, py = rnd() * S;
-    if (Math.hypot(px - S / 2, py - S / 2) < S * 0.22) continue; // keep the court clean
-    x.strokeStyle = rnd() > 0.5 ? g.seam : g.line;
-    x.globalAlpha = 0.5;
-    x.beginPath();
-    x.moveTo(px, py);
-    x.lineTo(px + (rnd() - 0.5) * 40, py + (rnd() - 0.5) * 8);
-    x.stroke();
+  for(let i=0;i<16;i++){
+    const x=i*S/15;stroke(x,0,x,S,p.seam,1.7,.07);
   }
-  x.globalAlpha = 1;
-  // Stage 13c: radial brush dabs + colour variation on the ground disc.
-  // Strokes run radially (out from the centre, following the seams) or
-  // tangentially, each a lightened/darkened variant of the base, so
-  // the court reads as painted, not flat. The court stays clean.
-  const baseRgb = [parseInt(g.base.slice(1, 3), 16), parseInt(g.base.slice(3, 5), 16), parseInt(g.base.slice(5, 7), 16)];
-  x.lineCap = 'round';
-  for (let i = 0; i < 300; i++) {
-    const a = rnd() * Math.PI * 2;
-    const rr = S * (0.24 + rnd() * 0.26);
-    const px = S / 2 + Math.cos(a) * rr, py = S / 2 + Math.sin(a) * rr;
-    const ang = rnd() < 0.6 ? a : a + Math.PI / 2;
-    const f = 0.85 + rnd() * 0.3;
-    x.strokeStyle = `rgb(${Math.min(255, baseRgb[0] * f) | 0},${Math.min(255, baseRgb[1] * f) | 0},${Math.min(255, baseRgb[2] * f) | 0})`;
-    x.globalAlpha = 0.25 + rnd() * 0.25;
-    x.lineWidth = 2 + rnd() * 4;
-    const len = 12 + rnd() * 30;
-    x.beginPath();
-    x.moveTo(px - Math.cos(ang) * len / 2, py - Math.sin(ang) * len / 2);
-    x.lineTo(px + Math.cos(ang) * len / 2, py + Math.sin(ang) * len / 2);
-    x.stroke();
+  // A second, softly offset court-color field frames the figure.
+  g.beginPath();g.arc(C,C,S*.145,0,Math.PI*2);g.fillStyle=p.field;g.fill();
+  g.beginPath();g.arc(C,C,S*.125,0,Math.PI*2);g.strokeStyle=p.edge;g.globalAlpha=.38;g.lineWidth=12;g.stroke();g.globalAlpha=1;
+  // Sporadic long directional scuffs; center remains legible.
+  for(let i=0;i<480;i++){
+    const x=rnd()*S,y=rnd()*S;
+    const d=Math.hypot(x-C,y-C);
+    if(d<S*.11)continue;
+    const a=rnd()*Math.PI*2,len=5+rnd()*43;
+    stroke(x,y,x+Math.cos(a)*len,y+Math.sin(a)*len,
+      rnd()>.48?p.line:p.seam,1+rnd()*4,.055+rnd()*.18);
   }
-  x.globalAlpha = 1;
-  // Court: centre circle (1.8 m radius = S*0.03) + key (4.9 x 5.8 m),
-  // centred on the character.
-  x.strokeStyle = g.line;
-  x.lineWidth = 3;
-  x.beginPath();
-  x.arc(S / 2, S / 2, S * 0.03, 0, Math.PI * 2);
-  x.stroke();
-  x.strokeRect(S * 0.46, S * 0.5, S * 0.08, S * 0.10);
+  // Pigment chips under the rim of the mural, at believable ground scale.
+  for(let i=0;i<90;i++){
+    const a=rnd()*Math.PI*2,d=S*(.17+rnd()*.27);
+    const x=C+Math.cos(a)*d,y=C+Math.sin(a)*d;
+    stroke(x,y,x+(rnd()-.5)*22,y+(rnd()-.5)*15,p.accent,2+rnd()*6,.16+rnd()*.20);
+  }
+  // The near player's key and center-circle marks use correct world size.
+  g.strokeStyle=p.line;g.lineWidth=3.2;g.globalAlpha=.94;
+  g.beginPath();g.arc(C,C,S*.03,0,Math.PI*2);g.stroke();
+  g.strokeRect(S*.46,S*.50,S*.08,S*.10);
+  g.beginPath();g.arc(C,S*.50,S*.047,0,Math.PI);g.stroke();
+  g.globalAlpha=1;
   return c;
 }
 
