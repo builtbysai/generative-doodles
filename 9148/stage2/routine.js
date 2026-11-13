@@ -520,6 +520,9 @@ export function createRoutine(player, poser) {
 
   function applyPose(beat) {
     const p = interpolate(beat);
+    // All limb targets belong to the same posed instant. Accumulate them
+    // first and solve once instead of solving 1 + 2 + 3 + 4 chains.
+    poser.beginBatch();
     poser.reset();
     // The skeleton's root bone IS the pelvis: compose its position
     // from the ground root (travel) and the pelvis channel (height).
@@ -538,6 +541,7 @@ export function createRoutine(player, poser) {
         poser.setHandTarget(side, [wx, p.handsLocal[side][1], wz]);
       } else poser.clearTarget('hand', side);
     }
+    poser.endBatch();
     // Hand orientation after the IK solve (setJointWorld does not
     // re-solve). The orientation blends from the IK-solved pose
     // toward the spin platform and/or palm-down by the blends, so
@@ -569,12 +573,13 @@ export function createRoutine(player, poser) {
       const dir = s === 'R' ? -1 : 1;
       const c = p.spinBlend;
       for (const f of ['middle', 'ring', 'pinky']) {
-        poser.setJoint(`${f}Proximal_${s}`, [0, 0, dir * 1.2 * c]);
-        poser.setJoint(`${f}Middle_${s}`, [0, 0, dir * 1.0 * c]);
-        poser.setJoint(`${f}Distal_${s}`, [0, 0, dir * 0.5 * c]);
+        poser.setJointLocal(`${f}Proximal_${s}`, [0, 0, dir * 1.2 * c]);
+        poser.setJointLocal(`${f}Middle_${s}`, [0, 0, dir * 1.0 * c]);
+        poser.setJointLocal(`${f}Distal_${s}`, [0, 0, dir * 0.5 * c]);
       }
-      poser.setJoint(`thumbProximal_${s}`, [0, 0, dir * 0.5 * c]);
-      poser.setJoint(`thumbMiddle_${s}`, [0, 0, dir * 0.5 * c]);
+      poser.setJointLocal(`thumbProximal_${s}`, [0, 0, dir * 0.5 * c]);
+      poser.setJointLocal(`thumbMiddle_${s}`, [0, 0, dir * 0.5 * c]);
+      poser.update(); // refresh the skinned mesh once, not once per finger
     }
     return p;
   }
