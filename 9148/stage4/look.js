@@ -258,16 +258,16 @@ export function makeHalftoneShadow(light, { dotScale = 90, opacity = 0.85 } = {}
       void main() {
         vec3 coord = vShadowCoord.xyz / vShadowCoord.w;
         if (coord.x < 0.0 || coord.x > 1.0 || coord.y < 0.0 || coord.y > 1.0) discard;
-        // 3x3 PCF for a soft edge.
-        float s = 0.0;
+        // Five-tap cross PCF instead of nine samples per fragment.
+        // The centre is weighted twice to retain the hand-inked soft edge.
         vec2 texel = 1.0 / vec2(textureSize(uShadowMap, 0));
-        for (int x = -1; x <= 1; x++) {
-          for (int y = -1; y <= 1; y++) {
-            float d = texture2D(uShadowMap, coord.xy + vec2(x, y) * texel).r;
-            s += (coord.z - 0.002 > d) ? 1.0 : 0.0;
-          }
-        }
-        float shadow = s / 9.0;
+        float depth = coord.z - 0.002;
+        float s = 2.0 * step(texture2D(uShadowMap, coord.xy).r, depth);
+        s += step(texture2D(uShadowMap, coord.xy + vec2(texel.x, 0.0)).r, depth);
+        s += step(texture2D(uShadowMap, coord.xy - vec2(texel.x, 0.0)).r, depth);
+        s += step(texture2D(uShadowMap, coord.xy + vec2(0.0, texel.y)).r, depth);
+        s += step(texture2D(uShadowMap, coord.xy - vec2(0.0, texel.y)).r, depth);
+        float shadow = s / 6.0;
         if (shadow < 0.02) discard;
         // Halftone dots: radius grows with shadow darkness.
         vec2 grid = vUv * uDotScale;
