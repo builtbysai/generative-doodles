@@ -157,7 +157,8 @@ export function buildPanel(settings, container, hooks = {}, opts = {}) {
 
   // Header: title + collapse toggle. Collapsed, only this row shows.
   const head = el('div', 'fbp-head');
-  head.appendChild(el('span', '', 'Streetball / 9148'));
+  const headerTitle = el('span', '', 'Streetball / 9148');
+  head.appendChild(headerTitle);
   const collapseBtn = el('button', '', '-');
   collapseBtn.setAttribute('data-action', 'collapse-panel');
   collapseBtn.setAttribute('aria-label', 'Collapse panel');
@@ -173,6 +174,7 @@ export function buildPanel(settings, container, hooks = {}, opts = {}) {
     const hidden = body.style.display === 'none';
     body.style.display = hidden ? '' : 'none';
     collapseBtn.textContent = hidden ? '-' : '+';
+    headerTitle.textContent = hidden ? 'Streetball / 9148' : 'Edit';
     // Collapsed, the panel shrinks to the header (otherwise the 300 px
     // header bar covers the HUD on a 390 px phone).
     root.classList.toggle('fbp-collapsed', !hidden);
@@ -190,6 +192,7 @@ export function buildPanel(settings, container, hooks = {}, opts = {}) {
   if (opts.startCollapsed) {
     body.style.display = 'none';
     collapseBtn.textContent = '+';
+    headerTitle.textContent = 'Edit';
     root.classList.add('fbp-collapsed');
   }
 
