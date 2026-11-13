@@ -175,6 +175,23 @@ function washington(g,p,r) {
   // Stone inscription, side pilasters and crown.
   rect(g,x+113,y+16,122,7,p.shade);
   rect(g,x+124,y+30,100,4,p.bright);
+  // Fluted pilasters, radiating keystones and engraved attic establish a
+  // proper triumphal arch instead of a featureless modern pavilion.
+  for(const bx of [x+17,x+w-72]){
+    rect(g,bx,y+86,56,10,p.bright);
+    rect(g,bx-4,HOR-17,66,13,p.ink);
+    for(let k=0;k<5;k++)line(g,bx+7+k*10,y+99,bx+7+k*10,HOR-20,p.shade,2,.38);
+  }
+  for(let k=0;k<=12;k++){
+    const ang=Math.PI+k*Math.PI/12;
+    const xx=x+w/2+109*Math.cos(ang);
+    const yy=y+244+109*Math.sin(ang);
+    line(g,xx,yy,xx+18*Math.cos(ang),yy+18*Math.sin(ang),p.shade,3,.72);
+  }
+  g.save();g.font='bold 15px Georgia,serif';g.textAlign='center';
+  g.fillStyle=p.ink;g.globalAlpha=.7;
+  g.fillText('WASHINGTON SQUARE',x+w/2,y+45);
+  g.restore();
   lamp(g,570,HOR,p,.8);lamp(g,1450,HOR,p,.8);
 }
 function dumbo(g,p,r) {
@@ -197,6 +214,20 @@ function dumbo(g,p,r) {
   rect(g,cx-85,208,170,355,'#7b8b9f');
   rect(g,cx+64,208,21,355,'#3d546e');
   rect(g,cx-98,197,196,14,p.ink);
+  // Bridge tower's layered steelwork: buttresses, crest, rivets, and
+  // diagonal trusses make it a suspension bridge, not a roof.
+  for(const edge of [cx-102,cx+83]){
+    rect(g,edge,206,17,HOR-206,p.ink);
+    line(g,edge+4,216,edge+4,HOR-7,p.bright,2,.35);
+  }
+  path(g,[[cx-115,161],[cx-82,145],[cx+82,145],[cx+115,161]],p.ink);
+  for(let q=0;q<6;q++){
+    const yy=220+q*47;
+    line(g,cx-88,yy,cx-57,yy+34,p.ink,4,.66);
+    line(g,cx+88,yy,cx+57,yy+34,p.ink,4,.66);
+    disc(g,cx-95,yy,3,3,p.bright,.8);
+    disc(g,cx+95,yy,3,3,p.bright,.8);
+  }
   g.fillStyle=p.haze;g.beginPath();g.moveTo(cx-53,HOR);
   g.lineTo(cx-53,338);g.arc(cx,338,53,Math.PI,0);g.lineTo(cx+53,HOR);g.closePath();g.fill();
   rect(g,0,465,W,17,p.ink);
@@ -223,6 +254,14 @@ function soho(g,p,r) {
   for(const [x,y,w,color] of xs){
     facade(g,x,y,w,p,r,{base:color,rows:3,arched:true,awning:p.accents[0]});
     for(let k=0;k<3;k++)line(g,x-3,y+30+k*97,x+w,y+30+k*97,p.ink,4,.7);
+    // Cast-iron capitals with distinct vertical piers and lintels.
+    for(let c=0;c<4;c++){
+      const xx=x+12+c*(w-26)/3;
+      rect(g,xx,y+40,6,HOR-y-100,p.ink);
+      rect(g,xx-7,y+41,21,9,p.bright);
+      rect(g,xx-5,y+54,17,4,p.shade);
+      rect(g,xx-5,HOR-101,16,8,p.ink);
+    }
   }
   // Cast-iron fire escapes: landings, railings, diagonal stairs.
   for(const x of [410,1220,1825]){
@@ -241,6 +280,10 @@ function soho(g,p,r) {
     for(let xx=x+10;xx<x+70;xx+=13)line(g,xx,213,xx,275,p.bright,2,.28);
   }
   lamp(g,140,HOR,p,.88);lamp(g,1940,HOR,p,.86);
+  // A real intersection cue nested in the architecture, not a HUD.
+  rect(g,860,478,141,29,p.ink);
+  g.save();g.textAlign='center';g.font='bold 17px Georgia,serif';
+  g.fillStyle=p.bright;g.fillText('SOHO',930,499);g.restore();
   // Small storefront color accents, not large floating labels.
   for(const [x,w] of [[78,152],[810,180],[1380,170]]){
     rect(g,x,512,w,15,p.ink);
@@ -277,6 +320,11 @@ function coney(g,p,r) {
   }
   disc(g,wx,wy,25,25,p.ink);disc(g,wx,wy,14,14,p.bright);
   line(g,wx,wy,908,HOR,p.ink,14);line(g,wx,wy,1152,HOR,p.ink,14);
+  // Small carnival marquee anchors the ride to the boardwalk.
+  rect(g,934,522,191,35,p.ink);
+  rect(g,941,528,177,22,p.accents[0]);
+  g.save();g.font='bold 18px Georgia,serif';g.textAlign='center';
+  g.fillStyle=p.ink;g.fillText('CONEY ISLAND',1030,545);g.restore();
   // Boardwalk rides and lit striped canopy at the horizon.
   for(const [x,y,w] of [[1370,395,250],[1685,443,280],[23,465,195]]){
     path(g,[[x,y+64],[x+w*.5,y-15],[x+w,y+64]],p.accents[0],p.ink,6);
