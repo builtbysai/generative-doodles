@@ -73,9 +73,23 @@ export function createPoser(player) {
   const BIND_ROOT = new THREE.Vector3(0, 0.74, 0); // chibi pelvis bind height (Stage 13b)
   const targets = { foot_L: null, foot_R: null, hand_L: null, hand_R: null };
   const flatFoot = { L: true, R: true };
+  let batchDepth = 0;
 
+  // A procedural pose sets the root, torso and four IK targets together.
+  // Solve only after all targets are known; otherwise each setter runs
+  // every active chain again against an incomplete intermediate pose.
+  function beginBatch() { batchDepth++; }
+  function endBatch() {
+    if (batchDepth <= 0) throw new Error('Unbalanced poser batch');
+    if (--batchDepth === 0) {
+      if (hasTargets()) solveAll();
+      else update();
+    }
+  }
+
+  function syncWorld() { group.updateMatrixWorld(true); }
   function update() {
-    group.updateMatrixWorld(true);
+    syncWorld();
     skeleton.update();
   }
 
@@ -92,7 +106,7 @@ export function createPoser(player) {
     const rootB = bones[ch.root];
     const midB = bones[ch.mid];
     const endB = bones[ch.end];
-    update();
+    syncWorld();
     const R = rootB.getWorldPosition(new THREE.Vector3());
     const M = midB.getWorldPosition(new THREE.Vector3());
     const E = endB.getWorldPosition(new THREE.Vector3());
@@ -120,14 +134,14 @@ export function createPoser(player) {
       .addScaledVector(dirRT, L1 * Math.cos(a1))
       .addScaledVector(bend, L1 * Math.sin(a1));
     aimBone(rootB, M, midTarget);
-    update();
+    syncWorld();
     const E2 = endB.getWorldPosition(new THREE.Vector3());
     aimBone(midB, E2, T);
-    update();
+    syncWorld();
   }
 
   function solveAll() {
-    update();
+    syncWorld();
     for (const key of Object.keys(targets)) {
       if (!targets[key]) continue;
       solveChain(key, targets[key]);
@@ -146,27 +160,32 @@ export function createPoser(player) {
     targets.foot_R = null;
     targets.hand_L = null;
     targets.hand_R = null;
-    update();
+    if (!batchDepth) update();
   }
 
   function setFootTarget(side, pos, opts = {}) {
     targets[`foot_${side}`] = new THREE.Vector3(pos[0], pos[1], pos[2]);
     flatFoot[side] = opts.flat !== false;
-    solveAll();
+    if (!batchDepth) solveAll();
   }
 
   function setHandTarget(side, pos) {
     targets[`hand_${side}`] = new THREE.Vector3(pos[0], pos[1], pos[2]);
-    solveAll();
+    if (!batchDepth) solveAll();
   }
 
   function clearTarget(kind, side) {
     targets[`${kind}_${side}`] = null;
   }
 
-  function setJoint(name, euler) {
+  // For terminal joints (fingers), changing a local rotation cannot move
+  // a hand or foot IK endpoint. Do not re-solve the entire rig for a curl.
+  function setJointLocal(name, euler) {
     bones[name].quaternion.setFromEuler(new THREE.Euler(euler[0], euler[1], euler[2], 'XYZ'));
-    if (hasTargets()) solveAll(); else update();
+  }
+  function setJoint(name, euler) {
+    setJointLocal(name, euler);
+    if (!batchDepth) { if (hasTargets()) solveAll(); else update(); }
   }
 
   function setJointWorld(name, quat) {
@@ -178,7 +197,7 @@ export function createPoser(player) {
   function setRoot(pos, euler) {
     if (pos) bones.root.position.set(pos[0], pos[1], pos[2]);
     if (euler) bones.root.quaternion.setFromEuler(new THREE.Euler(euler[0], euler[1], euler[2], 'XYZ'));
-    if (hasTargets()) solveAll(); else update();
+    if (!batchDepth) { if (hasTargets()) solveAll(); else update(); }
   }
 
   function snapshot() {
@@ -212,8 +231,9 @@ export function createPoser(player) {
   }
 
   return {
-    setFootTarget, setHandTarget, clearTarget, setJoint, setJointWorld,
+    setFootTarget, setHandTarget, clearTarget, setJoint, setJointLocal, setJointWorld,
     setRoot, snapshot, restore, reset, solveAll, update,
+    beginBatch, endBatch,
     jointWorld, jointBendOffset, CHAINS,
   };
 }

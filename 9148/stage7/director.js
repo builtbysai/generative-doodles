@@ -92,45 +92,78 @@ export function createDirector({ camera, player, routine, sceneManager }) {
     return routine.moveAt(shot.at + shot.dur / 2).name;
   }
 
-  // `routineBeatOverride` (Stage 8): when the routine loops a section,
-  // the viewer passes the LOOPED routine beat here; shots use it while
-  // the street breath and sceneManager.update still use the absolute
-  // beat. Omitted = current behaviour (routine beat = beat % 24).
+  // The original director jumped straight from one shot's last frame
+  // to the next shot's start (sometimes changing both radius and height
+  // dramatically). Treat the shot starts as periodic camera control
+  // points instead: monotone cubic Hermite interpolation gives continuous
+  // POSITION AND VELOCITY across boundaries, without zoom overshoot.
+  // This preserves the authored angles/framing and the 24-beat loop.
+  function pchipSlope(d0, d1, h0, h1) {
+    if (d0 * d1 <= 0 || !Number.isFinite(d0 + d1)) return 0;
+    const w0 = 2 * h1 + h0, w1 = h1 + 2 * h0;
+    return (w0 + w1) / (w0 / d0 + w1 / d1);
+  }
+  function channel(a, b, prev, after, t0, t1, tp, ta, value, u) {
+    const h0 = t0 - tp, h1 = t1 - t0, h2 = ta - t1;
+    const d0 = (value(a) - value(prev)) / h0;
+    const d1 = (value(b) - value(a)) / h1;
+    const d2 = (value(after) - value(b)) / h2;
+    const m0 = pchipSlope(d0, d1, h0, h1);
+    const m1 = pchipSlope(d1, d2, h1, h2);
+    const u2 = u * u, u3 = u2 * u;
+    return (2*u3 - 3*u2 + 1) * value(a)
+      + (u3 - 2*u2 + u) * h1 * m0
+      + (-2*u3 + 3*u2) * value(b)
+      + (u3 - u2) * h1 * m1;
+  }
+  const ballTarget = new THREE.Vector3();
+  const PERIOD = ROUTINE_BEATS;
+  const N = SHOTS.length;
   function update(beat, routineBeatOverride) {
-    const rb = routineBeatOverride !== undefined
-      ? routineBeatOverride
-      : ((beat % ROUTINE_BEATS) + ROUTINE_BEATS) % ROUTINE_BEATS;
-    const shot = shotAt(rb);
-    currentShot = shot;
-    const t = smooth((rb - shot.at) / shot.dur);
-    let az = lerp(shot.az, shot.azEnd !== undefined ? shot.azEnd : shot.az, t);
-    let dist = lerp(shot.dist, shot.distEnd !== undefined ? shot.distEnd : shot.dist, t);
-    // Street-change signature: a 1-beat "breath" over the first beat of
-    // each new street (skipped at the piece's start). sin^2 starts and
-    // ends at rest, so the excursion is smooth in and out, completes
-    // within 1 beat (0.42 s at 144 BPM), and never overshoots.
+    const rb = ((routineBeatOverride !== undefined ? routineBeatOverride : beat) % PERIOD + PERIOD) % PERIOD;
+    let i = 0;
+    while (i + 1 < N && rb >= SHOTS[i + 1].at) i++;
+    const a = SHOTS[i], b = SHOTS[(i + 1) % N];
+    const prev = SHOTS[(i + N - 1) % N], after = SHOTS[(i + 2) % N];
+    const t0 = a.at;
+    const t1 = i === N - 1 ? PERIOD : b.at;
+    const tp = i === 0 ? prev.at - PERIOD : prev.at;
+    const ta = i >= N - 2 ? after.at + PERIOD : after.at;
+    const u = Math.min(1, Math.max(0, (rb - t0) / (t1 - t0)));
+    const sample = (key) => channel(a, b, prev, after, t0, t1, tp, ta, s => s[key], u);
+    currentShot = a;
+    let az = sample('az');
+    let dist = sample('dist');
+    const height = sample('height');
+    const fov = sample('fov');
+    const roll = sample('roll');
+    const targetY = sample('targetY');
+    const focus = channel(a, b, prev, after, t0, t1, tp, ta, s => s.ballTarget ? 1 : 0, u);
+
+    // A one-beat street-change breath is an additive, zero-velocity
+    // excursion; it doesn't introduce a camera cut.
     if (beat >= BEATS_PER_STREET) {
-      const sb = beat % BEATS_PER_STREET;
+      const sb = ((beat % BEATS_PER_STREET) + BEATS_PER_STREET) % BEATS_PER_STREET;
       if (sb < 1) {
-        const sn = Math.sin(Math.PI * sb);
-        const s = sn * sn;
-        dist *= 1 - 0.1 * s;
-        az += D(10) * s;
+        const v = Math.sin(Math.PI * sb);
+        dist *= 1 - 0.1 * v * v;
+        az += D(10) * v * v;
       }
     }
-    camera.position.set(Math.sin(az) * dist, shot.height, Math.cos(az) * dist);
-    if (shot.ballTarget) player.ball.getWorldPosition(tmpTarget);
-    else tmpTarget.set(0, shot.targetY, 0);
+    camera.position.set(Math.sin(az) * dist, height, Math.cos(az) * dist);
+    tmpTarget.set(0, targetY, 0);
+    if (focus > 0) {
+      player.ball.getWorldPosition(ballTarget);
+      tmpTarget.lerp(ballTarget, Math.min(1, Math.max(0, focus)));
+    }
     camera.lookAt(tmpTarget);
-    if (shot.roll) camera.rotateZ(shot.roll);
-    if (camera.fov !== shot.fov) {
-      camera.fov = shot.fov;
+    if (roll) camera.rotateZ(roll);
+    if (Math.abs(camera.fov - fov) > 0.00001) {
+      camera.fov = fov;
       camera.updateProjectionMatrix();
     }
-    // Pass the ACTUAL azimuth so the backdrop counter-rotates to the
-    // directed camera (scene.js falls back to the orbit when omitted).
     sceneManager.update(beat, az);
-    return shot;
+    return a;
   }
 
   return {
