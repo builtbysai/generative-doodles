@@ -87,8 +87,9 @@ export function createPoser(player) {
     }
   }
 
+  function syncWorld() { group.updateMatrixWorld(true); }
   function update() {
-    group.updateMatrixWorld(true);
+    syncWorld();
     skeleton.update();
   }
 
@@ -105,7 +106,7 @@ export function createPoser(player) {
     const rootB = bones[ch.root];
     const midB = bones[ch.mid];
     const endB = bones[ch.end];
-    update();
+    syncWorld();
     const R = rootB.getWorldPosition(new THREE.Vector3());
     const M = midB.getWorldPosition(new THREE.Vector3());
     const E = endB.getWorldPosition(new THREE.Vector3());
@@ -133,14 +134,14 @@ export function createPoser(player) {
       .addScaledVector(dirRT, L1 * Math.cos(a1))
       .addScaledVector(bend, L1 * Math.sin(a1));
     aimBone(rootB, M, midTarget);
-    update();
+    syncWorld();
     const E2 = endB.getWorldPosition(new THREE.Vector3());
     aimBone(midB, E2, T);
-    update();
+    syncWorld();
   }
 
   function solveAll() {
-    update();
+    syncWorld();
     for (const key of Object.keys(targets)) {
       if (!targets[key]) continue;
       solveChain(key, targets[key]);
