@@ -253,6 +253,16 @@ export function createBallDrive(player, poser, routine) {
         s.us.push(1);
         s.arc = buildArcTable(s);
       } else s.v0 = solveDirect(s.p0, s.p1, s.T);
+      // Rotate around the horizontal travel direction while airborne.
+      // Integer turns bring the seams into the receiving hand without
+      // a visible quaternion snap on contact.
+      if (kind !== 'snatch') {
+        const dx=s.p1.x-s.p0.x, dz=s.p1.z-s.p0.z;
+        s.rollAxis=new THREE.Vector3(dz,0,-dx);
+        if (s.rollAxis.lengthSq()<0.0001) s.rollAxis.set(1,0,0);
+        s.rollAxis.normalize();
+        s.turns=Math.max(1,Math.round(s.T*(kind==='bounce'?2.4:1.4)));
+      }
       // Orientation turns gently from the release hand to the catch hand.
       s.q0 = kind === 'snatch' ? null : handHold(t0, from).quat;
       s.q1 = kind === 'snatch' ? null : handHold(t1, to).quat;
@@ -320,6 +330,7 @@ export function createBallDrive(player, poser, routine) {
     // transform, which this update overwrites unconditionally below.
     if (ball.parent !== group) group.attach(ball);
     const s = segAt(beat);
+    ball.scale.set(1, 1, 1);
     routine.applyPose(beat);
     const hand = bones[`hand_${s.from}`];
     const hp = poser.jointWorld(`hand_${s.from}`);
@@ -351,13 +362,28 @@ export function createBallDrive(player, poser, routine) {
       // (Stage 12 — the raw spline parameter swung the speed 5x).
       const u = arcToU(s, passProgress((beat - s.t0) / (s.t1 - s.t0)));
       ball.position.set(...evalPath(s, u));
-      ball.quaternion.slerpQuaternions(s.q0, s.q1, Math.min(1, u));
+      const flightU = Math.min(1, (beat - s.t0) / (s.t1 - s.t0));
+      ball.quaternion.slerpQuaternions(s.q0, s.q1, flightU);
+      ball.quaternion.multiply(_q2.setFromAxisAngle(s.rollAxis, flightU * Math.PI * 2 * s.turns));
     } else {
       // Free: ballistic arc (+ orientation turn, or spin during the snatch).
       const t = (beat - s.t0) * BEAT;
       ball.position.copy(evalFree(s, t));
       if (s.kind === 'snatch') ball.quaternion.copy(spinQuat(beat));
-      else ball.quaternion.slerpQuaternions(s.q0, s.q1, Math.min(1, t / s.T));
+      else {
+        const u=Math.max(0,Math.min(1,t/s.T));
+        ball.quaternion.slerpQuaternions(s.q0,s.q1,u);
+        ball.quaternion.multiply(_q2.setFromAxisAngle(s.rollAxis,u*Math.PI*2*s.turns));
+      }
+      if (s.kind === 'bounce') {
+        // Brief compression at floor contact, then elastic recovery.
+        // The centre drops by exactly the lost radius, preserving the
+        // no-penetration contact point at the impact instant.
+        const near=Math.max(0,1-Math.abs(t-s.tB)/0.055);
+        const squash=0.065*near*near*(3-2*near);
+        ball.scale.set(1+squash*0.42,1-squash,1+squash*0.42);
+        ball.position.y-=BALL_R*squash;
+      }
     }
     trackHead(beat); // head follows the ball (after the pose + ball)
     return s;
