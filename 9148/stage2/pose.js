@@ -177,8 +177,13 @@ export function createPoser(player) {
     targets[`${kind}_${side}`] = null;
   }
 
-  function setJoint(name, euler) {
+  // For terminal joints (fingers), changing a local rotation cannot move
+  // a hand or foot IK endpoint. Do not re-solve the entire rig for a curl.
+  function setJointLocal(name, euler) {
     bones[name].quaternion.setFromEuler(new THREE.Euler(euler[0], euler[1], euler[2], 'XYZ'));
+  }
+  function setJoint(name, euler) {
+    setJointLocal(name, euler);
     if (!batchDepth) { if (hasTargets()) solveAll(); else update(); }
   }
 
@@ -225,7 +230,7 @@ export function createPoser(player) {
   }
 
   return {
-    setFootTarget, setHandTarget, clearTarget, setJoint, setJointWorld,
+    setFootTarget, setHandTarget, clearTarget, setJoint, setJointLocal, setJointWorld,
     setRoot, snapshot, restore, reset, solveAll, update,
     beginBatch, endBatch,
     jointWorld, jointBendOffset, CHAINS,
