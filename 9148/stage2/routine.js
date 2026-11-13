@@ -296,6 +296,12 @@ const KEYFRAMES = [
     hands: { L: [-0.30, 0.69, 0.15], R: [0.42, 0.95, 0.30] },
     palm: { L: false, R: false }, spinHand: 'R',
   }),
+  // A free-arm flourish while the ball settles on the index finger.
+  K(19.6, {
+    root: [0, 0], pelvis: 0.69, yaw: Math.PI * 2 + 0.10, lean: 0.08,
+    hands: { L: [-0.43, 0.82, 0.12], R: [0.40, 0.95, 0.17] },
+    palm: { L: false, R: false }, spinHand: 'R',
+  }),
   K(20.0, {
     root: [0, 0], pelvis: 0.69, yaw: Math.PI * 2 + 0.30, lean: 0.08,
     // Hand out to the right-back (Stage 13b): the old near-centre hold
@@ -308,6 +314,18 @@ const KEYFRAMES = [
   K(21.0, {
     root: [0, 0], pelvis: 0.69, yaw: Math.PI * 2, lean: 0.08,
     hands: { L: [-0.30, 0.69, 0.15], R: [0.42, 0.95, 0.30] },
+    palm: { L: false, R: false }, spinHand: 'R',
+  }),
+  // On the snatch the free arm opens to frame the spinning ball,
+  // then recovers before the final palm gather.
+  K(21.65, {
+    root: [0, 0], pelvis: 0.69, yaw: Math.PI * 2 + 0.06, lean: 0.10,
+    hands: { L: [-0.44, 0.84, 0.15], R: [0.42, 0.96, 0.28] },
+    palm: { L: false, R: false }, spinHand: 'R',
+  }),
+  K(22.35, {
+    root: [0, 0], pelvis: 0.69, yaw: Math.PI * 2, lean: 0.13,
+    hands: { L: [-0.35, 0.74, 0.17], R: [0.40, 0.93, 0.29] },
     palm: { L: false, R: false }, spinHand: 'R',
   }),
   K(23.0, {
