@@ -303,7 +303,10 @@ export function createSceneManager({ scene, camera, sun, hemi }) {
     const cur = baked[streetIndex];
     const curU = LANDMARK_U[cur.name];
     lastLandmarkU = curU;
-    lastRotY = az + (0.5 - curU) * Math.PI * 2;
+    // CylinderGeometry maps u=0 to local +Z, u=0.5 to local -Z.
+    // Rotating by az - landmark longitude faces the drawing toward the
+    // camera. The former +0.5 offset placed landmarks 180° behind it.
+    lastRotY = az - curU * Math.PI * 2;
     layers[0].mesh.rotation.y = lastRotY;
     layers[0].mat.uniforms.uMap.value = cur.tex;
     layers[0].mat.uniforms.uArcStart.value = curU - 40 / 360;
@@ -315,7 +318,7 @@ export function createSceneManager({ scene, camera, sun, hemi }) {
     if (fadeFrom >= 0) {
       const prev = baked[fadeFrom];
       const prevU = LANDMARK_U[prev.name];
-      layers[1].mesh.rotation.y = az + (0.5 - prevU) * Math.PI * 2;
+      layers[1].mesh.rotation.y = az - prevU * Math.PI * 2;
       layers[1].mat.uniforms.uMap.value = prev.tex;
       layers[1].mat.uniforms.uArcStart.value = prevU - 40 / 360;
       layers[1].mat.uniforms.uArcLength.value = 1; // fully revealed
