@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FloodLines</title>
+<style>
+html, body { margin: 0; padding: 0; background: #0e100f; overflow: hidden; }
+canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+var TAU = Math.PI * 2;
+var GROUND = '#0e100f';
+var GROUND_DEEP = '#090a09';
+var DROWNED = '#2c3d2a';
+var DROWNED_DEEP = '#1d2a1c';
+var DROWNED_PALE = '#47603f';
+var MUD = '#4a3823';
+var MUD_DARK = '#33261a';
+var MUD_LIGHT = '#6b5232';
+var MIST = '#c9cdc9';
+var LINE_BLUE = '#a8d8e8';
+var LINE_BRIGHT = '#d6f0f8';
+var TREE_DARK = '#101a10';
+var TREE_MID = '#182615';
+var PLATE = '#0e100f';
+var PLATE_LINE = 'rgba(168,216,232,0.55)';
+var TITLE_INK = '#e8ece8';
+var HINT_INK = '#a8d8e8';
+var FRAME_T = 60.0; /* fixed phase: mid-rise of the first flood cycle */
+var BASE_V = 0.82; /* resting waterline, fraction of projection height */
+var MARKS = [0.70, 0.62, 0.54, 0.46]; /* gauge marks, top to bottom by height */
+function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+function mulberry32(seed) {
+  return function () {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    var t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+function hexRgb(h) {
+  return [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
+}
+function rgba(h, a) {
+  var c = hexRgb(h);
+  return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a.toFixed(4) + ')';
+}
+function smooth(f) { return f * f * (3 - 2 * f); }
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var VW = 0, VH = 0, isPhone = false;
+var reduced = false;
+try { reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (e) { reduced = false; }
+var rng = mulberry32(1765);
+var phaseT = FRAME_T;
+var simT = 0;
+var P = { x: 0, y: 0, w: 0, h: 0 }; /* projection rect */
+/* ---- irregular flood schedule: seeded cycles, first rise forced long ---- */
+var CYCLES = [];
+(function () {
+  var t = 0, i;
+  var targets = [0.54, 0.62, 0.70, 0.46, 0.62, 0.54, 0.46, 0.70];
+  for (i = 0; i < 16; i++) {
+    var rise = (i === 0) ? 70 : 44 + rng() * 28;
+    var fall = 15 + rng() * 11;
+    CYCLES.push({ start: t, rise: rise, fall: fall, target: targets[i % targets.length] });
+    t += rise + fall;
+  }
+})();
+function cycleAt(t) {
+  var i, c;
+  for (i = 0; i < CYCLES.length; i++) {
+    c = CYCLES[i];
+    if (t < c.start + c.rise + c.fall) return { c: c, local: t - c.start };
+  }
+  c = CYCLES[CYCLES.length - 1];
+  return { c: c, local: c.rise + c.fall - 0.001 };
+}
+function levelV(t) {
+  var s = cycleAt(t);
+  var c = s.c;
+  if (s.local <= c.rise) {
+    return BASE_V + (c.target - BASE_V) * smooth(s.local / c.rise);
+  }
+  var f = (s.local - c.rise) / c.fall;
+  return c.target + (BASE_V - c.target) * (f * f); /* fall accelerates, quicker than the rise */
+}
+function brightnessAt(t) {
+  var v = levelV(t);
+  return 0.52 + 0.48 * clamp((BASE_V - v) / 0.38, 0, 1);
+}
+/* ---- seeded tree masses along the top of the projection ---- */
+var TREES = [];
+(function () {
+  var i, u = 0.02;
+  while (u < 0.98) {
+    var w = 0.05 + rng() * 0.09;
+    TREES.push({
+      u: u, w: w,
+      h: 0.16 + rng() * 0.26,
+      lean: (rng() - 0.5) * 0.06,
+      dark: rng() < 0.5
+    });
+    u += w + 0.01 + rng() * 0.05;
+  }
+})();
+/* ---- seeded mist bands and road sheen streaks ---- */
+var MISTS = [];
+(function () {
+  var i;
+  for (i = 0; i < 4; i++) {
+    MISTS.push({ v: 0.18 + i * 0.17 + rng() * 0.05, h: 0.05 + rng() * 0.05, drift: 0.004 + rng() * 0.008, off: rng() * TAU });
+  }
+})();
+var SHEENS = [];
+(function () {
+  var i;
+  for (i = 0; i < 9; i++) {
+    SHEENS.push({ v: 0.68 + rng() * 0.24, u: rng() * 0.8, w: 0.08 + rng() * 0.18, a: 0.05 + rng() * 0.08 });
+  }
+})();
+function size() {
+  var vw = 0, vh = 0;
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.width) {
+    vw = window.visualViewport.width; vh = window.visualViewport.height;
+  } else if (typeof window !== 'undefined' && window.innerWidth) {
+    vw = window.innerWidth; vh = window.innerHeight;
+  }
+  VW = vw; VH = vh;
+  canvas.width = VW; canvas.height = VH;
+  canvas.style.width = VW + 'px'; canvas.style.height = VH + 'px';
+  if (typeof window !== 'undefined' && window.screen) {
+    var mn = Math.min(window.screen.width, window.screen.height);
+    isPhone = mn < 700 || VH > VW * 1.15;
+  }
+  var pw, ph;
+  if (isPhone) {
+    pw = VW * 0.92; ph = pw * 0.66;
+    P = { x: (VW - pw) / 2, y: (VH - ph) / 2, w: pw, h: ph };
+  } else {
+    var side = Math.min(VW, VH) - 40;
+    pw = side * 0.88; ph = pw * 0.66;
+    P = { x: (VW - pw) / 2, y: (VH - ph) / 2, w: pw, h: ph };
+  }
+}
+function px(u) { return P.x + u * P.w; }
+function py(v) { return P.y + v * P.h; }
+function stepSim(dt) { simT += dt; }
+function drawTrees(b) {
+  var i, tr, x, y, w, h;
+  for (i = 0; i < TREES.length; i++) {
+    tr = TREES[i];
+    x = px(tr.u); w = tr.w * P.w;
+    h = tr.h * P.h;
+    y = P.y;
+    ctx.fillStyle = tr.dark ? TREE_DARK : TREE_MID;
+    /* trunk mass, leaning slightly */
+    var tx = x + w * 0.25 + tr.lean * P.w;
+    ctx.fillRect(tx, y + h * 0.30, w * 0.5, h * 0.62);
+    /* canopy: overlapping dark discs sunk into the trunk top, moveTo before every arc */
+    ctx.beginPath();
+    ctx.moveTo(x + w * 0.5, y + h * 0.30);
+    ctx.arc(x + w * 0.5, y + h * 0.30, w * 0.52, 0, TAU);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(x + w * 0.20, y + h * 0.44);
+    ctx.arc(x + w * 0.20, y + h * 0.44, w * 0.36, 0, TAU);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(x + w * 0.82, y + h * 0.42);
+    ctx.arc(x + w * 0.82, y + h * 0.42, w * 0.34, 0, TAU);
+    ctx.fill();
+    /* faint reflection streak below the mass, in the flood */
+    ctx.fillStyle = rgba(TREE_DARK, 0.16 * b);
+    ctx.fillRect(tx, py(0.62), w * 0.5, P.h * 0.16);
+  }
+}
+function drawMist(b, t) {
+  var i, m, x, y, h;
+  for (i = 0; i < MISTS.length; i++) {
+    m = MISTS[i];
+    var drift = Math.sin(t * m.drift + m.off) * 0.05;
+    x = P.x + drift * P.w;
+    y = py(m.v); h = m.h * P.h;
+    var g = ctx.createLinearGradient(0, y, 0, y + h);
+    var a = 0.10 + 0.14 * (1 - b);
+    g.addColorStop(0, rgba(MIST, 0.0));
+    g.addColorStop(0.5, rgba(MIST, a));
+    g.addColorStop(1, rgba(MIST, 0.0));
+    ctx.fillStyle = g;
+    ctx.fillRect(x, y, P.w, h);
+  }
+}
+function lineYAt(u, v, seedPh) {
+  var wob = Math.sin(u * 9.0 + seedPh) * 0.004 + Math.sin(u * 23.0 + seedPh * 2.7) * 0.002;
+  return py(v + wob);
+}
+function drawLevelLine(v, alpha, width, seedPh) {
+  var segs = 26, i, u;
+  ctx.beginPath();
+  for (i = 0; i <= segs; i++) {
+    u = i / segs;
+    if (i === 0) ctx.moveTo(px(u), lineYAt(u, v, seedPh));
+    else ctx.lineTo(px(u), lineYAt(u, v, seedPh));
+  }
+  ctx.strokeStyle = rgba(LINE_BLUE, alpha);
+  ctx.lineWidth = width;
+  ctx.stroke();
+}
+function draw() {
+  size();
+  ctx.fillStyle = GROUND;
+  ctx.fillRect(0, 0, VW, VH);
+  /* wall vignette */
+  var vg = ctx.createRadialGradient(VW / 2, VH / 2, Math.min(VW, VH) * 0.3, VW / 2, VH / 2, Math.max(VW, VH) * 0.75);
+  vg.addColorStop(0, rgba(GROUND_DEEP, 0.0));
+  vg.addColorStop(1, rgba(GROUND_DEEP, 0.55));
+  ctx.fillStyle = vg;
+  ctx.fillRect(0, 0, VW, VH);
+  var b = brightnessAt(simT);
+  var lv = levelV(simT);
+  /* ---- the projection: drowned green over mud, road low ---- */
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(P.x, P.y, P.w, P.h);
+  ctx.clip();
+  var g = ctx.createLinearGradient(0, P.y, 0, P.y + P.h);
+  g.addColorStop(0, DROWNED_DEEP);
+  g.addColorStop(0.42, DROWNED);
+  g.addColorStop(0.58, DROWNED_PALE);
+  g.addColorStop(0.66, MUD);
+  g.addColorStop(1, MUD_DARK);
+  ctx.fillStyle = g;
+  ctx.fillRect(P.x, P.y, P.w, P.h);
+  /* flooded road band */
+  ctx.fillStyle = MUD;
+  ctx.fillRect(P.x, py(0.66), P.w, P.h * 0.34);
+  ctx.fillStyle = rgba(MUD_LIGHT, 0.25 * b);
+  ctx.fillRect(P.x, py(0.66), P.w, 2);
+  /* sheen streaks on the wet road */
+  var i, s;
+  for (i = 0; i < SHEENS.length; i++) {
+    s = SHEENS[i];
+    ctx.fillStyle = rgba(MIST, s.a * b);
+    ctx.fillRect(px(s.u), py(s.v), s.w * P.w, 1.5);
+  }
+  drawTrees(b);
+  /* brightness veil: the flood develops the picture as it rises */
+  var veil = ((1 - b) * 0.58).toFixed(4);
+  ctx.fillStyle = 'rgba(9,10,9,' + veil + ')';
+  ctx.fillRect(P.x, P.y, P.w, P.h);
+  drawMist(b, phaseT);
+  /* residual lines at marks already passed this rise, fading as the flood falls */
+  var sc = cycleAt(simT);
+  var rising = sc.local <= sc.c.rise;
+  for (i = 0; i < MARKS.length; i++) {
+    if (MARKS[i] >= lv) {
+      var ra = rising ? 0.38 : 0.38 * (1 - (sc.local - sc.c.rise) / sc.c.fall);
+      if (ra > 0.02) drawLevelLine(MARKS[i], ra, 1, 1.3 + i * 2.1);
+    }
+  }
+  /* the active creeping line: soft glow under a bright core */
+  drawLevelLine(lv, 0.22, 5, 0.7);
+  drawLevelLine(lv, 0.95, 1.5, 0.7);
+  ctx.restore(); /* end of clipped projection interior */
+  /* gauge ticks at the left edge of the projection */
+  for (i = 0; i < MARKS.length; i++) {
+    ctx.fillStyle = rgba(LINE_BLUE, 0.5 * b);
+    ctx.fillRect(P.x - 7, py(MARKS[i]) - 1, 7, 2);
+  }
+  /* projector glow at the top edge */
+  var pg = ctx.createRadialGradient(px(0.5), P.y - 6, 2, px(0.5), P.y - 6, P.w * 0.16);
+  pg.addColorStop(0, rgba(LINE_BRIGHT, 0.14 * b));
+  pg.addColorStop(1, rgba(LINE_BRIGHT, 0.0));
+  ctx.fillStyle = pg;
+  ctx.fillRect(P.x - P.w * 0.1, P.y - P.h * 0.18, P.w * 1.2, P.h * 0.20);
+  ctx.fillStyle = rgba(LINE_BRIGHT, 0.55 * b);
+  ctx.fillRect(px(0.5) - 14, P.y - 4, 28, 3);
+  /* projection frame */
+  ctx.strokeStyle = rgba(LINE_BLUE, 0.18);
+  ctx.lineWidth = 1;
+  ctx.strokeRect(P.x + 0.5, P.y + 0.5, P.w - 1, P.h - 1);
+  drawPlates();
+}
+function drawPlates() {
+  var smallPx = isPhone ? 11 : 12;
+  var titlePx = isPhone ? 16 : 20;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.font = 'bold ' + titlePx + 'px monospace';
+  while (titlePx > 9 && ctx.measureText('FloodLines').width > VW - 60) {
+    titlePx -= 1;
+    ctx.font = 'bold ' + titlePx + 'px monospace';
+  }
+  var titleW = ctx.measureText('FloodLines').width;
+  ctx.font = smallPx + 'px monospace';
+  var dateW = ctx.measureText('2006 · 11 · 11').width;
+  var plateW = Math.max(titleW, dateW) + 28;
+  var plateH = titlePx + smallPx + 20;
+  var plateX = 12, plateY = 12;
+  ctx.fillStyle = PLATE;
+  ctx.fillRect(plateX, plateY, plateW, plateH);
+  ctx.strokeStyle = PLATE_LINE;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(plateX + 0.5, plateY + 0.5, plateW - 1, plateH - 1);
+  ctx.fillStyle = TITLE_INK;
+  ctx.font = 'bold ' + titlePx + 'px monospace';
+  ctx.fillText('FloodLines', plateX + 14, plateY + 7);
+  ctx.font = smallPx + 'px monospace';
+  ctx.fillStyle = HINT_INK;
+  ctx.fillText('2006 · 11 · 11', plateX + 14, plateY + 7 + titlePx + 3);
+  var hint = 'Watch only.';
+  ctx.font = smallPx + 'px monospace';
+  var hintW = ctx.measureText(hint).width;
+  var hintPlateW = hintW + 24;
+  var hintPlateH = smallPx + 14;
+  var hintPlateX = 12;
+  var hintPlateY = VH - hintPlateH - 12;
+  ctx.fillStyle = PLATE;
+  ctx.fillRect(hintPlateX, hintPlateY, hintPlateW, hintPlateH);
+  ctx.strokeStyle = PLATE_LINE;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(hintPlateX + 0.5, hintPlateY + 0.5, hintPlateW - 1, hintPlateH - 1);
+  ctx.fillStyle = HINT_INK;
+  ctx.fillText(hint, hintPlateX + 12, hintPlateY + 7);
+}
+if (typeof window !== 'undefined') {
+  window.__probe = {
+    drawAt: function (t) { phaseT = t; draw(); },
+    levelV: function () { return levelV(simT); },
+    brightness: function () { return brightnessAt(simT); },
+    phaseT: function () { return phaseT; }
+  };
+}
+/* ---- frame one: fixed phase t = 60 s, sim pre-run 0 to 60 s in 1/30 s steps ---- */
+size();
+/* pre-run the schedule so frame one sits mid-rise of the first cycle */
+(function () {
+  var steps = Math.round(FRAME_T * 30);
+  var s;
+  for (s = 0; s < steps; s++) stepSim(1 / 30);
+  phaseT = FRAME_T;
+})();
+if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', size);
+if (typeof window !== 'undefined' && window.addEventListener) window.addEventListener('resize', size);
+draw();
+if (!reduced && typeof requestAnimationFrame !== 'undefined') {
+  (function loop() {
+    var t0 = null, prevTs = null, clockT = 0, acc = 0;
+    function step(now) {
+      if (t0 === null) t0 = now;
+      if (prevTs === null) prevTs = now;
+      var dt = clamp((now - prevTs) / 1000, 0, 0.05);
+      prevTs = now;
+      clockT += dt;
+      acc += dt;
+      while (acc >= 1 / 30) { stepSim(1 / 30); acc -= 1 / 30; }
+      phaseT = FRAME_T + clockT;
+      var hidden = false;
+      try { hidden = document.hidden; } catch (e) { hidden = false; }
+      if (!hidden) draw();
+      if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  })();
+}
+</script>
+</body>
+</html>
