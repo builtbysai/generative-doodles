@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Ether Is Full</title>
+<style>
+html, body { margin: 0; padding: 0; background: #080a07; overflow: hidden; }
+canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+var TAU = Math.PI * 2;
+var FRAME_T = 60.0; /* fixed phase: t = 60 s, catch 2 mid weighted hold */
+var CYCLE = 300.0; /* catch table repeats every five minutes */
+var CATCH_DUR = 9.0; /* seconds a caught fragment lives: 1.5 draw-in, 5 hold, 2.5 dissolve */
+var GROUND = '#080A07'; /* near-black ground */
+var BAND_TINT = '#0D120B';
+var PHOSPHOR = '#7FB069'; /* phosphor green ticks and waveforms */
+var TICK_GREY = '#9AA29A'; /* pale grey ticks */
+var AMBER = '#E8A33D'; /* caught fragments, the only warm colour */
+var NEEDLE_INK = '#C9D2BC';
+var PLATE_FILL = '#10130E';
+var PLATE_LINE = 'rgba(160,180,150,0.25)';
+var PLATE_INK = '#C9D2BC';
+var HINT_INK = '#C9D2BC';
+function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    var t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+function rgb(hex) {
+  return [parseInt(hex.slice(1, 3), 16), parseInt(hex.slice(3, 5), 16), parseInt(hex.slice(5, 7), 16)];
+}
+function rgba(hex, a) {
+  var c = rgb(hex);
+  return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a.toFixed(4) + ')';
+}
+/* ---- fixed catch table, seeds 1800 ----
+   Base times within one 300 s cycle, types cycle waveform / pattern /
+   glyphs, band positions spread across the band. Index 2 is pinned
+   exactly: t0 = 55 s, x = 0.62, glyph burst, seed 1915, so at frame
+   one (t = 60 s) it is 5.0 s old, mid weighted hold. All other
+   entries carry small seeded jitter (+/-4 s time, +/-0.03 x).
+   Catch spacing is long on purpose: most of the time the piece is
+   near-silence, thin static and the needle's slow sweep. */
+var CATCH_TYPES = ['waveform', 'pattern', 'glyphs', 'waveform', 'glyphs', 'pattern', 'waveform', 'glyphs'];
+var CATCH_BASE_T = [12, 33, 55, 97, 140, 178, 211, 256];
+var CATCH_BASE_X = [0.31, 0.52, 0.62, 0.24, 0.78, 0.44, 0.68, 0.36];
+var CATCHES = [];
+(function buildCatches() {
+  var rng = mulberry32(1800);
+  var k, i;
+  for (k = -1; k <= 2; k++) {
+    for (i = 0; i < 8; i++) {
+      var pinned = (k === 0 && i === 2);
+      CATCHES.push({
+        t0: k * CYCLE + CATCH_BASE_T[i] + (pinned ? 0 : (rng() - 0.5) * 8),
+        x: clamp(CATCH_BASE_X[i] + (pinned ? 0 : (rng() - 0.5) * 0.06), 0.06, 0.94),
+        type: CATCH_TYPES[i],
+        seed: 1800 + i * 7 + (k + 1) * 101
+      });
+    }
+  }
+})();
+/* frame-one catch: index 2 of cycle k = 0, seed 1915, glyph burst,
+   x = 0.62, t0 = 55 s, age 5.0 s at t = 60 s. */
+/* ---- fixed static field, seed 1800 ----
+   420 specks inside the band, each with a twinkle phase. Positions
+   never move; only their alpha breathes, so the static is calm. */
+var SPECKS = [];
+(function buildSpecks() {
+  var rng = mulberry32(1800 + 500);
+  var i;
+  for (i = 0; i < 420; i++) {
+    SPECKS.push({
+      x: rng(), y: rng(), r: 0.5 + rng() * 1.1,
+      ph: rng() * TAU, sp: 0.35 + rng() * 0.9,
+      green: rng() < 0.6
+    });
+  }
+})();
+/* ---- fixed tick field, seed 1800 ----
+   97 ticks across the band; every twelfth is a taller marker tick. */
+var TICKS = [];
+(function buildTicks() {
+  var rng = mulberry32(1800 + 900);
+  var i;
+  for (i = 0; i < 97; i++) {
+    TICKS.push({
+      x: i / 96, h: 0.35 + rng() * 0.65,
+      grey: rng() < 0.45, marker: i % 12 === 0
+    });
+  }
+})();
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var VW = 0, VH = 0, isPhone = false;
+var reduced = false;
+try { reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (e) { reduced = false; }
+var phaseT = FRAME_T;
+var F = { x: 0, y: 0, w: 0, h: 0 }; /* field rect */
+var dragging = false;
+var dragX = 0.5; /* needle fraction while held */
+function size() {
+  var vw = 0, vh = 0;
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.width) {
+    vw = window.visualViewport.width; vh = window.visualViewport.height;
+  } else if (typeof window !== 'undefined' && window.innerWidth) {
+    vw = window.innerWidth; vh = window.innerHeight;
+  }
+  VW = vw; VH = vh;
+  canvas.width = VW; canvas.height = VH;
+  canvas.style.width = VW + 'px'; canvas.style.height = VH + 'px';
+  if (typeof window !== 'undefined' && window.screen) {
+    var mn = Math.min(window.screen.width, window.screen.height);
+    isPhone = mn < 700 || VH > VW * 1.15;
+  }
+  if (isPhone) {
+    F = { x: 0, y: 0, w: VW, h: VH };
+  } else {
+    var side = Math.min(VW, VH) - 40;
+    F = { x: (VW - side) / 2, y: (VH - side) / 2, w: side, h: side };
+  }
+}
+function bandRect() {
+  return { x: F.x, y: F.y + 0.36 * F.h, w: F.w, h: 0.28 * F.h };
+}
+function bandCenterY() {
+  return F.y + 0.50 * F.h;
+}
+/* The needle's free path: a slow noise path, three sines at 211 s,
+   53 s and 17 s. At t = 60 s the free path sits at 0.8165, but the
+   needle is locked on catch 2 at frame one, so it reads 0.62. */
+function freeNeedleX(t) {
+  return 0.5 + 0.30 * Math.sin(TAU * t / 211) + 0.09 * Math.sin(TAU * t / 53 + 1.7) + 0.04 * Math.sin(TAU * t / 17 + 0.6);
+}
+function activeCatch(t) {
+  var i;
+  for (i = 0; i < CATCHES.length; i++) {
+    var age = t - CATCHES[i].t0;
+    if (age >= 0 && age < CATCH_DUR) return { c: CATCHES[i], age: age };
+  }
+  return null;
+}
+function needleX(t) {
+  if (dragging) return dragX;
+  var act = activeCatch(t);
+  if (act) return act.c.x; /* locked on the caught fragment */
+  return clamp(freeNeedleX(t), 0.04, 0.96);
+}
+/* Catch envelope: draw-in 0-1.5 s, weighted hold 1.5-6.5 s with the
+   halo ramping in over 1.5-3.5 s, dissolve 6.5-9 s. At frame one
+   (age 5.0 s) alpha is 1 and the halo is at full strength. */
+function catchEnvelope(age) {
+  var a = 0, halo = 0;
+  if (age < 0 || age >= CATCH_DUR) return { a: 0, halo: 0 };
+  if (age < 1.5) {
+    a = age / 1.5;
+  } else if (age < 6.5) {
+    a = 1;
+    halo = clamp((age - 1.5) / 2, 0, 1);
+  } else {
+    a = 1 - (age - 6.5) / 2.5;
+    halo = 1 - (age - 6.5) / 2.5;
+  }
+  return { a: a, halo: halo };
+}
+function drawTicks(t) {
+  var b = bandRect();
+  var i, tk;
+  for (i = 0; i < TICKS.length; i++) {
+    tk = TICKS[i];
+    var x = b.x + tk.x * b.w;
+    var len = (tk.marker ? 16 : 9) * tk.h * (isPhone ? 1 : 1);
+    var al = tk.marker ? 0.42 : 0.22;
+    ctx.strokeStyle = rgba(tk.grey ? TICK_GREY : PHOSPHOR, al);
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(x, b.y);
+    ctx.lineTo(x, b.y + len);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(x, b.y + b.h);
+    ctx.lineTo(x, b.y + b.h - len);
+    ctx.stroke();
+  }
+}
+function drawDrift(t) {
+  var b = bandRect();
+  var cy = bandCenterY();
+  var i;
+  /* two faint drifting waveforms, phosphor green and pale grey */
+  var waves = [
+    { col: PHOSPHOR, al: 0.14, amp: 0.16, wl: 0.16, sp: 0.05, ph: 0.0 },
+    { col: TICK_GREY, al: 0.10, amp: 0.11, wl: 0.11, sp: -0.035, ph: 2.1 }
+  ];
+  for (i = 0; i < waves.length; i++) {
+    var wv = waves[i];
+    ctx.strokeStyle = rgba(wv.col, wv.al);
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    var x;
+    for (x = b.x; x <= b.x + b.w; x += 6) {
+      var fx = (x - b.x) / b.w;
+      var y = cy + wv.amp * b.h * Math.sin(TAU * fx / wv.wl + t * wv.sp * TAU + wv.ph);
+      if (x === b.x) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+}
+function drawStatic(t) {
+  var b = bandRect();
+  var i, s;
+  for (i = 0; i < SPECKS.length; i++) {
+    s = SPECKS[i];
+    var tw = 0.5 + 0.5 * Math.sin(TAU * (t * s.sp * 0.16 + s.ph / TAU));
+    var al = 0.05 + 0.16 * tw;
+    ctx.fillStyle = rgba(s.green ? PHOSPHOR : TICK_GREY, al);
+    ctx.fillRect(b.x + s.x * b.w, b.y + s.y * b.h, s.r, s.r);
+  }
+}
+function drawNeedle(t) {
+  var b = bandRect();
+  var nx = F.x + needleX(t) * F.w;
+  ctx.strokeStyle = rgba(NEEDLE_INK, 0.85);
+  ctx.lineWidth = Math.max(1.5, F.w * 0.002);
+  ctx.beginPath();
+  ctx.moveTo(nx, b.y - 10);
+  ctx.lineTo(nx, b.y + b.h + 10);
+  ctx.stroke();
+  /* small triangle marker above the band */
+  ctx.fillStyle = rgba(NEEDLE_INK, 0.85);
+  ctx.beginPath();
+  ctx.moveTo(nx - 6, b.y - 10);
+  ctx.lineTo(nx + 6, b.y - 10);
+  ctx.lineTo(nx, b.y - 2);
+  ctx.closePath();
+  ctx.fill();
+  /* faint cross tick at band centre */
+  ctx.strokeStyle = rgba(NEEDLE_INK, 0.35);
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(nx - 7, bandCenterY());
+  ctx.lineTo(nx + 7, bandCenterY());
+  ctx.stroke();
+}
+function drawHalo(cx, cy, w, h, halo) {
+  /* low-alpha concentric rings hugging the fragment, not glow: radii
+     stay close to the fragment's own width and height. */
+  var i;
+  for (i = 0; i < 3; i++) {
+    var s = 1.0 + i * 0.10;
+    ctx.strokeStyle = rgba(AMBER, (0.06 - i * 0.015) * halo);
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, w * 0.58 * s, h * 0.68 * s, 0, 0, TAU);
+    ctx.stroke();
+  }
+}
+function drawWaveformFragment(cx, cy, w, h, seed, a) {
+  var rng = mulberry32(seed);
+  var p1 = rng() * TAU, p2 = rng() * TAU;
+  var f1 = 2 + Math.floor(rng() * 2), f2 = 5 + Math.floor(rng() * 3);
+  ctx.strokeStyle = rgba(AMBER, 0.95 * a);
+  ctx.lineWidth = Math.max(2, w * 0.006);
+  ctx.beginPath();
+  var x;
+  for (x = cx - w / 2; x <= cx + w / 2; x += 4) {
+    var fx = (x - (cx - w / 2)) / w;
+    var y = cy + h * 0.5 * Math.sin(TAU * f1 * fx + p1) * 0.7
+      + h * 0.22 * Math.sin(TAU * f2 * fx + p2);
+    if (x === cx - w / 2) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+  /* fainter echo, half amplitude, offset down */
+  ctx.strokeStyle = rgba(AMBER, 0.30 * a);
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (x = cx - w / 2; x <= cx + w / 2; x += 4) {
+    var fx2 = (x - (cx - w / 2)) / w;
+    var y2 = cy + h * 0.5 * Math.sin(TAU * f1 * fx2 + p1) * 0.7 + h * 0.30;
+    if (x === cx - w / 2) ctx.moveTo(x, y2); else ctx.lineTo(x, y2);
+  }
+  ctx.stroke();
+}
+function drawGlyphFragment(cx, cy, w, h, seed, a) {
+  var rng = mulberry32(seed);
+  var glyphs = ['x', '+', '*', '#', '%', '=', '~', '^', '.', ':', ';', '/', '|', 'o', '-', '&', '?'];
+  var i;
+  for (i = 0; i < 26; i++) {
+    var gx = cx + (rng() - 0.5) * w;
+    var gy = cy + (rng() - 0.5) * h;
+    var sz = 10 + rng() * 26;
+    var al = (0.35 + rng() * 0.65) * a;
+    ctx.font = 'bold ' + Math.round(sz) + 'px monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = rgba(AMBER, al);
+    ctx.fillText(glyphs[Math.floor(rng() * glyphs.length)], gx, gy);
+  }
+}
+function drawPatternFragment(cx, cy, w, h, seed, a) {
+  var rng = mulberry32(seed);
+  var rows = 5, cols = 18;
+  var i, j;
+  ctx.strokeStyle = rgba(AMBER, 0.55 * a);
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(cx - w / 2, cy - h / 2);
+  ctx.lineTo(cx + w / 2, cy - h / 2);
+  ctx.moveTo(cx - w / 2, cy + h / 2);
+  ctx.lineTo(cx + w / 2, cy + h / 2);
+  ctx.stroke();
+  for (i = 0; i < rows; i++) {
+    for (j = 0; j < cols; j++) {
+      var px = cx - w / 2 + (j + 0.5) * (w / cols);
+      var py = cy - h / 2 + (i + 0.5) * (h / rows);
+      var on = rng() < 0.62;
+      if (!on) continue;
+      var s = 2 + rng() * 4;
+      var al = (0.4 + rng() * 0.6) * a;
+      ctx.fillStyle = rgba(AMBER, al);
+      if ((i + j) % 3 === 0) {
+        ctx.fillRect(px - s / 2, py - s / 2, s, s);
+      } else {
+        ctx.beginPath();
+        ctx.ellipse(px, py, s / 2, s / 2, 0, 0, TAU);
+        ctx.fill();
+      }
+    }
+  }
+}
+function drawFragment(t) {
+  var act = activeCatch(t);
+  if (!act) return;
+  var env = catchEnvelope(act.age);
+  if (env.a <= 0) return;
+  var cx = F.x + F.w / 2;
+  var cy = bandCenterY();
+  var w = F.w * 0.56;
+  var h = F.h * 0.20; /* keeps the fragment inside the band */
+  if (env.halo > 0) drawHalo(cx, cy, w, h, env.halo);
+  if (act.c.type === 'waveform') drawWaveformFragment(cx, cy, w, h, act.c.seed, env.a);
+  else if (act.c.type === 'glyphs') drawGlyphFragment(cx, cy, w, h, act.c.seed, env.a);
+  else drawPatternFragment(cx, cy, w, h, act.c.seed, env.a);
+}
+function drawBand(t) {
+  var b = bandRect();
+  ctx.fillStyle = BAND_TINT;
+  ctx.fillRect(b.x, b.y, b.w, b.h);
+  ctx.strokeStyle = rgba(PHOSPHOR, 0.18);
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(b.x, b.y + 0.5);
+  ctx.lineTo(b.x + b.w, b.y + 0.5);
+  ctx.moveTo(b.x, b.y + b.h - 0.5);
+  ctx.lineTo(b.x + b.w, b.y + b.h - 0.5);
+  ctx.stroke();
+  drawTicks(t);
+  drawDrift(t);
+  drawStatic(t);
+  drawNeedle(t);
+  drawFragment(t);
+}
+function drawPlates() {
+  var smallPx = isPhone ? 11 : 12;
+  var titlePx = isPhone ? 16 : 20;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.font = 'bold ' + titlePx + 'px monospace';
+  while (titlePx > 9 && ctx.measureText('The Ether Is Full').width > VW - 60) {
+    titlePx -= 1;
+    ctx.font = 'bold ' + titlePx + 'px monospace';
+  }
+  var titleW = ctx.measureText('The Ether Is Full').width;
+  ctx.font = smallPx + 'px monospace';
+  var dateW = ctx.measureText('2006 · 12 · 16').width;
+  var plateW = Math.max(titleW, dateW) + 28;
+  var plateH = titlePx + smallPx + 20;
+  var plateX = 12, plateY = 12;
+  ctx.fillStyle = PLATE_FILL;
+  ctx.fillRect(plateX, plateY, plateW, plateH);
+  ctx.strokeStyle = PLATE_LINE;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(plateX + 0.5, plateY + 0.5, plateW - 1, plateH - 1);
+  ctx.fillStyle = PLATE_INK;
+  ctx.font = 'bold ' + titlePx + 'px monospace';
+  ctx.fillText('The Ether Is Full', plateX + 14, plateY + 7);
+  ctx.font = smallPx + 'px monospace';
+  ctx.fillStyle = HINT_INK;
+  ctx.fillText('2006 · 12 · 16', plateX + 14, plateY + 7 + titlePx + 3);
+  var hint = 'Drag to tune.';
+  ctx.font = smallPx + 'px monospace';
+  var hintW = ctx.measureText(hint).width;
+  var hintPlateW = hintW + 24;
+  var hintPlateH = smallPx + 14;
+  var hintPlateX = 12;
+  var hintPlateY = VH - hintPlateH - 12;
+  ctx.fillStyle = PLATE_FILL;
+  ctx.fillRect(hintPlateX, hintPlateY, hintPlateW, hintPlateH);
+  ctx.strokeStyle = PLATE_LINE;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(hintPlateX + 0.5, hintPlateY + 0.5, hintPlateW - 1, hintPlateH - 1);
+  ctx.fillStyle = HINT_INK;
+  ctx.fillText(hint, hintPlateX + 12, hintPlateY + 7);
+}
+function draw() {
+  size();
+  ctx.fillStyle = GROUND;
+  ctx.fillRect(0, 0, VW, VH);
+  drawBand(phaseT);
+  drawPlates();
+}
+if (typeof window !== 'undefined') {
+  window.__probe = {
+    drawAt: function (t) { phaseT = t; draw(); },
+    phaseT: function () { return phaseT; },
+    needleX: function (t) { return needleX(t); },
+    freeNeedleX: function (t) { return freeNeedleX(t); },
+    catchAt: function (t) {
+      var act = activeCatch(t);
+      if (!act) return null;
+      return { type: act.c.type, seed: act.c.seed, x: act.c.x, t0: act.c.t0, age: act.age };
+    }
+  };
+}
+/* ---- pointer: drag tunes the needle ----
+   While held, the needle follows the drag position along the band.
+   A catch scheduled within the next 25 s whose band position lies
+   within 0.12 of the drag position fires early, so the system
+   catches more readily where the viewer tunes. On release the
+   needle resumes its own slow sweep. No click-to-reload anywhere:
+   a tap without drag does nothing. */
+function pointerX(e) {
+  var cx = 0;
+  if (typeof e.clientX === 'number') cx = e.clientX;
+  else if (e.touches && e.touches[0]) cx = e.touches[0].clientX;
+  return clamp((cx - F.x) / F.w, 0.04, 0.96);
+}
+function tuneEarly(t) {
+  var i;
+  for (i = 0; i < CATCHES.length; i++) {
+    var c = CATCHES[i];
+    if (c.t0 > t && c.t0 < t + 25 && Math.abs(c.x - dragX) < 0.12) {
+      c.t0 = t; /* fire now, at the tuned position */
+    }
+  }
+}
+if (canvas.addEventListener) {
+  canvas.addEventListener('pointerdown', function (e) {
+    dragging = true;
+    dragX = pointerX(e);
+    tuneEarly(phaseT);
+    if (e.preventDefault) e.preventDefault();
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (!dragging) return;
+    dragX = pointerX(e);
+    tuneEarly(phaseT);
+  });
+  canvas.addEventListener('pointerup', function () { dragging = false; });
+  canvas.addEventListener('pointercancel', function () { dragging = false; });
+}
+/* ---- frame one: fixed phase t = 60 s ----
+   No wall clock is read for frame one. The needle is locked on
+   catch 2 (glyph burst, seed 1915, x = 0.62, age 5.0 s, mid weighted
+   hold with full halo) at center. No pointer input has happened. */
+size();
+phaseT = FRAME_T;
+if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', size);
+if (typeof window !== 'undefined' && window.addEventListener) window.addEventListener('resize', size);
+draw();
+if (!reduced && typeof requestAnimationFrame !== 'undefined') {
+  /* True time: phase is computed from a wall-clock start captured after
+     the fixed first frame, so dropped frames never lose time. */
+  var startMs = Date.now();
+  (function loop() {
+    function step() {
+      phaseT = FRAME_T + (Date.now() - startMs) / 1000;
+      var hidden = false;
+      try { hidden = document.hidden; } catch (e) { hidden = false; }
+      if (!hidden) draw();
+      if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  })();
+}
+</script>
+</body>
+</html>

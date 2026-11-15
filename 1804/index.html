@@ -1,0 +1,603 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Moving Photograph</title>
+<style>
+html, body { margin: 0; padding: 0; background: #14100c; overflow: hidden; }
+canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+var TAU = Math.PI * 2;
+var FRAME_T = 60.0; /* fixed phase: t = 60 s */
+var SCAN_PERIOD = 240.0; /* scan line sweeps the frame once per four minutes */
+var WALL_Y = 0.62; /* wall/floor boundary, fraction of field height */
+var SKY_TOP = '#2E2A24'; /* hall wall, dark warm grey */
+var WALL_LOW = '#4A4036'; /* wall near the floor line, warm sepia */
+var FLOOR_TOP = '#5A4C3C'; /* floor at the wall line */
+var FLOOR_LOW = '#241F18'; /* floor at the bottom edge */
+var FRAME_INK = '#191510';
+var FACE_A = '#C9B99A'; /* face tone, state A */
+var FACE_B = '#B7A88C'; /* face tone, state B */
+var COAT_INK = '#1C1813';
+var COAT_BLOOM = '#8A4A3A'; /* faded rust coat, blooms in colour */
+var SIGN_BLOOM = '#4A6A6E'; /* faded teal sign, blooms in colour */
+var PLATE_FILL = '#191510';
+var PLATE_LINE = 'rgba(214,198,168,0.30)';
+var PLATE_INK = '#D6C6A8';
+var HINT_INK = '#D6C6A8';
+function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    var t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+function rgb(hex) {
+  return [parseInt(hex.slice(1, 3), 16), parseInt(hex.slice(3, 5), 16), parseInt(hex.slice(5, 7), 16)];
+}
+function rgba(hex, a) {
+  var c = rgb(hex);
+  return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + clamp(a, 0, 1).toFixed(4) + ')';
+}
+function smooth01(u) { u = clamp(u, 0, 1); return u * u * (3 - 2 * u); }
+/* ---- morph clock ----
+   Each region runs on its own long period P with a fixed offset.
+   frac in [0, 0.55): rest at state A. [0.55, 0.75): morph A to B.
+   [0.75, 0.90): rest at state B. [0.90, 1.0): morph back to A.
+   Morphs are always slow and local; no region ever moves the frame. */
+function morphFrac(t, P, off) {
+  var f = ((t + off) % P) / P;
+  if (f < 0) f += 1;
+  return f;
+}
+function morphM(t, P, off) {
+  var f = morphFrac(t, P, off);
+  if (f < 0.55) return 0;
+  if (f < 0.75) return smooth01((f - 0.55) / 0.20);
+  if (f < 0.90) return 1;
+  return 1 - smooth01((f - 0.90) / 0.10);
+}
+/* ---- colour bloom envelope ----
+   frac in [0, 0.55): no colour. [0.55, 0.65): bloom in.
+   [0.65, 0.80): full faded colour. [0.80, 0.90): fade back.
+   [0.90, 1.0): no colour. */
+function bloomA(t, P, off) {
+  var f = morphFrac(t, P, off);
+  if (f < 0.55) return 0;
+  if (f < 0.65) return smooth01((f - 0.55) / 0.10);
+  if (f < 0.80) return 1;
+  if (f < 0.90) return 1 - smooth01((f - 0.80) / 0.10);
+  return 0;
+}
+/* ---- region table (period s, offset s, state at t = 60 s) ----
+   R1 face left      P 300 off   0 : frac 0.200, m 0.00, at rest (face A)
+   R2 face right     P 280 off 120 : frac 0.643, m 0.46, MID-MORPH A to B
+   R3 opening right  P 360 off  20 : frac 0.222, m 0.00, at rest (window)
+   R4 poster left    P 420 off 200 : frac 0.619, m 0.28, MID-MORPH poster 0 to 1
+   R5 poster right   P 320 off  90 : frac 0.469, m 0.00, at rest (poster A)
+   R6 coat bloom     P 300 off 150 : frac 0.700, bloom 1.00, MID-BLOOM rust coat
+   R7 sign bloom     P 360 off 100 : frac 0.444, bloom 0.00, at rest (no colour)
+   R8 doorway figure P 240 off 200 : frac 0.083, m 0.00, at rest (no figure)
+   Scan line at t = 60 s: (60 mod 240) / 240 = 0.25, one quarter down the frame. */
+var REGIONS = {
+  R1: { P: 300, off: 0 },
+  R2: { P: 280, off: 120 },
+  R3: { P: 360, off: 20 },
+  R4: { P: 420, off: 200 },
+  R5: { P: 320, off: 90 },
+  R6: { P: 300, off: 150 },
+  R7: { P: 360, off: 100 },
+  R8: { P: 240, off: 200 }
+};
+/* ---- fixed crowd layout, seed 1804 ----
+   Eight figures across the lower half. Two carry morphing faces
+   (R1 left, R2 right); one wears the blooming coat (R6, centre). */
+var FIGURES = [];
+(function buildFigures() {
+  var rng = mulberry32(1804);
+  var i;
+  for (i = 0; i < 8; i++) {
+    FIGURES.push({
+      x: 0.07 + i * 0.118 + (rng() - 0.5) * 0.03,
+      s: 0.80 + rng() * 0.45, /* scale, back row smaller */
+      hat: rng() > 0.45,
+      lean: (rng() - 0.5) * 0.06
+    });
+  }
+})();
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var VW = 0, VH = 0, isPhone = false;
+var reduced = false;
+try { reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (e) { reduced = false; }
+var phaseT = FRAME_T;
+var F = { x: 0, y: 0, w: 0, h: 0 }; /* field rect */
+function size() {
+  var vw = 0, vh = 0;
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.width) {
+    vw = window.visualViewport.width; vh = window.visualViewport.height;
+  } else if (typeof window !== 'undefined' && window.innerWidth) {
+    vw = window.innerWidth; vh = window.innerHeight;
+  }
+  VW = vw; VH = vh;
+  canvas.width = VW; canvas.height = VH;
+  canvas.style.width = VW + 'px'; canvas.style.height = VH + 'px';
+  if (typeof window !== 'undefined' && window.screen) {
+    var mn = Math.min(window.screen.width, window.screen.height);
+    isPhone = mn < 700 || VH > VW * 1.15;
+  }
+  if (isPhone) {
+    F = { x: 0, y: 0, w: VW, h: VH };
+  } else {
+    var side = Math.min(VW, VH) - 40;
+    F = { x: (VW - side) / 2, y: (VH - side) / 2, w: side, h: side };
+  }
+}
+function floorY() { return F.y + WALL_Y * F.h; }
+/* ---- the hall: wall, floor, windows, doorway, posters ---- */
+function drawHall(t) {
+  var fy = floorY();
+  /* wall: dark warm grey fading to sepia at the floor line */
+  var g = ctx.createLinearGradient(0, F.y, 0, fy);
+  g.addColorStop(0, SKY_TOP);
+  g.addColorStop(1, WALL_LOW);
+  ctx.fillStyle = g;
+  ctx.fillRect(F.x, F.y, F.w, fy - F.y);
+  /* floor: sepia boards, darker toward the viewer */
+  var g2 = ctx.createLinearGradient(0, fy, 0, F.y + F.h);
+  g2.addColorStop(0, FLOOR_TOP);
+  g2.addColorStop(1, FLOOR_LOW);
+  ctx.fillStyle = g2;
+  ctx.fillRect(F.x, fy, F.w, F.y + F.h - fy);
+  /* floor boards converging on the centre vanishing point */
+  ctx.strokeStyle = rgba('#0F0C09', 0.35);
+  ctx.lineWidth = 1;
+  var i, bx;
+  for (i = -4; i <= 4; i++) {
+    ctx.beginPath();
+    ctx.moveTo(F.x + F.w * 0.5 + i * F.w * 0.055, fy);
+    ctx.lineTo(F.x + F.w * 0.5 + i * F.w * 0.16, F.y + F.h);
+    ctx.stroke();
+  }
+  for (i = 1; i <= 3; i++) {
+    var by = fy + (F.y + F.h - fy) * (i / 4) * (i / 4);
+    ctx.beginPath();
+    ctx.moveTo(F.x, by);
+    ctx.lineTo(F.x + F.w, by);
+    ctx.stroke();
+  }
+  /* wainscot line */
+  ctx.strokeStyle = rgba('#0F0C09', 0.5);
+  ctx.lineWidth = Math.max(1, F.w * 0.002);
+  ctx.beginPath();
+  ctx.moveTo(F.x, fy);
+  ctx.lineTo(F.x + F.w, fy);
+  ctx.stroke();
+  drawWindows(t);
+  drawPosters(t);
+}
+/* Two fixed arched windows left and centre; the right opening is R3,
+   a window that slowly becomes a doorway. */
+function drawWindows(t) {
+  var fy = floorY();
+  var top = F.y + F.h * 0.06;
+  var bot = fy - F.h * 0.02;
+  var i;
+  var xs = [0.10, 0.38];
+  for (i = 0; i < xs.length; i++) {
+    var wx = F.x + F.w * xs[i];
+    var ww = F.w * 0.14;
+    drawArchedWindow(wx, ww, top, bot);
+  }
+  drawOpening(t, top, bot);
+}
+function drawArchedWindow(wx, ww, top, bot) {
+  var hgt = bot - top;
+  var rad = ww / 2;
+  ctx.fillStyle = rgba('#CFC0A0', 0.82);
+  ctx.beginPath();
+  ctx.moveTo(wx, bot);
+  ctx.lineTo(wx, top + rad);
+  ctx.arc(wx + rad, top + rad, rad, Math.PI, 0);
+  ctx.lineTo(wx + ww, bot);
+  ctx.closePath();
+  ctx.fill();
+  /* mullions */
+  ctx.strokeStyle = rgba('#241F18', 0.85);
+  ctx.lineWidth = Math.max(1, ww * 0.03);
+  ctx.beginPath();
+  ctx.moveTo(wx + ww / 2, top);
+  ctx.lineTo(wx + ww / 2, bot);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(wx, top + hgt * 0.45);
+  ctx.lineTo(wx + ww, top + hgt * 0.45);
+  ctx.stroke();
+  ctx.strokeStyle = rgba('#241F18', 0.9);
+  ctx.lineWidth = Math.max(1.5, ww * 0.035);
+  ctx.beginPath();
+  ctx.moveTo(wx, bot);
+  ctx.lineTo(wx, top + rad);
+  ctx.arc(wx + rad, top + rad, rad, Math.PI, 0);
+  ctx.lineTo(wx + ww, bot);
+  ctx.closePath();
+  ctx.stroke();
+}
+function drawOpening(t, top, bot) {
+  var m = morphM(t, REGIONS.R3.P, REGIONS.R3.off);
+  var wx = F.x + F.w * 0.66;
+  var ww = F.w * 0.14;
+  var hgt = bot - top;
+  var rad = ww / 2;
+  /* window state: lit panes, alpha (1 - m) */
+  ctx.save();
+  ctx.globalAlpha = 1 - m;
+  ctx.fillStyle = rgba('#CFC0A0', 0.82);
+  ctx.beginPath();
+  ctx.moveTo(wx, bot);
+  ctx.lineTo(wx, top + rad);
+  ctx.arc(wx + rad, top + rad, rad, Math.PI, 0);
+  ctx.lineTo(wx + ww, bot);
+  ctx.closePath();
+  ctx.fill();
+  ctx.strokeStyle = rgba('#241F18', 0.85);
+  ctx.lineWidth = Math.max(1, ww * 0.03);
+  ctx.beginPath();
+  ctx.moveTo(wx + ww / 2, top);
+  ctx.lineTo(wx + ww / 2, bot);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(wx, top + hgt * 0.45);
+  ctx.lineTo(wx + ww, top + hgt * 0.45);
+  ctx.stroke();
+  ctx.restore();
+  /* doorway state: dark opening, alpha m; the arch flattens as it opens */
+  ctx.save();
+  ctx.globalAlpha = m;
+  var doorTop = top + rad * (1 - m * 0.4);
+  ctx.fillStyle = '#0D0A07';
+  ctx.beginPath();
+  ctx.moveTo(wx, bot);
+  ctx.lineTo(wx, doorTop + rad * 0.6);
+  ctx.arc(wx + rad, doorTop + rad * 0.6, rad * 0.6, Math.PI, 0);
+  ctx.lineTo(wx + ww, bot);
+  ctx.closePath();
+  ctx.fill();
+  /* a figure steps through as the doorway opens (R8 shares the clock) */
+  var m8 = morphM(t, REGIONS.R8.P, REGIONS.R8.off);
+  if (m8 > 0.01) {
+    ctx.globalAlpha = m * m8;
+    ctx.fillStyle = '#2A241C';
+    var cx = wx + ww / 2;
+    ctx.beginPath();
+    ctx.moveTo(cx - ww * 0.16, bot);
+    ctx.lineTo(cx - ww * 0.12, bot - hgt * 0.42);
+    ctx.lineTo(cx + ww * 0.12, bot - hgt * 0.42);
+    ctx.lineTo(cx + ww * 0.16, bot);
+    ctx.closePath();
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(cx, bot - hgt * 0.48, ww * 0.11, 0, TAU);
+    ctx.fill();
+  }
+  ctx.restore();
+  /* frame outline, drawn in both states */
+  ctx.strokeStyle = rgba('#241F18', 0.9);
+  ctx.lineWidth = Math.max(1.5, ww * 0.035);
+  ctx.beginPath();
+  ctx.moveTo(wx, bot);
+  ctx.lineTo(wx, top + rad);
+  ctx.arc(wx + rad, top + rad, rad, Math.PI, 0);
+  ctx.lineTo(wx + ww, bot);
+  ctx.closePath();
+  ctx.stroke();
+}
+/* ---- posters: text-like marks cycling through decades ---- */
+function drawPosters(t) {
+  var fy = floorY();
+  var py = F.y + F.h * 0.10;
+  var ph = F.h * 0.20;
+  /* left poster, R4, three decades: 0 (tall headline), 1 (two columns),
+     2 (big numeral). Cycle index advances once per period. */
+  var p4 = REGIONS.R4;
+  var cyc4 = Math.floor((t + p4.off) / p4.P);
+  var sA4 = ((cyc4 % 3) + 3) % 3;
+  var sB4 = (sA4 + 1) % 3;
+  var m4 = morphM(t, p4.P, p4.off);
+  var px4 = F.x + F.w * 0.252;
+  var pw4 = F.w * 0.095;
+  drawPoster(px4, pw4, py, ph, sA4, 1 - m4);
+  drawPoster(px4, pw4, py, ph, sB4, m4);
+  /* right poster, R5, two states: A (rules and lines), B (circle emblem) */
+  var m5 = morphM(t, REGIONS.R5.P, REGIONS.R5.off);
+  var px5 = F.x + F.w * 0.845;
+  var pw5 = F.w * 0.085;
+  drawPoster(px5, pw5, py, ph, 3, 1 - m5);
+  drawPoster(px5, pw5, py, ph, 4, m5);
+  /* the small sign under the right poster blooms faded teal (R7) */
+  var b7 = bloomA(t, REGIONS.R7.P, REGIONS.R7.off);
+  var sx = F.x + F.w * 0.845;
+  var sy = py + ph + F.h * 0.015;
+  var sw = F.w * 0.085;
+  var sh = F.h * 0.028;
+  ctx.fillStyle = rgba('#8A7A5E', 0.9);
+  ctx.fillRect(sx, sy, sw, sh);
+  ctx.fillStyle = rgba('#241F18', 0.85);
+  ctx.fillRect(sx + sw * 0.08, sy + sh * 0.30, sw * 0.84, sh * 0.14);
+  ctx.fillRect(sx + sw * 0.08, sy + sh * 0.60, sw * 0.60, sh * 0.14);
+  if (b7 > 0.01) {
+    ctx.fillStyle = rgba(SIGN_BLOOM, 0.45 * b7);
+    ctx.fillRect(sx, sy, sw, sh);
+  }
+}
+function drawPoster(px, pw, py, ph, state, alpha) {
+  if (alpha <= 0.01) return;
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = rgba('#B9A887', 0.92);
+  ctx.fillRect(px, py, pw, ph);
+  ctx.strokeStyle = rgba('#241F18', 0.85);
+  ctx.lineWidth = Math.max(1, pw * 0.03);
+  ctx.strokeRect(px + 0.5, py + 0.5, pw - 1, ph - 1);
+  ctx.fillStyle = rgba('#241F18', 0.9);
+  var i;
+  if (state === 0) {
+    /* 1920s: tall headline bar, three rules */
+    ctx.fillRect(px + pw * 0.12, py + ph * 0.10, pw * 0.76, ph * 0.16);
+    for (i = 0; i < 3; i++) {
+      ctx.fillRect(px + pw * 0.12, py + ph * (0.38 + i * 0.12), pw * 0.76, ph * 0.03);
+    }
+    ctx.fillRect(px + pw * 0.12, py + ph * 0.80, pw * 0.50, ph * 0.05);
+  } else if (state === 1) {
+    /* 1950s: two columns of text marks */
+    for (i = 0; i < 5; i++) {
+      ctx.fillRect(px + pw * 0.10, py + ph * (0.10 + i * 0.15), pw * 0.36, ph * 0.035);
+      ctx.fillRect(px + pw * 0.54, py + ph * (0.10 + i * 0.15), pw * 0.36, ph * 0.035);
+    }
+  } else if (state === 2) {
+    /* 1980s: big numeral block */
+    ctx.fillRect(px + pw * 0.18, py + ph * 0.12, pw * 0.64, ph * 0.42);
+    ctx.fillStyle = rgba('#B9A887', 0.92);
+    ctx.fillRect(px + pw * 0.30, py + ph * 0.22, pw * 0.40, ph * 0.22);
+    for (i = 0; i < 3; i++) {
+      ctx.fillStyle = rgba('#241F18', 0.9);
+      ctx.fillRect(px + pw * 0.12, py + ph * (0.64 + i * 0.10), pw * 0.76, ph * 0.03);
+    }
+  } else if (state === 3) {
+    /* right poster A: rules and a small square */
+    ctx.fillRect(px + pw * 0.12, py + ph * 0.10, pw * 0.76, ph * 0.05);
+    for (i = 0; i < 4; i++) {
+      ctx.fillRect(px + pw * 0.12, py + ph * (0.24 + i * 0.11), pw * 0.76, ph * 0.028);
+    }
+    ctx.fillRect(px + pw * 0.12, py + ph * 0.76, pw * 0.24, ph * 0.12);
+  } else {
+    /* right poster B: circle emblem and two rules */
+    ctx.beginPath();
+    ctx.arc(px + pw / 2, py + ph * 0.30, pw * 0.26, 0, TAU);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(px + pw / 2, py + ph * 0.30, pw * 0.13, 0, TAU);
+    ctx.fillStyle = rgba('#B9A887', 0.92);
+    ctx.fill();
+    ctx.fillStyle = rgba('#241F18', 0.9);
+    for (i = 0; i < 2; i++) {
+      ctx.fillRect(px + pw * 0.12, py + ph * (0.62 + i * 0.12), pw * 0.76, ph * 0.03);
+    }
+  }
+  ctx.restore();
+}
+/* ---- the crowd ---- */
+function drawFace(cx, cy, r, stateA, stateB, m) {
+  /* state A: eyes level, straight mouth. State B: eyes higher and
+     closer, mouth a small curve. Crossfaded per region, never swapped. */
+  ctx.save();
+  ctx.globalAlpha = 1 - m;
+  ctx.fillStyle = stateA;
+  ctx.beginPath();
+  ctx.moveTo(cx, cy - r);
+  ctx.ellipse(cx, cy, r * 0.82, r, 0, 0, TAU);
+  ctx.fill();
+  ctx.fillStyle = rgba('#241F18', 0.9);
+  ctx.beginPath();
+  ctx.arc(cx - r * 0.32, cy - r * 0.12, r * 0.09, 0, TAU);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(cx + r * 0.32, cy - r * 0.12, r * 0.09, 0, TAU);
+  ctx.fill();
+  ctx.fillRect(cx - r * 0.28, cy + r * 0.38, r * 0.56, r * 0.07);
+  ctx.restore();
+  ctx.save();
+  ctx.globalAlpha = m;
+  ctx.fillStyle = stateB;
+  ctx.beginPath();
+  ctx.moveTo(cx, cy - r);
+  ctx.ellipse(cx, cy, r * 0.82, r, 0, 0, TAU);
+  ctx.fill();
+  ctx.fillStyle = rgba('#241F18', 0.9);
+  ctx.beginPath();
+  ctx.arc(cx - r * 0.22, cy - r * 0.28, r * 0.08, 0, TAU);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(cx + r * 0.22, cy - r * 0.28, r * 0.08, 0, TAU);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(cx, cy + r * 0.30, r * 0.22, 0.15 * Math.PI, 0.85 * Math.PI);
+  ctx.stroke();
+  ctx.restore();
+}
+function drawCrowd(t) {
+  var fy = floorY();
+  var m1 = morphM(t, REGIONS.R1.P, REGIONS.R1.off);
+  var m2 = morphM(t, REGIONS.R2.P, REGIONS.R2.off);
+  var b6 = bloomA(t, REGIONS.R6.P, REGIONS.R6.off);
+  var i;
+  for (i = 0; i < FIGURES.length; i++) {
+    var f = FIGURES[i];
+    var cx = F.x + f.x * F.w;
+    var base = fy + F.h * (0.10 + i * 0.028) + (i % 2) * F.h * 0.012;
+    var s = F.w * 0.052 * f.s;
+    var coatW = s * 1.5;
+    var coatH = F.h * 0.20 * f.s;
+    var headR = s * 0.42;
+    var headY = base - coatH - headR * 0.9;
+    /* coat */
+    ctx.fillStyle = COAT_INK;
+    ctx.beginPath();
+    ctx.moveTo(cx - coatW / 2, base);
+    ctx.lineTo(cx - coatW * 0.38 + f.lean * F.w, base - coatH);
+    ctx.lineTo(cx + coatW * 0.38 + f.lean * F.w, base - coatH);
+    ctx.lineTo(cx + coatW / 2, base);
+    ctx.closePath();
+    ctx.fill();
+    /* the centre figure's coat blooms faded rust (R6) */
+    if (i === 3 && b6 > 0.01) {
+      ctx.fillStyle = rgba(COAT_BLOOM, 0.55 * b6);
+      ctx.beginPath();
+      ctx.moveTo(cx - coatW / 2, base);
+      ctx.lineTo(cx - coatW * 0.38 + f.lean * F.w, base - coatH);
+      ctx.lineTo(cx + coatW * 0.38 + f.lean * F.w, base - coatH);
+      ctx.lineTo(cx + coatW / 2, base);
+      ctx.closePath();
+      ctx.fill();
+    }
+    /* head */
+    if (i === 1) {
+      drawFace(cx, headY, headR, FACE_A, FACE_B, m1);
+    } else if (i === 5) {
+      drawFace(cx, headY, headR, FACE_A, FACE_B, m2);
+    } else {
+      ctx.fillStyle = FACE_A;
+      ctx.beginPath();
+      ctx.moveTo(cx, headY - headR);
+      ctx.ellipse(cx, headY, headR * 0.82, headR, 0, 0, TAU);
+      ctx.fill();
+      ctx.fillStyle = rgba('#241F18', 0.85);
+      ctx.beginPath();
+      ctx.arc(cx - headR * 0.30, headY - headR * 0.10, headR * 0.08, 0, TAU);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(cx + headR * 0.30, headY - headR * 0.10, headR * 0.08, 0, TAU);
+      ctx.fill();
+    }
+    /* hat or hair */
+    if (f.hat) {
+      ctx.fillStyle = COAT_INK;
+      ctx.fillRect(cx - headR * 0.95, headY - headR * 1.05, headR * 1.9, headR * 0.28);
+      ctx.fillRect(cx - headR * 0.55, headY - headR * 1.55, headR * 1.1, headR * 0.55);
+    } else {
+      ctx.fillStyle = rgba('#241F18', 0.9);
+      ctx.beginPath();
+      ctx.moveTo(cx - headR * 0.82, headY - headR * 0.1);
+      ctx.ellipse(cx, headY - headR * 0.55, headR * 0.85, headR * 0.55, 0, Math.PI, TAU);
+      ctx.fill();
+    }
+  }
+}
+/* ---- scan line: one faint band sweeping down on a 240 s cycle ---- */
+function drawScan(t) {
+  var frac = ((t % SCAN_PERIOD) + SCAN_PERIOD) % SCAN_PERIOD / SCAN_PERIOD;
+  var y = F.y + frac * F.h;
+  var bandH = F.h * 0.045;
+  var g = ctx.createLinearGradient(0, y - bandH, 0, y + bandH);
+  g.addColorStop(0, 'rgba(232,220,190,0)');
+  g.addColorStop(0.5, 'rgba(232,220,190,0.10)');
+  g.addColorStop(1, 'rgba(232,220,190,0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(F.x, y - bandH, F.w, bandH * 2);
+  ctx.fillStyle = 'rgba(232,220,190,0.16)';
+  ctx.fillRect(F.x, y - 1, F.w, 2);
+}
+function drawField(t) {
+  drawHall(t);
+  drawCrowd(t);
+  drawScan(t);
+}
+function drawPlates() {
+  var smallPx = isPhone ? 11 : 12;
+  var titlePx = isPhone ? 16 : 20;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.font = 'bold ' + titlePx + 'px monospace';
+  while (titlePx > 9 && ctx.measureText('The Moving Photograph').width > VW - 60) {
+    titlePx -= 1;
+    ctx.font = 'bold ' + titlePx + 'px monospace';
+  }
+  var titleW = ctx.measureText('The Moving Photograph').width;
+  ctx.font = smallPx + 'px monospace';
+  var dateW = ctx.measureText('2006 · 12 · 20').width;
+  var plateW = Math.max(titleW, dateW) + 28;
+  var plateH = titlePx + smallPx + 20;
+  var plateX = 12, plateY = 12;
+  ctx.fillStyle = PLATE_FILL;
+  ctx.fillRect(plateX, plateY, plateW, plateH);
+  ctx.strokeStyle = PLATE_LINE;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(plateX + 0.5, plateY + 0.5, plateW - 1, plateH - 1);
+  ctx.fillStyle = PLATE_INK;
+  ctx.font = 'bold ' + titlePx + 'px monospace';
+  ctx.fillText('The Moving Photograph', plateX + 14, plateY + 7);
+  ctx.font = smallPx + 'px monospace';
+  ctx.fillStyle = HINT_INK;
+  ctx.fillText('2006 · 12 · 20', plateX + 14, plateY + 7 + titlePx + 3);
+  var hint = 'Watch only.';
+  ctx.font = smallPx + 'px monospace';
+  var hintW = ctx.measureText(hint).width;
+  var hintPlateW = hintW + 24;
+  var hintPlateH = smallPx + 14;
+  var hintPlateX = 12;
+  var hintPlateY = VH - hintPlateH - 12;
+  ctx.fillStyle = PLATE_FILL;
+  ctx.fillRect(hintPlateX, hintPlateY, hintPlateW, hintPlateH);
+  ctx.strokeStyle = PLATE_LINE;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(hintPlateX + 0.5, hintPlateY + 0.5, hintPlateW - 1, hintPlateH - 1);
+  ctx.fillStyle = HINT_INK;
+  ctx.fillText(hint, hintPlateX + 12, hintPlateY + 7);
+}
+function draw() {
+  size();
+  ctx.fillStyle = '#14100c';
+  ctx.fillRect(0, 0, VW, VH);
+  drawField(phaseT);
+  drawPlates();
+}
+if (typeof window !== 'undefined') {
+  window.__probe = {
+    drawAt: function (t) { phaseT = t; draw(); },
+    phaseT: function () { return phaseT; },
+    morphM: morphM,
+    bloomA: bloomA,
+    scanFrac: function (t) { return ((t % SCAN_PERIOD) + SCAN_PERIOD) % SCAN_PERIOD / SCAN_PERIOD; }
+  };
+}
+/* ---- frame one: fixed phase t = 60 s ----
+   No wall clock is read for frame one. Watch-only by design: no
+   pointer or keyboard handlers are registered. */
+size();
+phaseT = FRAME_T;
+if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', size);
+if (typeof window !== 'undefined' && window.addEventListener) window.addEventListener('resize', size);
+draw();
+if (!reduced && typeof requestAnimationFrame !== 'undefined') {
+  var startMs = Date.now();
+  (function loop() {
+    function step() {
+      phaseT = FRAME_T + (Date.now() - startMs) / 1000;
+      var hidden = false;
+      try { hidden = document.hidden; } catch (e) { hidden = false; }
+      if (!hidden) draw();
+      if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  })();
+}
+</script>
+</body>
+</html>
