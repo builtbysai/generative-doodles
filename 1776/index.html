@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Diverging, Converging (a plan that draws itself)</title>
+<style>
+html, body { margin: 0; padding: 0; background: #F4F1EA; overflow: hidden; }
+canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+var TAU = Math.PI * 2;
+var GROUND = '#F4F1EA';
+var INK = '#111110';
+var RED = '#C8102E';
+var RED_BRIGHT = '#E0183A';
+var FADE = 'rgba(17,17,16,0.20)';
+var TITLE = 'Diverging, Converging (a plan that draws itself)';
+var DATE_STR = '2006 · 11 · 22';
+var FRAME_T = 60.0; /* fixed phase: network laid down, red wavefront mid-network, pulses travelling */
+var PEN_SPEED = 0.06; /* normalized field units per second along a path */
+var PULSE_SPEED = 0.40; /* fraction of a path per second */
+var PLATE_INK = '#F4F1EA';
+var PLATE_LINE = 'rgba(244,241,234,0.45)';
+var PLATE_FILL = '#111110';
+var HINT_INK = '#F4F1EA';
+function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+/* seeded RNG only; no Math.random, no Date.now anywhere in this script */
+function mulberry32(seed) {
+  return function () {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    var t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+var R = mulberry32(1776);
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var VW = 0, VH = 0, isPhone = false;
+var reduced = false;
+try { reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (e) { reduced = false; }
+var phaseT = FRAME_T;
+var F = { x: 0, y: 0, w: 0, h: 0 }; /* full-bleed field, marginless per the prompt */
+function size() {
+  var vw = 0, vh = 0;
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.width) {
+    vw = window.visualViewport.width; vh = window.visualViewport.height;
+  } else if (typeof window !== 'undefined' && window.innerWidth) {
+    vw = window.innerWidth; vh = window.innerHeight;
+  }
+  VW = vw; VH = vh;
+  canvas.width = VW; canvas.height = VH;
+  canvas.style.width = VW + 'px'; canvas.style.height = VH + 'px';
+  if (typeof window !== 'undefined' && window.screen) {
+    var mn = Math.min(window.screen.width, window.screen.height);
+    isPhone = mn < 700 || VH > VW * 1.15;
+  }
+  F = { x: 0, y: 0, w: VW, h: VH };
+}
+/* ---- path graph: seeded orthogonal routing between terminal pads ---- */
+function genPath() {
+  var x, y;
+  if (R() < 0.65) {
+    /* dense at centre: mean of three draws, squeezed toward 0.5 */
+    x = 0.5 + (((R() + R() + R()) / 3) - 0.5) * 0.85;
+    y = 0.5 + (((R() + R() + R()) / 3) - 0.5) * 0.85;
+  } else {
+    x = 0.05 + R() * 0.90;
+    y = 0.05 + R() * 0.90;
+  }
+  var pts = [[x, y]];
+  var horiz = R() < 0.5;
+  var dx = horiz ? (R() < 0.5 ? 1 : -1) : 0;
+  var dy = horiz ? 0 : (R() < 0.5 ? 1 : -1);
+  var nSeg = 4 + Math.floor(R() * 3);
+  var i, len, nx, ny;
+  for (i = 0; i < nSeg; i++) {
+    len = 0.05 + R() * 0.16;
+    nx = x + dx * len; ny = y + dy * len;
+    if (nx < 0.04 || nx > 0.96) { dx = -dx; nx = x + dx * len; }
+    if (ny < 0.04 || ny > 0.96) { dy = -dy; ny = y + dy * len; }
+    nx = clamp(nx, 0.04, 0.96); ny = clamp(ny, 0.04, 0.96);
+    x = nx; y = ny;
+    pts.push([x, y]);
+    /* turn 90 degrees, or occasionally run straight on */
+    if (R() < 0.72) {
+      var ndx = dy * (R() < 0.5 ? 1 : -1);
+      var ndy = dx * (R() < 0.5 ? 1 : -1);
+      dx = ndx; dy = ndy;
+    }
+  }
+  return pts;
+}
+function pathLen(pts) {
+  var L = 0, i;
+  for (i = 1; i < pts.length; i++) {
+    L += Math.abs(pts[i][0] - pts[i - 1][0]) + Math.abs(pts[i][1] - pts[i - 1][1]);
+  }
+  return L;
+}
+var NPATHS = 30;
+var PATHS = [];
+var CYCLE = 0;
+var i, p;
+for (i = 0; i < NPATHS; i++) {
+  var pts = genPath();
+  var alt = genPath();
+  var L = pathLen(pts);
+  p = { pts: pts, alt: alt, len: L, dur: L / PEN_SPEED, off: R(), pulseOff: R() };
+  PATHS.push(p);
+  CYCLE += p.dur;
+}
+/* fixed authored alternate segment per path: the drag re-route target.
+   Frame one is pre-drag, so the first frame stays byte-comparable. */
+var rerouted = [];
+for (i = 0; i < NPATHS; i++) rerouted.push(false);
+function activePts(path, idx) { return rerouted[idx] ? path.alt : path.pts; }
+/* wavefront: which path the red pen is drawing at piece time t, and how far
+   along it. Closed-form function of t; no state, no randomness. */
+function wavefront(t) {
+  var tt = ((t % CYCLE) + CYCLE) % CYCLE;
+  var cum = 0, k;
+  for (k = 0; k < NPATHS; k++) {
+    if (tt < cum + PATHS[k].dur) return { idx: k, u: (tt - cum) / PATHS[k].dur };
+    cum += PATHS[k].dur;
+  }
+  return { idx: NPATHS - 1, u: 1 };
+}
+/* point along a polyline at fraction s of its length, in field px */
+function pointAlong(pts, s) {
+  var total = pathLen(pts);
+  var target = clamp(s, 0, 1) * total;
+  var acc = 0, i, seg;
+  for (i = 1; i < pts.length; i++) {
+    seg = Math.abs(pts[i][0] - pts[i - 1][0]) + Math.abs(pts[i][1] - pts[i - 1][1]);
+    if (acc + seg >= target) {
+      var f = seg > 0 ? (target - acc) / seg : 0;
+      return {
+        x: F.x + (pts[i - 1][0] + (pts[i][0] - pts[i - 1][0]) * f) * F.w,
+        y: F.y + (pts[i - 1][1] + (pts[i][1] - pts[i - 1][1]) * f) * F.h
+      };
+    }
+    acc += seg;
+  }
+  return { x: F.x + pts[pts.length - 1][0] * F.w, y: F.y + pts[pts.length - 1][1] * F.h };
+}
+function strokeUpTo(pts, u, color, lw) {
+  var total = pathLen(pts);
+  var target = clamp(u, 0, 1) * total;
+  var acc = 0, i, seg, f;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = lw;
+  ctx.lineJoin = 'miter';
+  ctx.beginPath();
+  ctx.moveTo(F.x + pts[0][0] * F.w, F.y + pts[0][1] * F.h);
+  for (i = 1; i < pts.length; i++) {
+    seg = Math.abs(pts[i][0] - pts[i - 1][0]) + Math.abs(pts[i][1] - pts[i - 1][1]);
+    if (acc + seg >= target) {
+      f = seg > 0 ? (target - acc) / seg : 0;
+      ctx.lineTo(F.x + (pts[i - 1][0] + (pts[i][0] - pts[i - 1][0]) * f) * F.w,
+                 F.y + (pts[i - 1][1] + (pts[i][1] - pts[i - 1][1]) * f) * F.h);
+      break;
+    }
+    ctx.lineTo(F.x + pts[i][0] * F.w, F.y + pts[i][1] * F.h);
+    acc += seg;
+  }
+  ctx.stroke();
+}
+function strokeBetween(pts, s0, s1, color, lw) {
+  var total = pathLen(pts);
+  var t0 = clamp(s0, 0, 1) * total, t1 = clamp(s1, 0, 1) * total;
+  if (t1 <= t0) return;
+  var acc = 0, i, seg, f0, f1;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = lw;
+  ctx.lineJoin = 'miter';
+  ctx.beginPath();
+  var started = false;
+  for (i = 1; i < pts.length; i++) {
+    seg = Math.abs(pts[i][0] - pts[i - 1][0]) + Math.abs(pts[i][1] - pts[i - 1][1]);
+    if (acc + seg < t0) { acc += seg; continue; }
+    if (acc > t1) break;
+    f0 = seg > 0 ? clamp((t0 - acc) / seg, 0, 1) : 0;
+    f1 = seg > 0 ? clamp((t1 - acc) / seg, 0, 1) : 0;
+    var ax = F.x + (pts[i - 1][0] + (pts[i][0] - pts[i - 1][0]) * f0) * F.w;
+    var ay = F.y + (pts[i - 1][1] + (pts[i][1] - pts[i - 1][1]) * f0) * F.h;
+    var bx = F.x + (pts[i - 1][0] + (pts[i][0] - pts[i - 1][0]) * f1) * F.w;
+    var by = F.y + (pts[i - 1][1] + (pts[i][1] - pts[i - 1][1]) * f1) * F.h;
+    if (!started) { ctx.moveTo(ax, ay); started = true; }
+    ctx.lineTo(bx, by);
+    acc += seg;
+    if (acc >= t1) break;
+  }
+  ctx.stroke();
+}
+function drawPad(x, y, color, s) {
+  ctx.fillStyle = color;
+  ctx.fillRect(x - s / 2, y - s / 2, s, s);
+}
+function drawPath(path, idx, t) {
+  var wf = wavefront(t);
+  var pts = activePts(path, idx);
+  var S = Math.min(F.w, F.h);
+  var lw = Math.max(1, 0.0016 * S);
+  var padS = Math.max(5, 0.008 * S);
+  var x0 = F.x + pts[0][0] * F.w, y0 = F.y + pts[0][1] * F.h;
+  var x1 = F.x + pts[pts.length - 1][0] * F.w, y1 = F.y + pts[pts.length - 1][1] * F.h;
+  if (idx < wf.idx) {
+    /* finished in this cycle: full ink, with a pulse travelling it */
+    strokeUpTo(pts, 1, INK, lw);
+    drawPad(x0, y0, INK, padS);
+    drawPad(x1, y1, INK, padS);
+    var s = ((t * PULSE_SPEED * (0.7 + 0.6 * path.pulseOff) + path.off) % 1 + 1) % 1;
+    var tail = 0.05, head = 0.015;
+    strokeBetween(pts, s - tail, s - head, 'rgba(224,24,58,0.35)', lw + 1.5);
+    strokeBetween(pts, s - head, s, RED_BRIGHT, lw + 1.5);
+    var dot = pointAlong(pts, s);
+    ctx.fillStyle = RED_BRIGHT;
+    ctx.beginPath();
+    ctx.arc(dot.x, dot.y, lw + 1.5, 0, TAU);
+    ctx.fill();
+  } else if (idx === wf.idx) {
+    /* the red wavefront is drawing this path now */
+    strokeUpTo(pts, wf.u, RED, lw + 0.5);
+    drawPad(x0, y0, RED, padS);
+    var pen = pointAlong(pts, wf.u);
+    /* slight pen jitter, a deterministic function of piece time */
+    var jx = Math.sin(t * 9 + idx * 1.7) * 1.1;
+    var jy = Math.cos(t * 7 + idx * 2.3) * 1.1;
+    ctx.fillStyle = RED;
+    ctx.beginPath();
+    ctx.arc(pen.x + jx, pen.y + jy, lw + 2.5, 0, TAU);
+    ctx.fill();
+  } else {
+    /* not yet redrawn this cycle: old ink, faded */
+    strokeUpTo(pts, 1, FADE, lw);
+    drawPad(x0, y0, FADE, padS);
+    drawPad(x1, y1, FADE, padS);
+  }
+}
+function drawPlates() {
+  var smallPx = isPhone ? 11 : 12;
+  var titlePx = isPhone ? 16 : 20;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.font = 'bold ' + titlePx + 'px monospace';
+  while (titlePx > 9 && ctx.measureText(TITLE).width > VW - 60) {
+    titlePx -= 1;
+    ctx.font = 'bold ' + titlePx + 'px monospace';
+  }
+  var titleW = ctx.measureText(TITLE).width;
+  ctx.font = smallPx + 'px monospace';
+  var dateW = ctx.measureText(DATE_STR).width;
+  var plateW = Math.max(titleW, dateW) + 28;
+  var plateH = titlePx + smallPx + 20;
+  var plateX = 12, plateY = 12;
+  ctx.fillStyle = PLATE_FILL;
+  ctx.fillRect(plateX, plateY, plateW, plateH);
+  ctx.strokeStyle = PLATE_LINE;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(plateX + 0.5, plateY + 0.5, plateW - 1, plateH - 1);
+  ctx.fillStyle = PLATE_INK;
+  ctx.font = 'bold ' + titlePx + 'px monospace';
+  ctx.fillText(TITLE, plateX + 14, plateY + 7);
+  ctx.font = smallPx + 'px monospace';
+  ctx.fillStyle = HINT_INK;
+  ctx.fillText(DATE_STR, plateX + 14, plateY + 7 + titlePx + 3);
+  var hint = 'Drag to re-route one path.';
+  ctx.font = smallPx + 'px monospace';
+  var hintW = ctx.measureText(hint).width;
+  var hintPlateW = hintW + 24;
+  var hintPlateH = smallPx + 14;
+  var hintPlateX = 12;
+  var hintPlateY = VH - hintPlateH - 12;
+  ctx.fillStyle = PLATE_FILL;
+  ctx.fillRect(hintPlateX, hintPlateY, hintPlateW, hintPlateH);
+  ctx.strokeStyle = PLATE_LINE;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(hintPlateX + 0.5, hintPlateY + 0.5, hintPlateW - 1, hintPlateH - 1);
+  ctx.fillStyle = HINT_INK;
+  ctx.fillText(hint, hintPlateX + 12, hintPlateY + 7);
+}
+function draw() {
+  size();
+  ctx.fillStyle = GROUND;
+  ctx.fillRect(0, 0, VW, VH);
+  var k;
+  for (k = 0; k < NPATHS; k++) drawPath(PATHS[k], k, phaseT);
+  drawPlates();
+}
+/* ---- drag re-routes one nearby path ---- */
+function distToSeg(px, py, ax, ay, bx, by) {
+  var dx = bx - ax, dy = by - ay;
+  var L2 = dx * dx + dy * dy;
+  var t = 0;
+  if (L2 > 0) t = clamp(((px - ax) * dx + (py - ay) * dy) / L2, 0, 1);
+  var cx = ax + t * dx, cy = ay + t * dy;
+  return Math.sqrt((px - cx) * (px - cx) + (py - cy) * (py - cy));
+}
+function nearestPath(px, py) {
+  var best = -1, bestD = 26, k, i, pts, d;
+  for (k = 0; k < NPATHS; k++) {
+    pts = activePts(PATHS[k], k);
+    for (i = 1; i < pts.length; i++) {
+      d = distToSeg(px, py,
+        F.x + pts[i - 1][0] * F.w, F.y + pts[i - 1][1] * F.h,
+        F.x + pts[i][0] * F.w, F.y + pts[i][1] * F.h);
+      if (d < bestD) { bestD = d; best = k; }
+    }
+  }
+  return best;
+}
+var dragging = false;
+function handlePointer(e) {
+  var rect = canvas.getBoundingClientRect();
+  var px = e.clientX - rect.left, py = e.clientY - rect.top;
+  var k = nearestPath(px, py);
+  if (k >= 0 && !rerouted[k]) {
+    rerouted[k] = true;
+    if (reduced) draw();
+  }
+}
+if (typeof window !== 'undefined' && canvas.addEventListener) {
+  canvas.addEventListener('pointerdown', function (e) { dragging = true; handlePointer(e); });
+  canvas.addEventListener('pointermove', function (e) { if (dragging) handlePointer(e); });
+  canvas.addEventListener('pointerup', function () { dragging = false; });
+  canvas.addEventListener('pointercancel', function () { dragging = false; });
+}
+if (typeof window !== 'undefined') {
+  window.__probe = {
+    drawAt: function (t) { phaseT = t; draw(); },
+    phaseT: function () { return phaseT; },
+    wavefront: function () { return wavefront(phaseT); },
+    cycle: function () { return CYCLE; },
+    reroute: function (k) { rerouted[k] = true; draw(); return rerouted[k]; },
+    rerouted: function () { var out = [], k; for (k = 0; k < NPATHS; k++) if (rerouted[k]) out.push(k); return out; },
+    paths: function () { return NPATHS; }
+  };
+}
+/* ---- frame one: fixed phase t = 60 s ---- */
+size();
+phaseT = FRAME_T;
+if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', size);
+if (typeof window !== 'undefined' && window.addEventListener) window.addEventListener('resize', size);
+draw();
+if (!reduced && typeof requestAnimationFrame !== 'undefined') {
+  (function loop() {
+    var prevTs = null, clockT = 0;
+    function step(now) {
+      if (prevTs === null) prevTs = now;
+      var dt = clamp((now - prevTs) / 1000, 0, 0.05);
+      prevTs = now;
+      clockT += dt;
+      phaseT = FRAME_T + clockT;
+      var hidden = false;
+      try { hidden = document.hidden; } catch (e) { hidden = false; }
+      if (!hidden) draw();
+      if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  })();
+}
+</script>
+</body>
+</html>
