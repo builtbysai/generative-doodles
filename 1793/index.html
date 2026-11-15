@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Activated Field</title>
+<style>
+html, body { margin: 0; padding: 0; background: #F6F1E7; overflow: hidden; }
+canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+var TAU = Math.PI * 2;
+var SKY = '#F6F1E7';
+var GROUND_COL = '#EAE1CB';
+var FRAME_T = 60.0; /* fixed phase: t = 60 s, mid-gust, gust front partway across the field */
+var STRAW = '#C2A15E';
+var STRAW_LIGHT = '#D3B87E';
+var ASH = '#9A968A';
+var UMBER = '#5C4A33';
+var UMBER_DEEP = '#453722';
+var SEED_COL = '#8A7A52';
+var PLATE_FILL = '#ffffff';
+var PLATE_LINE = 'rgba(0,0,0,0.28)';
+var PLATE_INK = '#2b2b28';
+var HINT_INK = '#2b2b28';
+function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    var t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+function rgb(hex) {
+  return [parseInt(hex.slice(1, 3), 16), parseInt(hex.slice(3, 5), 16), parseInt(hex.slice(5, 7), 16)];
+}
+function rgba(hex, a) {
+  var c = rgb(hex);
+  return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a.toFixed(4) + ')';
+}
+/* ---- fixed seeded planting, seed 1793 ----
+   Per stem: u (x position, 0..1 across field), v (depth, 0 horizon .. 1 near),
+   height factor, colour index, flex, sway phase, type 0 stem / 1 reed / 2 branch.
+   Density is denser at the edges: candidates are accepted with probability
+   rising toward the left and right edges, so gusts read as travelling waves. */
+var NSTEMS = 1100;
+var STEMS = [];
+(function buildStems() {
+  var rng = mulberry32(1793);
+  var i, u, v, acc;
+  while (STEMS.length < NSTEMS) {
+    u = rng(); v = rng();
+    var edge = Math.abs(u - 0.5) * 2; /* 0 centre .. 1 edge */
+    acc = 0.45 + 0.55 * edge * edge;
+    if (rng() > acc) continue;
+    var r = rng();
+    var type = (r < 0.62) ? 0 : (r < 0.86 ? 1 : 2);
+    STEMS.push({
+      u: u, v: v,
+      h: 0.55 + rng() * 0.75,
+      col: Math.floor(rng() * 5),
+      flex: 0.6 + rng() * 0.8,
+      ph: rng() * TAU,
+      type: type,
+      lean: (rng() - 0.5) * 0.16
+    });
+  }
+  /* far to near so near stems overlap far ones */
+  STEMS.sort(function (a, b) { return a.v - b.v; });
+})();
+/* ---- gust schedule, closed form of piece time ----
+   Gusts arrive in clusters, then long calm. Calm dominates.
+   Each gust: t0 start, dur seconds, x0 front start (0..1), v front speed
+   (field widths per second), strength 0..1, width of the front band.
+   At t = 60 s gust G3 (t0 52, dur 24) is mid-passage: its front is at
+   x ~ 0.54, the left half bent, the far right still. */
+var GUSTS = [
+  { t0: 8,   dur: 16, x0: 0.00, v: 0.045, s: 0.55, w: 0.16 },
+  { t0: 30,  dur: 13, x0: 1.00, v: -0.055, s: 0.70, w: 0.14 },
+  { t0: 52,  dur: 24, x0: 0.00, v: 0.068, s: 0.95, w: 0.18 },
+  { t0: 88,  dur: 15, x0: 0.15, v: 0.040, s: 0.60, w: 0.15 },
+  { t0: 118, dur: 18, x0: 1.00, v: -0.038, s: 0.80, w: 0.17 },
+  { t0: 150, dur: 12, x0: 0.00, v: 0.050, s: 0.50, w: 0.14 }
+];
+function gustEnv(g, t) {
+  if (t < g.t0 || t > g.t0 + g.dur) return 0;
+  var p = (t - g.t0) / g.dur; /* 0..1 through the gust */
+  var rise = clamp(p / 0.25, 0, 1);
+  var fall = clamp((1 - p) / 0.30, 0, 1);
+  return g.s * rise * fall;
+}
+function frontX(g, t) { return g.x0 + g.v * (t - g.t0); }
+/* local gust strength at field position u (0..1) and time t */
+function gustAt(u, t) {
+  var s = 0, i, g, fx, d;
+  for (i = 0; i < GUSTS.length; i++) {
+    g = GUSTS[i];
+    var e = gustEnv(g, t);
+    if (e === 0) continue;
+    fx = frontX(g, t);
+    d = (u - fx) / g.w;
+    s += e * Math.exp(-d * d);
+  }
+  return clamp(s, 0, 1);
+}
+/* ---- seeds: closed form from stem velocity ----
+   Each seed is tied to one stem and to the gust whose front reaches it.
+   It lifts when the front arrives, tumbles on a short arc, then settles.
+   A few keep tumbling after the gust passes, then stillness returns. */
+var SEEDS = [];
+(function buildSeeds() {
+  var rng = mulberry32(17931);
+  var i, g, si, stem, spawnT;
+  var gustIdx = [2, 2, 1, 3, 2, 1, 3, 1, 2, 3, 1, 3];
+  for (i = 0; i < 42; i++) {
+    g = GUSTS[gustIdx[i % gustIdx.length]];
+    /* G3 seeds are planted in the front zone (u 0.15..0.62) so a few are
+       airborne at the frame-one phase t = 60 s, when the front is at 0.54 */
+    var tries = 0;
+    do {
+      si = Math.floor(rng() * NSTEMS);
+      tries++;
+    } while (g === GUSTS[2] && (STEMS[si].u < 0.15 || STEMS[si].u > 0.62) && tries < 40);
+    stem = STEMS[si];
+    spawnT = g.t0 + (stem.u - g.x0) / g.v;
+    SEEDS.push({
+      stem: si,
+      spawnT: spawnT,
+      dur: 2.2 + rng() * 1.8,
+      vx: (0.05 + rng() * 0.10) * (g.v >= 0 ? 1 : -1),
+      vy: 0.10 + rng() * 0.14,
+      spin: (rng() - 0.5) * 9,
+      len: 0.004 + rng() * 0.005
+    });
+  }
+})();
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var VW = 0, VH = 0, isPhone = false;
+var reduced = false;
+try { reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (e) { reduced = false; }
+var phaseT = FRAME_T;
+var F = { x: 0, y: 0, w: 0, h: 0 }; /* field rect */
+var HOR = 0; /* horizon y in screen space */
+function size() {
+  var vw = 0, vh = 0;
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.width) {
+    vw = window.visualViewport.width; vh = window.visualViewport.height;
+  } else if (typeof window !== 'undefined' && window.innerWidth) {
+    vw = window.innerWidth; vh = window.innerHeight;
+  }
+  VW = vw; VH = vh;
+  canvas.width = VW; canvas.height = VH;
+  canvas.style.width = VW + 'px'; canvas.style.height = VH + 'px';
+  if (typeof window !== 'undefined' && window.screen) {
+    var mn = Math.min(window.screen.width, window.screen.height);
+    isPhone = mn < 700 || VH > VW * 1.15;
+  }
+  if (isPhone) {
+    F = { x: 0, y: 0, w: VW, h: VH };
+  } else {
+    var side = Math.min(VW, VH) - 40;
+    F = { x: (VW - side) / 2, y: (VH - side) / 2, w: side, h: side };
+  }
+  HOR = F.y + (2 / 3) * F.h;
+}
+function stemColor(i) {
+  if (i === 0) return STRAW;
+  if (i === 1) return STRAW_LIGHT;
+  if (i === 2) return ASH;
+  if (i === 3) return UMBER;
+  return UMBER_DEEP;
+}
+/* stem geometry at time t: base, tip and mid control point.
+   Bend is the local gust strength times stem flex, plus a small idle sway
+   that never exceeds a few degrees, so calm reads as calm. */
+function stemGeom(st, t) {
+  var gx = F.x + st.u * F.w;
+  var groundH = F.y + F.h - HOR;
+  var by = HOR + st.v * groundH;
+  var depth = 0.35 + 0.65 * st.v; /* near stems taller */
+  var h = st.h * depth * groundH * 0.52;
+  var g = gustAt(st.u, t);
+  var sway = 0.03 * Math.sin(TAU * t / 7.0 + st.ph);
+  var bend = (g * 0.85 * st.flex + sway) + st.lean * 0.25;
+  var tipX = gx + Math.sin(bend) * h;
+  var tipY = by - Math.cos(bend) * h;
+  var midX = gx + Math.sin(bend * 0.55) * h * 0.5;
+  var midY = by - Math.cos(bend * 0.55) * h * 0.5;
+  return { bx: gx, by: by, tx: tipX, ty: tipY, mx: midX, my: midY, h: h, bend: bend, g: g };
+}
+function drawStem(st, t) {
+  var g = stemGeom(st, t);
+  var wdt = Math.max(1, F.w * 0.0016 * (0.5 + st.v));
+  ctx.strokeStyle = stemColor(st.col);
+  ctx.lineWidth = (st.type === 1) ? wdt * 1.5 : wdt;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(g.bx, g.by);
+  ctx.quadraticCurveTo(g.mx, g.my, g.tx, g.ty);
+  ctx.stroke();
+  if (st.type === 1) { /* reed: seed head at the tip */
+    ctx.fillStyle = stemColor(st.col);
+    ctx.beginPath();
+    ctx.ellipse(g.tx, g.ty, wdt * 2.4, wdt * 5.5, g.bend, 0, TAU);
+    ctx.fill();
+  } else if (st.type === 2) { /* thin branch: a fork near the tip */
+    var fx = g.bx + (g.tx - g.bx) * 0.62;
+    var fy = g.by + (g.ty - g.by) * 0.62;
+    ctx.beginPath();
+    ctx.moveTo(fx, fy);
+    ctx.lineTo(fx + (g.tx - g.bx) * 0.28 + F.w * 0.012, fy + (g.ty - g.by) * 0.28 - F.h * 0.02);
+    ctx.stroke();
+  }
+  /* seed head on some grass stems */
+  if (st.type === 0 && (st.col === 0 || st.col === 1)) {
+    ctx.fillStyle = stemColor(st.col);
+    ctx.beginPath();
+    ctx.arc(g.tx, g.ty, Math.max(1, wdt * 1.1), 0, TAU);
+    ctx.fill();
+  }
+}
+function drawSeed(sd, t) {
+  var age = t - sd.spawnT;
+  if (age < 0 || age > sd.dur) return;
+  var st = STEMS[sd.stem];
+  var g0 = stemGeom(st, sd.spawnT);
+  var p = age / sd.dur;
+  var x = g0.tx + sd.vx * age * F.w;
+  var y = g0.ty - sd.vy * age * F.h * 0.35 + 0.5 * 0.35 * age * age * F.h * 0.35;
+  var fade = (p < 0.7) ? 1 : 1 - (p - 0.7) / 0.3;
+  ctx.strokeStyle = rgba(SEED_COL, 0.85 * fade);
+  ctx.lineWidth = Math.max(1, F.w * 0.0012);
+  ctx.lineCap = 'round';
+  var ang = sd.spin * age;
+  var dx = Math.cos(ang) * sd.len * F.w;
+  var dy = Math.sin(ang) * sd.len * F.w;
+  ctx.beginPath();
+  ctx.moveTo(x - dx, y - dy);
+  ctx.lineTo(x + dx, y + dy);
+  ctx.stroke();
+}
+function drawField(t) {
+  var i;
+  /* flat warm-white sky, never changes */
+  ctx.fillStyle = SKY;
+  ctx.fillRect(F.x, F.y, F.w, HOR - F.y);
+  /* pale ground */
+  ctx.fillStyle = GROUND_COL;
+  ctx.fillRect(F.x, HOR, F.w, F.y + F.h - HOR);
+  /* horizon line, faint */
+  ctx.fillStyle = 'rgba(92,74,51,0.35)';
+  ctx.fillRect(F.x, HOR - 1, F.w, 1.5);
+  /* a faint ground wash, darker toward the near edge */
+  var wg = ctx.createLinearGradient(0, HOR, 0, F.y + F.h);
+  wg.addColorStop(0, 'rgba(92,74,51,0)');
+  wg.addColorStop(1, 'rgba(92,74,51,0.10)');
+  ctx.fillStyle = wg;
+  ctx.fillRect(F.x, HOR, F.w, F.y + F.h - HOR);
+  for (i = 0; i < STEMS.length; i++) drawStem(STEMS[i], t);
+  for (i = 0; i < SEEDS.length; i++) drawSeed(SEEDS[i], t);
+}
+function drawPlates() {
+  var smallPx = isPhone ? 11 : 12;
+  var titlePx = isPhone ? 16 : 20;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.font = 'bold ' + titlePx + 'px monospace';
+  while (titlePx > 9 && ctx.measureText('The Activated Field').width > VW - 60) {
+    titlePx -= 1;
+    ctx.font = 'bold ' + titlePx + 'px monospace';
+  }
+  var titleW = ctx.measureText('The Activated Field').width;
+  ctx.font = smallPx + 'px monospace';
+  var dateW = ctx.measureText('2006 · 12 · 09').width;
+  var plateW = Math.max(titleW, dateW) + 28;
+  var plateH = titlePx + smallPx + 20;
+  var plateX = 12, plateY = 12;
+  ctx.fillStyle = PLATE_FILL;
+  ctx.fillRect(plateX, plateY, plateW, plateH);
+  ctx.strokeStyle = PLATE_LINE;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(plateX + 0.5, plateY + 0.5, plateW - 1, plateH - 1);
+  ctx.fillStyle = PLATE_INK;
+  ctx.font = 'bold ' + titlePx + 'px monospace';
+  ctx.fillText('The Activated Field', plateX + 14, plateY + 7);
+  ctx.font = smallPx + 'px monospace';
+  ctx.fillStyle = HINT_INK;
+  ctx.fillText('2006 · 12 · 09', plateX + 14, plateY + 7 + titlePx + 3);
+  var hint = 'Watch only.';
+  ctx.font = smallPx + 'px monospace';
+  var hintW = ctx.measureText(hint).width;
+  var hintPlateW = hintW + 24;
+  var hintPlateH = smallPx + 14;
+  var hintPlateX = 12;
+  var hintPlateY = VH - hintPlateH - 12;
+  ctx.fillStyle = PLATE_FILL;
+  ctx.fillRect(hintPlateX, hintPlateY, hintPlateW, hintPlateH);
+  ctx.strokeStyle = PLATE_LINE;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(hintPlateX + 0.5, hintPlateY + 0.5, hintPlateW - 1, hintPlateH - 1);
+  ctx.fillStyle = HINT_INK;
+  ctx.fillText(hint, hintPlateX + 12, hintPlateY + 7);
+}
+function draw() {
+  size();
+  ctx.fillStyle = SKY;
+  ctx.fillRect(0, 0, VW, VH);
+  drawField(phaseT);
+  drawPlates();
+}
+if (typeof window !== 'undefined') {
+  window.__probe = {
+    drawAt: function (t) { phaseT = t; draw(); },
+    phaseT: function () { return phaseT; },
+    stemCount: function () { return STEMS.length; },
+    gustAt: function (u, t) { return gustAt(u, t); },
+    gustFront: function (gi, t) { return frontX(GUSTS[gi], t); },
+    seedCount: function () { return SEEDS.length; },
+    seedsAirborne: function (t) {
+      var n = 0, i;
+      for (i = 0; i < SEEDS.length; i++) {
+        var age = t - SEEDS[i].spawnT;
+        if (age >= 0 && age <= SEEDS[i].dur) n++;
+      }
+      return n;
+    }
+  };
+}
+/* ---- frame one: fixed phase t = 60 s ---- */
+size();
+phaseT = FRAME_T;
+if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', size);
+if (typeof window !== 'undefined' && window.addEventListener) window.addEventListener('resize', size);
+/* watch-only: no pointer handlers, tap does nothing */
+draw();
+if (!reduced && typeof requestAnimationFrame !== 'undefined') {
+  (function loop() {
+    var prevTs = null, clockT = 0;
+    function step(now) {
+      if (prevTs === null) prevTs = now;
+      var dt = clamp((now - prevTs) / 1000, 0, 0.05);
+      prevTs = now;
+      clockT += dt;
+      phaseT = FRAME_T + clockT;
+      var hidden = false;
+      try { hidden = document.hidden; } catch (e) { hidden = false; }
+      if (!hidden) draw();
+      if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  })();
+}
+</script>
+</body>
+</html>
