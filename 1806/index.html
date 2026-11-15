@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Serial Collaborator</title>
+<style>
+html, body { margin: 0; padding: 0; background: #111111; overflow: hidden; }
+canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+var TAU = Math.PI * 2;
+var FRAME_T = 37.5; /* fixed phase: mid-era 0, the geometric hand */
+var ERA_LEN = 75; /* each hand holds the field 75 s, inside the 60-90 s band */
+var FADE_START = 0.84; /* dissolve begins in the last 12 s of each era */
+function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+function smooth01(u) { u = clamp(u, 0, 1); return u * u * (3 - 2 * u); }
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    var t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+function rgb(hex) {
+  return [parseInt(hex.slice(1, 3), 16), parseInt(hex.slice(3, 5), 16), parseInt(hex.slice(5, 7), 16)];
+}
+function rgba(hex, a) {
+  var c = rgb(hex);
+  return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + clamp(a, 0, 1).toFixed(4) + ')';
+}
+/* ---- the one seeded field: 26 drifting forms, closed-form positions ----
+   Every hand reads the same forms at the same time t, so the field is
+   continuous across eras. Positions wrap inside the field. */
+var FORMS = [];
+var GRAIN = [];
+var TEAR = [];
+(function buildField() {
+  var rng = mulberry32(1806);
+  var i;
+  for (i = 0; i < 26; i++) {
+    FORMS.push({
+      x: 0.06 + rng() * 0.88,
+      y: 0.06 + rng() * 0.88,
+      r: 0.028 + rng() * 0.055,
+      vx: (rng() - 0.5) * 0.0022,
+      vy: (rng() - 0.5) * 0.0022,
+      ang: rng() * TAU,
+      spin: (rng() - 0.5) * 0.02,
+      kind: i % 4, /* 0 circle, 1 square, 2 triangle, 3 bar */
+      red: i % 5 === 2
+    });
+  }
+  for (i = 0; i < 420; i++) {
+    GRAIN.push({ x: rng(), y: rng(), s: 0.5 + rng() * 1.4, w: rng() > 0.5 });
+  }
+  /* torn-edge jagged points, one per side, fixed by the seed */
+  var j;
+  for (j = 0; j < 4; j++) {
+    var side = [];
+    for (i = 0; i <= 24; i++) side.push(0.004 + rng() * 0.016);
+    TEAR.push(side);
+  }
+})();
+function formAt(f, t) {
+  /* wrap inside [0.10, 0.90] so no form ever bleeds off the field edge:
+     largest radius is 0.083, so the farthest edge stays inside 0.983 */
+  var x = 0.10 + ((((f.x + f.vx * t) - 0.10) % 0.80) + 0.80) % 0.80;
+  var y = 0.10 + ((((f.y + f.vy * t) - 0.10) % 0.80) + 0.80) % 0.80;
+  return { x: x, y: y, a: f.ang + f.spin * t };
+}
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var VW = 0, VH = 0, isPhone = false;
+var reduced = false;
+try { reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (e) { reduced = false; }
+var phaseT = FRAME_T;
+var F = { x: 0, y: 0, w: 0, h: 0 };
+function size() {
+  var vw = 0, vh = 0;
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.width) {
+    vw = window.visualViewport.width; vh = window.visualViewport.height;
+  } else if (typeof window !== 'undefined' && window.innerWidth) {
+    vw = window.innerWidth; vh = window.innerHeight;
+  }
+  VW = vw; VH = vh;
+  canvas.width = VW; canvas.height = VH;
+  canvas.style.width = VW + 'px'; canvas.style.height = VH + 'px';
+  if (typeof window !== 'undefined' && window.screen) {
+    var mn = Math.min(window.screen.width, window.screen.height);
+    isPhone = mn < 700 || VH > VW * 1.15;
+  }
+  if (isPhone) {
+    F = { x: 0, y: 0, w: VW, h: VH };
+  } else {
+    var side = Math.min(VW, VH) - 40;
+    F = { x: (VW - side) / 2, y: (VH - side) / 2, w: side, h: side };
+  }
+}
+/* ---- shape helpers, drawn in field coordinates ---- */
+function poly(points) {
+  ctx.beginPath();
+  ctx.moveTo(points[0][0], points[0][1]);
+  var i;
+  for (i = 1; i < points.length; i++) ctx.lineTo(points[i][0], points[i][1]);
+  ctx.closePath();
+}
+function shapePath(f, p, scale) {
+  var cx = F.x + p.x * F.w;
+  var cy = F.y + p.y * F.h;
+  var r = f.r * F.w * scale;
+  var i;
+  if (f.kind === 0) {
+    ctx.beginPath();
+    ctx.moveTo(cx + r, cy);
+    ctx.arc(cx, cy, r, 0, TAU);
+  } else if (f.kind === 1) {
+    var c = Math.cos(p.a), s = Math.sin(p.a);
+    var pts = [];
+    var corners = [[-1, -1], [1, -1], [1, 1], [-1, 1]];
+    for (i = 0; i < 4; i++) {
+      pts.push([cx + (corners[i][0] * c - corners[i][1] * s) * r,
+                cy + (corners[i][0] * s + corners[i][1] * c) * r]);
+    }
+    poly(pts);
+  } else if (f.kind === 2) {
+    var pts2 = [];
+    for (i = 0; i < 3; i++) {
+      var a = p.a + i * TAU / 3;
+      pts2.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r]);
+    }
+    poly(pts2);
+  } else {
+    var w = r * 2.2, h = r * 0.42;
+    var c2 = Math.cos(p.a), s2 = Math.sin(p.a);
+    var cr = [[-w / 2, -h / 2], [w / 2, -h / 2], [w / 2, h / 2], [-w / 2, h / 2]];
+    var pts3 = [];
+    for (i = 0; i < 4; i++) {
+      pts3.push([cx + (cr[i][0] * c2 - cr[i][1] * s2),
+                cy + (cr[i][0] * s2 + cr[i][1] * c2)]);
+    }
+    poly(pts3);
+  }
+}
+/* ================= HAND 0: GEOMETRIC =================
+   White ground, hard black grid, hard-edged black and white shapes,
+   one red accent form in five. Flat fills, crisp strokes, no softness. */
+function drawGeometric(t) {
+  ctx.fillStyle = '#F6F4EE';
+  ctx.fillRect(F.x, F.y, F.w, F.h);
+  ctx.strokeStyle = rgba('#111111', 0.16);
+  ctx.lineWidth = 1;
+  var i, g;
+  for (i = 1; i < 8; i++) {
+    g = F.x + F.w * i / 8;
+    ctx.beginPath(); ctx.moveTo(g, F.y); ctx.lineTo(g, F.y + F.h); ctx.stroke();
+    g = F.y + F.h * i / 8;
+    ctx.beginPath(); ctx.moveTo(F.x, g); ctx.lineTo(F.x + F.w, g); ctx.stroke();
+  }
+  ctx.strokeStyle = '#111111';
+  ctx.lineWidth = Math.max(1.5, F.w * 0.002);
+  ctx.strokeRect(F.x + 0.5, F.y + 0.5, F.w - 1, F.h - 1);
+  for (i = 0; i < FORMS.length; i++) {
+    var f = FORMS[i];
+    var p = formAt(f, t);
+    shapePath(f, p, 1);
+    if (f.red) {
+      ctx.fillStyle = '#C1272D';
+      ctx.fill();
+    } else if (i % 2 === 0) {
+      ctx.fillStyle = '#111111';
+      ctx.fill();
+    } else {
+      ctx.fillStyle = '#F6F4EE';
+      ctx.fill();
+      ctx.strokeStyle = '#111111';
+      ctx.lineWidth = Math.max(1.5, F.w * 0.003);
+      ctx.stroke();
+    }
+  }
+}
+/* ================= HAND 1: PAINTERLY =================
+   Paper ground, soft washes built from layered translucent ellipses,
+   overlaid wavy strokes in umber. No hard outlines anywhere. */
+function drawPainterly(t) {
+  ctx.fillStyle = '#E6D9BD';
+  ctx.fillRect(F.x, F.y, F.w, F.h);
+  var i, k;
+  for (i = 0; i < FORMS.length; i++) {
+    var f = FORMS[i];
+    var p = formAt(f, t);
+    var cx = F.x + p.x * F.w;
+    var cy = F.y + p.y * F.h;
+    var r = f.r * F.w;
+    var wash = f.red ? '#A85B1E' : (i % 2 === 0 ? '#B98A3E' : '#6B4A2A');
+    /* wash: three nested soft ellipses, alpha layered, edges feathered
+       by falling alpha rather than a stroke */
+    for (k = 3; k >= 1; k--) {
+      ctx.fillStyle = rgba(wash, 0.10 + 0.05 * k);
+      ctx.beginPath();
+      ctx.moveTo(cx + r * k * 0.62, cy);
+      ctx.ellipse(cx + (k - 2) * r * 0.08, cy + (k - 2) * r * 0.06,
+        r * k * 0.62, r * k * 0.5, p.a * 0.3, 0, TAU);
+      ctx.fill();
+    }
+    /* overlaid stroke: a wavy line crossing the wash */
+    ctx.strokeStyle = rgba('#4A3220', 0.55);
+    ctx.lineWidth = Math.max(1, F.w * 0.002);
+    ctx.beginPath();
+    ctx.moveTo(cx - r * 1.4, cy + r * 0.3);
+    ctx.quadraticCurveTo(cx - r * 0.4, cy - r * 0.7, cx + r * 0.6, cy - r * 0.1);
+    ctx.quadraticCurveTo(cx + r * 1.1, cy + r * 0.2, cx + r * 1.5, cy - r * 0.3);
+    ctx.stroke();
+  }
+  /* a few long dry-brush strokes across the whole field */
+  ctx.strokeStyle = rgba('#6B4A2A', 0.18);
+  ctx.lineWidth = Math.max(2, F.w * 0.006);
+  for (i = 0; i < 4; i++) {
+    var yy = F.y + F.h * (0.18 + i * 0.21);
+    ctx.beginPath();
+    ctx.moveTo(F.x + F.w * 0.04, yy);
+    ctx.bezierCurveTo(F.x + F.w * 0.3, yy - F.h * 0.02, F.x + F.w * 0.65, yy + F.h * 0.02, F.x + F.w * 0.96, yy);
+    ctx.stroke();
+  }
+}
+/* ================= HAND 2: ARCHIVAL =================
+   Grey photocopy ground, grain speckles, halftone dots, rough ink
+   shapes, rust accents, torn paper edges, caption-like ruled marks. */
+function drawArchival(t) {
+  ctx.fillStyle = '#B8B4AC';
+  ctx.fillRect(F.x, F.y, F.w, F.h);
+  /* halftone dot field */
+  ctx.fillStyle = rgba('#26221E', 0.10);
+  var gx, gy;
+  var step = Math.max(9, F.w * 0.018);
+  for (gy = F.y + step / 2; gy < F.y + F.h; gy += step) {
+    for (gx = F.x + step / 2; gx < F.x + F.w; gx += step) {
+      ctx.beginPath();
+      ctx.moveTo(gx + 1.2, gy);
+      ctx.arc(gx, gy, 1.2, 0, TAU);
+      ctx.fill();
+    }
+  }
+  var i;
+  for (i = 0; i < FORMS.length; i++) {
+    var f = FORMS[i];
+    var p = formAt(f, t);
+    shapePath(f, p, 0.96);
+    if (f.red) {
+      ctx.fillStyle = rgba('#8A4A30', 0.85);
+      ctx.fill();
+    } else if (i % 2 === 0) {
+      ctx.fillStyle = rgba('#26221E', 0.88);
+      ctx.fill();
+    } else {
+      ctx.fillStyle = rgba('#D8D2C4', 0.9);
+      ctx.fill();
+      ctx.strokeStyle = rgba('#26221E', 0.85);
+      ctx.lineWidth = Math.max(1, F.w * 0.002);
+      ctx.stroke();
+    }
+  }
+  /* caption-like marks: ruled lines, bottom left, no words */
+  ctx.fillStyle = rgba('#26221E', 0.75);
+  var bx = F.x + F.w * 0.06, by = F.y + F.h * 0.90;
+  var widths = [0.30, 0.22, 0.26, 0.14];
+  for (i = 0; i < 4; i++) {
+    ctx.fillRect(bx, by + i * F.h * 0.014, F.w * widths[i], Math.max(1.5, F.h * 0.004));
+  }
+  /* photocopy grain */
+  for (i = 0; i < GRAIN.length; i++) {
+    var gr = GRAIN[i];
+    ctx.fillStyle = gr.w ? rgba('#FFFFFF', 0.10) : rgba('#26221E', 0.12);
+    ctx.fillRect(F.x + gr.x * F.w, F.y + gr.y * F.h, gr.s, gr.s);
+  }
+  /* torn edges: jagged paper strips on all four sides */
+  ctx.fillStyle = '#E8E4DA';
+  var n = 24, k2;
+  for (k2 = 0; k2 <= n; k2++) {
+    var d = TEAR[0][k2];
+    ctx.fillRect(F.x + F.w * k2 / n, F.y, F.w / n + 1, d * F.h);
+    ctx.fillRect(F.x + F.w * k2 / n, F.y + F.h - TEAR[1][k2] * F.h, F.w / n + 1, TEAR[1][k2] * F.h);
+    var d2 = TEAR[2][k2];
+    ctx.fillRect(F.x, F.y + F.h * k2 / n, d2 * F.w, F.h / n + 1);
+    ctx.fillRect(F.x + F.w - TEAR[3][k2] * F.w, F.y + F.h * k2 / n, TEAR[3][k2] * F.w, F.h / n + 1);
+  }
+}
+/* ================= HAND 3: DIGITAL =================
+   Dark grey ground with a precise vertical gradient, phosphor green
+   forms built from pixel blocks on a fixed cell grid, scanlines. */
+function drawDigital(t) {
+  var g = ctx.createLinearGradient(0, F.y, 0, F.y + F.h);
+  g.addColorStop(0, '#232823');
+  g.addColorStop(1, '#141714');
+  ctx.fillStyle = g;
+  ctx.fillRect(F.x, F.y, F.w, F.h);
+  var cell = Math.max(6, F.w / 56);
+  var i;
+  for (i = 0; i < FORMS.length; i++) {
+    var f = FORMS[i];
+    var p = formAt(f, t);
+    var cx = F.x + p.x * F.w;
+    var cy = F.y + p.y * F.h;
+    var r = f.r * F.w;
+    /* quantize the form centre to the cell grid */
+    var qx = Math.round(cx / cell) * cell;
+    var qy = Math.round(cy / cell) * cell;
+    var rr = Math.max(1, Math.round(r / cell));
+    var col = f.red ? '#39FF6A' : (i % 2 === 0 ? '#2BD95A' : '#1D7A3A');
+    ctx.fillStyle = col;
+    var dx, dy;
+    if (f.kind === 0) {
+      for (dy = -rr; dy <= rr; dy++) {
+        for (dx = -rr; dx <= rr; dx++) {
+          if (dx * dx + dy * dy <= rr * rr + 0.5) {
+            ctx.fillRect(qx + dx * cell, qy + dy * cell, cell, cell);
+          }
+        }
+      }
+    } else if (f.kind === 1) {
+      ctx.save();
+      ctx.translate(qx, qy);
+      ctx.rotate(Math.round(p.a / (Math.PI / 4)) * (Math.PI / 4));
+      ctx.fillRect(-rr * cell, -rr * cell, rr * 2 * cell, rr * 2 * cell);
+      ctx.restore();
+    } else if (f.kind === 2) {
+      for (dy = -rr; dy <= rr; dy++) {
+        var half = Math.round((rr - Math.abs(dy)) * 0.9);
+        for (dx = -half; dx <= half; dx++) {
+          ctx.fillRect(qx + dx * cell, qy + dy * cell, cell, cell);
+        }
+      }
+    } else {
+      var len = Math.round(r * 2.2 / cell);
+      var wid = Math.max(1, Math.round(r * 0.42 / cell));
+      for (dx = -len; dx <= len; dx++) {
+        for (dy = -wid; dy <= wid; dy++) {
+          ctx.fillRect(qx + dx * cell, qy + dy * cell, cell, cell);
+        }
+      }
+    }
+    /* one bright pixel-block highlight per form */
+    ctx.fillStyle = rgba('#BFFFCF', 0.85);
+    ctx.fillRect(qx - cell, qy - cell, cell, cell);
+  }
+  /* precise grid and scanlines */
+  ctx.strokeStyle = rgba('#39FF6A', 0.12);
+  ctx.lineWidth = 1;
+  var gx2;
+  for (gx2 = 1; gx2 < 8; gx2++) {
+    ctx.beginPath();
+    ctx.moveTo(F.x + F.w * gx2 / 8, F.y);
+    ctx.lineTo(F.x + F.w * gx2 / 8, F.y + F.h);
+    ctx.stroke();
+  }
+  ctx.fillStyle = rgba('#000000', 0.14);
+  var sy;
+  for (sy = F.y; sy < F.y + F.h; sy += 4) {
+    ctx.fillRect(F.x, sy, F.w, 1);
+  }
+}
+var HANDS = [drawGeometric, drawPainterly, drawArchival, drawDigital];
+function eraAt(t) {
+  var e = Math.floor(t / ERA_LEN) % 4;
+  if (e < 0) e += 4;
+  return e;
+}
+function drawField(t) {
+  var e = eraAt(t);
+  var u = (t % ERA_LEN) / ERA_LEN;
+  if (u < 0) u += 1;
+  HANDS[e](t);
+  if (u > FADE_START) {
+    var blend = smooth01((u - FADE_START) / (1 - FADE_START));
+    ctx.save();
+    ctx.globalAlpha = blend;
+    HANDS[(e + 1) % 4](t);
+    ctx.restore();
+  }
+}
+function drawPlates() {
+  var smallPx = isPhone ? 11 : 12;
+  var titlePx = isPhone ? 16 : 20;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.font = 'bold ' + titlePx + 'px monospace';
+  while (titlePx > 9 && ctx.measureText('The Serial Collaborator').width > VW - 60) {
+    titlePx -= 1;
+    ctx.font = 'bold ' + titlePx + 'px monospace';
+  }
+  var titleW = ctx.measureText('The Serial Collaborator').width;
+  ctx.font = smallPx + 'px monospace';
+  var dateW = ctx.measureText('2006 · 12 · 22').width;
+  var plateW = Math.max(titleW, dateW) + 28;
+  var plateH = titlePx + smallPx + 20;
+  var plateX = 12, plateY = 12;
+  ctx.fillStyle = '#191510';
+  ctx.fillRect(plateX, plateY, plateW, plateH);
+  ctx.strokeStyle = 'rgba(214,198,168,0.30)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(plateX + 0.5, plateY + 0.5, plateW - 1, plateH - 1);
+  ctx.fillStyle = '#D6C6A8';
+  ctx.font = 'bold ' + titlePx + 'px monospace';
+  ctx.fillText('The Serial Collaborator', plateX + 14, plateY + 7);
+  ctx.font = smallPx + 'px monospace';
+  ctx.fillStyle = '#D6C6A8';
+  ctx.fillText('2006 · 12 · 22', plateX + 14, plateY + 7 + titlePx + 3);
+  var hint = 'Watch only.';
+  ctx.font = smallPx + 'px monospace';
+  var hintW = ctx.measureText(hint).width;
+  var hintPlateW = hintW + 24;
+  var hintPlateH = smallPx + 14;
+  var hintPlateX = 12;
+  var hintPlateY = VH - hintPlateH - 12;
+  ctx.fillStyle = '#191510';
+  ctx.fillRect(hintPlateX, hintPlateY, hintPlateW, hintPlateH);
+  ctx.strokeStyle = 'rgba(214,198,168,0.30)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(hintPlateX + 0.5, hintPlateY + 0.5, hintPlateW - 1, hintPlateH - 1);
+  ctx.fillStyle = '#D6C6A8';
+  ctx.fillText(hint, hintPlateX + 12, hintPlateY + 7);
+}
+function draw() {
+  size();
+  ctx.fillStyle = '#111111';
+  ctx.fillRect(0, 0, VW, VH);
+  drawField(phaseT);
+  drawPlates();
+}
+if (typeof window !== 'undefined') {
+  window.__probe = {
+    drawAt: function (t) { phaseT = t; draw(); },
+    phaseT: function () { return phaseT; },
+    eraAt: eraAt
+  };
+}
+/* ---- frame one: fixed phase t = 37.5 s, mid-era 0 (geometric) ----
+   No wall clock is read for frame one. Watch-only by design: no
+   pointer or keyboard handlers are registered. */
+size();
+phaseT = FRAME_T;
+if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', size);
+if (typeof window !== 'undefined' && window.addEventListener) window.addEventListener('resize', size);
+draw();
+if (!reduced && typeof requestAnimationFrame !== 'undefined') {
+  var startMs = Date.now();
+  (function loop() {
+    function step() {
+      phaseT = FRAME_T + (Date.now() - startMs) / 1000;
+      var hidden = false;
+      try { hidden = document.hidden; } catch (e) { hidden = false; }
+      if (!hidden) draw();
+      if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  })();
+}
+</script>
+</body>
+</html>
