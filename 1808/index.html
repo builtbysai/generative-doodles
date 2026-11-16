@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Long Wire</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #0d0c0b; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; touch-action: none; }
+  .hint {
+    position: fixed; left: 0; right: 0; bottom: 14px; text-align: center;
+    font: 12px/1.4 system-ui, -apple-system, sans-serif; letter-spacing: 0.14em;
+    color: #8a7a5e; pointer-events: none; user-select: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="hint">DRAG ALONG THE WIRE</div>
+<script>
+(function () {
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // Seeded PRNG, fixed seed: frame one is fully deterministic.
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  var rnd = mulberry32(1808);
+
+  var reduced = false;
+  try {
+    reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  } catch (e) { reduced = false; }
+
+  // Dust motes: seeded positions and drift phases.
+  var MOTES = [];
+  for (var i = 0; i < 36; i++) {
+    MOTES.push({
+      x: rnd(), y: rnd(), r: 0.6 + rnd() * 1.4,
+      a: 0.04 + rnd() * 0.12,
+      px: rnd() * Math.PI * 2, py: rnd() * Math.PI * 2,
+      sx: 0.003 + rnd() * 0.008, sy: 0.002 + rnd() * 0.006
+    });
+  }
+
+  // Drag state. Samples are recorded drag events along the wire:
+  // { t, s, len } where s is position along the wire (0..1) and len is
+  // the accumulated stroke length (wire fractions) at that moment.
+  // Shimmer and glow are closed-form functions of piece time and these
+  // samples. Frame one (t = 60, pre-drag) carries no samples, so the
+  // wire is quiet and the frame is byte-comparable.
+  var samples = [];
+  var dragging = false;
+  var finger = null; // { x, y, s } in canvas px while the finger is down
+  var strokeLen = 0; // accumulated lengthwise travel, wire fractions
+  var lastS = null;
+  var tNow = 60;
+
+  function alpha(v) {
+    var a = Math.round(v * 10000) / 10000;
+    if (a < 0) a = 0;
+    if (a > 1) a = 1;
+    return a;
+  }
+
+  // Wire geometry in room coordinates, recomputed per draw.
+  function wireGeom(rx, ry, rw, rh) {
+    return {
+      ax: rx + rw * 0.07, ay: ry + rh * 0.84,
+      bx: rx + rw * 0.93, by: ry + rh * 0.16
+    };
+  }
+
+  // Project point (x, y) onto the wire segment; returns { s, d } where
+  // s is the along-wire fraction and d the perpendicular distance in px.
+  function projectOnWire(x, y, g) {
+    var dx = g.bx - g.ax, dy = g.by - g.ay;
+    var len2 = dx * dx + dy * dy;
+    var s = ((x - g.ax) * dx + (y - g.ay) * dy) / len2;
+    if (s < 0) s = 0;
+    if (s > 1) s = 1;
+    var px = g.ax + dx * s, py = g.ay + dy * s;
+    var d = Math.sqrt((x - px) * (x - px) + (y - py) * (y - py));
+    return { s: s, d: d, x: px, y: py };
+  }
+
+  function recordSample(t, s) {
+    samples.push({ t: t, s: s, len: strokeLen });
+    if (samples.length > 400) samples.splice(0, samples.length - 400);
+  }
+
+  // Longitudinal shimmer at wire position s, time t: for each recorded
+  // drag sample, wavefronts travel away from the fingertip in both
+  // directions along the wire. Longer strokes slow the wave and widen
+  // the envelope. No transverse vibration anywhere.
+  function shimmerAt(s, t) {
+    var total = 0;
+    for (var i = 0; i < samples.length; i++) {
+      var sm = samples[i];
+      var age = t - sm.t;
+      if (age < 0 || age > 9) continue;
+      var speed = 0.30 / (1 + 2.0 * sm.len); // slower after long strokes
+      var w = 0.03 + 0.10 * sm.len;          // wider after long strokes
+      var d = speed * age;                   // wavefront distance from finger
+      var dist = Math.abs(s - sm.s);
+      var env = Math.exp(-((dist - d) * (dist - d)) / (2 * w * w));
+      var near = Math.exp(-dist / 0.05) * Math.exp(-age / 2);
+      total += 0.85 * env * Math.exp(-age / 5) + 0.55 * near;
+    }
+    if (total > 1) total = 1;
+    return total;
+  }
+
+  // Dull-amber glow: accumulation field, slow decay over seconds on lift.
+  function glowAt(s, t) {
+    var total = 0;
+    for (var i = 0; i < samples.length; i++) {
+      var sm = samples[i];
+      var age = t - sm.t;
+      if (age < 0 || age > 12) continue;
+      total += 0.8 * Math.exp(-Math.abs(s - sm.s) / 0.06) * Math.exp(-age / 4);
+    }
+    if (total > 1) total = 1;
+    return total;
+  }
+
+  function draw(t) {
+    var vw = (window.visualViewport && window.visualViewport.width) || window.innerWidth;
+    var vh = (window.visualViewport && window.visualViewport.height) || window.innerHeight;
+    var dpr = window.devicePixelRatio || 1;
+    var W = Math.max(1, Math.floor(vw));
+    var H = Math.max(1, Math.floor(vh));
+    canvas.width = Math.floor(W * dpr);
+    canvas.height = Math.floor(H * dpr);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    var isPhone = false;
+    try {
+      var sw = window.screen.width, sh = window.screen.height;
+      var mn = Math.min(sw, sh);
+      isPhone = mn < 700 || (H > W * 1.15);
+    } catch (e) { isPhone = (H > W * 1.15); }
+
+    // Page ground is the piece's own background color on both sizes.
+    ctx.fillStyle = '#0d0c0b';
+    ctx.fillRect(0, 0, W, H);
+
+    // Room rect: full-bleed on phones, centered 5:4 interior on desktop.
+    var rw, rh, rx, ry;
+    if (isPhone) {
+      rx = 0; ry = 0; rw = W; rh = H;
+    } else {
+      rw = Math.min(W * 0.94, H * 0.94 * 1.25);
+      rh = rw / 1.25;
+      rx = (W - rw) / 2;
+      ry = (H - rh) / 2;
+    }
+    var floorY = ry + rh * 0.70;
+
+    // Back wall: near-black, slightly lighter toward the top.
+    var wall = ctx.createLinearGradient(0, ry, 0, floorY);
+    wall.addColorStop(0, '#1a1714');
+    wall.addColorStop(1, '#100e0d');
+    ctx.fillStyle = wall;
+    ctx.fillRect(rx, ry, rw, floorY - ry);
+
+    // High dark ceiling: a darker band with one beam line.
+    ctx.fillStyle = '#080706';
+    ctx.fillRect(rx, ry, rw, rh * 0.09);
+    ctx.fillStyle = 'rgba(255,255,255,' + alpha(0.03) + ')';
+    ctx.fillRect(rx, ry + rh * 0.09, rw, 1);
+
+    // Far arch: a tall rounded doorway in the back wall, left of center,
+    // giving the room its depth. Barely lit.
+    var ax0 = rx + rw * 0.30, aw = rw * 0.16, ah = rh * 0.42;
+    var ay0 = floorY - ah;
+    ctx.strokeStyle = 'rgba(220,210,190,' + alpha(0.10) + ')';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(ax0, floorY);
+    ctx.lineTo(ax0, ay0 + aw / 2);
+    ctx.arc(ax0 + aw / 2, ay0 + aw / 2, aw / 2, Math.PI, 0);
+    ctx.lineTo(ax0 + aw, floorY);
+    ctx.stroke();
+    ctx.fillStyle = 'rgba(0,0,0,' + alpha(0.25) + ')';
+    ctx.beginPath();
+    ctx.moveTo(ax0, floorY);
+    ctx.lineTo(ax0, ay0 + aw / 2);
+    ctx.arc(ax0 + aw / 2, ay0 + aw / 2, aw / 2, Math.PI, 0);
+    ctx.lineTo(ax0 + aw, floorY);
+    ctx.closePath();
+    ctx.fill();
+
+    // Far column on the right, where the wire's upper anchor lives.
+    var cx0 = rx + rw * 0.86, cw = rw * 0.055;
+    var col = ctx.createLinearGradient(cx0, 0, cx0 + cw, 0);
+    col.addColorStop(0, '#211d19');
+    col.addColorStop(0.5, '#2a251f');
+    col.addColorStop(1, '#171412');
+    ctx.fillStyle = col;
+    ctx.fillRect(cx0, ry, cw, floorY - ry);
+    ctx.fillStyle = 'rgba(0,0,0,' + alpha(0.30) + ')';
+    ctx.fillRect(cx0 + cw, ry, 2, floorY - ry);
+
+    // Stone floor: darker, with perspective seams converging toward a
+    // vanishing point just left of center.
+    var fl = ctx.createLinearGradient(0, floorY, 0, ry + rh);
+    fl.addColorStop(0, '#141110');
+    fl.addColorStop(1, '#0a0908');
+    ctx.fillStyle = fl;
+    ctx.fillRect(rx, floorY, rw, ry + rh - floorY);
+    var vx = rx + rw * 0.44, vy = floorY;
+    ctx.strokeStyle = 'rgba(255,255,255,' + alpha(0.04) + ')';
+    ctx.lineWidth = 1;
+    for (var si = -3; si <= 3; si++) {
+      ctx.beginPath();
+      ctx.moveTo(vx + si * rw * 0.09, vy);
+      ctx.lineTo(rx + rw * (0.5 + si * 0.22), ry + rh);
+      ctx.stroke();
+    }
+    ctx.beginPath();
+    ctx.moveTo(rx, floorY + (ry + rh - floorY) * 0.45);
+    ctx.lineTo(rx + rw, floorY + (ry + rh - floorY) * 0.45);
+    ctx.stroke();
+    // Wall/floor seam.
+    ctx.fillStyle = 'rgba(0,0,0,' + alpha(0.35) + ')';
+    ctx.fillRect(rx, floorY - 1, rw, 1);
+
+    // Tungsten light pools on the stone floor.
+    function pool(px, py, pr, a) {
+      var g = ctx.createRadialGradient(px, py, 0, px, py, pr);
+      g.addColorStop(0, 'rgba(216,164,92,' + alpha(a) + ')');
+      g.addColorStop(1, 'rgba(216,164,92,0)');
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.moveTo(px + pr, py);
+      ctx.arc(px, py, pr, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    pool(rx + rw * 0.30, floorY + rh * 0.13, rw * 0.26, 0.13);
+    pool(rx + rw * 0.70, floorY + rh * 0.11, rw * 0.20, 0.10);
+
+    // Faint warm shafts falling from the ceiling fixtures.
+    ctx.fillStyle = 'rgba(220,170,95,' + alpha(0.022) + ')';
+    ctx.beginPath();
+    ctx.moveTo(rx + rw * 0.27, ry + rh * 0.09);
+    ctx.lineTo(rx + rw * 0.33, ry + rh * 0.09);
+    ctx.lineTo(rx + rw * 0.40, floorY);
+    ctx.lineTo(rx + rw * 0.20, floorY);
+    ctx.closePath();
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(rx + rw * 0.67, ry + rh * 0.09);
+    ctx.lineTo(rx + rw * 0.71, ry + rh * 0.09);
+    ctx.lineTo(rx + rw * 0.77, floorY);
+    ctx.lineTo(rx + rw * 0.62, floorY);
+    ctx.closePath();
+    ctx.fill();
+
+    var g = wireGeom(rx, ry, rw, rh);
+
+    // Background wires: dimmer, unplayed, crossing behind.
+    ctx.lineCap = 'round';
+    var bg = [
+      { x1: 0.12, y1: 0.06, x2: 0.78, y2: 0.62, a: 0.16 },
+      { x1: 0.45, y1: 0.04, x2: 0.60, y2: 0.70, a: 0.11 },
+      { x1: 0.05, y1: 0.30, x2: 0.55, y2: 0.22, a: 0.09 }
+    ];
+    for (var bi = 0; bi < bg.length; bi++) {
+      var b = bg[bi];
+      ctx.strokeStyle = 'rgba(190,195,200,' + alpha(b.a) + ')';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(rx + rw * b.x1, ry + rh * b.y1);
+      ctx.lineTo(rx + rw * b.x2, ry + rh * b.y2);
+      ctx.stroke();
+    }
+
+    // The long wire: drawn in segments so the longitudinal shimmer and
+    // the amber glow can vary along its length. Base line first.
+    ctx.strokeStyle = 'rgba(200,205,212,' + alpha(0.80) + ')';
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    ctx.moveTo(g.ax, g.ay);
+    ctx.lineTo(g.bx, g.by);
+    ctx.stroke();
+    // Thin bright highlight just above the wire.
+    ctx.strokeStyle = 'rgba(235,240,245,' + alpha(0.35) + ')';
+    ctx.lineWidth = 0.8;
+    ctx.beginPath();
+    ctx.moveTo(g.ax, g.ay - 1);
+    ctx.lineTo(g.bx, g.by - 1);
+    ctx.stroke();
+
+    // Shimmer and glow overlays, segment by segment.
+    var SEG = 240;
+    var dxw = (g.bx - g.ax) / SEG, dyw = (g.by - g.ay) / SEG;
+    for (var sgi = 0; sgi < SEG; sgi++) {
+      var s0 = sgi / SEG, s1 = (sgi + 1) / SEG;
+      var smid = (s0 + s1) / 2;
+      var sh = shimmerAt(smid, t);
+      var gl = glowAt(smid, t);
+      var x0 = g.ax + dxw * sgi, y0 = g.ay + dyw * sgi;
+      var x1 = g.ax + dxw * (sgi + 1), y1 = g.ay + dyw * (sgi + 1);
+      if (gl > 0.02) {
+        ctx.strokeStyle = 'rgba(217,154,78,' + alpha(gl * 0.30) + ')';
+        ctx.lineWidth = 5;
+        ctx.beginPath();
+        ctx.moveTo(x0, y0);
+        ctx.lineTo(x1, y1);
+        ctx.stroke();
+      }
+      if (sh > 0.02) {
+        ctx.strokeStyle = 'rgba(240,244,248,' + alpha(sh * 0.85) + ')';
+        ctx.lineWidth = 2.6;
+        ctx.beginPath();
+        ctx.moveTo(x0, y0);
+        ctx.lineTo(x1, y1);
+        ctx.stroke();
+      }
+    }
+
+    // Anchors. Lower-left: a bolt in the wall.
+    ctx.fillStyle = '#2b2723';
+    ctx.beginPath();
+    ctx.moveTo(g.ax + 6, g.ay);
+    ctx.arc(g.ax, g.ay, 6, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(200,205,212,' + alpha(0.45) + ')';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(g.ax + 6, g.ay);
+    ctx.arc(g.ax, g.ay, 6, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.fillStyle = '#8f959c';
+    ctx.beginPath();
+    ctx.moveTo(g.ax + 2, g.ay);
+    ctx.arc(g.ax, g.ay, 2, 0, Math.PI * 2);
+    ctx.fill();
+    // Upper-right: a bracket on the far column.
+    ctx.fillStyle = '#2b2723';
+    ctx.fillRect(g.bx - 4, g.by - 8, 8, 16);
+    ctx.strokeStyle = 'rgba(200,205,212,' + alpha(0.45) + ')';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(g.bx - 4, g.by - 8, 8, 16);
+    ctx.fillStyle = '#8f959c';
+    ctx.beginPath();
+    ctx.moveTo(g.bx + 2, g.by);
+    ctx.arc(g.bx, g.by, 2, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Fingertip: a dull-amber glow where the finger touches the wire.
+    if (dragging && finger) {
+      var fg = ctx.createRadialGradient(finger.x, finger.y, 0, finger.x, finger.y, 16);
+      fg.addColorStop(0, 'rgba(222,164,84,' + alpha(0.55) + ')');
+      fg.addColorStop(1, 'rgba(222,164,84,0)');
+      ctx.fillStyle = fg;
+      ctx.beginPath();
+      ctx.moveTo(finger.x + 16, finger.y);
+      ctx.arc(finger.x, finger.y, 16, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = 'rgba(240,200,130,' + alpha(0.85) + ')';
+      ctx.beginPath();
+      ctx.moveTo(finger.x + 3, finger.y);
+      ctx.arc(finger.x, finger.y, 3, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // Dust motes drifting in the light.
+    for (var m = 0; m < MOTES.length; m++) {
+      var mo = MOTES[m];
+      var mx = rx + (mo.x + Math.sin(t * mo.sx + mo.px) * 0.02) * rw;
+      var my = ry + (mo.y + Math.sin(t * mo.sy + mo.py) * 0.015) * rh;
+      var warm = (my > floorY - rh * 0.05 && my < floorY + rh * 0.18);
+      ctx.beginPath();
+      ctx.moveTo(mx + mo.r, my);
+      ctx.arc(mx, my, mo.r, 0, Math.PI * 2);
+      ctx.fillStyle = warm
+        ? 'rgba(240,210,160,' + alpha(mo.a + 0.06) + ')'
+        : 'rgba(190,195,200,' + alpha(mo.a) + ')';
+      ctx.fill();
+    }
+
+    // Plates on canvas: title, date, hint.
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillStyle = '#9a917f';
+    ctx.font = '600 13px system-ui, -apple-system, sans-serif';
+    ctx.fillText('THE LONG WIRE', rx + rw * 0.04, ry + rh * 0.055);
+    ctx.fillStyle = '#7a7264';
+    ctx.font = '11px system-ui, -apple-system, sans-serif';
+    ctx.fillText('2006 · 12 · 24', rx + rw * 0.04, ry + rh * 0.055 + 16);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#8a7a5e';
+    ctx.font = '11px system-ui, -apple-system, sans-serif';
+    ctx.fillText('DRAG ALONG THE WIRE · LENGTHWISE ONLY, NEVER PLUCKED',
+      rx + rw / 2, ry + rh - 12);
+  }
+
+  // One synchronous frame at load: t = 60, fixed phase, pre-drag.
+  draw(60);
+  tNow = 60;
+
+  // Drag is the instrument. Only lengthwise travel along the wire
+  // injects shimmer and glow; sideways drag does nothing.
+  function onDown(e) {
+    var rect = canvas.getBoundingClientRect();
+    var x = e.clientX - rect.left, y = e.clientY - rect.top;
+    var vw = (window.visualViewport && window.visualViewport.width) || window.innerWidth;
+    var vh = (window.visualViewport && window.visualViewport.height) || window.innerHeight;
+    var W = Math.max(1, Math.floor(vw)), H = Math.max(1, Math.floor(vh));
+    var isPhone = false;
+    try {
+      var mn = Math.min(window.screen.width, window.screen.height);
+      isPhone = mn < 700 || (H > W * 1.15);
+    } catch (err) { isPhone = (H > W * 1.15); }
+    var rw, rh, rx, ry;
+    if (isPhone) { rx = 0; ry = 0; rw = W; rh = H; }
+    else {
+      rw = Math.min(W * 0.94, H * 0.94 * 1.25);
+      rh = rw / 1.25;
+      rx = (W - rw) / 2; ry = (H - rh) / 2;
+    }
+    var g = wireGeom(rx, ry, rw, rh);
+    var p = projectOnWire(x, y, g);
+    if (p.d > 26) return; // off the wire: sideways drag does nothing
+    dragging = true;
+    lastS = p.s;
+    finger = { x: p.x, y: p.y, s: p.s };
+    recordSample(tNow, p.s);
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+    draw(tNow);
+  }
+
+  function onMove(e) {
+    if (!dragging) return;
+    var rect = canvas.getBoundingClientRect();
+    var x = e.clientX - rect.left, y = e.clientY - rect.top;
+    var vw = (window.visualViewport && window.visualViewport.width) || window.innerWidth;
+    var vh = (window.visualViewport && window.visualViewport.height) || window.innerHeight;
+    var W = Math.max(1, Math.floor(vw)), H = Math.max(1, Math.floor(vh));
+    var isPhone = false;
+    try {
+      var mn = Math.min(window.screen.width, window.screen.height);
+      isPhone = mn < 700 || (H > W * 1.15);
+    } catch (err) { isPhone = (H > W * 1.15); }
+    var rw, rh, rx, ry;
+    if (isPhone) { rx = 0; ry = 0; rw = W; rh = H; }
+    else {
+      rw = Math.min(W * 0.94, H * 0.94 * 1.25);
+      rh = rw / 1.25;
+      rx = (W - rw) / 2; ry = (H - rh) / 2;
+    }
+    var g = wireGeom(rx, ry, rw, rh);
+    var p = projectOnWire(x, y, g);
+    if (p.d > 40) return; // drifted off the wire: hold, do not inject
+    if (lastS !== null) strokeLen += Math.abs(p.s - lastS);
+    lastS = p.s;
+    finger = { x: p.x, y: p.y, s: p.s };
+    recordSample(tNow, p.s);
+    draw(tNow);
+  }
+
+  function onUp() {
+    dragging = false;
+    finger = null;
+    lastS = null;
+    draw(tNow);
+  }
+
+  canvas.addEventListener('pointerdown', onDown);
+  canvas.addEventListener('pointermove', onMove);
+  canvas.addEventListener('pointerup', onUp);
+  canvas.addEventListener('pointercancel', onUp);
+
+  if (reduced) {
+    var t0 = 0;
+    try { t0 = performance.now(); } catch (e) { t0 = 0; }
+    var origDown = onDown;
+    canvas.removeEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointerdown', function (e) {
+      try { tNow = 60 + (performance.now() - t0) / 1000; } catch (err) {}
+      origDown(e);
+    });
+    return;
+  }
+
+  var start = null;
+  function loop(ts) {
+    if (start === null) start = ts;
+    tNow = 60 + (ts - start) / 1000;
+    draw(tNow);
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(loop);
+    }
+  }
+  if (typeof requestAnimationFrame === 'function') {
+    requestAnimationFrame(loop);
+  }
+
+  function onResize() { draw(tNow); }
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', onResize);
+  }
+  window.addEventListener('resize', onResize);
+})();
+</script>
+</body>
+</html>
