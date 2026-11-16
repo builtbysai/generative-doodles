@@ -1,0 +1,578 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Streetwalker 1980</title>
+<style>
+html, body { margin: 0; padding: 0; background: #0B0F1A; overflow: hidden; }
+canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+var TAU = Math.PI * 2;
+var NIGHT = '#0B0F1A';
+var SKY = '#0D1322';
+var BUILDING = '#0E1524';
+var PAVEMENT = '#080C14';
+var SODIUM = '#F59A2E';
+var SODIUM_DEEP = '#E88A2A';
+var SODIUM_PALE = '#F7B45C';
+var METAL = '#9AA3AD';
+var METAL_DARK = '#6E7680';
+var METAL_LIGHT = '#C7CDD4';
+var SILHOUETTE = '#141B29';
+var SILHOUETTE_EDGE = '#1E2839';
+var STRING_COL = '#C9A06A';
+var PLATE = '#101623';
+var PLATE_LINE = 'rgba(245,154,46,0.45)';
+var TITLE_INK = '#F2EEE3';
+var HINT_INK = '#D8C9A8';
+/* Walk cycle, seconds. Walk right, pause, turn, walk left, pause. */
+var CYCLE = 28;
+var WALK_A_END = 10;
+var PAUSE_A_END = 13;
+var TURN_END = 15;
+var WALK_B_END = 25;
+var FRAME_T = 3.2;         /* fixed phase: mid-stride, walking right, inside the lamp pool */
+var V0 = 0.020;            /* background scroll speed, fraction of scene width per second */
+var STEP_LEN = 0.035;      /* scene-width fraction travelled per half stride */
+var RAMP = 0.6;            /* ease-in/out at each walk start and end, seconds */
+function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+function ramp(u) { u = clamp(u, 0, 1); return u * u * (3 - 2 * u); }
+function rampF(u) { u = clamp(u, 0, 1); return u * u * u - 0.5 * u * u * u * u; }
+function mulberry32(seed) {
+  return function () {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    var t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+function hexRgb(h) {
+  return [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
+}
+function rgba(h, a) {
+  var c = hexRgb(h);
+  return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a.toFixed(4) + ')';
+}
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var VW = 0, VH = 0, isPhone = false;
+var reduced = false;
+try { reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (e) { reduced = false; }
+var rng = mulberry32(1831);
+var phaseT = FRAME_T;
+var soundOn = false;
+var audioCtx = null;
+var noiseBuf = null;
+var soundPlate = { x: 0, y: 0, w: 0, h: 0 };
+/* seeded static details: stars, buildings with windows, pavement marks, skirt brushing */
+var STARS = [];
+var BUILDINGS = [];
+var STREAKS = [];
+(function () {
+  var i, j;
+  for (i = 0; i < 46; i++) STARS.push({ x: rng(), y: rng() * 0.42, r: 0.4 + rng() * 1.1, a: 0.18 + rng() * 0.45 });
+  for (i = 0; i < 7; i++) {
+    var wins = [];
+    var nw = 1 + Math.floor(rng() * 3);
+    for (j = 0; j < nw; j++) wins.push({ fx: 0.15 + rng() * 0.65, fy: 0.12 + rng() * 0.62, w: 0.10 + rng() * 0.14, h: 0.10 + rng() * 0.16, a: 0.25 + rng() * 0.5, lit: rng() < 0.6 });
+    BUILDINGS.push({ base: i * 0.16, w: 0.10 + ((i * 37) % 10) * 0.008, h: 0.06 + ((i * 53) % 10) * 0.010, wins: wins });
+  }
+  for (i = 0; i < 6; i++) STREAKS.push({ x: -0.42 + i * 0.17, a: 0.10 + rng() * 0.10 });
+})();
+/* ---- walk state as closed-form functions of cycle time tc ---- */
+function cycleT(t) { return ((t % CYCLE) + CYCLE) % CYCLE; }
+/* velocity profile, 0..1, during a walk phase [a,b) */
+function velProfile(a, b, tc) {
+  if (tc < a || tc >= b) return 0;
+  return ramp((tc - a) / RAMP) * ramp((b - tc) / RAMP);
+}
+/* integral of the velocity profile from a to tc, for background scroll */
+function velIntegral(a, b, tc) {
+  if (tc <= a) return 0;
+  var span = b - a;
+  var x = Math.min(tc - a, span);
+  var total = 0;
+  var rise = Math.min(x, RAMP);
+  total += RAMP * rampF(rise / RAMP);
+  var mid = Math.max(0, Math.min(x, span - RAMP) - RAMP);
+  total += mid;
+  var fallStart = span - RAMP;
+  var fall = Math.max(0, Math.min(x, span) - fallStart);
+  total += RAMP * (rampF(1) - rampF(1 - fall / RAMP));
+  return total;
+}
+function walkState(tc) {
+  var st = { vel: 0, dir: 1, facing: 1, dist: 0, travel: 0 };
+  var dA = velIntegral(0, WALK_A_END, tc);
+  var dB = velIntegral(WALK_B_END - 10, WALK_B_END, tc); /* walk B is [15,25) */
+  if (tc < WALK_A_END) {
+    st.vel = velProfile(0, WALK_A_END, tc);
+    st.dir = 1; st.facing = 1;
+  } else if (tc < PAUSE_A_END) {
+    st.vel = 0; st.dir = 1; st.facing = 1;
+  } else if (tc < TURN_END) {
+    var u = (tc - PAUSE_A_END) / (TURN_END - PAUSE_A_END);
+    st.vel = 0; st.dir = 1; st.facing = Math.cos(u * Math.PI);
+  } else if (tc < WALK_B_END) {
+    st.vel = velProfile(WALK_B_END - 10, WALK_B_END, tc);
+    st.dir = -1; st.facing = -1;
+  } else {
+    st.vel = 0; st.dir = -1; st.facing = -1;
+  }
+  st.dist = V0 * (dA - dB);
+  st.travel = V0 * (dA + dB);
+  return st;
+}
+function stridePhase(travel) { return (travel / STEP_LEN) * Math.PI; }
+function stringTension(phase, i) {
+  return clamp(0.55 + 0.35 * Math.sin(phase + i * 0.9), 0.2, 0.95);
+}
+function size() {
+  var vw = 0, vh = 0;
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.width) {
+    vw = window.visualViewport.width; vh = window.visualViewport.height;
+  } else if (typeof window !== 'undefined' && window.innerWidth) {
+    vw = window.innerWidth; vh = window.innerHeight;
+  }
+  VW = vw; VH = vh;
+  canvas.width = VW; canvas.height = VH;
+  canvas.style.width = VW + 'px'; canvas.style.height = VH + 'px';
+  if (typeof window !== 'undefined' && window.screen) {
+    var mn = Math.min(window.screen.width, window.screen.height);
+    isPhone = mn < 700 || VH > VW * 1.15;
+  }
+}
+function sceneRect() {
+  if (isPhone) return { x: 0, y: 0, w: VW, h: VH };
+  var s = Math.min(VW, VH);
+  return { x: (VW - s) / 2, y: (VH - s) / 2, w: s, h: s };
+}
+function drawSky(sc, t) {
+  var i, sx, sy;
+  ctx.fillStyle = SKY;
+  ctx.fillRect(sc.x, sc.y, sc.w, sc.h * 0.62);
+  for (i = 0; i < STARS.length; i++) {
+    sx = sc.x + STARS[i].x * sc.w;
+    sy = sc.y + STARS[i].y * sc.h;
+    ctx.fillStyle = rgba(SODIUM_PALE, STARS[i].a * 0.5);
+    ctx.fillRect(sx, sy, STARS[i].r, STARS[i].r);
+  }
+}
+function drawBuildings(sc, dist) {
+  var horizon = sc.y + sc.h * 0.62;
+  var i, j, bw, bh, bx, by, win;
+  for (i = 0; i < BUILDINGS.length; i++) {
+    bw = BUILDINGS[i].w * sc.w;
+    bh = BUILDINGS[i].h * sc.h;
+    bx = sc.x + (((BUILDINGS[i].base - dist * 0.5) % 1.15) + 1.15) % 1.15 * sc.w - bw / 2;
+    by = horizon - bh;
+    ctx.fillStyle = BUILDING;
+    ctx.fillRect(bx, by, bw, bh);
+    for (j = 0; j < BUILDINGS[i].wins.length; j++) {
+      win = BUILDINGS[i].wins[j];
+      if (!win.lit) continue;
+      ctx.fillStyle = rgba(SODIUM, win.a * 0.55);
+      ctx.fillRect(bx + win.fx * bw, by + win.fy * bh, win.w * bw, win.h * bh);
+    }
+  }
+  ctx.fillStyle = PAVEMENT;
+  ctx.fillRect(sc.x, horizon, sc.w, sc.h * 0.38);
+}
+function drawPavement(sc, dist) {
+  var horizon = sc.y + sc.h * 0.62;
+  var gy = sc.y + sc.h * 0.80;
+  var i, jx;
+  ctx.strokeStyle = rgba(SODIUM_PALE, 0.10);
+  ctx.lineWidth = 1;
+  for (i = -1; i < 14; i++) {
+    jx = sc.x + (((i * 0.09 - dist) % 1.1) + 1.1) % 1.1 * sc.w;
+    ctx.beginPath();
+    ctx.moveTo(jx, horizon);
+    ctx.lineTo(jx + sc.w * 0.012, gy + sc.h * 0.16);
+    ctx.stroke();
+  }
+  ctx.fillStyle = rgba(SODIUM_PALE, 0.06);
+  ctx.fillRect(sc.x, gy + sc.h * 0.02, sc.w, Math.max(2, sc.h * 0.004));
+}
+function drawLamp(sc, lampX, scale, alpha) {
+  var gy = sc.y + sc.h * 0.80;
+  var headY = sc.y + sc.h * 0.16 * scale + sc.h * 0.10 * (1 - scale);
+  var headX = lampX;
+  var poolRx = sc.w * 0.26 * scale;
+  var poolRy = sc.h * 0.045 * scale;
+  /* light cone from head to pool */
+  var cone = ctx.createLinearGradient(0, headY, 0, gy);
+  cone.addColorStop(0, rgba(SODIUM, 0.10 * alpha));
+  cone.addColorStop(1, rgba(SODIUM, 0.02 * alpha));
+  ctx.fillStyle = cone;
+  ctx.beginPath();
+  ctx.moveTo(headX - sc.w * 0.008 * scale, headY);
+  ctx.lineTo(headX + sc.w * 0.008 * scale, headY);
+  ctx.lineTo(lampX + poolRx, gy + sc.h * 0.01);
+  ctx.lineTo(lampX - poolRx, gy + sc.h * 0.01);
+  ctx.closePath();
+  ctx.fill();
+  /* pool of light on the pavement */
+  var pool = ctx.createRadialGradient(lampX, gy + sc.h * 0.01, 0, lampX, gy + sc.h * 0.01, poolRx);
+  pool.addColorStop(0, rgba(SODIUM, 0.42 * alpha));
+  pool.addColorStop(0.55, rgba(SODIUM, 0.16 * alpha));
+  pool.addColorStop(1, rgba(SODIUM, 0));
+  ctx.fillStyle = pool;
+  ctx.beginPath();
+  ctx.ellipse(lampX, gy + sc.h * 0.01, poolRx, poolRy, 0, 0, TAU);
+  ctx.fill();
+  /* post, arm, head */
+  ctx.strokeStyle = rgba('#05070C', 0.9);
+  ctx.lineWidth = Math.max(3, sc.w * 0.006 * scale);
+  ctx.beginPath();
+  ctx.moveTo(lampX, gy);
+  ctx.lineTo(lampX, headY);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(lampX, headY);
+  ctx.quadraticCurveTo(lampX - sc.w * 0.02 * scale, headY - sc.h * 0.012 * scale, lampX - sc.w * 0.035 * scale, headY + sc.h * 0.006 * scale);
+  ctx.stroke();
+  var glow = ctx.createRadialGradient(headX - sc.w * 0.035 * scale, headY + sc.h * 0.006 * scale, 0, headX - sc.w * 0.035 * scale, headY + sc.h * 0.006 * scale, sc.w * 0.05 * scale);
+  glow.addColorStop(0, rgba(SODIUM_PALE, 0.85 * alpha));
+  glow.addColorStop(0.35, rgba(SODIUM, 0.28 * alpha));
+  glow.addColorStop(1, rgba(SODIUM, 0));
+  ctx.fillStyle = glow;
+  ctx.beginPath();
+  ctx.ellipse(headX - sc.w * 0.035 * scale, headY + sc.h * 0.006 * scale, sc.w * 0.05 * scale, sc.w * 0.05 * scale, 0, 0, TAU);
+  ctx.fill();
+  ctx.fillStyle = rgba(SODIUM_PALE, 0.95 * alpha);
+  ctx.beginPath();
+  ctx.ellipse(headX - sc.w * 0.035 * scale, headY + sc.h * 0.008 * scale, sc.w * 0.008 * scale, sc.h * 0.005 * scale, 0, 0, TAU);
+  ctx.fill();
+}
+function drawFigure(sc, st, t) {
+  var gy = sc.y + sc.h * 0.80;
+  var figH = sc.h * 0.50;
+  var u = figH / 100;
+  var fx = sc.x + sc.w * 0.50;
+  var phase = stridePhase(st.travel);
+  var vel = st.vel;
+  var swing = 0.55 * vel;
+  var lampX = sc.x + sc.w * 0.64;
+  var lampSide = (lampX > fx) ? 1 : -1;
+  /* leg poses: pendulum from the hip, stride pose blended toward
+     standing by velocity so the feet settle during pauses */
+  function legPose(ph) {
+    var a = swing * Math.sin(ph);
+    var lift = 2.6 * u * Math.max(0, Math.sin(ph + Math.PI / 2)) * vel;
+    var sx = 15.5 * u * Math.sin(a);
+    var sy = -16 * u + 15.5 * u * Math.cos(a) - lift;
+    var nx = 0, ny = 0;
+    return { x: nx + (sx - nx) * vel, y: ny + (sy - ny) * vel };
+  }
+  var footA = legPose(phase);
+  var footB = legPose(phase + Math.PI);
+  var frontFoot = (Math.sin(phase) > 0) ? footA : footB;
+  var backFoot = (Math.sin(phase) > 0) ? footB : footA;
+  ctx.save();
+  ctx.translate(fx, gy);
+  ctx.scale(st.facing, 1);
+  /* legs, behind the skirt */
+  ctx.strokeStyle = SILHOUETTE;
+  ctx.lineCap = 'round';
+  ctx.lineWidth = 3.4 * u;
+  ctx.beginPath(); ctx.moveTo(0, -16 * u); ctx.lineTo(footA.x, footA.y); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(0, -16 * u); ctx.lineTo(footB.x, footB.y); ctx.stroke();
+  /* sodium edge on the lamp-side leg so the stride reads in the dark */
+  var strideFoot = (footA.x * lampSide * st.facing > footB.x * lampSide * st.facing) ? footA : footB;
+  ctx.strokeStyle = rgba(SODIUM_PALE, 0.35);
+  ctx.lineWidth = 1.1 * u;
+  ctx.beginPath(); ctx.moveTo(0, -16 * u); ctx.lineTo(strideFoot.x, strideFoot.y); ctx.stroke();
+  /* shoes */
+  ctx.fillStyle = SILHOUETTE;
+  ctx.beginPath(); ctx.ellipse(footA.x + 1.5 * u, footA.y - 1 * u, 5.5 * u, 2.6 * u, 0, 0, TAU); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(footB.x + 1.5 * u, footB.y - 1 * u, 5.5 * u, 2.6 * u, 0, 0, TAU); ctx.fill();
+  /* torso */
+  ctx.fillStyle = SILHOUETTE;
+  ctx.beginPath();
+  ctx.moveTo(-6.5 * u, -80 * u);
+  ctx.quadraticCurveTo(0, -83 * u, 6.5 * u, -80 * u);
+  ctx.lineTo(8 * u, -54 * u);
+  ctx.lineTo(-8 * u, -54 * u);
+  ctx.closePath();
+  ctx.fill();
+  /* arms, swinging gently against the legs */
+  var armSwing = 3.5 * u * Math.sin(phase + Math.PI) * vel;
+  ctx.strokeStyle = SILHOUETTE;
+  ctx.lineWidth = 2.8 * u;
+  ctx.beginPath(); ctx.moveTo(-6 * u, -77 * u); ctx.lineTo(-9.5 * u + armSwing, -52 * u); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(6 * u, -77 * u); ctx.lineTo(9.5 * u - armSwing, -52 * u); ctx.stroke();
+  /* head, plain, no features, hair pulled back */
+  ctx.fillStyle = SILHOUETTE;
+  ctx.beginPath(); ctx.ellipse(0, -88 * u, 6.4 * u, 7.2 * u, 0, 0, TAU); ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(-6 * u, -90 * u);
+  ctx.quadraticCurveTo(0, -97 * u, 6 * u, -90 * u);
+  ctx.quadraticCurveTo(5 * u, -83 * u, -5 * u, -83 * u);
+  ctx.closePath();
+  ctx.fill();
+  ctx.fillRect(-1.2 * u, -82 * u, 2.4 * u, 3 * u);
+  /* metal skirt: bell from waist to hem, brushed vertical streaks */
+  var skirtGrad = ctx.createLinearGradient(0, -54 * u, 0, -13 * u);
+  skirtGrad.addColorStop(0, METAL_LIGHT);
+  skirtGrad.addColorStop(0.45, METAL);
+  skirtGrad.addColorStop(1, METAL_DARK);
+  ctx.fillStyle = skirtGrad;
+  ctx.beginPath();
+  ctx.moveTo(-8 * u, -54 * u);
+  ctx.lineTo(8 * u, -54 * u);
+  ctx.quadraticCurveTo(15 * u, -32 * u, 17.5 * u, -13.5 * u);
+  ctx.lineTo(-17.5 * u, -13.5 * u);
+  ctx.quadraticCurveTo(-15 * u, -32 * u, -8 * u, -54 * u);
+  ctx.closePath();
+  ctx.fill();
+  ctx.strokeStyle = rgba(METAL_DARK, 0.6);
+  ctx.lineWidth = 1 * u;
+  ctx.beginPath();
+  ctx.moveTo(-17.5 * u, -13.5 * u);
+  ctx.lineTo(17.5 * u, -13.5 * u);
+  ctx.stroke();
+  var si;
+  for (si = 0; si < STREAKS.length; si++) {
+    ctx.strokeStyle = rgba(METAL_LIGHT, STREAKS[si].a);
+    ctx.lineWidth = 0.8 * u;
+    ctx.beginPath();
+    ctx.moveTo(STREAKS[si].x * 34 * u, -50 * u);
+    ctx.lineTo(STREAKS[si].x * 38 * u, -15 * u);
+    ctx.stroke();
+  }
+  /* waist band */
+  ctx.fillStyle = METAL_DARK;
+  ctx.fillRect(-8.4 * u, -55.5 * u, 16.8 * u, 2.2 * u);
+  /* guitar strings: skirt hem down to the shoes, catenary sag by tension,
+     faint trembling lines thrown off the strings as she walks */
+  var nStr = 7;
+  var i, hx, bx, by, tension, sag, mx, my, trem;
+  for (i = 0; i < nStr; i++) {
+    var fi = i / (nStr - 1);
+    hx = -15.5 * u + fi * 31 * u;
+    bx = backFoot.x + fi * (frontFoot.x - backFoot.x);
+    by = Math.min(backFoot.y, frontFoot.y) - 1.5 * u;
+    tension = stringTension(phase, i);
+    sag = (1 - tension) * 4.5 * u + 0.6 * u;
+    trem = 0.9 * u * Math.sin(t * 7 + i * 2.3) * (1 - tension);
+    mx = (hx + bx) / 2 + trem;
+    my = (-13.5 * u + by) / 2 + sag;
+    ctx.strokeStyle = rgba(STRING_COL, 0.85);
+    ctx.lineWidth = Math.max(1, 1.1 * u);
+    ctx.beginPath();
+    ctx.moveTo(hx, -13.5 * u);
+    ctx.quadraticCurveTo(mx, my, bx, by);
+    ctx.stroke();
+    /* scrape: a faint trembling line thrown off the string */
+    if (i % 2 === 0) {
+      var wob = 1.6 * u * Math.sin(t * 6 + i * 1.7);
+      ctx.strokeStyle = rgba(SODIUM_PALE, 0.14 + 0.08 * vel);
+      ctx.lineWidth = Math.max(0.75, 0.8 * u);
+      ctx.beginPath();
+      ctx.moveTo(mx, my);
+      ctx.quadraticCurveTo(mx + (6 + wob) * u * 0.4, my + 2 * u, mx + (10 + wob) * u * 0.5, my + 5 * u);
+      ctx.stroke();
+    }
+  }
+  ctx.restore();
+  /* sodium rim light on the lamp side of the figure, in world space */
+  ctx.strokeStyle = rgba(SODIUM_PALE, 0.55);
+  ctx.lineWidth = Math.max(1, 1.4 * u);
+  ctx.beginPath();
+  ctx.moveTo(fx + lampSide * 8 * u, gy - 54 * u);
+  ctx.quadraticCurveTo(fx + lampSide * 16 * u, gy - 32 * u, fx + lampSide * 17 * u, gy - 14 * u);
+  ctx.stroke();
+  /* soft shadow under the feet, stretched toward the lamp pool */
+  var sh = ctx.createRadialGradient(fx, gy + 2 * u, 0, fx, gy + 2 * u, 26 * u);
+  sh.addColorStop(0, rgba('#000000', 0.45));
+  sh.addColorStop(1, rgba('#000000', 0));
+  ctx.fillStyle = sh;
+  ctx.beginPath();
+  ctx.ellipse(fx + lampSide * 4 * u, gy + 2 * u, 26 * u, 4.5 * u, 0, 0, TAU);
+  ctx.fill();
+}
+function drawPlates() {
+  var smallPx = isPhone ? 11 : 12;
+  var titlePx = isPhone ? 16 : 20;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.font = 'bold ' + titlePx + 'px monospace';
+  while (titlePx > 9 && ctx.measureText('Streetwalker 1980').width > VW - 60) {
+    titlePx -= 1;
+    ctx.font = 'bold ' + titlePx + 'px monospace';
+  }
+  var titleW = ctx.measureText('Streetwalker 1980').width;
+  ctx.font = smallPx + 'px monospace';
+  var dateW = ctx.measureText('2007 · 01 · 16').width;
+  var plateW = Math.max(titleW, dateW) + 28;
+  var plateH = titlePx + smallPx + 20;
+  var plateX = 12, plateY = 12;
+  ctx.fillStyle = PLATE;
+  ctx.fillRect(plateX, plateY, plateW, plateH);
+  ctx.strokeStyle = PLATE_LINE;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(plateX + 0.5, plateY + 0.5, plateW - 1, plateH - 1);
+  ctx.fillStyle = TITLE_INK;
+  ctx.font = 'bold ' + titlePx + 'px monospace';
+  ctx.fillText('Streetwalker 1980', plateX + 14, plateY + 7);
+  ctx.font = smallPx + 'px monospace';
+  ctx.fillStyle = HINT_INK;
+  ctx.fillText('2007 · 01 · 16', plateX + 14, plateY + 7 + titlePx + 3);
+  var hint = 'Watch only.';
+  ctx.font = smallPx + 'px monospace';
+  var hintW = ctx.measureText(hint).width;
+  var hintPlateW = hintW + 24;
+  var hintPlateH = smallPx + 14;
+  var hintPlateX = 12;
+  var hintPlateY = VH - hintPlateH - 12;
+  ctx.fillStyle = PLATE;
+  ctx.fillRect(hintPlateX, hintPlateY, hintPlateW, hintPlateH);
+  ctx.strokeStyle = PLATE_LINE;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(hintPlateX + 0.5, hintPlateY + 0.5, hintPlateW - 1, hintPlateH - 1);
+  ctx.fillStyle = HINT_INK;
+  ctx.fillText(hint, hintPlateX + 12, hintPlateY + 7);
+  var snd = soundOn ? 'Sound: on' : 'Sound: off';
+  ctx.font = smallPx + 'px monospace';
+  var sndW = ctx.measureText(snd).width;
+  soundPlate.w = sndW + 24;
+  soundPlate.h = smallPx + 14;
+  soundPlate.x = VW - soundPlate.w - 12;
+  soundPlate.y = VH - soundPlate.h - 12;
+  ctx.fillStyle = PLATE;
+  ctx.fillRect(soundPlate.x, soundPlate.y, soundPlate.w, soundPlate.h);
+  ctx.strokeStyle = PLATE_LINE;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(soundPlate.x + 0.5, soundPlate.y + 0.5, soundPlate.w - 1, soundPlate.h - 1);
+  ctx.fillStyle = HINT_INK;
+  ctx.fillText(snd, soundPlate.x + 12, soundPlate.y + 7);
+}
+/* ---- sound: closed-form model, real WebAudio only after a tap ---- */
+function ensureAudio() {
+  if (typeof AudioContext === 'undefined') return null;
+  if (!audioCtx) {
+    try { audioCtx = new AudioContext(); } catch (e) { return null; }
+    try {
+      noiseBuf = audioCtx.createBuffer(1, audioCtx.sampleRate * 0.3, audioCtx.sampleRate);
+      var d = noiseBuf.getChannelData(0);
+      var j;
+      for (j = 0; j < d.length; j++) d[j] = Math.random() * 2 - 1;
+    } catch (e) { noiseBuf = null; }
+  }
+  if (audioCtx.state === 'suspended') { try { audioCtx.resume(); } catch (e) {} }
+  return audioCtx;
+}
+function playFootfall(tension) {
+  var ac = ensureAudio();
+  if (!ac || !soundOn) return;
+  var now = ac.currentTime;
+  var f = 90 + 160 * tension;
+  var osc = ac.createOscillator();
+  osc.type = 'triangle';
+  osc.frequency.setValueAtTime(f, now);
+  osc.frequency.exponentialRampToValueAtTime(Math.max(40, f * 0.55), now + 0.28);
+  var og = ac.createGain();
+  og.gain.setValueAtTime(0.0001, now);
+  og.gain.exponentialRampToValueAtTime(0.16, now + 0.012);
+  og.gain.exponentialRampToValueAtTime(0.0001, now + 0.30);
+  osc.connect(og);
+  og.connect(ac.destination);
+  osc.start(now);
+  osc.stop(now + 0.32);
+  if (noiseBuf) {
+    var src = ac.createBufferSource();
+    src.buffer = noiseBuf;
+    var bp = ac.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value = 1100 + 900 * tension;
+    bp.Q.value = 1.2;
+    var ng = ac.createGain();
+    ng.gain.setValueAtTime(0.0001, now);
+    ng.gain.exponentialRampToValueAtTime(0.07, now + 0.01);
+    ng.gain.exponentialRampToValueAtTime(0.0001, now + 0.14);
+    src.connect(bp);
+    bp.connect(ng);
+    ng.connect(ac.destination);
+    src.start(now);
+    src.stop(now + 0.16);
+  }
+}
+var prevStepSign = 1;
+function maybeFootfall(st, phase) {
+  if (!soundOn) return;
+  var s = Math.sin(phase);
+  var sign = s >= 0 ? 1 : -1;
+  if (sign !== prevStepSign && st.vel > 0.25) {
+    playFootfall(stringTension(phase, 3));
+  }
+  prevStepSign = sign;
+}
+function draw() {
+  size();
+  var sc = sceneRect();
+  var t = phaseT;
+  var tc = cycleT(t);
+  var st = walkState(tc);
+  ctx.fillStyle = NIGHT;
+  ctx.fillRect(0, 0, VW, VH);
+  drawSky(sc, t);
+  drawBuildings(sc, st.dist);
+  drawLamp(sc, sc.x + sc.w * 0.12, 0.55, 0.5);
+  drawPavement(sc, st.dist);
+  drawLamp(sc, sc.x + sc.w * 0.64, 1.0, 1.0);
+  drawFigure(sc, st, t);
+  drawPlates();
+  maybeFootfall(st, stridePhase(st.travel));
+}
+if (typeof window !== 'undefined') {
+  window.__probe = {
+    drawAt: function (t) { phaseT = t; draw(); },
+    phaseT: function () { return phaseT; },
+    walkState: function () { return walkState(cycleT(phaseT)); }
+  };
+}
+/* ---- frame one: fixed phase t = 3.2 s, mid-stride inside the lamp pool ---- */
+size();
+if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', size);
+if (typeof window !== 'undefined' && window.addEventListener) window.addEventListener('resize', size);
+if (typeof canvas !== 'undefined' && canvas.addEventListener) {
+  canvas.addEventListener('click', function (ev) {
+    var rect = { left: 0, top: 0 };
+    try { rect = canvas.getBoundingClientRect(); } catch (e) {}
+    var x = ev.clientX - rect.left;
+    var y = ev.clientY - rect.top;
+    if (x >= soundPlate.x && x <= soundPlate.x + soundPlate.w && y >= soundPlate.y && y <= soundPlate.y + soundPlate.h) {
+      soundOn = !soundOn;
+      if (soundOn) { ensureAudio(); playFootfall(0.7); }
+      draw();
+    }
+  });
+}
+draw();
+if (!reduced && typeof requestAnimationFrame !== 'undefined') {
+  (function loop() {
+    var t0 = null, prevTs = null, clockT = 0;
+    function step(now) {
+      if (t0 === null) t0 = now;
+      if (prevTs === null) prevTs = now;
+      var dt = clamp((now - prevTs) / 1000, 0, 0.05);
+      prevTs = now;
+      clockT += dt;
+      phaseT = (FRAME_T + clockT) % 86400;
+      var hidden = false;
+      try { hidden = document.hidden; } catch (e) { hidden = false; }
+      if (!hidden) draw();
+      if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  })();
+}
+</script>
+</body>
+</html>
