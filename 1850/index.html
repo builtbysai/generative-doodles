@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tuyshtak</title>
+<style>
+html, body { margin: 0; padding: 0; background: #3A2415; overflow: hidden; }
+canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+/* Driver: six clarinet players in a semicircle on a wooden stage, seen from
+   above and slightly behind. Above each player floats a translucent strip
+   showing their fingering diagram, a vertical ladder of open and closed
+   holes. The six ladders are offset by microtonal cents deviations and, as
+   the players play, the rungs light in sequence and the whole ensemble
+   slowly bends toward one pure just-intonation chord until all six ladders
+   align into one ladder. The viewer only watches. */
+var TAU = Math.PI * 2;
+var GROUND = '#3A2415';
+var WOOD = '#6E4A2E';
+var WOOD_DARK = '#5A3A22';
+var WOOD_LIGHT = '#7D5736';
+var SEAM = '#4A2E1B';
+var BONE = '#E8DCC8';
+var BONE_HI = '#FFF6E0';
+var RED_FADED = '#B4553F';
+var INK = '#0D0906';
+var PLATE = '#1E130C';
+var PLATE_LINE = 'rgba(232,220,200,0.30)';
+var TITLE_INK = '#EFE6D4';
+var HINT_INK = '#C9B89A';
+var FRAME_T = 60.0;        /* fixed phase: early in the convergence, ladders still spread */
+var CYCLE = 600;           /* one full convergence breath, seconds */
+var RUNGS = 7;             /* rungs on every fingering ladder */
+var PLAYERS = 6;
+var DEVIATIONS = [-31, 4, -14, -31, 4, -14];  /* cents, per player */
+var ROOT = 116.54;         /* Bb2, the six clarinets' common root */
+var RATIOS = [1, 9 / 8, 5 / 4, 4 / 3, 3 / 2, 5 / 3];  /* just-intonation chord */
+function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+function lerp(a, b, k) { return a + (b - a) * k; }
+function mulberry32(seed) {
+  return function () {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    var t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+function hexRgb(h) {
+  return [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
+}
+function rgba(h, a) {
+  var c = hexRgb(h);
+  return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a.toFixed(4) + ')';
+}
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var VW = 0, VH = 0, isPhone = false;
+var reduced = false;
+try { reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (e) { reduced = false; }
+var phaseT = FRAME_T;
+var audioCtx = null;
+var voices = null;
+/* ---- seeded stage: plank tones and grain, fixed at load ---- */
+var PLANKS = [];
+var GRAIN = [];
+(function () {
+  var rng = mulberry32(1850);
+  var i, j;
+  for (i = 0; i < 9; i++) {
+    PLANKS.push({ tone: rng() * 0.5 });  /* 0 dark plank, 1 light plank */
+  }
+  for (i = 0; i < 46; i++) {
+    var pts = [];
+    for (j = 0; j < 6; j++) pts.push({ x: j / 5, y: rng() * 0.02 - 0.01 });
+    GRAIN.push({ y: 0.02 + rng() * 0.96, a: 0.04 + rng() * 0.06, pts: pts });
+  }
+})();
+/* ---- the six players: fixed arc positions, fixed per-player offsets ---- */
+var ARC_CX = 0.5, ARC_CY = 1.02, ARC_R = 0.46;
+var PLAYERS_POS = [];
+(function () {
+  var rng = mulberry32(1851);
+  var i, ang;
+  for (i = 0; i < PLAYERS; i++) {
+    ang = (210 + i * 24) * Math.PI / 180;  /* 210 to 330 degrees, semicircle */
+    PLAYERS_POS.push({
+      x: ARC_CX + ARC_R * Math.cos(ang),
+      y: ARC_CY + ARC_R * Math.sin(ang),
+      ang: ang,
+      rungOff: (rng() - 0.5) * 0.030,  /* per-player rung grid offset, converges away */
+      step: (rng() - 0.5) * 1.2        /* per-player rung lighting phase offset */
+    });
+  }
+})();
+/* Convergence: 0 spread, 1 one ladder. A slow cosine breath over CYCLE
+   seconds, aligned at the midpoint, so the loop has no snap. */
+function convergence(t) {
+  var u = ((t % CYCLE) + CYCLE) % CYCLE / CYCLE;
+  return 0.5 - 0.5 * Math.cos(TAU * u);
+}
+function size() {
+  var vw = 0, vh = 0;
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.width) {
+    vw = window.visualViewport.width; vh = window.visualViewport.height;
+  } else if (typeof window !== 'undefined' && window.innerWidth) {
+    vw = window.innerWidth; vh = window.innerHeight;
+  }
+  VW = vw; VH = vh;
+  canvas.width = VW; canvas.height = VH;
+  canvas.style.width = VW + 'px'; canvas.style.height = VH + 'px';
+  if (typeof window !== 'undefined' && window.screen) {
+    var mn = Math.min(window.screen.width, window.screen.height);
+    isPhone = mn < 700 || VH > VW * 1.15;
+  }
+}
+/* The stage fills the frame to the edges on every screen: no hall, no
+   audience, nothing between the viewer and the six players. */
+function fieldRect() {
+  return { x: 0, y: 0, w: VW, h: VH };
+}
+function drawStage(sc) {
+  var i, y0, y1, g, j, p;
+  ctx.fillStyle = WOOD;
+  ctx.fillRect(sc.x, sc.y, sc.w, sc.h);
+  /* planks: nine horizontal boards with alternating tones and dark seams */
+  for (i = 0; i < PLANKS.length; i++) {
+    y0 = sc.y + sc.h * i / PLANKS.length;
+    y1 = sc.y + sc.h * (i + 1) / PLANKS.length;
+    ctx.fillStyle = rgba(PLANKS[i].tone > 0.5 ? WOOD_LIGHT : WOOD_DARK, 0.35);
+    ctx.fillRect(sc.x, y0, sc.w, y1 - y0);
+    ctx.fillStyle = rgba(SEAM, 0.55);
+    ctx.fillRect(sc.x, y1 - 1, sc.w, 1);
+  }
+  /* grain: faint wavy lines, seeded, fixed */
+  ctx.lineWidth = 1;
+  for (i = 0; i < GRAIN.length; i++) {
+    g = GRAIN[i];
+    ctx.strokeStyle = rgba(SEAM, g.a);
+    ctx.beginPath();
+    for (j = 0; j < g.pts.length; j++) {
+      p = g.pts[j];
+      var px = sc.x + p.x * sc.w;
+      var py = sc.y + g.y * sc.h + p.y * sc.h;
+      if (j === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.stroke();
+  }
+  /* soft spotlight over the semicircle, warm from above */
+  var cx = sc.x + sc.w * 0.5;
+  var cy = sc.y + sc.h * 0.62;
+  var R = Math.min(sc.w, sc.h) * 0.85;
+  var grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, R);
+  grad.addColorStop(0, 'rgba(255,214,150,0.10)');
+  grad.addColorStop(0.7, 'rgba(255,214,150,0.02)');
+  grad.addColorStop(1, 'rgba(255,214,150,0)');
+  ctx.fillStyle = grad;
+  ctx.fillRect(sc.x, sc.y, sc.w, sc.h);
+}
+function playerXY(i, sc) {
+  var P = PLAYERS_POS[i];
+  return { x: sc.x + P.x * sc.w, y: sc.y + P.y * sc.h };
+}
+/* Which rung is lit on ladder i at time t. As convergence grows, every
+   player's lit rung is pulled toward the common sequence. */
+function litRung(i, t, p) {
+  var common = Math.floor(t / 2.2) % RUNGS;
+  var mine = Math.floor(t / 2.2 + PLAYERS_POS[i].step) % RUNGS;
+  return Math.round(lerp(mine, common, p));
+}
+function drawLadders(sc, t) {
+  var p = convergence(t);
+  var m = Math.min(sc.w, sc.h);
+  var stripW = m * 0.052;
+  var i, j, P, px, top, bot, x, rungY, lit;
+  var cx = sc.x + sc.w * 0.5;
+  for (i = 0; i < PLAYERS; i++) {
+    P = PLAYERS_POS[i];
+    var pos = playerXY(i, sc);
+    px = pos.x;
+    top = sc.y + sc.h * 0.10;
+    bot = pos.y - m * 0.055;
+    /* the strip glides toward the centre as the ensemble converges */
+    x = lerp(px, cx, p);
+    /* translucent strip, like an organ pipe */
+    ctx.fillStyle = rgba(BONE, 0.08 + 0.05 * p);
+    ctx.fillRect(x - stripW / 2, top, stripW, bot - top);
+    ctx.strokeStyle = rgba(BONE, 0.35 + 0.25 * p);
+    ctx.lineWidth = 1;
+    ctx.strokeRect(x - stripW / 2 + 0.5, top + 0.5, stripW - 1, bot - top - 1);
+    lit = litRung(i, t, p);
+    for (j = 0; j < RUNGS; j++) {
+      /* rung heights converge onto one shared grid as p grows */
+      var sharedY = top + (j + 0.5) * (bot - top) / RUNGS;
+      var myY = top + (j + 0.5 + P.rungOff * RUNGS) * (bot - top) / RUNGS;
+      rungY = lerp(myY, sharedY, p);
+      if (j === lit) {
+        ctx.fillStyle = rgba(BONE_HI, 0.25);
+        ctx.fillRect(x - stripW / 2, rungY - m * 0.006, stripW, m * 0.012);
+        ctx.strokeStyle = BONE_HI;
+        ctx.lineWidth = isPhone ? 2 : 2.5;
+        ctx.beginPath();
+        ctx.moveTo(x - stripW / 2 + 2, rungY);
+        ctx.lineTo(x + stripW / 2 - 2, rungY);
+        ctx.stroke();
+      } else {
+        ctx.strokeStyle = rgba(BONE, 0.55);
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(x - stripW / 2 + 3, rungY);
+        ctx.lineTo(x + stripW / 2 - 3, rungY);
+        ctx.stroke();
+      }
+      /* cents deviation printed small beside each rung, faded red */
+      ctx.fillStyle = rgba(RED_FADED, 0.85);
+      ctx.font = (isPhone ? 7 : 8) + 'px monospace';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      var dev = DEVIATIONS[i] > 0 ? '+' + DEVIATIONS[i] : '' + DEVIATIONS[i];
+      ctx.fillText(dev, x + stripW / 2 + 3, rungY);
+    }
+    /* the deviation label just inside the top of the strip, clear of the
+       title plate at every size */
+    ctx.fillStyle = rgba(RED_FADED, 0.9);
+    ctx.font = 'bold ' + (isPhone ? 9 : 10) + 'px monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'alphabetic';
+    var devTop = DEVIATIONS[i] > 0 ? '+' + DEVIATIONS[i] : '' + DEVIATIONS[i];
+    ctx.fillText(devTop, x, top + 11);
+  }
+}
+function drawPlayers(sc, t) {
+  var p = convergence(t);
+  var m = Math.min(sc.w, sc.h);
+  var i, P, pos, cx, cy, dx, dy, len;
+  /* faint arc marking the players' line on the stage, an ellipse through
+     the six player positions */
+  ctx.strokeStyle = rgba(SEAM, 0.5);
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(sc.x + (ARC_CX + ARC_R * Math.cos(Math.PI * 1.1667)) * sc.w, sc.y + (ARC_CY + ARC_R * Math.sin(Math.PI * 1.1667)) * sc.h);
+  ctx.ellipse(sc.x + ARC_CX * sc.w, sc.y + ARC_CY * sc.h, ARC_R * sc.w, ARC_R * sc.h, 0, Math.PI * 1.1667, Math.PI * 1.8333);
+  ctx.stroke();
+  for (i = 0; i < PLAYERS; i++) {
+    P = PLAYERS_POS[i];
+    pos = playerXY(i, sc);
+    /* soft shadow on the wood */
+    ctx.fillStyle = 'rgba(20,10,4,0.35)';
+    ctx.beginPath();
+    ctx.moveTo(pos.x + m * 0.030, pos.y + m * 0.008);
+    ctx.arc(pos.x, pos.y + m * 0.008, m * 0.030, 0, TAU);
+    ctx.fill();
+    /* clarinet points inward toward the centre of the arc */
+    cx = sc.x + ARC_CX * sc.w;
+    cy = sc.y + ARC_CY * sc.h;
+    dx = cx - pos.x; dy = cy - pos.y;
+    len = Math.sqrt(dx * dx + dy * dy) || 1;
+    dx /= len; dy /= len;
+    var bellX = pos.x + dx * m * 0.052;
+    var bellY = pos.y + dy * m * 0.052;
+    ctx.strokeStyle = INK;
+    ctx.lineWidth = Math.max(2, m * 0.004);
+    ctx.beginPath();
+    ctx.moveTo(pos.x + dx * m * 0.012, pos.y + dy * m * 0.012);
+    ctx.lineTo(bellX, bellY);
+    ctx.stroke();
+    /* bell flare */
+    ctx.fillStyle = INK;
+    ctx.beginPath();
+    ctx.moveTo(bellX + dx * m * 0.010, bellY + dy * m * 0.010);
+    ctx.arc(bellX + dx * m * 0.006, bellY + dy * m * 0.006, m * 0.006, 0, TAU);
+    ctx.fill();
+    /* body: black silhouette, seen from above and slightly behind */
+    ctx.fillStyle = INK;
+    ctx.beginPath();
+    ctx.moveTo(pos.x + m * 0.024, pos.y);
+    ctx.arc(pos.x, pos.y, m * 0.024, 0, TAU);
+    ctx.fill();
+    /* head, toward the arc centre, no facial detail */
+    ctx.beginPath();
+    ctx.moveTo(pos.x + dx * m * 0.026, pos.y + dy * m * 0.026);
+    ctx.arc(pos.x + dx * m * 0.014, pos.y + dy * m * 0.014, m * 0.012, 0, TAU);
+    ctx.fill();
+  }
+}
+function drawPlates() {
+  var smallPx = isPhone ? 11 : 12;
+  var titlePx = isPhone ? 16 : 20;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.font = 'bold ' + titlePx + 'px monospace';
+  while (titlePx > 9 && ctx.measureText('Tuyshtak').width > VW - 60) {
+    titlePx -= 1;
+    ctx.font = 'bold ' + titlePx + 'px monospace';
+  }
+  var titleW = ctx.measureText('Tuyshtak').width;
+  ctx.font = smallPx + 'px monospace';
+  var dateW = ctx.measureText('2007 · 02 · 04').width;
+  var plateW = Math.max(titleW, dateW) + 28;
+  var plateH = titlePx + smallPx + 20;
+  var plateX = 12, plateY = 12;
+  ctx.fillStyle = PLATE;
+  ctx.fillRect(plateX, plateY, plateW, plateH);
+  ctx.strokeStyle = PLATE_LINE;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(plateX + 0.5, plateY + 0.5, plateW - 1, plateH - 1);
+  ctx.fillStyle = TITLE_INK;
+  ctx.font = 'bold ' + titlePx + 'px monospace';
+  ctx.fillText('Tuyshtak', plateX + 14, plateY + 7);
+  ctx.font = smallPx + 'px monospace';
+  ctx.fillStyle = HINT_INK;
+  ctx.fillText('2007 · 02 · 04', plateX + 14, plateY + 7 + titlePx + 3);
+  var hint = 'Watch only.';
+  ctx.font = smallPx + 'px monospace';
+  var hintW = ctx.measureText(hint).width;
+  var hintPlateW = hintW + 24;
+  var hintPlateH = smallPx + 14;
+  var hintPlateX = 12;
+  var hintPlateY = VH - hintPlateH - 12;
+  ctx.fillStyle = PLATE;
+  ctx.fillRect(hintPlateX, hintPlateY, hintPlateW, hintPlateH);
+  ctx.strokeStyle = PLATE_LINE;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(hintPlateX + 0.5, hintPlateY + 0.5, hintPlateW - 1, hintPlateH - 1);
+  ctx.fillStyle = HINT_INK;
+  ctx.fillText(hint, hintPlateX + 12, hintPlateY + 7);
+}
+/* ---- sound: six clarinet-ish voices, sawtooth through a formant filter,
+   each with its own cents offset gliding toward unison as the ladders
+   converge. Created lazily inside the first user gesture, never autoplay. */
+function ensureAudio() {
+  if (typeof AudioContext === 'undefined') return null;
+  if (!audioCtx) {
+    try { audioCtx = new AudioContext(); } catch (e) { return null; }
+  }
+  if (audioCtx.state === 'suspended') { try { audioCtx.resume(); } catch (e) {} }
+  return audioCtx;
+}
+function startVoices(ac) {
+  if (voices) return;
+  try {
+    voices = [];
+    var i, o, f, g;
+    for (i = 0; i < PLAYERS; i++) {
+      o = ac.createOscillator();
+      o.type = 'sawtooth';
+      o.frequency.value = ROOT * RATIOS[i];
+      f = ac.createBiquadFilter();
+      f.type = 'bandpass';
+      f.frequency.value = 1150 + i * 90;
+      f.Q.value = 1.1;
+      g = ac.createGain();
+      g.gain.value = 0.012;
+      o.connect(f);
+      f.connect(g);
+      g.connect(ac.destination);
+      o.start();
+      voices.push({ osc: o, filter: f, gain: g, base: ROOT * RATIOS[i] });
+    }
+  } catch (e) { voices = null; }
+}
+function updateVoices(t) {
+  if (!voices || !audioCtx) return;
+  var p = convergence(t);
+  var i, v, cents;
+  for (i = 0; i < PLAYERS; i++) {
+    v = voices[i];
+    cents = DEVIATIONS[i] * (1 - p);  /* deviations melt away toward unison */
+    try {
+      v.osc.frequency.setTargetAtTime(v.base * Math.pow(2, cents / 1200), audioCtx.currentTime, 0.5);
+    } catch (e) {}
+  }
+}
+function draw() {
+  size();
+  var sc = fieldRect();
+  var t = phaseT;
+  ctx.fillStyle = GROUND;
+  ctx.fillRect(0, 0, VW, VH);
+  drawStage(sc);
+  drawLadders(sc, t);
+  drawPlayers(sc, t);
+  drawPlates();
+  updateVoices(t);
+}
+if (typeof window !== 'undefined') {
+  window.__probe = {
+    drawAt: function (t) { phaseT = t; draw(); },
+    convergenceAt: function (t) { return convergence(t); },
+    playerCount: PLAYERS,
+    ladderCount: PLAYERS,
+    rungCount: RUNGS,
+    litRungAt: function (i, t) { return litRung(i, t, convergence(t)); }
+  };
+}
+/* ---- frame one: fixed phase t = 60.0 s, early in the convergence ---- */
+size();
+if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', size);
+if (typeof window !== 'undefined' && window.addEventListener) window.addEventListener('resize', size);
+/* First gesture only unlocks the sound; it changes nothing visual and the
+   piece has no controls. The timeline advances on its own. */
+if (typeof window !== 'undefined' && window.addEventListener) {
+  var unlock = function () {
+    var ac = ensureAudio();
+    if (ac) startVoices(ac);
+  };
+  window.addEventListener('pointerdown', unlock, { once: true });
+  window.addEventListener('keydown', unlock, { once: true });
+}
+draw();
+if (!reduced && typeof requestAnimationFrame !== 'undefined') {
+  (function loop() {
+    var t0 = null, prevTs = null, clockT = 0;
+    function step(now) {
+      if (t0 === null) t0 = now;
+      if (prevTs === null) prevTs = now;
+      var dt = clamp((now - prevTs) / 1000, 0, 0.05);
+      prevTs = now;
+      clockT += dt;
+      phaseT = (FRAME_T + clockT) % 86400;
+      var hidden = false;
+      try { hidden = document.hidden; } catch (e) { hidden = false; }
+      if (!hidden) draw();
+      if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  })();
+}
+</script>
+</body>
+</html>
