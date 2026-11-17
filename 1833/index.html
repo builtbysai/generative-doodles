@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Metrical Discomfort</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #0b0b0e; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // Seeded PRNG, fixed seed: frame one is fully deterministic.
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  var rnd = mulberry32(1833);
+
+  var reduced = false;
+  try {
+    reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  } catch (e) { reduced = false; }
+
+  // Driver: one rotating phasor sweeps a ring of twelve strike points.
+  // The eye expects a clock, the ear keeps getting refused, because the
+  // live points follow a Euclidean pattern that never settles on 4/4.
+  //
+  // Fixed tempo, 96 BPM. One bar is 2.5 s, one beam revolution per bar.
+  // k changes every 8 bars (20 s) through [5, 7, 9, 11]; the whole
+  // pattern cycle is 32 bars, 80 s. A live point fires when the beam
+  // crosses its angle; the flare decays in 0.9 s, the violet trail in 6 s.
+  var BPM = 96;
+  var BAR = 60 / BPM * 4;      // 2.5 s
+  var KSCHED = [5, 7, 9, 11];
+  var CYCLE = 32 * BAR;        // 80 s
+  var NPOINTS = 12;
+  var FLARE_DUR = 0.9;
+  var TRAIL_DUR = 6;
+
+  // Euclidean pattern E(k, n), maximally even distribution, rotation
+  // starting with a hit at position 0. Computed, not tabled.
+  function euclid(k, n) {
+    var p = [];
+    for (var i = 0; i < n; i++) {
+      p.push(Math.floor(i * k / n) - Math.floor((i - 1) * k / n) === 1 ? 1 : 0);
+    }
+    return p;
+  }
+  var PATTERNS = {};
+  for (var pk = 0; pk < KSCHED.length; pk++) {
+    PATTERNS[KSCHED[pk]] = euclid(KSCHED[pk], NPOINTS);
+  }
+  function patternForBar(bar) {
+    var k = KSCHED[Math.floor(bar / 8) % KSCHED.length];
+    return PATTERNS[k];
+  }
+
+  // Per-point radius jitter, seeded once, fixed forever.
+  var PRAD = [];
+  for (var i = 0; i < NPOINTS; i++) {
+    PRAD.push(4.4 + rnd() * 1.2);
+  }
+
+  var GROUND = '#0b0b0e';
+  var DISC = '#121218';
+  var BONE = '#e8e2d4';
+  var ORANGE = '#ff5c1a';
+  var VIOLET = '#8b7fd4';
+
+  function alpha(v) {
+    var a = Math.round(v * 10000) / 10000;
+    if (a < 0) a = 0;
+    if (a > 1) a = 1;
+    return a;
+  }
+
+  // Seconds since point i last fired, in cycle-local time lt (0..80).
+  // Scans back 8 bars, wrapping inside the 80 s cycle, so the result is
+  // a pure function of lt. Returns Infinity if no fire in the window.
+  function lastFireAge(i, lt) {
+    var curBar = Math.floor(lt / BAR);
+    var best = Infinity;
+    for (var j = 0; j < 8; j++) {
+      var b = curBar - j;
+      var bb = ((b % 32) + 32) % 32;
+      if (!patternForBar(bb)[i]) continue;
+      var ft = b * BAR + (i / NPOINTS) * BAR;
+      var age = lt - ft;
+      while (age < 0) age += CYCLE;
+      while (age >= CYCLE) age -= CYCLE;
+      if (age < best) best = age;
+    }
+    return best;
+  }
+
+  // ---- Sound: opt-in only, tap toggles. Never autoplay. ----
+  var actx = null;
+  var soundOn = false;
+  function ensureAudio() {
+    var AC = null;
+    try { AC = window.AudioContext || window.webkitAudioContext; } catch (e) { AC = null; }
+    if (!AC) return false;
+    if (!actx) {
+      try { actx = new AC(); } catch (e) { return false; }
+    }
+    if (actx.state === 'suspended') {
+      try { actx.resume(); } catch (e) {}
+    }
+    return true;
+  }
+  // Short membrane-ish hit: sine dropping 150 to 52 Hz under a fast
+  // attack and a 0.32 s decay. Quiet, one per fire, nothing else.
+  function thump() {
+    if (!actx) return;
+    try {
+      var t0 = actx.currentTime + 0.01;
+      var o = actx.createOscillator();
+      var g = actx.createGain();
+      o.type = 'sine';
+      o.frequency.setValueAtTime(150, t0);
+      o.frequency.exponentialRampToValueAtTime(52, t0 + 0.14);
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.exponentialRampToValueAtTime(0.5, t0 + 0.008);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.32);
+      o.connect(g);
+      g.connect(actx.destination);
+      o.start(t0);
+      o.stop(t0 + 0.36);
+    } catch (e) {}
+  }
+  // Fire the thump for every live-point crossing between prevT and t.
+  // Split at bar boundaries so each crossing uses its own bar's pattern.
+  var prevT = null;
+  function audioTick(t) {
+    if (!soundOn || !actx) { prevT = t; return; }
+    if (prevT === null || t - prevT > 1) { prevT = t; return; }
+    var a = prevT, b = t;
+    while (a < b) {
+      var barStart = Math.floor(a / BAR) * BAR;
+      var segEnd = Math.min(b, barStart + BAR);
+      var pat = patternForBar(Math.floor(a / BAR));
+      for (var i = 0; i < NPOINTS; i++) {
+        if (!pat[i]) continue;
+        var ft = barStart + (i / NPOINTS) * BAR;
+        if (ft > a && ft <= segEnd) thump();
+      }
+      a = segEnd;
+    }
+    prevT = t;
+  }
+
+  var lastT = 61.35;
+
+  function draw(t) {
+    lastT = t;
+    var vw = (window.visualViewport && window.visualViewport.width) || window.innerWidth;
+    var vh = (window.visualViewport && window.visualViewport.height) || window.innerHeight;
+    var dpr = window.devicePixelRatio || 1;
+    var W = Math.max(1, Math.floor(vw));
+    var H = Math.max(1, Math.floor(vh));
+    canvas.width = Math.floor(W * dpr);
+    canvas.height = Math.floor(H * dpr);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    var isPhone = false;
+    try {
+      var sw = window.screen.width, sh = window.screen.height;
+      var mn = Math.min(sw, sh);
+      isPhone = mn < 700 || (H > W * 1.15);
+    } catch (e) { isPhone = (H > W * 1.15); }
+
+    var lt = t % CYCLE;
+    var bar = Math.floor(lt / BAR);
+    var pat = patternForBar(bar);
+    var beamAng = ((lt % BAR) / BAR) * Math.PI * 2; // 0 at top, clockwise
+
+    // Page ground: near-black, the piece's own background.
+    ctx.fillStyle = GROUND;
+    ctx.fillRect(0, 0, W, H);
+
+    var cx = W / 2, cy = H / 2;
+    var R = Math.min(W, H) * 0.36;
+    var DISC_R = R + 16;
+
+    // The dark circle the ring sits on, a shade lighter than the ground.
+    ctx.fillStyle = DISC;
+    ctx.beginPath();
+    ctx.moveTo(cx + DISC_R, cy);
+    ctx.arc(cx, cy, DISC_R, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(232,226,212,0.16)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(cx + DISC_R, cy);
+    ctx.arc(cx, cy, DISC_R, 0, Math.PI * 2);
+    ctx.stroke();
+    // Faint ring line the strike points sit on.
+    ctx.strokeStyle = 'rgba(232,226,212,0.10)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(cx + R, cy);
+    ctx.arc(cx, cy, R, 0, Math.PI * 2);
+    ctx.stroke();
+
+    // Point positions: angle a measured clockwise from the top.
+    function pt(i) {
+      var a = (i / NPOINTS) * Math.PI * 2;
+      return { x: cx + R * Math.sin(a), y: cy - R * Math.cos(a), a: a };
+    }
+
+    // ---- Fading violet trails, oldest first, under the points ----
+    for (var i = 0; i < NPOINTS; i++) {
+      var age = lastFireAge(i, lt);
+      if (age === Infinity || age >= TRAIL_DUR) continue;
+      var p = pt(i);
+      var f = 1 - age / TRAIL_DUR;
+      var ta = alpha(0.5 * Math.pow(f, 1.5));
+      var w = 0.11 + (1 - f) * 0.05;
+      ctx.strokeStyle = VIOLET;
+      ctx.globalAlpha = ta;
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(cx, cy, R, p.a - Math.PI / 2 - w, p.a - Math.PI / 2 + w);
+      ctx.stroke();
+      // A violet ember at the point itself, cooling with the trail.
+      ctx.globalAlpha = alpha(ta * 0.7);
+      ctx.fillStyle = VIOLET;
+      ctx.beginPath();
+      ctx.moveTo(p.x + 3, p.y);
+      ctx.arc(p.x, p.y, 3, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    // ---- The beam: a faint wedge behind it, then the thin line ----
+    ctx.fillStyle = BONE;
+    ctx.globalAlpha = alpha(0.04);
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.arc(cx, cy, R + 8, beamAng - Math.PI / 2 - 0.4, beamAng - Math.PI / 2);
+    ctx.closePath();
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    var bx = cx + (R + 10) * Math.sin(beamAng);
+    var by = cy - (R + 10) * Math.cos(beamAng);
+    ctx.strokeStyle = BONE;
+    ctx.globalAlpha = alpha(0.5);
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(bx, by);
+    ctx.stroke();
+    ctx.globalAlpha = alpha(0.9);
+    ctx.fillStyle = BONE;
+    ctx.beginPath();
+    ctx.moveTo(cx + R * Math.sin(beamAng) + 3, cy - R * Math.cos(beamAng));
+    ctx.arc(cx + R * Math.sin(beamAng), cy - R * Math.cos(beamAng), 3, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    // Centre pin.
+    ctx.fillStyle = BONE;
+    ctx.globalAlpha = alpha(0.7);
+    ctx.beginPath();
+    ctx.moveTo(cx + 2.5, cy);
+    ctx.arc(cx, cy, 2.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+
+    // ---- Strike points: live ones filled bone, the rest hollow ----
+    for (var j = 0; j < NPOINTS; j++) {
+      var q = pt(j);
+      if (pat[j]) {
+        ctx.fillStyle = BONE;
+        ctx.beginPath();
+        ctx.moveTo(q.x + PRAD[j], q.y);
+        ctx.arc(q.x, q.y, PRAD[j], 0, Math.PI * 2);
+        ctx.fill();
+      } else {
+        ctx.strokeStyle = BONE;
+        ctx.globalAlpha = alpha(0.4);
+        ctx.lineWidth = 1.2;
+        ctx.beginPath();
+        ctx.moveTo(q.x + 4, q.y);
+        ctx.arc(q.x, q.y, 4, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+      }
+    }
+
+    // ---- Flares: signal orange, decaying over 0.9 s ----
+    for (var k2 = 0; k2 < NPOINTS; k2++) {
+      var age2 = lastFireAge(k2, lt);
+      if (age2 === Infinity || age2 >= FLARE_DUR) continue;
+      var p2 = pt(k2);
+      var ff = 1 - age2 / FLARE_DUR;
+      // Glow rings, then a hot core.
+      ctx.fillStyle = ORANGE;
+      ctx.globalAlpha = alpha(0.10 * ff);
+      ctx.beginPath();
+      ctx.moveTo(p2.x + 24 * ff + 8, p2.y);
+      ctx.arc(p2.x, p2.y, 24 * ff + 8, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = alpha(0.22 * ff);
+      ctx.beginPath();
+      ctx.moveTo(p2.x + 14 * ff + 4, p2.y);
+      ctx.arc(p2.x, p2.y, 14 * ff + 4, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = alpha(0.9 * ff);
+      ctx.beginPath();
+      ctx.moveTo(p2.x + 6.5, p2.y);
+      ctx.arc(p2.x, p2.y, 6.5, 0, Math.PI * 2);
+      ctx.fill();
+      // Four short spikes, radial and tangential.
+      var sp = 8 + 10 * ff;
+      ctx.strokeStyle = ORANGE;
+      ctx.globalAlpha = alpha(0.75 * ff);
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(p2.x + Math.sin(p2.a) * 8, p2.y - Math.cos(p2.a) * 8);
+      ctx.lineTo(p2.x + Math.sin(p2.a) * sp, p2.y - Math.cos(p2.a) * sp);
+      ctx.moveTo(p2.x - Math.sin(p2.a) * 8, p2.y + Math.cos(p2.a) * 8);
+      ctx.lineTo(p2.x - Math.sin(p2.a) * sp, p2.y + Math.cos(p2.a) * sp);
+      ctx.moveTo(p2.x + Math.cos(p2.a) * 8, p2.y + Math.sin(p2.a) * 8);
+      ctx.lineTo(p2.x + Math.cos(p2.a) * sp, p2.y + Math.sin(p2.a) * sp);
+      ctx.moveTo(p2.x - Math.cos(p2.a) * 8, p2.y - Math.sin(p2.a) * 8);
+      ctx.lineTo(p2.x - Math.cos(p2.a) * sp, p2.y - Math.sin(p2.a) * sp);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+
+    // ---- Title, date and hint plates, drawn on canvas ----
+    ctx.textAlign = 'left';
+    ctx.fillStyle = BONE;
+    ctx.font = '600 13px system-ui, sans-serif';
+    ctx.fillText('METRICAL DISCOMFORT', 16, 26);
+    ctx.fillStyle = '#8a8578';
+    ctx.font = '11px system-ui, sans-serif';
+    ctx.fillText('2007 · 01 · 18', 16, 44);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#8a8578';
+    ctx.font = '11px system-ui, sans-serif';
+    ctx.fillText('WATCH ONLY', W / 2, H - 30);
+    ctx.fillStyle = '#6a6558';
+    ctx.font = '10px system-ui, sans-serif';
+    ctx.fillText(soundOn ? 'SOUND ON, TAP TO MUTE' : 'TAP FOR SOUND', W / 2, H - 14);
+  }
+
+  // Tap only toggles the optional sound. Nothing else is interactive.
+  canvas.addEventListener('click', function () {
+    if (!soundOn) {
+      if (ensureAudio()) soundOn = true;
+    } else {
+      soundOn = false;
+    }
+    draw(lastT);
+  });
+
+  // One synchronous frame at load: fixed phase t = 61.35 s.
+  // Bar 24 (k = 11), beam at 194.4 degrees: seven fires already landed
+  // this bar, the 180 degree flare is 0.10 s old and the 150 degree
+  // flare is mid-decay, and the previous bar's nine fires still show
+  // as violet trails, so the rhythm's shape is visible at once.
+  draw(61.35);
+
+  if (reduced) return;
+
+  var start = null;
+  function loop(ts) {
+    if (start === null) start = ts;
+    var t = 61.35 + (ts - start) / 1000;
+    draw(t);
+    audioTick(t);
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(loop);
+    }
+  }
+  if (typeof requestAnimationFrame === 'function') {
+    requestAnimationFrame(loop);
+  }
+
+  function onResize() { draw(61.35); }
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', onResize);
+  }
+  window.addEventListener('resize', onResize);
+})();
+</script>
+</body>
+</html>
