@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Amendment</title>
+<style>
+html, body { margin: 0; padding: 0; background: #F7F3E8; overflow: hidden; }
+canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+/* Driver: a broadsheet of the word AMENDMENT lettered over and over in red
+   ink, while thick black bars drift across it like slow glaciers and swallow
+   the words one by one. Each word carries a small sung voice, and a covered
+   word goes quiet, so the page thins into a hush. A few bright words survive
+   in white gaps on the black, still singing, and the music left standing is
+   what the black bars could not silence. Dragging draws your own bar, and
+   erasure becomes the instrument. */
+var TAU = Math.PI * 2;
+var PAPER = '#F7F3E8';
+var PAPER_SHADE = '#EFE8D6';
+var RED = '#B3271E';
+var RED_DARK = '#8F1F16';
+var RED_LIGHT = '#C23A2A';
+var BLACK = '#141210';
+var BLACK_SOFT = 'rgba(20,18,16,0.55)';
+var BONE = '#F2EAD8';
+var BONE_GLOW = 'rgba(242,234,216,0.35)';
+var PLATE = '#FBFAF7';
+var PLATE_LINE = 'rgba(46,44,41,0.30)';
+var TITLE_INK = '#2E2C29';
+var HINT_INK = '#5C5954';
+var FRAME_T = 60.0;        /* fixed phase for frame one */
+var ROWS = 13;
+var VOICE_COUNT = 6;
+var VOICE_FREQS = [110.0, 130.81, 164.81, 196.0, 246.94, 293.66];
+function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+function lerp(a, b, f) { return a + (b - a) * f; }
+function mulberry32(seed) {
+  return function () {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    var t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+function hexRgb(h) {
+  return [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
+}
+function rgba(h, a) {
+  var c = hexRgb(h);
+  return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a.toFixed(4) + ')';
+}
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var VW = 0, VH = 0, isPhone = false;
+var reduced = false;
+try { reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (e) { reduced = false; }
+var phaseT = FRAME_T;
+var soundOn = true;
+var audioCtx = null;
+var master = null;
+var voices = null;   /* one voice per row band, built lazily inside a gesture */
+var soundPlate = { x: 0, y: 0, w: 0, h: 0 };
+var userBars = [];   /* bars drawn by dragging, in field fractions */
+var dragBar = null;  /* bar in progress, in field fractions */
+/* Five glacier bars. Each sweeps horizontally at its own slow pace, so at
+   the fixed first frame (t = 60) several are already partway across the
+   page with words covered beneath them. */
+var AUTO_BARS = [
+  { y: 0.075, h: 0.115, len: 0.52, speed: 0.0042, phase: 0.31, dir: 1 },
+  { y: 0.245, h: 0.115, len: 0.44, speed: 0.0031, phase: 0.78, dir: -1 },
+  { y: 0.415, h: 0.115, len: 0.58, speed: 0.0037, phase: 0.12, dir: 1 },
+  { y: 0.585, h: 0.115, len: 0.47, speed: 0.0026, phase: 0.55, dir: -1 },
+  { y: 0.755, h: 0.115, len: 0.50, speed: 0.0034, phase: 0.80, dir: 1 }
+];
+/* Survivor slots: one per bar, row and column chosen so the word centre sits
+   inside its bar at the fixed first frame (t = 60). A survivor outside its
+   bar is drawn in red ink like any other word, never as a pale ghost. */
+var SURVIVORS = [
+  { row: 0, col: 2 }, { row: 1, col: 1 }, { row: 3, col: 1 },
+  { row: 6, col: 2 }, { row: 9, col: 1 }, { row: 11, col: 3 }
+];
+function size() {
+  var vw = 0, vh = 0;
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.width) {
+    vw = window.visualViewport.width; vh = window.visualViewport.height;
+  } else if (typeof window !== 'undefined' && window.innerWidth) {
+    vw = window.innerWidth; vh = window.innerHeight;
+  }
+  VW = vw; VH = vh;
+  canvas.width = VW; canvas.height = VH;
+  canvas.style.width = VW + 'px'; canvas.style.height = VH + 'px';
+  if (typeof window !== 'undefined' && window.screen) {
+    var mn = Math.min(window.screen.width, window.screen.height);
+    isPhone = mn < 700 || VH > VW * 1.15;
+  }
+}
+/* Field-like composition: full-bleed on phones, a centered square on desktop. */
+function fieldRect() {
+  if (isPhone) return { x: 0, y: 0, w: VW, h: VH };
+  var s = Math.min(VW, VH);
+  return { x: (VW - s) / 2, y: (VH - s) / 2, w: s, h: s };
+}
+/* Bar left edge as a pure function of time: a slow sweep that wraps. */
+function barX(b, t) {
+  var span = 1.6;
+  var u = (b.phase + b.dir * b.speed * t) % span;
+  if (u < 0) u += span;
+  return u - 0.3;
+}
+function barRects(rc, t) {
+  var rects = [], i, b, x;
+  for (i = 0; i < AUTO_BARS.length; i++) {
+    b = AUTO_BARS[i];
+    x = barX(b, t);
+    rects.push({ x: rc.x + x * rc.w, y: rc.y + b.y * rc.h, w: b.len * rc.w, h: b.h * rc.h, auto: true });
+  }
+  for (i = 0; i < userBars.length; i++) {
+    rects.push({ x: rc.x + userBars[i].x * rc.w, y: rc.y + userBars[i].y * rc.h, w: userBars[i].w * rc.w, h: userBars[i].h * rc.h, auto: false });
+  }
+  if (dragBar) {
+    rects.push({ x: rc.x + dragBar.x * rc.w, y: rc.y + dragBar.y * rc.h, w: dragBar.w * rc.w, h: dragBar.h * rc.h, auto: false });
+  }
+  return rects;
+}
+/* The word grid, rebuilt deterministically from the seed on every draw, so
+   frame one is identical on every load. */
+function buildWords(rc) {
+  var m = Math.min(rc.w, rc.h);
+  var fs = m * 0.034;
+  var wordW = fs * 5.4;
+  var stepX = fs * 6.35;
+  var stepY = rc.h * 0.064;
+  var marginX = rc.w * 0.045;
+  var cols = Math.max(3, Math.floor((rc.w - marginX * 2 + fs) / stepX));
+  var rng = mulberry32(1859);
+  var words = [], r, c, jx, jy, rot, shade;
+  for (r = 0; r < ROWS; r++) {
+    for (c = 0; c < cols; c++) {
+      jx = (rng() - 0.5) * fs * 0.35;
+      jy = (rng() - 0.5) * fs * 0.22;
+      rot = (rng() - 0.5) * 0.05;
+      shade = rng();
+      words.push({
+        row: r, col: c,
+        x: rc.x + marginX + c * stepX + jx,
+        y: rc.y + rc.h * 0.10 + r * stepY + jy,
+        rot: rot,
+        ink: shade < 0.55 ? RED : (shade < 0.85 ? RED_DARK : RED_LIGHT),
+        fs: fs * (0.96 + rng() * 0.08),
+        survivor: false
+      });
+    }
+  }
+  var s, idx;
+  for (s = 0; s < SURVIVORS.length; s++) {
+    idx = SURVIVORS[s].row * cols + Math.min(SURVIVORS[s].col, cols - 1);
+    if (idx >= 0 && idx < words.length) words[idx].survivor = true;
+  }
+  return { words: words, cols: cols, fs: fs, stepY: stepY };
+}
+function wordCovered(w, rects) {
+  var cx = w.x + w.fs * 2.7, cy = w.y;
+  var i, r;
+  for (i = 0; i < rects.length; i++) {
+    r = rects[i];
+    if (cx >= r.x && cx <= r.x + r.w && cy >= r.y && cy <= r.y + r.h) return true;
+  }
+  return false;
+}
+/* ---- audio: built lazily inside the first gesture, never autoplay ---- */
+function ensureAudio() {
+  if (typeof AudioContext === 'undefined') return null;
+  if (!audioCtx) {
+    try {
+      audioCtx = new AudioContext();
+      master = audioCtx.createGain();
+      master.gain.value = 0.7;
+      master.connect(audioCtx.destination);
+      voices = [];
+      var j, v, o1, o2, f1, g, lfo, vib;
+      for (j = 0; j < VOICE_COUNT; j++) {
+        v = { gainNode: null, filt: null, base: 0.11 };
+        f1 = audioCtx.createBiquadFilter();
+        f1.type = 'bandpass'; f1.frequency.value = 620 + j * 130; f1.Q.value = 2.2;
+        g = audioCtx.createGain();
+        g.gain.value = 0.0001;
+        f1.connect(g); g.connect(master);
+        v.gainNode = g; v.filt = f1;
+        /* sung voice model: two soft sawtooths a fifth apart, slow vibrato */
+        o1 = audioCtx.createOscillator();
+        o1.type = 'sawtooth'; o1.frequency.value = VOICE_FREQS[j];
+        o2 = audioCtx.createOscillator();
+        o2.type = 'sawtooth'; o2.frequency.value = VOICE_FREQS[j] * 1.5;
+        var g1 = audioCtx.createGain(); g1.gain.value = 0.6;
+        var g2 = audioCtx.createGain(); g2.gain.value = 0.35;
+        o1.connect(g1); g1.connect(f1);
+        o2.connect(g2); g2.connect(f1);
+        lfo = audioCtx.createOscillator();
+        lfo.type = 'sine'; lfo.frequency.value = 4.8 + j * 0.35;
+        vib = audioCtx.createGain(); vib.gain.value = 3.0;
+        lfo.connect(vib); vib.connect(o1.detune); vib.connect(o2.detune);
+        lfo.start();
+        o1.start(); o2.start();
+        voices.push(v);
+      }
+    } catch (e) { return null; }
+  }
+  if (audioCtx.state === 'suspended') { try { audioCtx.resume(); } catch (e) {} }
+  return audioCtx;
+}
+function updateAudio(voiceLevels) {
+  if (!audioCtx || !voices) return;
+  var i, v;
+  try {
+    for (i = 0; i < voices.length; i++) {
+      v = voices[i];
+      var g = soundOn ? voiceLevels[i] * v.base : 0;
+      v.gainNode.gain.setTargetAtTime(Math.max(g, 0.0001), audioCtx.currentTime, 0.3);
+    }
+  } catch (e) {}
+}
+function drawBarRect(r, t) {
+  var m = Math.min(VW, VH);
+  /* soft ink edges: two translucent passes feather the top and bottom */
+  ctx.fillStyle = BLACK_SOFT;
+  ctx.fillRect(r.x - m * 0.004, r.y - m * 0.006, r.w + m * 0.008, r.h + m * 0.012);
+  ctx.fillStyle = BLACK;
+  ctx.fillRect(r.x, r.y, r.w, r.h);
+  /* a faint hand-drawn wobble along the lower edge */
+  ctx.fillStyle = rgba(BLACK, 0.85);
+  ctx.fillRect(r.x + r.w * 0.08, r.y + r.h - m * 0.004, r.w * 0.5, m * 0.004);
+  ctx.fillRect(r.x + r.w * 0.62, r.y + r.h - m * 0.003, r.w * 0.3, m * 0.003);
+}
+function drawPlates() {
+  var smallPx = isPhone ? 11 : 12;
+  var titlePx = isPhone ? 16 : 20;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.font = 'bold ' + titlePx + 'px monospace';
+  while (titlePx > 9 && ctx.measureText('Amendment').width > VW - 60) {
+    titlePx -= 1;
+    ctx.font = 'bold ' + titlePx + 'px monospace';
+  }
+  var titleW = ctx.measureText('Amendment').width;
+  ctx.font = smallPx + 'px monospace';
+  var dateW = ctx.measureText('2007 · 02 · 13').width;
+  var plateW = Math.max(titleW, dateW) + 28;
+  var plateH = titlePx + smallPx + 20;
+  var plateX = 12, plateY = 12;
+  ctx.fillStyle = PLATE;
+  ctx.fillRect(plateX, plateY, plateW, plateH);
+  ctx.strokeStyle = PLATE_LINE;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(plateX + 0.5, plateY + 0.5, plateW - 1, plateH - 1);
+  ctx.fillStyle = TITLE_INK;
+  ctx.font = 'bold ' + titlePx + 'px monospace';
+  ctx.fillText('Amendment', plateX + 14, plateY + 7);
+  ctx.font = smallPx + 'px monospace';
+  ctx.fillStyle = HINT_INK;
+  ctx.fillText('2007 · 02 · 13', plateX + 14, plateY + 7 + titlePx + 3);
+  var hint = 'Drag to redact a word silent.';
+  ctx.font = smallPx + 'px monospace';
+  var hintW = ctx.measureText(hint).width;
+  var hintPlateW = hintW + 24;
+  var hintPlateH = smallPx + 14;
+  var hintPlateX = 12;
+  var hintPlateY = VH - hintPlateH - 12;
+  ctx.fillStyle = PLATE;
+  ctx.fillRect(hintPlateX, hintPlateY, hintPlateW, hintPlateH);
+  ctx.strokeStyle = PLATE_LINE;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(hintPlateX + 0.5, hintPlateY + 0.5, hintPlateW - 1, hintPlateH - 1);
+  ctx.fillStyle = HINT_INK;
+  ctx.fillText(hint, hintPlateX + 12, hintPlateY + 7);
+  var snd = soundOn ? 'Sound: on' : 'Sound: off';
+  ctx.font = smallPx + 'px monospace';
+  var sndW = ctx.measureText(snd).width;
+  soundPlate.w = sndW + 24;
+  soundPlate.h = smallPx + 14;
+  soundPlate.x = VW - soundPlate.w - 12;
+  soundPlate.y = VH - soundPlate.h - 12;
+  ctx.fillStyle = PLATE;
+  ctx.fillRect(soundPlate.x, soundPlate.y, soundPlate.w, soundPlate.h);
+  ctx.strokeStyle = PLATE_LINE;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(soundPlate.x + 0.5, soundPlate.y + 0.5, soundPlate.w - 1, soundPlate.h - 1);
+  ctx.fillStyle = HINT_INK;
+  ctx.fillText(snd, soundPlate.x + 12, soundPlate.y + 7);
+}
+function draw() {
+  size();
+  var sc = fieldRect();
+  var t = phaseT;
+  var rects = barRects(sc, t);
+  var grid = buildWords(sc);
+  var words = grid.words;
+  var i, w;
+  var voiceTotal = [], voiceOpen = [], v;
+  for (v = 0; v < VOICE_COUNT; v++) { voiceTotal[v] = 0; voiceOpen[v] = 0; }
+  var covered = [];
+  for (i = 0; i < words.length; i++) {
+    w = words[i];
+    var c = wordCovered(w, rects);
+    covered.push(c);
+    var vi = w.row % VOICE_COUNT;
+    voiceTotal[vi] += 1;
+    if (!c) voiceOpen[vi] += 1;
+  }
+  var voiceLevels = [];
+  for (v = 0; v < VOICE_COUNT; v++) {
+    voiceLevels[v] = voiceTotal[v] ? voiceOpen[v] / voiceTotal[v] : 0;
+  }
+  updateAudio(voiceLevels);
+  ctx.fillStyle = PAPER;
+  ctx.fillRect(0, 0, VW, VH);
+  /* faint paper grain lines, a broadsheet rule every few rows */
+  ctx.strokeStyle = rgba(PAPER_SHADE, 0.9);
+  ctx.lineWidth = 1;
+  var r;
+  for (r = 1; r < ROWS; r += 2) {
+    var gy = sc.y + sc.h * 0.10 + r * grid.stepY - grid.fs * 0.9;
+    ctx.beginPath();
+    ctx.moveTo(sc.x + sc.w * 0.03, gy);
+    ctx.lineTo(sc.x + sc.w * 0.97, gy);
+    ctx.stroke();
+  }
+  /* red ink words: covered words are skipped, survivors outside their bar
+     are drawn in red ink, survivors inside their bar are drawn later */
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'middle';
+  for (i = 0; i < words.length; i++) {
+    w = words[i];
+    if (covered[i] && !w.survivor) continue;
+    ctx.save();
+    ctx.translate(w.x, w.y);
+    ctx.rotate(w.rot);
+    ctx.font = 'bold ' + Math.round(w.fs) + 'px monospace';
+    ctx.fillStyle = w.ink;
+    ctx.fillText('AMENDMENT', 0, 0);
+    ctx.restore();
+  }
+  /* glacier bars sweep over the text */
+  for (i = 0; i < rects.length; i++) drawBarRect(rects[i], t);
+  /* survivors: bone white words standing in white gaps on the black, only
+     where a bar actually covers them. The bone pass is clipped to the bars,
+     so a word half out of a bar stays red ink on paper at its free end. */
+  var glow = 0.5 + 0.5 * Math.sin(TAU * t / 9 + 1.2);
+  for (i = 0; i < words.length; i++) {
+    w = words[i];
+    if (!w.survivor || !covered[i]) continue;
+    ctx.save();
+    ctx.beginPath();
+    var ri;
+    for (ri = 0; ri < rects.length; ri++) ctx.rect(rects[ri].x, rects[ri].y, rects[ri].w, rects[ri].h);
+    ctx.clip();
+    ctx.save();
+    ctx.translate(w.x, w.y);
+    ctx.rotate(w.rot);
+    ctx.font = 'bold ' + Math.round(w.fs * 1.06) + 'px monospace';
+    var tw = ctx.measureText('AMENDMENT').width;
+    ctx.fillStyle = rgba(BONE, 0.18 + 0.14 * glow);
+    ctx.fillRect(-w.fs * 0.35, -w.fs * 0.75, tw + w.fs * 0.7, w.fs * 1.5);
+    ctx.fillStyle = BONE;
+    ctx.fillText('AMENDMENT', 0, 0);
+    ctx.restore();
+    ctx.restore();
+  }
+  drawPlates();
+}
+if (typeof window !== 'undefined') {
+  window.__probe = {
+    drawAt: function (t) { phaseT = t; draw(); },
+    wordCount: function () { return buildWords(fieldRect()).words.length; }
+  };
+}
+/* ---- frame one: fixed phase t = 60.0 s, bars partway across the page ---- */
+size();
+if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', size);
+if (typeof window !== 'undefined' && window.addEventListener) window.addEventListener('resize', size);
+function fieldFrac(ev) {
+  var rect = { left: 0, top: 0 };
+  try { rect = canvas.getBoundingClientRect(); } catch (e) {}
+  var px = ev.clientX - rect.left, py = ev.clientY - rect.top;
+  var sc = fieldRect();
+  return {
+    x: clamp((px - sc.x) / Math.max(sc.w, 1), 0, 0.98),
+    y: clamp((py - sc.y) / Math.max(sc.h, 1), 0, 0.95)
+  };
+}
+function onDown(ev) {
+  var px = 0, py = 0;
+  try { px = ev.clientX; py = ev.clientY; } catch (e) {}
+  if (px >= soundPlate.x && px <= soundPlate.x + soundPlate.w && py >= soundPlate.y && py <= soundPlate.y + soundPlate.h) {
+    soundOn = !soundOn;
+    updateAudio([1, 1, 1, 1, 1, 1]);
+    draw();
+    return;
+  }
+  ensureAudio();
+  var p = fieldFrac(ev);
+  var sc = fieldRect();
+  var barH = Math.min(sc.w, sc.h) * 0.034 * 1.7 / sc.h;
+  dragBar = { x: p.x, y: clamp(p.y - barH / 2, 0, 1 - barH), w: 0.01, h: barH, x0: p.x };
+  try { ev.preventDefault(); } catch (e) {}
+}
+function onMove(ev) {
+  if (!dragBar) return;
+  var p = fieldFrac(ev);
+  dragBar.x = Math.min(dragBar.x0, p.x);
+  dragBar.w = Math.max(0.01, Math.abs(p.x - dragBar.x0));
+  draw();
+  try { ev.preventDefault(); } catch (e) {}
+}
+function onUp() {
+  if (!dragBar) return;
+  if (dragBar.w > 0.03) {
+    userBars.push({ x: dragBar.x, y: dragBar.y, w: dragBar.w, h: dragBar.h });
+    if (userBars.length > 10) userBars.shift();
+  }
+  dragBar = null;
+  draw();
+}
+if (typeof canvas !== 'undefined' && canvas.addEventListener) {
+  canvas.addEventListener('pointerdown', onDown);
+  canvas.addEventListener('pointermove', onMove);
+  canvas.addEventListener('pointerup', onUp);
+  canvas.addEventListener('pointercancel', onUp);
+  canvas.addEventListener('pointerleave', onUp);
+}
+draw();
+if (!reduced && typeof requestAnimationFrame !== 'undefined') {
+  (function loop() {
+    var t0 = null, prevTs = null, clockT = 0;
+    function step(now) {
+      if (t0 === null) t0 = now;
+      if (prevTs === null) prevTs = now;
+      var dt = clamp((now - prevTs) / 1000, 0, 0.05);
+      prevTs = now;
+      clockT += dt;
+      phaseT = (FRAME_T + clockT) % 86400;
+      var hidden = false;
+      try { hidden = document.hidden; } catch (e) { hidden = false; }
+      if (!hidden) draw();
+      if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  })();
+}
+</script>
+</body>
+</html>

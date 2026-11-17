@@ -1,0 +1,681 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tune It With a Saw</title>
+<style>
+html, body { margin: 0; padding: 0; background: #E7E0D2; overflow: hidden; }
+canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+/* Driver: a workshop table where seven red corrugated tubes lie in a row
+   like an organ manual, each one a note, and a handsaw rests across them.
+   The tubes sound when struck, and every so often one is cut a little
+   shorter, sawdust falling, and its pitch climbs a small step. The tuning
+   is always one cut behind the music, until for a brief moment all seven
+   agree on a chord, the saw is lifted, and the argument begins again.
+   Drag the saw across a tube to cut it yourself: you are the bench hand. */
+var TAU = Math.PI * 2;
+var GROUND = '#E7E0D2';
+var WOOD = '#8A5A33';
+var WOOD_DK = '#6B4226';
+var WOOD_LT = '#A9744F';
+var WOOD_TIP = '#C9A06A';
+var SEAM = 'rgba(60,35,15,0.28)';
+var GRAIN = 'rgba(60,35,15,0.10)';
+var RED = '#C1272D';
+var RED_DK = '#8E1B20';
+var RED_HI = '#E05252';
+var CORR = 'rgba(142,27,32,0.45)';
+var TAPE = '#E3D3A8';
+var TAPE_EDGE = '#C9B586';
+var PENCIL = '#5C5C5C';
+var PENCIL_LT = '#8A8A8A';
+var GOLD = '#D9A441';
+var GOLD_LT = '#E8C05C';
+var STEEL = '#C9CDD2';
+var STEEL_DK = '#7E858C';
+var STEEL_TEETH = '#9AA1A8';
+var PLATE = '#FBFAF7';
+var PLATE_LINE = 'rgba(46,44,41,0.30)';
+var TITLE_INK = '#2E2C29';
+var HINT_INK = '#5C5954';
+var FRAME_T = 37.0;        /* fixed phase for frame one: a cut happened 1s ago */
+var CYCLE = 72;            /* 7 cuts, one every 9s, chord moment, then reset */
+var CUT_EVERY = 9;
+var CUT_FACTOR = 0.98;     /* each cut shortens a tube 2 percent */
+var LEFT_X = 0.07;         /* tube row left edge, fraction of field width */
+var NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+/* After one cut each, the seven tubes land on a C major chord. The
+   pre-cut lengths are computed from those chord frequencies. */
+var CHORD = [261.63, 329.63, 392.00, 523.25, 659.25, 783.99, 1046.50];
+var F0 = 196;
+var L0 = 0.88;
+function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+function lerp(a, b, f) { return a + (b - a) * f; }
+function smooth(f) { f = clamp(f, 0, 1); return f * f * (3 - 2 * f); }
+function mulberry32(seed) {
+  return function () {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    var t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+function hexRgb(h) {
+  return [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
+}
+function rgba(h, a) {
+  var c = hexRgb(h);
+  return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a.toFixed(4) + ')';
+}
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var VW = 0, VH = 0, isPhone = false;
+var reduced = false;
+try { reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (e) { reduced = false; }
+var phaseT = FRAME_T;
+var soundOn = true;
+var audioCtx = null;
+var master = null;
+var noiseBuf = null;
+var voices = null;
+var soundPlate = { x: 0, y: 0, w: 0, h: 0 };
+/* ---- the seven tubes ---- */
+var BASE_LEN = [];
+(function () {
+  var i, fPre;
+  for (i = 0; i < 7; i++) {
+    fPre = CHORD[i] / (1 / (CUT_FACTOR * CUT_FACTOR));
+    BASE_LEN.push(L0 * Math.sqrt(F0 / fPre));
+  }
+})();
+var TUBES = [];
+(function () {
+  var i;
+  for (i = 0; i < 7; i++) {
+    TUBES.push({ base: BASE_LEN[i], userCuts: 0, pulse: 0, ph: i * 0.7 });
+  }
+})();
+function cycleT(t) { return ((t % CYCLE) + CYCLE) % CYCLE; }
+/* auto cuts: tube i is cut once per cycle, at 9*(i+1) seconds in */
+function autoCutsAt(t) {
+  var tc = cycleT(t), out = [], i;
+  for (i = 0; i < 7; i++) out.push(9 * (i + 1) <= tc ? 1 : 0);
+  return out;
+}
+function totalAutoCuts(t) {
+  var a = autoCutsAt(t), s = 0, i;
+  for (i = 0; i < 7; i++) s += a[i];
+  return s;
+}
+function tubeLen(i, t) {
+  var a = autoCutsAt(t);
+  return TUBES[i].base * Math.pow(CUT_FACTOR, a[i] + TUBES[i].userCuts);
+}
+function tubeRight(i, t) { return LEFT_X + tubeLen(i, t); }
+function freqOf(i, t) {
+  var len = tubeLen(i, t);
+  return F0 * (L0 / len) * (L0 / len);
+}
+function noteNameOf(i, t) {
+  var f = freqOf(i, t);
+  var midi = Math.round(69 + 12 * (Math.log(f / 440) / Math.log(2)));
+  var name = NOTE_NAMES[((midi % 12) + 12) % 12];
+  return name + (Math.floor(midi / 12) - 1);
+}
+/* cut points: right end of tube i after its one auto cut */
+function cutPoint(i) { return LEFT_X + TUBES[i].base * CUT_FACTOR; }
+/* most recent auto cut: index and age in seconds, or null */
+function recentCut(t) {
+  var tc = cycleT(t);
+  if (tc < CUT_EVERY) return null;
+  var k = Math.floor(tc / CUT_EVERY) - 1;
+  var age = tc - CUT_EVERY * (k + 1);
+  if (age > 2.2) return null;
+  return { tube: k, age: age, seed: 1856 + k * 31 };
+}
+/* saw lift during the chord moment, tc in [63, 67) */
+function sawLift(t) {
+  var tc = cycleT(t);
+  if (tc < 63) return 0;
+  if (tc < 64.2) return smooth((tc - 63) / 1.2);
+  if (tc < 66) return 1;
+  if (tc < 67) return 1 - smooth(tc - 66);
+  return 0;
+}
+/* autonomous saw position: glides between successive cut points */
+function sawAutoX(t) {
+  var tc = cycleT(t);
+  var j = Math.floor(tc / CUT_EVERY);
+  var from, to, prog;
+  if (j === 0) { from = cutPoint(6); to = cutPoint(0); prog = tc / CUT_EVERY; }
+  else { from = cutPoint((j - 1) % 7); to = cutPoint(j % 7); prog = (tc - CUT_EVERY * j) / CUT_EVERY; }
+  return lerp(from, to, smooth(prog));
+}
+var saw = { x: sawAutoX(FRAME_T), userX: sawAutoX(FRAME_T), prevX: sawAutoX(FRAME_T), dragging: false, blend: 0 };
+var userDust = [];   /* {x, y, t0, seed} in field fractions, age from phaseT */
+var lastStrikeM = null;
+var lastAutoCuts = null;
+function size() {
+  var vw = 0, vh = 0;
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.width) {
+    vw = window.visualViewport.width; vh = window.visualViewport.height;
+  } else if (typeof window !== 'undefined' && window.innerWidth) {
+    vw = window.innerWidth; vh = window.innerHeight;
+  }
+  VW = vw; VH = vh;
+  canvas.width = VW; canvas.height = VH;
+  canvas.style.width = VW + 'px'; canvas.style.height = VH + 'px';
+  if (typeof window !== 'undefined' && window.screen) {
+    var mn = Math.min(window.screen.width, window.screen.height);
+    isPhone = mn < 700 || VH > VW * 1.15;
+  }
+}
+/* Field-like composition: full-bleed on phones, a centered square on desktop. */
+function fieldRect() {
+  if (isPhone) return { x: 0, y: 0, w: VW, h: VH };
+  var s = Math.min(VW, VH);
+  return { x: (VW - s) / 2, y: (VH - s) / 2, w: s, h: s };
+}
+function tubeY(i, rc) {
+  return rc.y + rc.h * (0.30 + (i + 0.5) * (0.44 / 7));
+}
+function tubeH(rc) { return rc.h * 0.040; }
+/* ---- audio: built lazily inside the first gesture, never autoplay ---- */
+function ensureAudio() {
+  if (typeof AudioContext === 'undefined') return null;
+  if (!audioCtx) {
+    try {
+      audioCtx = new AudioContext();
+      master = audioCtx.createGain();
+      master.gain.value = 0.7;
+      master.connect(audioCtx.destination);
+      var len = Math.floor(audioCtx.sampleRate * 1.0);
+      noiseBuf = audioCtx.createBuffer(1, len, audioCtx.sampleRate);
+      var d = noiseBuf.getChannelData(0), i;
+      var rng = mulberry32(1856);
+      for (i = 0; i < len; i++) d[i] = rng() * 2 - 1;
+      voices = [];
+      var j, v, o1, o2, g1, g2, g;
+      for (j = 0; j < 7; j++) {
+        v = { gainNode: null, o1: null, o2: null };
+        g = audioCtx.createGain();
+        g.gain.value = 0.0001;
+        g.connect(master);
+        o1 = audioCtx.createOscillator();
+        o1.type = 'sine';
+        o2 = audioCtx.createOscillator();
+        o2.type = 'triangle';
+        g1 = audioCtx.createGain(); g1.gain.value = 1.0;
+        g2 = audioCtx.createGain(); g2.gain.value = 0.3;
+        o1.connect(g1); g1.connect(g);
+        o2.connect(g2); g2.connect(g);
+        o1.start(); o2.start();
+        v.gainNode = g; v.o1 = o1; v.o2 = o2;
+        voices.push(v);
+      }
+    } catch (e) { return null; }
+  }
+  if (audioCtx.state === 'suspended') { try { audioCtx.resume(); } catch (e) {} }
+  return audioCtx;
+}
+function strikeTube(i, vel) {
+  if (!audioCtx || !voices) return;
+  try {
+    var f = freqOf(i, phaseT);
+    var v = voices[i];
+    v.o1.frequency.setTargetAtTime(f, audioCtx.currentTime, 0.02);
+    v.o2.frequency.setTargetAtTime(f * 2, audioCtx.currentTime, 0.02);
+    var g = v.gainNode.gain;
+    g.cancelScheduledValues(audioCtx.currentTime);
+    g.setValueAtTime(Math.max(vel, 0.0001), audioCtx.currentTime);
+    g.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + 1.8);
+  } catch (e) {}
+}
+function sawNoise() {
+  if (!audioCtx || !noiseBuf) return;
+  try {
+    var src = audioCtx.createBufferSource();
+    src.buffer = noiseBuf; src.loop = true;
+    var bp = audioCtx.createBiquadFilter();
+    bp.type = 'bandpass'; bp.frequency.value = 1400; bp.Q.value = 1.2;
+    var g = audioCtx.createGain();
+    g.gain.setValueAtTime(0.22, audioCtx.currentTime);
+    g.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + 0.5);
+    src.connect(bp); bp.connect(g); g.connect(master);
+    src.start();
+    src.stop(audioCtx.currentTime + 0.55);
+  } catch (e) {}
+}
+/* ---- interaction: drag the saw, tap a tube to strike it ---- */
+function stepLogic(dt, t, rc) {
+  var i;
+  for (i = 0; i < 7; i++) TUBES[i].pulse = Math.max(0, TUBES[i].pulse - dt * 1.4);
+  if (saw.dragging) saw.blend = Math.min(1, saw.blend + dt * 6);
+  else saw.blend = Math.max(0, saw.blend - dt / 1.5);
+  var autoX = sawAutoX(t);
+  saw.prevX = saw.x;
+  saw.x = lerp(autoX, saw.userX, saw.blend);
+  /* cutting while dragging: saw moving left past a tube end cuts it */
+  if (saw.blend > 0.5 && saw.x < saw.prevX) {
+    for (i = 0; i < 7; i++) {
+      var end = tubeRight(i, t);
+      if (TUBES[i].userCuts < 4 && saw.prevX > end - 0.004 && saw.x <= end - 0.004) {
+        TUBES[i].userCuts++;
+        TUBES[i].pulse = 1;
+        userDust.push({ x: end, y: (tubeY(i, rc) - rc.y) / rc.h, t0: t, seed: 1856 + i * 97 + TUBES[i].userCuts * 13 });
+        if (userDust.length > 12) userDust.shift();
+        sawNoise();
+        strikeTube(i, 0.5);
+      }
+    }
+  }
+}
+function drawTable(rc, t) {
+  var m = Math.min(rc.w, rc.h);
+  ctx.fillStyle = WOOD;
+  ctx.fillRect(rc.x, rc.y, rc.w, rc.h);
+  /* plank seams */
+  ctx.strokeStyle = SEAM;
+  ctx.lineWidth = 1;
+  var i;
+  for (i = 1; i < 3; i++) {
+    ctx.beginPath();
+    ctx.moveTo(rc.x, rc.y + rc.h * i / 3);
+    ctx.lineTo(rc.x + rc.w, rc.y + rc.h * i / 3);
+    ctx.stroke();
+  }
+  /* wood grain, seeded so it never moves */
+  var rng = mulberry32(1856);
+  ctx.strokeStyle = GRAIN;
+  ctx.lineWidth = 1;
+  for (i = 0; i < 14; i++) {
+    var gy = rc.y + rng() * rc.h;
+    var wob = (rng() - 0.5) * rc.h * 0.02;
+    ctx.beginPath();
+    ctx.moveTo(rc.x, gy);
+    ctx.quadraticCurveTo(rc.x + rc.w * 0.5, gy + wob, rc.x + rc.w, gy - wob * 0.5);
+    ctx.stroke();
+  }
+  /* a pencil resting at the top right of the table */
+  var px = rc.x + rc.w * 0.70, py = rc.y + rc.h * 0.115;
+  var plen = rc.w * 0.17, ph = Math.max(4, m * 0.011);
+  ctx.save();
+  ctx.translate(px, py);
+  ctx.rotate(-0.10);
+  ctx.fillStyle = PENCIL;
+  ctx.fillRect(-plen / 2, -ph / 2, plen * 0.82, ph);
+  ctx.fillStyle = PENCIL_LT;
+  ctx.fillRect(-plen / 2, -ph / 2, plen * 0.82, ph * 0.30);
+  ctx.fillStyle = WOOD_TIP;
+  ctx.beginPath();
+  ctx.moveTo(plen * 0.32, -ph / 2);
+  ctx.lineTo(plen * 0.50, 0);
+  ctx.lineTo(plen * 0.32, ph / 2);
+  ctx.closePath();
+  ctx.fill();
+  ctx.fillStyle = TITLE_INK;
+  ctx.beginPath();
+  ctx.moveTo(plen * 0.44, -ph * 0.18);
+  ctx.lineTo(plen * 0.50, 0);
+  ctx.lineTo(plen * 0.44, ph * 0.18);
+  ctx.closePath();
+  ctx.fill();
+  ctx.fillStyle = STEEL_DK;
+  ctx.fillRect(-plen / 2 - plen * 0.05, -ph / 2, plen * 0.05, ph);
+  ctx.restore();
+}
+function drawTubes(rc, t) {
+  var m = Math.min(rc.w, rc.h);
+  var lift = sawLift(t);
+  if (lift > 0) {
+    /* soft gold glow behind the row while the chord holds */
+    var cy = rc.y + rc.h * 0.52;
+    var rg = ctx.createRadialGradient(rc.x + rc.w / 2, cy, 0, rc.x + rc.w / 2, cy, rc.w * 0.55);
+    rg.addColorStop(0, rgba(GOLD_LT, 0.20 * lift));
+    rg.addColorStop(1, rgba(GOLD_LT, 0));
+    ctx.fillStyle = rg;
+    ctx.fillRect(rc.x, rc.y + rc.h * 0.20, rc.w, rc.h * 0.64);
+  }
+  var i, j;
+  for (i = 0; i < 7; i++) {
+    var ty = tubeY(i, rc);
+    var th = tubeH(rc);
+    var left = rc.x + LEFT_X * rc.w;
+    var right = rc.x + tubeRight(i, t) * rc.w;
+    var w = right - left;
+    /* struck pulse glow */
+    if (TUBES[i].pulse > 0.01) {
+      ctx.fillStyle = rgba(GOLD_LT, 0.25 * TUBES[i].pulse);
+      ctx.fillRect(left - m * 0.006, ty - th / 2 - m * 0.006, w + m * 0.012, th + m * 0.012);
+    }
+    /* tube body */
+    var g = ctx.createLinearGradient(0, ty - th / 2, 0, ty + th / 2);
+    g.addColorStop(0, RED_HI);
+    g.addColorStop(0.45, RED);
+    g.addColorStop(1, RED_DK);
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.moveTo(left, ty - th / 2);
+    ctx.lineTo(right, ty - th / 2);
+    ctx.lineTo(right, ty + th / 2);
+    ctx.lineTo(left, ty + th / 2);
+    ctx.closePath();
+    ctx.fill();
+    /* corrugation rings */
+    ctx.fillStyle = CORR;
+    var step = Math.max(5, m * 0.014);
+    for (j = left + step; j < right - 2; j += step * 2) {
+      ctx.fillRect(j, ty - th / 2, Math.max(1.5, m * 0.004), th);
+    }
+    /* highlight along the top edge */
+    ctx.fillStyle = rgba(RED_HI, 0.55);
+    ctx.fillRect(left, ty - th / 2, w, Math.max(1, th * 0.16));
+    /* end cap */
+    ctx.fillStyle = RED_DK;
+    ctx.beginPath();
+    ctx.moveTo(right, ty - th / 2);
+    ctx.lineTo(right + m * 0.006, ty);
+    ctx.lineTo(right, ty + th / 2);
+    ctx.closePath();
+    ctx.fill();
+    /* sawdust pile under a tube cut this cycle */
+    if (autoCutsAt(t)[i] === 1) {
+      ctx.fillStyle = rgba(GOLD, 0.22);
+      ctx.beginPath();
+      ctx.moveTo(right + m * 0.028, ty + th * 1.1);
+      ctx.ellipse(right + m * 0.010, ty + th * 1.1, m * 0.020, m * 0.006, 0, 0, TAU);
+      ctx.fill();
+    }
+    /* masking-tape label with the note name, hand lettered */
+    var labW = rc.w * 0.085;
+    var labX = left + rc.w * 0.018;
+    ctx.fillStyle = TAPE;
+    ctx.fillRect(labX, ty - th / 2 - 1, labW, th + 2);
+    ctx.strokeStyle = TAPE_EDGE;
+    ctx.lineWidth = 1;
+    ctx.strokeRect(labX + 0.5, ty - th / 2 - 0.5, labW - 1, th + 1);
+    ctx.fillStyle = PENCIL;
+    ctx.font = 'italic bold ' + Math.max(9, Math.round(m * 0.016)) + 'px monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(noteNameOf(i, t), labX + labW / 2, ty + 1);
+  }
+}
+function drawDustParticle(ox, oy, age, seed, m) {
+  var rng = mulberry32(seed);
+  var i;
+  for (i = 0; i < 26; i++) {
+    var vx = (rng() - 0.5) * 34;
+    var vy = 18 + rng() * 55;
+    var sz = 1.5 + rng() * 2.0;
+    var px = ox + vx * age;
+    var py = oy + vy * age + 30 * age * age;
+    var a = clamp(1 - age / 2.2, 0, 1);
+    ctx.fillStyle = rgba(i % 3 === 0 ? GOLD_LT : GOLD, a * 0.9);
+    ctx.beginPath();
+    ctx.moveTo(px + sz, py);
+    ctx.arc(px, py, sz, 0, TAU);
+    ctx.fill();
+  }
+}
+function drawDust(rc, t) {
+  var m = Math.min(rc.w, rc.h);
+  var rc0 = recentCut(t);
+  if (rc0) {
+    var ox = rc.x + tubeRight(rc0.tube, t) * rc.w;
+    var oy = tubeY(rc0.tube, rc);
+    drawDustParticle(ox, oy, rc0.age, rc0.seed, m);
+  }
+  var k;
+  for (k = 0; k < userDust.length; k++) {
+    var d = userDust[k];
+    var age = t - d.t0;
+    if (age < 0 || age > 2.2) continue;
+    drawDustParticle(rc.x + d.x * rc.w, rc.y + d.y * rc.h, age, d.seed, m);
+  }
+}
+function drawSaw(rc, t) {
+  var m = Math.min(rc.w, rc.h);
+  var topY = rc.y + rc.h * 0.245;
+  var botY = rc.y + rc.h * 0.795;
+  var lift = sawLift(t);
+  var tc = cycleT(t);
+  var yOsc = 0;
+  if (tc % CUT_EVERY > CUT_EVERY - 0.9) {
+    yOsc = Math.sin(TAU * (tc % CUT_EVERY - (CUT_EVERY - 0.9)) * 2.0) * m * 0.008;
+  }
+  var cx = rc.x + saw.x * rc.w;
+  var midY = (topY + botY) / 2 - lift * rc.h * 0.11 + yOsc;
+  var bladeW = Math.max(10, m * 0.034);
+  var bladeH = botY - topY;
+  ctx.save();
+  ctx.translate(cx, midY);
+  ctx.rotate(-0.10 - lift * 0.12);
+  /* blade */
+  var g = ctx.createLinearGradient(-bladeW / 2, 0, bladeW / 2, 0);
+  g.addColorStop(0, STEEL_DK);
+  g.addColorStop(0.35, STEEL);
+  g.addColorStop(1, STEEL_DK);
+  ctx.fillStyle = g;
+  ctx.fillRect(-bladeW / 2, -bladeH / 2, bladeW, bladeH);
+  /* spine line */
+  ctx.fillStyle = rgba(STEEL_DK, 0.8);
+  ctx.fillRect(-bladeW / 2, -bladeH / 2, Math.max(1, bladeW * 0.10), bladeH);
+  /* teeth along the right edge */
+  ctx.fillStyle = STEEL_TEETH;
+  var ty, step = Math.max(6, m * 0.010);
+  for (ty = -bladeH / 2 + 6; ty < bladeH / 2 - 4; ty += step) {
+    ctx.beginPath();
+    ctx.moveTo(bladeW / 2, ty);
+    ctx.lineTo(bladeW / 2 + bladeW * 0.30, ty + step * 0.45);
+    ctx.lineTo(bladeW / 2, ty + step * 0.9);
+    ctx.closePath();
+    ctx.fill();
+  }
+  /* wooden handle above the blade */
+  var hw = bladeW * 2.1, hh = m * 0.085;
+  ctx.fillStyle = WOOD_DK;
+  ctx.beginPath();
+  ctx.moveTo(-hw / 2, -bladeH / 2 - hh);
+  ctx.quadraticCurveTo(-hw / 2 - hw * 0.12, -bladeH / 2 - hh * 0.5, -hw / 2, -bladeH / 2);
+  ctx.lineTo(hw / 2, -bladeH / 2);
+  ctx.quadraticCurveTo(hw / 2 + hw * 0.12, -bladeH / 2 - hh * 0.5, hw / 2, -bladeH / 2 - hh);
+  ctx.closePath();
+  ctx.fill();
+  ctx.fillStyle = WOOD_LT;
+  ctx.fillRect(-hw / 2 + 2, -bladeH / 2 - hh + 3, hw - 4, Math.max(2, hh * 0.16));
+  /* grip hole */
+  ctx.fillStyle = GROUND;
+  ctx.beginPath();
+  ctx.moveTo(hw * 0.22, -bladeH / 2 - hh * 0.72);
+  ctx.ellipse(0, -bladeH / 2 - hh * 0.62, hw * 0.22, hh * 0.22, 0, 0, TAU);
+  ctx.fill();
+  ctx.restore();
+}
+function drawPlates() {
+  var smallPx = isPhone ? 11 : 12;
+  var titlePx = isPhone ? 16 : 20;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.font = 'bold ' + titlePx + 'px monospace';
+  while (titlePx > 9 && ctx.measureText('Tune It With a Saw').width > VW - 60) {
+    titlePx -= 1;
+    ctx.font = 'bold ' + titlePx + 'px monospace';
+  }
+  var titleW = ctx.measureText('Tune It With a Saw').width;
+  ctx.font = smallPx + 'px monospace';
+  var dateW = ctx.measureText('2007 · 02 · 10').width;
+  var plateW = Math.max(titleW, dateW) + 28;
+  var plateH = titlePx + smallPx + 20;
+  var plateX = 12, plateY = 12;
+  ctx.fillStyle = PLATE;
+  ctx.fillRect(plateX, plateY, plateW, plateH);
+  ctx.strokeStyle = PLATE_LINE;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(plateX + 0.5, plateY + 0.5, plateW - 1, plateH - 1);
+  ctx.fillStyle = TITLE_INK;
+  ctx.font = 'bold ' + titlePx + 'px monospace';
+  ctx.fillText('Tune It With a Saw', plateX + 14, plateY + 7);
+  ctx.font = smallPx + 'px monospace';
+  ctx.fillStyle = HINT_INK;
+  ctx.fillText('2007 · 02 · 10', plateX + 14, plateY + 7 + titlePx + 3);
+  var hint = 'Drag the saw to cut a tube.';
+  ctx.font = smallPx + 'px monospace';
+  var hintW = ctx.measureText(hint).width;
+  var hintPlateW = hintW + 24;
+  var hintPlateH = smallPx + 14;
+  var hintPlateX = 12;
+  var hintPlateY = VH - hintPlateH - 12;
+  ctx.fillStyle = PLATE;
+  ctx.fillRect(hintPlateX, hintPlateY, hintPlateW, hintPlateH);
+  ctx.strokeStyle = PLATE_LINE;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(hintPlateX + 0.5, hintPlateY + 0.5, hintPlateW - 1, hintPlateH - 1);
+  ctx.fillStyle = HINT_INK;
+  ctx.fillText(hint, hintPlateX + 12, hintPlateY + 7);
+  var snd = soundOn ? 'Sound: on' : 'Sound: off';
+  ctx.font = smallPx + 'px monospace';
+  var sndW = ctx.measureText(snd).width;
+  soundPlate.w = sndW + 24;
+  soundPlate.h = smallPx + 14;
+  soundPlate.x = VW - soundPlate.w - 12;
+  soundPlate.y = VH - soundPlate.h - 12;
+  ctx.fillStyle = PLATE;
+  ctx.fillRect(soundPlate.x, soundPlate.y, soundPlate.w, soundPlate.h);
+  ctx.strokeStyle = PLATE_LINE;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(soundPlate.x + 0.5, soundPlate.y + 0.5, soundPlate.w - 1, soundPlate.h - 1);
+  ctx.fillStyle = HINT_INK;
+  ctx.fillText(snd, soundPlate.x + 12, soundPlate.y + 7);
+}
+function draw() {
+  size();
+  var rc = fieldRect();
+  var t = phaseT;
+  /* autonomous music: a slow strike every 3s, and a cut event sound */
+  var mIdx = Math.floor(t / 3);
+  if (lastStrikeM === null) lastStrikeM = mIdx;
+  if (audioCtx && mIdx !== lastStrikeM) {
+    lastStrikeM = mIdx;
+    var ti = (mIdx * 3) % 7;
+    TUBES[ti].pulse = 1;
+    strikeTube(ti, 0.3);
+  }
+  var ac = totalAutoCuts(t);
+  if (lastAutoCuts === null) lastAutoCuts = ac;
+  if (audioCtx && ac > lastAutoCuts) {
+    lastAutoCuts = ac;
+    var cutTube = (ac - 1) % 7;
+    TUBES[cutTube].pulse = 1;
+    sawNoise();
+    strikeTube(cutTube, 0.5);
+  }
+  ctx.fillStyle = GROUND;
+  ctx.fillRect(0, 0, VW, VH);
+  drawTable(rc, t);
+  drawTubes(rc, t);
+  drawDust(rc, t);
+  drawSaw(rc, t);
+  drawPlates();
+}
+if (typeof window !== 'undefined') {
+  window.__probe = {
+    drawAt: function (t) { phaseT = t; draw(); },
+    tubeCount: TUBES.length,
+    sawAt: function () { return { x: saw.x }; }
+  };
+}
+/* ---- frame one: fixed phase t = 37.0 s, a cut happened 1s ago ---- */
+size();
+if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', size);
+if (typeof window !== 'undefined' && window.addEventListener) window.addEventListener('resize', size);
+function pointerFieldPos(ev) {
+  var rect = { left: 0, top: 0 };
+  try { rect = canvas.getBoundingClientRect(); } catch (e) {}
+  var rc = fieldRect();
+  return {
+    fx: clamp((ev.clientX - rect.left - rc.x) / Math.max(rc.w, 1), 0, 1),
+    fy: clamp((ev.clientY - rect.top - rc.y) / Math.max(rc.h, 1), 0, 1),
+    px: ev.clientX - rect.left,
+    py: ev.clientY - rect.top
+  };
+}
+function onDown(ev) {
+  var px = 0, py = 0;
+  try { px = ev.clientX; py = ev.clientY; } catch (e) {}
+  if (px >= soundPlate.x && px <= soundPlate.x + soundPlate.w && py >= soundPlate.y && py <= soundPlate.y + soundPlate.h) {
+    soundOn = !soundOn;
+    if (audioCtx && master) { try { master.gain.value = soundOn ? 0.7 : 0; } catch (e) {} }
+    draw();
+    return;
+  }
+  ensureAudio();
+  var rc = fieldRect();
+  var p = pointerFieldPos(ev);
+  var sawPx = rc.x + saw.x * rc.w;
+  var m = Math.min(rc.w, rc.h);
+  var topY = rc.y + rc.h * 0.20, botY = rc.y + rc.h * 0.85;
+  if (Math.abs(p.px - sawPx) < Math.max(22, m * 0.045) && p.py > topY && p.py < botY) {
+    saw.dragging = true;
+    saw.userX = clamp(p.fx, LEFT_X, 0.92);
+    try { ev.preventDefault(); } catch (e) {}
+    return;
+  }
+  /* tap a tube to strike it */
+  var i;
+  for (i = 0; i < 7; i++) {
+    var ty = tubeY(i, rc);
+    if (Math.abs(p.py - ty) < tubeH(rc)) {
+      TUBES[i].pulse = 1;
+      strikeTube(i, 0.5);
+      draw();
+      return;
+    }
+  }
+  try { ev.preventDefault(); } catch (e) {}
+}
+function onMove(ev) {
+  if (!saw.dragging) return;
+  var p = pointerFieldPos(ev);
+  saw.userX = clamp(p.fx, LEFT_X, 0.92);
+  try { ev.preventDefault(); } catch (e) {}
+}
+function onUp() { saw.dragging = false; }
+if (typeof canvas !== 'undefined' && canvas.addEventListener) {
+  canvas.addEventListener('pointerdown', onDown);
+  canvas.addEventListener('pointermove', onMove);
+  canvas.addEventListener('pointerup', onUp);
+  canvas.addEventListener('pointercancel', onUp);
+  canvas.addEventListener('pointerleave', onUp);
+}
+draw();
+if (!reduced && typeof requestAnimationFrame !== 'undefined') {
+  (function loop() {
+    var t0 = null, prevTs = null, clockT = 0;
+    function step(now) {
+      if (t0 === null) t0 = now;
+      if (prevTs === null) prevTs = now;
+      var dt = clamp((now - prevTs) / 1000, 0, 0.05);
+      prevTs = now;
+      clockT += dt;
+      phaseT = (FRAME_T + clockT) % 86400;
+      var hidden = false;
+      try { hidden = document.hidden; } catch (e) { hidden = false; }
+      if (!hidden) {
+        stepLogic(dt, phaseT, fieldRect());
+        draw();
+      }
+      if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  })();
+}
+</script>
+</body>
+</html>
