@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Seek-Wah Chain</title>
+<style>
+html, body { margin: 0; padding: 0; background: #0E0D0C; overflow: hidden; }
+canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+/* Driver: transformation along a chain. One pluck enters as a bright dot
+   and each node rewrites it: fuzz fattens it, the seek-wah chops it into a
+   stepping rhythmic pattern, the looper layers ghosts of earlier passes,
+   the amp turns it into light on the grille. The felt phenomenon is a
+   signal that leaves as a dot and returns as a pattern. Tap anywhere to
+   send a fresh pluck into the chain; otherwise the chain plays itself. */
+var TAU = Math.PI * 2;
+var GROUND = '#0E0D0C';
+var CABLE = '#3A3733';
+var CABLE_HI = '#57524B';
+var TEAL = '#2E6E6A';
+var TEAL_DK = '#1E4A47';
+var RUST = '#A44A2A';
+var RUST_DK = '#7A341D';
+var AMBER = '#F2A93B';
+var AMBER_DK = '#C77F1A';
+var LAV = '#B9A7D9';
+var CREAM = '#EFE3C8';
+var CREAM_DK = '#C9B892';
+var INK = '#0E0D0C';
+var PLATE = '#EFE3C8';
+var PLATE_LINE = 'rgba(14,13,12,0.35)';
+var TITLE_INK = '#0E0D0C';
+var HINT_INK = '#5C4A2E';
+var FRAME_T = 10.0;        /* fixed phase: second pluck mid seek-wah, ghosts trailing */
+var LOOP_LEN = 24.0;       /* seconds per full loop */
+var PLUCK_PERIOD = 6.0;    /* an auto pluck enters every 6 s */
+var TRAVEL = 9.0;          /* seconds for a pluck to cross the whole chain */
+var SEG = 1.8;             /* seconds per chain segment (5 nodes, 4 gaps + amp) */
+function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+function lerp(a, b, f) { return a + (b - a) * f; }
+function mulberry32(seed) {
+  return function () {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    var t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+function hexRgb(h) {
+  return [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
+}
+function rgba(h, a) {
+  var c = hexRgb(h);
+  return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a.toFixed(4) + ')';
+}
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var VW = 0, VH = 0, isPhone = false;
+var reduced = false;
+try { reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (e) { reduced = false; }
+var phaseT = FRAME_T;
+var taps = [];             /* tap-injected pluck start times, in phase seconds */
+/* seeded floor dust: faint specks on the dark ground */
+var DUST = (function () {
+  var rng = mulberry32(1866), out = [], i;
+  for (i = 0; i < 70; i++) {
+    out.push({ x: rng(), y: rng(), r: 0.5 + rng() * 1.4, a: 0.04 + rng() * 0.08 });
+  }
+  return out;
+})();
+function size() {
+  var vw = 0, vh = 0;
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.width) {
+    vw = window.visualViewport.width; vh = window.visualViewport.height;
+  } else if (typeof window !== 'undefined' && window.innerWidth) {
+    vw = window.innerWidth; vh = window.innerHeight;
+  }
+  VW = vw; VH = vh;
+  canvas.width = VW; canvas.height = VH;
+  canvas.style.width = VW + 'px'; canvas.style.height = VH + 'px';
+  if (typeof window !== 'undefined' && window.screen) {
+    var mn = Math.min(window.screen.width, window.screen.height);
+    isPhone = mn < 700 || VH > VW * 1.15;
+  }
+}
+/* Field-like composition: full-bleed on phones, a centered square on desktop. */
+function fieldRect() {
+  if (isPhone) return { x: 0, y: 0, w: VW, h: VH };
+  var s = Math.min(VW, VH);
+  return { x: (VW - s) / 2, y: (VH - s) / 2, w: s, h: s };
+}
+function seg(x1, y1, x2, y2) {
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+}
+function circ(x, y, r, fill) {
+  ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arc(x, y, r, 0, TAU);
+  if (fill) ctx.fill(); else ctx.stroke();
+}
+/* ---- chain geometry: five node centers across the field ---- */
+var NODE_FX = [0.09, 0.29, 0.50, 0.71, 0.90];
+var NODE_LABELS = ['INPUT', 'FUZZ', 'SEEK-WAH', 'LOOPER', 'AMP'];
+function nodeGeom(sc) {
+  var cy = sc.y + sc.h * 0.52;
+  var pw = sc.w * 0.15, ph = sc.w * 0.115;
+  var out = [], i;
+  for (i = 0; i < 5; i++) {
+    out.push({ x: sc.x + sc.w * NODE_FX[i], y: cy, w: pw, h: ph });
+  }
+  /* the amp is a wider box */
+  out[4].w = pw * 1.25;
+  return out;
+}
+/* pluck position along the chain as a function of its age in seconds.
+   Returns {x, y, zone} where zone is 0 input cable, 1 fuzz, 2 seek-wah,
+   3 looper, 4 amp, 5 done. x is a field fraction, y a field fraction. */
+function pluckPos(age, sc, nodes) {
+  var cy = 0.52;
+  var i, f, x0, x1;
+  if (age < 0 || age >= TRAVEL) return { done: true, x: 0, y: cy, zone: 5 };
+  /* the last segment is a dwell at the amp: the dot arrives at 4*SEG
+     and the burst plays out until TRAVEL */
+  if (age >= 4 * SEG) {
+    return { done: false, x: NODE_FX[4], y: cy, zone: 4, local: (age - 4 * SEG) / SEG, stepped: false, age: age };
+  }
+  var segIdx = Math.floor(age / SEG);
+  var local = (age - segIdx * SEG) / SEG;
+  x0 = NODE_FX[segIdx]; x1 = NODE_FX[segIdx + 1];
+  f = local;
+  /* seek-wah segment (index 2): quantize into 8 steps */
+  var stepped = false;
+  if (segIdx === 2) {
+    f = Math.floor(local * 8) / 8;
+    stepped = true;
+  }
+  var x = lerp(x0, x1, f);
+  var y = cy;
+  if (stepped) y = cy - 0.018 * Math.sin(local * Math.PI);
+  return { done: false, x: x, y: y, zone: segIdx, local: local, stepped: stepped, age: age };
+}
+/* all plucks alive at time t: auto plucks every PLUCK_PERIOD plus taps */
+function livePlucks(t) {
+  var out = [], k, s;
+  for (k = 0; k * PLUCK_PERIOD < LOOP_LEN; k++) {
+    s = k * PLUCK_PERIOD;
+    var age = t - s;
+    if (age >= 0 && age < TRAVEL + 1.8) out.push({ start: s, age: age, tap: false });
+  }
+  for (k = 0; k < taps.length; k++) {
+    var a2 = t - taps[k];
+    if (a2 >= 0 && a2 < TRAVEL + 1.8) out.push({ start: taps[k], age: a2, tap: true });
+  }
+  return out;
+}
+function drawCables(sc, nodes, t) {
+  var i, j;
+  ctx.lineCap = 'round';
+  for (i = 0; i < 4; i++) {
+    var ax = nodes[i].x + nodes[i].w / 2, ay = nodes[i].y;
+    var bx = nodes[i + 1].x - nodes[i + 1].w / 2, by = nodes[i + 1].y;
+    var sag = sc.h * 0.035;
+    var mx = (ax + bx) / 2, my = ay + sag;
+    /* the cable from the left edge into the input jack */
+    ctx.strokeStyle = CABLE;
+    ctx.lineWidth = Math.max(2, sc.w * 0.006);
+    ctx.beginPath(); ctx.moveTo(ax, ay);
+    ctx.quadraticCurveTo(mx, my, bx, by); ctx.stroke();
+    /* travelling pulse beads, a pure function of t */
+    for (j = 0; j < 3; j++) {
+      var u = ((t * 0.06 + j / 3 + i * 0.13) % 1);
+      var px = (1 - u) * (1 - u) * ax + 2 * (1 - u) * u * mx + u * u * bx;
+      var py = (1 - u) * (1 - u) * ay + 2 * (1 - u) * u * my + u * u * by;
+      ctx.fillStyle = rgba(AMBER, 0.35);
+      circ(px, py, Math.max(1.5, sc.w * 0.003), true);
+    }
+  }
+  /* input cable from the left edge */
+  var ix = nodes[0].x - nodes[0].w / 2;
+  ctx.strokeStyle = CABLE;
+  ctx.lineWidth = Math.max(2, sc.w * 0.006);
+  ctx.beginPath(); ctx.moveTo(sc.x + sc.w * 0.01, nodes[0].y + sc.h * 0.02);
+  ctx.quadraticCurveTo(sc.x + sc.w * 0.05, nodes[0].y + sc.h * 0.05, ix, nodes[0].y);
+  ctx.stroke();
+  ctx.lineCap = 'butt';
+}
+function drawPedal(n, fill, dark, label, sc) {
+  var r = Math.min(n.w, n.h) * 0.18;
+  ctx.fillStyle = fill;
+  ctx.beginPath();
+  ctx.moveTo(n.x - n.w / 2 + r, n.y - n.h / 2);
+  ctx.lineTo(n.x + n.w / 2 - r, n.y - n.h / 2);
+  ctx.arc(n.x + n.w / 2 - r, n.y - n.h / 2 + r, r, -Math.PI / 2, 0, false);
+  ctx.lineTo(n.x + n.w / 2, n.y + n.h / 2 - r);
+  ctx.arc(n.x + n.w / 2 - r, n.y + n.h / 2 - r, r, 0, Math.PI / 2, false);
+  ctx.lineTo(n.x - n.w / 2 + r, n.y + n.h / 2);
+  ctx.arc(n.x - n.w / 2 + r, n.y + n.h / 2 - r, r, Math.PI / 2, Math.PI, false);
+  ctx.lineTo(n.x - n.w / 2, n.y - n.h / 2 + r);
+  ctx.arc(n.x - n.w / 2 + r, n.y - n.h / 2 + r, r, Math.PI, Math.PI * 1.5, false);
+  ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = dark;
+  ctx.lineWidth = Math.max(1, sc.w * 0.002);
+  ctx.stroke();
+  /* footswitch dot */
+  ctx.fillStyle = dark;
+  circ(n.x, n.y + n.h * 0.28, Math.max(2, sc.w * 0.006), true);
+  /* label */
+  ctx.fillStyle = CREAM;
+  ctx.font = Math.max(9, sc.w * 0.016) + 'px monospace';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+  ctx.fillText(label, n.x, n.y + n.h / 2 + sc.h * 0.014);
+}
+function drawNodes(sc, nodes, t, plucks) {
+  var i;
+  /* INPUT: dark jack with an amber ring */
+  var n0 = nodes[0];
+  ctx.fillStyle = '#1B1A18';
+  ctx.beginPath();
+  ctx.moveTo(n0.x - n0.w / 2 + 6, n0.y - n0.h / 2);
+  ctx.lineTo(n0.x + n0.w / 2 - 6, n0.y - n0.h / 2);
+  ctx.arc(n0.x + n0.w / 2 - 6, n0.y, 6, -Math.PI / 2, Math.PI / 2, false);
+  ctx.lineTo(n0.x - n0.w / 2 + 6, n0.y + n0.h / 2);
+  ctx.arc(n0.x - n0.w / 2 + 6, n0.y, 6, Math.PI / 2, Math.PI * 1.5, false);
+  ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = CABLE_HI;
+  ctx.lineWidth = Math.max(1, sc.w * 0.002);
+  ctx.stroke();
+  ctx.strokeStyle = AMBER;
+  ctx.lineWidth = Math.max(1.5, sc.w * 0.004);
+  circ(n0.x, n0.y, Math.max(4, sc.w * 0.014), false);
+  ctx.fillStyle = CREAM;
+  ctx.font = Math.max(9, sc.w * 0.016) + 'px monospace';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+  ctx.fillText('INPUT', n0.x, n0.y + n0.h / 2 + sc.h * 0.014);
+  /* FUZZ: rust enamel */
+  drawPedal(nodes[1], RUST, RUST_DK, 'FUZZ', sc);
+  /* SEEK-WAH: teal enamel, 8 step ticks along its top edge */
+  drawPedal(nodes[2], TEAL, TEAL_DK, 'SEEK-WAH', sc);
+  var n2 = nodes[2];
+  for (i = 0; i < 8; i++) {
+    var sx = n2.x - n2.w * 0.4 + i * n2.w * 0.8 / 7;
+    var lit = false;
+    for (var p = 0; p < plucks.length; p++) {
+      var pp = pluckPos(plucks[p].age, sc, nodes);
+      if (!pp.done && pp.zone === 2 && Math.floor(pp.local * 8) === i) lit = true;
+    }
+    ctx.fillStyle = lit ? AMBER : rgba(CREAM, 0.45);
+    ctx.fillRect(sx - Math.max(1, sc.w * 0.002), n2.y - n2.h * 0.32,
+      Math.max(2, sc.w * 0.004), Math.max(3, sc.h * 0.008));
+  }
+  /* LOOPER: teal enamel, lavender echo dots orbiting inside */
+  drawPedal(nodes[3], TEAL, TEAL_DK, 'LOOPER', sc);
+  var n3 = nodes[3];
+  for (i = 0; i < 4; i++) {
+    /* echo age: time since the most recent pluck passed the looper */
+    var lastPass = -1;
+    for (var q = 0; q < plucks.length; q++) {
+      var passT = plucks[q].start + 3 * SEG;
+      if (passT <= t && passT > lastPass) lastPass = passT;
+    }
+    var echoAge = lastPass < 0 ? 99 : t - lastPass;
+    var ea = clamp(1 - echoAge / 6, 0, 1);
+    if (ea > 0.02) {
+      var ang = t * 0.9 + i * TAU / 4;
+      var ex = n3.x + Math.cos(ang) * n3.w * 0.26;
+      var ey = n3.y - n3.h * 0.05 + Math.sin(ang) * n3.h * 0.22;
+      ctx.fillStyle = rgba(LAV, (0.25 + 0.55 * ea));
+      circ(ex, ey, Math.max(2, sc.w * 0.007), true);
+    }
+  }
+  /* AMP: cream grille box */
+  var n4 = nodes[4];
+  ctx.fillStyle = CREAM;
+  ctx.fillRect(n4.x - n4.w / 2, n4.y - n4.h / 2, n4.w, n4.h);
+  ctx.strokeStyle = CREAM_DK;
+  ctx.lineWidth = Math.max(1, sc.w * 0.002);
+  ctx.strokeRect(n4.x - n4.w / 2 + 0.5, n4.y - n4.h / 2 + 0.5, n4.w - 1, n4.h - 1);
+  /* grille slats */
+  ctx.strokeStyle = rgba('#8A7A58', 0.7);
+  ctx.lineWidth = Math.max(1, sc.w * 0.002);
+  for (i = 1; i < 6; i++) {
+    var gy = n4.y - n4.h / 2 + i * n4.h / 6;
+    seg(n4.x - n4.w / 2 + sc.w * 0.008, gy, n4.x + n4.w / 2 - sc.w * 0.008, gy);
+  }
+  ctx.fillStyle = CREAM;
+  ctx.font = Math.max(9, sc.w * 0.016) + 'px monospace';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+  ctx.fillText('AMP', n4.x, n4.y + n4.h / 2 + sc.h * 0.014);
+}
+function drawPlucks(sc, nodes, t, plucks) {
+  var i, k;
+  /* ghost layers first: lavender copies of each live pluck at fixed delays */
+  for (i = 0; i < plucks.length; i++) {
+    for (k = 1; k <= 4; k++) {
+      var gAge = plucks[i].age - k * 1.2;
+      if (gAge < 0) continue;
+      var gp = pluckPos(gAge, sc, nodes);
+      if (gp.done) continue;
+      var gx = sc.x + gp.x * sc.w, gy = sc.y + gp.y * sc.h;
+      ctx.fillStyle = rgba(LAV, (0.55 - k * 0.11));
+      circ(gx, gy, Math.max(2, sc.w * 0.006), true);
+    }
+  }
+  /* the live plucks themselves */
+  for (i = 0; i < plucks.length; i++) {
+    var pl = plucks[i];
+    var p = pluckPos(pl.age, sc, nodes);
+    if (p.done) continue;
+    var x = sc.x + p.x * sc.w, y = sc.y + p.y * sc.h;
+    var r = Math.max(3, sc.w * 0.008);
+    /* fuzz fattens the dot while it passes the fuzz node */
+    var fuzzNear = 1 - clamp(Math.abs(p.x - NODE_FX[1]) / 0.12, 0, 1);
+    if (fuzzNear > 0) {
+      r *= 1 + 1.6 * fuzzNear;
+      ctx.fillStyle = rgba(AMBER, (0.18 * fuzzNear));
+      circ(x, y, r * 2.1, true);
+    }
+    /* seek-wah leaves a stepped amber trail behind the dot */
+    if (p.zone === 2) {
+      ctx.fillStyle = rgba(AMBER, 0.5);
+      for (k = 0; k < Math.floor(p.local * 8); k++) {
+        var tx = sc.x + lerp(NODE_FX[2], NODE_FX[3], k / 8) * sc.w;
+        ctx.fillRect(tx - 1, y - Math.max(1.5, sc.w * 0.003),
+          Math.max(2, sc.w * 0.004), Math.max(3, sc.w * 0.006));
+      }
+    }
+    /* amp burst: expanding rings once the pluck reaches the amp */
+    if (pl.age >= 4 * SEG && pl.age < TRAVEL) {
+      var ba = (pl.age - 4 * SEG) / (TRAVEL - 4 * SEG);
+      var n4 = nodes[4];
+      ctx.strokeStyle = rgba(AMBER, (0.8 * (1 - ba)));
+      ctx.lineWidth = Math.max(1.5, sc.w * 0.004);
+      circ(n4.x, n4.y, Math.max(4, sc.w * 0.02) + ba * sc.w * 0.09, false);
+      ctx.strokeStyle = rgba(AMBER, (0.5 * (1 - ba)));
+      circ(n4.x, n4.y, Math.max(4, sc.w * 0.014) + ba * sc.w * 0.06, false);
+      /* grille glow */
+      ctx.fillStyle = rgba(AMBER, (0.35 * (1 - ba)));
+      ctx.fillRect(n4.x - n4.w / 2, n4.y - n4.h / 2, n4.w, n4.h);
+    }
+    /* the dot itself */
+    ctx.fillStyle = AMBER;
+    circ(x, y, r, true);
+    ctx.fillStyle = '#FFF3D6';
+    circ(x, y, r * 0.45, true);
+  }
+}
+function drawPlates() {
+  var smallPx = isPhone ? 11 : 12;
+  var titlePx = isPhone ? 16 : 20;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.font = 'bold ' + titlePx + 'px monospace';
+  while (titlePx > 9 && ctx.measureText('Seek-Wah Chain').width > VW - 60) {
+    titlePx -= 1;
+    ctx.font = 'bold ' + titlePx + 'px monospace';
+  }
+  var titleW = ctx.measureText('Seek-Wah Chain').width;
+  ctx.font = smallPx + 'px monospace';
+  var dateW = ctx.measureText('2007 · 02 · 20').width;
+  var plateW = Math.max(titleW, dateW) + 28;
+  var plateH = titlePx + smallPx + 20;
+  var plateX = 12, plateY = 12;
+  ctx.fillStyle = PLATE;
+  ctx.fillRect(plateX, plateY, plateW, plateH);
+  ctx.strokeStyle = PLATE_LINE;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(plateX + 0.5, plateY + 0.5, plateW - 1, plateH - 1);
+  ctx.fillStyle = TITLE_INK;
+  ctx.font = 'bold ' + titlePx + 'px monospace';
+  ctx.fillText('Seek-Wah Chain', plateX + 14, plateY + 7);
+  ctx.font = smallPx + 'px monospace';
+  ctx.fillStyle = HINT_INK;
+  ctx.fillText('2007 · 02 · 20', plateX + 14, plateY + 7 + titlePx + 3);
+  var hint = 'Tap anywhere to pluck. The chain plays itself.';
+  ctx.font = smallPx + 'px monospace';
+  var hintW = ctx.measureText(hint).width;
+  var hintPlateW = hintW + 24;
+  var hintPlateH = smallPx + 14;
+  var hintPlateX = 12;
+  var hintPlateY = VH - hintPlateH - 12;
+  ctx.fillStyle = PLATE;
+  ctx.fillRect(hintPlateX, hintPlateY, hintPlateW, hintPlateH);
+  ctx.strokeStyle = PLATE_LINE;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(hintPlateX + 0.5, hintPlateY + 0.5, hintPlateW - 1, hintPlateH - 1);
+  ctx.fillStyle = HINT_INK;
+  ctx.fillText(hint, hintPlateX + 12, hintPlateY + 7);
+}
+function draw() {
+  size();
+  var sc = fieldRect();
+  var t = phaseT;
+  var nodes = nodeGeom(sc);
+  var plucks = livePlucks(t);
+  ctx.fillStyle = GROUND;
+  ctx.fillRect(0, 0, VW, VH);
+  /* faint floor dust */
+  var i;
+  for (i = 0; i < DUST.length; i++) {
+    var d = DUST[i];
+    ctx.fillStyle = rgba(CREAM, d.a);
+    ctx.fillRect(sc.x + d.x * sc.w, sc.y + d.y * sc.h, d.r, d.r);
+  }
+  if (!isPhone) {
+    ctx.strokeStyle = rgba(CREAM, 0.22);
+    ctx.lineWidth = 1;
+    ctx.strokeRect(sc.x + 0.5, sc.y + 0.5, sc.w - 1, sc.h - 1);
+  }
+  drawCables(sc, nodes, t);
+  drawNodes(sc, nodes, t, plucks);
+  drawPlucks(sc, nodes, t, plucks);
+  drawPlates();
+}
+/* ---- audio: real WebAudio only lazily inside the first gesture ---- */
+var actx = null, fuzzNode = null, wahNode = null, delayNode = null;
+function ensureAudio() {
+  if (actx) return true;
+  var AC = null;
+  try {
+    AC = window.AudioContext || window.webkitAudioContext;
+  } catch (e) { AC = null; }
+  if (!AC) return false;
+  try { actx = new AC(); } catch (e) { return false; }
+  /* fuzz: waveshaper */
+  fuzzNode = actx.createWaveShaper();
+  var curve = new Float32Array(256), i;
+  for (i = 0; i < 256; i++) {
+    var v = i / 128 - 1;
+    curve[i] = Math.tanh(v * 3);
+  }
+  fuzzNode.curve = curve;
+  /* seek-wah: step-sequenced bandpass */
+  wahNode = actx.createBiquadFilter();
+  wahNode.type = 'bandpass';
+  wahNode.frequency.value = 700;
+  wahNode.Q.value = 6;
+  /* looper: 4-layer feedback delay */
+  delayNode = actx.createDelay(1.0);
+  delayNode.delayTime.value = 0.45;
+  var fb = actx.createGain();
+  fb.gain.value = 0.45;
+  delayNode.connect(fb);
+  fb.connect(delayNode);
+  fuzzNode.connect(wahNode);
+  wahNode.connect(delayNode);
+  delayNode.connect(actx.destination);
+  wahNode.connect(actx.destination);
+  /* slow step sequencer for the wah frequency, 8 steps per bar */
+  var steps = [400, 650, 900, 1400, 1800, 1200, 800, 550];
+  var step = 0;
+  setInterval(function () {
+    if (!actx) return;
+    wahNode.frequency.setTargetAtTime(steps[step % 8], actx.currentTime, 0.03);
+    step++;
+  }, 300);
+  return true;
+}
+function playPluck() {
+  if (!ensureAudio()) return;
+  try {
+    if (actx.state === 'suspended') actx.resume();
+    var osc = actx.createOscillator();
+    osc.type = 'triangle';
+    osc.frequency.value = 110 + (taps.length % 5) * 27.5;
+    var g = actx.createGain();
+    g.gain.setValueAtTime(0.5, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + 2.5);
+    osc.connect(g);
+    g.connect(fuzzNode);
+    osc.start();
+    osc.stop(actx.currentTime + 2.6);
+  } catch (e) { /* silent if audio is unavailable */ }
+}
+function onTap() {
+  taps.push(phaseT);
+  if (taps.length > 12) taps.shift();
+  playPluck();
+  draw();
+}
+if (typeof canvas !== 'undefined' && canvas.addEventListener) {
+  canvas.addEventListener('pointerdown', onTap);
+}
+/* ---- frame one: fixed phase t = 10.0 s, second pluck mid seek-wah ---- */
+size();
+if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', size);
+if (typeof window !== 'undefined' && window.addEventListener) window.addEventListener('resize', size);
+draw();
+if (!reduced && typeof requestAnimationFrame !== 'undefined') {
+  (function loop() {
+    var t0 = null, prevTs = null, clockT = 0;
+    function step(now) {
+      if (t0 === null) t0 = now;
+      if (prevTs === null) prevTs = now;
+      var dt = clamp((now - prevTs) / 1000, 0, 0.05);
+      prevTs = now;
+      clockT += dt;
+      phaseT = (FRAME_T + clockT) % LOOP_LEN;
+      var hidden = false;
+      try { hidden = document.hidden; } catch (e) { hidden = false; }
+      if (!hidden) draw();
+      if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  })();
+}
+</script>
+</body>
+</html>
