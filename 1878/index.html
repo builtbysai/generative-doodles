@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Terrazzo</title>
+<style>
+html, body { margin: 0; padding: 0; background: #E3D9BE; overflow: hidden; }
+canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+/* Terrazzo: a field of interlocking irregular stone chips in cream
+   cement, orange and black aggregate, with the occasional bottle-green
+   chip. The chips drift a few pixels along small Lissajous paths, the
+   cement seams stretch, and every three minutes the whole field
+   re-locks into a freshly relaxed tessellation. Watch only. */
+var TAU = Math.PI * 2;
+var CEMENT = '#E3D9BE';
+var CREAMS = ['#EFE6D2', '#E6DCC4', '#DDD2B8', '#F2EBDA', '#D9CDB2'];
+var ORANGES = ['#D96A2B', '#C75B21', '#E07B3A'];
+var BLACKS = ['#1E1C1A', '#2A2724'];
+var GREENS = ['#1F4D3A', '#2A5C46'];
+var SEAM = 'rgba(30,28,26,0.14)';
+var PLATE = '#1E1C1A';
+var PLATE_LINE = 'rgba(242,234,216,0.28)';
+var TITLE_INK = '#F2EAD8';
+var HINT_INK = '#D8CDB4';
+var FRAME_T = 12.0;      /* fixed phase: cycle 0, mid breath, field settled */
+var CYCLE = 180.0;       /* seconds between re-locks: every three minutes */
+var COLS = 12, ROWS = 12;
+var EXTENT = 1.24, ORIGIN = -0.12; /* unit-space seed grid covers the field plus margin */
+function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+function mulberry32(seed) {
+  return function () {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    var t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var VW = 0, VH = 0, isPhone = false;
+var reduced = false;
+try { reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (e) { reduced = false; }
+var phaseT = FRAME_T;
+function size() {
+  var vw = 0, vh = 0;
+  if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.width) {
+    vw = window.visualViewport.width; vh = window.visualViewport.height;
+  } else if (typeof window !== 'undefined' && window.innerWidth) {
+    vw = window.innerWidth; vh = window.innerHeight;
+  }
+  VW = vw; VH = vh;
+  canvas.width = VW; canvas.height = VH;
+  canvas.style.width = VW + 'px'; canvas.style.height = VH + 'px';
+  if (typeof window !== 'undefined' && window.screen) {
+    var mn = Math.min(window.screen.width, window.screen.height);
+    isPhone = mn < 700 || VH > VW * 1.15;
+  }
+}
+/* Field-like composition: full-bleed on phones, a centered square on desktop. */
+function fieldRect() {
+  if (isPhone) return { x: 0, y: 0, w: VW, h: VH };
+  var s = Math.min(VW, VH);
+  return { x: (VW - s) / 2, y: (VH - s) / 2, w: s, h: s };
+}
+/* Keep points closer to a than to b: clip polygon to the half-plane
+   bounded by the perpendicular bisector of a and b. */
+function clipHalf(poly, ax, ay, bx, by) {
+  var mx = (ax + bx) / 2, my = (ay + by) / 2;
+  var dx = bx - ax, dy = by - ay;
+  function inside(p) { return (p.x - mx) * dx + (p.y - my) * dy <= 0; }
+  function cross(p, q) {
+    var dp = (p.x - mx) * dx + (p.y - my) * dy;
+    var dq = (q.x - mx) * dx + (q.y - my) * dy;
+    var f = dp / (dp - dq);
+    return { x: p.x + (q.x - p.x) * f, y: p.y + (q.y - p.y) * f };
+  }
+  var out = [];
+  var i, cur, prev;
+  for (i = 0; i < poly.length; i++) {
+    cur = poly[i];
+    prev = poly[(i + poly.length - 1) % poly.length];
+    if (inside(cur)) {
+      if (!inside(prev)) out.push(cross(prev, cur));
+      out.push(cur);
+    } else if (inside(prev)) {
+      out.push(cross(prev, cur));
+    }
+  }
+  return out;
+}
+function polyCentroid(poly) {
+  var a = 0, cx = 0, cy = 0, i, p, q, cr;
+  for (i = 0; i < poly.length; i++) {
+    p = poly[i]; q = poly[(i + 1) % poly.length];
+    cr = p.x * q.y - q.x * p.y;
+    a += cr; cx += (p.x + q.x) * cr; cy += (p.y + q.y) * cr;
+  }
+  if (Math.abs(a) < 1e-9) return { x: poly[0].x, y: poly[0].y };
+  a *= 0.5;
+  return { x: cx / (6 * a), y: cy / (6 * a) };
+}
+/* Voronoi cells for a seed list inside a bounding box. Neighbors are
+   the nearest 16 seeds by squared distance, fixed per seed set. */
+function voronoiCells(seeds, bx, by, bw, bh, neighbors) {
+  var cells = [];
+  var i, j, n, poly;
+  for (i = 0; i < seeds.length; i++) {
+    poly = [
+      { x: bx, y: by }, { x: bx + bw, y: by },
+      { x: bx + bw, y: by + bh }, { x: bx, y: by + bh }
+    ];
+    n = neighbors[i];
+    for (j = 0; j < n.length; j++) {
+      poly = clipHalf(poly, seeds[i].x, seeds[i].y, seeds[n[j]].x, seeds[n[j]].y);
+      if (poly.length < 3) break;
+    }
+    cells.push(poly);
+  }
+  return cells;
+}
+function nearestNeighbors(seeds, k) {
+  var out = [];
+  var i, j, d, list;
+  for (i = 0; i < seeds.length; i++) {
+    list = [];
+    for (j = 0; j < seeds.length; j++) {
+      if (j === i) continue;
+      d = (seeds[j].x - seeds[i].x) * (seeds[j].x - seeds[i].x) +
+          (seeds[j].y - seeds[i].y) * (seeds[j].y - seeds[i].y);
+      list.push({ j: j, d: d });
+    }
+    list.sort(function (a, b) { return a.d - b.d; });
+    out.push(list.slice(0, k).map(function (e) { return e.j; }));
+  }
+  return out;
+}
+/* One re-lock arrangement: jittered grid seeds, two Lloyd relaxation
+   passes in unit space, then a chip color per seed. Deterministic per
+   cycle index; cycle 0 is the fixed first frame arrangement. */
+var cycleCache = {};
+function buildCycle(cycle) {
+  if (cycleCache[cycle]) return cycleCache[cycle];
+  var rng = mulberry32(1878 * 7919 + cycle * 104729);
+  var step = EXTENT / COLS;
+  var seeds = [];
+  var r, c, x, y;
+  for (r = 0; r < ROWS; r++) {
+    for (c = 0; c < COLS; c++) {
+      x = ORIGIN + (c + 0.5) * step + (rng() - 0.5) * 0.055;
+      y = ORIGIN + (r + 0.5) * step + (rng() - 0.5) * 0.055;
+      seeds.push({ x: x, y: y });
+    }
+  }
+  var pass, nb, cells, cen;
+  for (pass = 0; pass < 2; pass++) {
+    nb = nearestNeighbors(seeds, 16);
+    cells = voronoiCells(seeds, ORIGIN - 0.08, ORIGIN - 0.08, EXTENT + 0.16, EXTENT + 0.16, nb);
+    for (var i = 0; i < seeds.length; i++) {
+      if (cells[i].length >= 3) {
+        cen = polyCentroid(cells[i]);
+        seeds[i] = {
+          x: seeds[i].x + (cen.x - seeds[i].x) * 0.55,
+          y: seeds[i].y + (cen.y - seeds[i].y) * 0.55
+        };
+      }
+    }
+  }
+  var colors = [];
+  var roll, k;
+  for (k = 0; k < seeds.length; k++) {
+    roll = rng();
+    if (roll < 0.55) colors.push(CREAMS[Math.floor(rng() * CREAMS.length)]);
+    else if (roll < 0.77) colors.push(ORANGES[Math.floor(rng() * ORANGES.length)]);
+    else if (roll < 0.92) colors.push(BLACKS[Math.floor(rng() * BLACKS.length)]);
+    else colors.push(GREENS[Math.floor(rng() * GREENS.length)]);
+  }
+  /* Drift: small Lissajous paths per chip, seeded per cycle and chip. */
+  var drng = mulberry32(1878 * 131 + cycle * 7919);
+  var drift = [];
+  for (k = 0; k < seeds.length; k++) {
+    drift.push({
+      ax: 0.003 + drng() * 0.005,
+      ay: 0.003 + drng() * 0.005,
+      fx: 0.006 + drng() * 0.010,
+      fy: 0.006 + drng() * 0.010,
+      px: drng() * TAU,
+      py: drng() * TAU
+    });
+  }
+  var built = {
+    seeds: seeds,
+    colors: colors,
+    drift: drift,
+    neighbors: nearestNeighbors(seeds, 16)
+  };
+  cycleCache[cycle] = built;
+  return built;
+}
+function drawPlates() {
+  var smallPx = isPhone ? 11 : 12;
+  var titlePx = isPhone ? 16 : 20;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.font = 'bold ' + titlePx + 'px monospace';
+  while (titlePx > 9 && ctx.measureText('Terrazzo').width > VW - 60) {
+    titlePx -= 1;
+    ctx.font = 'bold ' + titlePx + 'px monospace';
+  }
+  var titleW = ctx.measureText('Terrazzo').width;
+  ctx.font = smallPx + 'px monospace';
+  var dateW = ctx.measureText('2007 · 03 · 04').width;
+  var plateW = Math.max(titleW, dateW) + 28;
+  var plateH = titlePx + smallPx + 20;
+  var plateX = 12, plateY = 12;
+  ctx.fillStyle = PLATE;
+  ctx.fillRect(plateX, plateY, plateW, plateH);
+  ctx.strokeStyle = PLATE_LINE;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(plateX + 0.5, plateY + 0.5, plateW - 1, plateH - 1);
+  ctx.fillStyle = TITLE_INK;
+  ctx.font = 'bold ' + titlePx + 'px monospace';
+  ctx.fillText('Terrazzo', plateX + 14, plateY + 7);
+  ctx.font = smallPx + 'px monospace';
+  ctx.fillStyle = HINT_INK;
+  ctx.fillText('2007 · 03 · 04', plateX + 14, plateY + 7 + titlePx + 3);
+  var hint = 'Watch the field re-lock.';
+  ctx.font = smallPx + 'px monospace';
+  var hintW = ctx.measureText(hint).width;
+  var hintPlateW = hintW + 24;
+  var hintPlateH = smallPx + 14;
+  var hintPlateX = 12;
+  var hintPlateY = VH - hintPlateH - 12;
+  ctx.fillStyle = PLATE;
+  ctx.fillRect(hintPlateX, hintPlateY, hintPlateW, hintPlateH);
+  ctx.strokeStyle = PLATE_LINE;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(hintPlateX + 0.5, hintPlateY + 0.5, hintPlateW - 1, hintPlateH - 1);
+  ctx.fillStyle = HINT_INK;
+  ctx.fillText(hint, hintPlateX + 12, hintPlateY + 7);
+}
+function draw() {
+  size();
+  var sc = fieldRect();
+  var t = phaseT;
+  var cycle = Math.floor(t / CYCLE);
+  var data = buildCycle(cycle);
+  var U = Math.min(sc.w, sc.h);
+  ctx.fillStyle = CEMENT;
+  ctx.fillRect(0, 0, VW, VH);
+  /* Drifted chip centroids in field pixels; the drift is a pure
+     function of t, so frame one is reproducible. */
+  var pts = [];
+  var i, d;
+  for (i = 0; i < data.seeds.length; i++) {
+    d = data.drift[i];
+    pts.push({
+      x: sc.x + (data.seeds[i].x + d.ax * Math.sin(TAU * d.fx * t + d.px)) * sc.w,
+      y: sc.y + (data.seeds[i].y + d.ay * Math.sin(TAU * d.fy * t + d.py)) * sc.h
+    });
+  }
+  var margin = 60;
+  var cells = voronoiCells(pts, sc.x - margin, sc.y - margin, sc.w + 2 * margin, sc.h + 2 * margin, data.neighbors);
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(sc.x, sc.y, sc.w, sc.h);
+  ctx.clip();
+  var inset = Math.max(2, U * 0.0035);
+  var poly, cen, v, dx, dy, dist, f, j;
+  for (i = 0; i < cells.length; i++) {
+    poly = cells[i];
+    if (poly.length < 3) continue;
+    cen = polyCentroid(poly);
+    ctx.beginPath();
+    for (j = 0; j < poly.length; j++) {
+      v = poly[j];
+      dx = v.x - cen.x; dy = v.y - cen.y;
+      dist = Math.sqrt(dx * dx + dy * dy);
+      f = dist > inset ? (dist - inset) / dist : 0;
+      if (j === 0) ctx.moveTo(cen.x + dx * f, cen.y + dy * f);
+      else ctx.lineTo(cen.x + dx * f, cen.y + dy * f);
+    }
+    ctx.closePath();
+    ctx.fillStyle = data.colors[i];
+    ctx.fill();
+    ctx.strokeStyle = SEAM;
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+  ctx.restore();
+  drawPlates();
+}
+/* ---- frame one: fixed phase t = 12.0 s, cycle 0, mid breath ---- */
+size();
+if (typeof window !== 'undefined' && window.visualViewport && window.visualViewport.addEventListener) window.visualViewport.addEventListener('resize', size);
+if (typeof window !== 'undefined' && window.addEventListener) window.addEventListener('resize', size);
+draw();
+if (!reduced && typeof requestAnimationFrame !== 'undefined') {
+  (function loop() {
+    var t0 = null, prevTs = null, clockT = 0;
+    function step(now) {
+      if (t0 === null) t0 = now;
+      if (prevTs === null) prevTs = now;
+      var dt = clamp((now - prevTs) / 1000, 0, 0.05);
+      prevTs = now;
+      clockT += dt;
+      phaseT = FRAME_T + clockT;
+      var hidden = false;
+      try { hidden = document.hidden; } catch (e) { hidden = false; }
+      if (!hidden) draw();
+      if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  })();
+}
+</script>
+</body>
+</html>
