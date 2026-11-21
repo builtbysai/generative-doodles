@@ -1,0 +1,563 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>№1953 The Errant Pipe</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #1c1c1f; height: 100%; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // The Errant Pipe, TC2 / PP1200, study #255 tom-challenger.
+  // A dark church interior. An organ's pipe ranks rise as an
+  // unbroken band across the top, sounding an endless wind tone.
+  // Below, a single breath-phrase arcs and falls as a visible
+  // lung-like swell, runs out, and returns. The sax is one more
+  // pipe, except it must breathe. Press and hold to breathe:
+  // holding sustains the phrase, releasing lets it fall and die;
+  // the organ never stops. Capacity always runs out; the player
+  // cannot hold forever. No melody, only keens and long held
+  // tones against the drone.
+  var STONE_TOP = '#333338';  // stone dark grey, upper wall
+  var STONE_BOT = '#1c1c1f';  // stone dark grey, floor shadow
+  var STONE_MID = '#26262a';  // stone, mid wall
+  var SILVER = '#c8ccd2';     // pipe silver, bright
+  var SILVER_DK = '#8f959d';  // pipe silver, shaded side
+  var SILVER_DIM = '#6a6f76'; // pipe silver, deep shadow
+  var AMBER = '#e8a33d';      // candle amber
+  var AMBER_DIM = '#b97e2a';  // candle amber, dim
+  var PALE = '#a8c8e8';       // breath-phrase, pale blue
+  var PALE_DIM = '#7fa3c4';   // breath-phrase, dim
+  var PLATE = '#e8e4d8';      // plate ink, warm off-white
+  var INK = '#1c1c1f';        // dark ink for the hint pill
+  var PILL = '#d8d4c6';       // hint pill, pale stone
+
+  // Fixed-phase first frame: FIRST_T = 8 s. The autonomous
+  // breath cycle is 14 s: rise 0 to 4, sustain 4 to 7, fall 7
+  // to 11, rest 11 to 14. At t = 8 the phrase is falling from
+  // its peak, the lung swell is still wide and glowing, and
+  // capacity is part spent, so the piece reads at once as a
+  // breath already running out against a drone that never stops.
+  var FIRST_T = 8;
+  var SEED = 1953;
+  var CYCLE = 14;
+  var HOLD_MAX = 6;   // seconds of breath at full hold before capacity runs out
+  var RECHARGE = 8;   // seconds of rest to refill capacity
+
+  // QA probe hooks: ?t=<seconds> sets the virtual clock at load,
+  // ?hold=1 starts held at load, ?seed= varies the texture seed.
+  // Read at load only.
+  var seedParam = 0, probeT = null, probeHold = false;
+  try {
+    var qs = (typeof location !== 'undefined' && location.search) ? location.search : '';
+    var m;
+    m = qs.match(/[?&]seed=(-?\d+)/); if (m) { seedParam = parseInt(m[1], 10) || 0; }
+    var mt = qs.match(/[?&]t=([0-9.]+)/); if (mt) { probeT = parseFloat(mt[1]); }
+    if (qs.indexOf('hold=1') !== -1) { probeHold = true; }
+  } catch (e) {}
+  var FIELD_SEED = seedParam ? (SEED + seedParam * 101) : SEED;
+
+  // Seeded PRNG, mulberry32. Fresh instances per draw from the
+  // piece number and a fixed salt, so every frame is reproducible.
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function a4(v) { return Math.round(v * 10000) / 10000; } // avoid scientific-notation alpha
+  function hexA(h, a) {
+    var r = parseInt(h.slice(1, 3), 16), g = parseInt(h.slice(3, 5), 16), b = parseInt(h.slice(5, 7), 16);
+    return 'rgba(' + r + ',' + g + ',' + b + ',' + a4(a) + ')';
+  }
+  function smooth(f) { return f * f * (3 - 2 * f); }
+
+  // The autonomous breath cycle, a pure function of t. Used for
+  // every frame until the visitor first presses, so frame one is
+  // fully reproducible. Returns { h, c }: phrase height 0 to 1
+  // and remaining capacity 0 to 1.
+  function cycleState(t) {
+    var ph = ((t % CYCLE) + CYCLE) % CYCLE;
+    var h, c;
+    if (ph < 4) { h = smooth(ph / 4); }
+    else if (ph < 7) { h = 1; }
+    else if (ph < 11) { h = 1 - smooth((ph - 7) / 4); }
+    else { h = 0; }
+    if (ph < 7) { c = 1 - 0.6 * (ph / 7); }
+    else { c = 0.4 + 0.6 * ((ph - 7) / 7); }
+    return { h: h, c: c };
+  }
+
+  // Interaction state. Before the first press, draw() uses
+  // cycleState(t). The first press captures the cycle state into
+  // hState and cState and hands control to the hold model: while
+  // held and capacity remains, the phrase climbs toward its peak
+  // and capacity drains at 1/HOLD_MAX per second; released, or
+  // with capacity spent, the phrase falls and capacity refills
+  // at 1/RECHARGE per second. Capacity always runs out, so no
+  // hold lasts forever.
+  var interacted = false;
+  var holding = false;
+  var hState = 0, cState = 1;
+  var exhausted = false; // set when capacity hits 0; the phrase
+  // stays dead until capacity refills past 0.5, so holding
+  // forever cannot sustain it, it only earns short gasps.
+
+  function captureCycle(t) {
+    var s = cycleState(t);
+    hState = s.h; cState = s.c;
+  }
+  function stepState(dt) {
+    if (!interacted) { return; }
+    if (holding && cState > 0 && !exhausted) {
+      hState = hState + (1 - hState) * Math.min(1, dt * 2.2);
+      cState = Math.max(0, cState - dt / HOLD_MAX);
+      if (cState <= 0) { exhausted = true; }
+    } else {
+      hState = Math.max(0, hState - dt * 0.45);
+      cState = Math.min(1, cState + dt / RECHARGE);
+      if (exhausted && cState >= 0.5) { exhausted = false; }
+    }
+  }
+
+  var reduced = false;
+  try {
+    if (typeof window.matchMedia === 'function') {
+      reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    }
+  } catch (e) { reduced = false; }
+
+  var W = 0, H = 0, dpr = 1, isPhone = false;
+  var stageX = 0, stageY = 0, stageW = 0, stageH = 0;
+  var lastT = FIRST_T;
+
+  function resize() {
+    var vw = 0, vh = 0;
+    try {
+      if (typeof window.visualViewport !== 'undefined' && window.visualViewport) {
+        vw = window.visualViewport.width; vh = window.visualViewport.height;
+      }
+    } catch (e) {}
+    if (!vw || !vh) { vw = window.innerWidth; vh = window.innerHeight; }
+    var sw = 0, sh = 0;
+    try { sw = window.screen.width; sh = window.screen.height; } catch (e) { sw = vw; sh = vh; }
+    isPhone = Math.min(sw, sh) < 700 || (vh > vw * 1.15);
+    if (isPhone) {
+      stageW = vw; stageH = vh; stageX = 0; stageY = 0;
+    } else {
+      var side = Math.min(vw * 0.8, vh * 0.92);
+      stageW = side; stageH = side;
+      stageX = (vw - stageW) / 2; stageY = (vh - stageH) / 2;
+    }
+    W = stageW; H = stageH;
+    dpr = (typeof window.devicePixelRatio === 'number' && window.devicePixelRatio > 0) ? window.devicePixelRatio : 1;
+    canvas.width = Math.max(1, Math.round(stageW * dpr));
+    canvas.height = Math.max(1, Math.round(stageH * dpr));
+    canvas.style.width = stageW + 'px';
+    canvas.style.height = stageH + 'px';
+    canvas.style.left = stageX + 'px';
+    canvas.style.top = stageY + 'px';
+    canvas.style.position = 'absolute';
+  }
+
+  // Pipe heights for the unbroken rank, seeded once per draw so
+  // the rank is identical every frame. Two rows: a tall back
+  // rank and a shorter front rank, heights in normalized units
+  // of the pipe band.
+  function pipeHeights(n, salt) {
+    var rng = mulberry32(FIELD_SEED * 31 + salt);
+    var i, out = [];
+    for (i = 0; i < n; i++) {
+      out.push(0.55 + 0.45 * rng());
+    }
+    return out;
+  }
+
+  // The church interior: stone gradient, two tall arched
+  // windows glowing faint amber on the sides, and a dark floor
+  // band at the bottom where the candles stand.
+  function drawInterior(t) {
+    var grad = ctx.createLinearGradient(0, 0, 0, H);
+    grad.addColorStop(0, STONE_TOP);
+    grad.addColorStop(0.55, STONE_MID);
+    grad.addColorStop(1, STONE_BOT);
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, W, H);
+    // Arched windows, left and right, faint amber glow.
+    var i, wx;
+    for (i = 0; i < 2; i++) {
+      wx = (i === 0 ? 0.06 : 0.94) * W;
+      var ww = 0.055 * W, wh = 0.30 * H, wy = 0.38 * H;
+      var flick = 0.05 * Math.sin(t * 0.7 + i * 2.1);
+      ctx.fillStyle = hexA(AMBER, a4(0.10 + flick));
+      ctx.beginPath();
+      ctx.moveTo(wx - ww / 2, wy + wh / 2);
+      ctx.lineTo(wx - ww / 2, wy);
+      ctx.moveTo(wx - ww / 2, wy);
+      ctx.arc(wx, wy, ww / 2, Math.PI, 0);
+      ctx.lineTo(wx + ww / 2, wy + wh / 2);
+      ctx.closePath();
+      ctx.fill();
+      // Mullion cross.
+      ctx.strokeStyle = hexA(STONE_BOT, a4(0.8));
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(wx, wy - ww / 2); ctx.lineTo(wx, wy + wh / 2);
+      ctx.moveTo(wx - ww / 2, wy + wh * 0.18); ctx.lineTo(wx + ww / 2, wy + wh * 0.18);
+      ctx.stroke();
+    }
+    // Floor band.
+    ctx.fillStyle = hexA(STONE_BOT, a4(0.9));
+    ctx.fillRect(0, H * 0.86, W, H * 0.14);
+  }
+
+  // The organ: an unbroken band of silver pipes across the top
+  // third, two ranks, mouths cut as dark slits. The drone never
+  // stops, so the pipes carry a slow shimmer: each pipe's
+  // brightness breathes on a slow sine of t, well under the
+  // 14 Hz ceiling. A dark case frame holds the band.
+  function drawOrgan(t) {
+    var bandY = 0.02 * H, bandH = 0.31 * H;
+    var baseY = bandY + bandH;
+    // Case frame.
+    ctx.fillStyle = '#141416';
+    ctx.fillRect(0, bandY - 6, W, bandH + 12);
+    ctx.fillStyle = hexA(SILVER_DIM, a4(0.5));
+    ctx.fillRect(0, bandY - 6, W, 3);
+    ctx.fillRect(0, baseY + 3, W, 3);
+    var ranks = [
+      { n: 26, salt: 7, top: 0, hFrac: 1.0, wFrac: 1.0 },
+      { n: 26, salt: 23, top: 0.38, hFrac: 0.62, wFrac: 0.92 }
+    ];
+    var r, i;
+    for (r = 0; r < ranks.length; r++) {
+      var rk = ranks[r];
+      var hs = pipeHeights(rk.n, rk.salt);
+      var pw = (W * rk.wFrac) / rk.n;
+      var x0 = (W - W * rk.wFrac) / 2;
+      for (i = 0; i < rk.n; i++) {
+        var ph = hs[i] * bandH * rk.hFrac;
+        var px = x0 + i * pw;
+        var py = baseY - ph - rk.top * bandH;
+        var shim = 0.5 + 0.5 * Math.sin(t * 0.6 + i * 0.45 + r * 1.7);
+        var bright = 0.72 + 0.28 * shim;
+        // Pipe body, bright face with a shaded side.
+        ctx.fillStyle = hexA(SILVER, a4(0.85 * bright));
+        ctx.fillRect(px + 1, py, pw * 0.62 - 1, ph);
+        ctx.fillStyle = hexA(SILVER_DK, a4(0.85 * bright));
+        ctx.fillRect(px + pw * 0.62, py, pw * 0.38 - 1, ph);
+        // Rounded cap.
+        ctx.fillStyle = hexA(SILVER, a4(0.9 * bright));
+        ctx.beginPath();
+        ctx.moveTo(px + pw * 0.62, py); ctx.arc(px + pw * 0.31, py, pw * 0.31, 0, Math.PI, true);
+        ctx.fill();
+        // Mouth slit, dark, near the base of each pipe.
+        ctx.fillStyle = hexA('#141416', a4(0.9));
+        var my = baseY - 14 - rk.top * bandH;
+        ctx.fillRect(px + pw * 0.16, my, pw * 0.5, 5);
+      }
+    }
+    // The drone: faint silver lines drifting down from the pipe
+    // mouths, the endless wind tone made visible.
+    var j;
+    for (j = 0; j < 9; j++) {
+      var lx = (0.08 + j * 0.105) * W;
+      var lp = ((t * 12 + j * 47) % 90) / 90;
+      var ly = baseY + 8 + lp * H * 0.10;
+      ctx.strokeStyle = hexA(SILVER, a4(0.22 * (1 - lp)));
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(lx, ly); ctx.lineTo(lx, ly + 18);
+      ctx.stroke();
+    }
+  }
+
+  // Candles: a row of small amber flames along the floor band,
+  // flickering slowly, with a soft glow halo each.
+  function drawCandles(t) {
+    var rng = mulberry32(FIELD_SEED * 11 + 5);
+    var i, n = 7;
+    for (i = 0; i < n; i++) {
+      var cx = (0.10 + i * 0.133) * W + (rng() - 0.5) * 12;
+      var cy = H * 0.945;
+      var fl = 0.8 + 0.2 * Math.sin(t * 1.3 + i * 2.4);
+      // Halo.
+      ctx.fillStyle = hexA(AMBER, a4(0.10 * fl));
+      ctx.beginPath(); ctx.moveTo(cx + 16, cy - 8); ctx.arc(cx, cy - 8, 16, 0, Math.PI * 2); ctx.fill();
+      // Stick.
+      ctx.fillStyle = hexA('#e8e0cc', a4(0.9));
+      ctx.fillRect(cx - 2, cy - 6, 4, 14);
+      // Flame.
+      ctx.fillStyle = hexA(AMBER, a4(0.95 * fl));
+      ctx.beginPath();
+      ctx.moveTo(cx, cy - 18 * fl);
+      ctx.quadraticCurveTo(cx + 4, cy - 10, cx, cy - 5);
+      ctx.quadraticCurveTo(cx - 4, cy - 10, cx, cy - 18 * fl);
+      ctx.fill();
+    }
+  }
+
+  // The breath-phrase: a pale blue arc through the lower two
+  // thirds, rising from the left floor, peaking near the center,
+  // and falling to the right floor. Its height is the phrase
+  // height h. The lung swell is a glowing ellipse at the arc
+  // apex that expands and contracts with h, and thin keen lines
+  // branch from the arc while the phrase is held high.
+  function drawBreath(t, h, c) {
+    if (h <= 0.005 && c >= 0.99) { return; }
+    var y0 = H * 0.86, apexY = H * 0.86 - h * H * 0.42;
+    var apexX = W * 0.5;
+    var lx = W * 0.08, rx = W * 0.92;
+    // The lung swell: layered glow ellipses at the apex.
+    var glowR = (0.07 + 0.11 * h) * Math.min(W, H);
+    var gi;
+    for (gi = 3; gi >= 1; gi--) {
+      ctx.fillStyle = hexA(PALE, a4(0.03 * h * gi));
+      ctx.beginPath();
+      ctx.moveTo(apexX + glowR * gi / 3, apexY); ctx.arc(apexX, apexY, glowR * gi / 3, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.fillStyle = hexA(PALE, a4(0.10 * h));
+    ctx.beginPath();
+    ctx.ellipse(apexX, apexY, glowR * 0.62, glowR * 0.38, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // The arc itself: a smooth sine dome from the left floor to
+    // the right floor, pale blue, thicker near the apex. Skipped
+    // entirely when the phrase is dead, so it never flattens
+    // into a line along the floor.
+    function domeY(f) { return y0 - h * H * 0.42 * Math.sin(Math.PI * f); }
+    if (h > 0.005) {
+    ctx.strokeStyle = hexA(PALE, a4(0.25 + 0.65 * h));
+    ctx.lineWidth = 2 + 3 * h;
+    ctx.beginPath();
+    var si;
+    for (si = 0; si <= 48; si++) {
+      var f = si / 48;
+      var ax = lx + (rx - lx) * f, ay = domeY(f);
+      if (si === 0) { ctx.moveTo(ax, ay); } else { ctx.lineTo(ax, ay); }
+    }
+    ctx.stroke();
+    // Keens: short thin ticks rising off the arc while the phrase
+    // is held high, long held tones against the drone.
+    if (h > 0.55) {
+      var k, keenA = (h - 0.55) / 0.45;
+      for (k = 0; k < 5; k++) {
+        var kf = 0.30 + k * 0.10;
+        var kx = lx + (rx - lx) * kf;
+        var ky = domeY(kf);
+        var klen = (10 + 16 * keenA) * (1 + 0.3 * Math.sin(t * 0.9 + k * 1.3));
+        ctx.strokeStyle = hexA(PALE_DIM, a4(0.55 * keenA));
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(kx, ky);
+        ctx.lineTo(kx + 3, ky - klen);
+        ctx.stroke();
+      }
+    }
+    }
+    // The sax: one more pipe, except it must breathe. A small
+    // brass-dark sax silhouette stands at the left foot of the
+    // arc, its bell aimed up the phrase, and a thin pale line
+    // joins its bell to the arc while the phrase lives.
+    var sx = W * 0.10, sy = H * 0.86;
+    ctx.strokeStyle = hexA(AMBER_DIM, a4(0.95));
+    ctx.lineWidth = 5;
+    ctx.beginPath();
+    ctx.moveTo(sx, sy - 6);
+    ctx.quadraticCurveTo(sx + 8, sy - 44, sx + 22, sy - 52);
+    ctx.stroke();
+    ctx.fillStyle = hexA(AMBER, a4(0.95));
+    ctx.beginPath();
+    ctx.moveTo(sx + 22, sy - 66); ctx.arc(sx + 22, sy - 56, 10, 0, Math.PI * 2); ctx.fill();
+    if (h > 0.05) {
+      ctx.strokeStyle = hexA(PALE, a4(0.5 * h));
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(sx + 22, sy - 56);
+      ctx.quadraticCurveTo(W * 0.24, apexY + 30, W * 0.30, apexY + 18);
+      ctx.stroke();
+    }
+  }
+
+  // Capacity bar: a thin gauge above the hint, showing how much
+  // breath remains. It drains amber to pale as it empties, and
+  // flashes the words when it is spent.
+  function drawCapacity(c) {
+    var bw = W * 0.36, bx = (W - bw) / 2, by = H * 0.83;
+    ctx.fillStyle = hexA(SILVER_DIM, a4(0.5));
+    ctx.fillRect(bx, by, bw, 5);
+    var col = c > 0.25 ? PALE : AMBER;
+    ctx.fillStyle = hexA(col, a4(0.9));
+    ctx.fillRect(bx, by, bw * c, 5);
+    ctx.fillStyle = hexA(PLATE, a4(0.75));
+    ctx.font = '11px Georgia, "Times New Roman", serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(c <= 0.001 ? 'breath spent' : 'breath', W / 2, by - 6);
+    ctx.textAlign = 'left';
+  }
+
+  function draw(t) {
+    lastT = t;
+    // Pin the canvas element in draw(), per house rules.
+    canvas.style.width = stageW + 'px';
+    canvas.style.height = stageH + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    var st = interacted ? { h: hState, c: cState } : cycleState(t);
+    var h = st.h, c = st.c;
+
+    drawInterior(t);
+    drawOrgan(t);
+    drawBreath(t, h, c);
+    drawCandles(t);
+    drawCapacity(c);
+
+    // ---- Plates: title top-left over the pipe band, number and
+    // date below it, a short descriptor top-right. The plates sit
+    // on the dark case frame, so they use the light plate ink.
+    var fsTitle = Math.round(20 * clamp(W / 560, 0.8, 1.15));
+    var fsSub = Math.round(fsTitle * 0.62);
+    var fsSmall = Math.round(11 * clamp(W / 560, 0.85, 1.1));
+    var fsHint = Math.round(13 * clamp(W / 560, 0.85, 1.1));
+    ctx.textBaseline = 'alphabetic';
+    ctx.textAlign = 'left';
+    // Dark backdrops so the plates stay legible over the silver
+    // pipes behind them.
+    ctx.fillStyle = hexA('#141416', a4(0.72));
+    ctx.fillRect(8, 8, 250 * clamp(W / 560, 0.8, 1.15), 18 + fsTitle * 0.8 + fsSub + 18);
+    ctx.fillStyle = PLATE;
+    ctx.font = '600 ' + fsTitle + 'px Georgia, "Times New Roman", serif';
+    ctx.fillText('The Errant Pipe', 18, 18 + fsTitle * 0.8);
+    ctx.fillStyle = hexA(PLATE, 0.8);
+    ctx.font = fsSub + 'px Georgia, "Times New Roman", serif';
+    ctx.fillText('№1953 · 2007 · 05 · 18', 18, 18 + fsTitle * 0.8 + fsSub + 8);
+    ctx.textAlign = 'right';
+    ctx.font = 'italic ' + fsSmall + 'px Georgia, "Times New Roman", serif';
+    var dw1 = ctx.measureText('the sax must breathe').width;
+    ctx.font = fsSmall + 'px Georgia, "Times New Roman", serif';
+    var dw2 = ctx.measureText('the organ never stops').width;
+    var dw = Math.max(dw1, dw2);
+    ctx.fillStyle = hexA('#141416', a4(0.72));
+    ctx.fillRect(W - 18 - dw - 12, 8, dw + 24, 18 + fsTitle * 0.8 + fsSmall * 2 + 22);
+    ctx.fillStyle = hexA(PLATE, 0.65);
+    ctx.font = 'italic ' + fsSmall + 'px Georgia, "Times New Roman", serif';
+    ctx.fillText('the sax must breathe', W - 18, 18 + fsTitle * 0.8 + fsSmall + 8);
+    ctx.fillStyle = hexA(PLATE, 0.8);
+    ctx.font = fsSmall + 'px Georgia, "Times New Roman", serif';
+    ctx.fillText('the organ never stops', W - 18, 18 + fsTitle * 0.8 + fsSmall + 8 + fsSmall + 6);
+    ctx.textAlign = 'left';
+
+    // ---- Hint, centered at the bottom on a pale pill.
+    var hint = 'Press and hold to breathe.';
+    ctx.font = fsHint + 'px Georgia, "Times New Roman", serif';
+    var hw = ctx.measureText(hint).width;
+    var px = (W - hw) / 2 - 12, py = H - fsHint - 22, pw = hw + 24, ph = fsHint + 12;
+    ctx.fillStyle = hexA(PILL, a4(0.9));
+    ctx.fillRect(px, py, pw, ph);
+    ctx.fillStyle = INK;
+    ctx.textAlign = 'center';
+    ctx.fillText(hint, W / 2, H - 16);
+    ctx.textAlign = 'left';
+  }
+
+  function canvasPos(e) {
+    var rect = { left: 0, top: 0 };
+    try { rect = canvas.getBoundingClientRect(); } catch (err) {}
+    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+  }
+
+  // Press and hold anywhere on the canvas to breathe. Pointer
+  // down captures the cycle state and starts the hold; pointer
+  // up or cancel releases and the phrase falls. Never reloads.
+  function pressStart(e) {
+    if (!interacted) {
+      captureCycle(lastT);
+      interacted = true;
+    }
+    holding = true;
+    try { if (typeof e.preventDefault === 'function') { e.preventDefault(); } } catch (err) {}
+    draw(reduced ? FIRST_T : lastT);
+  }
+  function pressEnd() {
+    holding = false;
+    draw(reduced ? FIRST_T : lastT);
+  }
+
+  if (typeof canvas.addEventListener === 'function') {
+    canvas.addEventListener('pointerdown', function (e) {
+      pressStart(e);
+      try { if (typeof canvas.setPointerCapture === 'function' && e.pointerId !== undefined) { canvas.setPointerCapture(e.pointerId); } } catch (err) {}
+    });
+    canvas.addEventListener('pointerup', pressEnd);
+    canvas.addEventListener('pointercancel', pressEnd);
+    canvas.addEventListener('pointerleave', pressEnd);
+  }
+  if (typeof window.addEventListener === 'function') {
+    window.addEventListener('pointerup', pressEnd);
+    window.addEventListener('pointercancel', pressEnd);
+    window.addEventListener('resize', function () { resize(); draw(FIRST_T); });
+  }
+  try {
+    if (typeof window.visualViewport !== 'undefined' && window.visualViewport &&
+        typeof window.visualViewport.addEventListener === 'function') {
+      window.visualViewport.addEventListener('resize', function () { resize(); draw(FIRST_T); });
+    }
+  } catch (e) {}
+
+  // QA hooks: window.__draw drives draw() with a virtual clock,
+  // window.__piece1953 exposes the hold model and state stepping.
+  try {
+    window.__draw = function (t) { draw(t); };
+    window.__piece1953 = {
+      setHold: function (v) {
+        if (!interacted) { captureCycle(lastT); interacted = true; }
+        holding = !!v;
+      },
+      step: function (dt) { stepState(dt); },
+      state: function () { return { h: interacted ? hState : cycleState(lastT).h, c: interacted ? cState : cycleState(lastT).c, holding: holding, interacted: interacted, exhausted: exhausted }; },
+      cycle: cycleState,
+      redraw: function (t) { draw(t); },
+      firstT: FIRST_T,
+      holdMax: HOLD_MAX
+    };
+  } catch (e) {}
+
+  resize();
+  if (probeHold) { if (!interacted) { captureCycle(FIRST_T); interacted = true; } holding = true; }
+  draw(probeT !== null ? probeT : FIRST_T); // one synchronous frame at load
+
+  // Motion loop: pipe shimmer at 0.6 rad/s, candle flicker at
+  // 1.3 rad/s, breath cycle at 14 s, all well under the 14 Hz
+  // ceiling. Guarded so node-canvas QA (no
+  // requestAnimationFrame) still works.
+  if (!reduced && typeof requestAnimationFrame === 'function') {
+    var start = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+    var prev = start;
+    var loop = function (now) {
+      var t = FIRST_T + (now - start) / 1000;
+      var dt = Math.min(0.1, (now - prev) / 1000);
+      prev = now;
+      stepState(dt);
+      lastT = t;
+      draw(t);
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
