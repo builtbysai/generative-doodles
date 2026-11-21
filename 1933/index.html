@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>№1933 Arpeggiator</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #2a1a10; height: 100%; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // Palette, hand-picked from the named colors in the prompt. The study
+  // file studies/chris-hyson.md does not exist in the repo, so these hex
+  // values are chosen from the prompt's own color names.
+  var WALL = '#2a1a10';       // room ground, warm brown
+  var TAP_RED = '#8e3b1d';    // tapestry, deep red
+  var TAP_RED_LT = '#a64a24'; // tapestry, brick red
+  var TAP_ORANGE = '#c75b2a'; // tapestry, burnt orange
+  var TAP_DARK = '#6e2a14';   // tapestry, dark red band
+  var TAP_GOLD = '#e8b64c';   // tapestry motif, biscuit gold
+  var TAP_CREAM = '#f2d8a0';  // tapestry motif, pale cream
+  var WOOD = '#4a2c17';       // synth body, dark wood
+  var WOOD_EDGE = '#6b4423';  // synth body edge
+  var KEY_WHITE = '#f5efe4';  // synth keys, white
+  var KEY_BLACK = '#1c1512';  // synth keys, black
+  var KEY_SHADE = '#d8cbb2';  // white key shading
+  var PLATE = '#efe3c8';      // plate, cream
+  var BISCUIT = '#c98f3d';    // biscuit, golden brown
+  var BISCUIT_DARK = '#a86f24';// biscuit, toasted edge
+  var INK = '#f7ead6';        // plate ink, pale cream
+  var INK_DARK = '#3a2418';   // hint ink on the white keys
+  var NOTE_COLORS = [
+    '#e8b64c', '#ff9a3d', '#f2d8a0', '#e0653a',
+    '#e8b64c', '#ffd98a', '#ff9a3d', '#ffc94d',
+    '#f2d8a0', '#e0653a', '#e8b64c', '#ffd98a'
+  ];
+  var NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+
+  // QA hook: ?tapkey=N (0-11) presses key N at t=0 before the first
+  // frame, so the probe render shows that note's beads in the weave.
+  // render-piece.js passes its seed argument as ?seed=N, so a small
+  // integer seed is read the same way. ?t= moves the first frame.
+  // Parsed by hand so it works in every host.
+  var QA = {};
+  try {
+    var qs = (typeof location !== 'undefined' && location.search) ? location.search.replace(/^\?/, '') : '';
+    if (qs) {
+      var parts = qs.split('&');
+      for (var qi = 0; qi < parts.length; qi++) {
+        var kv = parts[qi].split('=');
+        if (kv[0]) { QA[decodeURIComponent(kv[0])] = decodeURIComponent(kv[1] || ''); }
+      }
+    }
+  } catch (e) {}
+  var PROBE_KEY = -1;
+  if (QA.tapkey !== undefined) {
+    var pk = parseInt(QA.tapkey, 10);
+    if (!isNaN(pk) && pk >= 0 && pk <= 11) { PROBE_KEY = pk; }
+  } else if (QA.seed !== undefined) {
+    var ps = parseInt(QA.seed, 10);
+    if (!isNaN(ps) && ps >= 0 && ps <= 11) { PROBE_KEY = ps; }
+  }
+
+  // Fixed-phase first frame: FIRST_T = 12 s. The arpeggiator steps
+  // every 0.5 s and beads live 6 s, so at t = 12 the weave holds beads
+  // from thirteen steps (t = 6 to 12), four beads a step, mid-spiral,
+  // with the held note already ringing. Frame one is byte-reproducible: every bead is a
+  // pure function of its step index, bead index and t.
+  var FIRST_T = 12;
+  if (QA.t !== undefined) {
+    var pt = parseFloat(QA.t);
+    if (!isNaN(pt)) { FIRST_T = pt; }
+  }
+
+  var SEED = 1933;
+  var STEP = 0.5;   // arpeggiator step, seconds
+  var BEAD_LIFE = 6;// bead lifetime, seconds
+  var BEADS_PER_STEP = 4;
+  var HELD_KEY = 4; // the key already held down at frame one (E)
+
+  // Seeded PRNG, mulberry32. A fresh instance is built per bead from
+  // its step and bead index, so every frame is reproducible regardless
+  // of call order.
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // The held-note pool, with history: each entry records the pool as of
+  // a time, so beads emitted before a tap use the pool that existed
+  // then. The default pool holds one note; one held note is enough to
+  // keep the texture alive.
+  var poolHistory = [{ t: 0, notes: [HELD_KEY] }];
+  var pressed = {};
+  pressed[HELD_KEY] = true;
+  if (PROBE_KEY >= 0 && PROBE_KEY !== HELD_KEY) {
+    poolHistory[0].notes = [HELD_KEY, PROBE_KEY];
+    pressed[PROBE_KEY] = true;
+  } else if (PROBE_KEY === HELD_KEY) {
+    pressed[PROBE_KEY] = true;
+  }
+  function poolAt(time) {
+    var p = poolHistory[0].notes;
+    for (var i = 0; i < poolHistory.length; i++) {
+      if (poolHistory[i].t <= time) { p = poolHistory[i].notes; }
+    }
+    return p;
+  }
+  function poolNow() { return poolHistory[poolHistory.length - 1].notes; }
+
+  var reduced = false;
+  try {
+    if (typeof window.matchMedia === 'function') {
+      reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    }
+  } catch (e) { reduced = false; }
+
+  var W = 0, H = 0, dpr = 1, isPhone = false;
+  var stageX = 0, stageY = 0, stageW = 0, stageH = 0;
+  var nowT = FIRST_T;
+
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function lerp(a, b, t) { return a + (b - a) * t; }
+  function a4(v) { return Math.round(v * 10000) / 10000; } // avoid scientific-notation alpha
+  function hexA(h, a) {
+    var r = parseInt(h.slice(1, 3), 16), g = parseInt(h.slice(3, 5), 16), b = parseInt(h.slice(5, 7), 16);
+    return 'rgba(' + r + ',' + g + ',' + b + ',' + a4(a) + ')';
+  }
+
+  function resize() {
+    var vw = 0, vh = 0;
+    try {
+      if (typeof window.visualViewport !== 'undefined' && window.visualViewport) {
+        vw = window.visualViewport.width; vh = window.visualViewport.height;
+      }
+    } catch (e) {}
+    if (!vw || !vh) { vw = window.innerWidth; vh = window.innerHeight; }
+    var sw = 0, sh = 0;
+    try { sw = window.screen.width; sh = window.screen.height; } catch (e) { sw = vw; sh = vh; }
+    isPhone = Math.min(sw, sh) < 700 || (vh > vw * 1.15);
+    if (isPhone) {
+      stageW = vw; stageH = vh; stageX = 0; stageY = 0;
+    } else {
+      var side = Math.min(vw * 0.8, vh * 0.92);
+      stageW = side; stageH = side;
+      stageX = (vw - stageW) / 2; stageY = (vh - stageH) / 2;
+    }
+    W = stageW; H = stageH;
+    dpr = (typeof window.devicePixelRatio === 'number' && window.devicePixelRatio > 0) ? window.devicePixelRatio : 1;
+    canvas.width = Math.max(1, Math.round(stageW * dpr));
+    canvas.height = Math.max(1, Math.round(stageH * dpr));
+    canvas.style.width = stageW + 'px';
+    canvas.style.height = stageH + 'px';
+    canvas.style.left = stageX + 'px';
+    canvas.style.top = stageY + 'px';
+    canvas.style.position = 'absolute';
+  }
+
+  // Geometry, all as fractions of the stage so they survive resize.
+  // Tapestry: 0 to 0.66H. Synth body: 0.66H to H. Control strip:
+  // 0.66H to 0.74H. White keys: 0.74H to H. Black keys: 0.74H to 0.87H.
+  var N_WHITE = 12;
+  var BLACK_AFTER = { 0: true, 1: true, 3: true, 4: true, 5: true, 7: true, 8: true, 10: true };
+  function keysTop() { return H * 0.74; }
+  function whiteKeyW() { return W / N_WHITE; }
+  function whiteKeyX(i) { return i * whiteKeyW(); }
+  function blackKeyX(i) { return (i + 1) * whiteKeyW() - whiteKeyW() * 0.30; }
+  function keyNoteAt(x, y) {
+    if (y < keysTop() || y > H) { return -1; }
+    var ww = whiteKeyW();
+    var wi = Math.floor(x / ww);
+    if (wi < 0 || wi >= N_WHITE) { return -1; }
+    // Black keys sit above the whites; check them first.
+    if (y < H * 0.87) {
+      for (var b = 0; b < N_WHITE - 1; b++) {
+        if (!BLACK_AFTER[b]) { continue; }
+        var bx = blackKeyX(b);
+        if (x >= bx && x <= bx + ww * 0.60) { return 12 + b; }
+      }
+    }
+    return wi;
+  }
+  // Note index to bead color and spawn x: white keys 0-11 map to
+  // NOTE_COLORS directly; black-key notes 12-22 reuse the same palette
+  // by (note % 12) and spawn from the black key's center.
+  function noteColor(note) { return NOTE_COLORS[note % 12]; }
+  function noteSpawnX(note) {
+    if (note < 12) { return whiteKeyX(note) + whiteKeyW() / 2; }
+    var b = note - 12;
+    return blackKeyX(b) + whiteKeyW() * 0.30;
+  }
+  function noteName(note) { return NOTE_NAMES[note % 12]; }
+
+  function pointerPos(ev) {
+    var rect = canvas.getBoundingClientRect();
+    var sx = (rect.width > 0) ? (W / rect.width) : 1;
+    var sy = (rect.height > 0) ? (H / rect.height) : 1;
+    return { x: (ev.clientX - rect.left) * sx, y: (ev.clientY - rect.top) * sy };
+  }
+
+  // Tap a key to press it: its note joins the held pool and its beads
+  // join the weave. Notes are never lifted; they ring until they fade.
+  function pressKey(note) {
+    if (pressed[note]) { return; }
+    pressed[note] = true;
+    var cur = poolNow().slice();
+    cur.push(note);
+    poolHistory.push({ t: nowT, notes: cur });
+    draw(nowT);
+  }
+  function onDown(ev) {
+    var p = pointerPos(ev);
+    var n = keyNoteAt(p.x, p.y);
+    if (n < 0) { return; }
+    pressKey(n);
+    if (ev.preventDefault) { ev.preventDefault(); }
+  }
+  if (typeof canvas.addEventListener === 'function') {
+    canvas.addEventListener('pointerdown', onDown);
+  }
+
+  // One bead, a pure function of its step, bead index and t. It climbs
+  // in a widening spiral, scatters, and falls back to its key as it
+  // fades over its 6 s life.
+  function beadAt(step, j, t) {
+    var tk = step * STEP;
+    var age = t - tk;
+    if (age < 0 || age > BEAD_LIFE) { return null; }
+    var rng = mulberry32(SEED + step * 37 + j * 101);
+    var pool = poolAt(tk);
+    var note = pool[step % pool.length];
+    var phase = rng() * Math.PI * 2;
+    var scatter = (rng() - 0.5) * W * 0.14;
+    var speed = 1.6 + rng() * 1.2;
+    var u = age / BEAD_LIFE;
+    var rise = Math.sin(Math.PI * u);
+    var x0 = noteSpawnX(note);
+    var y0 = keysTop();
+    var ang = age * speed + phase;
+    var rad = W * 0.085 * rise;
+    var x = x0 + Math.cos(ang) * rad + scatter * rise;
+    var y = y0 - H * 0.55 * rise + Math.sin(ang) * H * 0.012 * rise;
+    var r = Math.max(2.5, H * 0.010) * (0.7 + 0.6 * rise);
+    return { x: x, y: y, r: r, color: noteColor(note), a: Math.sin(Math.PI * u), note: note };
+  }
+
+  function drawTapestry() {
+    // Woven bands in tapestry reds and oranges, with a diamond motif
+    // and a fine horizontal weave.
+    var bands = [TAP_RED, TAP_RED_LT, TAP_ORANGE, TAP_DARK, TAP_RED_LT, TAP_RED, TAP_ORANGE, TAP_DARK];
+    var bh = H * 0.66 / bands.length;
+    var i;
+    for (i = 0; i < bands.length; i++) {
+      ctx.fillStyle = bands[i];
+      ctx.fillRect(0, i * bh, W, bh + 1);
+    }
+    // Diamond motif rows, seeded so the weave is the same every frame.
+    var rng = mulberry32(SEED + 5);
+    var rows = 5, cols = 8;
+    for (var r = 0; r < rows; r++) {
+      for (var c = 0; c < cols; c++) {
+        var dx = (c + 0.5 + (r % 2 ? 0.5 : 0)) * (W / cols);
+        var dy = H * 0.05 + r * (H * 0.115);
+        var dr = Math.min(W, H) * 0.022 * (0.8 + rng() * 0.4);
+        var col = (r + c) % 2 ? TAP_GOLD : TAP_CREAM;
+        ctx.fillStyle = hexA(col, 0.55);
+        ctx.beginPath();
+        ctx.moveTo(dx, dy - dr);
+        ctx.lineTo(dx + dr, dy);
+        ctx.lineTo(dx, dy + dr);
+        ctx.lineTo(dx - dr, dy);
+        ctx.closePath();
+        ctx.fill();
+        ctx.fillStyle = hexA(col, 0.35);
+        ctx.beginPath(); ctx.moveTo(dx + dr * 0.28, dy); ctx.arc(dx, dy, dr * 0.28, 0, Math.PI * 2); ctx.fill();
+      }
+    }
+    // Weave: faint horizontal thread lines.
+    ctx.fillStyle = hexA('#000000', 0.06);
+    for (var y = 0; y < H * 0.66; y += 4) {
+      ctx.fillRect(0, y, W, 1);
+    }
+    // Fringe along the tapestry's bottom edge.
+    ctx.strokeStyle = hexA(TAP_CREAM, 0.7);
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (var fx = 4; fx < W; fx += 9) {
+      ctx.moveTo(fx, H * 0.66);
+      ctx.lineTo(fx, H * 0.66 + 7);
+    }
+    ctx.stroke();
+    // Warm light wash over the top, so the beads read against it.
+    var glow = ctx.createRadialGradient(W * 0.5, H * 0.18, 0, W * 0.5, H * 0.18, Math.min(W, H) * 0.6);
+    glow.addColorStop(0, hexA(TAP_GOLD, 0.14));
+    glow.addColorStop(1, hexA(TAP_GOLD, 0));
+    ctx.fillStyle = glow;
+    ctx.fillRect(0, 0, W, H * 0.66);
+  }
+
+  function drawSynth() {
+    var top = H * 0.66, strip = H * 0.74;
+    // Body.
+    ctx.fillStyle = WOOD;
+    ctx.fillRect(0, top, W, H - top);
+    ctx.fillStyle = hexA(WOOD_EDGE, 0.9);
+    ctx.fillRect(0, top, W, 2);
+    // Knobs on the control strip, left side.
+    var rng = mulberry32(SEED + 11);
+    for (var i = 0; i < 4; i++) {
+      var kx = W * (0.06 + i * 0.055);
+      var ky = (top + strip) / 2;
+      var kr = Math.max(3, H * 0.008);
+      ctx.fillStyle = hexA(KEY_WHITE, 0.85);
+      ctx.beginPath(); ctx.moveTo(kx + kr, ky); ctx.arc(kx, ky, kr, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = hexA(KEY_BLACK, 0.8);
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(kx, ky);
+      var ang = -Math.PI * 0.75 + rng() * Math.PI * 1.5;
+      ctx.lineTo(kx + Math.cos(ang) * kr, ky + Math.sin(ang) * kr);
+      ctx.stroke();
+    }
+    // The plate with a half-eaten biscuit, right end of the strip.
+    var px = W * 0.86, py = (top + strip) / 2;
+    var prx = W * 0.062, pry = (strip - top) * 0.34;
+    ctx.fillStyle = hexA(PLATE, 0.95);
+    ctx.beginPath(); ctx.moveTo(px + prx, py); ctx.ellipse(px, py, prx, pry, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = hexA(KEY_SHADE, 0.9);
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(px + prx, py); ctx.ellipse(px, py, prx, pry, 0, 0, Math.PI * 2); ctx.stroke();
+    var br = Math.max(4, H * 0.016);
+    var bx = px - prx * 0.18, by = py - pry * 0.08;
+    ctx.fillStyle = BISCUIT;
+    ctx.beginPath(); ctx.moveTo(bx + br, by); ctx.arc(bx, by, br, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = hexA(BISCUIT_DARK, 0.9);
+    ctx.beginPath(); ctx.moveTo(bx + br * 0.55, by); ctx.arc(bx, by, br * 0.55, 0, Math.PI * 2); ctx.fill();
+    // The bite: a plate-colored circle taken out of the biscuit's edge.
+    ctx.fillStyle = hexA(PLATE, 1);
+    ctx.beginPath(); ctx.moveTo(bx + br * 0.95, by - br * 0.35); ctx.arc(bx + br * 0.62, by - br * 0.55, br * 0.55, 0, Math.PI * 2); ctx.fill();
+    // Crumbs.
+    ctx.fillStyle = hexA(BISCUIT_DARK, 0.9);
+    var crng = mulberry32(SEED + 23);
+    for (var c = 0; c < 5; c++) {
+      var cx = px + (crng() - 0.5) * prx * 1.5;
+      var cy = py + (crng() - 0.2) * pry * 1.2;
+      ctx.beginPath(); ctx.moveTo(cx + 1.4, cy); ctx.arc(cx, cy, 1.4, 0, Math.PI * 2); ctx.fill();
+    }
+
+    // White keys.
+    var ww = whiteKeyW();
+    var kt = keysTop();
+    for (var i2 = 0; i2 < N_WHITE; i2++) {
+      var x = whiteKeyX(i2);
+      var pressedKey = !!pressed[i2];
+      var yOff = pressedKey ? 3 : 0;
+      ctx.fillStyle = pressedKey ? hexA(NOTE_COLORS[i2 % 12], 0.35) : KEY_WHITE;
+      ctx.fillRect(x + 1, kt + yOff, ww - 2, H - kt - yOff);
+      ctx.fillStyle = hexA(KEY_SHADE, 0.5);
+      ctx.fillRect(x + 1, H - 3, ww - 2, 3);
+      ctx.strokeStyle = hexA(KEY_BLACK, 0.25);
+      ctx.lineWidth = 1;
+      ctx.strokeRect(x + 0.5, kt, ww - 1, H - kt);
+      if (pressedKey) {
+        ctx.fillStyle = hexA(NOTE_COLORS[i2 % 12], 0.9);
+        ctx.fillRect(x + 1, kt, ww - 2, 3);
+      }
+    }
+    // Black keys.
+    for (var b = 0; b < N_WHITE - 1; b++) {
+      if (!BLACK_AFTER[b]) { continue; }
+      var bx2 = blackKeyX(b);
+      var note = 12 + b;
+      var bPressed = !!pressed[note];
+      var bOff = bPressed ? 3 : 0;
+      ctx.fillStyle = bPressed ? hexA(NOTE_COLORS[b % 12], 0.55) : KEY_BLACK;
+      ctx.fillRect(bx2, kt + bOff, ww * 0.60, H * 0.13 - bOff);
+      ctx.strokeStyle = hexA(KEY_WHITE, 0.15);
+      ctx.lineWidth = 1;
+      ctx.strokeRect(bx2 + 0.5, kt, ww * 0.60 - 1, H * 0.13);
+      if (bPressed) {
+        ctx.fillStyle = hexA(NOTE_COLORS[b % 12], 0.9);
+        ctx.fillRect(bx2, kt, ww * 0.60, 3);
+      }
+    }
+    // Glow where each held note's beads leave the keys.
+    for (var n = 0; n < poolNow().length; n++) {
+      var pn = poolNow()[n];
+      var gx = noteSpawnX(pn);
+      var gg = ctx.createRadialGradient(gx, kt, 0, gx, kt, Math.max(18, W * 0.05));
+      gg.addColorStop(0, hexA(noteColor(pn), 0.35));
+      gg.addColorStop(1, hexA(noteColor(pn), 0));
+      ctx.fillStyle = gg;
+      ctx.fillRect(gx - W * 0.05, kt - W * 0.05, W * 0.10, W * 0.05);
+    }
+  }
+
+  function draw(t) {
+    nowT = t;
+    // Pin the canvas element in draw(), per house rules.
+    canvas.style.width = stageW + 'px';
+    canvas.style.height = stageH + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    // Room ground, then the tapestry backdrop.
+    ctx.fillStyle = WALL;
+    ctx.fillRect(0, 0, W, H);
+    drawTapestry();
+    drawSynth();
+
+    // The bead weave: every arpeggiator step from t = 0, three beads
+    // each, only those still inside their 6 s life.
+    var lastStep = Math.floor(t / STEP);
+    for (var s = 0; s <= lastStep; s++) {
+      for (var j = 0; j < BEADS_PER_STEP; j++) {
+        var bd = beadAt(s, j, t);
+        if (!bd) { continue; }
+        ctx.fillStyle = hexA(bd.color, a4(0.38 * bd.a));
+        ctx.beginPath(); ctx.moveTo(bd.x + bd.r * 2.4, bd.y); ctx.arc(bd.x, bd.y, bd.r * 2.4, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = hexA(bd.color, a4(0.98 * bd.a));
+        ctx.beginPath(); ctx.moveTo(bd.x + bd.r, bd.y); ctx.arc(bd.x, bd.y, bd.r, 0, Math.PI * 2); ctx.fill();
+      }
+    }
+
+    // Plates: title top-left, date below it, held-note count top-right.
+    var fs1 = Math.round((isPhone ? 21 : 20) * clamp(W / 420, 0.85, 1.15));
+    var fs2 = Math.round(fs1 * 0.66);
+    var held = poolNow();
+    ctx.textBaseline = 'alphabetic';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = hexA(WALL, 0.45);
+    ctx.fillRect(10, 12, 200, fs1 + fs2 + 22);
+    ctx.fillStyle = INK;
+    ctx.font = '600 ' + fs1 + 'px Georgia, "Times New Roman", serif';
+    ctx.fillText('Arpeggiator', 18, 34);
+    ctx.fillStyle = hexA(INK, 0.75);
+    ctx.font = fs2 + 'px Georgia, "Times New Roman", serif';
+    ctx.fillText('№1933 · 2007 · 04 · 28', 18, 34 + fs2 + 8);
+
+    ctx.textAlign = 'right';
+    var heldWord = held.length === 1 ? 'held · 1 note' : 'held · ' + held.length + ' notes';
+    var heldNames = held.map(noteName).join(' + ');
+    ctx.fillStyle = hexA(WALL, 0.45);
+    ctx.fillRect(W - 150, 12, 140, fs1 + fs2 + 22);
+    ctx.fillStyle = INK;
+    ctx.font = '600 ' + fs2 + 'px Georgia, "Times New Roman", serif';
+    ctx.fillText(heldWord, W - 18, 34);
+    ctx.fillStyle = hexA(INK, 0.75);
+    ctx.font = 'italic ' + fs2 + 'px Georgia, "Times New Roman", serif';
+    ctx.fillText(heldNames, W - 18, 34 + fs2 + 8);
+    ctx.textAlign = 'left';
+
+    // Hint, centered at the bottom over the white keys, on a dark wash
+    // so it stays legible over both white keys and a pressed key.
+    var hint = 'Tap a key to press it.';
+    ctx.font = Math.round(fs2 * 0.95) + 'px Georgia, "Times New Roman", serif';
+    ctx.textAlign = 'center';
+    if (W < 560) {
+      ctx.fillStyle = hexA(WALL, 0.55);
+      ctx.fillRect(W / 2 - 52, H - 52, 104, 44);
+      ctx.fillStyle = INK;
+      ctx.fillText('Tap a key', W / 2, H - 34);
+      ctx.fillText('to press it.', W / 2, H - 16);
+    } else {
+      var hw = ctx.measureText(hint).width;
+      ctx.fillStyle = hexA(WALL, 0.55);
+      ctx.fillRect(W / 2 - hw / 2 - 12, H - 38, hw + 24, 26);
+      ctx.fillStyle = INK;
+      ctx.fillText(hint, W / 2, H - 20);
+    }
+    ctx.textAlign = 'left';
+  }
+
+  if (typeof window.addEventListener === 'function') {
+    window.addEventListener('resize', function () { resize(); draw(FIRST_T); });
+  }
+  try {
+    if (typeof window.visualViewport !== 'undefined' && window.visualViewport &&
+        typeof window.visualViewport.addEventListener === 'function') {
+      window.visualViewport.addEventListener('resize', function () { resize(); draw(FIRST_T); });
+    }
+  } catch (e) {}
+
+  resize();
+  draw(FIRST_T); // one synchronous frame at load
+
+  // Motion loop. Guarded so node-canvas QA (no requestAnimationFrame) still works.
+  // Tap only: no audio, no click-to-reload. Bead spirals run at about
+  // 0.3 to 0.5 revolutions a second, well under the 14 Hz ceiling.
+  if (!reduced && typeof requestAnimationFrame === 'function') {
+    var start = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+    var loop = function (now) {
+      var t = FIRST_T + (now - start) / 1000;
+      draw(t);
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
