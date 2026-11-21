@@ -1,0 +1,509 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>№1944 Ring of Horns</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0a0a0c; height: 100%; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // Ring of Horns, LR1 / PP1191, study #254 lucy-railton.
+  // A dark hall seen from the center: a ring of eight horn
+  // loudspeakers on tall stands surrounds the listener, red and
+  // white horns alternating, a lone amber bench and a leaning
+  // cello at the middle. Each horn breathes its own sustained
+  // tone, one a slow bowed drone, another a faint sine, a third
+  // a granulated cello whisper. The diffusion is the performance:
+  // the lead voice travels horn to horn around the ring, swelling
+  // as it passes the listener, never leaving the circle. Drag
+  // horizontally to steer the diffusion: the lead voice moves to
+  // the horn under the drag, and the ring rebalances around it.
+  var HALL = '#0a0a0c';     // hall black, page ground and field
+  var HALL_SOFT = '#141417'; // hall black, slightly lifted
+  var HORN_RED = '#a8261c';  // horn red
+  var HORN_RED_DIM = '#5e1712'; // horn red, at rest
+  var HORN_RED_MOUTH = '#3d0f0b'; // horn red bell interior
+  var HORN_WHITE = '#e8e2d4'; // horn white
+  var HORN_WHITE_DIM = '#8d8778'; // horn white, at rest
+  var HORN_WHITE_MOUTH = '#4a463c'; // horn white bell interior
+  var GOLD = '#d9a441';     // warm gold glow of the active horn
+  var GOLD_SOFT = '#8a6a2e'; // dim gold for the ring line
+  var AMBER = '#c98a2e';    // bench amber
+  var AMBER_DARK = '#7a5216'; // bench amber, shaded
+  var VARNISH = '#7a4a22';  // cello varnish brown
+  var VARNISH_DARK = '#4a2c14'; // cello varnish, shaded
+  var PLATE = '#e8e2d4';    // plate text, warm off-white
+  var STAND = '#2c2c30';    // stand poles, near black grey
+  var FLOOR_LINE = '#232326'; // faint floor ellipse
+
+  // Fixed-phase first frame: FIRST_T = 8 s. The diffusion dwell
+  // is 6 s, so at t = 8 the scheduler lead is horn 1 (floor(8/6)),
+  // the second horn of the ring, and the lead voice is mid swell
+  // on its way around. The bench and cello are fixed; the horns
+  // are fixed; only the lead glow and the travelling wave arcs
+  // move with t.
+  var FIRST_T = 8;
+
+  // Eight spatialized voice agents, one per visible horn, in just
+  // intonation above a 55 Hz cello A. Types cycle drone, sine,
+  // whisper, so the ring carries all three named tones at once.
+  var N_HORNS = 8;
+  var DWELL = 6; // seconds the lead voice rests on one horn
+  var BASE_HZ = 55;
+  var RATIOS = [1, 9 / 8, 5 / 4, 4 / 3, 3 / 2, 5 / 3, 15 / 8, 2];
+  var VOICE_NAMES = ['bowed drone', 'faint sine', 'cello whisper'];
+  var VOICES = [];
+  (function buildVoices() {
+    var i;
+    for (i = 0; i < N_HORNS; i++) {
+      VOICES.push({
+        hz: BASE_HZ * RATIOS[i],
+        type: VOICE_NAMES[i % 3],
+        ph: i * 1.31, // slow breathing phase, seeded by horn index
+        red: (i % 2 === 0) // red and white horns alternate
+      });
+    }
+  })();
+
+  // QA probe hooks: ?seed= varies nothing visual (the ring is
+  // fixed geometry) but is accepted for parity; ?lead=N sets the
+  // lead horn at load so a probe can compare lead states.
+  var probeLead = null;
+  try {
+    var qs = (typeof location !== 'undefined' && location.search) ? location.search : '';
+    var ml = qs.match(/[?&]lead=(-?\d+)/);
+    if (ml) { probeLead = parseInt(ml[1], 10) || 0; }
+  } catch (e) {}
+  if (probeLead !== null) {
+    probeLead = ((probeLead % N_HORNS) + N_HORNS) % N_HORNS;
+  }
+
+  // Interaction state: dragLead is null until the first drag, so
+  // frame one is a pure function of t. After a drag, the scheduler
+  // resumes from the dragged horn at the drag time.
+  var dragLead = null;
+  var dragAnchorT = FIRST_T;
+  var dragging = false;
+  var downX = 0, downY = 0, dragStartLead = 0, dragDx = 0;
+  var startT = FIRST_T;
+
+  var reduced = false;
+  try {
+    if (typeof window.matchMedia === 'function') {
+      reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    }
+  } catch (e) { reduced = false; }
+
+  var W = 0, H = 0, dpr = 1, isPhone = false;
+  var stageX = 0, stageY = 0, stageW = 0, stageH = 0;
+  var lastT = FIRST_T;
+
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function a4(v) { return Math.round(v * 10000) / 10000; } // avoid scientific-notation alpha
+  function hexA(h, a) {
+    var r = parseInt(h.slice(1, 3), 16), g = parseInt(h.slice(3, 5), 16), b = parseInt(h.slice(5, 7), 16);
+    return 'rgba(' + r + ',' + g + ',' + b + ',' + a4(a) + ')';
+  }
+  function circDist(a, b) {
+    var d = Math.abs(a - b) % N_HORNS;
+    return Math.min(d, N_HORNS - d);
+  }
+
+  // The diffusion scheduler: the lead voice rests DWELL seconds
+  // on one horn, then steps to the next, travelling around the
+  // ring forever. A drag re-anchors the scheduler at the dragged
+  // horn and time.
+  function leadAt(t) {
+    if (probeLead !== null) { return probeLead; }
+    if (dragLead !== null) {
+      var steps = Math.floor(Math.max(0, t - dragAnchorT) / DWELL);
+      return (dragLead + steps) % N_HORNS;
+    }
+    return Math.floor(t / DWELL) % N_HORNS;
+  }
+
+  // Voice amplitude: the lead swells toward 1, its neighbours fall
+  // off with circular distance, and every voice breathes slowly
+  // at its own phase. At rest every horn still carries a faint
+  // 0.18 so the ring never goes silent.
+  function ampAt(i, t) {
+    var lead = leadAt(t);
+    var d = circDist(i, lead);
+    var prox = Math.exp(-(d * d) / (2 * 1.1 * 1.1));
+    var breathe = 0.8 + 0.2 * Math.sin(t * 0.5 + VOICES[i].ph);
+    return clamp(0.18 + 0.82 * prox * breathe, 0, 1);
+  }
+
+  function resize() {
+    var vw = 0, vh = 0;
+    try {
+      if (typeof window.visualViewport !== 'undefined' && window.visualViewport) {
+        vw = window.visualViewport.width; vh = window.visualViewport.height;
+      }
+    } catch (e) {}
+    if (!vw || !vh) { vw = window.innerWidth; vh = window.innerHeight; }
+    var sw = 0, sh = 0;
+    try { sw = window.screen.width; sh = window.screen.height; } catch (e) { sw = vw; sh = vh; }
+    isPhone = Math.min(sw, sh) < 700 || (vh > vw * 1.15);
+    if (isPhone) {
+      stageW = vw; stageH = vh; stageX = 0; stageY = 0;
+    } else {
+      var side = Math.min(vw * 0.8, vh * 0.92);
+      stageW = side; stageH = side;
+      stageX = (vw - stageW) / 2; stageY = (vh - stageH) / 2;
+    }
+    W = stageW; H = stageH;
+    dpr = (typeof window.devicePixelRatio === 'number' && window.devicePixelRatio > 0) ? window.devicePixelRatio : 1;
+    canvas.width = Math.max(1, Math.round(stageW * dpr));
+    canvas.height = Math.max(1, Math.round(stageH * dpr));
+    canvas.style.width = stageW + 'px';
+    canvas.style.height = stageH + 'px';
+    canvas.style.left = stageX + 'px';
+    canvas.style.top = stageY + 'px';
+    canvas.style.position = 'absolute';
+  }
+
+  // Horn positions on a perspective ellipse around the listener,
+  // horn 0 at the top, then clockwise every 45 degrees.
+  function hornPos(i) {
+    var cx = W / 2, cy = H * 0.44;
+    var rx = W * 0.40, ry = H * 0.27;
+    var ang = -Math.PI / 2 + i * (Math.PI * 2 / N_HORNS);
+    return { x: cx + rx * Math.cos(ang), y: cy + ry * Math.sin(ang), ang: ang, cx: cx, cy: cy, rx: rx, ry: ry };
+  }
+
+  function drawHorn(i, t) {
+    var p = hornPos(i);
+    var v = VOICES[i];
+    var amp = ampAt(i, t);
+    var s = Math.min(W, H);
+    var hornLen = s * 0.085;
+    var mouthW = hornLen * 0.62;
+    var throatW = hornLen * 0.16;
+    var ang = Math.atan2(p.cy - p.y, p.cx - p.x); // horn faces the listener
+
+    // Stand: a tall thin pole from the horn down to the floor.
+    var standLen = H * 0.17;
+    ctx.strokeStyle = hexA(STAND, a4(0.9));
+    ctx.lineWidth = Math.max(1, s * 0.004);
+    ctx.beginPath();
+    ctx.moveTo(p.x, p.y + hornLen * 0.1);
+    ctx.lineTo(p.x, p.y + standLen);
+    ctx.stroke();
+    // Stand foot.
+    ctx.beginPath();
+    ctx.moveTo(p.x - s * 0.02, p.y + standLen);
+    ctx.lineTo(p.x + s * 0.02, p.y + standLen);
+    ctx.stroke();
+
+    // Active horn glows faintly in warm gold.
+    if (amp > 0.45) {
+      var gr = hornLen * 2.6;
+      var gg = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, gr);
+      gg.addColorStop(0, hexA(GOLD, a4(0.10 + 0.28 * amp)));
+      gg.addColorStop(1, hexA(GOLD, a4(0)));
+      ctx.fillStyle = gg;
+      ctx.fillRect(p.x - gr, p.y - gr, gr * 2, gr * 2);
+    }
+
+    // The horn bell: a flared cone, wide mouth toward the listener.
+    var fill = v.red ? (amp > 0.5 ? HORN_RED : HORN_RED_DIM) : (amp > 0.5 ? HORN_WHITE : HORN_WHITE_DIM);
+    var mouthFill = v.red ? HORN_RED_MOUTH : HORN_WHITE_MOUTH;
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.rotate(ang);
+    ctx.fillStyle = fill;
+    ctx.beginPath();
+    ctx.moveTo(0, -throatW);
+    ctx.lineTo(hornLen, -mouthW);
+    ctx.lineTo(hornLen, mouthW);
+    ctx.lineTo(0, throatW);
+    ctx.closePath();
+    ctx.fill();
+    // Bell interior: a dark ellipse at the mouth.
+    ctx.fillStyle = mouthFill;
+    ctx.beginPath();
+    ctx.moveTo(hornLen + mouthW * 0.55, 0);
+    ctx.ellipse(hornLen, 0, mouthW * 0.55, mouthW, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // Gold rim on the active horn's mouth.
+    if (amp > 0.55) {
+      ctx.strokeStyle = hexA(GOLD, a4(0.25 + 0.55 * amp));
+      ctx.lineWidth = Math.max(1, s * 0.005);
+      ctx.beginPath();
+      ctx.moveTo(hornLen + mouthW * 0.55, 0);
+      ctx.ellipse(hornLen, 0, mouthW * 0.55, mouthW, 0, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    // Throat dot where the bell meets the stand.
+    ctx.fillStyle = hexA(HALL_SOFT, a4(0.9));
+    ctx.beginPath();
+    ctx.moveTo(throatW + 1.5, 0);
+    ctx.arc(0, 0, Math.max(2, throatW * 0.7), 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+
+    // Travelling wave arcs from the lead horn toward the listener:
+    // three slow rings, each cycling over 6 s, fading as they widen.
+    // No pinging, no sweep: the rings breathe at 1/6 Hz.
+    if (i === leadAt(t)) {
+      var k;
+      for (k = 0; k < 3; k++) {
+        var phase = ((t / 6) + k / 3) % 1;
+        var rr = hornLen * (0.8 + phase * 2.6);
+        var wa = (1 - phase) * 0.30 * amp;
+        if (wa < 0.02) { continue; }
+        ctx.strokeStyle = hexA(GOLD, a4(wa));
+        ctx.lineWidth = Math.max(1, s * 0.003);
+        ctx.beginPath();
+        ctx.moveTo(p.x + rr, p.y);
+        ctx.arc(p.x, p.y, rr, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    }
+  }
+
+  function drawBenchAndCello(t) {
+    var cx = W / 2, cy = H * 0.44;
+    var s = Math.min(W, H);
+    // Listener glow: a faint warm pool at the center of the ring,
+    // where the lead voice swells as it passes.
+    var lead = leadAt(t);
+    var glowA = 0.05 + 0.10 * ampAt(lead, t);
+    var gr = s * 0.30;
+    var gg = ctx.createRadialGradient(cx, cy + s * 0.10, 0, cx, cy + s * 0.10, gr);
+    gg.addColorStop(0, hexA(GOLD, a4(glowA)));
+    gg.addColorStop(1, hexA(GOLD, a4(0)));
+    ctx.fillStyle = gg;
+    ctx.fillRect(cx - gr, cy + s * 0.10 - gr, gr * 2, gr * 2);
+
+    // The lone bench, amber, left of center in the middle third.
+    var bx = cx - s * 0.14, by = cy + s * 0.08;
+    var bw = s * 0.17, bh = s * 0.028;
+    ctx.fillStyle = AMBER;
+    ctx.fillRect(bx - bw / 2, by - bh, bw, bh);
+    ctx.fillStyle = AMBER_DARK;
+    ctx.fillRect(bx - bw / 2 + s * 0.012, by, s * 0.010, s * 0.055);
+    ctx.fillRect(bx + bw / 2 - s * 0.022, by, s * 0.010, s * 0.055);
+    ctx.fillStyle = hexA(GOLD, a4(0.25));
+    ctx.fillRect(bx - bw / 2, by - bh, bw, s * 0.004);
+
+    // The leaning cello, varnish brown, right of center, leaning
+    // against the bench at about 18 degrees, scaled to clear the
+    // lower horns.
+    var ccx = cx + s * 0.10, ccy = cy + s * 0.07;
+    ctx.save();
+    ctx.translate(ccx, ccy);
+    ctx.rotate(-0.31);
+    ctx.scale(0.8, 0.8);
+    // Neck and scroll.
+    ctx.strokeStyle = VARNISH_DARK;
+    ctx.lineWidth = Math.max(2, s * 0.008);
+    ctx.beginPath();
+    ctx.moveTo(0, -s * 0.10);
+    ctx.lineTo(0, -s * 0.19);
+    ctx.stroke();
+    ctx.fillStyle = VARNISH_DARK;
+    ctx.beginPath();
+    ctx.moveTo(s * 0.014, -s * 0.19);
+    ctx.arc(0, -s * 0.19, s * 0.014, 0, Math.PI * 2);
+    ctx.fill();
+    // Body: two stacked ellipses, upper bout smaller, lower bout
+    // larger, with a darker waist between them.
+    ctx.fillStyle = VARNISH;
+    ctx.beginPath();
+    ctx.moveTo(s * 0.052, -s * 0.10);
+    ctx.ellipse(0, -s * 0.055, s * 0.052, s * 0.055, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(s * 0.066, s * 0.055);
+    ctx.ellipse(0, s * 0.055, s * 0.066, s * 0.062, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = VARNISH_DARK;
+    ctx.beginPath();
+    ctx.moveTo(s * 0.030, -s * 0.005);
+    ctx.ellipse(0, -s * 0.005, s * 0.030, s * 0.018, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // Fingerboard strip and bridge hint.
+    ctx.fillStyle = hexA(HALL, a4(0.85));
+    ctx.fillRect(-s * 0.008, -s * 0.16, s * 0.016, s * 0.10);
+    ctx.strokeStyle = hexA(GOLD, a4(0.5));
+    ctx.lineWidth = Math.max(1, s * 0.003);
+    ctx.beginPath();
+    ctx.moveTo(-s * 0.035, s * 0.03);
+    ctx.lineTo(s * 0.035, s * 0.03);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function draw(t) {
+    lastT = t;
+    // Pin the canvas element in draw(), per house rules.
+    canvas.style.width = stageW + 'px';
+    canvas.style.height = stageH + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    // Hall: black ground with a faint lifted wash behind the ring.
+    ctx.fillStyle = HALL;
+    ctx.fillRect(0, 0, W, H);
+    var cx = W / 2, cy = H * 0.44;
+    var s = Math.min(W, H);
+    var washR = s * 0.52;
+    var wash = ctx.createRadialGradient(cx, cy, 0, cx, cy, washR);
+    wash.addColorStop(0, hexA(HALL_SOFT, a4(0.9)));
+    wash.addColorStop(1, hexA(HALL_SOFT, a4(0)));
+    ctx.fillStyle = wash;
+    ctx.fillRect(cx - washR, cy - washR, washR * 2, washR * 2);
+
+    // Floor: a faint ellipse the stands rest on.
+    ctx.strokeStyle = hexA(FLOOR_LINE, a4(0.9));
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(cx + W * 0.40, cy + H * 0.27 + H * 0.17);
+    ctx.ellipse(cx, cy + H * 0.27 + H * 0.17, W * 0.40, H * 0.045, 0, 0, Math.PI * 2);
+    ctx.stroke();
+
+    // The diffusion ring: a thin dim gold circle through the horns.
+    ctx.strokeStyle = hexA(GOLD_SOFT, a4(0.35));
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(cx + W * 0.40, cy);
+    ctx.ellipse(cx, cy, W * 0.40, H * 0.27, 0, 0, Math.PI * 2);
+    ctx.stroke();
+
+    // The eight horns, back ones first so the front ones overlap.
+    var order = [0, 1, 7, 2, 6, 3, 5, 4];
+    var oi;
+    for (oi = 0; oi < order.length; oi++) { drawHorn(order[oi], t); }
+
+    // Bench and cello anchor the middle third.
+    drawBenchAndCello(t);
+
+    // ---- Plates: title top-left, number and date below it, the
+    // travelling voice named top-right.
+    var lead = leadAt(t);
+    var fsTitle = Math.round(20 * clamp(W / 560, 0.8, 1.15));
+    var fsSub = Math.round(fsTitle * 0.62);
+    var fsSmall = Math.round(11 * clamp(W / 560, 0.85, 1.1));
+    var fsHint = Math.round(13 * clamp(W / 560, 0.85, 1.1));
+    ctx.textBaseline = 'alphabetic';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = PLATE;
+    ctx.font = '600 ' + fsTitle + 'px Georgia, "Times New Roman", serif';
+    ctx.fillText('Ring of Horns', 18, 18 + fsTitle * 0.8);
+    ctx.fillStyle = hexA(PLATE, 0.75);
+    ctx.font = fsSub + 'px Georgia, "Times New Roman", serif';
+    ctx.fillText('№1944 · 2007 · 05 · 09', 18, 18 + fsTitle * 0.8 + fsSub + 8);
+    ctx.textAlign = 'right';
+    ctx.fillStyle = hexA(GOLD, 0.85);
+    ctx.font = 'italic ' + fsSmall + 'px Georgia, "Times New Roman", serif';
+    ctx.fillText('horn ' + (lead + 1) + ' leads · ' + VOICES[lead].type + ' · ' + Math.round(VOICES[lead].hz) + ' Hz', W - 18, 18 + fsTitle * 0.8 + fsSmall + 8);
+    ctx.textAlign = 'left';
+
+    // ---- Hint, centered at the bottom on a dark pill with gold
+    // text so it stays legible over the black hall.
+    var hint = 'Drag to steer the diffusion.';
+    ctx.font = fsHint + 'px Georgia, "Times New Roman", serif';
+    var hw = ctx.measureText(hint).width;
+    var px = (W - hw) / 2 - 12, py = H - fsHint - 22, pw = hw + 24, ph = fsHint + 12;
+    ctx.fillStyle = hexA(HALL_SOFT, a4(0.85));
+    ctx.fillRect(px, py, pw, ph);
+    ctx.fillStyle = GOLD;
+    ctx.textAlign = 'center';
+    ctx.fillText(hint, W / 2, H - 16);
+    ctx.textAlign = 'left';
+  }
+
+  function canvasPos(e) {
+    var rect = { left: 0, top: 0 };
+    try { rect = canvas.getBoundingClientRect(); } catch (err) {}
+    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+  }
+
+  // One drag step (a ninth of the stage width) moves the lead one
+  // horn around the ring. The drag is horizontal: the lead follows
+  // the hand, and the scheduler resumes from the dragged horn.
+  function dragStep() { return Math.max(40, W / 9); }
+
+  if (typeof canvas.addEventListener === 'function') {
+    canvas.addEventListener('pointerdown', function (e) {
+      dragging = true;
+      dragDx = 0;
+      dragStartLead = leadAt(lastT);
+      startT = lastT;
+      try { if (typeof canvas.setPointerCapture === 'function' && e.pointerId !== undefined) { canvas.setPointerCapture(e.pointerId); } } catch (err) {}
+      try { if (typeof e.preventDefault === 'function') { e.preventDefault(); } } catch (err) {}
+      var p = canvasPos(e);
+      downX = p.x; downY = p.y;
+    });
+  }
+  if (typeof window.addEventListener === 'function') {
+    window.addEventListener('pointermove', function (e) {
+      if (!dragging) { return; }
+      var p = canvasPos(e);
+      dragDx = p.x - downX;
+      var steps = Math.round(dragDx / dragStep());
+      var newLead = ((dragStartLead + steps) % N_HORNS + N_HORNS) % N_HORNS;
+      if (newLead !== dragLead) {
+        dragLead = newLead;
+        dragAnchorT = lastT;
+      }
+      draw(reduced ? FIRST_T : lastT);
+    });
+    window.addEventListener('pointerup', function () { dragging = false; });
+    window.addEventListener('pointercancel', function () { dragging = false; });
+    window.addEventListener('resize', function () { resize(); draw(FIRST_T); });
+  }
+  try {
+    if (typeof window.visualViewport !== 'undefined' && window.visualViewport &&
+        typeof window.visualViewport.addEventListener === 'function') {
+      window.visualViewport.addEventListener('resize', function () { resize(); draw(FIRST_T); });
+    }
+  } catch (e) {}
+
+  // QA hooks: window.__draw lets a harness drive draw() with a
+  // virtual clock; window.__piece1944 exposes the lead index, the
+  // voice amplitudes, and a redraw.
+  try {
+    window.__draw = function (t) { draw(t); };
+    window.__piece1944 = {
+      lead: function (t) { return leadAt(t === undefined ? lastT : t); },
+      amp: function (i, t) { return ampAt(i, t === undefined ? lastT : t); },
+      dragLead: function () { return dragLead; },
+      redraw: function (t) { draw(t); },
+      firstT: FIRST_T
+    };
+  } catch (e) {}
+
+  resize();
+  draw(FIRST_T); // one synchronous frame at load
+
+  // Motion loop: the scheduler steps the lead every 6 s, voices
+  // breathe at 0.5 rad/s, wave rings cycle at 1/6 Hz, all far under
+  // the 14 Hz ceiling. Guarded so node-canvas QA (no
+  // requestAnimationFrame) still works.
+  if (!reduced && typeof requestAnimationFrame === 'function') {
+    var start = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+    var loop = function (now) {
+      var t = FIRST_T + (now - start) / 1000;
+      lastT = t;
+      draw(t);
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
