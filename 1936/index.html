@@ -1,0 +1,543 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>№1936 The Disrepair Console</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #8a857c; height: 100%; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // Palette, hand-picked from the prompt's named colors.
+  var STONE = '#8a857c';       // church stone grey, the room beyond
+  var STONE_DARK = '#6f6a61';   // darker stone
+  var MAHOGANY = '#5b3a28';     // console mahogany
+  var MAHOGANY_DK = '#432a1c';  // console shadow
+  var MAHOGANY_LT = '#6e4a35';  // console highlight
+  var BONE = '#e8e2d4';         // stop knobs, bone white
+  var INK = '#1c1713';          // handwritten ink black
+  var RED = '#a83a2c';          // fault annotations, red pencil
+  var PAPER = '#efe8d3';        // fault list paper
+  var LIGHT = '#f2ead8';        // staff-lines of light
+  var KEY_W = '#efe9dc';        // manual white keys
+  var KEY_B = '#241a12';        // manual black keys
+
+  // Fixed-phase first frame: t = 8 s. At frame one the broken mixture,
+  // the ripe clarinet and the intermittent pedal reed are already out,
+  // with a clean flute beside them, so the faults read immediately:
+  // the mixture sputters, the clarinet staff has drifted sharp, and the
+  // pedal reed is in an on-window of its dropout cycle. Frame one is
+  // byte-reproducible: every fault is a pure function of t and the seed.
+  var FIRST_T = 8;
+
+  // Seeded PRNG, mulberry32. A fresh instance is built per draw from
+  // the piece number, so every frame is reproducible regardless of
+  // call order.
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // The stops. Each is a living behavior, not a switch: fault is one of
+  // none, misfire (broken mixture), drift (ripe clarinet), dropout
+  // (intermittent pedal reed), waver (oboe, vox humana). level is how
+  // far the stop is pulled out, 0 retired to 1 fully in; the field's
+  // voices change with each pull. Default pulls put the three faulted
+  // voices out at frame one, plus a clean flute for contrast.
+  var STOPS = [
+    { name: 'Principal 8', fault: 'none',    level: 0,    ph: 0.11 },
+    { name: 'Mixture IV',  fault: 'misfire', level: 0.70, ph: 0.37 },
+    { name: 'Clarinet 8',  fault: 'drift',   level: 0.85, ph: 0.53 },
+    { name: 'Flute 4',     fault: 'none',    level: 0.45, ph: 0.71 },
+    { name: 'Oboe 8',      fault: 'waver',   level: 0,    ph: 0.23 },
+    { name: 'Trumpet 8',   fault: 'none',    level: 0,    ph: 0.89 },
+    { name: 'Pedal Reed 16', fault: 'dropout', level: 0.60, ph: 4.5 },
+    { name: 'Gedackt 8',   fault: 'none',    level: 0,    ph: 0.47 },
+    { name: 'Vox Humana',  fault: 'waver',   level: 0,    ph: 0.67 },
+    { name: 'Bourdon 16',  fault: 'none',    level: 0,    ph: 0.97 }
+  ];
+  var FAULT_NOTE = {
+    misfire: 'sputters',
+    drift: 'drifts sharp',
+    dropout: 'cuts out',
+    waver: 'trembles',
+    none: ''
+  };
+
+  // QA probe hook: ?pull=N (or ?seed=N, which render-piece.js passes)
+  // pulls stop N fully, as a drag to the end of its travel would. The
+  // default render (no params) is the deterministic first frame.
+  function probePull() {
+    try {
+      var s = (typeof location !== 'undefined' && location.search) ? location.search : '';
+      var m = s.match(/[?&](?:pull|seed)=(\d+)/);
+      if (m) {
+        var n = parseInt(m[1], 10);
+        if (n >= 1 && n <= STOPS.length) { return n - 1; }
+      }
+    } catch (e) {}
+    return -1;
+  }
+  var probe = probePull();
+  if (probe >= 0) { STOPS[probe].level = 1; }
+
+  var reduced = false;
+  try {
+    if (typeof window.matchMedia === 'function') {
+      reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    }
+  } catch (e) { reduced = false; }
+
+  var W = 0, H = 0, dpr = 1, isPhone = false;
+  var stageX = 0, stageY = 0, stageW = 0, stageH = 0;
+  var dragStop = -1, dragStartY = 0, dragStartLevel = 0;
+
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function lerp(a, b, t) { return a + (b - a) * t; }
+  function a4(v) { return Math.round(v * 10000) / 10000; } // avoid scientific-notation alpha
+  function hexA(h, a) {
+    var r = parseInt(h.slice(1, 3), 16), g = parseInt(h.slice(3, 5), 16), b = parseInt(h.slice(5, 7), 16);
+    return 'rgba(' + r + ',' + g + ',' + b + ',' + a4(a) + ')';
+  }
+  function smooth(a, b, x) {
+    var u = clamp((x - a) / (b - a), 0, 1);
+    return u * u * (3 - 2 * u);
+  }
+  // Deterministic step noise in [0,1): a pure function of a step index
+  // and a seed, so the sputter is reproducible at any t.
+  function stepNoise(step, seed) {
+    var x = Math.sin(step * 12.9898 + seed * 78.233) * 43758.5453;
+    return x - Math.floor(x);
+  }
+
+  // Layout, recomputed in resize() and read by draw().
+  var L = {};
+  function layout() {
+    var headerH = Math.round(H * 0.08);
+    var hintH = Math.round(H * 0.05);
+    var paperW = Math.min(W * 0.68, 470);
+    var paperH = Math.round(H * 0.185);
+    var paperX = (W - paperW) / 2;
+    var paperY = headerH + Math.round(H * 0.012);
+    var consoleY0 = Math.round(H * 0.335);
+    var consoleY1 = H - hintH - 8;
+    var consoleH = consoleY1 - consoleY0;
+    var margin = Math.round(W * 0.055);
+    var gridMargin = Math.max(margin, 52); // room for the jamb labels at the left edge
+    var cols = 5;
+    var spacing = (W - gridMargin * 2) / cols;
+    var row1Y = consoleY0 + Math.round(consoleH * 0.13);
+    var row2Y = consoleY0 + Math.round(consoleH * 0.30);
+    var pullDist = Math.round(clamp(H * 0.035, 18, 30));
+    var knobR = Math.max(8, Math.round(W * 0.017));
+    var manW = W - margin * 2;
+    var man1Y = consoleY0 + Math.round(consoleH * 0.50);
+    var man2Y = consoleY0 + Math.round(consoleH * 0.70);
+    var manH = Math.round(consoleH * 0.13);
+    L = {
+      headerH: headerH, hintH: hintH,
+      paperX: paperX, paperY: paperY, paperW: paperW, paperH: paperH,
+      consoleY0: consoleY0, consoleY1: consoleY1, consoleH: consoleH,
+      margin: margin, gridMargin: gridMargin, spacing: spacing, row1Y: row1Y, row2Y: row2Y,
+      pullDist: pullDist, knobR: knobR,
+      manX: margin, manW: manW, man1Y: man1Y, man2Y: man2Y, manH: manH
+    };
+  }
+
+  function resize() {
+    var vw = 0, vh = 0;
+    try {
+      if (typeof window.visualViewport !== 'undefined' && window.visualViewport) {
+        vw = window.visualViewport.width; vh = window.visualViewport.height;
+      }
+    } catch (e) {}
+    if (!vw || !vh) { vw = window.innerWidth; vh = window.innerHeight; }
+    var sw = 0, sh = 0;
+    try { sw = window.screen.width; sh = window.screen.height; } catch (e) { sw = vw; sh = vh; }
+    isPhone = Math.min(sw, sh) < 700 || (vh > vw * 1.15);
+    if (isPhone) {
+      stageW = vw; stageH = vh; stageX = 0; stageY = 0;
+    } else {
+      var side = Math.min(vw * 0.8, vh * 0.92);
+      stageW = side; stageH = side;
+      stageX = (vw - stageW) / 2; stageY = (vh - stageH) / 2;
+    }
+    W = stageW; H = stageH;
+    dpr = (typeof window.devicePixelRatio === 'number' && window.devicePixelRatio > 0) ? window.devicePixelRatio : 1;
+    canvas.width = Math.max(1, Math.round(stageW * dpr));
+    canvas.height = Math.max(1, Math.round(stageH * dpr));
+    canvas.style.width = stageW + 'px';
+    canvas.style.height = stageH + 'px';
+    canvas.style.left = stageX + 'px';
+    canvas.style.top = stageY + 'px';
+    canvas.style.position = 'absolute';
+    layout();
+  }
+
+  function stopXY(i) {
+    var row = (i < 5) ? 0 : 1;
+    var col = i % 5;
+    var x = L.gridMargin + (col + 0.5) * L.spacing;
+    var y = (row === 0) ? L.row1Y : L.row2Y;
+    return { x: x, y: y, row: row };
+  }
+
+  // A stop's voice level at time t: the pull sets the level, and the
+  // fault shapes it. Dropout gates the voice on a 5 s scheduler (on
+  // 3.2 s, off 1.8 s) with soft edges; waver breathes slowly; misfire
+  // and drift keep the level but show in the staff jitter instead.
+  function voiceLevel(stop, t) {
+    if (stop.level <= 0.02) { return 0; }
+    if (stop.fault === 'dropout') {
+      var cyc = (t + stop.ph) % 5;
+      var gate = smooth(0, 0.4, cyc) * (1 - smooth(3.2, 3.6, cyc));
+      return stop.level * gate;
+    }
+    if (stop.fault === 'waver') {
+      return stop.level * (0.82 + 0.18 * Math.sin(t * 0.9 + stop.ph * 6.28));
+    }
+    return stop.level;
+  }
+
+  function draw(t) {
+    // Pin the canvas element in draw(), per house rules.
+    canvas.style.width = stageW + 'px';
+    canvas.style.height = stageH + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    // ---- The room beyond: church stone grey.
+    ctx.fillStyle = STONE;
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = hexA(STONE_DARK, 0.35);
+    var seam = Math.round(H * 0.30);
+    ctx.fillRect(0, seam, W, 2);
+    ctx.strokeStyle = hexA(STONE_DARK, 0.25);
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (var sx = 0; sx < 5; sx++) {
+      var bx = (sx + 0.5) * (W / 5);
+      ctx.moveTo(bx, 0); ctx.lineTo(bx, L.consoleY0);
+    }
+    ctx.stroke();
+
+    var fsTitle = Math.round(20 * clamp(W / 560, 0.8, 1.15));
+    var fsSub = Math.round(fsTitle * 0.62);
+    var fsNote = Math.round(14 * clamp(W / 560, 0.85, 1.1));
+    var fsSmall = Math.round(fsNote * 0.8);
+    var fsTiny = Math.round(fsNote * 0.68);
+    ctx.textBaseline = 'alphabetic';
+
+    // ---- Title plate, top-left; organ note, top-right.
+    ctx.textAlign = 'left';
+    ctx.fillStyle = INK;
+    ctx.font = '600 ' + fsTitle + 'px Georgia, "Times New Roman", serif';
+    ctx.fillText('The Disrepair Console', 18, 18 + fsTitle * 0.8);
+    ctx.fillStyle = hexA(INK, 0.75);
+    ctx.font = fsSub + 'px Georgia, "Times New Roman", serif';
+    ctx.fillText('№1936 · 2007 · 05 · 01', 18, 18 + fsTitle * 0.8 + fsSub + 8);
+    ctx.textAlign = 'right';
+    ctx.fillStyle = INK;
+    ctx.font = '600 ' + fsSub + 'px Georgia, "Times New Roman", serif';
+    ctx.fillText('Grüneberg organ', W - 18, 18 + fsTitle * 0.8);
+    ctx.fillStyle = hexA(INK, 0.6);
+    ctx.font = 'italic ' + fsSmall + 'px Georgia, "Times New Roman", serif';
+    ctx.fillText('faults as found', W - 18, 18 + fsTitle * 0.8 + fsSmall + 8);
+    ctx.textAlign = 'left';
+
+    // ---- The fault list, pinned above center.
+    var px = L.paperX, py = L.paperY, pw = L.paperW, ph = L.paperH;
+    ctx.save();
+    ctx.shadowColor = 'rgba(0,0,0,0.25)';
+    ctx.shadowBlur = 8;
+    ctx.shadowOffsetY = 3;
+    ctx.fillStyle = PAPER;
+    ctx.fillRect(px, py, pw, ph);
+    ctx.restore();
+    ctx.strokeStyle = hexA(INK, 0.35);
+    ctx.lineWidth = 1;
+    ctx.strokeRect(px + 0.5, py + 0.5, pw - 1, ph - 1);
+    // The pin.
+    ctx.fillStyle = RED;
+    ctx.beginPath(); ctx.moveTo(px + pw / 2 + 4, py + 8); ctx.arc(px + pw / 2, py + 8, 4, 0, Math.PI * 2); ctx.fill();
+    // Handwritten faults, ink; annotations in red pencil.
+    var faults = [
+      { ink: 'broken mixture', red: 'sputters, misfires' },
+      { ink: 'very ripe clarinet', red: 'drifts sharp' },
+      { ink: "intermittent 16' pedal reed", red: 'cuts out on its own' }
+    ];
+    var lineH = (ph - 26) / 4;
+    ctx.font = 'italic ' + fsNote + 'px Georgia, "Times New Roman", serif';
+    for (var f = 0; f < faults.length; f++) {
+      var fy = py + 22 + f * lineH + fsNote * 0.5;
+      ctx.fillStyle = INK;
+      ctx.textAlign = 'left';
+      ctx.fillText(faults[f].ink, px + 16, fy);
+      ctx.fillStyle = RED;
+      ctx.textAlign = 'right';
+      ctx.fillText(faults[f].red, px + pw - 16, fy);
+      if (f === 0) {
+        // Red pencil underline under the worst fault.
+        var uw = ctx.measureText(faults[f].ink).width;
+        ctx.strokeStyle = hexA(RED, 0.8);
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(px + 16, fy + 4);
+        ctx.lineTo(px + 16 + uw, fy + 3);
+        ctx.stroke();
+      }
+    }
+    ctx.fillStyle = RED;
+    ctx.textAlign = 'center';
+    ctx.font = 'italic ' + fsSmall + 'px Georgia, "Times New Roman", serif';
+    ctx.fillText('leave as found', px + pw / 2, py + ph - 8);
+    ctx.textAlign = 'left';
+
+    // ---- The console, lower two thirds.
+    var cy0 = L.consoleY0, cy1 = L.consoleY1;
+    ctx.fillStyle = MAHOGANY;
+    ctx.fillRect(0, cy0, W, cy1 - cy0);
+    ctx.fillStyle = MAHOGANY_DK;
+    ctx.fillRect(0, cy0, W, 4);
+    ctx.fillStyle = hexA(MAHOGANY_LT, 0.5);
+    ctx.fillRect(0, cy0 + 4, W, 2);
+    // Wood grain, faint.
+    ctx.strokeStyle = hexA(MAHOGANY_DK, 0.35);
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (var g = 0; g < 4; g++) {
+      var gy = cy0 + (g + 1) * (cy1 - cy0) / 5;
+      ctx.moveTo(0, gy); ctx.lineTo(W, gy + 3);
+    }
+    ctx.stroke();
+    // Stop jamb labels, at the left edge, centered on each row so they
+    // can never strike through a stop name below the row above.
+    ctx.fillStyle = hexA(BONE, 0.85);
+    ctx.font = '600 ' + fsTiny + 'px Georgia, "Times New Roman", serif';
+    ctx.textAlign = 'left';
+    ctx.fillText('GREAT', 8, L.row1Y + fsTiny * 0.35);
+    ctx.fillText('PEDAL', 8, L.row2Y + fsTiny * 0.35);
+    ctx.textAlign = 'left';
+
+    // ---- Voices: faint staff-lines of light rising from pulled stops.
+    var staffW = L.spacing * 0.8;
+    var lineGap = Math.max(5, Math.round(W * 0.009));
+    for (var i = 0; i < STOPS.length; i++) {
+      var stop = STOPS[i];
+      var vl = voiceLevel(stop, t);
+      if (vl <= 0.02) { continue; }
+      var pos = stopXY(i);
+      var kx = pos.x, ky = pos.y + stop.level * L.pullDist;
+      // The staff rises slowly and fades near the top of its travel.
+      var u = ((t * 0.055 + stop.ph) % 1 + 1) % 1;
+      var rise = u * 64;
+      var fade = (u < 0.1 ? u / 0.1 : 1) * (u > 0.85 ? (1 - u) / 0.15 : 1);
+      var baseY = ky - 30 - rise;
+      var alpha = a4(0.8 * vl * fade);
+      // A faint column of light under the staff.
+      ctx.fillStyle = hexA(LIGHT, a4(0.04 * vl * fade));
+      ctx.fillRect(kx - staffW / 2, baseY - lineGap * 2, staffW, ky - baseY + lineGap * 2);
+      // Five staff lines. The fault shows in the jitter: misfire drops
+      // segments and spikes, drift slides the whole staff sharp
+      // (upward) on a slow sawtooth, waver breathes, dropout gates the
+      // alpha above. Clean stops shimmer gently.
+      var driftY = 0;
+      if (stop.fault === 'drift') {
+        driftY = -(((t * 0.12 + stop.ph) % 1 + 1) % 1) * 9;
+      }
+      var step = Math.floor(t * 4); // 4 Hz sputter steps, under the 14 Hz ceiling
+      for (var ln = 0; ln < 5; ln++) {
+        var ly = baseY + ln * lineGap + driftY;
+        var wob = 0;
+        if (stop.fault === 'waver') { wob = Math.sin(t * 0.9 + stop.ph * 6.28 + ln) * 1.5; }
+        if (stop.fault === 'misfire') { wob = (stepNoise(step + ln * 7, stop.ph * 13) - 0.5) * 5; }
+        ctx.strokeStyle = hexA(LIGHT, alpha);
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        var x0 = kx - staffW / 2;
+        if (stop.fault === 'misfire') {
+          // Sputter: the staff is drawn in segments, and some
+          // segments never sound.
+          var segW = 9, segGap = 4;
+          for (var sg = 0; sg * (segW + segGap) < staffW; sg++) {
+            var sx0 = x0 + sg * (segW + segGap);
+            var sx1 = Math.min(sx0 + segW, x0 + staffW);
+            if (stepNoise(step * 3 + sg * 11 + ln * 5, stop.ph * 29) > 0.72) { continue; }
+            var jy = ly + wob * (0.4 + 0.6 * stepNoise(sg + ln * 3, stop.ph * 7));
+            ctx.moveTo(sx0, jy);
+            ctx.lineTo(sx1, jy);
+          }
+        } else {
+          // Clean and drifting voices draw as continuous staff lines.
+          var jy2 = ly + wob;
+          ctx.moveTo(x0, jy2);
+          ctx.lineTo(x0 + staffW, jy2);
+        }
+        ctx.stroke();
+      }
+    }
+
+    // ---- Draw stops: rod, knob, name, fault note.
+    for (var s = 0; s < STOPS.length; s++) {
+      var st = STOPS[s];
+      var p = stopXY(s);
+      var kx2 = p.x;
+      var ky2 = p.y + st.level * L.pullDist;
+      // Rod from the jamb to the knob.
+      ctx.strokeStyle = hexA(INK, 0.55);
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(kx2, p.y - L.knobR - 2);
+      ctx.lineTo(kx2, ky2);
+      ctx.stroke();
+      // Knob, bone white with an ink rim; pulled stops read out.
+      ctx.fillStyle = BONE;
+      ctx.beginPath(); ctx.moveTo(kx2 + L.knobR, ky2); ctx.arc(kx2, ky2, L.knobR, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = INK;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(kx2 + L.knobR, ky2); ctx.arc(kx2, ky2, L.knobR, 0, Math.PI * 2); ctx.stroke();
+      ctx.fillStyle = hexA(INK, 0.8);
+      ctx.beginPath(); ctx.moveTo(kx2 + 2, ky2); ctx.arc(kx2, ky2, 2, 0, Math.PI * 2); ctx.fill();
+      // Name under the knob, fault note in red pencil when out.
+      ctx.textAlign = 'center';
+      ctx.fillStyle = hexA(BONE, 0.92);
+      ctx.font = fsSmall + 'px Georgia, "Times New Roman", serif';
+      ctx.fillText(st.name, kx2, ky2 + L.knobR + fsSmall + 4);
+      if (st.fault !== 'none' && st.level > 0.02) {
+        ctx.fillStyle = hexA(RED, 0.95);
+        ctx.font = 'italic ' + fsTiny + 'px Georgia, "Times New Roman", serif';
+        ctx.fillText(FAULT_NOTE[st.fault], kx2, ky2 + L.knobR + fsSmall + fsTiny + 8);
+      }
+      ctx.textAlign = 'left';
+    }
+
+    // ---- Two manuals.
+    function drawManual(my) {
+      var whites = 14;
+      var ww = L.manW / whites;
+      ctx.fillStyle = KEY_W;
+      ctx.fillRect(L.manX, my, L.manW, L.manH);
+      ctx.strokeStyle = hexA(INK, 0.5);
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      for (var k = 0; k <= whites; k++) {
+        ctx.moveTo(L.manX + k * ww, my);
+        ctx.lineTo(L.manX + k * ww, my + L.manH);
+      }
+      ctx.stroke();
+      // Black keys: groups of 2 and 3 across the white keys.
+      var pattern = [0, 1, 3, 4, 5];
+      ctx.fillStyle = KEY_B;
+      for (var w2 = 0; w2 < whites; w2++) {
+        if (pattern.indexOf(w2 % 7) >= 0) {
+          var bx = L.manX + (w2 + 1) * ww - ww * 0.3;
+          ctx.fillRect(bx, my, ww * 0.6, L.manH * 0.62);
+        }
+      }
+      ctx.strokeStyle = hexA(INK, 0.6);
+      ctx.strokeRect(L.manX + 0.5, my + 0.5, L.manW - 1, L.manH - 1);
+    }
+    drawManual(L.man1Y);
+    drawManual(L.man2Y);
+    ctx.fillStyle = hexA(BONE, 0.85);
+    ctx.font = '600 ' + fsTiny + 'px Georgia, "Times New Roman", serif';
+    ctx.textAlign = 'left';
+    ctx.fillText('MANUAL I', L.margin, L.man1Y - 6);
+    ctx.fillText('MANUAL II', L.margin, L.man2Y - 6);
+    ctx.textAlign = 'left';
+
+    // ---- Hint, centered at the bottom.
+    ctx.fillStyle = hexA(BONE, 0.9);
+    ctx.textAlign = 'center';
+    ctx.font = Math.round(fsNote * 0.95) + 'px Georgia, "Times New Roman", serif';
+    ctx.fillText('Drag a stop out to pull it in. Push it back to retire it.', W / 2, H - 16);
+    ctx.textAlign = 'left';
+  }
+
+  // Drag: pointerdown picks the nearest stop within reach, vertical
+  // drag pulls it out or pushes it back. No click-to-reload, no other
+  // interaction.
+  function pointerPos(e) {
+    var rect = { left: 0, top: 0 };
+    try { rect = canvas.getBoundingClientRect(); } catch (err) {}
+    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+  }
+  function nearestStop(x, y) {
+    var best = -1, bestD = 1e9;
+    for (var i = 0; i < STOPS.length; i++) {
+      var p = stopXY(i);
+      var ky = p.y + STOPS[i].level * L.pullDist;
+      var dx = x - p.x, dy = y - ky;
+      var d = dx * dx + dy * dy;
+      if (d < bestD) { bestD = d; best = i; }
+    }
+    return (bestD < 70 * 70) ? best : -1;
+  }
+  var lastT = FIRST_T;
+  function perfT() { return lastT; }
+
+  if (typeof canvas.addEventListener === 'function') {
+    canvas.addEventListener('pointerdown', function (e) {
+      var pos = pointerPos(e);
+      var idx = nearestStop(pos.x, pos.y);
+      if (idx >= 0) {
+        dragStop = idx;
+        dragStartY = pos.y;
+        dragStartLevel = STOPS[idx].level;
+        try { if (typeof canvas.setPointerCapture === 'function' && e.pointerId !== undefined) { canvas.setPointerCapture(e.pointerId); } } catch (err) {}
+        try { if (typeof e.preventDefault === 'function') { e.preventDefault(); } } catch (err) {}
+      }
+    });
+  }
+  if (typeof window.addEventListener === 'function') {
+    window.addEventListener('pointermove', function (e) {
+      if (dragStop < 0) { return; }
+      var pos = pointerPos(e);
+      STOPS[dragStop].level = clamp(dragStartLevel + (pos.y - dragStartY) / L.pullDist, 0, 1);
+      draw(reduced ? FIRST_T : perfT());
+    });
+    window.addEventListener('pointerup', function () { dragStop = -1; });
+    window.addEventListener('pointercancel', function () { dragStop = -1; });
+    window.addEventListener('resize', function () { resize(); draw(FIRST_T); });
+  }
+  try {
+    if (typeof window.visualViewport !== 'undefined' && window.visualViewport &&
+        typeof window.visualViewport.addEventListener === 'function') {
+      window.visualViewport.addEventListener('resize', function () { resize(); draw(FIRST_T); });
+    }
+  } catch (e) {}
+
+  resize();
+  draw(FIRST_T); // one synchronous frame at load
+
+  // Motion loop: only the slow staff rise, drift and sputter move on
+  // their own; stops move only by drag. Guarded so node-canvas QA (no
+  // requestAnimationFrame) still works. All motion runs under 4 Hz,
+  // well under the 14 Hz ceiling.
+  if (!reduced && typeof requestAnimationFrame === 'function') {
+    var start = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+    var loop = function (now) {
+      var t = FIRST_T + (now - start) / 1000;
+      lastT = t;
+      draw(t);
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
