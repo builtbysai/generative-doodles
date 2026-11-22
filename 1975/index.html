@@ -1,0 +1,502 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>№1975 Burn and Stamp</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0d0d0d; height: 100%; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // №1975 Burn and Stamp, TL8 / PP1222, study #257 theodora-laird.
+  // A procedural monochrome landscape builds from black toward
+  // full detail, then the exposure pushes up and the detail
+  // burns out until the image is almost nothing but white.
+  // A single hot-pink wordmark, fEEo, stamps across the burn
+  // and holds for a beat. Then the image falls back to black
+  // and rebuilds. The cycle is the piece: build, burn, sign,
+  // rebuild. Drag upward to accelerate the burn, downward to
+  // hold back the light and keep the detail. The cycle cannot
+  // be skipped, only paced.
+  var PINK = '#ff2e9d';   // the stamp, the only color
+  var PINKD = '#c2177c';  // misregistered stamp shadow
+  var GROUND = '#0d0d0d'; // page ground, near black
+
+  // Fixed-phase first frame: FIRST_T = 7 s. The cycle is 24 s:
+  // build 0-9, burn 9-15, stamp hold 15-18, fall to black
+  // 18-19.5, black hold 19.5-24. At t = 7 the build is nearly
+  // complete (exposure about 0.86), so the first frame shows
+  // the landscape in full detail, still rising out of black.
+  var FIRST_T = 7;
+  var CYCLE = 24;
+  var SEED = 1975;
+
+  // QA probe hooks: ?t=<seconds> sets the virtual clock at load.
+  // ?seed=<seconds> is an alias for the same clock, so the
+  // node-canvas render tool (which passes its probe value as
+  // ?seed=) can verify that the frame changes over time.
+  // Read at load only.
+  var probeT = null;
+  try {
+    var qs = (typeof location !== 'undefined' && location.search) ? location.search : '';
+    var mt = qs.match(/[?&]t=([0-9.]+)/);
+    if (mt) { probeT = parseFloat(mt[1]); }
+    if (probeT === null) {
+      var ms = qs.match(/[?&]seed=([0-9.]+)/);
+      if (ms) { probeT = parseFloat(ms[1]); }
+    }
+  } catch (e) {}
+
+  // Seeded PRNG, mulberry32.
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // Deterministic 1D value noise, pure function of x.
+  function hash1(i) {
+    var s = Math.sin(i * 127.1 + SEED * 311.7) * 43758.5453;
+    return s - Math.floor(s);
+  }
+  function vnoise(x) {
+    var i = Math.floor(x), f = x - i;
+    var u = f * f * (3 - 2 * f);
+    return hash1(i) * (1 - u) + hash1(i + 1) * u;
+  }
+  function fbm(x) {
+    return vnoise(x) * 0.55 + vnoise(x * 2.13 + 7.7) * 0.30 + vnoise(x * 4.31 + 3.1) * 0.15;
+  }
+  function ridge(x) {
+    var v = fbm(x);
+    var r = 1 - Math.abs(2 * v - 1);
+    return r * r;
+  }
+
+  var reduced = false;
+  try {
+    if (typeof window.matchMedia === 'function') {
+      reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    }
+  } catch (e) { reduced = false; }
+
+  var W = 0, H = 0, dpr = 1, isPhone = false;
+  var stageX = 0, stageY = 0, stageW = 0, stageH = 0;
+  var lastT = FIRST_T;
+
+  // Drag pacing: the pointer only ever changes the rate at
+  // which the virtual clock runs, never the phase directly.
+  // Upward drag runs the clock at 2.5x (the burn comes sooner),
+  // downward drag at 0.15x (the detail is held). The clock is
+  // continuous, so the burn and the stamp are always traversed:
+  // the cycle can be paced, never skipped.
+  var paceOffset = 0; // seconds added to the clock by dragging
+  var dragDir = 0;    // 1 up (accelerate), -1 down (hold back), 0 none
+  var dragging = false;
+  var lastY = 0;
+
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function smooth(x) { x = clamp(x, 0, 1); return x * x * (3 - 2 * x); }
+  function a4(v) { return Math.round(v * 10000) / 10000; } // avoid scientific-notation alpha
+  function gray(v) { // base luminance 0..1 -> rgb string, no alpha
+    var g = Math.round(clamp(v, 0, 1) * 255);
+    return 'rgb(' + g + ',' + g + ',' + g + ')';
+  }
+  function grayA(v, a) { // base luminance with alpha
+    var g = Math.round(clamp(v, 0, 1) * 255);
+    return 'rgba(' + g + ',' + g + ',' + g + ',' + a4(a) + ')';
+  }
+
+  var L = {};
+  function layout() {
+    L.fsCap = Math.round(clamp(W * 0.020, 11, 15));
+    L.fsHint = Math.round(clamp(W * 0.022, 12, 16));
+    L.fsMark = Math.round(clamp(W * 0.17, 64, 150));
+    L.horizon = H * 0.46;
+    L.waterTop = H * 0.68;
+    L.shoreTop = H * 0.92;
+  }
+  function resize() {
+    var vw = 0, vh = 0;
+    try {
+      if (typeof window.visualViewport !== 'undefined' && window.visualViewport) {
+        vw = window.visualViewport.width; vh = window.visualViewport.height;
+      }
+    } catch (e) {}
+    if (!vw || !vh) { vw = window.innerWidth; vh = window.innerHeight; }
+    var sw = 0, sh = 0;
+    try { sw = window.screen.width; sh = window.screen.height; } catch (e) { sw = vw; sh = vh; }
+    isPhone = Math.min(sw, sh) < 700 || (vh > vw * 1.15);
+    if (isPhone) {
+      stageW = vw; stageH = vh; stageX = 0; stageY = 0;
+    } else {
+      var side = Math.min(vw * 0.8, vh * 0.92);
+      stageW = side; stageH = side;
+      stageX = (vw - stageW) / 2; stageY = (vh - stageH) / 2;
+    }
+    W = stageW; H = stageH;
+    dpr = (typeof window.devicePixelRatio === 'number' && window.devicePixelRatio > 0) ? window.devicePixelRatio : 1;
+    canvas.width = Math.max(1, Math.round(stageW * dpr));
+    canvas.height = Math.max(1, Math.round(stageH * dpr));
+    canvas.style.width = stageW + 'px';
+    canvas.style.height = stageH + 'px';
+    canvas.style.left = stageX + 'px';
+    canvas.style.top = stageY + 'px';
+    canvas.style.position = 'absolute';
+  }
+
+  // ---- Cycle ---------------------------------------------------
+  // Exposure E over one 24 s cycle. The burn destroys detail
+  // by clipping, not by a white overlay: every drawn gray is
+  // base * E, clamped to white, so as E rises past 1 the
+  // lighter grays clip first and the darkest detail follows,
+  // until at E = 6 every element (darkest base 0.22) is white.
+  function cycleState(t) {
+    var p = ((t % CYCLE) + CYCLE) % CYCLE;
+    var E, stamp = 0;
+    if (p < 9) {
+      E = smooth(p / 9);                    // build: black to full detail
+    } else if (p < 15) {
+      E = 1 + 5 * smooth((p - 9) / 6);      // burn: 1 to 6
+    } else if (p < 18) {
+      E = 6;                                // white hold, stamp visible
+      var st = (p - 15) / 3;
+      stamp = st < 0.06 ? st / 0.06 : 1;    // stamp pops in fast
+    } else if (p < 19.5) {
+      E = 6 * (1 - (p - 18) / 1.5);         // fall back to black
+    } else {
+      E = 0;                                // black hold, then rebuild
+    }
+    return { p: p, E: E, stamp: stamp };
+  }
+  // Gray after exposure: the burn itself, applied per element.
+  function ex(base, E) { return clamp(base * E, 0, 1); }
+
+  // ---- Landscape -----------------------------------------------
+  // Three ridged mountain layers over a lake, drawn in grays
+  // that all pass through ex() so the burn eats real detail.
+  function ridgeY(layer, x) {
+    var u = x / W;
+    if (layer === 0) {
+      return L.horizon - H * 0.10 * ridge(u * 3.1 + 1.7) - H * 0.03 * ridge(u * 7.3 + 4.2);
+    }
+    if (layer === 1) {
+      return L.horizon + H * 0.07 - H * 0.13 * ridge(u * 2.3 + 5.9) - H * 0.04 * ridge(u * 6.1 + 0.8);
+    }
+    return L.horizon + H * 0.17 - H * 0.17 * ridge(u * 1.7 + 11.4) - H * 0.05 * ridge(u * 5.2 + 2.6);
+  }
+
+  function drawLandscape(t, E) {
+    var i, x, y, px;
+    var rng = mulberry32(SEED * 7 + 3);
+
+    // Sky: horizontal bands, light at the top, darker at the
+    // horizon. A pale disc sun and slow cloud streaks.
+    var bands = 22;
+    for (i = 0; i < bands; i++) {
+      var by0 = (L.horizon / bands) * i;
+      var bh = L.horizon / bands + 1;
+      var skyBase = 0.88 - 0.12 * (i / bands);
+      ctx.fillStyle = gray(ex(skyBase, E));
+      ctx.fillRect(0, by0, W, bh);
+    }
+    // Sun disc.
+    var sunX = W * 0.72, sunY = H * 0.19, sunR = W * 0.055;
+    ctx.fillStyle = gray(ex(0.95, E));
+    ctx.beginPath();
+    ctx.moveTo(sunX + sunR, sunY);
+    ctx.arc(sunX, sunY, sunR, 0, Math.PI * 2);
+    ctx.fill();
+    // Cloud streaks, drifting slowly right, wrapped so a
+    // streak never hangs half cut at an edge.
+    for (i = 0; i < 4; i++) {
+      var cy = H * (0.08 + i * 0.075);
+      var cw = W * (0.22 + rng() * 0.16);
+      var cx0 = rng() * W * 0.9;
+      var drift = (t * (2 + i * 0.7)) % (W + cw);
+      var cx = ((cx0 + drift) % (W + cw)) - cw;
+      ctx.fillStyle = grayA(ex(0.92, E), a4(0.32));
+      ctx.fillRect(cx, cy, cw, H * 0.008);
+      ctx.fillRect(cx + cw * 0.12, cy + H * 0.010, cw * 0.6, H * 0.005);
+    }
+
+    // Far ridge: palest, sits on the horizon. Its fill runs
+    // down to the water line, so no gap of bare ground ever
+    // shows between the horizon and the ridge behind it. A
+    // mist band softens its foot.
+    ctx.fillStyle = gray(ex(0.74, E));
+    ctx.beginPath();
+    ctx.moveTo(0, L.waterTop);
+    for (px = 0; px <= W; px += W / 110) { ctx.lineTo(px, ridgeY(0, px)); }
+    ctx.lineTo(W, L.waterTop);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = grayA(ex(0.80, E), a4(0.35));
+    ctx.fillRect(0, L.horizon - H * 0.018, W, H * 0.036);
+
+    // Mid ridge.
+    ctx.fillStyle = gray(ex(0.58, E));
+    ctx.beginPath();
+    ctx.moveTo(0, L.waterTop);
+    for (px = 0; px <= W; px += W / 110) { ctx.lineTo(px, ridgeY(1, px)); }
+    ctx.lineTo(W, L.waterTop);
+    ctx.closePath();
+    ctx.fill();
+    // Snow line along the mid crest.
+    ctx.strokeStyle = gray(ex(0.93, E));
+    ctx.lineWidth = Math.max(1.5, W * 0.002);
+    ctx.beginPath();
+    for (px = 0; px <= W; px += W / 110) {
+      y = ridgeY(1, px);
+      if (px === 0) { ctx.moveTo(px, y); } else { ctx.lineTo(px, y); }
+    }
+    ctx.stroke();
+
+    // Near ridge: darkest, most detailed, with a tree line of
+    // fine ticks along its crest.
+    ctx.fillStyle = gray(ex(0.36, E));
+    ctx.beginPath();
+    ctx.moveTo(0, L.waterTop);
+    for (px = 0; px <= W; px += W / 110) { ctx.lineTo(px, ridgeY(2, px)); }
+    ctx.lineTo(W, L.waterTop);
+    ctx.closePath();
+    ctx.fill();
+    ctx.strokeStyle = gray(ex(0.22, E));
+    ctx.lineWidth = Math.max(1, W * 0.0016);
+    ctx.beginPath();
+    for (x = W * 0.02; x < W; x += W * 0.016) {
+      y = ridgeY(2, x);
+      var th = H * (0.008 + hash1(Math.floor(x / 7)) * 0.012);
+      ctx.moveTo(x, y);
+      ctx.lineTo(x, y - th);
+    }
+    ctx.stroke();
+
+    // Water: dark field from the near ridge foot to the shore,
+    // with wave lines, reflection streaks, and grain.
+    ctx.fillStyle = gray(ex(0.30, E));
+    ctx.fillRect(0, L.waterTop, W, L.shoreTop - L.waterTop);
+    var wl;
+    for (wl = 0; wl < 9; wl++) {
+      var wy = L.waterTop + (L.shoreTop - L.waterTop) * (0.08 + wl * 0.10);
+      var wAmp = H * (0.004 + wl * 0.0012);
+      ctx.strokeStyle = grayA(ex(0.52, E), a4(0.75 - wl * 0.04));
+      ctx.lineWidth = Math.max(1, W * 0.0015);
+      ctx.beginPath();
+      for (px = 0; px <= W; px += W / 48) {
+        y = wy + Math.sin(px * 0.018 + t * 0.45 + wl * 1.3) * wAmp;
+        if (px === 0) { ctx.moveTo(px, y); } else { ctx.lineTo(px, y); }
+      }
+      ctx.stroke();
+    }
+    // Reflection streaks under the near ridge.
+    for (i = 0; i < 46; i++) {
+      var rx = rng() * W;
+      var rl = H * (0.02 + rng() * 0.07);
+      ctx.strokeStyle = grayA(ex(0.48, E), a4(0.20 + rng() * 0.20));
+      ctx.lineWidth = Math.max(1, W * 0.002);
+      ctx.beginPath();
+      ctx.moveTo(rx, L.waterTop + H * 0.01);
+      ctx.lineTo(rx, L.waterTop + H * 0.01 + rl);
+      ctx.stroke();
+    }
+    // Grain: fine dots over the whole scene, the first detail
+    // the burn takes.
+    for (i = 0; i < 260; i++) {
+      var gx = rng() * W, gy = rng() * H * 0.92;
+      var gr = 0.8 + rng() * 1.4;
+      ctx.fillStyle = grayA(ex(0.5, E), a4(0.10 + rng() * 0.14));
+      ctx.beginPath();
+      ctx.moveTo(gx + gr, gy);
+      ctx.arc(gx, gy, gr, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // Shore: dark foreground band with grass ticks.
+    ctx.fillStyle = gray(ex(0.22, E));
+    ctx.fillRect(0, L.shoreTop, W, H - L.shoreTop);
+    ctx.strokeStyle = gray(ex(0.42, E));
+    ctx.lineWidth = Math.max(1, W * 0.0016);
+    ctx.beginPath();
+    for (x = W * 0.01; x < W; x += W * 0.012) {
+      var gh = H * (0.012 + hash1(Math.floor(x / 5)) * 0.02);
+      ctx.moveTo(x, L.shoreTop);
+      ctx.lineTo(x + W * 0.002, L.shoreTop - gh);
+    }
+    ctx.stroke();
+  }
+
+  // ---- Stamp -----------------------------------------------------
+  function drawStamp(stamp, t) {
+    if (stamp <= 0) { return; }
+    var cx = W / 2, cy = H * 0.47;
+    var pop = 1 + 0.14 * (1 - smooth(stamp / 0.4)); // settles from 1.14 to 1
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(-0.105); // about -6 degrees
+    ctx.scale(pop, pop);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = 'italic 900 ' + L.fsMark + 'px Georgia, "Times New Roman", serif';
+    // Misregistered shadow copy, then the stamp itself.
+    ctx.fillStyle = PINKD;
+    ctx.globalAlpha = a4(0.55 * stamp);
+    ctx.fillText('fEEo', L.fsMark * 0.03, L.fsMark * 0.04);
+    ctx.globalAlpha = a4(stamp);
+    ctx.fillStyle = PINK;
+    ctx.fillText('fEEo', 0, 0);
+    ctx.globalAlpha = 1;
+    // Underline rule, the stamp's baseline.
+    var mw = ctx.measureText('fEEo').width;
+    ctx.fillStyle = PINK;
+    ctx.globalAlpha = a4(stamp);
+    ctx.fillRect(-mw / 2, L.fsMark * 0.42, mw, Math.max(2, L.fsMark * 0.045));
+    ctx.globalAlpha = 1;
+    ctx.restore();
+  }
+
+  // ---- Captions --------------------------------------------------
+  // The caption and hint are part of the image: they burn with
+  // it, but stay readable on pure black and on pure white.
+  function uiGray(E) {
+    if (E < 0.25) { return 0.62; }
+    if (E > 2) { return 0.30; }
+    return clamp(0.55 * E, 0.14, 0.9);
+  }
+
+  function draw(t) {
+    lastT = t;
+    // Pin the canvas element in draw(), per house rules.
+    canvas.style.width = stageW + 'px';
+    canvas.style.height = stageH + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    layout();
+
+    var cs = cycleState(t);
+    var E = cs.E;
+
+    // Ground is near black; the stage is the whole image.
+    ctx.fillStyle = GROUND;
+    ctx.fillRect(0, 0, W, H);
+
+    drawLandscape(t, E);
+    drawStamp(cs.stamp, t);
+
+    // Caption, top left, and the hint, bottom center.
+    var ug = uiGray(E);
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillStyle = grayA(ug, a4(0.85));
+    ctx.font = '600 ' + L.fsCap + 'px Georgia, "Times New Roman", serif';
+    ctx.fillText('№1975 · Burn and Stamp', W * 0.04, H * 0.055);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = grayA(ug, a4(0.9));
+    ctx.font = L.fsHint + 'px Georgia, "Times New Roman", serif';
+    ctx.fillText('Drag to push the exposure.', W / 2, H - L.fsHint * 0.9);
+    ctx.textAlign = 'left';
+  }
+
+  // Drag paces the clock: up accelerates the burn, down holds
+  // the detail back. Pointer only, never a click to reload.
+  function onDown(e) {
+    dragging = true;
+    dragDir = 0;
+    lastY = (e && typeof e.clientY === 'number') ? e.clientY : 0;
+    if (reduced) { draw(lastT + paceOffset); }
+  }
+  function onMove(e) {
+    if (!dragging) { return; }
+    var y = (e && typeof e.clientY === 'number') ? e.clientY : lastY;
+    var dy = lastY - y; // positive when the pointer moves up
+    lastY = y;
+    if (dy > 2) { dragDir = 1; }
+    else if (dy < -2) { dragDir = -1; }
+    if (reduced) {
+      // No motion loop in reduced mode: nudge the clock
+      // directly, so a drag still paces the cycle.
+      paceOffset += dy * 0.02;
+      if (lastT + paceOffset < 0) { paceOffset = -lastT; }
+      draw(lastT + paceOffset);
+    }
+  }
+  function onUp() {
+    dragging = false;
+    dragDir = 0;
+  }
+  if (typeof canvas.addEventListener === 'function') {
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+    canvas.addEventListener('pointerleave', onUp);
+  }
+
+  if (typeof window.addEventListener === 'function') {
+    window.addEventListener('resize', function () { resize(); draw(lastT + paceOffset); });
+  }
+  try {
+    if (typeof window.visualViewport !== 'undefined' && window.visualViewport &&
+        typeof window.visualViewport.addEventListener === 'function') {
+      window.visualViewport.addEventListener('resize', function () { resize(); draw(lastT + paceOffset); });
+    }
+  } catch (e) {}
+
+  // QA hooks: window.__draw drives draw() with a virtual clock,
+  // window.__piece1975 exposes the cycle state and drag pacing.
+  try {
+    window.__draw = function (t) { draw(t); };
+    window.__piece1975 = {
+      firstT: FIRST_T,
+      cycle: CYCLE,
+      state: function (t) { return cycleState(t); },
+      exposure: function (t) { return cycleState(t).E; },
+      stamp: function (t) { return cycleState(t).stamp; },
+      paceOffset: function () { return paceOffset; },
+      drag: function (dir) { dragDir = dir; },
+      redraw: function (t) { draw(t); }
+    };
+  } catch (e) {}
+
+  resize();
+  draw(probeT !== null ? probeT : FIRST_T); // one synchronous frame at load
+
+  // Motion loop: the landscape builds, burns, stamps, and
+  // rebuilds on a 24 s cycle. Drag changes the clock rate
+  // (2.5x up, 0.15x down), never the phase, so the cycle is
+  // paced but never skipped. Guarded so node-canvas QA (no
+  // requestAnimationFrame) works.
+  if (!reduced && typeof requestAnimationFrame === 'function') {
+    var start = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+    var prevNow = start;
+    var loop = function (now) {
+      var dt = (now - prevNow) / 1000;
+      prevNow = now;
+      if (dt < 0) { dt = 0; }
+      if (dt > 0.25) { dt = 0.25; }
+      var rate = dragDir > 0 ? 2.5 : (dragDir < 0 ? 0.15 : 1);
+      paceOffset += (rate - 1) * dt;
+      var t = FIRST_T + (now - start) / 1000 + paceOffset;
+      if (t < 0) { paceOffset -= t; t = 0; }
+      lastT = t;
+      draw(t);
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+})();
+</script>
+</body>
+</html>
