@@ -1,57 +1,10 @@
-# No.165 Strange Loop (Five Colours)
+# No.289 Gold Seam
 
 ## Concept
-Squares hinged at their corners open and close like a
-breathing lattice, map-coloured in exactly five colours with
-neighbours never matching, while the plane itself rotates so
-that the central square sits perfectly still. A strange loop:
-everything moves, and the middle does not.
+After Sophia Golovanevskaya's kintsugi repair philosophy: a dark vessel on a near-black ground that slowly breaks into shards along glowing gold seams, then reassembles, each cycle leaving its gold lines behind. The break pattern differs every cycle, past seam sets accumulate and fade, and the gold does all the talking. Tapping forces the next break at once; double-tapping freezes a broken state with glowing seams. Nothing ever reloads.
 
 ## Construction
-Canvas 2D, single self-contained page, watch only. The
-stillness is exact, and the construction is the proof. Every
-square turns +theta about its own hinge corner inside a plane
-that turns -theta about the panel centre, so in the world
-frame no square ever rotates: each stays axis-aligned and
-only travels, its hinge tracing a circle whose radius is its
-distance from the centre. One hinge sits exactly at the
-centre; its square has radius zero, nowhere to travel to, and
-is motionless in every frame while the field breathes around
-it. Theta runs a 24 second loop (open 11s, hold 2s, close
-11s, smoothstep eased) from closed to a full quarter turn.
-Thirty-six squares on a 6 by 6 hinge lattice, coloured
-(i + 2j) mod 5 from vermillion #D64533, ochre #D9A441, teal
-#1F7A6B, indigo #2A2A72, bone #F2EDE3, a gradient colouring
-that keeps edge and corner neighbours distinct; the colour
-offset advances by one each completed loop. Hinge dots in
-#1A1A1A ride the plane transform at the lattice corners.
-Pitch is set so the widest orbit (a corner hinge dot at
-4.24 pitches) stays inside the panel. House rules held:
-Visual Viewport sizing with both resize listeners, canvas
-pinned in px, page ground equal to the bone of the palette,
-synchronous first frame opened mid-loop at theta near 50
-degrees, typeof-guarded rAF, no pointer listeners (the
-renderer confirms only the two resize listeners). Two
-recorded decisions: an early draft counter-rotated by only
-theta/2 with a separate untransformed underlayer, and the
-squares visibly tumbled and scattered; the exact-cancellation
-construction replaced it. A breathing scale on the plane was
-also cut, because any scale about the centre moves the
-central square's corners: exact stillness allows rotation
-alone.
+Canvas 2D in a 1280 by 900 design space, centred fit with the near-black ground as the page ground. The palette is held to the five specced colours only: the dark vessel, the shard edge, gold seam, gold glow, and the ground. The vessel is a lathe profile, half widths against height fraction sampled with Catmull-Rom, standing 70 percent of the frame height and centred. Shards are Voronoi cells: seeded points inside the silhouette, each cell clipped to the vessel outline by the half planes against every other seed, all held as plain data and drawn directly each frame. Interior edges shared by exactly two cells are the seams, and each seam records its two cells so a parting seam is stroked once under each cell transform and glows along both edges. The break animation moves each shard outward along its centroid direction by a small seeded offset, at most about eleven pixels, with a slight rotation, so nothing leaves the frame. Seams are layered translucent strokes, a wide low-alpha glow pass under a mid gold pass under a bright thin core, never a gradient or shadowBlur, and they are clipped to the silhouette so no gold tip drifts past the wall. Crack propagation is ordered by distance from a point on the upper belly, so the break spreads across the vessel as the cycle advances. The loop runs 16 seconds on a fixed tick: intact, crack propagates, shards part, hold broken and glowing, reassemble, then rest with the gold settled. At each rollover the finished seam set moves into a history of up to three past sets, drawn at rest under the current shards with falling alpha, oldest faintest. The clock starts 7.2 seconds in, mid-cycle with the shards parted and glowing, and one past seam set is built before frame one so the accumulated gold already reads faintly underneath. A tap waits out a 380 millisecond double-tap window, then pushes the current set into the history, builds the next seeded shard set and jumps straight to the crack phase; a double-tap toggles the freeze, easing separation and glow to full and holding them there. Pointer handlers convert client coordinates to design coordinates through the stored centred-fit transform (S, OX, OY) set by frame(). House rules held: Visual Viewport sizing with resize listeners on visualViewport and window, canvas pinned in px every frame, phone detection via window.screen with the aspect fallback, synchronous first frame, rAF typeof guarded, fixed seeds with a deterministic seed cycle, no text, no audio, no offscreen canvas, no gradients or shadowBlur.
 
 ## QA log
-Rendered with render-piece.js at 1280x900, 390x844 and 720x720
-and inspected all three. The first two builds failed honestly:
-squares rotated about their corners inside a half-cancelled
-plane rotation tumbled across the whole canvas, the lattice
-and the five-colour law unreadable. The rebuilt construction
-was verified in the renders: every square axis-aligned in the
-world frame at theta near 50 degrees, squares travelling on
-their circular hinge paths, hinge dots at the corners, the
-vermillion central square registered at the panel centre.
-Colour adjacency checked across the lattice in the desktop
-render: no edge neighbours share a colour. Pitch was raised
-once (panel/9.2 to panel/8.8) after the first rebuilt render
-sat small in its ground; containment of the corner orbits was
-recomputed before the change.
+Rendered at 1280x900, 390x844 and 720x720 from the shipped script and inspected all three; the renderer reported both resize listeners and the three canvas pointer listeners, and a grep confirms exactly the five specced palette colours and no em dashes. One fix after the first render: parted shards pushed a few seam tips past the silhouette, one poking below the foot, so the current seam passes are now clipped to the vessel outline. Final frame one reads as specced at all three sizes: a dark vessel centred and standing 70 percent of the frame height on the near-black ground, shards slightly parted along bright layered gold seams, one older seam set glowing faintly underneath, no shard out of frame and no text. On the phone the centred fit keeps the whole vessel in frame and the seams stay legible.

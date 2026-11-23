@@ -1,10 +1,80 @@
-# No.185 Hat Field
+# No.336 Red Triangle - process notes
 
 ## Concept
-Goodman-Strauss's own telling of the hat story: a single aperiodic monotile, discovered by David Smith and cracked open with Craig Kaplan, grown by substitution from one central hat, supercluster inside supercluster, until the plane is covered by a pattern that never repeats. This piece is deliberately a different beast from No.167's Kaplan field (neon outlines and stars on black): here the hats are filled, seamed in slate, coloured in two greens and two blues by supercluster neighbourhood, and every mirror-image hat is picked out in yellow, the reflected minority made visible at a glance.
+After Arunima Dazess Wangchuk's 2024 degree-show installation: a
+tall red-lit triangular arch stands in a black room, a projected
+fire burning inside it, flanked at the base by dark glazed masks
+with red-lit eyes. Red is the operating colour and light is the
+structural material. The palette holds to six colours only: arch
+red, fire orange, ember yellow, mask dark, eye red and room
+black, and nothing else is used anywhere in the piece. The piece
+is watch-only, with no interaction at all: the fire churns, the
+edge light breathes, and the masks never move.
 
 ## Construction
-Canvas 2D, single self contained page. One deviation must be stated plainly: the substitution is not re-run live in the browser. It was executed and verified at build time using the H/T/P/F metatile rules of Smith, Myers, Kaplan and Goodman-Strauss (the same verified data No.167 shipped: the level-3 supertile census, 1156 hats of which 147 reflected, zero overlaps), and a 462 tile centre crop of that supertile, with each tile's exact placement, rotation in 30 degree steps and handedness, is baked into the page as data. What the page does live is everything the viewer sees: adjacency between tiles is rebuilt from shared polygon edges, growth shells are computed by breadth-first search outward from the tile nearest the centre, and the field blooms in four rounds of three seconds each, tiles scaling and fading in shell by shell, followed by a ten second hold in which the whole field breathes by four thousandths of its size. Colour is a property of position in the supertile: reflected tiles are exactly #F2B233, the rest take green or blue family by a coarse neighbourhood parity, two shades each, so superclusters read as districts. Seams are 1px strokes in the ground colour #1B2230; there are no gradients and no decorative rotation anywhere; every hat sits exactly where the substitution put it. A tap grows a different tiling: a new crop centre, a rotation in 60 degree steps, possibly the mirror handedness of the whole family (a genuinely different valid tiling, not a redecoration), chosen from a seeded generator with a memory of every layout already shown, so a layout never repeats; the growth then replays from the single central hat. House rules held: Visual Viewport sizing with both resize listeners, canvas pinned in px every frame, rAF typeof guarded, hint lowercase and short. The cycle clock is offset so the first frame is the fully grown field in its hold.
+- Single self-contained page, canvas 2D, one canvas, no
+  libraries. Design space 1280x900, centred fit, page ground set
+  to the room black so the letterbox on tall screens is seamless.
+- The arch is a triangular frame path, apex near the top of the
+  frame, stroked in six layered translucent red passes from a
+  wide faint halo to a thin bright core. The alpha of every pass
+  follows one combined light value: a breath term completing one
+  whole sine cycle in 30s, multiplied by a flicker term read from
+  a fixed seeded table of 60 values sampled eight times a second
+  and smoothed, the table repeating every 30s. Because both terms
+  close at 30s, the frame at 30s is pixel-identical to frame 0.
+- The fire is particle data, not an image: exactly 120 particles,
+  asserted in the code, drawn inside a path clip of the triangle
+  interior. Each particle respawns at the base and rises once per
+  its own duration; every duration (3.75, 5, 6, 7.5 or 10
+  seconds) divides the 30s loop a whole number of times, and each
+  particle's sideways sway completes a whole number of cycles per
+  rise, so every particle completes its rise inside the loop's
+  flicker cycle. Particle colour steps from fire orange low in
+  the rise to ember yellow higher up, size shrinking as it climbs.
+  A low translucent fire-bed band glows along the base inside the
+  clip. Glow everywhere is layered translucency only: no
+  shadowBlur, no filters, no gradients, no offscreen canvas.
+- Exactly 4 flanking masks, asserted in the code, two per side in
+  a loose row at the base. Each is fixed dark path data: a
+  crown-tufted silhouette filled in mask dark, features carved
+  with room black strokes (stern angled brows, nose, frown,
+  forehead line), drawn every frame in the same place and never
+  moving. Their eye points are small filled circles in eye red at
+  constant alpha, never touched by the breath or flicker: the
+  only constant red in the piece.
+- The first frame is already developed: the loop clock starts at
+  7.5s, a quarter into the cycle, so the fire is burning
+  mid-flicker and the edge light is mid-breath on load. Visual
+  Viewport sizing with resize listeners on visualViewport and
+  window; canvas pinned by style width and height every frame;
+  phone detection via window.screen min dimension under 700px
+  with aspect fallback; every requestAnimationFrame call
+  typeof-guarded; fixed seeds throughout.
 
 ## QA log
-Rendered at 1280x900, 390x844 and 720x720 and inspected all three. The desktop frame is the developed state: an edge to edge aperiodic sea, yellow mirrors scattered at the true reflected density (60 of 462 in this crop), green and blue districts large enough to read as supercluster neighbourhoods rather than noise, seams fine and even. The phone frame shows the same full-bleed field with no margin and no distortion, hats at a comfortable size. The growth rounds and the reseed history live in the animation and tap paths, which the still renderer cannot exercise; they were verified by re-reading the shell computation against the adjacency map the page builds at load. What the stills do prove, palette, density, coverage and the mirror census, is exactly what the spec fixes numerically, and it all checks.
+- Frames rendered from the actual page script (node-canvas) at
+  1280x900 desktop, 390x844 mobile and 720x720 thumbnail size and
+  inspected before handoff. Desktop: tall triangle centred, apex
+  near the top, fire densest and orange at the base stepping to
+  ember yellow near the apex, four dark masks in a flanking row
+  at the base with red eye points. Mobile: centred fit holds,
+  masks and fire legible, ground seamless. Thumb: composition
+  reads at small size.
+- First render pass showed the mask brows reading as closed
+  happy eyes and the mouth as a smile; brows were redrawn as
+  stern angled strokes and the mouth as a shallow frown, and the
+  particle halos and fire-bed band were softened. Re-rendered and
+  re-inspected after the fix.
+- Assertions in code: exactly 120 particles, every rise duration
+  dividing the 30s loop, every sway a whole number of cycles,
+  exactly 60 flicker table values, exactly 4 masks with exactly
+  two per side. All pass at load; the renderer runs the script
+  without error.
+- Visible copy check: no em dashes, no date strings, no absolute
+  URLs, no text or UI in the piece. Hans's real-device check is
+  the final gate.
+- Files: `336/index.html`, `336/thumb.png` (720x720, rendered
+  from the live script), `336/process.md`, plus `336/qa-desktop.png`
+  and `336/qa-mobile.png` alongside. Gallery entry belongs in
+  pieces.json with the formula date 2002 · 12 · 13.

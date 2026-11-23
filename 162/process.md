@@ -1,50 +1,10 @@
-# No.162 Not a Quasicrystal
+# No.281 Terracotta Speckle
 
 ## Concept
-Jay Bonner's forensic rebuttal of the Darb-i Imam "quasicrystal"
-reading, made visible. A field of ten-pointed stars in ink on
-paper reads as quasiperiodic scatter; in fact every star is
-generated from a perfectly periodic tessellation of decagons
-and bow ties (wallpaper group cmm). Tap X-rays the hidden
-tessellation in red over the stars: it draws on from the tap
-point, holds, and fades. The grid was never hidden; it was the
-drawing.
+After Njalikwa Chongwe's terracotta range: a burnt-orange field of raw clay, dense with cream and dark speckle, seen so close that no form or vessel shape remains, only the surface itself. Idle, the speckle shimmers faintly and the field sits still. Dragging stirs it: the speckle inside the drag radius curls into swirls, trails briefly, and settles back to stillness once the drag lets go. Nothing ever reloads.
 
 ## Construction
-Canvas 2D, single self-contained page. Decagon centres sit on a
-staggered periodic lattice (rows offset by half a pitch, cmm
-mirrors); bow ties sit at the horizontal midpoints between
-neighbouring decagons and at the diagonal midpoints between
-rows. Each decagon carries a true {10/3} star polygon drawn as
-one continuous path (the polygonal technique: the star arises
-from the decagon), a centre dot, and a faint pencil
-circumcircle left as construction residue. Each bow tie carries
-one small diamond at its heart. The reveal layer is the same
-tessellation objects, decagon and bow tie outlines stroked in
-red (#B03A2E) under a circular clip that grows from the tap
-point over 2s, holds 3s, fades over 1.5s; a second tap fades
-it early. No Penrose tiling anywhere: the underdrawing is
-periodic by construction. Palette only: paper #F4F1E8, ink
-#1A1A1A, red #B03A2E, pencil #8A8A8A. House rules held: Visual
-Viewport sizing with both resize listeners, canvas pinned in
-px, window.screen phone check with aspect fallback, field
-full-bleed on phones, synchronous first frame, typeof-guarded
-requestAnimationFrame.
+Canvas 2D in a 1280 by 900 design space, cover-fitted so the clay field fills the frame edge to edge, with the burnt orange as the page ground. The palette is held to the four specced colours only: burnt orange ground, cream speckle, dark speckle, and the trail orange used only for swirl trails. About 1200 speckle dots are held purely as data, each with a stored position, velocity, colour, size and shimmer phase, placed by a fixed seed across the design space and past its edges so the cover crop is always covered. Sizes are skewed small so the field reads rough and granular, with a few larger grains scattered through it. The shimmer is a faint per-dot radius breathing on its own phase and rate, drawn in two batched fills, one per speckle colour, so the per-frame cost stays low no matter how dense the field gets. Motion runs on a fixed tick: a moving dot advances by its velocity, wraps at the extended edges so density is never lost, and its velocity is damped by 0.94 per tick, which leaves motion imperceptible about six seconds after a stir ends. Dragging applies two impulses to every dot inside a 190px radius around the drag point, both scaled by a smoothstep falloff: a share of the drag vector itself, and a rotational impulse tangential to the drag point, so the speckle swirls instead of only sliding sideways. Speeds are capped so trails read without dots flying off. Swirl trails are short segments drawn back along each moving dot's recent velocity in the trail colour at low alpha, as one batched path, and they vanish on their own as velocities damp out. Frame one opens fully settled and dense, with the shimmer already running, because every dot starts at rest. Pointer handlers convert client coordinates to design coordinates through the stored cover-fit transform (S, OX, OY) set by frame(). House rules held: Visual Viewport sizing with resize listeners on visualViewport and window, canvas pinned in px every frame, phone detection via window.screen with the aspect fallback, synchronous first frame, rAF typeof guarded, fixed seeds, no text, no audio, no offscreen canvas, no filters or shadowBlur.
 
 ## QA log
-Rendered with render-piece.js at 1280x900, 390x844 and 720x720
-and inspected all three, plus a forced-reveal test render (tap
-state set directly in a test copy, since the tap cannot be
-driven headlessly): the red decagon-and-bowtie lattice draws
-over the stars exactly registered to them, and its regularity
-reads instantly. Two faults caught and fixed during QA. The
-first star used the alternating outline formula with inner
-radius ratio 0.727, which read as a blunt gear rather than a
-star; replaced with the true {10/3} star polygon path, and the
-reveal decagons re-registered to the same vertex-up rotation.
-The bow tie motif began as two diamonds per tie, which collided
-with the star points; reduced to a single small diamond at each
-bow tie's heart, and the revealed bow tie outlines shrunk
-slightly so they interlock with the decagons instead of
-overrunning them. Frame one is the finished star field, reveal
-off.
+Rendered at 1280x900, 390x844 and 720x720 from the shipped script and inspected all three; the renderer reported both resize listeners and the four canvas pointer listeners, and a grep confirms exactly the four specced palette colours and no em dashes. One fix: the first render read a little sparse for raw clay, so the grain sizes were raised while the count stayed at about 1200, and the field re-rendered. Final frame one reads as specced at all three sizes: a full-bleed burnt-orange field dense with cream and dark speckle, settled and shimmering, with speckle running off every edge and no forms or text anywhere. On the phone the cover crop centres on the middle of the field and the speckle stays legible. No further fixes were needed.

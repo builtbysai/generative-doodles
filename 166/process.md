@@ -1,48 +1,10 @@
-# No.166 Parquet Drift
+# No.291 Puffer Time
 
 ## Concept
-A horizontal strip of parquet that cannot decide what it is:
-a square grid on one side, a rhomb tiling on the other, and
-between them a melt front that takes half a minute to cross.
-Every intermediate stage is still a legal tiling. The slowness
-is the piece; there is nothing else in it, just ink on paper
-and a front moving at glacial speed.
+After Ruby Waters' puffer clock: a spiky tattoo-flash puffer creature that fills the frame and is itself a working clock. Exactly 14 spikes. The top half is cadmium yellow covered in black hand-drawn squiggle marks; the bottom half is white with orange polka dots, split hard at the middle. Two enormous googly eyes track the pointer, a blue oval mouth carries white teeth, and the side fins run orange-yellow tipped cobalt. Black clock hands pivot from a brass centre and keep real time. The creature breathes on a slow 6 second squash-stretch. Dragging a spike wobbles it on spring physics; tapping the body inflates it to scale 1.15 with longer spines, then it relaxes. Nothing ever reloads.
 
 ## Construction
-Canvas 2D, single self-contained page, watch only. The strip
-occupies the middle 55 percent of the viewport and bleeds off
-both sides, its segments fading to nothing at the extreme
-edges. Each grid vertex owns two positions: its square-grid
-position, and its rhomb position, the same point with its row
-sheared by 0.6 of a cell per step away from the middle row,
-which turns the verticals into the diagonals of a 59 degree
-rhomb. A front sweeps the strip left to right over 30 seconds
-and returns over the next 30 (smoothstep eased, 60 second
-loop, closing exactly). A vertex's blend is a clamped ramp of
-its own x against the front, so all vertices in a column
-share one blend value and every column at every instant is a
-true tiling of trapezoids leaning a little more or a little
-less; edges are drawn straight between blended vertices, 2px
-ink #111111 on paper #FAFAF7. Cell size is capped by width as
-well as strip height, so narrow screens get more, smaller
-cells instead of a cropped few. House rules held: Visual
-Viewport sizing with both resize listeners, canvas pinned in
-px, synchronous first frame opened with the front mid-strip
-(offset 15s: rhombs on the left, squares on the right, the
-melt zone in the middle), typeof-guarded rAF, no pointer
-listeners (the renderer confirms only the two resize
-listeners).
+Canvas 2D in a 1280 by 900 design space, centred-fitted so the round creature keeps its shape in the middle of the frame, with the warm page ground held to the specced cream. The palette is held to the specced colours only: page cream, puffer yellow, squiggle black, white, dot orange, cobalt for the fin tips and the mouth, and brass for the centre. The silhouette is a radial star polygon with exactly 14 spikes: tip radius 355 and valley radius 248 in design units, with tip, valley and angle jitter per spike from a fixed seed, so the sun outline stays hand-made rather than machined. The body is drawn under a silhouette path clip recomputed each frame: the top half fills yellow, the bottom half fills white, and a thin black band at the local middle makes the split read hard. The squiggle field is 120 short random-walk strokes held purely as point data, no two alike, stroked in black and clipped to the top half of the silhouette by a second path clip. The dot field is a seeded dart-thrown scatter with a relaxed minimum distance, about 130 orange dots, clipped to the bottom half the same way. No offscreen canvas anywhere: both masks are path clips recomputed each frame and all marks are data drawn directly. Flat fills only, no gradients, no filters or shadowBlur. The fins are layered flat shapes at the sides of the body: a full cobalt fin with a black outline, a smaller orange fin laid over it, and a smaller yellow fin over that, so the cobalt reads as the tip and the orange and yellow read as the fin body. The mouth is a cobalt oval with five chunky white teeth hanging from its top edge and two small fangs rising from the bottom, all clipped to the oval and outlined in black. The eyes are huge white circles outlined in black with black pupils and a small white catchlight; the pupils track the pointer, converted to design coords through the stored centred-fit transform (S, OX, OY), and on touch the last drag point is the gaze target. The clock hands are Date-driven every frame: a thick hour hand, a longer minute hand, and a thin second hand that sweeps smoothly on milliseconds, all black and pivoting under a brass centre cap. Breathing is a 6 second cycle: the creature squashes and stretches by just under 3 percent in opposite axes and bobs a few pixels, and frame one opens at the rest phase of that cycle with the hands already showing the actual time. Drag uses spring physics throughout: while dragging, the wobble leans toward the drag offset capped at 80 design pixels and tracks its own velocity, and on release a damped spring (stiffness 120, damping 9) settles it with a visible squash and wobble. A tap on the body sets a 1.5 second puff envelope: a sine swell that scales the whole creature to 1.15 and lengthens the spike tips by a further tenth before relaxing back. Grabs and taps only count on the creature itself, within 410 design pixels of the centre. House rules held: Visual Viewport sizing with resize listeners on visualViewport and window, canvas pinned in px every frame, phone detection via window.screen with the aspect fallback, synchronous first frame, rAF typeof guarded, fixed seeds, no text, no UI chrome, no audio, no em dashes.
 
 ## QA log
-Rendered with render-piece.js at 1280x900, 390x844 and 720x720
-and inspected all three. The desktop frame passed as drawn:
-rhombs left, squares right, legal trapezoid columns through
-the melt zone, edges dissolving at both sides. The first
-mobile render failed: with the strip height fixing the cell
-at 77px, a 390px screen held only five columns and the shear
-threw the pattern off the left edge, reading as cropped
-rather than full-bleed. Cell size is now the minimum of
-strip-height/6 and width/9 with the row count recomputed to
-keep the strip at its full height; the re-rendered mobile
-frame holds eleven rows and the full melt, front mid-strip,
-and the thumb matches the desktop composition.
+Rendered at 1280x900, 390x844 and 720x720 from the shipped script and inspected all three; the renderer reported both resize listeners and all four canvas pointer listeners, and a grep confirms exactly the seven specced palette colours, no em dashes, and no gradients, shadowBlur or offscreen canvas. No fixes were needed. Final frame one reads as specced at all three sizes: a spiky puffer filling the frame with exactly 14 spikes counted tip by tip, the top half cadmium yellow under dense black squiggle walks, the bottom half white with orange polka dots, the split hard at the middle with its thin black band. The two googly eyes are huge and manic with centred pupils and catchlights, the blue oval mouth shows five white top teeth and two small fangs, the side fins read yellow inside orange with cobalt at the tips, and the black hour, minute and thin second hands stand clear of the face from the brass centre, showing the render time. Nothing clips: the longest spike tips sit inside the frame with margin at rest breath phase on desktop and thumb. On the phone the centred fit sets the creature in the middle of the tall frame on the cream ground and every element stays legible, fins and teeth included.

@@ -1,52 +1,10 @@
-# No.161 Polygons in Contact
+# No.277 Target
 
 ## Concept
-Hankin's 1905 discovery as Jay Bonner reclaimed it: a Turkish-bath
-wall of lightly drawn polygonal tiling in pencil, with small star
-motifs blooming inside each tile. The motifs are not contained by
-their tiles: at every shared edge they meet at a contact point on
-the boundary, marked by a short red link, so the finished pattern
-links across the tiling into one quiet tapestry.
+After Njalikwa Chongwe's hand-painted medallions: a spiral target centred on a crackled cream ground. Six wobbly concentric rings in cobalt, cream and terracotta are drawn stroke by stroke, one by one from the centre outward, each revealed along its angle the way a brush travels. An ochre spiral winds into the middle last. The finished medallion holds, then gently fades as a fresh crackled ground comes back underneath, and the 30 second loop begins again. A band of green bleeds in at the frame edge under the crackle. Watch only: there is no interaction, the drawing itself is the whole event.
 
 ## Construction
-Canvas 2D, single self-contained page. Four tessellation
-generators cycle on tap, each with a fixed seed so the result is
-stable: 4.8.8 (octagons with squares in the gaps), 3.6.3.6
-(hexagons with triangles), 3.4.6.4 (hexagons, squares and
-triangles), and a decagon, pentagon and hexagon mix. Tiles are
-stroked in pencil (#B9B2A0) on plaster (#EFE9DA). Inside each tile
-a star motif ({n/k} with the true inner radius, k chosen per tile
-size so small tiles stay legible) is stroked in ink (#1A1A1A) at
-about half the tile radius. Cross-boundary linking is by
-construction: neighbouring tiles whose boundaries nearly touch
-share a contact point at the midpoint between their centres, and
-a short red (#B03A2E) link is drawn across it with a red dot at
-the point itself. Tap (a press under half a second that does not
-travel) advances the family and the motifs re-bloom with a one
-second staggered grow. The first family opens fully grown. House
-rules held: Visual Viewport sizing with both resize listeners,
-canvas pinned in px, window.screen phone check with aspect
-fallback, synchronous first frame, typeof-guarded
-requestAnimationFrame.
+Canvas 2D in a 1280 by 900 design space, centred fit so the medallion keeps its shape at any aspect, with the ground cream as the page ground. The palette is held to the seven specced colours only: ground cream, crackle grey, terracotta, ring cream, cobalt, ochre and rim green. The medallion is centred at 640, 450 with an outer radius of 270, so it spans 540 design pixels, about 60 percent of the frame height. The six rings sit at radii 95, 130, 165, 200, 235 and 270, colours running cobalt, cream, terracotta, cobalt, cream, terracotta from the centre outward, stroke widths 20 to 26. Each ring is a 180 step polyline whose radius carries hand wobble from seeded 1D value noise: a coarse nine knot field interpolated with smoothstep and wrapped so it joins around the circle, plus a finer seventeen knot field at lower amplitude, with the radius held above a minimum so a ring never collapses. Each ring also carries one seeded alpha between 0.86 and 0.99, so the unevenness of the painting sits between rings. The spiral centre is Archimedean, r equals a plus b times theta, five turns out to a radius of about 68, with a light noise pass over its radius and a 13 pixel ochre stroke. The crackle ground is data only: 110 seeded random walk polylines of four to eleven segments each, stored as point lists and stroked every frame in the crackle colour at alpha 0.22 and width 1. The rim bleed is three nested green strokes at the frame edge, widths 44, 24 and 10 at alphas 0.13, 0.18 and 0.26, drawn before the crackle so the crackle sits over the bleed. Timing: each ring takes 2.2 seconds to draw, so the six rings complete at 13.2 seconds; the spiral draws from 13.2 to 17 seconds; the medallion holds to 26 seconds and fades out over the last 4 seconds of the 30 second loop. The opening clock starts at 8 seconds, so frame one opens with three rings complete and the fourth ring, cobalt at radius 200, about two thirds drawn, and the medallion reads immediately. House rules held: Visual Viewport sizing with both resize listeners, canvas pinned in px every frame, phone detection via window.screen with the aspect fallback, synchronous first frame, rAF typeof guarded, fixed seeds, no interaction handlers, no audio, no text, no offscreen canvas and no filters or shadowBlur.
 
 ## QA log
-Rendered with render-piece.js at 1280x900, 390x844 and 720x720
-and inspected all three, plus forced renders of families 2, 3
-and 4 (the tap cycle cannot be driven headlessly, so the family
-index was set directly in test copies; all four families produce
-coherent full tapestries in palette). Two faults were caught and
-fixed during QA. The 4-point star parameter for the smallest
-tiles drove the inner radius to zero and the square motifs
-collapsed into thin crosses; the step parameter is now chosen
-per tile size and the squares carry small diamond motifs. And
-the lattice ranges were fixed counts sized from the smaller
-frame dimension, which left plaster bands at the top and bottom
-of the tall phone frame; ranges are now computed from the width
-and height separately, and the phone render fills edge to edge. Frame one: the 4.8.8 wall
-fills the frame, eight-point stars in the octagons, diamonds in
-the squares, red links stitching every shared boundary. Palette
-audit: plaster #EFE9DA, pencil tiling #B9B2A0, motifs #1A1A1A,
-link accents #B03A2E only. Gallery entry ready: 2002 · 06 · 21,
-"Hankin's polygons in contact: a pencil tiling with small stars
-blooming inside each tile and linking across the boundaries into
-one tapestry. Tap to change the tiling family."
+Rendered at 1280x900, 390x844 and 720x720 from the shipped script and inspected all three; the renderer reported resize listeners only, and a grep confirms no interaction handlers, no shadowBlur, no gradients and exactly the seven specced palette colours in the script. One fix. The first render drew each ring in short alpha varying runs, and the round caps at the run joints doubled up into a dotted dark texture along every stroke; the wobble also read slightly squarish on the inner rings. The runs were replaced with one seeded alpha per ring drawn as a single stroke, and the noise amplitudes were lowered from 5.5 and 2.4 to 4.2 and 1.8. Re-rendered and re-inspected: the strokes are smooth with a clear hand wobble and no joint dots. Final frame one reads as specced at all three sizes: a crackled cream field with green bleeding in at the rim, and at the centre a target in progress, a small cobalt ring inside a cream ring inside a terracotta ring, with the next cobalt ring about two thirds drawn around them and its open ends showing the stroke by stroke reveal. On the phone the centred fit keeps the whole medallion in frame with the crackle and rim bleed still legible and nothing clipped. No further fixes were needed.

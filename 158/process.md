@@ -1,54 +1,10 @@
-# No.158 The Puzzling Unstructured
+# No.267 Living Vessels
 
 ## Concept
-Bonner's dual-level mechanism, the one Bultheel called
-"puzzlingly unstructured": a coarse polygonal grid is drawn in
-faint pencil, wide ribbons grow along its edges, and a fine grid
-of small red stars blooms at its intersections, registered to
-the coarse level. Then the coarse grid is deleted, entirely, and
-the pattern stands alone with nothing visible holding it up.
-Later the ghost of the scaffolding breathes back for a moment,
-at a quarter of its strength, and leaves again. Watch-only: the
-viewer should feel that the scaffolding was there.
+After Shupiwe Chongwe's Vessel at Likir: an open dusty field backed by a low stone wall and arid mountains, with dozens of rough unfired clay vessels standing on flat stones, each holding a hidden seed. A slow irreversible progression runs over about 75 seconds: the vessels weather, cracks spreading and surfaces darkening toward the eroded dark, and green shoots rise from the mouths once each vessel's erosion passes its own threshold. The piece never resets; after the change only sprout sway and drifting dust move. Watch only.
 
 ## Construction
-Canvas 2D, single self-contained page, watch-only. The coarse
-level is a 4.8.8 scaffolding, octagons on a square lattice with
-squares in the diagonal gaps, only about three cells across the
-panel so the deletion is dramatic; edges are deduplicated across
-polygons so every polygon vertex is a true grid intersection.
-The fine level is an 8-point rosette ({8/3} inner radius) sitting
-on every vertex, nested inside the ribbon band. The coarse
-layer's alpha is the animated parameter of the 36 second loop:
-grid draws on (4s), ribbons widen over it (9s), rosettes bloom
-with per-vertex delays (to 16s), grid fades to zero (21s), the
-puzzling field holds alone (to 28s), the ghost breathes back to
-25% and out (34s), soft reset to blank paper (36s). While the
-ribbons are wide the grid is stroked just wider than they are, so
-the pencil underdrawing peeks out as a halo around every strap
-and its deletion genuinely shows. The clock is offset 24 seconds
-so frame one opens on the hold: ribbons and rosettes standing on
-open paper, no trace of the grid. House rules held: Visual
-Viewport sizing with both resize listeners, canvas pinned in px,
-window.screen phone check with aspect fallback, synchronous
-first frame, typeof-guarded requestAnimationFrame. No pointer
-listeners and no hint element exist in the page.
+Canvas 2D in a 1280 by 900 design space, cover-fitted so the field fills the frame edge to edge. The sky is flat, with two seeded blue-grey mountain ridges and a low wall of seeded stone blocks across the upper third. The dusty field below carries seeded grain flecks and soft tone patches, its foreground left empty. Twenty six vessels stand mid-frame in eight loose groups of two to four, each on a group stone and its own flat stone. Each vessel is a lathe side-profile path with its own seed, scale and tone drawn from the terracotta and raw mud browns; straw flecks, patina patches and crack polylines are seeded per vessel and clipped to the body. Progress p is clamp01(T/75) with the clock starting at 26 seconds: per-vessel erosion darkens the body and softens the rim, cracks are drawn in proportion to max(0, p - crackDelay), and sprouts grow as a stem polyline with small leaves in the two greens, length set by a smoothstep of (p - threshold) with a staggered threshold per vessel. Forty six dust motes drift on a slow sine and keep moving after p reaches 1. House rules held: Visual Viewport sizing with both resize listeners, canvas pinned in px every frame, phone detection via window.screen with the aspect fallback, cover-fit transform stored as S/OX/OY, synchronous first frame, rAF typeof guarded, no interaction handlers, no audio, no text.
 
 ## QA log
-Rendered with render-piece.js at 1280x900, 390x844 and 720x720
-and inspected all three. One fault was caught and fixed during
-QA: the first rosette radius was scaled to the cell spacing
-rather than the edge length, so the fine stars came out at 55px
-on a 65px vertex spacing and smeared into red zigzag scribble
-across the whole panel. Rescaled to the edge (0.08 of the cell
-unit), the rosettes now sit inside the ribbon band as fine
-detail, one at every vertex. Frame one: three-by-three ribbon
-octagons and their square diamonds on open paper, red rosettes
-studding the joints, the deleted grid nowhere in sight. Palette
-audit: paper #F4F1E8, coarse grid #C9C4B4, ribbons #1A1A1A, fine
-stars #B03A2E only. Watch-only: no interaction, no hint. Gallery
-entry ready: 2002 · 06 · 18, "A coarse pencil grid, wide black
-ribbons over it, fine red stars nested at the intersections,
-then the coarse grid deletes and the pattern stands puzzlingly
-unstructured, its ghost breathing back now and then. Watch
-only."
+Rendered at 1280x900, 390x844 and 720x720 from the shipped script and inspected all three; the renderer reported resize listeners only, no interaction handlers. Two fixes after the first pass: the wall first read as a thin grey fence because its blocks were dark and the gaps between them showed the mountains through, so the wall now sits on a solid stone band with lighter blocks and inset mortar lines; and the straw flecks were too dense and bright, reading as scribble, so they were cut to fifteen per vessel, shorter and fainter. The mountain ridges also gained flat shoulders so they read as arid ranges rather than cones, and sprout stems were lengthened slightly. Frame one now reads as specced at all three sizes: sky, ridged mountains and stone wall in the upper third, twenty six vessels on stones mid-frame with cracks and darkened patina underway, small green sprouts showing on the early vessels, and an empty dusty foreground. On the phone the cover crop keeps the central vessel groups, the wall and the mountains in frame. No further fixes were needed.
