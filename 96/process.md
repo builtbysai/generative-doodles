@@ -1,15 +1,37 @@
-# №96 · Kinetic Word - process notes
+# №101 · Flower Gradient - process notes
 
 ## Concept
-After cristiania's kinetic type study. The word is the piece: MOTION in a bold grotesque, broken into its 6 glyphs, each pulsing in sequence left to right, scale rising and settling, then the whole word breathes once and the 7 second cycle repeats. Black glyphs on cream, no other text anywhere.
+A free blossom mass with no radial structure: exactly 4 metaballs
+on Lissajous paths fuse and fold into one soft body that blooms
+and relaxes on a 10s loop (after teknosis_sis, batch 0 prompt 21).
+Colours drift through rose, peach, lilac and deep plum over a
+20s super-cycle, so every odd loop starts from the same palette
+position as the first. The mass stays centred, fills about 70% of
+the frame and never touches an edge. No hard edges anywhere.
 
 ## Construction
-- Single self-contained page, no libraries. 2D canvas. Exactly 6 glyphs (asserted). Word centred and sized to fill 80% of the frame width on any screen: glyph widths are measured per glyph with ctx.measureText and the font size is solved from the measured total, tracking included.
-- Font route, per the spec flag: no external font is loaded. The stack actually used is "Helvetica Neue", Helvetica, Arial, "Noto Sans", "DejaVu Sans", sans-serif at weight 800, so the piece stays self-contained and the node-canvas QA renders the same layout a browser does. The prompt's p5.js route was not taken.
-- Loop: seamless 7s on wrapped cycle time. Per-glyph raised-cosine pulses staggered across the first two thirds of the cycle, glyph scale 1 to 1.25 and rise proportional to font size, then one whole-word breath (scale to 1.05) late in the cycle. Dragging horizontally scrubs the cycle phase by hand; on release the phase eases back and the loop resumes. Never click-to-reload.
-- Palette only: ground #F5EFE0, glyphs #141210. Visual Viewport sizing with resize listened to on visualViewport and window; canvas pinned by style width and height in px; phone detection via window.screen with aspect fallback; full width on phones, centred square composition on desktop. A synchronous first frame is drawn at load and requestAnimationFrame is guarded so node-canvas QA works.
+- Single self-contained page, canvas 2D, no libraries. Software
+  shader route (the No.81-84 pattern): the field is sampled on a
+  reduced grid, FIELD_CELL 8px (10px on phones), and drawn
+  full-frame each frame. No WebGL, so thumbnails are true
+  node-canvas renders.
+- Shading: field value sets the body, a vertical gradient and
+  domain-warped noise move the colour through a cyclic ramp of
+  the four chromatic palette stops (deep ground never cycles
+  into the bloom), and an exponential term near the iso surface
+  gives a fresnel-like rim.
+- Palette rotation choice, recorded per the spec: the rotation
+  runs through the ramp itself over the wrapped 20s super-cycle,
+  so only palette colours ever appear.
+- Drag warps the domain while pressed; release eases back.
+  Visual Viewport sizing; canvas pinned by style; full-bleed on
+  phones via the screen-size check, ground margin kept.
 
 ## QA log
-- Frames rendered from the actual page script (node-canvas) at 1280x900 desktop, 390x844 mobile and 720x720 thumbnail size and inspected before shipping. First frame is set mid-ripple so the stagger is visible in stills: the I sits scaled up and risen while its neighbours rest. Word width verified at 80% of the frame on desktop and mobile renders. Hans's real-device check is the final gate.
-- Visible copy check: no em dashes, no date strings, no absolute URLs; hint is lowercase and short. The word MOTION is the prompt's own content, the one permitted on-canvas text; no title or label is drawn.
-- Files: `96/index.html`, `96/thumb.png` (720x720, rendered from the live script), `96/process.md`. Gallery entry added to pieces.json with the formula date.
+- Frames rendered from the actual page script (node-canvas) at
+  1280x900 desktop, 390x844 mobile and 720x720 thumbnail size and
+  inspected before handoff. Hans's real-device check is the final
+  gate.
+- Visible copy check: no em dashes, no date strings, no absolute
+  URLs; hint is lowercase and short.
+- Files: `101/index.html`, `101/thumb.png` (720x720, rendered from the live script), `101/process.md`. Gallery entry belongs in pieces.json with the formula date.

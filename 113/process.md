@@ -1,15 +1,16 @@
-# №113 · Cellfield - process notes
+# №121 · Weight of Process - process notes
 
 ## Concept
-After Continuum, Lammetje's Art Blocks piece. A polar grid of 9 rings divided into 48 sectors forms a luminous mosaic disc. Each cell's colour is mixed from two overlapping radial fields, one warm (ember through gold) and one cool (deep blue through cyan), whose centres orbit each other on a 75 second period, so the colours churn like weather over a grid that never moves. Hairline gaps separate the cells and a fine film grain sits over everything.
+After Iskra Velitchkova's Uninhabitable and her ellipse systems, where stroke weight reveals the process. A field built only from ellipses, hundreds of them in loose ecosystems, where the subject is not the shapes but the three discrete weights they are drawn with: hairlines for the searching, heavy strokes for the machine's decisions. Drifts of red fog settle under some tangles and not others.
 
 ## Construction
-- Single self-contained page, no libraries. 2D canvas. Exactly 432 cells (9 by 48, asserted), geometry precomputed per size; ring radii follow an r to the 0.8 curve, disc radius 42 percent of the smaller frame dimension, centred. Each cell is filled per frame: warm and cool intensities fall off with distance to their centres, each field colour lerps along its own gradient, and the two mix by relative strength.
-- Grain: 1600 random 1px rects per frame in white at alpha 0.05, drawn as one batched path (no pre-rendered tile, no glow filters).
-- Palette only: warm #E4572E to #F2A03D, cool #1B3A6B to #3FA7D6, ground #101014. Drag pulls the warm field centre toward the fingertip; on release the offset decays and the centre rejoins its orbit. Never click-to-reload.
-- Motion and interaction per the prompt. Visual Viewport sizing with resize listened to on visualViewport and window; canvas pinned by style width and height in px every frame; phone detection via window.screen with aspect fallback; the centred disc keeps its shape on phones and the page ground is the piece ground colour. A synchronous first frame is drawn at load and requestAnimationFrame is guarded so node-canvas QA works.
+- Single self-contained page, no libraries. 2D canvas. 230 ellipse records in 4 seeded clusters, each with home point, radii, rotation, drift phase and a weight class. Exactly three stroke weights exist in the piece: 1, 2.4 and 4.6 px; no continuous weight range anywhere. Ellipses are stroked only, never filled, ink #1C1B18 on warm paper #EFE9DC.
+- Promotion: each ellipse carries its own slow period (14 to 52 s); when its cycle turns, its weight class steps up (hairline to medium to heavy, then back to hairline) with a short pulse in width and scale, the machine changing its mind. Ellipses also drift, rotate and breathe slowly on per-ellipse phases.
+- Red fog: 5 soft radial washes in #C23A2A at alpha 0.06 to 0.12, drawn beneath the ellipses, wandering very slowly.
+- Interaction: drag attracts nearby ellipses gently toward the fingertip with an eased falloff; double-tap reseeds the ecosystems. Never click-to-reload.
+- Motion and interaction per the prompt. Visual Viewport sizing with resize listened to on visualViewport and window; canvas pinned by style width and height in px each frame; phone detection via window.screen with aspect fallback. Full-bleed on phones. A synchronous first frame is drawn at load and requestAnimationFrame is guarded so node-canvas QA works.
 
 ## QA log
-- Frames rendered from the actual page script (node-canvas) at 1280x900 desktop, 390x844 mobile and 720x720 thumbnail size and inspected before pushing. All three show the mosaic disc with hairline gaps, warm and cool halves blended through the middle, grain visible on the ground. Hans's real-device check is the final gate.
+- Frames rendered from the actual page script (node-canvas) at 1280x900 desktop, 390x844 mobile and 720x720 thumbnail size and inspected before reporting. Desktop shows four tangled ecosystems with clear breathing room, all three weights readable, fog pooled at the left and centre. Mobile stacks the ecosystems vertically, full-bleed, fog still visible. Hans's real-device check is the final gate.
 - Visible copy check: no em dashes, no date strings, no absolute URLs; hint is lowercase and short.
-- Files: `113/index.html`, `113/thumb.png` (720x720, rendered from the live script), `113/process.md`. Gallery entry for pieces.json: title "Cellfield", date 2002 · 05 · 04, note "A polar mosaic of nine rings and forty eight sectors, coloured by two slow-orbiting fields, one warm and one cool. Drag to pull the warm field."
+- Files: `121/index.html`, `121/thumb.png` (720x720, rendered from the live script), `121/process.md`. Gallery entry to be added to pieces.json by fly with the formula date 2002 · 05 · 12.

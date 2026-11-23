@@ -1,22 +1,22 @@
-# №53 · Intersecting Colour - process notes
+# №54 · Chromatic Scale - process notes
 
 ## Concept
-Four horizontal and four vertical hard-edge bands crossing over
-a bone field after Angela Johal's 2026 solo show. Where bands
-meet, the overlap snaps to a flat mixed hue from a lookup, never
-alpha blending. Bands drift on their own axes and wrap around
-the field.
+Twelve tiles, one per semitone from C to B after Angela Johal,
+each a hard-edge two-color split. A playhead sweeps the scale as
+an eighteen second measure; the sounding tile swaps its two
+colors for its beat, then snaps back like a tape cut.
 
 ## Construction
-- Single self-contained page, canvas 2D, no libraries. Band
-  widths and starting positions are seeded; speeds are integer
-  ratios of the 28 second loop so the seam closes and the first
-  and last frames match.
-- Draw order: ground, horizontal bands, vertical bands, then
-  overlap quads in their mixed hues. Drag grabs the nearest band
-  and moves it along its axis; release resumes the drift.
-- Square on desktop, full-bleed on phones via the screen-size
-  check; Visual Viewport sizing; canvas pinned by style.
+- Single self-contained page, canvas 2D, no libraries. Split
+  type (vertical, horizontal, semicircular arc) is seeded per
+  tile; the second color is the note a fifth-step away in the
+  prompt palette, so every tile stays inside the twelve listed
+  colors. No labels, no audio.
+- One row of twelve on phones, a 4 by 3 grid on desktop, tiles
+  always abutting on the paper ground. Drag scrubs the playhead;
+  the measure loops by construction.
+- Visual Viewport sizing; canvas pinned by style; phone layout
+  via the screen-size check.
 
 ## QA log
 - Frames rendered from the actual page script (node-canvas) at
@@ -25,4 +25,4 @@ the field.
   final gate.
 - Visible copy check: no em dashes, no date strings, no absolute
   URLs; hint is lowercase and short.
-- Files: `53/index.html`, `53/thumb.png` (720x720, rendered from the live script), `53/process.md`. Gallery entry added to pieces.json with the formula date.
+- Files: `54/index.html`, `54/thumb.png` (720x720, rendered from the live script), `54/process.md`. Gallery entry added to pieces.json with the formula date.

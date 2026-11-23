@@ -1,14 +1,13 @@
-# №79 · Refraction Wedge - process notes
+# №83 · Interference Bloom - process notes
 
 ## Concept
-After stevefortier_art's Refraction series. Striped concentric circles: 8 rings, each striped with 24 radial wedges (192 segments, asserted by construction) in cobalt, emerald, vermilion and ochre. One 90 degree wedge mirrors the stripe order, bounded by two hairline ink rays.
+After marioecg's Bloss and Leaf loops. Two slow wave systems cross over a dark ground and their interference blooms into petal-like forms that open and close on a twenty second breath.
 
 ## Construction
-- Single self-contained page, canvas 2D, no libraries. Shared batch palette only: ground #F3EDE1, ink #141414, cobalt #1F4ED8, emerald #2E9E5B, vermilion #E03A1F, ochre #D9A02B. Flat hard-edge work throughout, no gradients, no alpha blending, no texture, no numerals.
-- The refracting wedge rotates one full revolution on a seamless 24 second loop. Drag sets the wedge angle directly from the centre; release resumes the sweep after four seconds. Hard mirror boundary only, no gradients, no blur.
-- Motion loop with touch and drag interaction, never click-to-reload. Full-bleed on phones and a centred square composition on desktop per the spec; Visual Viewport sizing with resize listened to on visualViewport and window; canvas pinned by style width and height in px; phone detection via window.screen with aspect fallback. A synchronous first frame is drawn at load and requestAnimationFrame is guarded so node-canvas QA works.
+- Single self-contained page, no libraries. Canvas 2D software shader for the same QA reason as No.81. Exactly 2 wave systems (asserted), their product sharpened into fringes, a radial mask opening and closing with a sine envelope. Palette only: near black #060809, ember #FF7A2F, teal #2FD8C0, bloom white #FFF8EC. Seamless 20s loop; drag sets the interference centre and release recentres.
+- Motion loop with touch and drag interaction, never click-to-reload. Full-bleed field on phones (square nest centred for No.85 with white ground edge to edge), Visual Viewport sizing with resize listened to on visualViewport and window; canvas pinned by style width and height in px; phone detection via window.screen with aspect fallback. A synchronous first frame is drawn at load and requestAnimationFrame is guarded so node-canvas QA works.
 
 ## QA log
 - Frames rendered from the actual page script (node-canvas) at 1280x900 desktop, 390x844 mobile and 720x720 thumbnail size and inspected before pushing. Hans's real-device check is the final gate.
 - Visible copy check: no em dashes, no date strings, no absolute URLs; hint is lowercase and short.
-- Files: `79/index.html`, `79/thumb.png` (720x720, rendered from the live script), `79/process.md`. Gallery entry added to pieces.json with the formula date.
+- Files: `83/index.html`, `83/thumb.png` (720x720, rendered from the live script), `83/process.md`. Gallery entry added to pieces.json with the formula date.

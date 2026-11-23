@@ -1,14 +1,13 @@
-# №77 · Sortation Pass - process notes
+# №81 · Wormhole Study - process notes
 
 ## Concept
-After stevefortier_art's Sortations series. A 10x10 grid of flat colour cells on cream (100 cells, asserted by construction), reorganised by one continuous bubble-sort pass so colours migrate toward spectral order within each column.
+After marioecg's Wormhole. A full-bleed tunnel of colour pulling toward frame centre: concentric bands of saturated magenta, teal and amber fold inward with a slow recursive wobble, deep near-black at the mouth, luminous at the rim.
 
 ## Construction
-- Single self-contained page, canvas 2D, no libraries. Shared batch palette only: ground #F3EDE1, ink #141414, cobalt #1F4ED8, emerald #2E9E5B, vermilion #E03A1F, ochre #D9A02B. Flat hard-edge work throughout, no gradients, no alpha blending, no texture, no numerals.
-- The 20 second loop staggers one full bubble-sort pass through the ten columns, holds on the sorted field, then re-seeds through a one second fade to ground, the only fade in the batch. Vertical drag scrubs the sort progress; release resumes after four seconds. Vertical swaps only, 2px ink gutters, no gradients, no labels.
-- Motion loop with touch and drag interaction, never click-to-reload. Full-bleed on phones and a centred square composition on desktop per the spec; Visual Viewport sizing with resize listened to on visualViewport and window; canvas pinned by style width and height in px; phone detection via window.screen with aspect fallback. A synchronous first frame is drawn at load and requestAnimationFrame is guarded so node-canvas QA works.
+- Single self-contained page, no libraries. Canvas 2D software shader (per-cell polar field, chosen so thumbnails are true renders of the actual script; the spec's WebGL route cannot be rendered by the node-canvas QA path). Polar transform, depth 1/r scrolled by wrapped time, 3 folding passes (asserted), fbm-style sine domain warp, cosine palette sampled by folded radius. 16 visible rings (asserted in range 14 to 20). Palette only: ground #05070D, magenta #E040FB, teal #18E0C8, amber #FFB13D, core #FFF6E8. Seamless 12s loop; drag offsets the warp centre and eases back on release.
+- Motion loop with touch and drag interaction, never click-to-reload. Full-bleed field on phones (square nest centred for No.85 with white ground edge to edge), Visual Viewport sizing with resize listened to on visualViewport and window; canvas pinned by style width and height in px; phone detection via window.screen with aspect fallback. A synchronous first frame is drawn at load and requestAnimationFrame is guarded so node-canvas QA works.
 
 ## QA log
 - Frames rendered from the actual page script (node-canvas) at 1280x900 desktop, 390x844 mobile and 720x720 thumbnail size and inspected before pushing. Hans's real-device check is the final gate.
 - Visible copy check: no em dashes, no date strings, no absolute URLs; hint is lowercase and short.
-- Files: `77/index.html`, `77/thumb.png` (720x720, rendered from the live script), `77/process.md`. Gallery entry added to pieces.json with the formula date.
+- Files: `81/index.html`, `81/thumb.png` (720x720, rendered from the live script), `81/process.md`. Gallery entry added to pieces.json with the formula date.

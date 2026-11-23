@@ -1,15 +1,39 @@
-# №112 · Palindrome - process notes
+# №120 Monolith Study - process
 
 ## Concept
-After Lammetje's Orix and his mirror-symmetric palette notes. One hundred forty concentric circles are stroked from a point offset from centre (0.62w, 0.42h), expanding past the frame edges. Colour is sampled by angle from a palindromic palette, maroon, signal red, sand, teal-grey, then mirrored back, so the colour wheel cycles with no seam. The palette phase rotates very slowly while the circles themselves stay still, and the fine striations shimmer with moire.
+From Zancan's garden-versus-monolith duality, through the lammetje
+network study. Two generative regimes trade places on one canvas. The
+garden: a dense chaotic line thicket grown from root points. The
+monolith: one massive dark slab described by sparse contour lines,
+floating in near-empty paper, always slightly off centre. Every 25
+seconds the piece crossfades; the change is a slow dissolve, never a
+wipe or a cut. Palette: paper #F2EEE2, garden ink #22221E, slab #14130F,
+contours in paper, and one accent, oxide red #A03A22, used sparingly in
+both regimes (rare garden lineages, one contour ring).
 
 ## Construction
-- Single self-contained page, no libraries. 2D canvas. Exactly 140 circles (asserted), each drawn as 120 arc segments (96 on phones), segment colour from a 720-entry look-up table built over the mirrored stops. Same-colour runs are batched into one path per run for speed. Alpha 0.9, line width min(3, r times 0.012), clamped to at least 0.75.
-- Palette exactly #6B0C22, #D9042B, #F4CB89, #588C8C mirrored, on ground #0E0C0A. No radial-gradient fills anywhere; every tone is stroked arcs.
-- Drag moves the circle origin (eased follow); on release it eases back to its seeded home. Double-tap reseeds the palette order while keeping the mirror structure. Never click-to-reload.
-- Motion and interaction per the prompt. Visual Viewport sizing with resize listened to on visualViewport and window; canvas pinned by style width and height in px every frame; phone detection via window.screen with aspect fallback. A synchronous first frame is drawn at load and requestAnimationFrame is guarded so node-canvas QA works.
+- Canvas 2D. The garden is a compact version of the Grassline growth
+  engine (16,000 segment cap, height-scaled tip lifetimes, pre-rolled at
+  load). The monolith is a slightly skewed slab polygon filled at the
+  blend alpha, with thirteen inset contour strokes whose offsets shimmer
+  gently; the sixth contour is the red one.
+- A global blend parameter runs a 25 second cycle (garden hold, 4s
+  dissolve, monolith hold, 4s dissolve back) with smoothstep easing.
+  Horizontal drag scrubs the blend by hand in either direction; on
+  release the offset eases out and the timer resumes. Within each regime
+  the piece keeps breathing: the garden keeps growing, the contours keep
+  shimmering.
+- The first frame is drawn mid-dissolve, since the trade between regimes
+  is the subject. House scaffold: Visual Viewport sizing, canvas pin,
+  screen-based phone check, guarded requestAnimationFrame.
 
 ## QA log
-- Frames rendered from the actual page script (node-canvas) at 1280x900 desktop, 390x844 mobile and 720x720 thumbnail size and inspected before pushing. All three show the off-centre origin, seamless mirrored colour cycling and fine striation moire. Hans's real-device check is the final gate.
-- Visible copy check: no em dashes, no date strings, no absolute URLs; hint is lowercase and short.
-- Files: `112/index.html`, `112/thumb.png` (720x720, rendered from the live script), `112/process.md`. Gallery entry for pieces.json: title "Palindrome", date 2002 · 05 · 03, note "One hundred forty stroked circles from an off-centre point, coloured by a mirrored palette that turns very slowly. Drag to move the center."
+- Rendered at 1280x900, 390x844 and 720x720 and inspected.
+- The garden engine received the same fixes as №119 (depth-weighted
+  alpha, height-scaled tip lifetimes, capped pre-roll, gentle
+  home-column pull), after the first mobile render left the garden
+  hanging in the lower half of the tall frame.
+- Final renders show the dissolve honestly: garden linework ghosts
+  through the half-faded slab, contour rings and the single red contour
+  visible; on mobile the slab sits monumentally at centre with the
+  garden gathered around and below it.

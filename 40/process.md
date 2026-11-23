@@ -1,28 +1,27 @@
-# №40 · Moire Rings - process notes
+# №41 · Light Orbit - process notes
 
 ## Concept
-Two identical fields of dots: concentric rings, ring r carrying
-6r dots, one field ink, one indigo. The fields rotate in opposite
-directions at slightly different rates, so interference bands
-breathe slowly across the field. Nothing is drawn but the two
-fields; the moire is the picture. Drag horizontally to shift the
-second field's phase; on release the offset eases back to the
-loop rate. Spec: BATCH-36-40-SPEC.md.
+Three great circles of a sphere drawn as if by a moving point of
+light (after mathiaskrissmer; prompt 6 in Bug's ig-artist-study
+queue). Each ring turns around a different axis at an integer
+rate, so the 28 second loop closes exactly. The glow is layered
+additive strokes (alphas 0.08, 0.25, 0.7, decreasing width), never
+a blur filter; crossings brighten from blending alone. White on
+#050505, no other color, no markers, no axes.
 
 ## Construction
-- Single self-contained page, canvas 2D, no libraries. 16 rings,
-  816 dots per field. Rotation rates 0.05 and -0.043 rad/s give a
-  slow beat period the eye can follow.
-- Visual Viewport sizing; canvas pinned by style; full-bleed on
-  phones via the screen-size check, square on desktop.
+- Single self-contained page, canvas 2D, no libraries. Rings are
+  128-sample polylines rotated in 3D and projected orthographically.
+- Drag orbits the viewpoint; on release the offset eases back to
+  the auto-loop. Visual Viewport sizing; canvas pinned by style;
+  full-bleed on phones via the screen-size check.
 
 ## QA log
 - Frames rendered from the actual page script (node-canvas) at
   1280x900 desktop, 390x844 mobile and 720x720 thumbnail size and
-  inspected before pushing; enumeration contents verified against
-  the generation order (No.37 was iterated once: diagonal skylines
-  replaced by true staircases). Hans's real-device check is the
-  final gate.
+  inspected before pushing. Hans's real-device check is the final
+  gate.
 - Visible copy check: no em dashes, no date strings, no absolute
-  URLs; hint is lowercase and short.
-- Files: `40/index.html`, `40/thumb.png` (720x720, rendered from the live script), `40/process.md`. Gallery entry added to pieces.json with the formula date.
+  URLs; hint is lowercase and short. (No.42's caption is the
+  generated binary string the prompt specifies.)
+- Files: `41/index.html`, `41/thumb.png` (720x720, rendered from the live script), `41/process.md`. Gallery entry added to pieces.json with the formula date.

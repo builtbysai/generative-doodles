@@ -1,23 +1,22 @@
-# №43 · Wall of Light - process notes
+# №44 · Color Break - process notes
 
 ## Concept
-Three long luminous curves only, sweeping wall to wall like a
-projector beam on a dark gallery wall (after mathiaskrissmer;
-prompt 8). Each curve is a Catmull-Rom chain through six control
-points whose heights orbit slowly on a 35 second loop with
-integer cycle counts. Sampled at 200 points and stroked in three
-additive passes; curves always enter and exit beyond the canvas
-edges, so no endpoint is visible. White on #050505, nothing else.
+Five luminous white elliptical loops turn slowly on black, seeded
+eccentricity and tilt, integer rotation rates, 32 second loop
+(after mathiaskrissmer; prompt 9). One accent only: flat vermilion
+#ff2e1f, appearing solely on loop segments inside a single
+drifting zone. The zone is an alpha test, never drawn; its
+outline is never visible. Inside segments render vermilion in one
+flat pass, no glow; outside segments render white with additive
+passes, split at segment level on the zone boundary. Idle, the
+zone drifts on its own path. Drag moves it, eased.
 
 ## Construction
-- Single self-contained page, canvas 2D, no libraries. Drag adds
-  a parallax offset, deeper curves moving more; the offset eases
-  back on release.
-- Visual Viewport sizing; canvas pinned by style; full-bleed on
-  phones via the screen-size check, square on desktop with the
-  page ground matched to the piece.
-- QA iteration: the first glow pass was too wide and read as
-  ribbons; passes narrowed to light beams before shipping.
+- Single self-contained page, canvas 2D, no libraries. Loops are
+  110-segment polylines; each segment is classified by its
+  midpoint against the zone radius.
+- Visual Viewport sizing; canvas pinned by style; centered
+  composition with the page ground matched to the piece.
 
 ## QA log
 - Frames rendered from the actual page script (node-canvas) at
@@ -27,4 +26,4 @@ edges, so no endpoint is visible. White on #050505, nothing else.
 - Visible copy check: no em dashes, no date strings, no absolute
   URLs; hint is lowercase and short. (No.42's caption is the
   generated binary string the prompt specifies.)
-- Files: `43/index.html`, `43/thumb.png` (720x720, rendered from the live script), `43/process.md`. Gallery entry added to pieces.json with the formula date.
+- Files: `44/index.html`, `44/thumb.png` (720x720, rendered from the live script), `44/process.md`. Gallery entry added to pieces.json with the formula date.

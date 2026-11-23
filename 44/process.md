@@ -1,22 +1,22 @@
-# №44 · Color Break - process notes
+# №45 · Thirty Seconds - process notes
 
 ## Concept
-Five luminous white elliptical loops turn slowly on black, seeded
-eccentricity and tilt, integer rotation rates, 32 second loop
-(after mathiaskrissmer; prompt 9). One accent only: flat vermilion
-#ff2e1f, appearing solely on loop segments inside a single
-drifting zone. The zone is an alpha test, never drawn; its
-outline is never visible. Inside segments render vermilion in one
-flat pass, no glow; outside segments render white with additive
-passes, split at segment level on the zone boundary. Idle, the
-zone drifts on its own path. Drag moves it, eased.
+Seven points fly Lissajous paths in 3D, projected flat (after
+mathiaskrissmer; prompt 10). Each leaves a luminous trail that
+fades over exactly 30 seconds, the length of the loop. All
+frequencies are integer ratios of the loop, so every path closes
+exactly and the trail fading out is the trail fading in: seamless.
+Positions are analytic in time, so the trail buffer (900 samples
+per point at 30 per second) is recomputed from the clock each
+frame with no stored state, and a time scrub rebuilds it
+deterministically. White trails on black; no markers, no HUD.
 
 ## Construction
-- Single self-contained page, canvas 2D, no libraries. Loops are
-  110-segment polylines; each segment is classified by its
-  midpoint against the zone radius.
-- Visual Viewport sizing; canvas pinned by style; centered
-  composition with the page ground matched to the piece.
+- Single self-contained page, canvas 2D, no libraries. Trail alpha
+  ramps by age in chunks; drawn trails only, never the points.
+- Drag horizontally to scrub time; release holds 4 idle seconds,
+  then resumes. Visual Viewport sizing; canvas pinned by style;
+  full-bleed on phones via the screen-size check.
 
 ## QA log
 - Frames rendered from the actual page script (node-canvas) at
@@ -26,4 +26,4 @@ zone drifts on its own path. Drag moves it, eased.
 - Visible copy check: no em dashes, no date strings, no absolute
   URLs; hint is lowercase and short. (No.42's caption is the
   generated binary string the prompt specifies.)
-- Files: `44/index.html`, `44/thumb.png` (720x720, rendered from the live script), `44/process.md`. Gallery entry added to pieces.json with the formula date.
+- Files: `45/index.html`, `45/thumb.png` (720x720, rendered from the live script), `45/process.md`. Gallery entry added to pieces.json with the formula date.

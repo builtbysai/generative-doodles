@@ -1,21 +1,22 @@
-# №38 · Thirty-Two Words - process notes
+# №39 · Pendulum Web - process notes
 
 ## Concept
-Five lamps, each on or off, make exactly 32 words. All 32 binary
-strings of length 5 are listed, one per row, filled lamp for 1,
-open ring for 0. A counting sweep lights the rows in binary
-counting order and the current row inverts, so the count reads as
-a moving band of light. The units column, the lamp that flips on
-every count, is neon, tying back to No.35. Drag vertically to move
-the count by hand. Spec: BATCH-36-40-SPEC.md.
+A double pendulum integrated with a fixed timestep, so every run
+is reproducible. Its tip leaves a single fading trace: a woven web
+that builds for about one cycle, fades, and redraws. The arm and
+bobs stay visible in warm white, the pivot is gold, the trace pale
+cyan on deep indigo. Drag to set the release angle of the first
+arm; on release the piece lets go from that angle and keeps
+looping. Spec: BATCH-36-40-SPEC.md.
 
 ## Construction
-- Single self-contained page, canvas 2D, no libraries. The words
-  are generated as the values 0 to 31, each exactly once by
-  construction; column periods (16, 8, 4, 2, 1) verify the count
-  visually. On release the loop holds 4 idle seconds, then resumes.
-- Visual Viewport sizing; canvas pinned by style; full-bleed on
-  phones via the screen-size check, square on desktop.
+- Single self-contained page, canvas 2D, no libraries. Physics at
+  240 steps per second with the standard double-pendulum equations;
+  the sim pre-rolls deterministically at load so the first frame
+  already holds a web. Simulated time advances in fixed steps
+  only, never by frame dt.
+- Visual Viewport sizing; canvas pinned by style; centered
+  composition, page ground is the piece's own indigo.
 
 ## QA log
 - Frames rendered from the actual page script (node-canvas) at
@@ -26,4 +27,4 @@ the count by hand. Spec: BATCH-36-40-SPEC.md.
   final gate.
 - Visible copy check: no em dashes, no date strings, no absolute
   URLs; hint is lowercase and short.
-- Files: `38/index.html`, `38/thumb.png` (720x720, rendered from the live script), `38/process.md`. Gallery entry added to pieces.json with the formula date.
+- Files: `39/index.html`, `39/thumb.png` (720x720, rendered from the live script), `39/process.md`. Gallery entry added to pieces.json with the formula date.

@@ -1,15 +1,14 @@
-# №65 · Pascal's Field - process notes
+# №66 · Folding Mutation - process notes
 
 ## Concept
-A diamond-pinwheel field whose colors are data, not decoration: each cell's eight triangles sample binomial coefficients from Pascal's triangle, reduced by a cycling modulus and mapped to seven flat residue hues.
+One closed polyline grows by node insertion, spring tension and non-neighbour repulsion, with a curl drift, so it folds into itself instead of spreading. One re-ink point partway round the loop shifts the ink from black to deep teal for the rest of the run.
 
 ## Construction
-- Single self-contained page, canvas 2D, no libraries. Pascal rows 0 to 16 are precomputed exactly; each triangle's residue is C(n,k) mod m for its binomial neighbourhood cell, with k mirrored past the triangle's edge.
-- Grid is 9x9 with 1px pale separators in ground #f4f1ea. Residue hues: 0 pale, 1 red, 2 orange, 3 yellow, 4 green, 5 cyan, 6 violet.
-- The modulus cycles 5, 6, 7, 9 on a 24s loop (6s each) with a 1.2s color crossfade, recoloring the whole field under the new residue system. Drag raises the modulus locally under the finger and the recoloring settles after release.
-- No numerals or labels on the piece. Square on desktop, full-bleed on phones; Visual Viewport sizing; canvas pinned by style; phone detection via window.screen with aspect fallback.
+- Single self-contained page, canvas 2D, no libraries. Differential growth core shared across the batch: closed polyline of nodes, neighbour springs toward a target spacing, repulsion from non neighbours within a radius via a spatial bucket grid, curl field drift, and growth by inserting nodes at random edges up to a capped count.
+- Motion loop with touch and drag interaction, never click-to-reload. Drag disturbs the growth: the finger acts as a local repellor and the nodes bend away, then settle and resume growing. The loop grows to full density, holds, fades and reseeds as a new mutation.
+- Full-bleed on phones, square on desktop; Visual Viewport sizing with resize listened to on visualViewport and window; canvas pinned by style width and height in px; phone detection via window.screen with aspect fallback.
 
 ## QA log
-- Frames rendered from the actual page script (node-canvas) at 1280x900 desktop, 390x844 mobile and 720x720 thumbnail size and inspected before pushing. Hans's real-device check is the final gate.
+- Frames rendered from the actual page script (node-canvas) at 1280x900 desktop, 390x844 mobile and 720x720 thumbnail size and inspected before pushing. First QA pass caught a weak growth core (rings stayed smooth); the spring and insertion model was rebuilt and the batch re-rendered. Hans's real-device check is the final gate.
 - Visible copy check: no em dashes, no date strings, no absolute URLs; hint is lowercase and short.
-- Files: `65/index.html`, `65/thumb.png` (720x720, rendered from the live script), `65/process.md`. Gallery entry added to pieces.json with the formula date.
+- Files: `66/index.html`, `66/thumb.png` (720x720, rendered from the live script), `66/process.md`. Gallery entry added to pieces.json with the formula date.

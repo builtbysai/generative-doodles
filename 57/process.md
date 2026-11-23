@@ -1,19 +1,20 @@
-# №57 · Spirograph Knot - process notes
+# №58 · Pentagon Swarm - process notes
 
 ## Concept
-A hypotrochoid drawing itself pen-on-paper after automination's
-spirograph pieces, one ratio laying lace over the ghost of the last.
+Ninety particles streaming around a pentagon after automination's
+pentagon and particle work, snapping inside out into the dual star.
 
 ## Construction
-- Single self-contained page, canvas 2D, no libraries. Two
-  hypotrochoids (R=5, r=3, d=2.2 in ink; R=7, r=5, d=3 in flat
-  indigo) are drawn progressively with about 2,400 samples each
-  at 1.5px; each loop starts from a slightly larger rotation so
-  consecutive loops read as a slowly turning rosette.
-- 12s cycle: the first curve draws over about 5.5s and holds,
-  then fades to pale gray while the second draws on top.
-- Drag moves the hole offset d in real time, morphing the figure
-  under the finger; release returns to the loop values.
+- Single self-contained page, canvas 2D, no libraries. The base
+  path is the pentagon perimeter; the rewire path is the pentagram
+  through the same vertices. Particle i sits at path position
+  (t flow + i/90), with six short ghost steps behind it.
+- Seamless 10s loop: 4s pentagon, 1s rewire snap (a flat magenta
+  ring flashes), 4s star, 1s snap back; the whole figure rotates
+  one full turn per loop. Snap windows lerp the two paths with
+  smoothstep easing.
+- Drag adds a swirl offset from the drag angle around the center;
+  it damps out on release and the path never pauses.
 - Full-bleed on phones via the screen-size check where the
   composition is a field, otherwise centered on the matching
   ground color; Visual Viewport sizing; canvas pinned by style.
@@ -25,4 +26,4 @@ spirograph pieces, one ratio laying lace over the ghost of the last.
   final gate.
 - Visible copy check: no em dashes, no date strings, no absolute
   URLs; hint is lowercase and short.
-- Files: `57/index.html`, `57/thumb.png` (720x720, rendered from the live script), `57/process.md`. Gallery entry added to pieces.json with the formula date.
+- Files: `58/index.html`, `58/thumb.png` (720x720, rendered from the live script), `58/process.md`. Gallery entry added to pieces.json with the formula date.
