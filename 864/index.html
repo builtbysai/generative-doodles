@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>№864 Mostly Sky</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #1c2a3a; height: 100%; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // №864 Mostly Sky, ZW2 / PP1264, study #263 zach-wolfe.
+  // The driver, as a felt phenomenon: the sky is the subject and
+  // the tower is only its excuse. Two dark slabs rise from the
+  // bottom edge, shot dead-vertical from their base, and the rest
+  // of the frame, sixty-eight percent of it, is empty sky. Clouds
+  // cross that expanse slowly, and the light on the towers moves
+  // through a full day over six minutes. The emptiness is the
+  // piece. Watch-only; interaction would fill it.
+  var GROUND = '#1c2a3a'; // page ground, deep sky blue
+
+  // Fixed-phase first frame: FIRST_T = 120 s into a 360 s cycle.
+  // The day cycle is 360 s (six minutes, dawn to dawn); clouds
+  // cross the frame once per cycle; the light breathing on the
+  // towers is 60 s. Every period divides 360, so the frame at
+  // FIRST_T + 360 equals the frame at FIRST_T. At FIRST_T the day
+  // phase sits at midday: saturated blue sky, bright light.
+  var FIRST_T = 120;
+  var CYCLE = 360;
+  var SEED = 864;
+
+  // QA probe hooks: ?t=<seconds> sets the virtual clock at load.
+  // ?seed=<seconds> is an alias for the same clock, so the
+  // node-canvas render tool (which passes its probe value as
+  // ?seed=) can verify that the frame changes over time.
+  // Read at load only.
+  var probeT = null;
+  try {
+    var qs = (typeof location !== 'undefined' && location.search) ? location.search : '';
+    var mt = qs.match(/[?&]t=([0-9.]+)/);
+    if (mt) { probeT = parseFloat(mt[1]); }
+    if (probeT === null) {
+      var ms = qs.match(/[?&]seed=([0-9.]+)/);
+      if (ms) { probeT = parseFloat(ms[1]); }
+    }
+  } catch (e) {}
+
+  // Seeded PRNG, mulberry32. Used once at load to build fixed tables.
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  var reduced = false;
+  try {
+    if (typeof window.matchMedia === 'function') {
+      reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    }
+  } catch (e) { reduced = false; }
+
+  var W = 0, H = 0, dpr = 1, isPhone = false;
+  var stageX = 0, stageY = 0, stageW = 0, stageH = 0;
+  var lastT = FIRST_T;
+
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function smooth(x) { x = clamp(x, 0, 1); return x * x * (3 - 2 * x); }
+  function lerp(a, b, u) { return a + (b - a) * u; }
+  function lerp3(c1, c2, u) {
+    return [lerp(c1[0], c2[0], u), lerp(c1[1], c2[1], u), lerp(c1[2], c2[2], u)];
+  }
+  function a4(v) { return Math.round(v * 10000) / 10000; } // avoid scientific-notation alpha
+  function rgb(c) {
+    return 'rgb(' + Math.round(c[0]) + ',' + Math.round(c[1]) + ',' + Math.round(c[2]) + ')';
+  }
+  function rgba(c, a) {
+    return 'rgba(' + Math.round(c[0]) + ',' + Math.round(c[1]) + ',' + Math.round(c[2]) + ',' + a4(a) + ')';
+  }
+  function ellipsePath(x, y, rx, ry, rot) {
+    ctx.beginPath();
+    ctx.moveTo(x + rx, y);
+    ctx.ellipse(x, y, rx, ry, rot || 0, 0, Math.PI * 2);
+  }
+
+  // ---- The sky-to-subject ratio, the load-bearing parameter ------
+  // Tower tops sit at 0.32H from the bottom (right tower, the
+  // taller of the pair); the sky above the main mass is 68% of
+  // the frame. A hairline spire on the right tower reaches to
+  // 0.36H, leaving 64% of clear sky above even the spire tip.
+  var SKY_RATIO = 0.68;
+
+  // ---- Day keyframes: dawn, midday, dusk, back to dawn ----------
+  // Day phase 0 = dawn, 1/3 = midday, 2/3 = dusk, 1 = dawn again.
+  // The sky stays saturated blue through the whole day; only its
+  // warmth and the light on the towers shift.
+  var DAY_KEYS = [
+    { u: 0,        skyTop: [28, 66, 148], skyLow: [150, 182, 222], lit: [168, 178, 198], edge: [210, 205, 190] },
+    { u: 1 / 3,    skyTop: [38, 92, 172], skyLow: [170, 202, 234], lit: [214, 220, 228], edge: [245, 244, 232] },
+    { u: 2 / 3,    skyTop: [42, 82, 158], skyLow: [196, 196, 214], lit: [232, 200, 158], edge: [252, 214, 160] },
+    { u: 1,        skyTop: [28, 66, 148], skyLow: [150, 182, 222], lit: [168, 178, 198], edge: [210, 205, 190] }
+  ];
+  function dayColors(dayU) {
+    var i, k0, k1, u;
+    for (i = 0; i < DAY_KEYS.length - 1; i++) {
+      if (dayU <= DAY_KEYS[i + 1].u) { break; }
+    }
+    k0 = DAY_KEYS[i]; k1 = DAY_KEYS[i + 1];
+    u = smooth((dayU - k0.u) / (k1.u - k0.u));
+    return {
+      skyTop: lerp3(k0.skyTop, k1.skyTop, u),
+      skyLow: lerp3(k0.skyLow, k1.skyLow, u),
+      lit: lerp3(k0.lit, k1.lit, u),
+      edge: lerp3(k0.edge, k1.edge, u)
+    };
+  }
+  // Day phase at t: FIRST_T sits at midday (dayU = 1/3).
+  function dayU(t) {
+    return ((((t - FIRST_T) / CYCLE) + 1 / 3) % 1 + 1) % 1;
+  }
+  // Cycle phase for the cloud drift, 0 at FIRST_T.
+  function cycleU(t) {
+    return ((((t - FIRST_T) % CYCLE) + CYCLE) % CYCLE) / CYCLE;
+  }
+
+  // ---- Fixed cloud table: 7 clouds, seeded -----------------------
+  // Each cloud is a cluster of soft ellipses. Drift is one full
+  // crossing per 360 s cycle, left to right, wrapping off-frame.
+  var cloudRng = mulberry32(SEED * 19 + 5);
+  var CLOUDS = [];
+  var ci, cj;
+  for (ci = 0; ci < 7; ci++) {
+    var blobs = [];
+    var nb = 3 + Math.floor(cloudRng() * 3);
+    for (cj = 0; cj < nb; cj++) {
+      blobs.push({
+        dx: (cloudRng() - 0.5) * 0.16,
+        dy: (cloudRng() - 0.5) * 0.016,
+        rx: 0.028 + cloudRng() * 0.045,
+        ry: 0.008 + cloudRng() * 0.012
+      });
+    }
+    CLOUDS.push({
+      x: cloudRng(),            // base position across the frame
+      y: 0.07 + cloudRng() * 0.46, // sky zone only, above the towers
+      speed: 0.9 + cloudRng() * 0.25, // crossing rate, near 1
+      alpha: 0.45 + cloudRng() * 0.35,
+      blobs: blobs
+    });
+  }
+
+  // ---- The towers: two dark slabs, off-center, anchored at the bottom
+  // Left tower: x 0.14-0.32, top at 0.28H. Right tower: x 0.38-0.56,
+  // top at 0.32H, with a hairline spire to 0.36H. The pair sits
+  // left of center; the right two-fifths of the frame is open sky
+  // all the way to the ground line. Facade lines are faint.
+  var TOWERS = [
+    { x0: 0.14, x1: 0.32, top: 0.28, spire: false },
+    { x0: 0.38, x1: 0.56, top: 0.32, spire: true }
+  ];
+  var TOWER_DARK = [26, 30, 38];
+  var TOWER_SHADOW = [16, 18, 24];
+  var PLAZA = [12, 14, 18];
+  var CLOUD_WHITE = [245, 248, 252];
+  var INK = [240, 244, 248];
+
+  var L = {};
+  function layout() {
+    L.fsCap = Math.round(clamp(W * 0.020, 11, 15));
+    L.fsDate = Math.round(clamp(W * 0.016, 9, 12));
+    L.fsHint = Math.round(clamp(W * 0.022, 12, 16));
+  }
+  function resize() {
+    var vw = 0, vh = 0;
+    try {
+      if (typeof window.visualViewport !== 'undefined' && window.visualViewport) {
+        vw = window.visualViewport.width; vh = window.visualViewport.height;
+      }
+    } catch (e) {}
+    if (!vw || !vh) { vw = window.innerWidth; vh = window.innerHeight; }
+    var sw = 0, sh = 0;
+    try { sw = window.screen.width; sh = window.screen.height; } catch (e) { sw = vw; sh = vh; }
+    isPhone = Math.min(sw, sh) < 700 || (vh > vw * 1.15);
+    if (isPhone) {
+      stageW = vw; stageH = vh; stageX = 0; stageY = 0;
+    } else {
+      var side = Math.min(vw * 0.8, vh * 0.92);
+      stageW = side; stageH = side;
+      stageX = (vw - stageW) / 2; stageY = (vh - stageH) / 2;
+    }
+    W = stageW; H = stageH;
+    dpr = (typeof window.devicePixelRatio === 'number' && window.devicePixelRatio > 0) ? window.devicePixelRatio : 1;
+    canvas.width = Math.max(1, Math.round(stageW * dpr));
+    canvas.height = Math.max(1, Math.round(stageH * dpr));
+    canvas.style.width = stageW + 'px';
+    canvas.style.height = stageH + 'px';
+    canvas.style.left = stageX + 'px';
+    canvas.style.top = stageY + 'px';
+    canvas.style.position = 'absolute';
+  }
+
+  // ---- Sky: a vertical gradient field, saturated blue -------------
+  function drawSky(t) {
+    var dc = dayColors(dayU(t));
+    var sky = ctx.createLinearGradient(0, 0, 0, H);
+    sky.addColorStop(0, rgb(dc.skyTop));
+    sky.addColorStop(0.62, rgb(lerp3(dc.skyTop, dc.skyLow, 0.55)));
+    sky.addColorStop(1, rgb(dc.skyLow));
+    ctx.fillStyle = sky;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  // ---- Clouds: slow drift across the expanse ----------------------
+  function drawClouds(t) {
+    var u = cycleU(t);
+    var i, j, c, cx, b;
+    for (i = 0; i < CLOUDS.length; i++) {
+      c = CLOUDS[i];
+      // One crossing per cycle, wrapping: position in [-0.15, 1.15].
+      cx = (((c.x + u * c.speed) % 1.3) + 1.3) % 1.3 - 0.15;
+      for (j = 0; j < c.blobs.length; j++) {
+        b = c.blobs[j];
+        ctx.fillStyle = rgba(CLOUD_WHITE, a4(c.alpha * 0.85));
+        ellipsePath((cx + b.dx) * W, (c.y + b.dy) * H, b.rx * W, b.ry * H, 0);
+        ctx.fill();
+      }
+    }
+  }
+
+  // ---- The towers: dark vertical mass, light shifting through the day
+  function drawTowers(t) {
+    var dc = dayColors(dayU(t));
+    // A slow 60 s breathing on the lit faces, so the light feels
+    // alive without ever flashing.
+    var breathe = 0.5 + 0.5 * Math.sin(2 * Math.PI * (t - FIRST_T) / 60);
+    var i, tw, x0, x1, yTop, yBot, gx;
+    yBot = H; // anchored at the bottom edge
+    for (i = 0; i < TOWERS.length; i++) {
+      tw = TOWERS[i];
+      x0 = tw.x0 * W; x1 = tw.x1 * W;
+      yTop = H * (1 - tw.top);
+      // Main mass: dark, with the day's light on the left face.
+      var face = ctx.createLinearGradient(x0, 0, x1, 0);
+      face.addColorStop(0, rgb(lerp3(TOWER_DARK, dc.lit, 0.55 + 0.15 * breathe)));
+      face.addColorStop(0.45, rgb(TOWER_DARK));
+      face.addColorStop(1, rgb(TOWER_SHADOW));
+      ctx.fillStyle = face;
+      ctx.fillRect(x0, yTop, x1 - x0, yBot - yTop);
+      // Faint facade: vertical mullions and floor lines.
+      ctx.strokeStyle = rgba([140, 160, 185], a4(0.14));
+      ctx.lineWidth = Math.max(1, W * 0.0012);
+      var mx;
+      for (mx = x0 + (x1 - x0) / 6; mx < x1 - 1; mx += (x1 - x0) / 6) {
+        ctx.beginPath();
+        ctx.moveTo(mx, yTop);
+        ctx.lineTo(mx, yBot);
+        ctx.stroke();
+      }
+      ctx.strokeStyle = rgba([140, 160, 185], a4(0.09));
+      var fy;
+      for (fy = yTop + H * 0.02; fy < yBot; fy += H * 0.02) {
+        ctx.beginPath();
+        ctx.moveTo(x0, fy);
+        ctx.lineTo(x1, fy);
+        ctx.stroke();
+      }
+      // Lit edge: a thin warm line on the sun side, shifting
+      // with the day.
+      ctx.fillStyle = rgba(dc.edge, a4(0.55 + 0.25 * breathe));
+      ctx.fillRect(x0, yTop, Math.max(1.5, W * 0.004), yBot - yTop);
+      // Hairline spire on the taller tower.
+      if (tw.spire) {
+        var sx = (x0 + x1) / 2;
+        ctx.fillStyle = rgba(dc.edge, a4(0.5));
+        ctx.fillRect(sx - Math.max(1, W * 0.0015), H * (1 - 0.36), Math.max(2, W * 0.003), H * 0.04);
+      }
+    }
+    // Plaza: a thin dark strip the towers stand in, across the
+    // full width, so the towers anchor and the hint has ground.
+    ctx.fillStyle = rgb(PLAZA);
+    ctx.fillRect(0, H * 0.97, W, H * 0.03);
+    ctx.fillStyle = rgba([140, 160, 185], a4(0.25));
+    ctx.fillRect(0, H * 0.97, W, Math.max(1, H * 0.0015));
+  }
+
+  // ---- Caption and hint, in the template's place ------------------
+  function drawText() {
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillStyle = rgba(INK, a4(0.92));
+    ctx.font = '600 ' + L.fsCap + 'px Georgia, "Times New Roman", serif';
+    ctx.fillText('No.864 - Mostly Sky', W * 0.04, H * 0.055);
+    ctx.fillStyle = rgba(INK, a4(0.6));
+    ctx.font = L.fsDate + 'px Georgia, "Times New Roman", serif';
+    ctx.fillText('2004 · 05 · 24', W * 0.04, H * 0.055 + L.fsDate + 6);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = rgba(INK, a4(0.85));
+    ctx.font = L.fsHint + 'px Georgia, "Times New Roman", serif';
+    ctx.fillText('Watch the clouds cross the sky.', W / 2, H - L.fsHint * 0.9);
+    ctx.textAlign = 'left';
+  }
+
+  function draw(t) {
+    lastT = t;
+    // Pin the canvas element in draw(), per house rules.
+    canvas.style.width = stageW + 'px';
+    canvas.style.height = stageH + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    layout();
+
+    drawSky(t);
+    drawClouds(t);
+    drawTowers(t);
+    drawText();
+  }
+
+  // Watch-only: no pointer interaction. The emptiness is the piece.
+
+  if (typeof window.addEventListener === 'function') {
+    window.addEventListener('resize', function () { resize(); draw(lastT); });
+  }
+  try {
+    if (typeof window.visualViewport !== 'undefined' && window.visualViewport &&
+        typeof window.visualViewport.addEventListener === 'function') {
+      window.visualViewport.addEventListener('resize', function () { resize(); draw(lastT); });
+    }
+  } catch (e) {}
+
+  // QA hooks: window.__draw drives draw() with a virtual clock,
+  // window.__piece864 exposes the cycle, the day phase and the sky ratio.
+  try {
+    window.__draw = function (t) { draw(t); };
+    window.__piece864 = {
+      firstT: FIRST_T,
+      cycle: CYCLE,
+      skyRatio: SKY_RATIO,
+      dayU: function (t) { return dayU(t); },
+      cycleU: function (t) { return cycleU(t); },
+      dayColors: function (t) { return dayColors(dayU(t)); },
+      draw: function (t) { draw(t); }
+    };
+  } catch (e) {}
+
+  resize();
+  draw(probeT !== null ? probeT : FIRST_T); // one synchronous frame at load
+
+  // Motion loop: 360 s cycle, closed-form. Guarded so
+  // node-canvas QA (no requestAnimationFrame) works.
+  if (!reduced && typeof requestAnimationFrame === 'function') {
+    var start = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+    requestAnimationFrame(function loop(now) {
+      var t = FIRST_T + (now - start) / 1000;
+      lastT = t;
+      draw(t);
+      requestAnimationFrame(loop);
+    });
+  }
+})();
+</script>
+</body>
+</html>

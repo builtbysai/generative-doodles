@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>№866 Spell It in Cardboard</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #5a7a38; height: 100%; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // №866 Spell It in Cardboard, ZW4 / PP1266, study #263 zach-wolfe.
+  // The word is built, not shown. Cardboard letters lie on a lawn,
+  // shot straight down, spelling one word. A breeze ruffles the
+  // grass and the letter shadows creep. Tapping rebuilds the word
+  // from a new seed while the grass keeps ruffling: the letters
+  // slide to their new spots, because building the word is the
+  // mechanism. The meaning is in how much green there is around
+  // the letters. Visual-only: no WebAudio, no autoplay audio.
+  var GROUND = '#5a7a38'; // page ground, the grass itself
+
+  // Fixed-phase first frame: FIRST_T = 12 s into a 60 s cycle.
+  // The breeze sway is 6 s, the grass shimmer 10 s, the shadow
+  // creep 60 s; every period divides 60, so the frame at
+  // FIRST_T + 60 equals the frame at FIRST_T.
+  var FIRST_T = 12;
+  var CYCLE = 60;
+  var SEED = 866;
+
+  // Seed words: a small fixed list, never generated text beyond
+  // it. CHEESESTEAK is the study's example.
+  var WORDS = ['CHEESESTEAK', 'PARKING', 'POTHOLE', 'LAWNCARE', 'SPRINKLER'];
+  var SLIDE_DUR = 1.4; // seconds for the re-spell slide
+
+  // QA probe hooks: ?t=<seconds> sets the virtual clock at load.
+  // ?seed=<seconds> is an alias for the same clock, so the
+  // node-canvas render tool (which passes its probe value as
+  // ?seed=) can verify that the frame changes over time.
+  // ?word=<0..4> sets the seed word at load. Read at load only.
+  var probeT = null;
+  var probeWord = null;
+  try {
+    var qs = (typeof location !== 'undefined' && location.search) ? location.search : '';
+    var mt = qs.match(/[?&]t=([0-9.]+)/);
+    if (mt) { probeT = parseFloat(mt[1]); }
+    if (probeT === null) {
+      var ms = qs.match(/[?&]seed=([0-9.]+)/);
+      if (ms) { probeT = parseFloat(ms[1]); }
+    }
+    var mw = qs.match(/[?&]word=([0-4])/);
+    if (mw) { probeWord = parseInt(mw[1], 10); }
+  } catch (e) {}
+
+  // Seeded PRNG, mulberry32. Used once at load to build fixed tables.
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  var reduced = false;
+  try {
+    if (typeof window.matchMedia === 'function') {
+      reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    }
+  } catch (e) { reduced = false; }
+
+  var W = 0, H = 0, dpr = 1, isPhone = false;
+  var stageX = 0, stageY = 0, stageW = 0, stageH = 0;
+  var lastT = FIRST_T;
+  var wordIdx = (probeWord !== null) ? probeWord : 0;
+  // Slide state: -1 means no slide in progress.
+  var slideStart = -1;
+  var slideFrom = null; // word the slide started from
+  var slideTo = null;   // word the slide is heading to
+
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function smooth(x) { x = clamp(x, 0, 1); return x * x * (3 - 2 * x); }
+  function lerp(a, b, u) { return a + (b - a) * u; }
+  function a4(v) { return Math.round(v * 10000) / 10000; } // avoid scientific-notation alpha
+  function rgb(c) {
+    return 'rgb(' + Math.round(c[0]) + ',' + Math.round(c[1]) + ',' + Math.round(c[2]) + ')';
+  }
+  function rgba(c, a) {
+    return 'rgba(' + Math.round(c[0]) + ',' + Math.round(c[1]) + ',' + Math.round(c[2]) + ',' + a4(a) + ')';
+  }
+  function circle(x, y, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+  }
+
+  // Palettes: grass green, cardboard tan, one accent on one letter.
+  var GRASS = {
+    base: [90, 122, 56], deep: [72, 102, 44], light: [110, 144, 70],
+    blade: [ [64, 94, 38], [96, 130, 60], [118, 152, 76], [80, 112, 48] ],
+    speck: [ [58, 88, 34], [124, 158, 82], [70, 100, 42] ]
+  };
+  var CARDBOARD = [198, 164, 110];
+  var CARDBOARD_EDGE = [158, 124, 76];
+  var INK = [64, 44, 26];
+  var ACCENT = [198, 82, 52];      // one letter, red-orange
+  var ACCENT_INK = [246, 236, 212];
+  var CREAM = [244, 238, 214];
+  var SHADOW = [38, 56, 22];
+
+  // ---- Fixed grass tables -----------------------------------------
+  // Speckles: the field's texture doing the color work.
+  var speckRng = mulberry32(SEED * 17 + 3);
+  var SPECKS = [];
+  var i;
+  for (i = 0; i < 520; i++) {
+    SPECKS.push({
+      x: speckRng(), y: speckRng(),
+      r: 0.0012 + speckRng() * 0.0028,
+      c: Math.floor(speckRng() * 3),
+      a: 0.25 + speckRng() * 0.45
+    });
+  }
+  // Blades: short strokes that sway in the breeze.
+  var bladeRng = mulberry32(SEED * 23 + 7);
+  var BLADES = [];
+  for (i = 0; i < 320; i++) {
+    BLADES.push({
+      x: bladeRng(), y: bladeRng(),
+      len: 0.008 + bladeRng() * 0.014,
+      ang: -Math.PI / 2 + (bladeRng() - 0.5) * 0.7,
+      ph: bladeRng() * Math.PI * 2,
+      c: Math.floor(bladeRng() * 4),
+      w: 0.0012 + bladeRng() * 0.0016
+    });
+  }
+  // Per-tile wobble: hand-placed rotation and offset, fixed per
+  // letter position so a word never shuffles itself.
+  var tileRng = mulberry32(SEED * 31 + 11);
+  var TILE_WOB = [];
+  for (i = 0; i < 12; i++) {
+    TILE_WOB.push({
+      rot: (tileRng() - 0.5) * 0.07,
+      dx: (tileRng() - 0.5) * 0.006,
+      dy: (tileRng() - 0.5) * 0.006
+    });
+  }
+  // Accent letter per word: one letter per seed word, fixed.
+  var ACCENT_IDX = [];
+  for (i = 0; i < WORDS.length; i++) {
+    var ar = mulberry32(SEED * 41 + i * 13 + 5);
+    ACCENT_IDX.push(Math.floor(ar() * WORDS[i].length));
+  }
+
+  var L = {};
+  function layout() {
+    L.fsCap = Math.round(clamp(W * 0.020, 11, 15));
+    L.fsDate = Math.round(clamp(W * 0.016, 9, 12));
+    L.fsHint = Math.round(clamp(W * 0.022, 12, 16));
+    // The word sits just below center, with green all around it.
+    L.wordCY = 0.54;
+  }
+  function resize() {
+    var vw = 0, vh = 0;
+    try {
+      if (typeof window.visualViewport !== 'undefined' && window.visualViewport) {
+        vw = window.visualViewport.width; vh = window.visualViewport.height;
+      }
+    } catch (e) {}
+    if (!vw || !vh) { vw = window.innerWidth; vh = window.innerHeight; }
+    var sw = 0, sh = 0;
+    try { sw = window.screen.width; sh = window.screen.height; } catch (e) { sw = vw; sh = vh; }
+    isPhone = Math.min(sw, sh) < 700 || (vh > vw * 1.15);
+    if (isPhone) {
+      // Field-like composition: full-bleed on phones.
+      stageW = vw; stageH = vh; stageX = 0; stageY = 0;
+    } else {
+      var side = Math.min(vw * 0.8, vh * 0.92);
+      stageW = side; stageH = side;
+      stageX = (vw - stageW) / 2; stageY = (vh - stageH) / 2;
+    }
+    W = stageW; H = stageH;
+    dpr = (typeof window.devicePixelRatio === 'number' && window.devicePixelRatio > 0) ? window.devicePixelRatio : 1;
+    canvas.width = Math.max(1, Math.round(stageW * dpr));
+    canvas.height = Math.max(1, Math.round(stageH * dpr));
+    canvas.style.width = stageW + 'px';
+    canvas.style.height = stageH + 'px';
+    canvas.style.left = stageX + 'px';
+    canvas.style.top = stageY + 'px';
+    canvas.style.position = 'absolute';
+  }
+
+  // Tile size for a word of length n: the word spans at most
+  // 80% of the stage width, generous green margin on all sides.
+  function tileSize(n) {
+    var gap = 0.22; // gap as a fraction of tile width
+    return (0.80 * W) / (n + gap * (n - 1));
+  }
+  // Target centers for a word, in stage coordinates.
+  function wordLayout(word) {
+    var n = word.length;
+    var tw = tileSize(n);
+    var gap = tw * 0.22;
+    var total = n * tw + (n - 1) * gap;
+    var x0 = (W - total) / 2 + tw / 2;
+    var out = [];
+    for (var k = 0; k < n; k++) {
+      out.push({ x: x0 + k * (tw + gap), y: H * L.wordCY, tw: tw });
+    }
+    return out;
+  }
+  // Shadow creep: the offset length breathes slowly over the
+  // 60 s cycle, the direction fixed down-right, so the shadows
+  // creep without ever snapping.
+  function shadowLen(t) {
+    var tw = tileSize(WORDS[wordIdx].length);
+    return tw * (0.24 + 0.08 * Math.sin(2 * Math.PI * (t - FIRST_T) / CYCLE + 1.0));
+  }
+  function shadowAngle() { return 0.65; } // down-right, fixed
+
+  // Slide progress 0..1, or 1 when no slide is running.
+  function slideU(t) {
+    if (slideStart < 0) { return 1; }
+    var u = (t - slideStart) / SLIDE_DUR;
+    if (u >= 1) { slideStart = -1; return 1; }
+    return smooth(u);
+  }
+
+  function roundRectPath(x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.lineTo(x + w - r, y);
+    ctx.arc(x + w - r, y + r, r, -Math.PI / 2, 0);
+    ctx.lineTo(x + w, y + h - r);
+    ctx.arc(x + w - r, y + h - r, r, 0, Math.PI / 2);
+    ctx.lineTo(x + r, y + h);
+    ctx.arc(x + r, y + h - r, r, Math.PI / 2, Math.PI);
+    ctx.lineTo(x, y + r);
+    ctx.arc(x + r, y + r, r, Math.PI, Math.PI * 1.5);
+    ctx.closePath();
+  }
+
+  // ---- The grass field --------------------------------------------
+  function drawGrass(t) {
+    var g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, rgb(GRASS.light));
+    g.addColorStop(0.5, rgb(GRASS.base));
+    g.addColorStop(1, rgb(GRASS.deep));
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+    // Mow stripes: faint vertical bands, the lawn's own pattern.
+    var band;
+    for (band = 0; band < 8; band++) {
+      if (band % 2 === 0) {
+        ctx.fillStyle = rgba([255, 255, 230], a4(0.045));
+        ctx.fillRect(band * W / 8, 0, W / 8, H);
+      }
+    }
+    // Speckles: the texture doing the color work.
+    var i, s;
+    for (i = 0; i < SPECKS.length; i++) {
+      s = SPECKS[i];
+      ctx.fillStyle = rgba(GRASS.speck[s.c], a4(s.a));
+      circle(s.x * W, s.y * H, s.r * W);
+      ctx.fill();
+    }
+    // Blades: a breeze ruffles the grass on a 6 s period.
+    ctx.lineCap = 'round';
+    var b, sway, tipX, tipY;
+    for (i = 0; i < BLADES.length; i++) {
+      b = BLADES[i];
+      sway = Math.sin(2 * Math.PI * (t - FIRST_T) / 6 + b.ph) * 0.45;
+      tipX = b.x * W + Math.cos(b.ang + sway * 0.3) * b.len * W;
+      tipY = b.y * H + Math.sin(b.ang + sway * 0.3) * b.len * W;
+      ctx.strokeStyle = rgba(GRASS.blade[b.c], a4(0.85));
+      ctx.lineWidth = Math.max(1, b.w * W);
+      ctx.beginPath();
+      ctx.moveTo(b.x * W, b.y * H);
+      ctx.lineTo(tipX, tipY);
+      ctx.stroke();
+    }
+    // A slow shimmer passes over the field once per 10 s.
+    var shim = 0.5 + 0.5 * Math.sin(2 * Math.PI * (t - FIRST_T) / 10);
+    var sg = ctx.createLinearGradient(0, 0, W, H);
+    sg.addColorStop(0, rgba([255, 255, 220], a4(0.03 * shim)));
+    sg.addColorStop(1, rgba([255, 255, 220], 0));
+    ctx.fillStyle = sg;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  // ---- One letter tile --------------------------------------------
+  function drawTile(ch, cx, cy, tw, rot, accent, t, alpha) {
+    var th = tw * 1.28;
+    var sa = shadowAngle();
+    var sl = shadowLen(t);
+    var dx = Math.cos(sa) * sl, dy = Math.sin(sa) * sl;
+    ctx.save();
+    ctx.globalAlpha = a4(alpha);
+    // Long soft shadow: a wide faint offset, then a tighter one.
+    ctx.fillStyle = rgba(SHADOW, a4(0.14 * alpha));
+    roundRectPath(cx - tw / 2 + dx * 1.6, cy - th / 2 + dy * 1.6, tw, th, tw * 0.10);
+    ctx.fill();
+    ctx.fillStyle = rgba(SHADOW, a4(0.30 * alpha));
+    roundRectPath(cx - tw / 2 + dx, cy - th / 2 + dy, tw, th, tw * 0.10);
+    ctx.fill();
+    // The tile itself, cardboard tan, slightly rotated.
+    ctx.translate(cx, cy);
+    ctx.rotate(rot);
+    ctx.fillStyle = rgb(accent ? ACCENT : CARDBOARD);
+    roundRectPath(-tw / 2, -th / 2, tw, th, tw * 0.10);
+    ctx.fill();
+    ctx.strokeStyle = rgba(accent ? [140, 50, 30] : CARDBOARD_EDGE, a4(0.9));
+    ctx.lineWidth = Math.max(1, tw * 0.03);
+    ctx.stroke();
+    // The glyph, a heavy sans, ink dark on tan, cream on accent.
+    ctx.fillStyle = rgb(accent ? ACCENT_INK : INK);
+    ctx.font = '900 ' + Math.round(tw * 0.62) + 'px "Arial Black", "DejaVu Sans", sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(ch, 0, th * 0.02);
+    ctx.restore();
+  }
+
+  // ---- The word, with the re-spell slide ---------------------------
+  function drawWord(t) {
+    var u = slideU(t);
+    var word = WORDS[wordIdx];
+    var to = wordLayout(word);
+    var k, letter, from, fx, fy, ftw, alpha;
+    if (slideStart >= 0 || u < 1) {
+      // Mid-slide: letters travel from the old layout to the new.
+      var fromWord = slideFrom;
+      var fromL = wordLayout(fromWord);
+      for (k = 0; k < to.length; k++) {
+        if (k < fromL.length) {
+          fx = fromL[k].x; fy = fromL[k].y; ftw = fromL[k].tw;
+        } else {
+          // A new letter the old word never had: slides up from
+          // below the field.
+          fx = to[k].x; fy = H + to[k].tw; ftw = to[k].tw;
+        }
+        // Letters travel from the old slot to the new one, lifting
+        // in a small arc mid-slide, so a re-spell reads as motion
+        // even when the new word has the same length as the old.
+        letter = {
+          x: lerp(fx, to[k].x, u),
+          y: lerp(fy, to[k].y, u) - Math.sin(Math.PI * u) * to[k].tw * 0.9,
+          tw: lerp(ftw, to[k].tw, u)
+        };
+        drawTile(word[k], letter.x, letter.y, letter.tw,
+          TILE_WOB[k].rot,
+          k === ACCENT_IDX[wordIdx], t, 1);
+      }
+      // Old letters the new word drops: slide down and fade out.
+      for (k = to.length; k < fromL.length; k++) {
+        alpha = 1 - u;
+        drawTile(fromWord[k], fromL[k].x, fromL[k].y + u * H * 0.25,
+          fromL[k].tw, TILE_WOB[k].rot, k === ACCENT_IDX[WORDS.indexOf(fromWord)],
+          t, alpha);
+      }
+    } else {
+      for (k = 0; k < to.length; k++) {
+        drawTile(word[k],
+          to[k].x + TILE_WOB[k].dx * W,
+          to[k].y + TILE_WOB[k].dy * W,
+          to[k].tw, TILE_WOB[k].rot,
+          k === ACCENT_IDX[wordIdx], t, 1);
+      }
+    }
+  }
+
+  // ---- Caption and hint, in the template's place -------------------
+  function drawText() {
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    // A soft dark plate behind the caption so cream reads on grass,
+    // sized to the measured caption text.
+    ctx.font = '600 ' + L.fsCap + 'px Georgia, "Times New Roman", serif';
+    var capW = 0;
+    try { capW = ctx.measureText('№866 · Spell It in Cardboard').width; } catch (e) { capW = W * 0.36; }
+    ctx.fillStyle = rgba(SHADOW, a4(0.35));
+    roundRectPath(W * 0.03, H * 0.028, capW + W * 0.03, L.fsCap + L.fsDate + 22, 6);
+    ctx.fill();
+    ctx.fillStyle = rgba(CREAM, a4(0.95));
+    ctx.fillText('№866 · Spell It in Cardboard', W * 0.04, H * 0.055);
+    ctx.fillStyle = rgba(CREAM, a4(0.75));
+    ctx.font = L.fsDate + 'px Georgia, "Times New Roman", serif';
+    ctx.fillText('2004 · 05 · 26', W * 0.04, H * 0.055 + L.fsDate + 6);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = rgba(CREAM, a4(0.9));
+    ctx.font = L.fsHint + 'px Georgia, "Times New Roman", serif';
+    ctx.fillText('Tap to re-spell the word.', W / 2, H - L.fsHint * 0.9);
+    ctx.textAlign = 'left';
+  }
+
+  function draw(t) {
+    lastT = t;
+    // Pin the canvas element in draw(), per house rules.
+    canvas.style.width = stageW + 'px';
+    canvas.style.height = stageH + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    layout();
+
+    ctx.fillStyle = GROUND;
+    ctx.fillRect(0, 0, W, H);
+
+    drawGrass(t);
+    drawWord(t);
+    drawText();
+  }
+
+  // TAP re-spells the word from the next seed. A tap mid-slide
+  // is ignored, never corrupting the layout.
+  function respell() {
+    if (slideStart >= 0) { return; }
+    slideFrom = WORDS[wordIdx];
+    wordIdx = (wordIdx + 1) % WORDS.length;
+    slideTo = WORDS[wordIdx];
+    slideStart = lastT;
+    draw(lastT);
+  }
+  try {
+    if (typeof canvas.addEventListener === 'function') {
+      canvas.addEventListener('click', respell);
+    }
+  } catch (e) {}
+
+  if (typeof window.addEventListener === 'function') {
+    window.addEventListener('resize', function () { resize(); draw(lastT); });
+  }
+  try {
+    if (typeof window.visualViewport !== 'undefined' && window.visualViewport &&
+        typeof window.visualViewport.addEventListener === 'function') {
+      window.visualViewport.addEventListener('resize', function () { resize(); draw(lastT); });
+    }
+  } catch (e) {}
+
+  // QA hooks: window.__draw drives draw() with a virtual clock,
+  // window.__piece866 exposes the word, the slide and the shadows.
+  try {
+    window.__draw = function (t) { draw(t); };
+    window.__piece866 = {
+      firstT: FIRST_T,
+      cycle: CYCLE,
+      words: WORDS.slice(),
+      word: function () { return WORDS[wordIdx]; },
+      wordIndex: function () { return wordIdx; },
+      setWord: function (n) {
+        wordIdx = ((n % WORDS.length) + WORDS.length) % WORDS.length;
+        slideStart = -1; slideFrom = null; slideTo = null;
+        draw(lastT);
+      },
+      respell: function () { respell(); },
+      slideU: function (t) { return slideU(t); },
+      sliding: function () { return slideStart >= 0; },
+      shadowLen: function (t) { return shadowLen(t); },
+      accentIndex: function () { return ACCENT_IDX[wordIdx]; },
+      draw: function (t) { draw(t); }
+    };
+  } catch (e) {}
+
+  resize();
+  draw(probeT !== null ? probeT : FIRST_T); // one synchronous frame at load
+
+  // Motion loop: 60 s cycle, closed-form. Guarded so
+  // node-canvas QA (no requestAnimationFrame) works.
+  if (!reduced && typeof requestAnimationFrame === 'function') {
+    var start = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+    requestAnimationFrame(function loop(now) {
+      var t = FIRST_T + (now - start) / 1000;
+      lastT = t;
+      draw(t);
+      requestAnimationFrame(loop);
+    });
+  }
+})();
+</script>
+</body>
+</html>

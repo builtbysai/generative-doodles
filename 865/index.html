@@ -1,0 +1,561 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>№865 The Scale Mark</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #f2f4f5; height: 100%; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // №865 The Scale Mark, ZW3 / PP1265, study #263 zach-wolfe.
+  // The driver, as a felt phenomenon: one tiny dark mark gives an
+  // otherwise featureless white its size. Without the figure the
+  // frame is a snow-walled corridor dissolving into fog, nothing
+  // to measure against; with it, the white has a scale. Drag the
+  // mark to a new spot and the whole world re-measures from it:
+  // the corridor is generated around a movable scale anchor, so
+  // the vanishing point, the ridge spacing and the measuring
+  // ticks all rebuild from wherever the figure stands. Release
+  // and it resumes its slow walk out and back along the corridor.
+  var GROUND = '#f2f4f5'; // page ground, near-white
+  var INK = [32, 36, 40]; // the figure, a single dark mark
+  var SLATE = [70, 78, 84]; // faint measuring lines
+
+  // Fixed-phase first frame: FIRST_T = 6 s into a 48 s cycle.
+  // The walk is 48 s, the stride 2 s, the fog swell 48 s with a
+  // phase offset so the frame at the walk's midpoint differs
+  // from the first frame; every period divides 48, so the frame
+  // at FIRST_T + 48 equals the frame at FIRST_T.
+  var FIRST_T = 6;
+  var CYCLE = 48;
+  var SEED = 865;
+  var VP_Y = 0.42; // vanishing point height, stage fraction
+  var WALK_MID = 0.62, WALK_AMP = 0.33; // walk depth range 0.29..0.95
+
+  // QA probe hooks: ?t=<seconds> sets the virtual clock at load.
+  // ?seed=<seconds> is an alias for the same clock, so the
+  // node-canvas render tool (which passes its probe value as
+  // ?seed=) can verify that the frame changes over time.
+  // ?ax=<0..1>&ay=<0..1> places the scale anchor at load:
+  // &hold=1 holds it there as if mid-drag (the corridor
+  // re-measured, the walk paused); &resume=1 releases it at
+  // FIRST_T so the walk continues from that spot. Read at load only.
+  var probeT = null, probeAx = null, probeAy = null, probeMode = null;
+  try {
+    var qs = (typeof location !== 'undefined' && location.search) ? location.search : '';
+    var mt = qs.match(/[?&]t=([0-9.]+)/);
+    if (mt) { probeT = parseFloat(mt[1]); }
+    if (probeT === null) {
+      var ms = qs.match(/[?&]seed=([0-9.]+)/);
+      if (ms) { probeT = parseFloat(ms[1]); }
+    }
+    var ma = qs.match(/[?&]ax=([0-9.]+)/);
+    var mb = qs.match(/[?&]ay=([0-9.]+)/);
+    if (ma && mb) {
+      probeAx = parseFloat(ma[1]); probeAy = parseFloat(mb[1]);
+      if (qs.indexOf('hold=1') >= 0) { probeMode = 'hold'; }
+      else if (qs.indexOf('resume=1') >= 0) { probeMode = 'resume'; }
+    }
+  } catch (e) {}
+
+  // Seeded PRNG, mulberry32. Used once at load to build fixed tables.
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  var reduced = false;
+  try {
+    if (typeof window.matchMedia === 'function') {
+      reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    }
+  } catch (e) { reduced = false; }
+
+  var W = 0, H = 0, dpr = 1, isPhone = false;
+  var stageX = 0, stageY = 0, stageW = 0, stageH = 0;
+  var lastT = FIRST_T;
+
+  // ---- The scale anchor -------------------------------------------
+  // The corridor is generated around the anchor: the vanishing
+  // point, the ridge spacing and the measuring ticks all derive
+  // from it. The walk moves the anchor in depth; a drag moves it
+  // directly; on release the walk resumes from the dragged spot.
+  var phaseT = FIRST_T; // walk phase: walkU(phaseT) = WALK_MID
+  var dragging = false, dragU = WALK_MID, dragLat = 0;
+  var releasedAt = null, releaseU = WALK_MID, releaseLat = 0, releaseDir = 1;
+
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function smooth(x) { x = clamp(x, 0, 1); return x * x * (3 - 2 * x); }
+  function a4(v) { return Math.round(v * 10000) / 10000; } // avoid scientific-notation alpha
+  function rgb(c) {
+    return 'rgb(' + Math.round(c[0]) + ',' + Math.round(c[1]) + ',' + Math.round(c[2]) + ')';
+  }
+  function rgba(c, a) {
+    return 'rgba(' + Math.round(c[0]) + ',' + Math.round(c[1]) + ',' + Math.round(c[2]) + ',' + a4(a) + ')';
+  }
+  function circle(x, y, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+  }
+
+  // Depth u (0 near, 1 at the vanishing point) to screen parameter
+  // along any corridor line: perspective compression bunches
+  // equal depth steps near the vanishing point.
+  function depthS(u) { return Math.pow(clamp(u, 0, 1), 1.6); }
+  function walkU(t) {
+    return WALK_MID + WALK_AMP * Math.sin(2 * Math.PI * (t - phaseT) / CYCLE);
+  }
+  function walkDir(t) {
+    var c = Math.cos(2 * Math.PI * (t - phaseT) / CYCLE);
+    return c >= 0 ? 1 : -1;
+  }
+  function anchorU(t) {
+    if (dragging) { return dragU; }
+    return walkU(t);
+  }
+  // Lateral offset of the vanishing point, stage fractions.
+  // After a release it eases back to the centre line over 4 s.
+  function anchorLat(t) {
+    if (dragging) { return dragLat; }
+    if (releasedAt === null) { return 0; }
+    var dt = t - releasedAt;
+    if (dt <= 0) { return releaseLat; }
+    if (dt >= 4) { return 0; }
+    return releaseLat * (1 - smooth(dt / 4));
+  }
+  // Anchor from a stage point (pointer or probe): ay gives depth,
+  // ax gives lateral offset.
+  function anchorFromPoint(px, py) {
+    var s = clamp((1 - py / H) / (1 - VP_Y), 0.02, 1);
+    var u = Math.pow(s, 1 / 1.6);
+    var lat = clamp((px / W - 0.5) * 1.4, -0.28, 0.28);
+    return { u: clamp(u, 0.05, 0.97), lat: lat };
+  }
+  function applyAnchor(a, mode) {
+    if (mode === 'hold') {
+      dragging = true; dragU = a.u; dragLat = a.lat;
+    } else {
+      // Resume: re-phase the walk so it passes through the
+      // anchor at FIRST_T, walking away from the viewer.
+      var s = clamp((a.u - WALK_MID) / WALK_AMP, -1, 1);
+      var ph = Math.asin(s); // walking outward, derivative positive
+      phaseT = FIRST_T - CYCLE * ph / (2 * Math.PI);
+      releasedAt = FIRST_T; releaseU = a.u; releaseLat = a.lat; releaseDir = 1;
+      dragging = false;
+    }
+  }
+  function releaseAnchor(t) {
+    var u = dragging ? dragU : walkU(t);
+    var lat = dragging ? dragLat : 0;
+    var dir = walkDir(t);
+    var s = clamp((u - WALK_MID) / WALK_AMP, -1, 1);
+    var ph = (dir > 0) ? Math.asin(s) : Math.PI - Math.asin(s);
+    phaseT = t - CYCLE * ph / (2 * Math.PI);
+    releasedAt = t; releaseU = u; releaseLat = lat; releaseDir = dir;
+    dragging = false;
+  }
+
+  // Vanishing point and figure position at time t.
+  function vpAt(t) {
+    return { x: W * (0.5 + anchorLat(t)), y: H * VP_Y };
+  }
+  function figureAt(t) {
+    var u = anchorU(t);
+    var vp = vpAt(t);
+    var s = depthS(u);
+    var fx = W * 0.5 + (vp.x - W * 0.5) * s;
+    var fy = H + (vp.y - H) * s;
+    var fscale = 0.2 + 0.8 * Math.pow(1 - u, 0.8);
+    return { x: fx, y: fy, h: H * 0.085 * fscale, u: u };
+  }
+  // Stride: 2 s period, divides the 48 s cycle. Phase offset so
+  // the legs are visibly apart at FIRST_T, a mid-stride pose.
+  function legSwing(t) {
+    return Math.sin(2 * Math.PI * (t - FIRST_T) / 2 + 0.9);
+  }
+  // The figure faces the way it walks and turns at the far end:
+  // outward it faces right, back toward the viewer it faces left.
+  function walkFacing(t) { return walkDir(t); }
+  // Fog swell: the white breathes slowly over the 48 s cycle,
+  // densest a little after the first frame, so the frame at the
+  // walk's midpoint is never the same as the first frame even
+  // though the figure passes through the same depth.
+  function fogAlpha(t) {
+    return 0.55 + 0.06 * Math.sin(2 * Math.PI * (t - FIRST_T) / CYCLE + 0.7);
+  }
+
+  // ---- Fixed snow tables: faint speckles on the floor -------------
+  var speckRng = mulberry32(SEED * 13 + 5);
+  var SPECKS = [];
+  var ki;
+  for (ki = 0; ki < 46; ki++) {
+    SPECKS.push({
+      x: speckRng(), y: 0.45 + speckRng() * 0.55,
+      r: 0.0008 + speckRng() * 0.0016,
+      a: 0.05 + speckRng() * 0.08
+    });
+  }
+  // Wall strata jitter: each stratum line carries a fixed alpha.
+  var strataRng = mulberry32(SEED * 29 + 7);
+  var STRATA_A = [];
+  for (ki = 0; ki < 6; ki++) { STRATA_A.push(0.05 + strataRng() * 0.05); }
+
+  var L = {};
+  function layout() {
+    L.fsCap = Math.round(clamp(W * 0.020, 11, 15));
+    L.fsDate = Math.round(clamp(W * 0.016, 9, 12));
+    L.fsHint = Math.round(clamp(W * 0.022, 12, 16));
+  }
+  function resize() {
+    var vw = 0, vh = 0;
+    try {
+      if (typeof window.visualViewport !== 'undefined' && window.visualViewport) {
+        vw = window.visualViewport.width; vh = window.visualViewport.height;
+      }
+    } catch (e) {}
+    if (!vw || !vh) { vw = window.innerWidth; vh = window.innerHeight; }
+    var sw = 0, sh = 0;
+    try { sw = window.screen.width; sh = window.screen.height; } catch (e) { sw = vw; sh = vh; }
+    isPhone = Math.min(sw, sh) < 700 || (vh > vw * 1.15);
+    if (isPhone) {
+      stageW = vw; stageH = vh; stageX = 0; stageY = 0;
+    } else {
+      var side = Math.min(vw * 0.8, vh * 0.92);
+      stageW = side; stageH = side;
+      stageX = (vw - stageW) / 2; stageY = (vh - stageH) / 2;
+    }
+    W = stageW; H = stageH;
+    dpr = (typeof window.devicePixelRatio === 'number' && window.devicePixelRatio > 0) ? window.devicePixelRatio : 1;
+    canvas.width = Math.max(1, Math.round(stageW * dpr));
+    canvas.height = Math.max(1, Math.round(stageH * dpr));
+    canvas.style.width = stageW + 'px';
+    canvas.style.height = stageH + 'px';
+    canvas.style.left = stageX + 'px';
+    canvas.style.top = stageY + 'px';
+    canvas.style.position = 'absolute';
+  }
+
+  // ---- The corridor, generated around the anchor -------------------
+  // Ridge depths: in front of the figure (viewer to anchor) and
+  // behind it (anchor to vanishing point). Moving the anchor
+  // moves every ridge, so the whole floor re-measures.
+  function ridgeDepths(u) {
+    var ds = [], k;
+    for (k = 1; k <= 7; k++) { ds.push(u * k / 8); }
+    for (k = 1; k <= 5; k++) { ds.push(u + (1 - u) * k / 6); }
+    return ds;
+  }
+  function linePoint(x0, y0, x1, y1, s) {
+    return { x: x0 + (x1 - x0) * s, y: y0 + (y1 - y0) * s };
+  }
+
+  function drawCorridor(t) {
+    var vp = vpAt(t);
+    var u = anchorU(t);
+    var i, d, s, pL, pR, qL, qR;
+    // Sky: pale, open above the walls.
+    var sky = ctx.createLinearGradient(0, 0, 0, vp.y);
+    sky.addColorStop(0, rgb([248, 249, 249]));
+    sky.addColorStop(1, rgb([241, 243, 244]));
+    ctx.fillStyle = sky;
+    ctx.fillRect(0, 0, W, vp.y);
+    // Snow walls, left and right, a hair apart in tone.
+    ctx.fillStyle = rgb([237, 240, 241]);
+    ctx.beginPath();
+    ctx.moveTo(0, H * 0.22); ctx.lineTo(vp.x, vp.y); ctx.lineTo(0, H); ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = rgb([233, 237, 238]);
+    ctx.beginPath();
+    ctx.moveTo(W, H * 0.22); ctx.lineTo(vp.x, vp.y); ctx.lineTo(W, H); ctx.closePath();
+    ctx.fill();
+    // Floor.
+    ctx.fillStyle = rgb([243, 245, 245]);
+    ctx.beginPath();
+    ctx.moveTo(0, H); ctx.lineTo(vp.x, vp.y); ctx.lineTo(W, H); ctx.closePath();
+    ctx.fill();
+    // Wall top edges and base edges, faint.
+    ctx.strokeStyle = rgba(SLATE, a4(0.16));
+    ctx.lineWidth = Math.max(1, H * 0.0012);
+    ctx.beginPath();
+    ctx.moveTo(0, H * 0.22); ctx.lineTo(vp.x, vp.y); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(W, H * 0.22); ctx.lineTo(vp.x, vp.y); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(0, H); ctx.lineTo(vp.x, vp.y); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(W, H); ctx.lineTo(vp.x, vp.y); ctx.stroke();
+    // Wall strata: faint lines joining base and top edges at
+    // fixed depth fractions, the snow's bedding.
+    for (i = 0; i < 6; i++) {
+      d = (i + 1) / 7; s = depthS(d);
+      pL = linePoint(0, H, vp.x, vp.y, s);
+      qL = linePoint(0, H * 0.22, vp.x, vp.y, s);
+      pR = linePoint(W, H, vp.x, vp.y, s);
+      qR = linePoint(W, H * 0.22, vp.x, vp.y, s);
+      ctx.strokeStyle = rgba(SLATE, a4(STRATA_A[i]));
+      ctx.beginPath(); ctx.moveTo(pL.x, pL.y); ctx.lineTo(qL.x, qL.y); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(pR.x, pR.y); ctx.lineTo(qR.x, qR.y); ctx.stroke();
+    }
+    // Floor ridges across the corridor at the anchor-relative
+    // depths, slightly bowed, nearer ones a touch stronger.
+    var rds = ridgeDepths(u);
+    ctx.lineWidth = Math.max(1, H * 0.0012);
+    for (i = 0; i < rds.length; i++) {
+      d = rds[i]; s = depthS(d);
+      pL = linePoint(0, H, vp.x, vp.y, s);
+      pR = linePoint(W, H, vp.x, vp.y, s);
+      var midY = (pL.y + pR.y) / 2 + H * 0.012 * (1 - s);
+      ctx.strokeStyle = rgba(SLATE, a4(0.08 + 0.08 * (1 - d)));
+      ctx.beginPath();
+      ctx.moveTo(pL.x, pL.y);
+      ctx.quadraticCurveTo((pL.x + pR.x) / 2, midY, pR.x, pR.y);
+      ctx.stroke();
+    }
+    // Measuring ticks along both base edges at the ridge depths,
+    // and a stronger pair at the anchor's own depth: the ruler
+    // the figure carries with it.
+    var tickLen = H * 0.010;
+    for (i = 0; i < rds.length; i++) {
+      d = rds[i]; s = depthS(d);
+      pL = linePoint(0, H, vp.x, vp.y, s);
+      pR = linePoint(W, H, vp.x, vp.y, s);
+      ctx.strokeStyle = rgba(SLATE, a4(0.20));
+      ctx.lineWidth = Math.max(1, H * 0.0012);
+      ctx.beginPath(); ctx.moveTo(pL.x, pL.y); ctx.lineTo(pL.x + tickLen * 0.4, pL.y - tickLen); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(pR.x, pR.y); ctx.lineTo(pR.x - tickLen * 0.4, pR.y - tickLen); ctx.stroke();
+    }
+    var as = depthS(u);
+    pL = linePoint(0, H, vp.x, vp.y, as);
+    pR = linePoint(W, H, vp.x, vp.y, as);
+    ctx.strokeStyle = rgba(SLATE, a4(0.38));
+    ctx.lineWidth = Math.max(1, H * 0.0016);
+    ctx.beginPath(); ctx.moveTo(pL.x, pL.y); ctx.lineTo(pL.x + tickLen * 0.5, pL.y - tickLen * 1.6); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(pR.x, pR.y); ctx.lineTo(pR.x - tickLen * 0.5, pR.y - tickLen * 1.6); ctx.stroke();
+    // Faint snow speckles on the floor.
+    for (i = 0; i < SPECKS.length; i++) {
+      var sp = SPECKS[i];
+      ctx.fillStyle = rgba(SLATE, a4(sp.a));
+      ctx.fillRect(sp.x * W, sp.y * H, Math.max(1, sp.r * W), Math.max(1, sp.r * W));
+    }
+    // Fog: densest at the vanishing point, so the far end
+    // dissolves into white and the figure stands in it. The fog
+    // breathes slowly over the cycle (see fogAlpha).
+    var fa = fogAlpha(t);
+    var fog = ctx.createRadialGradient(vp.x, vp.y, 0, vp.x, vp.y, Math.max(W, H) * 0.72);
+    fog.addColorStop(0, rgba([255, 255, 255], a4(fa)));
+    fog.addColorStop(0.55, rgba([255, 255, 255], a4(fa * 0.4)));
+    fog.addColorStop(1, rgba([255, 255, 255], 0));
+    ctx.fillStyle = fog;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  // ---- The figure: one tiny dark mark, walking --------------------
+  function drawFigure(t) {
+    var f = figureAt(t);
+    var s = f.h;
+    var face = walkFacing(t); // 1 outward (faces right), -1 back (faces left)
+    var swing = legSwing(t) * face;
+    var lean = 0.04 * s * face;
+    var gy = f.y, fx = f.x;
+    var hipX = fx, hipY = gy - s * 0.48;
+    var shX = fx + lean, shY = gy - s * 0.84;
+    var headX = fx + lean * 1.2, headY = gy - s * 0.94;
+    var headR = s * 0.075;
+    // Soft contact shadow, faint in the snow.
+    ctx.fillStyle = rgba(SLATE, a4(0.12));
+    ctx.beginPath();
+    ctx.moveTo(fx + s * 0.28, gy);
+    ctx.ellipse(fx, gy, s * 0.28, s * 0.045, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.save();
+    ctx.strokeStyle = rgb(INK);
+    ctx.fillStyle = rgb(INK);
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    var lw = Math.max(1, s * 0.085);
+    // Legs: two-segment, swinging in opposite phase.
+    ctx.lineWidth = lw;
+    var fFootX = fx + swing * s * 0.24, fFootY = gy;
+    var bFootX = fx - swing * s * 0.24, bFootY = gy;
+    var fKneeX = fx + swing * s * 0.14, fKneeY = gy - s * 0.24;
+    var bKneeX = fx - swing * s * 0.14, bKneeY = gy - s * 0.24;
+    ctx.beginPath();
+    ctx.moveTo(hipX, hipY); ctx.lineTo(fKneeX, fKneeY); ctx.lineTo(fFootX, fFootY);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(hipX, hipY); ctx.lineTo(bKneeX, bKneeY); ctx.lineTo(bFootX, bFootY);
+    ctx.stroke();
+    // Torso, a solid stroke so the mark reads as a body.
+    ctx.lineWidth = Math.max(1.5, s * 0.13);
+    ctx.beginPath();
+    ctx.moveTo(hipX, hipY); ctx.lineTo(shX, shY);
+    ctx.stroke();
+    // Arms, swinging opposite to the legs.
+    var armSwing = -swing;
+    ctx.lineWidth = Math.max(1, s * 0.06);
+    ctx.beginPath();
+    ctx.moveTo(shX, shY);
+    ctx.lineTo(shX + armSwing * s * 0.08, shY + s * 0.18);
+    ctx.lineTo(shX + armSwing * s * 0.16, shY + s * 0.33);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(shX, shY);
+    ctx.lineTo(shX - armSwing * s * 0.08, shY + s * 0.18);
+    ctx.lineTo(shX - armSwing * s * 0.16, shY + s * 0.33);
+    ctx.stroke();
+    // Head.
+    circle(headX, headY, headR);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // ---- Caption and hint, in the template's place ----------------------
+  function drawText() {
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillStyle = rgba(INK, a4(0.88));
+    ctx.font = '600 ' + L.fsCap + 'px Georgia, "Times New Roman", serif';
+    ctx.fillText('№865 · The Scale Mark', W * 0.04, H * 0.055);
+    ctx.fillStyle = rgba(INK, a4(0.55));
+    ctx.font = L.fsDate + 'px Georgia, "Times New Roman", serif';
+    ctx.fillText('2004 · 05 · 25', W * 0.04, H * 0.055 + L.fsDate + 6);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = rgba(INK, a4(0.8));
+    ctx.font = L.fsHint + 'px Georgia, "Times New Roman", serif';
+    ctx.fillText('Drag the figure to re-measure the white.', W / 2, H - L.fsHint * 0.9);
+    ctx.textAlign = 'left';
+  }
+
+  function draw(t) {
+    lastT = t;
+    // Pin the canvas element in draw(), per house rules.
+    canvas.style.width = stageW + 'px';
+    canvas.style.height = stageH + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    layout();
+
+    ctx.fillStyle = GROUND;
+    ctx.fillRect(0, 0, W, H);
+
+    drawCorridor(t);
+    drawFigure(t);
+    drawText();
+  }
+
+  // ---- Drag: grab the figure, move the anchor, release to walk ----
+  function pointerPos(e) {
+    var x, y;
+    if (typeof e.offsetX === 'number' && typeof e.offsetY === 'number') {
+      x = e.offsetX; y = e.offsetY;
+    } else if (typeof e.clientX === 'number') {
+      x = e.clientX - stageX; y = e.clientY - stageY;
+    } else { return null; }
+    return { x: x, y: y };
+  }
+  function onDown(e) {
+    var p = pointerPos(e);
+    if (!p) { return; }
+    var f = figureAt(lastT);
+    var grab = Math.max(30, f.h * 2);
+    var dx = p.x - f.x, dy = p.y - f.y;
+    if (dx * dx + dy * dy <= grab * grab) {
+      var a = anchorFromPoint(p.x, p.y);
+      dragging = true; dragU = a.u; dragLat = a.lat;
+      draw(lastT);
+      if (typeof e.preventDefault === 'function') { e.preventDefault(); }
+    }
+  }
+  function onMove(e) {
+    if (!dragging) { return; }
+    var p = pointerPos(e);
+    if (!p) { return; }
+    var a = anchorFromPoint(p.x, p.y);
+    dragU = a.u; dragLat = a.lat;
+    draw(lastT);
+    if (typeof e.preventDefault === 'function') { e.preventDefault(); }
+  }
+  function onUp(e) {
+    if (!dragging) { return; }
+    releaseAnchor(lastT);
+    draw(lastT);
+  }
+  try {
+    if (typeof canvas.addEventListener === 'function') {
+      canvas.addEventListener('pointerdown', onDown);
+      canvas.addEventListener('pointermove', onMove);
+      canvas.addEventListener('pointerup', onUp);
+      canvas.addEventListener('pointercancel', onUp);
+    }
+  } catch (e) {}
+
+  if (typeof window.addEventListener === 'function') {
+    window.addEventListener('resize', function () { resize(); draw(lastT); });
+  }
+  try {
+    if (typeof window.visualViewport !== 'undefined' && window.visualViewport &&
+        typeof window.visualViewport.addEventListener === 'function') {
+      window.visualViewport.addEventListener('resize', function () { resize(); draw(lastT); });
+    }
+  } catch (e) {}
+
+  // QA hooks: window.__draw drives draw() with a virtual clock,
+  // window.__piece865 exposes the walk, the anchor and the drag.
+  try {
+    window.__draw = function (t) { draw(t); };
+    window.__piece865 = {
+      firstT: FIRST_T,
+      cycle: CYCLE,
+      walkU: function (t) { return walkU(t); },
+      anchorU: function (t) { return anchorU(t); },
+      anchorLat: function (t) { return anchorLat(t); },
+      figureAt: function (t) { return figureAt(t); },
+      legSwing: function (t) { return legSwing(t); },
+      fogAlpha: function (t) { return fogAlpha(t); },
+      walkFacing: function (t) { return walkFacing(t); },
+      setAnchor: function (ax, ay, mode) {
+        applyAnchor(anchorFromPoint(ax * W, ay * H), mode || 'hold');
+        draw(lastT);
+      },
+      releaseAnchor: function (t) { releaseAnchor(t); draw(lastT); },
+      dragging: function () { return dragging; },
+      draw: function (t) { draw(t); }
+    };
+  } catch (e) {}
+
+  resize();
+  if (probeAx !== null && probeMode) {
+    applyAnchor(anchorFromPoint(probeAx * W, probeAy * H), probeMode);
+  }
+  draw(probeT !== null ? probeT : FIRST_T); // one synchronous frame at load
+
+  // Motion loop: 48 s cycle, closed-form. Guarded so
+  // node-canvas QA (no requestAnimationFrame) works.
+  if (!reduced && typeof requestAnimationFrame === 'function') {
+    var start = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+    requestAnimationFrame(function loop(now) {
+      var t = FIRST_T + (now - start) / 1000;
+      lastT = t;
+      draw(t);
+      requestAnimationFrame(loop);
+    });
+  }
+})();
+</script>
+</body>
+</html>
