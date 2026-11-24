@@ -1,0 +1,686 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>№868 Through the Curtain</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #241509; height: 100%; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  'use strict';
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+
+  // №868 Through the Curtain, ZW6 / PP1268, study #263 zach-wolfe.
+  // An intimate backstage scene: a figure at a lit vanity mirror,
+  // seen through a translucent curtain. The curtain is visible as
+  // a layer: soft, wrinkled, catching the light. Warm tungsten
+  // interior, the curtain a milky veil over it, deep shadow at
+  // the edges. The mirror and figure are centred but veiled;
+  // nothing hidden by accident, everything hidden on purpose.
+  // The curtain sways almost imperceptibly. Drag to pull it
+  // aside and the scene sharpens; release and it falls back
+  // over the frame. The veil is the device, so the viewer earns
+  // control over it. The curtain is never fully removed by
+  // default, and the figure is seen from behind, so the device
+  // stays visible and the scene stays a backstage moment, not
+  // a watched one.
+  var GROUND = '#241509'; // page ground, warm dark brown
+  var WARM = [238, 214, 178]; // warm white for caption and hint
+
+  // Fixed-phase first frame: FIRST_T = 12 s into a 60 s cycle.
+  // The sway is 60 s, the bulb breathing 12 s, the dust drift
+  // 60 s; every period divides 60, so the frame at FIRST_T + 60
+  // equals the frame at FIRST_T and the loop is seamless.
+  var FIRST_T = 12;
+  var CYCLE = 60;
+  var SEED = 868;
+  var RELEASE_S = 2.5; // curtain falls back over this many seconds
+
+  // QA probe hooks: ?t=<seconds> sets the virtual clock at load.
+  // ?seed=<seconds> is an alias for the same clock, so the
+  // node-canvas render tool (which passes its probe value as
+  // ?seed=) can verify that the frame changes over time.
+  // ?cx=<0..1> sets the curtain open amount at load:
+  // &hold=1 holds it there as if mid-drag; &resume=1 releases
+  // it at FIRST_T so it falls back over RELEASE_S seconds.
+  // Read at load only.
+  var probeT = null, probeCx = null, probeMode = null;
+  try {
+    var qs = (typeof location !== 'undefined' && location.search) ? location.search : '';
+    var mt = qs.match(/[?&]t=([0-9.]+)/);
+    if (mt) { probeT = parseFloat(mt[1]); }
+    if (probeT === null) {
+      var ms = qs.match(/[?&]seed=([0-9.]+)/);
+      if (ms) { probeT = parseFloat(ms[1]); }
+    }
+    var mc = qs.match(/[?&]cx=([0-9.]+)/);
+    if (mc) {
+      probeCx = parseFloat(mc[1]);
+      if (qs.indexOf('hold=1') >= 0) { probeMode = 'hold'; }
+      else if (qs.indexOf('resume=1') >= 0) { probeMode = 'resume'; }
+    }
+  } catch (e) {}
+
+  // Seeded PRNG, mulberry32. Used once at load to build fixed tables.
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  var reduced = false;
+  try {
+    if (typeof window.matchMedia === 'function') {
+      reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    }
+  } catch (e) { reduced = false; }
+
+  var W = 0, H = 0, dpr = 1, isPhone = false;
+  var stageX = 0, stageY = 0, stageW = 0, stageH = 0;
+  var lastT = FIRST_T;
+
+  // ---- The curtain state ------------------------------------------
+  // u = 0 fully closed (veil over the whole frame), u = 1 pulled
+  // aside to the left, gathered over the left quarter. Drag sets
+  // it directly; on release it eases back to 0 over RELEASE_S.
+  var dragging = false, dragU = 0;
+  var releasedAt = null, releaseU = 0;
+
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function smooth(x) { x = clamp(x, 0, 1); return x * x * (3 - 2 * x); }
+  function a4(v) { return Math.round(v * 10000) / 10000; } // avoid scientific-notation alpha
+  function rgb(c) {
+    return 'rgb(' + Math.round(c[0]) + ',' + Math.round(c[1]) + ',' + Math.round(c[2]) + ')';
+  }
+  function rgba(c, a) {
+    return 'rgba(' + Math.round(c[0]) + ',' + Math.round(c[1]) + ',' + Math.round(c[2]) + ',' + a4(a) + ')';
+  }
+  function circle(x, y, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+  }
+
+  // Open amount at time t: held while dragging, easing back to 0
+  // after a release, 0 otherwise.
+  function curtainU(t) {
+    if (dragging) { return dragU; }
+    if (releasedAt === null) { return 0; }
+    var dt = t - releasedAt;
+    if (dt <= 0) { return releaseU; }
+    if (dt >= RELEASE_S) { return 0; }
+    return releaseU * (1 - smooth(dt / RELEASE_S));
+  }
+  // Right edge of the curtain in stage pixels. At u = 0 the edge
+  // sits at the frame's right side (full veil); at u = 1 it has
+  // gathered to the left quarter. The edge breathes a hair with
+  // the sway so the curtain never reads as a flat sheet.
+  function curtainEdgeX(t) {
+    var u = curtainU(t);
+    var sway = 0.006 * Math.sin(2 * Math.PI * (t - FIRST_T) / CYCLE + 1.1);
+    return clamp(W * (1 - 0.72 * u) + W * sway * (1 - u), 0, W);
+  }
+  function applyCurtain(u, mode) {
+    u = clamp(u, 0, 1);
+    if (mode === 'hold') {
+      dragging = true; dragU = u; releasedAt = null;
+    } else {
+      // Resume: the curtain falls back from u over RELEASE_S,
+      // starting at FIRST_T.
+      dragging = false; releaseU = u; releasedAt = FIRST_T;
+    }
+  }
+  function releaseCurtain(t) {
+    releaseU = dragging ? dragU : curtainU(t);
+    releasedAt = t;
+    dragging = false;
+  }
+
+  // ---- Fixed tables: curtain wrinkles, dust, bulb phases ---------
+  var wrRng = mulberry32(SEED * 13 + 5);
+  var WRINKLES = []; // horizontal wrinkle arcs across the curtain
+  var wi;
+  for (wi = 0; wi < 14; wi++) {
+    WRINKLES.push({
+      x: wrRng(), y: 0.08 + wrRng() * 0.84,
+      len: 0.10 + wrRng() * 0.22, sag: (wrRng() - 0.5) * 0.06,
+      a: 0.05 + wrRng() * 0.09, ph: wrRng() * Math.PI * 2
+    });
+  }
+  var dustRng = mulberry32(SEED * 29 + 11);
+  var DUST = [];
+  for (wi = 0; wi < 42; wi++) {
+    DUST.push({
+      x: dustRng(), y: dustRng(),
+      r: 0.0009 + dustRng() * 0.0018,
+      ph: dustRng() * Math.PI * 2,
+      sp: 0.6 + dustRng() * 0.8
+    });
+  }
+  var bulbRng = mulberry32(SEED * 47 + 3);
+  var BULB_PH = [];
+  for (wi = 0; wi < 12; wi++) { BULB_PH.push(bulbRng() * Math.PI * 2); }
+
+  // ---- The room: a centred square, proportions fixed -------------
+  // All scene geometry is in room fractions, so the composition
+  // reads the same on desktop, phone and thumb. The room is the
+  // smaller stage dimension, centred, nudged up a little so the
+  // hint has clear ground below it.
+  var R = {};
+  function room() {
+    var s = Math.min(W, H);
+    R.s = s;
+    R.x = (W - s) / 2;
+    R.y = (H - s) / 2 * 0.82;
+    R.cx = R.x + s / 2;
+  }
+  function rx(f) { return R.x + f * R.s; }
+  function ry(f) { return R.y + f * R.s; }
+
+  var L = {};
+  function layout() {
+    L.fsCap = Math.round(clamp(W * 0.020, 11, 15));
+    L.fsDate = Math.round(clamp(W * 0.016, 9, 12));
+    L.fsHint = Math.round(clamp(W * 0.022, 12, 16));
+    room();
+  }
+  function resize() {
+    var vw = 0, vh = 0;
+    try {
+      if (typeof window.visualViewport !== 'undefined' && window.visualViewport) {
+        vw = window.visualViewport.width; vh = window.visualViewport.height;
+      }
+    } catch (e) {}
+    if (!vw || !vh) { vw = window.innerWidth; vh = window.innerHeight; }
+    var sw = 0, sh = 0;
+    try { sw = window.screen.width; sh = window.screen.height; } catch (e) { sw = vw; sh = vh; }
+    isPhone = Math.min(sw, sh) < 700 || (vh > vw * 1.15);
+    if (isPhone) {
+      stageW = vw; stageH = vh; stageX = 0; stageY = 0;
+    } else {
+      var side = Math.min(vw * 0.8, vh * 0.92);
+      stageW = side; stageH = side;
+      stageX = (vw - stageW) / 2; stageY = (vh - stageH) / 2;
+    }
+    W = stageW; H = stageH;
+    dpr = (typeof window.devicePixelRatio === 'number' && window.devicePixelRatio > 0) ? window.devicePixelRatio : 1;
+    canvas.width = Math.max(1, Math.round(stageW * dpr));
+    canvas.height = Math.max(1, Math.round(stageH * dpr));
+    canvas.style.width = stageW + 'px';
+    canvas.style.height = stageH + 'px';
+    canvas.style.left = stageX + 'px';
+    canvas.style.top = stageY + 'px';
+    canvas.style.position = 'absolute';
+  }
+
+  // ---- The scene, drawn sharp -------------------------------------
+  // Warm tungsten wall, lit vanity mirror with bulbs, a figure
+  // seen from behind at the table, small bottles, deep shadow
+  // at the edges. Pure function of t (bulb breathing and dust
+  // only); the figure never moves, so the anchor is fixed.
+  function figureAnchor() {
+    // Head centre, stage pixels: the anchor the drag probe checks.
+    return { x: R.cx, y: ry(0.585), r: R.s * 0.052 };
+  }
+
+  function drawScene(t) {
+    var ph = (t - FIRST_T) / CYCLE;
+    // Wall: warm tungsten, darker toward the edges.
+    var wall = ctx.createLinearGradient(0, R.y, 0, R.y + R.s);
+    wall.addColorStop(0, rgb([74, 47, 28]));
+    wall.addColorStop(0.55, rgb([58, 36, 20]));
+    wall.addColorStop(1, rgb([34, 20, 11]));
+    ctx.fillStyle = wall;
+    ctx.fillRect(R.x, R.y, R.s, R.s);
+    // A faint warm wash from the mirror, centred on it.
+    var wash = ctx.createRadialGradient(R.cx, ry(0.38), 0, R.cx, ry(0.38), R.s * 0.55);
+    wash.addColorStop(0, rgba([255, 190, 110], a4(0.20)));
+    wash.addColorStop(1, rgba([255, 190, 110], 0));
+    ctx.fillStyle = wash;
+    ctx.fillRect(R.x, R.y, R.s, R.s);
+
+    // Mirror: rounded rect, bright warm glass, bulbs around it.
+    var mx = rx(0.30), my = ry(0.13), mw = R.s * 0.40, mh = R.s * 0.42;
+    var glow = 0.82 + 0.18 * Math.sin(2 * Math.PI * (t - FIRST_T) / 12);
+    var mg = ctx.createRadialGradient(R.cx, my + mh * 0.45, 0, R.cx, my + mh * 0.45, mw * 0.95);
+    mg.addColorStop(0, rgba([255, 214, 150], a4(0.55 * glow)));
+    mg.addColorStop(0.6, rgba([255, 178, 100], a4(0.22 * glow)));
+    mg.addColorStop(1, rgba([255, 178, 100], 0));
+    ctx.fillStyle = mg;
+    ctx.fillRect(mx - mw * 0.28, my - mh * 0.18, mw * 1.56, mh * 1.36);
+    // Mirror frame, dark wood.
+    ctx.fillStyle = rgb([46, 26, 14]);
+    roundRect(mx - R.s * 0.012, my - R.s * 0.012, mw + R.s * 0.024, mh + R.s * 0.024, R.s * 0.02);
+    ctx.fill();
+    // Mirror glass: warm gradient, brighter at the top.
+    var glass = ctx.createLinearGradient(0, my, 0, my + mh);
+    glass.addColorStop(0, rgb([255, 222, 168]));
+    glass.addColorStop(0.55, rgb([244, 196, 132]));
+    glass.addColorStop(1, rgb([214, 158, 96]));
+    ctx.fillStyle = glass;
+    roundRect(mx, my, mw, mh, R.s * 0.014);
+    ctx.fill();
+    // Reflection: the figure's face as a soft luminous oval,
+    // featureless, with a darker hair arc at its top so it reads
+    // as a face and not a glow blob. No detail is drawn in the
+    // glass beyond this, so the mirror reads as a reflection,
+    // not a portrait.
+    var faceY = my + mh * 0.42;
+    var fg = ctx.createRadialGradient(R.cx, faceY, 0, R.cx, faceY, R.s * 0.075);
+    fg.addColorStop(0, rgba([255, 238, 208], a4(1.0)));
+    fg.addColorStop(0.7, rgba([250, 216, 170], a4(0.65)));
+    fg.addColorStop(1, rgba([250, 216, 170], 0));
+    ctx.fillStyle = fg;
+    ctx.beginPath();
+    ctx.ellipse(R.cx, faceY, R.s * 0.052, R.s * 0.068, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = rgba([110, 70, 36], a4(0.55));
+    ctx.lineWidth = Math.max(1.5, R.s * 0.008);
+    ctx.beginPath();
+    ctx.arc(R.cx, faceY - R.s * 0.006, R.s * 0.052, Math.PI * 1.15, Math.PI * 1.85);
+    ctx.stroke();
+    // Bulbs around the mirror, warm, breathing slowly on a
+    // 12 s period with fixed individual phases.
+    var bi, bx, by, bph, ba;
+    var bulbPos = [];
+    for (bi = 0; bi < 4; bi++) {
+      bulbPos.push([mx + (bi + 0.5) * mw / 4, my - R.s * 0.012]);
+      bulbPos.push([mx + (bi + 0.5) * mw / 4, my + mh + R.s * 0.012]);
+    }
+    for (bi = 0; bi < 2; bi++) {
+      bulbPos.push([mx - R.s * 0.012, my + (bi + 0.5) * mh / 2]);
+      bulbPos.push([mx + mw + R.s * 0.012, my + (bi + 0.5) * mh / 2]);
+    }
+    for (bi = 0; bi < bulbPos.length; bi++) {
+      bx = bulbPos[bi][0]; by = bulbPos[bi][1];
+      bph = BULB_PH[bi];
+      ba = 0.85 + 0.15 * Math.sin(2 * Math.PI * (t - FIRST_T) / 12 + bph);
+      var bg = ctx.createRadialGradient(bx, by, 0, bx, by, R.s * 0.035);
+      bg.addColorStop(0, rgba([255, 226, 170], a4(0.8 * ba)));
+      bg.addColorStop(1, rgba([255, 226, 170], 0));
+      ctx.fillStyle = bg;
+      ctx.fillRect(bx - R.s * 0.035, by - R.s * 0.035, R.s * 0.07, R.s * 0.07);
+      ctx.fillStyle = rgba([255, 240, 210], a4(0.95 * ba));
+      circle(bx, by, Math.max(1.5, R.s * 0.008));
+      ctx.fill();
+    }
+
+    // Vanity table: a dark band with a pale top edge, small
+    // bottles and a brush catching the light.
+    var ty = ry(0.66);
+    ctx.fillStyle = rgb([40, 23, 12]);
+    ctx.fillRect(R.x, ty, R.s, R.y + R.s - ty);
+    ctx.fillStyle = rgba([240, 210, 170], a4(0.5));
+    ctx.fillRect(R.x, ty, R.s, Math.max(1, R.s * 0.006));
+    var bot = [
+      [0.22, 0.030, 0.012], [0.27, 0.022, 0.010], [0.74, 0.026, 0.011],
+      [0.78, 0.018, 0.009]
+    ];
+    for (bi = 0; bi < bot.length; bi++) {
+      var bxx = rx(bot[bi][0]), bh = R.s * bot[bi][1], bw = R.s * bot[bi][2];
+      ctx.fillStyle = rgba([235, 200, 150], a4(0.75));
+      ctx.fillRect(bxx - bw / 2, ty - bh, bw, bh);
+      ctx.fillStyle = rgba([255, 230, 190], a4(0.9));
+      ctx.fillRect(bxx - bw / 2, ty - bh, bw, Math.max(1, R.s * 0.004));
+    }
+
+    // The figure, seen from behind: dark silhouette with a warm
+    // rim from the mirror light on the right side. Head, hair,
+    // shoulders, back, one arm raised toward the mirror.
+    var fa = figureAnchor();
+    var hx = fa.x, hy = fa.y, hr = fa.r;
+    // Soft contact shadow on the chair and table.
+    ctx.fillStyle = rgba([10, 5, 2], a4(0.45));
+    ctx.beginPath();
+    ctx.ellipse(R.cx, ry(0.86), R.s * 0.16, R.s * 0.02, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.save();
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    // Back and shoulders.
+    ctx.fillStyle = rgb([22, 12, 6]);
+    ctx.beginPath();
+    ctx.moveTo(R.cx - R.s * 0.115, ry(0.86));
+    ctx.quadraticCurveTo(R.cx - R.s * 0.13, ry(0.70), R.cx - R.s * 0.075, ry(0.62));
+    ctx.lineTo(R.cx + R.s * 0.075, ry(0.62));
+    ctx.quadraticCurveTo(R.cx + R.s * 0.13, ry(0.70), R.cx + R.s * 0.115, ry(0.86));
+    ctx.closePath();
+    ctx.fill();
+    // Neck, joining the head to the shoulders.
+    ctx.fillStyle = rgb([22, 12, 6]);
+    ctx.fillRect(R.cx - R.s * 0.018, ry(0.60), R.s * 0.036, R.s * 0.045);
+    // Raised right arm, reaching toward the mirror: shoulder to
+    // elbow to hand, a gentle bend, ending in a small hand.
+    ctx.strokeStyle = rgb([22, 12, 6]);
+    ctx.lineWidth = Math.max(2, R.s * 0.026);
+    ctx.beginPath();
+    ctx.moveTo(R.cx + R.s * 0.075, ry(0.665));
+    ctx.lineTo(R.cx + R.s * 0.115, ry(0.605));
+    ctx.lineTo(R.cx + R.s * 0.105, ry(0.555));
+    ctx.stroke();
+    ctx.fillStyle = rgb([22, 12, 6]);
+    circle(R.cx + R.s * 0.105, ry(0.55), Math.max(2, R.s * 0.016));
+    ctx.fill();
+    // Head and hair.
+    ctx.fillStyle = rgb([16, 9, 4]);
+    circle(hx, hy, hr);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(hx - hr * 0.95, hy + hr * 0.2);
+    ctx.quadraticCurveTo(hx - hr * 1.15, hy - hr * 1.05, hx, hy - hr * 1.05);
+    ctx.quadraticCurveTo(hx + hr * 1.15, hy - hr * 1.05, hx + hr * 0.95, hy + hr * 0.2);
+    ctx.quadraticCurveTo(hx + hr * 0.7, hy + hr * 0.75, hx, hy + hr * 0.8);
+    ctx.quadraticCurveTo(hx - hr * 0.7, hy + hr * 0.75, hx - hr * 0.95, hy + hr * 0.2);
+    ctx.closePath();
+    ctx.fill();
+    // Warm rim light on the right side of the head and shoulder,
+    // the mirror's light catching the figure's edge.
+    ctx.strokeStyle = rgba([255, 205, 140], a4(0.85));
+    ctx.lineWidth = Math.max(1, R.s * 0.005);
+    ctx.beginPath();
+    ctx.arc(hx, hy, hr * 0.98, -Math.PI * 0.42, Math.PI * 0.38);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(R.cx + R.s * 0.075, ry(0.62));
+    ctx.quadraticCurveTo(R.cx + R.s * 0.128, ry(0.70), R.cx + R.s * 0.113, ry(0.86));
+    ctx.stroke();
+    ctx.restore();
+
+    // Dust motes drifting in the mirror light, slow 60 s drift.
+    // The drift is a closed sinusoid, so the frame at FIRST_T + 60
+    // equals the frame at FIRST_T and the loop is seamless.
+    var di, d, dx, dy;
+    for (di = 0; di < DUST.length; di++) {
+      d = DUST[di];
+      dx = R.x + (((d.x + 0.02 * d.sp * Math.sin(2 * Math.PI * ph + d.ph)) % 1 + 1) % 1) * R.s;
+      dy = R.y + (((d.y + 0.012 * d.sp * Math.cos(2 * Math.PI * ph + d.ph)) % 1 + 1) % 1) * R.s;
+      var tw = 0.5 + 0.5 * Math.sin(2 * Math.PI * ph + d.ph);
+      ctx.fillStyle = rgba([255, 225, 175], a4(0.10 + 0.25 * tw));
+      ctx.fillRect(dx, dy, Math.max(1, d.r * R.s), Math.max(1, d.r * R.s));
+    }
+
+    // Deep shadow at the edges: a vignette over the room.
+    var vg = ctx.createRadialGradient(R.cx, R.y + R.s * 0.5, R.s * 0.28,
+      R.cx, R.y + R.s * 0.5, R.s * 0.75);
+    vg.addColorStop(0, rgba([8, 4, 1], 0));
+    vg.addColorStop(1, rgba([8, 4, 1], a4(0.55)));
+    ctx.fillStyle = vg;
+    ctx.fillRect(R.x, R.y, R.s, R.s);
+  }
+  function roundRect(x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.lineTo(x + w - r, y);
+    ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+    ctx.lineTo(x + w, y + h - r);
+    ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+    ctx.lineTo(x + r, y + h);
+    ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+    ctx.lineTo(x, y + r);
+    ctx.quadraticCurveTo(x, y, x + r, y);
+    ctx.closePath();
+  }
+
+  // ---- The curtain layer ------------------------------------------
+  // A milky veil over the frame: a soft wash, vertical folds
+  // with light and shadow, horizontal wrinkle arcs, a brighter
+  // caught-light band near the top, and a gathered hem. The
+  // folds sway almost imperceptibly on the 60 s cycle. The layer
+  // is drawn only over [0, edgeX]; the revealed strip to the
+  // right is drawn sharp by re-drawing the scene clipped there.
+  function drawCurtain(t) {
+    var edgeX = curtainEdgeX(t);
+    if (edgeX <= 0) { return; }
+    var u = curtainU(t);
+    var swayPh = 2 * Math.PI * (t - FIRST_T) / CYCLE;
+    // Base milky wash: strong enough to veil, light enough that
+    // the mirror glow and the figure still read through it.
+    var wash = ctx.createLinearGradient(0, 0, edgeX, 0);
+    wash.addColorStop(0, rgba([238, 228, 210], a4(0.52)));
+    wash.addColorStop(0.7, rgba([238, 228, 210], a4(0.46)));
+    wash.addColorStop(1, rgba([238, 228, 210], a4(0.38)));
+    ctx.fillStyle = wash;
+    ctx.fillRect(0, 0, edgeX, H);
+    // Vertical folds: soft alternating light and shadow bands.
+    // As the curtain gathers (u rises) the folds compress toward
+    // the left edge and deepen, like fabric bunching.
+    var folds = 9;
+    var fw = edgeX / folds;
+    var fi, fx0, foldA;
+    for (fi = 0; fi < folds; fi++) {
+      fx0 = fi * fw;
+      // Fold shading follows the sway so the curtain breathes.
+      foldA = 0.10 + 0.08 * Math.sin(swayPh + fi * 1.3);
+      var fg = ctx.createLinearGradient(fx0, 0, fx0 + fw, 0);
+      fg.addColorStop(0, rgba([120, 100, 80], a4(0.16 + foldA * 0.5)));
+      fg.addColorStop(0.35, rgba([250, 242, 226], a4(0.14 + foldA)));
+      fg.addColorStop(0.65, rgba([250, 242, 226], a4(0.05)));
+      fg.addColorStop(1, rgba([120, 100, 80], a4(0.16 + foldA * 0.5)));
+      ctx.fillStyle = fg;
+      ctx.fillRect(fx0, 0, fw + 1, H);
+    }
+    // Fold seam lines, thin and soft.
+    ctx.strokeStyle = rgba([90, 72, 55], a4(0.18));
+    ctx.lineWidth = Math.max(1, W * 0.0012);
+    for (fi = 1; fi < folds; fi++) {
+      var sx = fi * fw + Math.sin(swayPh + fi * 1.3) * W * 0.004;
+      ctx.beginPath();
+      ctx.moveTo(sx, 0);
+      ctx.lineTo(sx + Math.sin(swayPh + fi) * W * 0.003, H);
+      ctx.stroke();
+    }
+    // Horizontal wrinkle arcs, drifting with the sway.
+    var wi, wrk, wy;
+    for (wi = 0; wi < WRINKLES.length; wi++) {
+      wrk = WRINKLES[wi];
+      var wx0 = wrk.x * edgeX;
+      wy = wrk.y * H + Math.sin(swayPh + wrk.ph) * H * 0.004;
+      ctx.strokeStyle = rgba([250, 242, 226], a4(wrk.a));
+      ctx.lineWidth = Math.max(1, H * 0.0016);
+      ctx.beginPath();
+      ctx.moveTo(wx0, wy);
+      ctx.quadraticCurveTo(wx0 + wrk.len * edgeX / 2, wy + wrk.sag * H,
+        wx0 + wrk.len * edgeX, wy);
+      ctx.stroke();
+    }
+    // Caught light near the top: a soft bright band where the
+    // curtain meets the rod's light.
+    var top = ctx.createLinearGradient(0, 0, 0, H * 0.14);
+    top.addColorStop(0, rgba([255, 246, 228], a4(0.22)));
+    top.addColorStop(1, rgba([255, 246, 228], 0));
+    ctx.fillStyle = top;
+    ctx.fillRect(0, 0, edgeX, H * 0.14);
+    // The curtain's free edge: a soft vertical highlight and a
+    // shadow just inside it, so the edge reads as fabric, not a
+    // cut. It fades in as the curtain is pulled aside.
+    if (u > 0.01) {
+      var eg = ctx.createLinearGradient(edgeX - W * 0.03, 0, edgeX, 0);
+      eg.addColorStop(0, rgba([90, 72, 55], 0));
+      eg.addColorStop(1, rgba([90, 72, 55], a4(0.28 * u)));
+      ctx.fillStyle = eg;
+      ctx.fillRect(edgeX - W * 0.03, 0, W * 0.03, H);
+      ctx.strokeStyle = rgba([255, 246, 228], a4(0.5 * u));
+      ctx.lineWidth = Math.max(1, W * 0.002);
+      ctx.beginPath();
+      ctx.moveTo(edgeX, 0);
+      ctx.lineTo(edgeX, H);
+      ctx.stroke();
+    }
+    // Curtain rod across the top, with rings: the device is
+    // visibly hung, not a filter over the lens.
+    var rodY = H * 0.028;
+    ctx.strokeStyle = rgba([30, 18, 8], a4(0.9));
+    ctx.lineWidth = Math.max(2, H * 0.006);
+    ctx.beginPath();
+    ctx.moveTo(0, rodY);
+    ctx.lineTo(W, rodY);
+    ctx.stroke();
+    ctx.fillStyle = rgba([60, 40, 20], a4(0.9));
+    var ri;
+    for (ri = 0; ri < 8; ri++) {
+      var ringX = (ri + 0.5) * W / 8;
+      circle(ringX, rodY, Math.max(2, H * 0.008));
+      ctx.fill();
+    }
+  }
+
+  // ---- Caption plate and hint --------------------------------------
+  function drawText() {
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillStyle = rgba(WARM, a4(0.92));
+    ctx.font = '600 ' + L.fsCap + 'px Georgia, "Times New Roman", serif';
+    ctx.fillText('№868 · Through the Curtain', W * 0.04, H * 0.055);
+    ctx.fillStyle = rgba(WARM, a4(0.6));
+    ctx.font = L.fsDate + 'px Georgia, "Times New Roman", serif';
+    ctx.fillText('2004 · 05 · 28', W * 0.04, H * 0.055 + L.fsDate + 6);
+    // Hint on a soft dark pill so it stays readable over the
+    // milky curtain at the bottom of the frame.
+    ctx.textAlign = 'center';
+    ctx.font = L.fsHint + 'px Georgia, "Times New Roman", serif';
+    var hint = 'Drag to pull the curtain aside.';
+    var hw = ctx.measureText(hint).width;
+    var hx = W / 2 - hw / 2 - L.fsHint * 0.9;
+    var hy = H - L.fsHint * 2.6;
+    ctx.fillStyle = rgba([16, 8, 3], a4(0.55));
+    roundRect(hx, hy, hw + L.fsHint * 1.8, L.fsHint * 2.0, L.fsHint);
+    ctx.fill();
+    ctx.fillStyle = rgba(WARM, a4(0.95));
+    ctx.fillText(hint, W / 2, H - L.fsHint * 0.9);
+    ctx.textAlign = 'left';
+  }
+
+  function draw(t) {
+    lastT = t;
+    // Pin the canvas element in draw(), per house rules.
+    canvas.style.width = stageW + 'px';
+    canvas.style.height = stageH + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    layout();
+
+    ctx.fillStyle = GROUND;
+    ctx.fillRect(0, 0, W, H);
+
+    drawScene(t);
+    // The curtain veils the frame up to its edge. The strip to
+    // the right of the edge is re-drawn sharp, clipped, so
+    // pulling the curtain aside sharpens the scene there while
+    // the veiled part stays soft behind the milky layer.
+    var edgeX = curtainEdgeX(t);
+    drawCurtain(t);
+    if (edgeX < W - 1) {
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(edgeX, 0, W - edgeX, H);
+      ctx.clip();
+      drawScene(t);
+      ctx.restore();
+    }
+    drawText();
+  }
+
+  // ---- Drag: pull the curtain aside, release to let it fall -------
+  function pointerPos(e) {
+    var x, y;
+    if (typeof e.offsetX === 'number' && typeof e.offsetY === 'number') {
+      x = e.offsetX; y = e.offsetY;
+    } else if (typeof e.clientX === 'number') {
+      x = e.clientX - stageX; y = e.clientY - stageY;
+    } else { return null; }
+    return { x: x, y: y };
+  }
+  var grabX = 0, grabU = 0;
+  function onDown(e) {
+    var p = pointerPos(e);
+    if (!p) { return; }
+    // Grab anywhere on the curtain; dragging left pulls it
+    // aside, dragging right lets it close.
+    dragging = true;
+    grabX = p.x;
+    grabU = curtainU(lastT);
+    dragU = grabU;
+    draw(lastT);
+    if (typeof e.preventDefault === 'function') { e.preventDefault(); }
+  }
+  function onMove(e) {
+    if (!dragging) { return; }
+    var p = pointerPos(e);
+    if (!p) { return; }
+    dragU = clamp(grabU + (grabX - p.x) / (W * 0.6), 0, 1);
+    draw(lastT);
+    if (typeof e.preventDefault === 'function') { e.preventDefault(); }
+  }
+  function onUp(e) {
+    if (!dragging) { return; }
+    releaseCurtain(lastT);
+    draw(lastT);
+  }
+  try {
+    if (typeof canvas.addEventListener === 'function') {
+      canvas.addEventListener('pointerdown', onDown);
+      canvas.addEventListener('pointermove', onMove);
+      canvas.addEventListener('pointerup', onUp);
+      canvas.addEventListener('pointercancel', onUp);
+    }
+  } catch (e) {}
+
+  if (typeof window.addEventListener === 'function') {
+    window.addEventListener('resize', function () { resize(); draw(lastT); });
+  }
+  try {
+    if (typeof window.visualViewport !== 'undefined' && window.visualViewport &&
+        typeof window.visualViewport.addEventListener === 'function') {
+      window.visualViewport.addEventListener('resize', function () { resize(); draw(lastT); });
+    }
+  } catch (e) {}
+
+  // QA hooks: window.__draw drives draw() with a virtual clock,
+  // window.__piece868 exposes the curtain and the figure anchor.
+  try {
+    window.__draw = function (t) { draw(t); };
+    window.__piece868 = {
+      firstT: FIRST_T,
+      cycle: CYCLE,
+      releaseS: RELEASE_S,
+      curtainU: function (t) { return curtainU(t); },
+      curtainEdgeX: function (t) { return curtainEdgeX(t); },
+      figureAnchor: function () { return figureAnchor(); },
+      setCurtain: function (u, mode) { applyCurtain(u, mode || 'hold'); draw(lastT); },
+      releaseCurtain: function (t) { releaseCurtain(t); draw(lastT); },
+      dragging: function () { return dragging; },
+      draw: function (t) { draw(t); }
+    };
+  } catch (e) {}
+
+  resize();
+  if (probeCx !== null && probeMode) {
+    applyCurtain(probeCx, probeMode);
+  }
+  draw(probeT !== null ? probeT : FIRST_T); // one synchronous frame at load
+
+  // Motion loop: 60 s cycle, closed-form. Guarded so
+  // node-canvas QA (no requestAnimationFrame) works.
+  if (!reduced && typeof requestAnimationFrame === 'function') {
+    var start = (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+    requestAnimationFrame(function loop(now) {
+      var t = FIRST_T + (now - start) / 1000;
+      lastT = t;
+      draw(t);
+      requestAnimationFrame(loop);
+    });
+  }
+})();
+</script>
+</body>
+</html>
